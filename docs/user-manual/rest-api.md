@@ -5716,7 +5716,29 @@ One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
-narrowed.
+narrowed. **(#4496)** A candidate inventory record excluded by the JSON depth
+guard (a poisoned/over-nested `data_json` row; the exclusion check runs
+before condition matching, so a record's plugin/fields need not relate to
+the query's conditions to trigger it; see json-dump-depth-guard below) gets
+the identical treatment: the route returns **503**
+("inventory record(s) excluded for nesting too deeply ... refusing to
+materialise a result set narrower than the true match set") rather than
+silently dropping the poisoned agent from membership: this is a
+DELIBERATE choice, unlike the read-only `POST /api/v1/inventory/evaluate` and
+`POST /api/inventory/query` routes below, which surface the same exclusion as
+a `results_excluded_by_poison` count field, this route materialises its
+match set into a *durable* result set other operators/dispatches consume
+later, so a flag on this response would never reach them. **(#4496
+follow-up)** A candidate inventory record excluded because its `data_json`
+failed to parse as JSON at all gets the SAME **503** treatment
+("inventory record(s) excluded for failing to parse as JSON ... refusing to
+materialise a result set narrower than the true match set"), as a
+distinctly-named sibling refusal, checked in a fixed sequence AFTER the
+depth-guard one above: a candidate set carrying both problems reports only
+the depth-guard (`poison_excluded`) refusal on that call, and the
+parse-error refusal surfaces on a subsequent retry once the poisoned record
+is fixed - so a caller is always told which cause remains, never that both
+have cleared at once.
 
 **Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
 route had NO authorization check of any kind before this fix, CWE-862: any
@@ -5756,11 +5778,31 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 **supplied** `parent_id` that is empty, non-string, or `null` is refused with
 `400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
 
+**`{id}/re-eval` field bounds (#4373).** The original set's re-run fields are
+rechecked against the same bound values used elsewhere, because the original
+row may have been minted through `POST /api/v1/result-sets` directly (which
+carries no `source_kind` allowlist) rather than through
+`from-tar-query`/`from-instruction-result`, and so may never have been
+validated at all: `sql` (tar_query) at 100 KiB, the bound `from-tar-query`
+itself already enforces at creation time; and `instruction_id`
+(instruction_result) at 256 bytes plus `params` at 32 keys / 256-byte keys /
+64 KiB values, the same bounds REST's own `from-instruction-result` route now
+also enforces at creation time (#4373), matching the MCP tool
+`create_result_set_from_instruction_result`. A `params` that is present but
+not a JSON object (a string, array, or number) is refused outright rather
+than silently dispatching with an empty params map. A type-mismatched
+`sql`/`instruction_id` value (not a JSON string) is treated as absent, taking
+the existing missing-field 400 path, rather than surfacing as an uncaught
+exception (#4406, fixed on both `from-tar-query` and `from-instruction-result`
+in the same change).
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
@@ -5870,6 +5912,26 @@ absent devices may simply not have
 been read rather than not matching. (The typed software route carries the same
 flag inside `data` — placement alignment is tracked with #2633.)
 
+`results_excluded_by_poison` (integer, optional, #4496): emitted at the same
+top level, present and non-zero when one or more candidate inventory records
+were excluded because their stored `data_json` nested past the JSON depth
+guard (a poisoned/over-nested row; the exclusion check runs before condition
+matching, so a record's plugin/fields need not relate to the query's
+conditions to trigger it; see json-dump-depth-guard below). The returned
+matches may be missing some the caller cannot detect any other way.
+Distinct from `result_truncated_by_cap` (a row/byte cap on the underlying
+read, not a per-record exclusion); either, both, or neither may be present
+on a given response.
+
+`results_excluded_by_parse_error` (integer, optional, #4496 follow-up):
+emitted at the same top level, present and non-zero when one or more
+candidate inventory records were excluded because their stored `data_json`
+failed to parse as JSON at all (a syntax defect, not over-nesting). A
+distinctly-named sibling of `results_excluded_by_poison` above, kept separate
+so a caller can tell WHICH guard excluded a record - the two causes are
+different (malformed JSON vs. over-nested JSON) and both, either, or neither
+may be present on a given response alongside `result_truncated_by_cap`.
+
 **Errors:**
 
 | Status | Reason |
@@ -5937,7 +5999,7 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
 
-**JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read.
+**JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
 
 **MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
 
@@ -6017,6 +6079,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
+| 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 403 | Service-scoped API token |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
@@ -7698,7 +7761,7 @@ One signal type's drill-down.
 Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` counts online Windows devices — historically the coverage-honest denominator when perf collectors were Windows-only. **Known limitation:** the TAR perf collector now also runs on Linux, so `reporting` can legitimately exceed `windows_online` on mixed fleets; an OS-aware denominator is a tracked follow-up. Not audited.
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online, linux_online, macos_online, reporting_windows, reporting_linux, reporting_macos}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online`/`reporting` are byte-identical to their historical values — only the trailing fields are new. `linux_online`/`macos_online` are the same online-count per OS, and `reporting_windows`/`reporting_linux`/`reporting_macos` split the reporting population by OS, closing the previous known limitation where `reporting` could legitimately exceed the Windows-only `windows_online` denominator on a mixed fleet. `reporting_macos` is always 0 today — `macos_online` counts real online macOS agents, but no macOS perf collector exists yet (honest absence, not a bug). Not audited.
 
 #### `GET /api/v1/dex/perf/cohorts`
 
@@ -7721,8 +7784,8 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle. **Known limitation:** Linux perf devices are excluded from this complement list — same OS-aware-denominator follow-up as `/dex/perf/fleet` above — so a Linux non-reporter does not appear here); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
-- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (devices of an OS with a real perf collector — Windows and Linux today — that had no perf sample this cycle; a macOS device never appears, collector or not); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric; `os` is the normalized token — `windows`/`linux`/`macos`/empty for unrecognized). `400` on an invalid `cohort_key` or `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
 - **Audit (behavioral PII):** each row is an `agent_id` + its perf metrics, individual-identifying, fleet-wide — emits **`dex.perf.device.view`** (`target_type=GuaranteedState`, `target_id=` empty) before serving. A denied service-scoped token also emits this verb (`result=denied`). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list.
 
 ### Application performance over time
@@ -9114,8 +9177,14 @@ valid, else returned as a raw string. `404` if no record exists for that agent+p
 Query inventory records across agents. Request body (all fields optional):
 `{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
 `limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
-"count": N, "result_truncated_by_cap": bool}` — `result_truncated_by_cap` is `true` when
-more matching rows existed than `limit` allowed.
+"count": N, "result_truncated_by_cap": bool, "results_excluded_by_poison": N}`.
+`result_truncated_by_cap` is `true` when more matching rows existed than `limit`
+allowed; `results_excluded_by_poison` (#4496) is the count of matching rows
+excluded because their stored `data_json` nested past the JSON depth guard (a
+poisoned/over-nested row), emitted unconditionally (`0` when none were
+excluded) so a short `count` can never be mistaken for "nothing else
+matched": the two truncation causes are otherwise indistinguishable from the
+response alone.
 
 **Storage failure (all three routes):** a null/unopened inventory store returns `503`
 (`{"error":{"code":503,"message":"inventory store not available"}}`); a store that opens

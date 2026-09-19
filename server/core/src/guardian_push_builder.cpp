@@ -6,9 +6,10 @@
 #include "yuzu/metrics.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <mutex>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -17,50 +18,13 @@ namespace yuzu::server::guardian {
 
 namespace {
 
-// Rate-limits the depth-exclusion log line the same way RuntimeConfigStore's
-// read-degrade sampler does (docs/observability-conventions.md's
-// RuntimeConfigStore entry): the counter always increments, but the log only
-// fires on the first occurrence of a new "episode" or every Nth occurrence
-// within a sustained one, so a persisting poisoned row (this function runs on
-// both the periodic heartbeat reconcile and the on-demand push fan-out
-// triggered by a rule create/update/dashboard toggle, for every affected
-// agent) cannot flood the log for as long as it remains unfixed in the store.
-constexpr std::uint64_t kExclusionLogSample = 100;
-constexpr std::int64_t kExclusionEpisodeGapSecs = 60;
-
-std::int64_t now_secs() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-struct ExclusionSampler {
-    std::atomic<std::uint64_t> count{0};
-    std::atomic<std::int64_t> last_ts{0};
-};
-
-// Unlike RuntimeConfigStore's note_read_degrade, this deliberately does NOT
-// also take a MetricsRegistry* and increment a counter itself: the counter
-// increment here has its own always-fires condition (every exclusion, not
-// just sampled ones), so the caller does that separately, right before
-// calling this - a reader porting this pattern elsewhere should not assume
-// the two responsibilities are bundled the way they are in that precedent.
-bool should_log_exclusion(ExclusionSampler& s) {
-    const std::int64_t now = now_secs();
-    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
-    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool new_episode = prev == 0 || (now - prev) > kExclusionEpisodeGapSecs;
-    return new_episode || (n % kExclusionLogSample) == 0;
-}
-
-// One sampler shared across all rules/agents in this process: unlike
-// RuntimeConfigStore's per-call-site samplers (which exist to stop a hot call
-// site masking a cold one), every exclusion here is the SAME failure shape (a
-// poisoned spec_json), so a single episode clock is the right grain. The
-// metric itself is not labeled per rule id (an open, unbounded set) - only by
-// the fixed `reason` value below - and this sampler paces the log line for
-// every excluded rule together, not per rule.
-ExclusionSampler g_exclusion_sampler;
+// One process-wide RuleExclusionSampler instance, shared by every push call
+// site in this process (same posture as the pre-#4497 shared sampler it
+// replaces). See RuleExclusionSampler's doc comment in guardian_push_builder.hpp
+// for the full behavior contract, the recorded design decision, and its
+// accepted eviction/burst limitation - this comment intentionally does not
+// restate it.
+RuleExclusionSampler g_exclusion_sampler;
 
 std::string to_lower(std::string_view s) {
     std::string out(s);
@@ -110,6 +74,50 @@ void fill_block(::yuzu::guardian::v1::GuardianSpecBlock* blk, const nlohmann::js
 }
 
 } // namespace
+
+void RuleExclusionSampler::set_clock_for_test(ClockFn fn) {
+    std::lock_guard<std::mutex> lock(mu_);
+    clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
+}
+
+bool RuleExclusionSampler::should_log(const std::string& rule_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto now = clock_();
+    const auto found = index_.find(rule_id);
+    if (found == index_.end()) {
+        // Absent from the cache: logs immediately, then enters the cache.
+        lru_.emplace_front(rule_id, now);
+        index_.emplace(rule_id, lru_.begin());
+        if (lru_.size() > kCapacity) {
+            // Evict the least-recently-OBSERVED entry (back of the list) to
+            // stay within kCapacity. A rule_id evicted here is a fresh
+            // first-observation the next time it is encountered - the
+            // documented eviction exception (see the class doc comment).
+            index_.erase(lru_.back().first);
+            lru_.pop_back();
+        }
+        return true;
+    }
+
+    auto entry = found->second;
+    // Every exclusion refreshes LRU recency, whether or not it is permitted
+    // to log - an entry only survives eviction by continuing to be OBSERVED,
+    // not by continuing to be LOGGED.
+    if (entry != lru_.begin())
+        lru_.splice(lru_.begin(), lru_, entry);
+    const bool due = (now - entry->second) >= kRepeatInterval;
+    if (due)
+        // Only a PERMITTED log advances the deadline - measuring time since
+        // the last exclusion instead would let continuous traffic on this
+        // rule_id suppress its own reminders indefinitely.
+        entry->second = now;
+    return due;
+}
+
+std::size_t RuleExclusionSampler::tracked_count_for_test() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return lru_.size();
+}
 
 std::vector<GuaranteedStateRuleRow>
 filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
@@ -210,7 +218,7 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
                     ->counter("yuzu_guardian_push_rule_excluded_total",
                              {{"reason", "depth_exceeded"}})
                     .increment();
-            if (should_log_exclusion(g_exclusion_sampler))
+            if (g_exclusion_sampler.should_log(row.rule_id))
                 spdlog::error(
                     "Guardian push: rule {} ('{}') has spec_json nested past the depth "
                     "guard (max {}); excluding it from this push, cannot be safely parsed",

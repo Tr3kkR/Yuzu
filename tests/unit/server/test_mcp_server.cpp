@@ -744,6 +744,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
+#include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1459,10 +1460,18 @@ private:
         // no-op for every pre-existing test.
         mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
 
-        // #4035: same setter idiom, reads dex_fleet_for_test LIVE at request
-        // time (see that field's doc comment) — unconditional, no-op-shaped
-        // default for every pre-existing test.
-        mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
+        // ADR-0031 WS-A4 (fifth family): McpServer::set_dex_fleet_fn is retired
+        // (the DEX tools get the fleet through the DexApi seam's own FleetFn,
+        // wired below). `dex_fleet_for_test` now flows via make_local_dex_api.
+        // ADR-0031 WS-A4 (fifth family): wire the REAL DexApi seam over this
+        // test's GuaranteedStateStore + fleet, so the DEX signal MCP tools
+        // exercise the SEAM path (production wires it identically). Gated on
+        // store presence exactly like server.cpp — no store → null api → the
+        // tools' harmonized `!dex_api_` readiness guard returns the
+        // store-unavailable error.
+        if (guaranteed_state_store_for_test)
+            mcp.set_dex_api(yuzu::server::make_local_dex_api(
+                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
 
         // #4035 hardening (governance): same setter idiom, reads
         // dex_visible_for_test LIVE at request time (see that field's doc
@@ -7841,7 +7850,7 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     auto dev = [](std::string id, double cpu, const char* cohort) {
         yuzu::server::DexPerfDevice d;
         d.agent_id = std::move(id);
-        d.is_windows = true;
+        d.os = "windows";
         d.cpu_pct = cpu;
         d.commit_pct = 50.0;
         d.disk_lat_ms = 1.0;
@@ -7875,6 +7884,12 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(fleet["cpu_pct"]["n"] == 16);
     CHECK(fleet["reporting"] == 16);
     CHECK(fleet["windows_online"] == 16);
+    // Additive per-OS fields (C1) — every fixture device is "windows".
+    CHECK(fleet["linux_online"] == 0);
+    CHECK(fleet["macos_online"] == 0);
+    CHECK(fleet["reporting_windows"] == 16);
+    CHECK(fleet["reporting_linux"] == 0);
+    CHECK(fleet["reporting_macos"] == 0);
 
     auto cohorts = mcp_tool_payload(
         ts.call(
@@ -8133,6 +8148,7 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
               R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
             ->body);
     CHECK(all.size() == 16);
+    CHECK(all[0]["os"] == "windows"); // additive (C1); mcp_perf_snapshot's fixture
 
     // cohort_value present-but-empty = the untagged residual (none here).
     auto untagged = mcp_tool_payload(
@@ -25375,9 +25391,122 @@ TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the de
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == kInvalidParams);
-    CHECK(body["error"]["message"].get<std::string>().find("nests too deeply") !=
-          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("too deeply") != std::string::npos);
     CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+
+    // #4493: this attempt still cannot proceed (the original query is
+    // unrecoverably gone), but the row itself must come out of this call
+    // HEALED so it is never a live grenade for a future read again. Status
+    // stays Materialized - only the poisoned payload is replaced.
+    auto healed_result = rs_bundle.get()->get(seeded->id);
+    REQUIRE(healed_result.has_value());
+    REQUIRE(healed_result->has_value());
+    CHECK((*healed_result)->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse((*healed_result)->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+
+    // Governance Gate 2/4 finding (#4493 re-review): the heal is a real
+    // write to an otherwise immutable-by-design row and must leave durable
+    // evidence, not just a JSON-RPC error code.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|success") !=
+          ts.audit_log.end());
+}
+
+// #4540 (BLOCKING finding 2 route-level coverage, MCP twin of the REST test
+// in test_rest_result_sets_async.cpp): heal_poisoned_payload's own UPDATE
+// must never be reported as a success when a concurrent delete removed the
+// row first. Simulated deterministically with a BEFORE UPDATE trigger that
+// deletes the row instead of letting the store's UPDATE apply -- from
+// reevaluate_result_set's own depth-check read the row looks present and
+// poisoned, and by the time heal_poisoned_payload's UPDATE runs it is
+// already gone, the same window a real concurrent delete_result_set/GC sweep
+// opens.
+TEST_CASE("MCP reevaluate_result_set: a heal that loses the race to a "
+          "concurrent delete is a JSON-RPC error and a result_set.heal|failure "
+          "audit, never success",
+          "[pg][mcp][integration][result-sets][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "vanishes-mid-heal";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    yuzu::server::pg::PgConn conn{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION test_4540_mcp_vanish_mid_heal() RETURNS trigger AS $$ "
+            "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+            "END; $$ LANGUAGE plpgsql")};
+        REQUIRE(r.ok());
+    }
+    {
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "CREATE TRIGGER test_4540_mcp_vanish_mid_heal BEFORE UPDATE ON "
+                               "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                               "test_4540_mcp_vanish_mid_heal()")};
+        REQUIRE(r.ok());
+    }
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // Distinct wording from the successful-heal error above ("too deeply and
+    // has been discarded") -- the caller must never be told a write happened
+    // that didn't.
+    CHECK(body["error"]["message"].get<std::string>().find("heal attempt failed") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+
+    {
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "DROP TRIGGER test_4540_mcp_vanish_mid_heal ON result_set_store.result_sets")};
+        REQUIRE(r.ok());
+    }
+    {
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP FUNCTION test_4540_mcp_vanish_mid_heal()")};
+        REQUIRE(r.ok());
+    }
+
+    // The row is genuinely gone -- the trigger's own DELETE really ran.
+    auto gone_result = rs_bundle.get()->get(seeded->id);
+    REQUIRE(gone_result.has_value());
+    CHECK_FALSE(gone_result->has_value());
+
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|failure") !=
+          ts.audit_log.end());
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|success") ==
+          ts.audit_log.end());
 }
 
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
@@ -25498,9 +25627,17 @@ TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is con
 // test_inventory_eval.cpp, the actual code under test). Real structural
 // nesting, NOT brackets inside a string literal. Reachability-proxy depth
 // (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack depth.
-TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_json is "
-          "excluded from matching membership, a healthy matching agent is still included, "
-          "no crash",
+//
+// #4496: this tool MATERIALISES its match set into a durable result set other
+// operators/dispatches consume later, so poison-exclusion is folded into the
+// SAME M1 dispatch-targeting-invariant refusal as an `inv_truncated` capped
+// read (see the REST twin's identical choice) rather than a flag on a
+// success response - a flag here would never reach a downstream consumer of
+// the created set. This test previously asserted the OPPOSITE (a 200 with
+// the poisoned agent silently dropped from membership); #4496 replaces that
+// silent narrowing with an explicit refusal.
+TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_json refuses "
+          "the request rather than silently materialising a narrowed set, no crash",
           "[pg][mcp][integration][result-sets][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -25536,6 +25673,45 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_js
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
         R"("arguments":{"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
     REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // no crash
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+// #4496: the healthy-only sibling of the test above - proves the refusal is
+// specific to an actual poisoned record, not a false-positive that fires on
+// every create_result_set_from_inventory_query call after this fix.
+TEST_CASE("MCP create_result_set_from_inventory_query: no poisoned record present -- "
+          "matching membership is materialised normally",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"depth-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
     CHECK(res->status == 200); // no crash
     auto payload = operator_surface_payload(res);
     CHECK(payload["device_count"] == 1);
@@ -25544,6 +25720,205 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_js
     auto members = rs_bundle->members(payload["id"].get<std::string>(), "", 10, next);
     REQUIRE(members.size() == 1);
     CHECK(members[0] == "agent-healthy");
+}
+
+// #4496 follow-up: the sibling of the poisoned-record MCP test above, for the
+// OTHER cause evaluate_inventory() can exclude a record for -- a genuine
+// JSON parse error rather than over-nesting. Same "exists"-condition
+// discriminating rationale as the poisoned test and its REST twin.
+TEST_CASE("MCP create_result_set_from_inventory_query: a malformed stored data_json refuses "
+          "the request rather than silently materialising a narrowed set, no crash",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"parse-error-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // no crash
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// refusal is specific to an actual malformed record, not a false-positive
+// that fires on every create_result_set_from_inventory_query call after this
+// fix.
+TEST_CASE("MCP create_result_set_from_inventory_query: no malformed record present -- "
+          "matching membership is materialised normally",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"parse-error-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // no crash
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["device_count"] == 1);
+    // Confirm identity, not just count.
+    std::string next;
+    auto members = rs_bundle->members(payload["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
+// #4541 review (minor finding): create_result_set_from_inventory_query's
+// served tools/list description needed two separate governance-driven fixes
+// during #4496's own review (187db8433 shipped it naming ONLY the
+// depth-guard refusal cause; 6fc64e639's Gate 8 re-review caught that drift
+// and added the parse-error cause) but had no regression test pinning the
+// corrected wording. Pins the two facts an agentic caller relies on: BOTH
+// refusal causes are named, and the three distinctly-named reason strings a
+// caller might see in a 503/kInternalError are enumerated.
+TEST_CASE("MCP create_result_set_from_inventory_query: served description names both the "
+          "depth-guard AND parse-error refusal causes (#4496 + follow-up, regression for "
+          "6fc64e639's Gate 8 fix)",
+          "[mcp][integration][result-sets][inventory]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "create_result_set_from_inventory_query") {
+            tool = &t;
+            break;
+        }
+    REQUIRE(tool != nullptr);
+    const auto desc = (*tool)["description"].get<std::string>();
+    INFO("description = " << desc);
+    CHECK(desc.find("nesting past the JSON depth guard") != std::string::npos);
+    CHECK(desc.find("failing to parse as JSON at all") != std::string::npos);
+    CHECK(desc.find("query_truncated") != std::string::npos);
+    CHECK(desc.find("poison_excluded") != std::string::npos);
+    CHECK(desc.find("parse_error_excluded") != std::string::npos);
+}
+
+// #4541 review (Important finding 2): MCP twin of the REST combined-cause
+// test in test_rest_result_sets_async.cpp - a poisoned AND a malformed record
+// in the SAME call must report poison_excluded, never parse_error_excluded
+// (evaluate_inventory() checks poison first), matching the documented
+// caller-facing contract (docs/user-manual/rest-api.md: "a caller is always
+// told which cause remains, never that both have cleared at once"). Only a
+// unit-level test previously asserted the two out-param counts directly;
+// this proves the actual error body, audit detail AND metric reason at the
+// MCP tool layer.
+TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned AND a malformed record in "
+          "the same call reports poison_excluded, never parse_error_excluded",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.metrics_for_test = &reg;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"combined-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // no crash
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("nesting too deeply") != std::string::npos);
+    CHECK(message.find("failing to parse") == std::string::npos);
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    bool saw_parse_error_failure = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("poison_excluded") != std::string::npos)
+            saw_poison_failure = true;
+        if (d.find("parse_error_excluded") != std::string::npos)
+            saw_parse_error_failure = true;
+    }
+    CHECK(saw_poison_failure);
+    CHECK_FALSE(saw_parse_error_failure);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"}, {"reason", "poison_excluded"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"},
+                        {"reason", "parse_error_excluded"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "

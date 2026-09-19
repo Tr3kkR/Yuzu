@@ -1082,10 +1082,65 @@ After upgrading, refusals are counted by
 `absent()` stays meaningful) and audited as `command.dispatch|denied`
 (`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
 (`detail=reason=<reason>`) or `result_set.create|denied`
-(`detail=reason=<reason> source_kind=<kind>`). The
+(`detail=reason=<reason> source_kind=<kind>`). The same action's `failure` result (#4496 + follow-up, the
+`POST /api/v1/result-sets/from-inventory-query` producer and its MCP twin) carries
+`detail=reason=store_degraded|query_truncated|poison_excluded|parse_error_excluded source_kind=inventory_query` - only
+the latter three of those four are counted on `yuzu_server_dispatch_target_rejected_total`
+(`route="result_set_inventory_query"`); `store_degraded` is a store-availability failure, not a
+targeting-shape refusal, so it is not on this series. The
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
+
+**`query_truncated`'s failure mode is structural, not a per-record near-miss - plan its runbook
+step separately from `poison_excluded`/`parse_error_excluded`.** `poison_excluded` and
+`parse_error_excluded` are both per-record and self-heal once the offending record is fixed or
+excluded - they are DIFFERENT causes (over-nested `data_json` vs. `data_json` that fails to parse
+as JSON at all), each with its own reason so an operator can tell which guard excluded a record,
+but the same "per-record, self-healing" runbook shape applies to both. `query_truncated` fires
+whenever the generic-inventory read backing both producer routes exceeds the hard-coded 5,000-row
+cap or the 8 MiB aggregate payload cap - there is no pagination on this path today. On a fleet
+whose inventory has grown past either cap, EVERY subsequent call to
+`POST /api/v1/result-sets/from-inventory-query` or its MCP twin refuses with `query_truncated`,
+and the alert never clears on its own. If you need to silence `YuzuDispatchTargetRejected` on such
+a fleet before the fix lands, scope the Alertmanager silence to `reason="query_truncated"` AND
+`route="result_set_inventory_query"` specifically - never the bare alertname, which would also
+hide `poison_excluded`/`parse_error_excluded`, genuine near-miss signals that must stay visible.
+Tracked fix: **#2633** (`InventoryStore::query` row cap (5000): keyset pagination +
+`limit+1` truncation probe).
+
+### vNEXT - result-set `instruction_id`/`params` fields are now bound-checked (#4373) (intentional compatibility break, no supported flow affected)
+
+**What changed.** `POST /api/v1/result-sets/from-instruction-result` and `POST
+/api/v1/result-sets/{id}/re-eval` had no bound on the `instruction_id` or `params` fields feeding
+an InstructionDefinition dispatch: an over-keyed/oversized `params` object could reach fleet-wide
+dispatch, and an oversized `instruction_id` could reach an unbounded `instruction_store` lookup
+(a real registered instruction id is capped at 128 characters, so an oversized id could never
+match one and dispatch - it reached the not-found fallback instead). Both routes now enforce the
+same caps MCP's `create_result_set_from_instruction_result`/`reevaluate_result_set` tools enforce:
+`instruction_id` at 256 bytes, `params` at 32 keys / 256-byte keys / 64 KiB values.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/v1/result-sets/from-instruction-result` | `instruction_id` over 256 bytes | reached an unbounded store lookup, then 404 | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
+| `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched (params) or reached an unbounded store lookup then 400 (instruction_id) | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
+| `POST /api/v1/result-sets/from-tar-query` | `sql` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `instruction_id` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-tar-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets`, `from-tar-query`, `from-instruction-result`, or `from-inventory-query` | `name` over 256 bytes, or (generic create route only) `source_kind` over 64 bytes | persisted/dispatched unbounded | `400` |
+| `POST /api/v1/result-sets` (the generic/synchronous create route) | `name` or `source_kind` present but not a JSON string | uncaught exception, bare `500` | `400` |
+
+**Who this affects.** Callers sending a field past a numeric/count bound (`instruction_id`,
+`params` count/key-length/value-length, both at the same values MCP's equivalent tools enforce -
+MCP's handler-side bounds landed within days of this fix, in the same unreleased cycle, not a
+long-standing MCP/REST gap), AND separately callers sending a wrong-typed `params`, `name`, or
+`source_kind` (not a numeric bound at all - a shape/type mismatch, always rejected regardless of
+size). No supported flow constructs any of these fields anywhere near the numeric limits or with
+the wrong JSON type, so no compliant client is affected either way.
 
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
 
@@ -2080,6 +2135,32 @@ A nonzero result means that host's `installed_count` will report a higher number
 **Deprecation window (per `docs/api-versioning-policy.md`).** Announced 2026-09-08. `GET /api/v1/agent/plugin-policy` keeps working for at least 90 days **and** at least one intervening feature release, whichever is longer (so no earlier than 2026-12-07, and not before the next feature release ships) — removal will carry its own `CHANGELOG.md` **Breaking/Removed** entry per the cycle's Step 3, never a silent drop.
 
 **Who this affects, and what to do.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Point it at `/api/v2/agent/plugin-policy` and read `response["data"]["trust_bundle_pem"]` (was `response["trust_bundle_pem"]`) — no CLI flag or configuration change is needed, this is a URL and response-shape change only. No action is required before the removal window closes, but migrating now also picks up the TOCTOU integrity fix.
+
+### vNEXT - a poisoned inventory record now makes two result-set producer routes refuse instead of silently narrowing (#4496) (breaking)
+
+**What changed.** `POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool now refuse (`503`/`kInternalError`) when a candidate inventory record's stored `data_json` nests past the JSON depth guard (the #2437-class poisoned/over-nested record). Previously the poisoned record was silently skipped with no signal at all, and the call succeeded, materialising a result set that had quietly excluded that agent.
+
+**Who this affects.** Any deployment with an existing stored inventory record (`inventory_store.inventory_data`) whose `data_json` nests deeper than the JSON depth guard allows - most likely a row predating the #2437-class write-side guard. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set.
+
+**How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source. Restart the affected agent to force a full resync; if the same WARN line (or a subsequent `poison_excluded` refusal) recurs afterward, the source data itself genuinely exceeds the depth guard and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
+
+### vNEXT - a malformed (unparseable) inventory record ALSO now makes the same two result-set producer routes refuse (#4496 follow-up) (breaking)
+
+**What changed.** Same two routes as the entry above (`POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool), a DIFFERENT trigger: a candidate inventory record whose stored `data_json` fails to parse as JSON at all (a syntax defect, not over-nesting) now also refuses (`503`/`kInternalError`, `reason=parse_error_excluded`) rather than being silently skipped. Kept as a separate, distinctly-named cause from `poison_excluded` above so an operator can tell WHICH guard excluded a record.
+
+**Who this affects.** Any deployment with an existing stored inventory record whose `data_json` is not valid JSON - the write-side depth guard (`gateway_service_impl.cpp`'s `json_exceeds_depth`) checks nesting depth only, not general JSON validity, so a malformed-but-shallow blob has always been able to reach storage. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set. The read-only `POST /api/v1/inventory/evaluate` route instead surfaces this as a `results_excluded_by_parse_error` count field alongside `results_excluded_by_poison` (present only when non-zero), the same posture as the depth-guard entry above. `POST /api/inventory/query` is UNAFFECTED by this specific change: it never calls `evaluate_inventory()` (it lists records by agent/plugin/time metadata, not by evaluating conditions against parsed JSON) and already degrades gracefully on a parse failure, returning the record with its `data` field as a raw string rather than dropping it - there is no narrowed-match-set hazard on that route for this cause.
+
+**How to identify the affected record(s).** Same mechanism as the entry above: a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json failed to parse (malformed JSON)`, emitted once per excluded record. Watch the server log for this line following a `503` (`reason=parse_error_excluded`) from either producer route to identify which agent/plugin's record needs re-collection at the source. Same remediation ladder as the entry above: restart the affected agent to force a full resync; if the same WARN line (or a subsequent `parse_error_excluded` refusal) recurs afterward, the source data itself is genuinely malformed and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
+
+---
+
+### vNEXT — `certificates` `delete` on Windows fails closed instead of silently switching stores (#4377) (breaking)
+
+**What changed.** The `security.certificates.delete` action on Windows opened the named store under the `LOCAL_MACHINE` hive; if that open failed, it silently retried under `CURRENT_USER` and deleted there if a same-named store existed and matched. `delete` now opens `LOCAL_MACHINE` only — a failure to open there reports `error|<store> store could not be opened; nothing removed` (non-zero exit, `status|not_found` never returned in this case) and removes nothing, rather than falling back. `list`/`details` are unaffected in kind — they keep the `CURRENT_USER` read fallback, and now disclose it more completely (an explicit output row and a `CONSTRAINED`/`PARTIAL` result whenever a store fell back, an earlier store couldn't be opened, or its enumeration was incomplete, not only when the final match itself came from the fallback).
+
+**Who this affects.** Any deployment where a `delete` automation's target `LOCAL_MACHINE` store can become unopenable (a permissions misconfiguration, a corrupted store) **and** a same-named `CURRENT_USER` store exists on the same host. Before this fix, that combination made `delete` silently remove a certificate from a store the caller never named — which is the bug this closes, not a regression. Automation that only checked for a non-zero exit code was already correctly informed on every OTHER failure path; this is the one combination where the old behavior masked a wrong-target delete with an apparent success.
+
+**Before upgrading, check whether this affects you.** If your `delete` automation for Windows hosts does not already treat a non-zero exit / an `error|...` result as a hard failure requiring investigation, add that check now. There is no way to pre-check for the specific `LOCAL_MACHINE`-unopenable-with-a-`CURRENT_USER`-fallback condition from outside the action itself; the fix is unconditional and has no opt-out.
 
 ---
 

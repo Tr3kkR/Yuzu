@@ -75,8 +75,8 @@ invalid_name_fixture_plugin = shared_library(
 
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
 # <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors.
-# agent-core links IOKit/CoreFoundation itself as of A0 (agents/core/meson.build's
-# darwin arm), but the test exe still pulls its own copy here: yuzu_agent_core_dep
+# agent-core links IOKit (a hard dependency, C0) and Security/CoreFoundation (A0's optional
+# probe) itself (agents/core/meson.build's darwin arm), but the test exe still pulls its own copy here: yuzu_agent_core_dep
 # (the declare_dependency() this exe consumes) declares no `dependencies:` kwarg at
 # all, so agent_platform_deps (IOKit/CoreFoundation/Security/ES) never propagates to
 # a consumer regardless of configuration -- not an AppleFrameworks -isystem quirk
@@ -279,6 +279,7 @@ agent_test_exe = executable(
     'unit/test_dex_perf_breach.cpp',
     'unit/test_net_quality_sampler.cpp',
     'unit/test_dex_linux_proc.cpp',
+    'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
@@ -346,6 +347,7 @@ agent_test_exe = executable(
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
     'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
+    'unit/test_certificates_linux_store.cpp',  # WS-A a1: real syscall-level delete against a TempDir (certificates_linux_store.hpp; POSIX-guarded, runs on macOS too)
     'unit/test_certificates_macos_actions.cpp',  # WS-B: action-level LocalDispatcher tests for the SecItem
                                                   # sentinel + console-owner recheck orchestration (#4374 fix
                                                   # shape 2 + 3); __APPLE__-guarded, empty TU elsewhere.
@@ -504,12 +506,15 @@ agent_test_exe = executable(
     'unit/test_peripherals_local_dispatcher.cpp',  # Wave 9 PR9.1a: real peripherals dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_peripherals_linux_parsers.cpp',     # Wave 9 PR9.1a: pure sysfs walk/attr parsers over a committed fixture tree
     'unit/test_peripherals_macos_parsers.cpp',     # Wave 9 PR9.1a: pure IOKit OSData decoders over this-Mac REAL CAPTURE fixtures
+    'unit/test_peripherals_win_parsers.cpp',       # Wave 9 PR9.1a2: pure SetupAPI hardware-id parsers over the-rig REAL CAPTURE fixtures
     'unit/test_app_usage_parsers.cpp',           # Wave 7b PR7b.3: pure sqlite seam, :memory: db seeded from the REAL CAPTURE export
     'unit/test_app_usage_local_dispatcher.cpp',  # Wave 7b PR7b.3: real plugin via LocalDispatcher, unguarded on every OS; seeded via StandalonePluginContext
     'unit/test_sync_source_app_usage.cpp',       # Wave 7b PR7b.3: app_usage daily-sync source
     'unit/test_execution_artifacts_parsers.cpp',   # Wave 7b PR7b.1: pure binary parsers over REAL CAPTURE fixtures + mutation fuzz
     'unit/test_execution_artifacts_local_dispatcher.cpp',  # Wave 7b PR7b.1: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
+    'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
+    'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
@@ -578,7 +583,8 @@ agent_test_exe = executable(
              # REQUIRE(exists), never skip. Wave 9 PR9.2a: test_windows_optional_features_parsers.cpp
              # reads the-rig REAL CAPTURE fixtures via this same define. Wave 9 PR9.1a:
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
-             # CAPTURE fixtures via this same define.
+             # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
+             # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -1191,6 +1197,7 @@ if build_server
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
+      'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin

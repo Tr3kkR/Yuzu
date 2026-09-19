@@ -336,7 +336,7 @@ corrected #2012 row in §5's register for the full per-mechanism status, includi
 correction that Service never actually had the hazard this row originally described, and the
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
-**Ladder status, updated 2026-09-14** (this track's OWN PR-0 through PR-6, not to be
+**Ladder status, updated 2026-09-18** (this track's OWN PR-0 through PR-6, not to be
 confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in this same
 doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
 **PR-0 (done, #4130)
@@ -369,17 +369,58 @@ during the #2233 item 3 governance sweep, re-surfaced while investigating this P
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
 `active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
 non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
-PR-5 (fault/K-bound logic, a 5-PR sub-ladder 5a-5e, 5a-5d merged and 5e
-implemented/not yet merged - 5a #4359 (up-101/cs-103), 5b #4381
+PR-5 (fault/K-bound logic, a 5-PR sub-ladder 5a-5e, **ALL FIVE MERGED** - 5a
+#4359 (up-101/cs-103), 5b #4381
 (up-3/up-4/ch-1/up-5, see status paragraph below), 5c #4417 (up-2, see status
 paragraph below), 5d #4485 (late-result adoption by current desired state,
 R5.3's arm-recovery telemetry mechanism - see
 `docs/spark-stage2-guardian-consumer-design.md`'s "as implemented (rung 9c
-PR-5d)" stamp), 5e #4221 (K=3 wedge waiver / decision 1 closeout, plus #4279's
-disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp;
-implemented, not yet merged as of this writing) - see acceptance criteria
-below) → PR-6 (Service readiness signal + a re-run of the #3990
-diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
+PR-5d)" stamp), 5e **#4529, merged 2026-09-18T13:18:55Z (`869ea6a29d14`)**
+(K=3 wedge waiver / decision 1 closeout, plus #4279's
+disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp) -
+see acceptance criteria below) → **PR-6 item 1 (Service positive-establishment
+signal) - IMPLEMENTED, not yet merged** (branch
+`feat/spark-9c-pr6-item1-establishment-signal`, off `origin/dev @ 7ff742f19`):
+`SparkIncarnation`/`SparkCoverage`/`SubscriptionEstablishment` (`spark.hpp`),
+the additive `ISparkMechanism::watch_incarnation()`/`set_established_sink()`
+seam, both Service mechanisms (Linux sd-bus, Windows SCM) wired to report
+tri-state coverage at every real transition, and
+`SparkEngine::subscription_establishment(id)` as the pull query. Full E1-E15
++ M1-M6 test matrix, E2/E4/E13/E14/E15/M1/M6 genuinely mutation-verified
+(break the fix, confirm red, restore, confirm green) - **M6 twice**: an
+initial baseline-snapshot design was itself caught as still partly vacuous
+before it ever ran on real hardware (two independent race/window hazards a
+subsequent review turned up), replaced with a bounded-count oracle, and
+mutation-verified clean on DGRHP with zero flake across 5 baseline / 3
+mutated / 3 restored repeated runs. Full DGRHP Windows/MSVC verification is
+DONE, not a remaining step: `[spark]` is 718/718 test cases (15774
+assertions) clean at HEAD, run repeatedly across this branch's fix history.
+A two-phase adversarial review (Kimi K3 + Codex Sol, both dynamic/compiled)
+found and this branch fixed 6 issues before this status was written - 2
+HIGH (the Windows M4a/M4b test bugs above, and M6's own vacuous oracle, both
+described above), 1 MEDIUM (a Windows-only fired-one-shot race in the
+coalesce/adoption branch, `w->fired ? SparkCoverage::None : w->coverage` at
+the Add-drain adoption site - NOT independently unit-tested, no test seam
+currently forces the specific cross-watch APC timing; flagged as a residual
+test gap), 3 LOW (a docs R4 caveat, a changelog naming convention, a
+diagnostic-message reuse detail) - all fixed, see this branch's commit
+history from `afbdaf0bd` onward for the exact diffs and reasoning. A
+further governance run on this branch (`7ff742f19..d20aa5020`) found and
+fixed two more coupled defects in commit `e5eb7dc8a` - PR-6 item 1's own
+UP-1(A), an exception-safety `.at()`-throw window in the new per-key
+incarnation/epoch bookkeeping, and PR-6 item 1's own UP-1(B), a
+pre-existing zombie-mechanism admission gate that let a dead
+Service-mechanism worker thread keep silently accepting `arm()` calls and
+returning success forever - both adjudicated LOW today (capped by
+`prefer_spark_` staying false in production, the sole gate on every path
+to this code) but MEDIUM (A) / HIGH (B) post-flip if ever left unfixed at
+that point; full adjudication in
+`governance.d/4340-spark-9c-pr6-item1-establishment-signal.MwM5ht.jsonl`.
+**Item
+2 (a re-run of the #3990 diagnostic's methodology against the full landed
+ladder, using this channel's real per-key timestamp) is a SEPARATE,
+not-yet-started piece of work, depends on item 1 landing first** - do not
+read "PR-6 item 1 implemented" as "PR-6 done".** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
 `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.4 updated to describe the
@@ -424,7 +465,8 @@ flip, with a red-first test each:
   through the failure result so the caller only cleans up when there is genuinely something to
   clean up. A third Gate 8 re-review round (8 agents) on round 2's fix found no further blocking
   residuals. Two small non-blocking follow-ups were identified and deliberately NOT fixed here,
-  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload still discards the
+  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload (what the `#3990`
+  §5 entry below calls "the WAITING attach model") still discards the
   preservation signal, currently harmless since it has zero production callers today; and two
   pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
   for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this
@@ -773,7 +815,47 @@ that is stated explicitly rather than inferred or invented.
   captures the CURRENT target content as its baseline on every arm, and `#3990`'s `full_sync`
   re-arms every rule unconditionally on any unrelated mutation, a genuinely-still-drifted such
   rule can be silently reclassified as compliant with no remediation having happened - filed
-  as **#4021**, also not risk-accepted here.
+  as **#4021**, also not risk-accepted here. See the new **#3990** entry immediately below for
+  the ruling-13 diagnostic this package's own milestone re-weighing should be read alongside.
+
+**#3990** (fleet-wide `full_sync` storm on any rule mutation - legacy-vs-spark blackout
+diagnostic, ruling-13 on #3850)
+- Detection signal: not specified in source; `yuzu_server_guardian_pushes_dispatched_total`
+  rate and agent `full_sync=true` log frequency are the closest existing signals, neither
+  purpose-built for this.
+- Operator action: not specified in source; not established by this diagnostic either - no
+  system-side effect was found for a mitigation to target.
+- Compensating control: this diagnostic (`docs/spark-rebuild-baselines/
+  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP, re-run 2026-09-07, clean re-run
+  same day. **Corrected THREE times on review before landing here** - first a fabricated
+  "pile-up effect" claim (retracted: every `full_sync` actually confirmed to run completed in
+  8.3s or less, most under 100ms at the clean cohort; the real cause of the low first-attempt
+  sample count was an agent `--log-file` flush-lag interacting with the driver's polling
+  timeout), then an overclaimed "reached the pre-registered floor / within margin" framing on
+  the first 2026-09-07 re-run (an external review found the driver computed `functional_valid`
+  but never gated its sample count on it - confirmed by reading the code; formal outcome
+  corrected to INCONCLUSIVE/INVALID BY COHORT DESIGN). **Current, accurate state: a genuine
+  pre-registered PASS.** Both defects behind the INCONCLUSIVE outcome were fixed at the source
+  (the `functional_valid` wiring, and 5 of 20 service-watch cohort targets swapped for services
+  confirmed live and stable, replacing ones confirmed permanently or intermittently Stopped on
+  the rig) and the diagnostic re-run clean. Every one of the 16 counted repeats (5+3 legacy,
+  5+3 spark) independently satisfies `failed=0` AND functional-validity - the full
+  pre-registered rule, not a partial check. Numeric result: Phase B legacy median 70.0ms vs
+  spark 127.0ms (threshold 1070.0ms); Phase B2 legacy 86.0ms vs spark 140.0ms (threshold
+  1086.0ms) - both within the predeclared non-inferiority margin. Full detail, all three
+  corrections, and the raw per-repeat data for every round (`fullsync-blackout-results.jsonl`,
+  the clean pass under `label="clean-v2"`) are in the run doc, not restated here. **This
+  `clean-v2` PASS was measured on the WAITING attach model** (`origin/dev@65f2938156a19`,
+  pre-rung-9c-PR-2) and stands unedited as its own record for that build.
+- Owner: not assigned in source material.
+- Milestone: not specified. Nothing found by this diagnostic changes this row's own
+  #2278/#2469/#2279 package - the two are not shown to be related.
+- Revisit trigger: before the PR-5 flip head re-run (CH-5-UAT's own driver, once its threshold
+  work lands) - this diagnostic's pass is on one rig, one cohort, two trigger shapes, not fleet
+  scale; before this diagnostic's "accepted-neutral" citation is relied upon for a flip decision.
+- The pre-registered pass above is evidence FOR #3990 being cited in §5 as "accepted-neutral"
+  per ruling-13's own wording, but whether it is sufficient on its own (one rig, one cohort) and
+  how to word the citation is Dave's call to make, not a conclusion reached by this entry.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)

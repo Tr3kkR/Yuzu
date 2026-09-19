@@ -1190,6 +1190,54 @@ completes and is not a valid proxy for it. The diagnostic script's completeness 
 own log line from that count, since a no-op returns the same `rules_size()` figure
 without a single real arm occurring.
 
+**Rung 9c PR-6 item 1 — a positive-establishment channel now exists (Service-scoped),
+2026-09-18.** R5.7 above still needs its own T2 arm-confirmation timestamp from the
+runtime, but the raw fact it would need to read from is no longer entirely missing at
+the mechanism layer: `SparkEngine::subscription_establishment(id)` is a pull query
+returning `armed_at` / an optional `established_at` (first Notification-coverage report
+for the subscription's CURRENT incarnation, never re-stamped by a later recovery) /
+the mechanism's current tri-state `SparkCoverage` (`None`/`Notification`/`Poll`). Wired
+for the **Service** mechanism only, on both platforms (Linux sd-bus, Windows SCM) — a
+Service watch's `watch()` call returning success carries zero information about
+establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged` registration is
+what this channel actually observes), so it was the mechanism with the most acute gap.
+**Registry and File are explicitly out of scope here and tracked separately as #4340**
+— both have a weaker but non-zero implicit signal via `arm()`'s own success/failure
+(Registry can still return success while an establishment probe is outstanding past the
+caller-wait budget; File can accept a definite failure into observable retry state
+rather than rejecting it), which is why they were not folded into this same PR.
+**Latency caveat, carried forward for R5.7's own future use of this channel:**
+`established_at` is stamped by the MECHANISM at the point it commits successful
+notification coverage, not at the moment `report_established` is dispatched to a
+consumer, and Windows's own dispatch is bounded by `kServicePollCadence` (a 50ms wait
+CAP the mechanism's alertable wait clamps to whenever any probe is outstanding — not a
+fixed delay; commands/APCs can wake the thread earlier). Do not compare Service's
+poll-mediated establishment timestamp against a future Registry/File wiring's
+caller-wait-bounded path as if they measured the same thing.
+**Windows live-registration-retry blind spot, carried forward for R5.7's own
+future use of this channel:** on a live-registration failure that occurs
+AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
+post-`OpenServiceW`), Windows's `begin_probe`→`resolve_probe` retry loop has
+no status-poll fallback — it only re-learns the service's real state from a
+future successful Notify callback. Linux's equivalent failure
+(`sd_bus_match_signal` post-`LoadUnit`) DOES fall back to `read_state()` via
+its backstop reconcile. A service can flip Running↔Stopped **undetected** on
+Windows during this narrow retry window; it cannot on Linux. This asymmetry
+predates this channel (confirmed against the pre-PR base commit `7ff742f19`
+— the fallback was already absent) — this channel only made the gap
+OBSERVABLE (staging `SparkCoverage::None`, honestly, rather than leaving it
+invisible). A future R5.7 consumer treating Windows's `None` in this
+specific window as "confirmed absent" rather than "not yet re-confirmed"
+would be wrong; do not conflate the two without a discriminating signal
+Spark does not currently have (see also the forward-looking
+`SparkCoverage::None` ambiguity note for Registry/File, tracked as #4340).
+**R4 (stale-after-stop), carried forward from the delivery plan's own residual list:**
+after `SparkEngine::stop()`, `subscription_establishment(id)` keeps returning the
+subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A future
+R5.7 consumer that cares whether the engine is still live checks `is_running()` itself
+(the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
+post-stop `established_at`/`coverage` pair as current live coverage.
+
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
 7.7b was first planned as one PR folding the #2237 send-path items and #2238 test
@@ -1271,9 +1319,11 @@ lost/coalesced edge can no longer leave the server's errored view stale forever
 (unhappy-path UP-1/2/4/11 closed); and (b) the **priority-lane eviction** -
 `pending_demote_sweeps`/`pending_demote_ms` (defaults 12 sweeps / 120 000 ms) demote a
 still-pending-initial rule off the 5 s priority lane to its normal type-lane cadence
-(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a COMMITTED
-Convergence-reason Unknown, counted on `yuzu.guardian_priority_demoted` - closing the *read*
-flood (UP-6) the edge-only fix left open. Demotion is per-rule, not per-key (a key with a
+(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a
+Convergence-reason Unknown READ (committed or outbox-rejected; the elapsed-time arm is
+checked on every Unknown pass regardless of reason or enqueue outcome - #2992), counted
+on `yuzu.guardian_priority_demoted` - closing the *read* flood (UP-6) the edge-only fix
+left open. Demotion is per-rule, not per-key (a key with a
 mixed demoted/non-demoted pending set still pays the read cost via its non-demoted sibling);
 the demoted rule keeps converging (and keeps re-arming errored_refresh_ms) at the slower
 cadence, so (a) backstops (b)'s resulting wire staleness. Both land in

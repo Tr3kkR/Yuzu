@@ -660,7 +660,9 @@ just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
 no `--suite`/name filter at all. Fix: split the Test step into 3
 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
 across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
-the 3 non-pg server tests, both uncapped (neither touches Postgres); the 8 pg
+the 3 non-pg server tests, both uncapped (neither touches Postgres) — status as
+of that day; see "Within-job cap extended to the non-pg step" at the end of
+this section for what changed; the 8 pg
 shards, isolated by exact name into their own `with-test-slot.sh`-gated call,
 run last with the pool dedicated entirely to them. 21+3+8 = 32, verified as an
 exact partition of the full registered test set before trusting it in CI.
@@ -1024,6 +1026,33 @@ correlation yet; building that is a real #3443 follow-up, not assumed
 done here. Response to either trigger is rebalancing/splitting the
 affected shard(s) or reverting to slots=2, never another timeout
 increase. Tracked: #3443.
+
+**Within-job cap extended to the non-pg step (2026-09-18).** The "3 non-pg
+server tests, both uncapped" status above (now 6 named entries, see the
+count-drift note on `ci.yml`'s comment) turned out to matter even though those
+tests don't touch Postgres: `--num-processes 2` was added to both
+`flake-retry.py` invocations in the "Test (non-pg suites)" step, matching the
+value already established for this box's pg-shard step. Evidence: on two
+independently-diagnosed CI runs (PR #4532 run 35307458479, PR #4566 run
+35361987460, no diff in common), that step's own `meson test` invocation
+failed exactly one Catch2 case each time — both async/timing assertions in
+the spark/guardian suite — consistent with the same within-job CPU-steal
+mechanism this section already proved for the pg shards, just flipping a
+timing assertion instead of hitting a hard per-shard timeout.
+
+This is **not** a fix for the much larger ~20-case failure list CI actually
+reported for those same two runs (`content_dist`/`script_exec`/`event_logs`/
+`wifi`/`windows_updates`/`software_actions`/`license_scan`). A `build-ci`
+review found that list is produced by `flake-retry.py`'s `catch2_failed_cases()`
+classifier, which re-runs the whole failed binary a second time, solo, outside
+meson's orchestrator entirely — untouched by `--num-processes` or by
+`with-test-slot.sh`. Why that solo re-run reports a different failure set than
+the original run (and drops the original run's own failing case from its own
+list) is not diagnosed; tracked as #4580. Cross-job `with-test-slot.sh` gating
+was deliberately not added to the non-pg step yet — this step's own duration
+is still short, so the within-job cap ships first per this section's "one axis
+at a time" practice; #4580's outcome may argue for cross-job gating here too,
+once the actual mechanism is understood.
 
 ### Persistent runner-local test history
 

@@ -31,6 +31,9 @@
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
+#include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
+#include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
+#include "dex_read_builders.hpp" // PR #4582 FIX 4: re-export dex_device_score (relocated here) to this header's callers
 
 #include <httplib.h>
 
@@ -47,75 +50,23 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
-struct GuardianObservationRow;
-struct DexSignalCount; // guaranteed_state_store.hpp -- forward decl only, see DexFamilyRollup below
 class HttpRouteSink;
 
-/// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` remains the established
-/// headline crash-rate denominator (and the "all" catalogue lens's denominator,
-/// kept for continuity); macOS and Linux crash/reliability collectors now exist
-/// too, and the per-OS counters below denominate the catalogue's single-OS
-/// lenses. `total_online` is context. A struct (not a registry dep) keeps
-/// render pure + testable.
-struct DexFleet {
-    int64_t windows_online{0};
-    int64_t total_online{0};
-    /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
-    /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
-    /// lens. Empty when nothing is connected.
-    std::vector<std::string> connected_os;
-    /// CONNECTED agents as (agent_id, normalized-os: "windows"/"linux"/"macos").
-    /// The Overview computes a per-device DEX score for each (window-respecting) to
-    /// build the experience distribution AND groups by os for the segment breakdown.
-    /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
-    std::vector<std::pair<std::string, std::string>> connected_agents;
-    /// Per-OS online-agent denominators (#1746) — the same coverage-honest count as
-    /// windows_online, split by platform, so the Catalogue's single-OS filter can
-    /// score a family against THAT OS's own online count instead of borrowing
-    /// windows_online. APPENDED here (not alongside windows_online) so the many
-    /// positional aggregate initializers of this struct across the test suite keep
-    /// compiling unchanged — trailing members default-init to 0.
-    int64_t linux_online{0};
-    int64_t macos_online{0};
-};
-
-/// One display family of the server-side signal catalogue. PUBLIC since F1:
-/// the Settings → DEX alerts panel renders the routable-type list from this
-/// same single source of truth (the /dex Catalogue's grouping).
-struct DexSignalGroup {
-    const char* name;
-    std::vector<const char*> types;
-};
-
-/// The catalogued signal types, grouped for display — the server-side mirror
-/// of the agent catalogue (keep in sync; the paired drift-net tests bite).
-const std::vector<DexSignalGroup>& dex_signal_groups();
-
-/// Total catalogued display types (sum over the groups).
-std::size_t dex_catalogued_type_count();
-
-/// obs_type -> index into dex_signal_groups(), or -1 when uncatalogued. Shared
-/// by the Trends fragment's family x day matrix and (#4035) its REST/MCP twin.
-int dex_family_index(const std::string& obs_type);
+// `DexFleet`/`DexSignalGroup` and the signal-catalogue accessors
+// (`dex_signal_groups` / `dex_catalogued_type_count` / `dex_family_index`) were
+// relocated to the pure `dex_types.hpp` (included above) for the ADR-0031 WS-A4
+// DexApi seam (PR #4582 FIX 4) — re-exported here transitively, so every
+// existing caller is unaffected while dex_read_model.cpp can call them without
+// this httplib-coupled header.
 
 /// Friendly display label for an obs_type — hoisted to `dex_view_types.hpp`
 /// (store-free; see that header for the doc comment).
 
-/// Shared window-selector resolvers — the single source of truth for how both the
-/// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
-/// token. `dex_window_to_days` maps "24h"/"7d"/"30d"/"all" (anything else → 7d) to
-/// a day count (0 = "all"). `dex_iso_since` (day count -> ISO-8601 UTC cutoff) is
-/// hoisted to `dex_view_types.hpp` — thin wrappers over the dashboard's internal
-/// helpers so REST and HTMX can never drift on the window vocabulary.
-int dex_window_to_days(const std::string& window);
-
-/// Normalises a REST/MCP `os` filter param to a store-ready platform token:
-/// "windows"/"linux"/"macos" pass through; anything else (including "all" or
-/// empty) returns "" = all-OS. The single source of truth so the machine
-/// surfaces' DEX OS-scoping stays identical to the dashboard drilldown (A1
-/// dashboard-parity, #C-DEX-1 follow-up).
-std::string dex_normalize_os_filter(const std::string& os);
+// `dex_window_to_days` / `dex_iso_since` / `dex_normalize_os_filter` — the shared
+// window-selector + OS-filter resolvers — are now declared in the pure
+// `dex_window.hpp` (included above), so the core `DexApi` impl can resolve a
+// window/os token without pulling this httplib-coupled header. Re-exported here
+// transitively; every existing caller is unaffected.
 
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
@@ -128,57 +79,14 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days, DexFleet fleet,
                                          const std::set<std::string>* visible = nullptr);
 
-/// Per-obs_type platform coverage: which OSes collect this signal type today
-/// (windows = the whole catalogue; linux/macos = the collector subsets). The thin
-/// explicit map the Catalogue's coverage view reads; keep in sync with the agent
-/// collectors (a schema↔catalogue cross-check test guards drift — H2/G9 style).
-std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
-
-/// Per-device DEX experience score (0–100) — the per-device projection of the
-/// canonical severity-weighted composite (100 − Σ family deductions over the
-/// device's OWN observations; benign families don't deduct, events gently scaled).
-/// Cheap server-side read (dex_device_signal_summary); returns -1 when `store` is
-/// null. The fleet-scale path (heartbeat rollup) is a follow-up.
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since);
-
-/// One family's rolled-up signal counts (events/active-types/peak-signal-devices/
-/// top signal) — the shared basis both the Catalogue grid and the health-score
-/// deduction read. External linkage already (defined outside dex_routes.cpp's
-/// anonymous namespace); declared here so `dex_read_model.cpp` can call it
-/// without a second copy (#4035, Rule 1).
-struct DexFamilyRollup {
-    int64_t events = 0;
-    int active = 0;
-    int total = 0;
-    int64_t max_signal_devices = 0; ///< #1374: max of member signals, not the family union
-    const DexSignalCount* top = nullptr;
-    bool benign = false;
-};
-DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
-                                  const std::vector<DexSignalCount>& signals);
-
-/// One family's health deduction (the per-family term of dex_compute_health,
-/// "default" preset) — the same number the Catalogue's per-card score shows.
-double dex_family_health_deduction(const DexSignalGroup& g,
-                                   const std::vector<DexSignalCount>& signals, int64_t N);
-
-/// The composite-health result: score (100 − Σ deductions; -1 when N<=0, no
-/// reporting agents to score) + the per-family deduction breakdown.
-struct DexHealthResult {
-    double score = -1.0;
-    struct Ded {
-        std::string name, sev;
-        double deduction = 0.0;
-    };
-    std::vector<Ded> deds;
-};
-
-/// PURE: the shared health-score computation — the Health page and the
-/// Overview hub's health teaser both call this (`weighting` = one of the
-/// allowlisted presets default/stability/productivity/security).
-DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
-                                   const std::string& preset);
+// The PURE catalogue/health helpers `dex_obs_platforms`, `dex_family_rollup`
+// (+ `DexFamilyRollup`), `dex_family_health_deduction`, and `dex_compute_health`
+// (+ `DexHealthResult`) — plus the store-reaching `dex_device_score` — were
+// relocated (PR #4582 FIX 4): the pure ones to `dex_types.hpp`, `dex_device_score`
+// to the core-only `dex_read_builders.hpp` (both included above), so
+// dex_read_model.cpp can call them without this httplib-coupled header. They are
+// re-exported here transitively, so this header's existing callers are
+// unaffected; the definitions are unchanged in their .cpp.
 
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:

@@ -103,9 +103,13 @@ handle_event([yuzu, gw, command, completed], #{duration_ms := D}, Meta, _Config)
 handle_event([yuzu, gw, command, timeout], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_commands_timed_out_total, [], N);
 
-handle_event([yuzu, gw, command, fanout], #{target_count := T, dispatched := D}, _Meta, _Config) ->
+handle_event([yuzu, gw, command, fanout],
+             #{target_count := T, dispatched := D, skipped := S,
+               remote_dispatched := R}, _Meta, _Config) ->
     prometheus_histogram:observe(yuzu_gw_fanout_target_count, [], T),
-    prometheus_histogram:observe(yuzu_gw_fanout_dispatched_count, [], D);
+    prometheus_histogram:observe(yuzu_gw_fanout_dispatched_count, [], D),
+    prometheus_histogram:observe(yuzu_gw_fanout_skipped_count, [], S),
+    prometheus_histogram:observe(yuzu_gw_fanout_remote_dispatched_count, [], R);
 
 handle_event([yuzu, gw, stream, backpressure], #{queue_len := Q}, _Meta, _Config) ->
     prometheus_histogram:observe(yuzu_gw_stream_queue_len_distribution, [], Q);
@@ -309,6 +313,18 @@ declare_metrics() ->
         {labels, []},
         {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
         {help, "Number of agents actually dispatched per fanout"}]),
+    prometheus_histogram:declare([
+        {name, yuzu_gw_fanout_skipped_count},
+        {labels, []},
+        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+        {help, "Number of agents skipped (not connected) per fanout"}]),
+    prometheus_histogram:declare([
+        {name, yuzu_gw_fanout_remote_dispatched_count},
+        {labels, []},
+        {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
+        {help, "Number of agents dispatched to a DIFFERENT node than the "
+               "dispatching one per fanout (HA WS-4 4.3a cross-node routing "
+               "— counts a cast SEND, not a confirmed delivery; see #4555)"}]),
 
     %% Gauges
     prometheus_gauge:declare([
