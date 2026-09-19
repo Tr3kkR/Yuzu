@@ -3450,6 +3450,60 @@ TEST_CASE("detach_all also clears pending-initial bookkeeping (no stale schedule
     SUCCEED("sweeping a detached key after detach_all did not crash");
 }
 
+TEST_CASE("R5.7: application_fence_for_test() - epoch starts at 0, detach_all() bumps it by "
+          "exactly 1, and incarnations straddle the reported floor correctly",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    auto [epoch0, floor0] = rt->application_fence_for_test();
+    CHECK(epoch0 == 0);
+
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    auto [epoch_before, floor_before] = rt->application_fence_for_test();
+    CHECK(epoch_before == 0); // no detach_all() yet
+    CHECK(floor_before > 0); // r1's own attach already minted an incarnation
+
+    rt->detach_all();
+    auto [epoch1, floor1] = rt->application_fence_for_test();
+    CHECK(epoch1 == epoch0 + 1);
+    CHECK(floor1 == floor_before); // detach_all() reports gen_counter_ as-is, never bumps it
+
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+    auto [epoch_after, floor_after] = rt->application_fence_for_test();
+    CHECK(epoch_after == epoch1); // only detach_all() bumps the epoch, not an attach
+    CHECK(floor_after > floor1); // r2's own attach minted an incarnation strictly above the floor
+
+    rt->detach_all();
+    auto [epoch2, floor2] = rt->application_fence_for_test();
+    CHECK(epoch2 == epoch1 + 1);
+    CHECK(floor2 == floor_after);
+}
+
+TEST_CASE("R5.7: commit_path_name() renders every CommitPath value distinctly",
+          "[spark][runtime]") {
+    using P = GuardianSparkRuntime::CommitPath;
+    const std::string inline_arm = commit_path_name(P::InlineArm);
+    const std::string inline_shared = commit_path_name(P::InlineShared);
+    const std::string callback_arm = commit_path_name(P::CallbackArm);
+    const std::string callback_shared = commit_path_name(P::CallbackShared);
+    const std::string callback_adopt = commit_path_name(P::CallbackAdopt);
+
+    CHECK(inline_arm == "inline-arm");
+    CHECK(inline_shared == "inline-shared");
+    CHECK(callback_arm == "callback-arm");
+    CHECK(callback_shared == "callback-shared");
+    CHECK(callback_adopt == "callback-adopt");
+
+    // Honest scope (werror=false repo-wide): this pins the five known names, it does
+    // not make a sixth CommitPath value fail to compile - that is a -Wswitch warning
+    // only, per commit_path_name()'s own header comment.
+    const std::set<std::string> names = {inline_arm, inline_shared, callback_arm,
+                                         callback_shared, callback_adopt};
+    CHECK(names.size() == 5);
+}
+
 TEST_CASE("status_for_rule reflects the last committed verdict; nullopt for an unattached rule",
           "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
