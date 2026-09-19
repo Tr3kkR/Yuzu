@@ -378,7 +378,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "text/html; charset=utf-8");
                 return;
             }
-            auto exec_opt = *exec_r;
+            const auto& exec_opt = *exec_r;
             // #1634 (Doomgoose review finding, important): fail closed on a
             // transient tracker degrade rather than silently treat it as
             // "zero agents" — see get_agent_statuses_checked's doc comment.
@@ -945,7 +945,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "text/plain; charset=utf-8");
                      return;
                  }
-                 auto exec_opt = *exec_r;
+                 const auto& exec_opt = *exec_r;
                  // #1634 perf (governance Gate 3 finding): only fetch/scan agent
                  // statuses when confined — an unrestricted subscriber is always
                  // visible regardless, so this indexed lookup would be pure

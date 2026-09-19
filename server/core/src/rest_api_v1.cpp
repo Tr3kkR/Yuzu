@@ -15183,7 +15183,7 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         }
-        auto exec_opt = *exec_r;
+        const auto& exec_opt = *exec_r;
         // #1634 perf (governance Gate 3 finding): only fetch/scan agent
         // statuses when confined — an unrestricted subscriber is always
         // visible regardless, so this indexed lookup would be pure waste on
