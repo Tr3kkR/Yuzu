@@ -45,7 +45,9 @@ struct GuardianArmStats {
     /// arm-recovery): a Wedged receipt whose exact (rule_id, generation)
     /// incarnation is later ADOPTED by the runtime (PR-5d's own concern 1 - a late
     /// success on a still-desired wedged claim) is detected by drain_locked()'s
-    /// own recovery scan (GuardianSparkRuntime::receipt_recovered()) and its
+    /// own recovery scan (GuardianSparkRuntime::receipt_recovery_status(), rung
+    /// 9c PR-5e's atomic combination of receipt_recovered() with the K-eligibility
+    /// probe - see that accessor's own doc comment) and its
     /// contribution here is cleared - every OTHER non-Committed status (Failed,
     /// CongestionExpired, Withdrawn, Stopped) still only ever increments this
     /// field within one application, exactly as before. It ALSO still resets to 0

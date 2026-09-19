@@ -310,16 +310,17 @@ public:
         /// granularity floors at the owning convergence lane's sweep cadence (file:
         /// ~600s) since a refresh can only fire on a committed re-evaluation.
         std::uint64_t errored_refresh_ms{300'000};
-        /// M1 item (b): consecutive COMMITTED Convergence-reason Unknown sweeps after
-        /// which a still-pending-initial rule is demoted off the 5s priority lane to
-        /// its normal type-lane cadence (the read flood, not the wire flood - errored_
-        /// refresh_ms above already bounds the wire side). 0 disables the sweep-count
-        /// demotion arm.
+        /// M1 item (b): consecutive Convergence-reason Unknown READS (committed or
+        /// outbox-rejected - #2992) after which a still-pending-initial rule is
+        /// demoted off the 5s priority lane to its normal type-lane cadence (the read
+        /// flood, not the wire flood - errored_refresh_ms above already bounds the
+        /// wire side). 0 disables the sweep-count demotion arm.
         std::uint64_t pending_demote_sweeps{12};
         /// Elapsed-time companion to pending_demote_sweeps: demote once this much time
         /// has passed since the rule first went pending, even if convergence sweeps
-        /// were sparse (Event-driven eval alone never advances the sweep counter). 0
-        /// disables the elapsed-time demotion arm.
+        /// were sparse (Event-driven eval alone never advances the sweep counter).
+        /// Checked on every Unknown pass regardless of reason or enqueue outcome
+        /// (#2992). 0 disables the elapsed-time demotion arm.
         std::uint64_t pending_demote_ms{120'000};
     };
 
@@ -589,10 +590,10 @@ public:
         return unhealthy_refreshed_.load(std::memory_order_relaxed);
     }
     /// M1 item (b): rule_ids demoted off the 5s convergence priority lane to their
-    /// normal type-lane cadence after pending_demote_sweeps consecutive committed
-    /// Convergence-reason Unknowns or pending_demote_ms elapsed, whichever first. A
-    /// counted metric, not a silent behavior change (Option-A: every loss/suppression/
-    /// resource-shedding channel is observable).
+    /// normal type-lane cadence after pending_demote_sweeps consecutive Convergence-
+    /// reason Unknown reads (committed or outbox-rejected - #2992) or pending_demote_ms
+    /// elapsed, whichever first. A counted metric, not a silent behavior change
+    /// (Option-A: every loss/suppression/resource-shedding channel is observable).
     [[nodiscard]] std::uint64_t priority_demoted() const noexcept {
         return priority_demoted_.load(std::memory_order_relaxed);
     }
@@ -1001,9 +1002,14 @@ private:
     /// keys_with_pending_initial()'s priority-lane worklist. A demoted rule keeps
     /// converging (and keeps re-arming errored_refresh_ms) at its normal type-lane
     /// cadence, which is what makes 6b the staleness backstop for 6c.
+    /// commit_new_generation_locked() reseeds this fresh (first_seen=attach_now,
+    /// unknown_sweeps=0, demoted=false) on EVERY generation commit for a rule_id, not
+    /// only on first attach - a same-rule_id content-plane push mid-demotion-episode
+    /// restarts the demotion clock rather than carrying prior progress forward.
     struct PendingState {
         std::chrono::steady_clock::time_point first_seen{};
-        std::uint64_t unknown_sweeps{0}; ///< committed Convergence-reason Unknowns since first_seen
+        std::uint64_t unknown_sweeps{0}; ///< Convergence-reason Unknown reads since first_seen
+                                         ///< (committed or outbox-rejected - #2992)
         bool demoted{false};
     };
 
@@ -1242,19 +1248,108 @@ public:
     ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial-review-class finding,
+    /// cpp-safety): `status` exactly as receipt_status() would report, and
+    /// `wedge_eligible` (meaningful ONLY when `status == Wedged`, false otherwise)
+    /// exactly as receipt_wedge_k_eligible() would report - both computed under
+    /// ONE registry_mu_ acquisition. A caller needing BOTH facts about the same
+    /// receipt must use this, never receipt_status() followed by a separate call
+    /// to receipt_wedge_k_eligible() - the two-call sequence has the identical
+    /// TOCTOU shape the adversarial review found and fixed in
+    /// GuardianArmAckLedger::drain_locked()'s recovery-scan loop
+    /// (receipt_recovery_status()'s own doc comment), just reachable from
+    /// drain_locked()'s PRIMARY per-pending loop instead: a claim read as Wedged
+    /// by call 1 can be genuinely adopted-and-popped by on_arm_complete() in the
+    /// gap before call 2, which then (correctly, as of that later instant) reports
+    /// not-eligible - but the caller has already committed to treating the
+    /// receipt as a failure based on call 1's stale snapshot, permanently losing
+    /// the genuine success for this specific application (self-heals only on the
+    /// NEXT identical retry, via decide_retry()'s forced Reapply once
+    /// resolved_failed>0 - not truly unbounded, but a real, avoidable gap).
+    struct WedgeAwareStatus {
+        ReceiptStatus status{ReceiptStatus::Failed};
+        bool wedge_eligible{false};
+    };
+    [[nodiscard]] WedgeAwareStatus receipt_status_wedge_aware(const ArmReceipt& receipt) const;
     /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
     /// been ADOPTED - i.e. rules_ currently carries a live generation for that
     /// claim's rule_id AND it is EXACTLY this claim's own (rule_id, generation)
     /// incarnation, not a newer or older one that happens to share the rule_id.
     /// `end`/`receipt_status()` never change on adoption (the sticky-Wedged
     /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
-    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal a ledger's
-    /// own maintenance drain uses to notice a late-success recovery on a claim it
-    /// is still holding as a retained failure - see GuardianArmAckLedger::
-    /// drain_locked(). False for a default-constructed / empty receipt (nothing
-    /// to recover) and false for any receipt whose claim was never adopted.
-    /// registry_mu_ taken internally.
+    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal for
+    /// noticing a late-success recovery on a claim still held as a retained
+    /// failure. rung 9c PR-5e (#4221, K-bound closeout - governance Gate 4/
+    /// consistency-auditor finding): `GuardianArmAckLedger::drain_locked()`'s
+    /// recovery-scan loop, this accessor's own original motivating caller, now
+    /// calls the atomic `receipt_recovery_status()` below instead (this standalone
+    /// accessor's own two-call combination with `receipt_wedge_k_eligible()` has a
+    /// TOCTOU `receipt_recovery_status()`'s own doc comment explains) - this
+    /// accessor stays live standalone API, currently with no production caller.
+    /// False for a default-constructed / empty receipt (nothing to recover) and
+    /// false for any receipt whose claim was never adopted. registry_mu_ taken
+    /// internally.
     [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a
+    /// CURRENTLY, GENUINELY outstanding Wedged episode - the narrow subset of "sticky
+    /// Wedged" (see receipt_status()'s own doc comment) that K-bound may waive.
+    /// `end == ClaimEnd::WaiterTimedOutDispatched` alone is NOT sufficient - `end` is
+    /// sticky (never un-Wedges) but the underlying episode is NOT: (1) a caller-side
+    /// timeout can stamp WaiterTimedOutDispatched while the claim is still mid-dispatch
+    /// (abandon_claim_locked()'s Dispatching branch), racing dispatch_arm_off_lock()'s
+    /// own re-lock, which - on a synchronous admission refusal - corrects the REAL
+    /// outcome via reclassify_dispatching_race_locked() but ONLY while `dispatch` is
+    /// still Dispatching; `dispatch` itself never reaches Dispatched on that corrected
+    /// path (dispatch_arm_off_lock only ever writes Dispatched on a successful
+    /// submission, see its own body) - so requiring `dispatch == Dispatched` here
+    /// excludes exactly that unsettled/corrected window, never the genuinely-launched-
+    /// and-still-outstanding case (a claim that IS submitted reaches Dispatched
+    /// immediately, well before any real backend deadline, and simply stays there for
+    /// as long as the backend call genuinely runs). (2) A LATER real backend outcome
+    /// (a synchronous refusal on the worker, or any other on_arm_complete() resolution)
+    /// leaves `end` stuck at Wedged by design (the sticky-Wedged receipt is a fact
+    /// about the ORIGINAL episode, not a live status - R5.3 "Three separate
+    /// transitions, never collapsed") but POPS the claim from its key's FIFO the
+    /// instant that resolution is published - so requiring `claim` to still be
+    /// `claims_[claim->key]`'s FIFO FRONT is the "still-claimed" test
+    /// docs/spark-legacy-delta-registry.md's own K-bound row names: once popped, this
+    /// reads false forever for that claim, regardless of what `end` still says. Both
+    /// checks together, evaluated atomically under registry_mu_ (the same lock every
+    /// FIFO pop and every reclassify_dispatching_race_locked() call already holds), are
+    /// race-free: an external reader (GuardianArmAckLedger::drain_locked()) can only
+    /// ever observe the state strictly before or strictly after either transition, never
+    /// in between. False for a default-constructed / empty receipt, an unclaimed key, or
+    /// a key whose front is a different claim entirely. Never mutates state (a query
+    /// only, matching receipt_recovered()'s own contract) - registry_mu_ taken
+    /// internally.
+    [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    /// Codex Sol independently converging): the ATOMIC combination of
+    /// receipt_recovered() and receipt_wedge_k_eligible(), for a caller that needs
+    /// BOTH questions answered about the exact same instant. Calling the two
+    /// standalone accessors sequentially (each takes and releases registry_mu_
+    /// independently) is NOT equivalent to this - a genuine adoption can land in the
+    /// gap between them: the first call correctly observes "not yet recovered", the
+    /// adoption's on_arm_complete() pops the claim in the window, and the second call
+    /// then observes "not eligible either" (no longer FIFO-front) - so a caller
+    /// combining the two booleans with `if (recovered) ... else if (!eligible) ...`
+    /// can misclassify a genuine, just-landed recovery as "no longer eligible",
+    /// dropping it without recording the recovery (GuardianArmAckLedger::
+    /// drain_locked()'s own recovery-scan loop is exactly this caller - see its own
+    /// comment on why it uses this accessor instead of the two standalone ones).
+    /// `Recovered` takes priority over `WedgeEligible` when both could apply (they
+    /// cannot in practice - an adopted claim's rule generation match and an
+    /// unadopted claim's FIFO-front position are mutually exclusive states of the
+    /// SAME claim - but the priority is stated for clarity, not because the case is
+    /// reachable). `Blocking` covers every other case: an empty receipt, a claim
+    /// neither recovered nor currently wedge-eligible (settled to a genuine
+    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
+    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
+    [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
 
     enum class ArmOutcomeKind { Armed, Accepted };
     /// The non-waiting attach_rule() overload's success result. Never encodes
@@ -1380,6 +1475,28 @@ private:
     /// responsibility (both current call sites already hold it), not this
     /// function's, since it never touches shared state itself.
     [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
+    /// mapping receipt_status() applies - factored out so
+    /// receipt_status_wedge_aware() can compute the SAME mapping under its own
+    /// single registry_mu_ acquisition without duplicating the switch (and
+    /// therefore without the two ever silently drifting apart). No lock of its
+    /// own - a pure function of the enum value the caller already holds under
+    /// registry_mu_.
+    [[nodiscard]] static ReceiptStatus classify_claim_end(ClaimEnd end) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
+    /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
+    /// == Dispatched && still its key's FIFO front`) - factored out so
+    /// receipt_wedge_k_eligible(), receipt_recovery_status() and
+    /// receipt_status_wedge_aware() all read ONE definition instead of three
+    /// independently-maintained copies (the drift risk classify_claim_end() was
+    /// already extracted to prevent for the ClaimEnd->ReceiptStatus mapping,
+    /// applied here to the eligibility predicate too). registry_mu_ held by the
+    /// CALLER - every call site already holds it - not this function's own
+    /// responsibility, since it never touches shared state itself beyond the
+    /// read-only `claims_` lookup a caller already has the right to make.
+    [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
