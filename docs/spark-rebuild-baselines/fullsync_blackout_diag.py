@@ -853,9 +853,16 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
         # differently-labeled reads of the same one.
         t0_true_epoch = t0["ts"].timestamp() - dgrhp_utc_offset().total_seconds()
     except Exception as e:  # noqa: BLE001
+        # Governance Gate 8 (unhappy-path, third pass): this guarded body is wider than "the
+        # clock" - cohort_events_d()'s own get_json()-parsing loop (outside ITS inner try) can
+        # also raise here, and void_reason may already be non-None from the checks above (e.g.
+        # failed_gt_0). Preserve it rather than silently overwrite a real system-under-test
+        # signal with an infra-failure label, and don't claim a narrower cause than the code
+        # actually knows.
         return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                  "trigger_http_status": http_status,
-                 "void_reason": f"dgrhp_clock_unavailable:{type(e).__name__}:{str(e)[:200]}"}
+                 "void_reason": void_reason or
+                     f"cohort_events_failed:{type(e).__name__}:{str(e)[:200]}"}
     if phase_is_clean_verdict and void_reason is None and not functional_valid:
         void_reason = "functional_invalid"
 
