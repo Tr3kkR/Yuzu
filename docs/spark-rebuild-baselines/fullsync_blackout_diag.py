@@ -1213,7 +1213,7 @@ def resolve_cohort_void(d_by_rule, never_fetched):
         - never_fetched
     if reliably_not_observed:
         return "genuine", "functional_invalid"
-    return "instrument", "cohort_fetch_never_succeeded:" + ",".join(sorted(never_fetched))
+    return "instrument", "cohort_fetch_unreliable_at_end:" + ",".join(sorted(never_fetched))
 
 
 def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
@@ -2337,11 +2337,15 @@ def _f19():
     # t2_collect_failed - the last one found missing from this list by
     # quality-engineer, a fixture-completeness gap only: void_class_for's default-
     # instrument fallback already classified it correctly, this list just didn't
-    # pin it), plus cohort_fetch_never_succeeded (Doomgoose review, PR #4614:
+    # pin it), plus cohort_fetch_unreliable_at_end (Doomgoose review, PR #4614:
     # cohort_events_d()'s bare `except Exception: continue` used to
     # launder a REST-fetch failure for the whole polling window into the same
     # "not_observed" a genuinely-never-fired guard produces, folding it into
-    # functional_invalid's genuine bucket - see cohort_events_d()'s own docstring).
+    # functional_invalid's genuine bucket - see cohort_events_d()'s own docstring.
+    # Named "unreliable_at_end", not "never_succeeded" - security-guardian Gate 2
+    # (this review round) found the earlier name literally false for a rule whose
+    # FIRST poll succeeded and only its later attempts failed, exactly the case
+    # this fix's own last-attempt semantics are about).
     dynamic_prefix_reasons = [
         "trigger_failed:some error",
         "push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)",
@@ -2354,7 +2358,7 @@ def _f19():
         "m1_unavailable:TimeoutExpired:cmd timed out",
         "cohort_events_failed:TimeoutExpired:cmd timed out",
         "t2_collect_failed:TimeoutExpired:cmd timed out",
-        "cohort_fetch_never_succeeded:r1,r2",
+        "cohort_fetch_unreliable_at_end:r1,r2",
     ]
     ok6 = all(void_class_for(r) == "instrument" for r in dynamic_prefix_reasons)
     # not_full_sync(...) is the ONE deliberate exception (D1, driver-merge follow-on
