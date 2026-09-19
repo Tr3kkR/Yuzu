@@ -843,7 +843,27 @@ diagnostic, ruling-13 on #3850)
   spark 127.0ms (threshold 1070.0ms); Phase B2 legacy 86.0ms vs spark 140.0ms (threshold
   1086.0ms) - both within the predeclared non-inferiority margin. Full detail, all three
   corrections, and the raw per-repeat data for every round (`fullsync-blackout-results.jsonl`,
-  the clean pass under `label="clean-v2"`) are in the run doc, not restated here.
+  the clean pass under `label="clean-v2"`) are in the run doc, not restated here. **This
+  `clean-v2` PASS was measured on the WAITING attach model** (`origin/dev@65f2938156a19`,
+  pre-rung-9c-PR-2) and stands unedited as its own record for that build.
+- **R5.7 T2 re-measurement (2026-09-19, rung 9c PR-6 item 2), a SEPARATE, LATER pass under the
+  CURRENT NonWaiting attach model** - `origin/dev@f0f07d4d8`-merged branch
+  `feat/3990-r57-t2-remeasure`. `clean-v2`'s own Window-B measurand no longer brackets spark's
+  arm completion under NonWaiting (T1 no longer waits for every arm), so this round adds an
+  epoch-fenced runtime-commit measurand (C = T2_last - T0, `docs/spark-stage2-guardian-consumer-
+  design.md` §R5.7) as the headline instead. **Phase B (baseline re-deploy trigger): PASS** -
+  legacy C median 74.0ms vs spark 98.0ms (margin 1074.0ms), 5/5 valid both backends, zero voids
+  either side. **Phase B2 (bare rule-create trigger, #3990's own literal shape): INCONCLUSIVE**
+  - legacy 3/3 valid (C median 66.0ms), spark only reached 2/3 valid across its full 10-attempt
+    budget (8 instrument-invalid voids, zero genuine failures) - floor not reached, not relaxed
+    post hoc. An unresolved asymmetry (spark Phase B ran clean immediately before and after this
+    Phase B2 sequence on the same agent/build) is recorded in the run doc as a real, uncharacterized
+    finding, not attributed to a cause. Full detail, hypothesis resolution, and raw per-repeat
+    data (same `fullsync-blackout-results.jsonl`, `label="t2-v1"`) are in the run doc's own
+    "R5.7 T2 re-run results" section, not restated here. **Do not read this entry's PASS as
+    reopening or superseding the `clean-v2` entry above - they measure different builds under
+    different attach models**, and #3990's own Phase B2 shape remains formally INCONCLUSIVE
+    under the current model pending a re-run.
 - Owner: not assigned in source material.
 - Milestone: not specified. Nothing found by this diagnostic changes this row's own
   #2278/#2469/#2279 package - the two are not shown to be related.

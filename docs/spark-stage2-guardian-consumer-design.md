@@ -1238,6 +1238,29 @@ R5.7 consumer that cares whether the engine is still live checks `is_running()` 
 (the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
 post-stop `established_at`/`coverage` pair as current live coverage.
 
+**R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
+calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
+`GuardianSparkRuntime::commit_new_generation_locked()` — never
+`subscription_establishment()` (that channel still has zero production callers) and never
+`SparkEngine`'s own "armed" log (fires before the OS watch call even runs, exactly as this
+section already says not to use it). Membership across repeated `#3990` diagnostic full_syncs
+is decided by an explicit APPLICATION FENCE, not by timestamp order: `detach_all()` stamps a
+monotonic `detach_epoch_` (bumped first, before any of its own mutation) and logs it in a new
+`Guardian spark: detach_all complete (epoch=, incarnation_floor=, ...)` line as its LAST
+statement; every T2 line then carries that epoch, so a stale in-flight commit from a PREVIOUS
+full_sync (which can land between the new `full_sync cleared` line and `detach_all()`, since
+both run under `registry_mu_`, not the engine's own `mtx_`) is rejected by epoch identity
+rather than by an insufficient timestamp check — a real gap an Astra adversarial review found
+in this item's own first design round, before implementation. `--spark-disable` never
+constructs `spark_runtime_` at all (`wire_spark_engine()`'s `spark_disabled_by_config` branch
+returns before that point) — legacy needs no fence in the first place, since its arms are
+synchronous on the same thread as T0/T1. Result: Phase B (baseline re-deploy) reached a
+pre-registered PASS on the current NonWaiting attach model; Phase B2 (bare rule-create,
+`#3990`'s own literal shape) reached only 2 of its 3-repeat floor and is formally
+INCONCLUSIVE. Full detail: `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`'s own
+"R5.7 T2 re-run results" section; `docs/spark-flip-gate.md`'s `#3990` entry for the flip-gate
+framing.
+
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
 7.7b was first planned as one PR folding the #2237 send-path items and #2238 test
