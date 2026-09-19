@@ -394,9 +394,11 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
         # #4471 quarantine-ref contract. ci.yml's trusted_inputs step is covered
-        # behaviourally by tests/shell/test_trusted_inputs_validate.sh;
-        # fork-dynamic-review.yml has no extraction harness, so this string pin
-        # is its only net. The wrapper's purge job is the sole actions:write
+        # behaviourally by tests/shell/test_trusted_inputs_validate.sh, and
+        # fork-dynamic-review.yml's own quarantine guard by
+        # tests/shell/test_fork_dynamic_review_validate.sh (both extraction
+        # harnesses) -- this string pin is a cheap structural backstop, not
+        # the only net. The wrapper's purge job is the sole actions:write
         # holder, checks nothing out, and must never hand that grant to the
         # reusable gate.
         quarantine = "^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$"

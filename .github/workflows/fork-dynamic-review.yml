@@ -61,6 +61,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake bison ccache cmake flex libblkid-dev libtool ninja-build
           python3 -m venv /tmp/yuzu-review-venv
+          # requirements-ci.txt is read from the FORK's own checked-out tree
+          # (already at HEAD above), so --require-hashes only proves each
+          # listed package matches ITS OWN declared hash on PyPI -- it does
+          # not prove the fork didn't edit which packages/hashes are listed.
+          # Not a gap for THIS job specifically: it holds no secrets, and
+          # `meson compile`/`meson test` of the same fork tree a few steps
+          # later is already arbitrary code execution by design.
           /tmp/yuzu-review-venv/bin/pip install --require-hashes -r requirements-ci.txt
           echo "/tmp/yuzu-review-venv/bin" >> "$GITHUB_PATH"
 
