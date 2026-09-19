@@ -308,11 +308,8 @@ TEST_CASE("peripherals plugin: usb reports a real row or is explicitly SKIPped",
     yuzu::agent::LocalDispatcher dispatcher;
     const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "usb").captured);
     REQUIRE_FALSE(rows.empty());
-    if (rows.size() == 1) {
-        const auto f = split_fields_escape_aware(rows[0]);
-        if (f.size() == 2) SKIP("no usb device on this host");
-        if (f.size() == 3 && f[1] == "unavailable")
-            SKIP("usb leg could not attempt the read on this host: " + f[2]);
+    if (rows.size() == 1 && split_fields_escape_aware(rows[0]).size() == 2) {
+        SKIP("no usb device on this host");
     }
     bool saw_real_row = false;
     for (const auto& r : rows)
@@ -330,11 +327,8 @@ TEST_CASE("peripherals plugin: pci reports a real row or is explicitly SKIPped",
     yuzu::agent::LocalDispatcher dispatcher;
     const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "pci").captured);
     REQUIRE_FALSE(rows.empty());
-    if (rows.size() == 1) {
-        const auto f = split_fields_escape_aware(rows[0]);
-        if (f.size() == 2) SKIP("no pci device on this host");
-        if (f.size() == 3 && f[1] == "unavailable")
-            SKIP("pci leg could not attempt the read on this host: " + f[2]);
+    if (rows.size() == 1 && split_fields_escape_aware(rows[0]).size() == 2) {
+        SKIP("no pci device on this host");
     }
     bool saw_real_row = false;
     for (const auto& r : rows)
@@ -352,11 +346,8 @@ TEST_CASE("peripherals plugin: thunderbolt reports a real row or is explicitly S
     yuzu::agent::LocalDispatcher dispatcher;
     const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "thunderbolt").captured);
     REQUIRE_FALSE(rows.empty());
-    if (rows.size() == 1) {
-        const auto f = split_fields_escape_aware(rows[0]);
-        if (f.size() == 2) SKIP("no thunderbolt/usb4 bus on this host");
-        if (f.size() == 3 && f[1] == "unavailable")
-            SKIP("thunderbolt leg could not attempt the read on this host: " + f[2]);
+    if (rows.size() == 1 && split_fields_escape_aware(rows[0]).size() == 2) {
+        SKIP("no thunderbolt/usb4 bus on this host");
     }
     bool saw_real_row = false;
     for (const auto& r : rows)
@@ -420,23 +411,15 @@ TEST_CASE("peripherals plugin: an unknown action is refused, not silently ignore
 
 // BUILD-COMPLETENESS CASE (P91-6, wave 2). All three legs (Windows/Linux/
 // macOS) replaced their wave-1 `<os>:leg:not_implemented` placeholder in this
-// same wave, so this case was host-agnostic with no platform #ifdef, GREEN on
-// every CI OS once wave 2 had integrated, and RED only if a real leg
-// placeholder ever survived a future wave.
-//
-// ws91 SPLIT NOTE: this PR ships the macOS + Linux legs only; the Windows
-// leg is deliberately still its own wave-1 placeholder (peripherals_win.cpp),
-// matching this plugin's own historical Wave-1-placeholder convention (see
-// the file banner up top), until a focused follow-up PR lands the real
-// Windows leg on top of this one. So for this PR specifically, Windows is
-// the one platform where the placeholder is CORRECT and expected to survive
-// -- asserting its absence there would be asserting a fact that is false by
-// design. Split the check accordingly: macOS/Linux keep the original
-// no-placeholder assertion (both are wave-2 already, in this PR); Windows
-// asserts the mirror image (the placeholder IS present), so this case still
-// proves something real on every OS rather than silently no-op'ing on one.
-// The follow-up PR reunifies this back to the single host-agnostic
-// assertion above once the Windows leg is no longer a placeholder.
+// same wave, so this case is host-agnostic and carries no platform #ifdef --
+// it is GREEN on every CI OS now that wave 2 has integrated, and RED only if
+// a real leg placeholder ever survives a future wave. It does not assert row shape or
+// count (those are the cases above); it asserts only the one thing every
+// leg's placeholder body shares regardless of OS: the `:leg:not_implemented`
+// suffix on the unavailable token's provenance string. Host-specific counts
+// (usb/pci/thunderbolt node totals on this Mac) are report-only, per the
+// package spec -- never committed as an assertion here, since CI runs this
+// suite on a shared, unknown-hardware runner (yuzu-bigmags-macos).
 TEST_CASE("peripherals plugin: no leg reports its wave-1 not_implemented placeholder",
           "[peripherals][actions]") {
     auto plugin = load_peripherals_plugin();
@@ -452,11 +435,7 @@ TEST_CASE("peripherals plugin: no leg reports its wave-1 not_implemented placeho
         REQUIRE_FALSE(rows.empty());
         for (const auto& r : rows) {
             INFO("row: " << r);
-#if defined(_WIN32)
-            CHECK(r.find(":leg:not_implemented") != std::string::npos);
-#else
             CHECK(r.find(":leg:not_implemented") == std::string::npos);
-#endif
         }
     }
 }

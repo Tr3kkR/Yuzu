@@ -79,6 +79,27 @@ inline std::string canonical_thumbprint(std::string_view s) {
     return out;
 }
 
+/// Whether a Windows CryptoAPI store read/delete is allowed to fall back
+/// from LOCAL_MACHINE to CURRENT_USER when the LOCAL_MACHINE open fails.
+/// #4377: a destructive action must never target a store the caller did not
+/// name -- delete_cert_win therefore opens LOCAL_MACHINE only and has NO
+/// fallback branch that consults this predicate at all; its CURRENT_USER
+/// exclusion is enforced STRUCTURALLY (exactly one CertOpenStore call in the
+/// function body), not by a runtime check of kDelete here. This predicate is
+/// consumed ONLY by enumerate_store (the read path, list/details), where a
+/// disclosed fallback is acceptable because nothing is being removed.
+/// win_store_fallback_allowed(kDelete) == false is therefore a decision-record
+/// oracle for that asymmetry, not a production-path test of delete's
+/// behaviour. Delete's actual CURRENT_USER exclusion is verified manually by
+/// reviewers reading delete_cert_win's body for exactly one CertOpenStore
+/// call (see test_certificates_store_honesty.cpp's comment on this) -- there
+/// is no automated check enforcing it today, so a future regression here
+/// would not be caught by CI.
+enum class WinStoreAction { kRead, kDelete };
+inline bool win_store_fallback_allowed(WinStoreAction a) {
+    return a == WinStoreAction::kRead;
+}
+
 /// The Linux cert-store directory filter: true iff `name` contains a '.' at
 /// an index > 0 and the suffix after the LAST '.' is exactly "pem" or "crt"
 /// (case-sensitive) -- byte-for-byte parity with the retired
@@ -99,16 +120,18 @@ inline bool is_cert_entry_name(std::string_view name) {
 /// Classifies the outcome of opening the Linux cert-store directory (or a
 /// `readdir(3)` call mid-enumeration, which reports failure the same way:
 /// errno set, nullptr returned). `ok` is whether the open/readdir succeeded;
-/// `err` is the resulting `errno` when it did not. ENOENT/ENOTDIR means the
+/// `err` is the resulting `errno` when it did not. ENOENT alone means the
 /// store simply doesn't exist -- today's "no store" semantics (list emits the
-/// header only; details/delete emit status|not_found). Anything else (EACCES,
-/// EPERM, EIO, ELOOP, ...) is a real, reportable failure to open a store that
+/// header only; details/delete emit status|not_found). Anything else,
+/// INCLUDING ENOTDIR (something non-directory sitting at the store path --
+/// a real, reportable misconfiguration, not "no store") -- EACCES, EPERM,
+/// EIO, ELOOP, ... -- is a real, reportable failure to open a store that
 /// does exist.
 enum class CertDirOpen { kOpened, kAbsent, kUnreadable };
 inline CertDirOpen classify_cert_dir_open(bool ok, int err) {
     if (ok)
         return CertDirOpen::kOpened;
-    if (err == ENOENT || err == ENOTDIR)
+    if (err == ENOENT)
         return CertDirOpen::kAbsent;
     return CertDirOpen::kUnreadable;
 }
