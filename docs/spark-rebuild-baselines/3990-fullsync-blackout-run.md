@@ -735,11 +735,13 @@ binary first):
 This section's own commit hash is the pre-registration timestamp; results are appended as a new
 section below it once the run completes, never edited into this section.
 
-## R5.7 T2 re-run results (2026-09-19) - Phase B PASS, Phase B2 INCONCLUSIVE
+## R5.7 T2 re-run results (2026-09-19) - Phase B PASS, Phase B2 FAIL-RELIABILITY
 
-**Read this first: the headline changes for Phase B, confirms non-inferiority for Phase B2's
-counted data, but Phase B2 itself did not reach its pre-registered floor and is formally
-INCONCLUSIVE.** All numbers below are recomputed directly from the committed
+**Read this first: the headline changes for Phase B; Phase B2 is FAIL-RELIABILITY - a genuine
+spark arm failure (`failed_gt_0`, repeat 3) was initially misclassified as an instrument-invalid
+void by a driver bug found via `/adversarial-review` and fixed same-session (see the "Correction"
+note under Phase B2 below); the corrected verdict is worse than what this section first
+reported, not better.** All numbers below are recomputed directly from the committed
 `fullsync-blackout-results.jsonl` (rows appended this round, `label="t2-v1"`), not from any
 executing agent's own printout.
 
@@ -788,32 +790,51 @@ backend across all attempts - holds. Both gates satisfied at floor in both cells
 
 ### Phase B2 - bare rule-create trigger (#3990's literal shape)
 
+**Correction (2026-09-19, post-`/adversarial-review`).** This section originally reported
+INCONCLUSIVE with "zero genuine-failure rows" on spark. Both independent reviewers (Kimi K3,
+Codex Sol) found, and cross-examination confirmed, that the driver checked a collection-stage
+void `reason` (here, `double_full_sync`) BEFORE the T1-reported `failed>0` check, so a real
+arm failure recorded on spark B2 repeat 3 (`applied=61, failed=1`, committed data unchanged)
+was laundered into an instrument-invalid void instead of counting against the reliability gate.
+Driver fixed (`genuine_t1_failure()`, hoisted ahead of the collection-stage check); the one
+affected row's `void_class`/`void_reason` corrected from `instrument`/`double_full_sync` to
+`genuine`/`failed_gt_0` in `fullsync-blackout-results.jsonl` (every other field on that row,
+including its 61 committed `t2_selected` entries, is unchanged - only the derived classification
+was wrong). The table, verdict, and analysis below reflect the corrected classification.
+
 | Backend | Attempted | Valid | Floor | B median (ms) | C median (ms) | Void breakdown |
 |---|---|---|---|---|---|---|
 | legacy | 3 | 3 | Y | 67.0 | 66.0 | - |
-| spark | 10 | 2 | N | 89.0 | 90.0 | double_full_sync=1, t1_not_found=7 |
+| spark | 10 | 2 | N | 89.0 | 90.0 | `failed_gt_0`=1 (genuine), `t1_not_found`=7 |
 
 Legacy C values: 66.0, 82.0, 65.0 ms - clean, no voids, matches Phase B's legacy figures
 closely. Spark reached its 10-attempt cap with only 2 valid repeats (C = 92.0, 88.0 ms, both
-consistent with Phase B's spark C figures where they did land); the other 8 attempts voided
-before ever committing an arm for that application, all `instrument-invalid`
-(`t1_not_found` x7, `double_full_sync` x1) - **zero genuine-failure rows**, so this is a floor
-miss, not a reliability finding.
+consistent with Phase B's spark C figures where they did land). Of the other 8 attempts: 7
+(`t1_not_found`) never reached T1 and carry no T2 evidence either way; the 8th (repeat 3)
+**did** reach T1 and **did** commit 61 of its 62 expected arms (`t2_selected` has 61 entries),
+but `apply_rules()` itself reported `failed=1` for the one remaining rule, `blackout-file-03` -
+a genuine, backend-self-reported arm failure, not an absence of evidence.
 
-**Verdict: INCONCLUSIVE.** Reliability gate holds (no genuine failures), but the spark cell's
-void rate (8/10 = 80%) exceeds the 50% instrument-invalid threshold and the floor (K=3) was
-never reached - INCONCLUSIVE per the pre-registered rule, not relaxed post hoc.
+**Temporal note, not a full root cause.** Repeat 3's T1 fired 86ms after its T0
+(04:23:40.529 -> 04:23:40.615), reporting `failed=1` already at that point. The event that
+produced this row's `double_full_sync` void classification pre-fix - an unrelated
+`__guard__`-reconcile push (`push_cmd_lines_in_window`) - landed at 04:24:11.326, **~30.7
+seconds later**. The confound cannot be the cause of a failure already reported 30+ seconds
+earlier; they are temporally and causally independent events that happened to fall in the same
+observation window. Why `blackout-file-03`'s arm itself failed is NOT established here - the
+DGRHP rig was unreachable by the time this was found (SSH session had already ended), so the
+raw `agent.log` line for that specific failure (which would name the underlying error) could
+not be pulled. Recorded as an open, unresolved product-level finding per the pre-registered
+rule ("any genuine failure... is filed as its own product finding separate from this
+diagnostic") - not root-caused, not dismissed as instrumentation.
 
-**An unresolved, real finding - stated plainly, not root-caused**: spark Phase B (baseline
-re-deploy trigger) ran immediately before and after this Phase B2 attempt sequence with
-**zero** voids across all 10 of its own attempts, on the same agent process, same rig, same
-build. Spark Phase B2 (bare rule-create trigger) then voided 8 of its first 10 attempts on
-`t1_not_found`/`double_full_sync`, before settling into 2 clean repeats at the very end. The
-asymmetry is real and reproducible within this run, but its cause is NOT established here - it
-may be an artifact of how a heartbeat-reconcile-mediated push differs from a direct
-baseline-deploy push in this timing regime, it may be a flush-lag effect specific to whatever
-else was happening on the rig during that window, or something else. Recorded as a candidate
-for a follow-up investigation, not asserted as any of those causes.
+**Verdict: FAIL-RELIABILITY.** The reliability gate is "zero genuine-failure attempts... counting
+EVERY attempt" (not just counted repeats); repeat 3's `failed_gt_0` breaks it outright, and per
+the pre-registered rule this holds "regardless of what the latency gate would otherwise say."
+The floor-miss (2/3 valid) and the >50% instrument-invalid rate among the remaining 7 attempts
+are both still true but are no longer the controlling fact - reliability fails before either is
+reached. Not relaxed, and not inflated: the corrected verdict is worse than what was first
+reported, stated exactly as the pre-registered rule requires.
 
 ### Hypotheses (i)-(iv), stated in the pre-registration - each resolved against the data
 
@@ -840,11 +861,12 @@ for a follow-up investigation, not asserted as any of those causes.
 
 Confirms the round-2 plan's central redesign point: C (the epoch-fenced runtime-commit
 measurand) is measurable and well-behaved on current `origin/dev`, and spark's Phase B
-non-inferiority holds under the pre-registered rule on this rig. Does NOT establish a spark
-verdict for the bare rule-create trigger shape (#3990's own literal reproduction) - that cell
-is INCONCLUSIVE and would need a re-run, ideally after investigating the asymmetry noted above.
-Does NOT reopen or restate the clean-v2 waiting-model result above, which stands as its own
-record for that build.
+non-inferiority holds under the pre-registered rule on this rig. Does NOT establish
+non-inferiority for the bare rule-create trigger shape (#3990's own literal reproduction) -
+that cell FAILS the reliability gate outright on a genuine, unroot-caused spark arm failure
+(`blackout-file-03`, repeat 3) and needs both a follow-up investigation into that failure and a
+re-run before any verdict can be reached for this trigger shape. Does NOT reopen or restate the
+clean-v2 waiting-model result above, which stands as its own record for that build.
 
 This section's own commit is the results record; see the driver-fix commit (`5a833f4ff`) and
 the T2 instrumentation commit (`0a4a605d6`) for the code these results depend on.
