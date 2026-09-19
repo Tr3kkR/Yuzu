@@ -1387,10 +1387,16 @@ namespace {
 /// crashing (TSan cannot catch this; it is a lock-order/self-deadlock property, not
 /// a race).
 ///
-/// NOTE: a real shipped mechanism must NEVER emit/fault synchronously from
-/// watch()/unwatch()/stop() (spark_engine.hpp's mech_ops_mu_by_type_ doc). This fake
-/// violates that deliberately, and only from stop(), purely to pin the lock-scope
-/// property under test.
+/// NOTE (adversarial-review C1-02/X2, 2026-09-19): a real shipped mechanism must
+/// NEVER emit/fault synchronously from watch()/unwatch() — that prohibition is
+/// scoped to those two calls specifically because they run with the per-type
+/// mech_ops_mu_by_type_ lock held (spark_engine.hpp's doc comment on that lock;
+/// ISparkMechanism's contract at spark_mechanism.hpp draws the same line). stop()
+/// carries no such prohibition — it is documented only as idempotent and required
+/// to quiesce before consumer dispatch. This fake's synchronous fault from stop()
+/// is legal under the current contract; it is adversarial only in the sense that
+/// it exercises the rollback's lock-scope guarantee (mu_ must already be released
+/// by the time stop() runs) rather than violating any documented rule.
 struct SyncFaultOnStopMechanism : ISparkMechanism {
     SparkFaultFn fault_fn;
     void start(SparkEmitFn, SparkFaultFn fault) override {
@@ -1412,11 +1418,22 @@ struct SyncFaultOnStopMechanism : ISparkMechanism {
 TEST_CASE("start()'s rollback runs with mu_ released — a mechanism that synchronously "
           "faults from its rollback stop() must not deadlock",
           "[spark][teardown][deadlock]") {
-    // Direct regression test for #2050's guard-scope requirement. Bounded via
-    // std::future so a future regression here is a red assertion, not a wedged CI
-    // job; Catch2 assertions stay on the main thread (this codebase's own
-    // convention — see the register_consumer/stop() stress test above) and the
-    // worker thread only reports whether start() threw.
+    // Direct regression test for #2050's guard-scope requirement. Catch2 assertions
+    // stay on the main thread (this codebase's own convention — see the
+    // register_consumer/stop() stress test above) and the worker thread only
+    // reports whether start() threw.
+    //
+    // HONEST BOUND (adversarial-review C1-01/X1, 2026-09-19): the 5s wait_for below
+    // bounds the REQUIRE itself — on a genuine deadlock it fails loudly at 5s, not
+    // silently forever. It does NOT bound the whole test: on that same failing path,
+    // unwinding past the failed REQUIRE destroys `fut`, and a std::future obtained
+    // from std::async blocks in its destructor until the deadlocked task's shared
+    // state is ready — which, being deadlocked, is never. So a real regression here
+    // wedges this test binary rather than exiting non-zero in 5s; only Meson's
+    // process-level timeout (tests/meson.build) eventually kills it. This is a
+    // deliberate trade-off, not an oversight: the alternative (not waiting for the
+    // future) would let `engine` be freed while the still-hung async thread might
+    // still dereference it — a use-after-free is worse than a slow, loud CI failure.
     //
     // Raw pointer into a unique_ptr (not a shared_ptr captured by value), matching
     // this file's own convention for exactly this shape (see the "stop() racing
@@ -1462,6 +1479,15 @@ namespace {
 /// swap, spdlog), not from an individual mechanism. Either containment layer would
 /// have to hold for this test to pass; this fake exercises the one it actually hits.
 struct DoubleThrowMechanism : ISparkMechanism {
+    // External reference, matching LeakyThrowingMechanism's pattern above: the
+    // mechanism itself is destroyed inside engine.reset() (owned by SparkEngine's
+    // mechanisms_ map), so a member counter read AFTER reset() would be a
+    // use-after-free. Adversarial-review K1/C2-03: makes "rollback actually ran"
+    // directly observable, rather than inferred only from the original exception
+    // propagating (which would also happen with no rollback at all — an absent or
+    // disarmed guard would leave this at 0 at the checkpoint below).
+    int& stop_calls;
+    explicit DoubleThrowMechanism(int& calls) : stop_calls(calls) {}
     void start(SparkEmitFn, SparkFaultFn) override {
         throw std::runtime_error("original startup failure");
     }
@@ -1469,7 +1495,10 @@ struct DoubleThrowMechanism : ISparkMechanism {
         return {};
     }
     void unwatch(const std::string&) override {}
-    void stop() override { throw std::runtime_error("cleanup boom"); }
+    void stop() override {
+        ++stop_calls;
+        throw std::runtime_error("cleanup boom");
+    }
     [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
 };
 } // namespace
@@ -1478,8 +1507,10 @@ TEST_CASE("a cleanup throw during start()'s rollback does not replace the origin
           "startup exception",
           "[spark][teardown]") {
     auto engine = std::make_unique<SparkEngine>();
+    int stop_calls = 0;
     REQUIRE(engine
-                ->register_mechanism(SparkType::Service, std::make_unique<DoubleThrowMechanism>())
+                ->register_mechanism(SparkType::Service,
+                                     std::make_unique<DoubleThrowMechanism>(stop_calls))
                 .has_value());
 
     bool caught = false;
@@ -1490,6 +1521,10 @@ TEST_CASE("a cleanup throw during start()'s rollback does not replace the origin
         CHECK(std::string(e.what()) == "original startup failure");
     }
     CHECK(caught);
+    // Rollback ran (not just "the exception happened to propagate") — checked BEFORE
+    // engine.reset(), so this is the rollback's own call, not the destructor's later
+    // retry. An absent or disarmed rollback guard would leave stop_calls at 0 here.
+    CHECK(stop_calls == 1);
     // teardown_complete_ stays false (this mechanism's stop() throw is contained by
     // teardown_locked()'s own per-iteration mechanism catch, step 2 — see
     // DoubleThrowMechanism's comment) — the destructor retries the same
@@ -1497,6 +1532,8 @@ TEST_CASE("a cleanup throw during start()'s rollback does not replace the origin
     // fully tears down, which is the honest outcome for a mechanism whose stop() is
     // itself broken.
     engine.reset();
+    CHECK(stop_calls == 2); // destructor's retry called it again; stop_calls outlives
+                            // the mechanism, so this is safe to read post-reset()
     SUCCEED("the rollback's own cleanup failure did not mask the original exception, "
             "and the destructor's retry completed without hanging or crashing");
 }
