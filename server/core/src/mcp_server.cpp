@@ -52,7 +52,8 @@
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
-#include "dex_read_model.hpp"    // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
+#include "dex_read_model.hpp"    // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
@@ -930,8 +931,14 @@ static const ToolDef kTools[] = {
      "family, a service-scoped API token is admitted and confined here, not denied outright "
      "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
      "the minting token's username, so a service token can mint a set the minter's other "
-     "credentials can later read back. REST v1 twin: POST "
-     "/api/v1/result-sets/from-inventory-query.",
+     "credentials can later read back. If any candidate inventory record was excluded for "
+     "nesting past the JSON depth guard (the exclusion check runs before condition matching, "
+     "so a record's plugin/fields need not relate to the query's conditions to trigger it), "
+     "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
+     "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
+     "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1453,7 +1460,11 @@ static const ToolDef kTools[] = {
      R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
-     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"})j"
+     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"},)j"
+     // Additive per-OS fields (C1) — appended after the original five, which
+     // stay untouched including "required" (unchanged on purpose).
+     R"j("linux_online":{"type":"integer"},"macos_online":{"type":"integer"},)j"
+     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"})j"
      R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
@@ -1509,7 +1520,9 @@ static const ToolDef kTools[] = {
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"},)j"
+     // Additive (C1): trailing "os" property; required stays ["agent_id","cohort"].
+     R"j("os":{"type":"string"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
 
     // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
     {"list_dex_perf_apps",
@@ -11454,6 +11467,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     // as a targeting set — the missing tail silently changes
                     // who gets acted on (#2500/#2492 dispatch-targeting
                     // invariant class).
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonQueryTruncated)}})
+                            .increment();
+                    }
                     (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
                                    "reason=query_truncated source_kind=inventory_query");
                     res.set_content(
@@ -11473,7 +11493,63 @@ McpServer::HandlerFn McpServer::build_handler(
                         continue;
                     records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                 }
-                auto results = yuzu::server::evaluate_inventory(eval_req, records);
+                // #4496: fold poison-exclusion into the SAME M1
+                // dispatch-targeting-invariant refusal as inv_truncated just
+                // above, rather than a silent flag - this tool MATERIALISES
+                // the matched set into a durable result set other
+                // operators/dispatches consume later, so a narrowed target
+                // set gets the same hard-refuse treatment as a capped read
+                // (see the REST twin, POST /api/v1/result-sets/from-inventory-query,
+                // which makes the identical choice).
+                std::size_t excluded_by_poison = 0;
+                std::size_t excluded_by_parse_error = 0;
+                auto results = yuzu::server::evaluate_inventory(
+                    eval_req, records, &excluded_by_poison, &excluded_by_parse_error);
+                if (excluded_by_poison > 0) {
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonPoisonExcluded)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=poison_excluded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory record(s) excluded for nesting too deeply - refusing "
+                                 "to materialise a result set narrower than the true match set",
+                                 "the excluded record(s) must be corrected at the source "
+                                 "(re-reported by the originating agent)"),
+                        "application/json");
+                    return;
+                }
+                // #4496 follow-up: same M1 refusal as the poison check above,
+                // for the sibling cause - a record whose data_json failed to
+                // parse at all. Kept as a SEPARATE check (not folded into the
+                // condition above) so the metric reason, audit detail and
+                // error message all name the actual cause rather than
+                // conflating the two.
+                if (excluded_by_parse_error > 0) {
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonParseErrorExcluded)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=parse_error_excluded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set",
+                                 "the excluded record(s) must be corrected at the source "
+                                 "(re-reported by the originating agent)"),
+                        "application/json");
+                    return;
+                }
                 std::unordered_set<std::string> seen;
                 std::vector<std::string> members;
                 for (const auto& r : results) {
@@ -13426,19 +13502,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                const std::string since =
-                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
                 // A1 parity with GET /api/v1/dex/signals + the dashboard catalogue
                 // OS filter: `os` narrows the rollup to one OS (all = every OS).
-                const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
+                // Routed through the DexApi seam (ADR-0031 WS-A4) — the SAME
+                // instance the REST twin uses, so the shapes cannot drift.
                 JArr arr;
-                for (const auto& r : guaranteed_state_store->dex_signal_summary(since, os_scope)) {
+                for (const auto& r : dex_api_->signals(param_str(args, "window", "7d"),
+                                                       param_str(args, "os", ""))) {
                     arr.add(JObj()
                                 .add("obs_type", r.obs_type)
                                 .add("count", r.count)
@@ -13464,16 +13540,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                const std::string since =
-                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
                 JArr arr;
-                for (const auto& r : guaranteed_state_store->dex_os_signal_scope(since)) {
+                for (const auto& r : dex_api_->scope(param_str(args, "window", "7d"))) {
                     arr.add(JObj()
                                 .add("platform", r.platform)
                                 .add("distinct_types", r.distinct_types)
@@ -13511,7 +13585,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13533,8 +13607,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since =
-                    dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
                 const int limit = std::clamp(param_int32(args, "limit", 50), 0, 500);
                 // A1 parity with GET /api/v1/dex/signals/{obs_type} + the dashboard
                 // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
@@ -13555,9 +13627,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "dex.signal.view", "success", "ObsType", obs_type,
                     "DEX per-signal drill-down via MCP get_dex_signal_detail");
 
+                // Routed through the DexApi seam (ADR-0031 WS-A4) — the four raw
+                // reads the REST twin also bundles, same obs_type/window/os/limit.
+                const auto detail =
+                    dex_api_->signal_detail(obs_type, param_str(args, "window", "7d"),
+                                            param_str(args, "os", ""), limit);
                 JArr subjects;
-                for (const auto& s :
-                     guaranteed_state_store->dex_signal_subjects(obs_type, since, limit, os_scope)) {
+                for (const auto& s : detail.subjects) {
                     subjects.add(JObj()
                                      .add("subject", s.subject)
                                      .add("count", s.count)
@@ -13565,7 +13641,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                      .add("last_seen", s.last_seen));
                 }
                 JArr by_os;
-                for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                for (const auto& o : detail.by_os) {
                     // DexOsCrashCount.crashes carries the generic event count here.
                     by_os.add(JObj()
                                   .add("platform", o.platform)
@@ -13573,16 +13649,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("distinct_devices", o.distinct_devices));
                 }
                 JArr devices;
-                for (const auto& d :
-                     guaranteed_state_store->dex_signal_devices(obs_type, since, limit, os_scope)) {
+                for (const auto& d : detail.devices) {
                     devices.add(JObj()
                                     .add("agent_id", d.agent_id)
                                     .add("count", d.crashes)
                                     .add("last_seen", d.last_seen));
                 }
                 JArr by_day;
-                for (const auto& d :
-                     guaranteed_state_store->dex_signal_by_day(obs_type, since, os_scope)) {
+                for (const auto& d : detail.by_day) {
                     by_day.add(JObj().add("day", d.day).add("count", d.crashes));
                 }
                 JObj payload_obj;
@@ -13636,7 +13710,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return; // the gate wrote its own 401/403
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13654,9 +13728,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
-                const auto model =
-                    build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+                const auto model = dex_api_->device_score(agent_id, window);
                 // Behavioral-PII access audit — same verb/target as the REST twin and
                 // the dashboard's per-device DEX lens, so one SIEM filter catches all
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
@@ -13760,7 +13832,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13774,7 +13846,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
                 // #4035 hardening (governance): confine the affected-devices
                 // list to the caller's management-group scope (ADR-0017 World
                 // A) -- deny_fleet_wide_service_scoped above closes the
@@ -13783,8 +13854,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // rest_api_v1.cpp's GET /dex/app handler).
                 const std::optional<std::set<std::string>> vis =
                     dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
-                                                       vis ? &*vis : nullptr);
+                const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/app).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
@@ -13807,7 +13877,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13821,8 +13891,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
-                const auto model = build_dex_apps_model(guaranteed_state_store, window, since);
+                const auto model = dex_api_->apps(window);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_apps_json(model), kObjectOutputSchema)),
@@ -13845,7 +13914,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13859,11 +13928,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
                 const std::string os = param_str(args, "os", "all");
-                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
-                auto model = build_dex_catalogue_group_model(guaranteed_state_store, name, os,
-                                                             fleet, window, since);
+                auto model = dex_api_->catalogue_group(name, os, window);
                 if (!model) {
                     res.set_content(
                         error_response(id, kInvalidParams, "no such signal family: " + name),
@@ -13900,7 +13966,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return; // the gate wrote its own 401/403
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13914,9 +13980,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
-                const auto model = build_dex_device_history_model(guaranteed_state_store, agent_id,
-                                                                   window, since);
+                const auto model = dex_api_->device_history(agent_id, window);
                 // Behavioral-PII access audit -- SAME verb as get_dex_device_score
                 // above (dex.device.view; the dashboard fragment audits this exact
                 // signal-history capability under this exact verb too).
@@ -13961,7 +14025,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure masked as not-found (build_dex_observation_model
                 // folds !store into nullopt, same as the not-found/foreign-
                 // device cases). Matches the REST twin's fix (rest_api_v1.cpp).
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13971,7 +14035,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // guessed/foreign event_id and a genuinely-absent one both
                 // resolve to the SAME error, revealing nothing beyond what
                 // the scope gate already allowed.
-                auto obs = build_dex_observation_model(guaranteed_state_store, agent_id, event_id);
+                auto obs = dex_api_->observation(agent_id, event_id);
                 if (!obs) {
                     res.set_content(error_response(id, kInvalidParams, "observation not found"),
                                     "application/json");
@@ -13998,7 +14062,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -14013,10 +14077,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string weighting = param_str(args, "weighting", "default");
-                const std::string since = dex_iso_since(dex_window_to_days(window));
-                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
-                const auto model = build_dex_health_model(guaranteed_state_store, fleet, weighting,
-                                                          window, since);
+                const auto model = dex_api_->health(weighting, window);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_health_json(model), kObjectOutputSchema)),
@@ -14033,7 +14094,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -14047,10 +14108,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string since = dex_iso_since(dex_window_to_days(window));
-                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
-                const auto model =
-                    build_dex_trends_model(guaranteed_state_store, fleet, window, since);
+                const auto model = dex_api_->trends(window);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_trends_json(model), kObjectOutputSchema)),
@@ -14076,7 +14134,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -14090,17 +14148,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const int window_days = dex_window_to_days(window);
-                const std::string since = dex_iso_since(window_days);
-                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
                 // #4035 hardening (governance): confine the top-devices list
                 // to the caller's management-group scope (ADR-0017 World A) --
                 // same independent second belt as get_dex_app above.
                 const std::optional<std::set<std::string>> vis =
                     dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
-                                                            window_days, since,
-                                                            vis ? &*vis : nullptr);
+                const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/overview).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
@@ -14202,6 +14255,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("disk_lat_ms", stat_json(now.disk_lat))
                                   .add("reporting", now.reporting)
                                   .add("windows_online", now.windows_online)
+                                  // Additive per-OS fields (C1); trailing.
+                                  .add("linux_online", now.linux_online)
+                                  .add("macos_online", now.macos_online)
+                                  .add("reporting_windows", now.reporting_windows)
+                                  .add("reporting_linux", now.reporting_linux)
+                                  .add("reporting_macos", now.reporting_macos)
                                   .str();
                 } else if (tool_name == "get_dex_perf_cohorts") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);
@@ -14356,6 +14415,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             o.add("disk_lat_ms", *r.disk_lat_ms);
                         if (r.fleet_pctile >= 0)
                             o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                        o.add("os", r.os); // additive (C1); trailing
                         arr.add(o);
                     }
                     payload = arr.str();

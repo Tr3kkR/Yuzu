@@ -197,16 +197,31 @@ subprojects define the same name.
 # picks it up without a separate `docker tag` step in Phase 2.
 # Cross-platform: SKIP gracefully if docker is unavailable (macOS dev box
 # without OrbStack/Docker Desktop running). Linux CI always has docker.
+#
+# TRIPLET must match the BUILD HOST's architecture (#4546). Dockerfile.server
+# defaults `ARG TRIPLET=x64-linux`, so on an arm64 host an unqualified build
+# cross-compiles x64 under emulation and dies inside vcpkg with "unable to
+# detect the active compiler's information" (detect_compiler) — the image gate
+# then fails on EVERY branch on Apple Silicon, `dev` included, and cascades to
+# the Phase 2 upgrade test. Derive it from `uname -m` and pass --platform to
+# match, so an arm64 box builds arm64-linux natively and an x64 box is
+# byte-unchanged from the historical behaviour.
 if [[ "$MODE" != "quick" ]]; then
     (
         set -e
         BUILD_START=$(date +%s)
+        case "$(uname -m)" in
+            arm64|aarch64) HOST_DOCKER_ARCH=arm64; HOST_VCPKG_TRIPLET=arm64-linux ;;
+            *)             HOST_DOCKER_ARCH=amd64; HOST_VCPKG_TRIPLET=x64-linux ;;
+        esac
         if ! docker_available; then
             bash scripts/test/test-db-write.sh gate \
                 --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
                 --status SKIP --duration 0 \
                 --notes "docker not available — install/start OrbStack or Docker Desktop"
         elif docker build \
+            --platform "linux/${HOST_DOCKER_ARCH}" \
+            --build-arg "TRIPLET=${HOST_VCPKG_TRIPLET}" \
             -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \

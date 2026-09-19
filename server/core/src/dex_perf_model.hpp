@@ -35,7 +35,11 @@ namespace yuzu::server {
 /// nullopt = the device did not report that metric this cycle.
 struct DexPerfDevice {
     std::string agent_id;
-    bool is_windows{false}; ///< denominator scoping (perf collectors are Windows-only today)
+    /// Normalized OS token from dex_perf_rules.hpp's dex_perf_os_from_session:
+    /// "windows" | "linux" | "macos" | "" (unrecognized/session-less). Denominator
+    /// scoping — see dex_perf_os_collects for which of these have a real
+    /// heartbeat perf collector today.
+    std::string os;
     std::optional<double> cpu_pct;
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;
@@ -82,7 +86,17 @@ struct DexPerfFleetNow {
     std::optional<DexPerfStat> commit;
     std::optional<DexPerfStat> disk_lat;
     int64_t reporting{0};      ///< devices contributing at least one metric
-    int64_t windows_online{0}; ///< the coverage-honest denominator
+    int64_t windows_online{0}; ///< the coverage-honest denominator (unchanged; keep first)
+    // Trailing per-OS breakdown (C1, additive — REST/MCP responses only ever
+    // APPEND fields; windows_online/reporting above stay byte-identical).
+    // *_online counts every online device of that OS (collector or not);
+    // reporting_* counts only those that ALSO reported ≥1 metric this cycle
+    // (dex_perf_os_collects gates which OSes can appear here at all today).
+    int64_t linux_online{0};
+    int64_t macos_online{0};
+    int64_t reporting_windows{0};
+    int64_t reporting_linux{0};
+    int64_t reporting_macos{0};
 };
 
 DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap);
@@ -146,6 +160,7 @@ struct DexPerfDeviceRow {
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;
     int fleet_pctile{-1};
+    std::string os; ///< normalized OS token (dex_perf_os_from_session); trailing, additive (C1)
 };
 
 /// Sort metrics for the devices drill. Anything else resolves to kCpu.

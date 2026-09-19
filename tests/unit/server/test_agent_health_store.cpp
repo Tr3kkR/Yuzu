@@ -1808,3 +1808,46 @@ TEST_CASE("REAL AgentHealthStore: a stale agent's health counters leave the flee
     CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
 }
+
+TEST_CASE("REAL AgentHealthStore: per-OS perf gauges (C1) reach the shipped families",
+          "[perf][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id, const std::string& os,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = os;
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("w1", "windows", {{"yuzu.perf_cpu_pct", "10.0"}});
+    beat("w2", "windows", {{"yuzu.perf_cpu_pct", "30.0"}});
+    beat("l1", "linux", {{"yuzu.perf_cpu_pct", "50.0"}});
+    beat("mac1", "darwin", {}); // online, no perf collector yet — must not appear below
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+
+    // The families this round adds. Deleting recompute_perf_os_gauges from
+    // agent_registry.cpp makes these fail — which no mirror-based case can do.
+    CHECK(val("yuzu_fleet_perf_os_reporting{os=\"windows\"} ") == 2.0);
+    CHECK(val("yuzu_fleet_perf_os_reporting{os=\"linux\"} ") == 1.0);
+    CHECK(val("yuzu_fleet_perf_os_cpu_pct{stat=\"avg\",os=\"windows\"} ") == 20.0);
+    CHECK(val("yuzu_fleet_perf_os_cpu_pct{stat=\"max\",os=\"windows\"} ") == 30.0);
+    CHECK(val("yuzu_fleet_perf_os_cpu_pct{stat=\"avg\",os=\"linux\"} ") == 50.0);
+    // The existing four fleet-wide families stay untouched (byte-identical mix).
+    CHECK(val("yuzu_fleet_perf_cpu_pct{stat=\"avg\"} ") == 30.0); // (10+30+50)/3
+
+    // ABSENT is not a zero: darwin reported no perf tag, so no darwin series at all.
+    CHECK(out.find("yuzu_fleet_perf_os_reporting{os=\"darwin\"}") == std::string::npos);
+    CHECK(out.find("yuzu_fleet_perf_os_cpu_pct{stat=\"avg\",os=\"darwin\"}") == std::string::npos);
+}

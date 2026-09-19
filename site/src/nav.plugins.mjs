@@ -35,6 +35,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/network_config/README', slug: 'plugins/network_config', title: 'network_config' },
   { file: 'agents/plugins/network_diag/README', slug: 'plugins/network_diag', title: 'network_diag' },
   { file: 'agents/plugins/os_info/README', slug: 'plugins/os_info', title: 'os_info' },
+  { file: 'agents/plugins/peripherals/README', slug: 'plugins/peripherals', title: 'peripherals' },
   { file: 'agents/plugins/power_health/README', slug: 'plugins/power_health', title: 'power_health' },
   { file: 'agents/plugins/printing/README', slug: 'plugins/printing', title: 'printing' },
   { file: 'agents/plugins/processes/README', slug: 'plugins/processes', title: 'processes' },
