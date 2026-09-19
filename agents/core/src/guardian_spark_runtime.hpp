@@ -698,6 +698,18 @@ public:
     /// returns an incarnation strictly greater than the floor it reported -
     /// without needing log capture.
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> application_fence_for_test() const;
+    struct ArmReceipt;
+    /// #4508: read-only claims_ walk; W1 requires at most one candidate per rule.
+    [[nodiscard]] std::size_t wedge_candidate_count_for_test(const std::string& rule_id) const;
+    /// Requires both FIFO-front identity membership and is_wedge_candidate_locked.
+    /// Reuses only is_wedge_k_eligible_locked's membership shape, not its Dispatched
+    /// gate: is_retained_wedge (defined in the .cpp) also accepts Dispatching.
+    /// A refused, popped claim can retain every candidate field under a different
+    /// committed generation (CH-4); receipt history alone cannot prove membership.
+    /// False after adoption or pop even though receipt_status stays Wedged.
+    [[nodiscard]] bool receipt_wedge_candidate_for_test(const ArmReceipt& receipt) const;
+    /// Committed generation's active bit, or nullopt if absent (CH-3 W0 pin).
+    [[nodiscard]] std::optional<bool> rule_active_for_test(const std::string& rule_id) const;
     /// #3816 / rung 9c R5.2: an arm's completion callback found a live subscription
     /// nobody was left to adopt - the head's caller had already timed out and no
     /// queued sibling was still waiting - so it disarmed it (a bounded run() on the
@@ -788,19 +800,6 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
-    /// rung 9c PR-5d adversarial-review fault seam (Blocker 2, widened at Gate 7 to
-    /// cover Blocker 1's own reorder fix): consumed once by WHICHEVER of the two
-    /// wedged_by_rule_.insert_or_assign() call sites reaches it first -
-    /// abandon_claim_locked()'s dispatched (non-Queued), non-stopping path, OR
-    /// attach_core()'s Reobserved-restore branch. Throws std::bad_alloc where that
-    /// insert's node allocation would, BEFORE the site's own irreversible write
-    /// (abandon_claim_locked: release_claim_index_locked/waiter_abandoned/end;
-    /// attach_core: rg->active=true). Proves a throw at either site leaves its
-    /// claim completely untouched/retry-safe rather than stranding a partially-
-    /// abandoned or wrongly-reactivated, adoption-eligible claim with no locator
-    /// entry to find it. A test driving one site must not assume the other is
-    /// unconsumed - the flag is one-shot across BOTH.
-    void set_wedge_locator_fault_for_test(bool on) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
     /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
@@ -995,7 +994,7 @@ private:
     /// `eval`) races nothing.
     struct RuleGeneration {
         std::uint64_t generation{0};
-        bool active{true};            ///< registry_mu_-guarded; false once withdrawn / stopping
+        bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
         RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
@@ -1519,6 +1518,64 @@ private:
     /// read-only `claims_` lookup a caller already has the right to make.
     [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
+    /// registry_mu_ held. Exact generation ownership, including unpublished commits.
+    [[nodiscard]] bool generation_committed_locked(const KeyClaim& claim) const noexcept;
+    /// registry_mu_ held. W0 excludes rg shared with a committed generation.
+    [[nodiscard]] bool is_wedge_candidate_locked(const KeyClaim& claim) const noexcept;
+    /// registry_mu_ held. nullopt selects all rules; except preserves one claim.
+    /// Allocation-free walks over claims_, never over receipt-held history.
+    void deactivate_wedge_candidates_locked(std::optional<std::string_view> rule_id,
+                                            const KeyClaim* except) noexcept;
+    [[nodiscard]] bool wedge_candidate_exists_locked(std::optional<std::string_view> rule_id,
+                                                     const KeyClaim* except) const noexcept;
+    /// registry_mu_ held; caller has already swept wedge candidates for rule_id.
+    [[nodiscard]] std::shared_ptr<KeyClaim> withdraw_rule_after_wedge_sweep_locked(
+        const std::string& rule_id, std::string_view lifecycle_kind);
+    /// Called under registry_mu_ (from WedgeWithdrawalPostcondition's destructor,
+    /// which still holds it) - touches no `this` state itself, so it needs no
+    /// `_locked` suffix of its own despite running under the caller's lock.
+    /// spdlog::critical, try/catch-guarded - never throws, never masks the real
+    /// failure. Out-of-line so this header stays spdlog-free.
+    void log_wedge_withdrawal_postcondition_violation(
+        std::optional<std::string_view> rule_id) const noexcept;
+    /// #4508: postcondition tripwire for instance-5's shape (a #4508 predecessor
+    /// commit's own final fix: an early return or a reordered edit skipping the
+    /// sweep). Only the final assert()/abort is debug-only - it, alone, compiles
+    /// out under NDEBUG, though this repo leaves b_ndebug unset so it is live in
+    /// every buildtype this repo actually configures today. The scan that decides
+    /// whether to fire, and the breadcrumb logged immediately before it does, are
+    /// NOT conditional on NDEBUG and always run. NOT a release-build structural
+    /// guarantee even where the abort IS live: deleting this guard or calling
+    /// withdraw_rule_after_wedge_sweep_locked directly bypasses it silently.
+    /// Construct FIRST (before the sweep, before any withdrawal work) so its
+    /// destructor - which runs LAST, per reverse construction order - observes
+    /// every exit path (normal return, Case 0's early return, an unwind), still
+    /// under registry_mu_. Copy disabled: the guard is stack-scoped RAII, never
+    /// meant to be duplicated or outlive the call it guards (matches this file's
+    /// own CompensationPermit/RetainedGuard convention for a scope-owned guard).
+    struct WedgeWithdrawalPostcondition {
+        const GuardianSparkRuntime& runtime;
+        std::optional<std::string_view> rule_id;
+        WedgeWithdrawalPostcondition(const GuardianSparkRuntime& rt,
+                                     std::optional<std::string_view> rid) noexcept
+            : runtime(rt), rule_id(rid) {}
+        WedgeWithdrawalPostcondition(const WedgeWithdrawalPostcondition&) = delete;
+        WedgeWithdrawalPostcondition& operator=(const WedgeWithdrawalPostcondition&) = delete;
+        ~WedgeWithdrawalPostcondition() noexcept {
+            // sg-1 (governance Gate 6, sre): unlike #3388's routine-input-gap ruling
+            // (aa081485f) against a bare abort, this IS the right invariant to abort
+            // on - a survived candidate means real state corruption, not a modeled
+            // gap with a safe fallback. But a bare assert leaves no breadcrumb before
+            // the process dies, so log first (this file's own detach_sweep_left_
+            // residue_ precedent, :2668-2706) via an out-of-line .cpp helper (keeps
+            // spdlog out of this header, matching every other log call in this file).
+            const bool survived = runtime.wedge_candidate_exists_locked(rule_id, nullptr);
+            if (survived)
+                runtime.log_wedge_withdrawal_postcondition_violation(rule_id);
+            assert(!survived);
+        }
+    };
+
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
     /// rule's key ->0 edge) for the CALLER to submit off-lock once it unlocks - see
@@ -1864,90 +1921,26 @@ private:
     /// rung 9c R5.2: per-spark_key claim entries (registry_mu_-guarded, same as
     /// keys_/index_/rules_ above). See KeyClaim's doc; empty in steady state, an entry
     /// exists only while a key has an arm or disarm in flight, queued, or retained.
+    /// #4508: claims_ is ALSO the sole source of pending wedge adoption candidacy:
+    /// is_retained_wedge(c) && c.rg && c.rg->active && !generation_committed_locked(c).
+    /// Receipt history (end / waiter_abandoned) is independent of candidacy.
+    /// Commitment is identified by rules_' generation, not a second adopted bit;
+    /// non-adopted completion ends candidacy when the claim leaves claims_.
+    /// W0: candidacy writers never mutate a generation owned by rules_, including
+    /// adoption's shared rg during the commit-to-publication exception window.
+    /// W1: at most one candidate per rule_id, the last attached or re-observed.
+    /// Three writer sites preserve these invariants under registry_mu_:
+    /// - withdrawal sweeps all matching candidates before ordinary teardown;
+    /// - re-observation sweeps other candidates before restoring its own desire;
+    /// - abandonment yields to an existing candidate (the fresher desire).
+    /// Each walk is allocation-free and noexcept, with no cached locator to drift.
+    /// detach_rule_locked guards then sweeps before Case 0 can return or throw.
+    /// detach_all guards and sweeps once globally, then uses the pre-swept helper
+    /// for both withdrawal loops. Its debug postcondition runs on unwind too.
+    /// A receipt can outlive its claim's FIFO membership, so test accessors must
+    /// check that membership separately from the candidate predicate.
     std::unordered_map<std::string, KeyClaimQueue> claims_;
-    /// rung 9c PR-5d (concern 1, adoption): a locator from rule_id to its currently
-    /// wedged claim, if any - registry_mu_-guarded, same as claims_/rules_/index_
-    /// above. Populated by TWO sites, corrected here (this comment previously said
-    /// "Populated ONLY by abandon_claim_locked()", which is false and has been
-    /// since 2131dc973 ("Adversarial-review Blocker 1", rung 9c PR-5d) first gave
-    /// the Reobserved-restore branch its own insert_or_assign() - well before
-    /// 1cd9a0772, which only added a cross-key GUARD around that pre-existing
-    /// insert, not the insert itself; a pre-existing stale claim in this comment,
-    /// not introduced by either fix): (1) abandon_claim_locked() the instant a
-    /// claim's `end` settles to the sticky ClaimEnd::WaiterTimedOutDispatched
-    /// (never for a stopping-time abandonment - R5.5's disarm-unconditionally
-    /// policy never needs this); and (2) attach_core()'s Reobserved-restore branch,
-    /// which re-inserts a still-wedged claim an intervening detach_all() sweep (or
-    /// detach_rule_locked()) already erased from this map, the moment the SAME
-    /// (rule_id, spec) is genuinely reobserved - see that branch's own comment for
-    /// why reaching Reobserved is itself proof the rule is still desired. Exists
-    /// because a wedged claim is UNREACHABLE by any other lookup
-    /// detach_rule_locked()/detach_all() already have: it is neither in index_
-    /// (abandon_claim_locked releases that mapping unconditionally, before this map
-    /// is ever populated) nor in rules_ (it was never committed) - and
-    /// detach_rule_locked()'s own Case 0 FIFO scan deliberately EXCLUDES a
-    /// waiter_abandoned claim (see that function's own comment: "the search
-    /// excludes withdrawn AND abandoned claims"), which is exactly correct for
-    /// Case 0's own purpose but means a withdrawal of a purely-wedged rule_id
-    /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
-    /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
-    /// Erased (a) by detach_rule_locked() the moment it deactivates the entry's
-    /// rg->active - withdrawal ends the claim's adoption candidacy. Rung 9c PR-5d
-    /// (concern 1, 5th occurrence): this erasure runs UNCONDITIONALLY, FIRST,
-    /// before detach_rule_locked()'s own Case 0 FIFO scan even starts - not, as an
-    /// earlier version of this fix had it, only reached when Case 0 fell through
-    /// without matching anything (Case 0 `return nullptr;`s from inside its own
-    /// loop on a match, which used to skip this erasure entirely whenever a
-    /// DIFFERENT, non-abandoned claim for the same rule_id was live on another key
-    /// - see detach_rule_locked()'s own header comment for the reachable
-    /// interleaving and the proof the two blocks can never match the same claim);
-    /// erased likewise by detach_all()'s own equivalent, unconditional sweep;
-    /// (b) by on_arm_complete() the instant the wedge actually resolves (adopted
-    /// or not) - the episode is over either way and a stale entry must not
-    /// outlive the claim object it names; and (c) by
-    /// reclassify_dispatching_race_locked() when it corrects a claim's `end` away
-    /// from WaiterTimedOutDispatched (it is no longer a retained wedge once
-    /// that happens). Adversarial-review correction (rung 9c PR-5d follow-up):
-    /// a same-rule_id/same-spec Reobserved retry DOES reinstate a still-wedged
-    /// claim whose rg->active was deactivated by an intervening full-sync
-    /// detach_all() sweep - see attach_core()'s Reobserved branch, added as the
-    /// fix for exactly that case (a rule genuinely still desired must not
-    /// permanently lose adoption candidacy just because a routine retry's
-    /// blanket teardown ran first). Two narrower paths can still leave a stale
-    /// entry uncorrected today - a fault injected before on_arm_complete()'s
-    /// own erase at (b) (the `fault_here_for_test(1)` seam), and the compensating/
-    /// finalize path that pops a claim without consulting this map - both are
-    /// contained by the identity-check below: a STALE entry (one whose claim has
-    /// already resolved) is harmless because every consequential read
-    /// `.lock()`s and identity-checks it. External review correction (PR #4485,
-    /// fjarvis): a later same-rule wedge overwriting this map is NOT
-    /// automatically harmless the way a stale entry is - if the entry being
-    /// overwritten still names a LIVE, unresolved claim on a DIFFERENT key (an
-    /// ordinary flip-flop redeploy can wedge the same rule_id on two keys at
-    /// once), an unguarded overwrite orphans that live claim with no way for a
-    /// future withdrawal to ever find it again. Both of this map's writers now
-    /// guard against exactly this, in OPPOSITE directions, because the claim
-    /// each one is about to insert carries opposite provenance:
-    /// attach_core()'s Reobserved-restore branch inserts `pre_head`, a claim
-    /// just re-observed for the (rule_id, spec) the caller currently wants -
-    /// definitionally the desired claim - so it deactivates whatever DIFFERENT,
-    /// still-live claim it is about to DISPLACE, then overwrites the entry
-    /// unconditionally; abandon_claim_locked()'s wedge branch inserts `claim`, a
-    /// claim that just TIMED OUT and carries no such signal, so instead it
-    /// checks whether the map already names a different, still-live claim (that
-    /// occupant can only have arrived via a LATER attach_core() call, so it is
-    /// provably the fresher generation) and, if so, deactivates the INCOMING
-    /// `claim` and leaves the map's existing entry untouched rather than
-    /// overwriting it. See each call site's own comment for the full
-    /// interleaving and the fallible-first ordering that makes each guard
-    /// retry-safe under an insert-time throw.
-    /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
-    /// claim alive after claims_ itself has already dropped it (a defensive
-    /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on
-    /// some future edit, including the two known-stale paths just named) - a
-    /// caller consulting this map .lock()s it and treats a dead weak_ptr
-    /// exactly like "not found".
-    std::unordered_map<std::string, std::weak_ptr<KeyClaim>> wedged_by_rule_;
+
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
     /// and production has at most one waiter at a time (GuardianEngine's mtx_); the
@@ -2098,16 +2091,6 @@ private:
         if (claim.dispatch == ClaimDispatch::Dispatching &&
             claim.end == ClaimEnd::WaiterTimedOutDispatched) {
             claim.end = real_end;
-            // Adversarial-review minor fix (rung 9c PR-5d follow-up): this claim
-            // is no longer a retained wedge once `end` is corrected away from
-            // WaiterTimedOutDispatched - drop its wedged_by_rule_ entry too, so
-            // "erased the instant the wedge resolves" holds here as well, not
-            // only on the ordinary on_arm_complete path. Identity-checked: only
-            // erase if the map still points at THIS claim (a same-rule_id
-            // re-wedge could already have overwritten the entry).
-            if (const auto wit = wedged_by_rule_.find(claim.rule_id);
-                wit != wedged_by_rule_.end() && wit->second.lock().get() == &claim)
-                wedged_by_rule_.erase(wit);
         }
     }
     /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
@@ -2151,7 +2134,6 @@ private:
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
-    std::atomic<bool> wedge_locator_fault_for_test_{false}; ///< see the setter
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
     std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
     /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
@@ -2168,11 +2150,6 @@ private:
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {
         if (detach_fault_for_test_.exchange(false))
-            throw std::bad_alloc{};
-    }
-    /// Seam body for set_wedge_locator_fault_for_test; consumed once.
-    void wedge_locator_fault_here_for_test() {
-        if (wedge_locator_fault_for_test_.exchange(false))
             throw std::bad_alloc{};
     }
 
