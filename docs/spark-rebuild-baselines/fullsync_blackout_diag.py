@@ -914,7 +914,18 @@ def collect_t2(t0_ts, t0d, window_start_ts, own_push_raw, expected_rule_ids, bac
     t2_incomplete/repush_confound are decided only after the polling deadline
     is exhausted (see resolve_collect_t2_reason() for the reason precedence
     itself, checked every iteration so fence_violation/double_full_sync can
-    never be masked by continuing to poll)."""
+    never be masked by continuing to poll).
+
+    Accepted residual limitation (/governance quality-engineer, Gate 8 round
+    2, same class already accepted for run_repeat()'s own call to
+    resolve_post_t2_void()): this function does live SSH/network I/O
+    (_fetch_window, time.sleep) and has no offline selftest coverage, so a
+    future edit that reorders THIS loop's own two-line early-return check
+    relative to resolve_collect_t2_reason() would go undetected by selftest
+    even though resolve_collect_t2_reason() itself is directly, thoroughly
+    fixture-tested (F18). Kept minimal deliberately (one function call, one
+    membership check) specifically to keep that residual risk as small as
+    it can be made without a live-rig integration test."""
     deadline = time.time() + visibility_timeout_s
     result, last_events = None, []
     while time.time() < deadline:
@@ -934,13 +945,28 @@ def collect_t2(t0_ts, t0d, window_start_ts, own_push_raw, expected_rule_ids, bac
     return result, resolve_collect_t2_reason(result), last_events
 
 
+def resolve_sweep_reclassification(fence_violated, still_missing):
+    """Pure: given sweep_row_pure()'s three-way result for one previously-
+    t2_incomplete row, decide its reclassification. Fence-violation-first,
+    same precedence family as resolve_collect_t2_reason()/
+    resolve_post_t2_void() (/governance quality-engineer, Gate 8 round 2:
+    the branch ORDER itself - not just sweep_row_pure()'s fence_violated
+    computation - is what UP-2's fix actually depends on, and nothing
+    exercised that order directly until this extraction; sweep_incomplete()
+    is a live-I/O wrapper like run_repeat()/collect_t2(), so this mirrors
+    the same "extract the decision into a pure function" fix already applied
+    to both). Returns (void_class, void_reason)."""
+    if fence_violated:
+        return "genuine", "fence_violation"
+    if not still_missing:
+        return "instrument", "t2_late"
+    return "genuine", "arm_never_confirmed"
+
+
 def sweep_incomplete(rows, window_start_ts):
     """R5.7 §2.2 item 8: one final, patient read of the whole log span at the
-    end of a cmd_run() invocation, reclassifying every t2_incomplete row into
-    fence_violation (genuine, takes precedence over the other two - see
-    sweep_row_pure()'s fence_violated return), t2_late (found on the second
-    look - instrument-invalid), or arm_never_confirmed (still missing -
-    genuine)."""
+    end of a cmd_run() invocation, reclassifying every t2_incomplete row per
+    resolve_sweep_reclassification()."""
     incomplete = [r for r in rows if r.get("void_reason") == "t2_incomplete"]
     if not incomplete:
         return rows
@@ -952,13 +978,14 @@ def sweep_incomplete(rows, window_start_ts):
         found, still_missing, fence_violated = sweep_row_pure(
             events, r["t0d"]["epoch"], r["t0d"]["floor"], set(r["missing_rule_ids"]),
             r["backend"], t0_ts, t0d_ts, own_push_raw)
-        if fence_violated:
-            r["void_class"], r["void_reason"] = "genuine", "fence_violation"
-        elif not still_missing:
+        r["void_class"], r["void_reason"] = resolve_sweep_reclassification(
+            fence_violated, still_missing)
+        if r["void_reason"] == "t2_late":
             for rid, v in found.items():
                 r["t2_selected"][rid] = {**v, "ts": v["ts"].isoformat()}
             r["missing_rule_ids"] = []
-            r["void_class"], r["void_reason"] = "instrument", "t2_late"
+        elif r["void_reason"] == "arm_never_confirmed":
+            r["missing_rule_ids"] = still_missing
         else:
             r["missing_rule_ids"] = still_missing
             r["void_class"], r["void_reason"] = "genuine", "arm_never_confirmed"
@@ -1873,12 +1900,30 @@ def _f19():
             f"instrument_classify_correct={ok5} dynamic_prefix_default_instrument={ok6}")
 
 
+def _f20():
+    # resolve_sweep_reclassification()'s branch order (/governance
+    # quality-engineer, Gate 8 round 2): fence_violation must win over BOTH
+    # t2_late and arm_never_confirmed, exactly like the two sibling
+    # precedence functions. Direct pure-function test, all three outcomes
+    # plus the one that matters most - fence_violated=True even when
+    # still_missing is ALSO empty (the exact UP-2 masking shape: a rule_id
+    # both rejected for a fence violation AND found via a different valid
+    # line must not read t2_late just because still_missing ended up empty).
+    ok1 = resolve_sweep_reclassification(True, []) == ("genuine", "fence_violation")
+    ok2 = resolve_sweep_reclassification(True, ["r1"]) == ("genuine", "fence_violation")
+    ok3 = resolve_sweep_reclassification(False, []) == ("instrument", "t2_late")
+    ok4 = resolve_sweep_reclassification(False, ["r1"]) == ("genuine", "arm_never_confirmed")
+    return (ok1 and ok2 and ok3 and ok4,
+            f"fence_violated_wins_even_when_found={ok1} fence_violated_wins_when_still_missing={ok2} "
+            f"t2_late_when_clean={ok3} arm_never_confirmed_when_missing={ok4}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
-        ("F19", _f19),
+        ("F19", _f19), ("F20", _f20),
     ]
     failures = 0
     for name, fn in fixtures:

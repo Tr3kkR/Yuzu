@@ -9,5 +9,8 @@
   '<id>' (epoch=, incarnation=, type=, via=, attach_to_commit_ms=)` line as its last statement.
   Both lines are the runtime-side confirmation the `#3990` diagnostic's T2 measurand reads -
   the existing `SparkEngine: armed` log fires before the OS watch call even runs and is not a
-  valid proxy. No behavioral change; purely additive logging plus one new counter, firewalled
-  against the same rollback paths the existing lifecycle-audit enqueue already is.
+  valid proxy. No change to detection/enforcement behavior; purely additive logging plus one new
+  counter, firewalled against the same rollback paths the existing lifecycle-audit enqueue
+  already is. The T0d line IS always-on in the default fleet (`detach_all()` fires on every
+  `full_sync` regardless of `prefer_spark_`, since `spark_runtime_` is constructed unconditionally
+  at boot) - one new INFO-level line per `full_sync`, counts and an epoch only, no PII.

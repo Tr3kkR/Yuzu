@@ -810,7 +810,10 @@ was wrong). The table, verdict, and analysis below reflect the corrected classif
 Legacy C values: 66.0, 82.0, 65.0 ms - clean, no voids, matches Phase B's legacy figures
 closely. Spark reached its 10-attempt cap with only 2 valid repeats (C = 92.0, 88.0 ms, both
 consistent with Phase B's spark C figures where they did land). Of the other 8 attempts: 7
-(`t1_not_found`) never reached T1 and carry no T2 evidence either way; the 8th (repeat 3)
+(`t1_not_found`, governance `sre` finding, this run: the same known `--log-file` flush-lag
+mechanism documented above for the earlier 2026-09-06/07 round, not a new cause - worth finally
+filing that deferred product issue given it has now cost two separate measurement rounds real
+rig time) never reached T1 and carry no T2 evidence either way; the 8th (repeat 3)
 **did** reach T1 and **did** commit 61 of its 62 expected arms (`t2_selected` has 61 entries),
 but `apply_rules()` itself reported `failed=1` for the one remaining rule, `blackout-file-03` -
 a genuine, backend-self-reported arm failure, not an absence of evidence.
@@ -826,7 +829,13 @@ DGRHP rig was unreachable by the time this was found (SSH session had already en
 raw `agent.log` line for that specific failure (which would name the underlying error) could
 not be pulled. Recorded as an open, unresolved product-level finding per the pre-registered
 rule ("any genuine failure... is filed as its own product finding separate from this
-diagnostic") - not root-caused, not dismissed as instrumentation.
+diagnostic") - not root-caused, not dismissed as instrumentation. **Not filed as its own issue
+yet** - a draft is ready (governance `enterprise-readiness` finding, this run) but issue creation
+needs operator action; cross-reference the issue number here once filed. **Observability gap,
+noted here for whoever picks this up (governance `sre` finding, this run)**: `yuzu.guardian_arm_failed`
+(`yuzu_fleet_guardian_arm_failed`) is an existing production metric that would have counted
+exactly this failure, but no alert rule exists on it in `docs/prometheus/yuzu-alerts.yml` today -
+worth adding one alongside the root-cause investigation, since the plumbing already exists.
 
 **Verdict: FAIL-RELIABILITY.** The reliability gate is "zero genuine-failure attempts... counting
 EVERY attempt" (not just counted repeats); repeat 3's `failed_gt_0` breaks it outright, and per
