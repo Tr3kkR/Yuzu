@@ -81,8 +81,8 @@ is no "prior state" for these types to compare against, so "already true at arm 
 arm event itself); on an edge-producing type (`service`, `disk`, `plist`, `process` — the types whose
 `SparkData` carries a real payload, `ServiceSparkData`/`DiskSparkData` today) it fires only if the
 persisted condition is already in the "true" state at arm time — `disk` fires only on a valid
-`Breach` reading, never unconditionally at arm, exactly like every other edge type — as described
-earlier in this document.
+`Breach` reading, never unconditionally at arm, exactly like every other edge type — see "Spark types
+and per-type facts" below for the full per-type edge-value table.
 
 ## Substitution tokens (closed list)
 
@@ -222,19 +222,27 @@ approving through their own second API token must not satisfy this gate, and R9'
 responsible for resolving every identity surface (session, API token, MCP principal) back to the
 underlying human before comparing. Approval is bound to a **canonical digest**
 (`canonical_reflex_digest(spec_json, assignment)`) — SHA-256 over key-sorted `spec_json` plus the
-**resolved device-id list the assignment expands to at digest-compute time**, sorted and deduplicated,
-not the raw group/tag reference alone. Editing a Reaction's params, or a management-group membership
-change that alters the resolved id list, invalidates the approval; see "Device-set binding, re-tag,
-and membership drift" below.
+**resolved device-id list the assignment expands to at digest-compute time** (the same "resolved
+device set" named throughout this section, expressed here as its sorted, deduplicated id list — the
+literal bytes hashed), not the raw group/tag reference alone. Editing a Reaction's params, or a
+management-group membership change that alters the resolved id list, invalidates the approval; see
+"Device-set binding, re-tag, and membership drift" below.
 
 **The approval REQUEST carries the digest the reviewer actually reviewed, and the server rejects on
-drift.** If the content changes between review and approve (an editor saves a new version mid-review),
-the approval call's digest no longer matches the row's *current* digest, and the server returns a
-`409` — approving stale content is not silently accepted as approving the current row. The digest is
-also **recomputed and compared at every compile** (`reflex_push_builder.cpp`), fail-closed on
-mismatch or absence: see "Generation, undeploy, and push semantics" below for the exact push-time refusal
-behavior (a stale/invalid-digest set is never silently downgraded, and a `reflex.set.compile_refused`
-critical audit event fires).
+drift.** **Decision, stated here because the symmetric digest formula above makes it load-bearing and
+not previously settled: the approve-time comparison MUST be a live recompute** — over the row's
+current `spec_json` AND a fresh resolution of the assignment's current device-id list — **never a
+read back of a stored value**, so drift is caught from either source: an editor saving a new version
+mid-review (a content edit), or a management-group membership change landing mid-review with no
+content edit at all. Either way the approval call's digest no longer matches this live recomputation,
+and the server returns a `409` — approving stale content, or a stale device-id list, is not silently
+accepted as approving the current row. **A membership-resolution failure during this live recompute is
+an evaluation error, refused, never a silent approve** — the same posture D4 takes on an unreadable
+`TagStore` (see "Consent gate (D4)" below), applied here to the resolution this digest now depends on.
+The digest is also **recomputed and compared at every compile** (`reflex_push_builder.cpp`),
+fail-closed on mismatch or absence: see "Generation, undeploy, and push semantics" below for the exact
+push-time refusal behavior (a stale/invalid-digest set is never silently downgraded, and a
+`reflex.set.compile_refused` critical audit event fires).
 
 **Break-glass is a NEW `ApprovalManager` capability, not an existing one Reflex merely reuses.**
 Today's `ApprovalManager` has no emergency single-principal override, no `justification` field, and
@@ -335,6 +343,34 @@ re-evaluated, and if it no longer holds, the set is **disarmed** on the affected
 explicit removal push described in "Generation, undeploy, and push semantics" below (a
 generation-advancing removal, never a compile-refusal HOLD, and never left silently armed under a
 now-false consent basis).
+
+**A device that leaves the resolved set entirely must not be treated as one of Rule 1's "affected
+agents" — this is a REQUIREMENT this document states, not a behavior Rule 1's text above already
+guarantees on its own.** Removing a device from scope can only preserve or vacuously satisfy D4's
+"every resolved target device satisfies `device_class == 'server'`" gate — it can never break it —
+so a pure shrink cannot reach Rule 2's consent-loss removal path, and per the paragraph above it DOES
+trigger Rule 1's digest-mismatch HOLD for the set's remaining, still-in-scope devices. Rule 1(a)'s
+"resend the prior, still-valid `full_sync` snapshot" **must be a per-agent rebuild of the set's
+last-approved content against CURRENT targeting, never a literal replay of a stored artifact to its
+original recipient list** — `reflex.proto`'s `ReflexSet` comment ("the server resolves the assignment
+to a concrete device set BEFORE building this message") describes the ordinary, never-refused compile
+path; R9 must implement the HOLD path so it re-resolves targeting the same way, never reusing a
+recipient list captured at the set's last successful compile. Under that requirement, a departed
+device is excluded from its own next push-build because it is no longer re-resolved as a target, not
+because the HOLD mechanism itself skips it — it must never be left running the set on stale,
+unreviewed grounds merely because HOLD is keeping the set alive for devices still in scope.
+
+**Acknowledged gap this document does not close: no trigger or time bound is stated for when the
+departed device's own next push-build actually happens.** The requirement above says what that
+push-build must do when it runs, not what makes it run. A membership change unconditionally triggers
+a recompile of the affected Reflex Set (stated above), but that recompile's HOLD outcome is about the
+set's remaining, still-in-scope devices — it says nothing about scheduling a push-build for the
+departed device specifically. If no other event happens to produce one (background reconcile,
+heartbeat-driven `get_status` round-trip, or some other push-build cause R9 defines), a departed
+device could in principle go unrevisited indefinitely, the same open-ended shape as the offline
+residual window below, but reachable here even while fully online. R9 must name a concrete trigger (or
+bound) for the departed device's own next push-build, or treat this identically to the acknowledged
+offline gap below; this document does not pre-decide which.
 
 **`device_class` write authorization.** Because `device_class` is the sole input to this
 safety-relevant compiler gate, setting or changing it is **not** a bare `Tag:Write` operation — it
@@ -464,11 +500,14 @@ now-false basis).** The two causes are split:
    message contains**, so a refused set silently *omitted* from a `full_sync=true` push would be
    *disarmed*, not held — the server therefore does **not** advance to a new `full_sync=true`
    snapshot for the affected agents at all while a refusal is outstanding. It either (a) resends the
-   prior, still-valid `full_sync` snapshot (the refused set is correctly absent because it was never
-   in a valid snapshot to begin with) or (b) sends a `full_sync=false` delta that omits the refused
-   set_id from both `sets` and `removed_set_ids` (see below) — the delta's own omission convention
-   ("absent = untouched") leaves it held exactly as last applied. R9 picks one of (a)/(b) and states
-   it in its own implementation notes.
+   prior, still-valid `full_sync` snapshot — **a per-agent rebuild against CURRENT targeting, never a
+   literal replay of a stored artifact to its original recipient list** (see "Device-set binding,
+   re-tag, and membership drift" above for why this distinction is load-bearing on a shrink) — (the
+   refused set is correctly absent because it was never in a valid snapshot to begin with) or
+   (b) sends a `full_sync=false` delta that omits the refused set_id from both `sets` and
+   `removed_set_ids` (see below) — the delta's own omission convention ("absent = untouched") leaves
+   it held exactly as last applied. R9 picks one of (a)/(b) and states it in its own implementation
+   notes.
 2. **Consent loss (a re-tag or membership change that makes a previously-consented, already-armed
    set's consent basis false — D4 above) or an explicit undeploy is a REMOVAL, never a hold.** The
    server sends an explicit removal push that **advances the generation** and disarms exactly that
@@ -483,15 +522,19 @@ now-false basis).** The two causes are split:
    different causes are active on the same agent at once.
 
 **Consent-loss disarm has a real, acknowledged residual window while a device is offline — "the
-moment its consent basis becomes false" above describes how promptly the SERVER reacts to the
-triggering re-tag or membership change (it queues the disarming push right away), not when the
-DEVICE actually stops.** The sole delivery mechanism for the disarm is the removal push described in
-this section; v1 has no agent-side consent lease, expiry, or dequeue-time recheck. An agent that is
-offline when its consent basis turns false keeps running its previously-armed dangerous Reaction,
-unchanged, until it reconnects and applies the removal. This is a genuine gap on D4 — the platform's
-headline consent guarantee, not an ordinary admin-scope decision — and it is unresolved here, not
-merely restated push latency: closing it (an agent-side lease/expiry, or narrowing the "moment" claim
-above to explicitly cover only connected devices) is future design work, not decided by this
+moment its consent basis becomes false" above describes how the trigger is handled server-side (the
+re-tag or membership change is picked up and the disarming push queued without added delay of its
+own), not when the DEVICE actually stops.** For THIS disarm path (a still-in-scope device whose D4
+consent basis turns false), the removal push described in this section is the sole delivery
+mechanism — a distinct case from the departed-device/HOLD scenario above, which disarms by
+exclusion-from-targeting rather than by a removal push; v1 has no agent-side consent lease, expiry,
+or dequeue-time recheck.
+An agent that is offline when its consent basis turns false keeps running its previously-armed
+dangerous Reaction, unchanged, until it reconnects and applies the removal. This is a genuine gap on
+D4 — the platform's headline consent guarantee, not an ordinary operational trade-off elsewhere in the
+platform. It is unresolved here — this is not merely a restatement of ordinary push latency. Closing
+it (an agent-side lease/expiry, or narrowing the "moment" claim above to explicitly cover only
+connected devices) is future design work, not decided by this
 document.
 
 - **Identical generation is a no-op.** If the agent's already-applied generation matches the
