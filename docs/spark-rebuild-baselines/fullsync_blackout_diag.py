@@ -250,7 +250,17 @@ def ssh_ps(cmd_ps1, timeout=30):
     stdout = r.stdout.decode("utf-8", errors="replace")
     stderr = r.stderr.decode("utf-8", errors="replace")
     if r.returncode != 0 and not stdout:
-        raise RuntimeError(f"ssh_ps failed rc={r.returncode}: {stderr[:500]}")
+        # Governance (Gate 8 re-review, security-guardian): this raise has the identical
+        # leak shape the TimeoutExpired fix above closed - OpenSSH's own connection/auth
+        # failure text (destination host, "Load key '<path>': ...") lands in `stderr` on
+        # exactly the failures this branch exists to report, and that text used to flow
+        # straight into the same str(e)[:200] call sites the TimeoutExpired fix was
+        # supposed to make uniformly safe. Print the raw stderr locally (console only,
+        # never committed) for whoever is actually debugging the rig; raise a sanitized
+        # message - just the return code - so every downstream void_reason site stays
+        # safe without needing its own fix.
+        print(f"[ssh_ps] rc={r.returncode} stderr: {stderr[:500]}", file=sys.stderr)
+        raise RuntimeError(f"ssh_ps failed rc={r.returncode}")
     return stdout
 
 
@@ -1595,6 +1605,14 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
               f"will not recover it. Re-run the measurement if the correction matters.",
               file=sys.stderr)
         return 1
+    # Governance (Gate 8 re-review, unhappy-path): explicitly restating the residual this
+    # check does NOT close, since the prior code's own comment naming it was dropped when
+    # this check replaced the bare line count - this fingerprint check narrows the
+    # concurrent-writer race to the gap between THIS check and the os.replace() swap two
+    # lines below; it is not a full lock. A third writer landing in that specific
+    # (small, unlocked) window still escapes detection. Acceptable under this tool's
+    # documented single-operator usage model; real locking would be needed if concurrent
+    # invocation becomes a real, expected usage pattern rather than an operator mistake.
     tmp_path = f"{out_path}.tmp-{os.getpid()}"
     with open(tmp_path, "w") as f:
         f.writelines(lines)
@@ -2428,13 +2446,33 @@ def _f22():
         row_c = base_row("blackout-reg-03")
         out_saturated = sweep_incomplete([row_c], window_start)
         saturated_ok = out_saturated[0]["void_reason"] == "t2_incomplete"
+
+        # Case D (Gate 8 re-review, quality-engineer + unhappy-path, independently: cases
+        # A-C each call sweep_incomplete() with a single-row list, so a regression to a
+        # BLANKET per-call check - "any row truncated -> skip the whole sweep", the exact
+        # shape the original broken attempt at this fix had - would still pass all three.
+        # This case puts an EARLY row (truncated: its own t0d_ts precedes the fetch's
+        # earliest event) and a LATER row (not truncated) in ONE sweep_incomplete() call
+        # and asserts they resolve independently - only a genuinely PER-ROW check can
+        # pass this.
+        row_early = base_row("blackout-reg-04")
+        row_early["t0d"] = {"ts": "2026-09-19T10:00:00.010+00:00", "epoch": 1, "floor": 5}
+        row_late = base_row("blackout-reg-05")
+        row_late["t0d"] = {"ts": "2026-09-19T10:00:20.000+00:00", "epoch": 1, "floor": 5}
+        mixed_events = [_ev("2026-09-19 10:00:15.000", "unrelated line")]
+        _fetch_window = lambda _ws: (mixed_events, 1000)  # noqa: E731
+        out_mixed = sweep_incomplete([row_early, row_late], window_start)
+        mixed_early_still_incomplete = out_mixed[0]["void_reason"] == "t2_incomplete"
+        mixed_late_reclassified = out_mixed[1]["void_reason"] == "arm_never_confirmed"
+        mixed_ok = mixed_early_still_incomplete and mixed_late_reclassified
     finally:
         _fetch_window = orig_fetch_window
 
-    ok = fence_ok and missing_ok and saturated_ok
+    ok = fence_ok and missing_ok and saturated_ok and mixed_ok
     return (ok, f"fence_violation_survives_sweep_incomplete={fence_ok} "
                 f"arm_never_confirmed_still_correct={missing_ok} "
-                f"saturated_tail_skips_reclassification={saturated_ok}")
+                f"saturated_tail_skips_reclassification={saturated_ok} "
+                f"per_row_not_blanket_in_mixed_batch={mixed_ok}")
 
 
 def _f23():
