@@ -1407,7 +1407,13 @@ void SparkEngine::start() {
     // is always long gone before the guard ever runs. Do not move this declaration
     // into the `lk` block, even for a specific narrower-looking failure site.
     bool rollback_armed = false;
-    ScopeExit rollback([this, &rollback_armed]() noexcept {
+    // Brace-init, not parens (Gate 3 cpp-expert, 2026-09-19): the two sibling
+    // ScopeExit copies (agent.cpp, api_token_store.cpp) both deliberately use
+    // `ScopeExit name{lambda}` rather than `ScopeExit name(lambda)` — parenthesized
+    // aggregate-init is a distinct C++20 feature (P0960) from the deduction guide
+    // itself, and this file has not yet been compiled on Windows/macOS. Brace-init
+    // has no such version dependency; match the established, verified-safe form.
+    ScopeExit rollback{[this, &rollback_armed]() noexcept {
         if (!rollback_armed)
             return;
         // A destructor must never let an exception escape mid-unwind (std::terminate
@@ -1428,7 +1434,7 @@ void SparkEngine::start() {
             } catch (...) {
             }
         }
-    });
+    }};
     {
         std::lock_guard lk(mu_);
         if (running_ || stopped_) {
