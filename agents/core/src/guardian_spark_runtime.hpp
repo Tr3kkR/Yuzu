@@ -1531,16 +1531,21 @@ private:
     /// registry_mu_ held; caller has already swept wedge candidates for rule_id.
     [[nodiscard]] std::shared_ptr<KeyClaim> withdraw_rule_after_wedge_sweep_locked(
         const std::string& rule_id, std::string_view lifecycle_kind);
-    /// registry_mu_ held (called from WedgeWithdrawalPostcondition's destructor,
-    /// still under the lock). spdlog::critical, try/catch-guarded - never throws,
-    /// never masks the real failure. Out-of-line so this header stays spdlog-free.
+    /// Called under registry_mu_ (from WedgeWithdrawalPostcondition's destructor,
+    /// which still holds it) - touches no `this` state itself, so it needs no
+    /// `_locked` suffix of its own despite running under the caller's lock.
+    /// spdlog::critical, try/catch-guarded - never throws, never masks the real
+    /// failure. Out-of-line so this header stays spdlog-free.
     void log_wedge_withdrawal_postcondition_violation(
         std::optional<std::string_view> rule_id) const noexcept;
-    /// #4508: debug-only postcondition tripwire for instance-5's shape (an early
-    /// return or a reordered edit skipping the sweep). Plain assert() - compiles
+    /// #4508: postcondition tripwire for instance-5's shape (a #4508 predecessor
+    /// commit's own final fix: an early return or a reordered edit skipping the
+    /// sweep). Only the final assert()/abort is debug-only - it, alone, compiles
     /// out under NDEBUG, though this repo leaves b_ndebug unset so it is live in
-    /// every buildtype this repo actually configures today. NOT a release-build
-    /// structural guarantee: deleting this guard or calling
+    /// every buildtype this repo actually configures today. The scan that decides
+    /// whether to fire, and the breadcrumb logged immediately before it does, are
+    /// NOT conditional on NDEBUG and always run. NOT a release-build structural
+    /// guarantee even where the abort IS live: deleting this guard or calling
     /// withdraw_rule_after_wedge_sweep_locked directly bypasses it silently.
     /// Construct FIRST (before the sweep, before any withdrawal work) so its
     /// destructor - which runs LAST, per reverse construction order - observes
