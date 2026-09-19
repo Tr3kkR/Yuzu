@@ -138,7 +138,8 @@ NETWORK_CONNECTED_RE = re.compile(r"Guardian engine network-connected")
 # Void taxonomy (R5.7 round 2, §2.2 item 3). Instrument-invalid: the instrument, not the
 # system, failed - reported, never counted, never held against reliability. Genuine failure:
 # the system did not do what the push asked - counts against the phase's reliability gate AND
-# is a product finding. `trigger_failed:*` is matched by prefix, not listed here.
+# is a product finding. `void_class_for` has no prefix matching: `trigger_failed:<msg>` (like
+# any other reason not listed in GENUINE_FAILURE_REASONS) classifies instrument by default.
 INSTRUMENT_INVALID_REASONS = frozenset({
     "t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete", "t2_late",
     "log_rotated_mid_window", "trigger_not_created", "repush_confound",
@@ -155,6 +156,17 @@ def void_class_for(reason):
     if reason in GENUINE_FAILURE_REASONS:
         return "genuine"
     return "instrument"
+
+
+def genuine_t1_failure(phase, failed):
+    """Pure: does this attempt's own T1-reported `failed` count override any
+    LATER collection-stage void reason? R5.7 adversarial-review fix (both
+    reviewers independently probed this live) - `run_repeat` must check this
+    before `collect_t2`'s own void `reason`, never after, or a genuine
+    backend-reported arm failure can be laundered into an instrument-invalid
+    void just because the same window also saw an unrelated collection-stage
+    confound (found live: R5.7 T2 re-run, Phase B2 spark repeat 3)."""
+    return "failed_gt_0" if phase in ("B", "B2") and failed > 0 else None
 
 
 # --------------------------------------------------------------------------
@@ -679,32 +691,25 @@ def check_teardown_size(t0d, backend, expected_n):
     return "teardown_size_mismatch" if t0d["detached_rules"] != expected_detached else None
 
 
-def sweep_row_pure(events, epoch, missing_rule_ids, backend, t0d_ts):
+def sweep_row_pure(events, epoch, floor, missing_rule_ids, backend, t0_ts, t0d_ts, own_push_raw):
     """Post-invocation sweep core: a second, patient look at a fuller log
     span for rule_ids a repeat's own bounded T2 collection never found.
-    Same epoch-identity rule as classify_t2. Returns (found{rid:{...}},
-    still_missing[rid,...])."""
-    found = {}
-    for p in events:
-        if p["ts"] < t0d_ts:
-            continue
-        if backend == "spark":
-            m2 = T2_RE.search(p["msg"])
-            if m2:
-                rid, epoch_s, inc_s, typ, via, ms_s = m2.groups()
-                if (int(epoch_s) == epoch and rid in missing_rule_ids
-                        and via != "callback-adopt"
-                        and (rid not in found or p["ts"] < found[rid]["ts"])):
-                    found[rid] = {"ts": p["ts"], "incarnation": int(inc_s), "type": typ,
-                                   "via": via, "attach_to_commit_ms": int(ms_s)}
-        else:
-            mL = ARM_LEGACY_RE.search(p["msg"])
-            if mL and mL.group(1) in missing_rule_ids:
-                rid = mL.group(1)
-                if rid not in found or p["ts"] < found[rid]["ts"]:
-                    found[rid] = {"ts": p["ts"]}
-    still_missing = sorted(set(missing_rule_ids) - set(found))
-    return found, still_missing
+
+    R5.7 adversarial-review fix (both reviewers independently probed this,
+    two directions): the original hand-rolled scan diverged from
+    classify_t2's membership predicate in both directions - no
+    next-application upper bound on the legacy branch (so a LATER
+    application's arm for the same fixed cohort rule_id could be attributed
+    to this, earlier, repeat), and no floor/adopt handling on the spark
+    branch (so it accepted a below-floor non-adopt line classify_t2 would
+    reject as fence_violation_below_floor, and rejected a legal below-floor
+    callback-adopt line classify_t2 accepts). Reusing classify_t2 itself,
+    scoped to just the missing rule_ids, makes the sweep's membership rule
+    identical to the primary classifier's by construction - not merely
+    documented as identical, which is what the docstring claimed before this
+    fix and was not true. Returns (found{rid:{...}}, still_missing[rid,...])."""
+    result = classify_t2(events, epoch, floor, missing_rule_ids, own_push_raw, backend, t0_ts, t0d_ts)
+    return result["selected"], result["missing"]
 
 
 def compute_window_math(t0_ts, t0d_ts, t1_ts, selected):
@@ -738,6 +743,20 @@ def compute_window_math(t0_ts, t0d_ts, t1_ts, selected):
     }
 
 
+def _instrument_void_ceiling_breached(rows):
+    """R5.7 adversarial-review fix (both reviewers independently probed this
+    live: 3 valid + 4 instrument-invalid rows returned PASS): compute_verdict
+    previously had no code path implementing the pre-registered rule
+    (3990-fullsync-blackout-run.md §"Verdict per phase" item 2) that a cell
+    whose instrument-invalid voids exceed 50% of its own attempts is
+    INCONCLUSIVE, never PASS, regardless of whether the valid count also
+    happens to reach the floor. Empty cell -> no ceiling to breach."""
+    if not rows:
+        return False
+    instrument = sum(1 for r in rows if r.get("void_class") == "instrument")
+    return instrument * 2 > len(rows)
+
+
 def compute_verdict(legacy_rows, spark_rows, floor):
     """§7 two-gate verdict: reliability (ALL attempts, both cells) then
     latency (counted repeats only), margin = max(1000ms, legacy median)."""
@@ -746,6 +765,8 @@ def compute_verdict(legacy_rows, spark_rows, floor):
     genuine = any(r.get("void_class") == "genuine" for r in legacy_rows + spark_rows)
     if genuine:
         return "FAIL-RELIABILITY"
+    if _instrument_void_ceiling_breached(legacy_rows) or _instrument_void_ceiling_breached(spark_rows):
+        return "INCONCLUSIVE"
     if len(legacy_valid) < floor or len(spark_valid) < floor:
         return "INCONCLUSIVE"
     legacy_c = statistics.median(r["c_ms"] for r in legacy_valid)
@@ -849,9 +870,12 @@ def sweep_incomplete(rows, window_start_ts):
         return rows
     events, _ = _fetch_window(window_start_ts)
     for r in incomplete:
+        t0_ts = datetime.fromisoformat(r["t0"])
         t0d_ts = datetime.fromisoformat(r["t0d"]["ts"])
+        own_push_raw = find_own_push_cmd_raw(events, t0_ts)
         found, still_missing = sweep_row_pure(
-            events, r["t0d"]["epoch"], set(r["missing_rule_ids"]), r["backend"], t0d_ts)
+            events, r["t0d"]["epoch"], r["t0d"]["floor"], set(r["missing_rule_ids"]),
+            r["backend"], t0_ts, t0d_ts, own_push_raw)
         if not still_missing:
             for rid, v in found.items():
                 r["t2_selected"][rid] = {**v, "ts": v["ts"].isoformat()}
@@ -1023,6 +1047,13 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         sum(1 for p in last_events if p["ts"] >= t0["ts"] and ARM_SPARK_RE.search(p["msg"]))
         if backend == "spark" else len(result["selected"])
     )
+    # A collection-stage instrument-invalid `reason` (e.g. double_full_sync,
+    # t2_incomplete) must never suppress an ALREADY-known genuine failure -
+    # genuine_t1_failure()'s own docstring has the full rationale.
+    t1_genuine_reason = genuine_t1_failure(phase, failed)
+    if t1_genuine_reason:
+        row.update(void_class="genuine", void_reason=t1_genuine_reason)
+        return row
     if reason:
         row.update(void_class=void_class_for(reason), void_reason=reason)
         return row
@@ -1039,11 +1070,10 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["reconcile_sent_delta"] = reconcile_sent_delta
     row["pushes_policy_change_delta"] = pushes_policy_change_delta
 
+    # failed>0 is handled above (hoisted ahead of collect_t2's reason check) -
+    # by this point every remaining row has failed==0.
     phase_is_clean_verdict = phase in ("B", "B2")
     if phase_is_clean_verdict:
-        if failed > 0:
-            row.update(void_class="genuine", void_reason="failed_gt_0")
-            return row
         if applied != total:
             row.update(void_class="instrument", void_reason="applied_ne_total")
             return row
@@ -1477,18 +1507,22 @@ def _f10():
 
 
 def _f11():
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
     t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
     events_found = [
         _ev("2026-09-19 10:00:05.000",
             "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
             "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
     ]
-    found, still_missing = sweep_row_pure(events_found, epoch=1,
+    found, still_missing = sweep_row_pure(events_found, epoch=1, floor=5,
                                            missing_rule_ids={"blackout-reg-01"},
-                                           backend="spark", t0d_ts=t0d_ts)
+                                           backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts,
+                                           own_push_raw=None)
     ok1 = "blackout-reg-01" in found and not still_missing
-    found2, still_missing2 = sweep_row_pure([], epoch=1, missing_rule_ids={"blackout-reg-01"},
-                                             backend="spark", t0d_ts=t0d_ts)
+    found2, still_missing2 = sweep_row_pure([], epoch=1, floor=5,
+                                             missing_rule_ids={"blackout-reg-01"},
+                                             backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts,
+                                             own_push_raw=None)
     ok2 = not found2 and still_missing2 == ["blackout-reg-01"]
     return ok1 and ok2, f"found_case={ok1} never_found_case={ok2}"
 
@@ -1565,11 +1599,118 @@ def _f14():
     return ok1 and ok2 and ok3, f"mismatch_detected={ok1} ok_spark={ok2} ok_legacy={ok3}"
 
 
+def _f15():
+    # genuine_t1_failure() itself: only B/B2 with failed>0 yields failed_gt_0.
+    ok1 = genuine_t1_failure("B2", 1) == "failed_gt_0"
+    ok2 = genuine_t1_failure("B", 1) == "failed_gt_0"
+    ok3 = genuine_t1_failure("B2", 0) is None
+    ok4 = genuine_t1_failure("A", 1) is None
+
+    # Integration shape of the bug found live (R5.7 T2 re-run, Phase B2 spark
+    # repeat 3): a row with failed=1 that ALSO carries a collection-stage
+    # instrument void reason. Pre-fix, compute_verdict never saw genuine=True
+    # for this row (run_repeat returned "instrument" before ever reaching the
+    # failed>0 check) and the cell's floor was met by other valid rows, so the
+    # phase read PASS. Post-fix, run_repeat now classifies this row
+    # void_class="genuine" up front - verify compute_verdict then reports
+    # FAIL-RELIABILITY regardless of how many other rows are valid.
+    laundered_row = {"comparison_id": "c", "run_id": "r", "phase": "B2", "backend": "spark",
+                      "repeat": 1, "applied": 61, "failed": 1, "total": 62,
+                      "void_class": "genuine", "void_reason": "failed_gt_0"}
+    other_valid = [{"comparison_id": "c", "run_id": "r", "phase": "B2", "backend": "spark",
+                     "repeat": i, "void_class": None, "void_reason": None, "c_ms": 90.0}
+                   for i in range(2, 5)]
+    legacy_valid = [{"comparison_id": "c", "run_id": "rl", "phase": "B2", "backend": "legacy",
+                      "repeat": i, "void_class": None, "void_reason": None, "c_ms": 70.0}
+                     for i in range(1, 4)]
+    verdict = compute_verdict(legacy_valid, [laundered_row] + other_valid, floor=3)
+    ok5 = verdict == "FAIL-RELIABILITY"
+    return (ok1 and ok2 and ok3 and ok4 and ok5,
+            f"phase_gate={ok1 and ok2 and ok3 and ok4} laundering_fixed={ok5} verdict={verdict}")
+
+
+def _f16():
+    # Sweep membership parity with classify_t2 (both directions, both reviewers'
+    # probes): (a) legacy - a LATER application's arm for the same fixed cohort
+    # rule_id must NOT be attributed to an earlier, still-open repeat once the
+    # next application's own T0d has appeared; (b) spark - a below-floor
+    # non-adopt line must be rejected (fence_violation_below_floor, same as
+    # classify_t2), and a below-floor callback-adopt line must be ACCEPTED
+    # (classify_t2's documented adoption exception), not the reverse.
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+
+    # (a) legacy cross-application attribution
+    events_cross_app = [
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=0, detached_rules=1, withdrawn_claims=0)"),
+        # the NEXT application's own T0d (a different epoch) appears before any
+        # arm line for the missing rule from THIS application ever does
+        _ev("2026-09-19 10:00:05.000", "Guardian spark: detach_all complete (epoch=2, "
+            "incarnation_floor=1, detached_rules=1, withdrawn_claims=0)"),
+        # this arm line belongs to epoch 2's application, not epoch 1's
+        _ev("2026-09-19 10:00:05.050", "Guardian: file guard armed for rule 'blackout-file-01'"),
+    ]
+    found_a, still_missing_a = sweep_row_pure(
+        events_cross_app, epoch=1, floor=0, missing_rule_ids={"blackout-file-01"},
+        backend="legacy", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
+    ok_a = "blackout-file-01" not in found_a and still_missing_a == ["blackout-file-01"]
+
+    # (b) spark below-floor non-adopt rejected, below-floor adopt accepted
+    events_floor = [
+        _ev("2026-09-19 10:00:05.000",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=3, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=1)"),
+        _ev("2026-09-19 10:00:05.010",
+            "Guardian spark: arm committed for rule 'blackout-reg-02' (epoch=1, incarnation=3, "
+            "type=registry, via=callback-adopt, attach_to_commit_ms=1)"),
+    ]
+    found_b, still_missing_b = sweep_row_pure(
+        events_floor, epoch=1, floor=5,
+        missing_rule_ids={"blackout-reg-01", "blackout-reg-02"},
+        backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
+    ok_b_reject_below_floor_non_adopt = "blackout-reg-01" not in found_b
+    ok_b_accept_below_floor_adopt = "blackout-reg-02" in found_b
+    return (ok_a and ok_b_reject_below_floor_non_adopt and ok_b_accept_below_floor_adopt,
+            f"legacy_no_cross_app_attribution={ok_a} "
+            f"spark_below_floor_non_adopt_rejected={ok_b_reject_below_floor_non_adopt} "
+            f"spark_below_floor_adopt_accepted={ok_b_accept_below_floor_adopt} "
+            f"still_missing_a={still_missing_a}")
+
+
+def _f17():
+    # >50% instrument-invalid ceiling (both reviewers independently probed
+    # this live): a cell with a majority of instrument-invalid voids must
+    # read INCONCLUSIVE even when its valid count also happens to reach floor.
+    def _rows(n_valid, n_instrument, backend, phase="B2"):
+        valid = [{"phase": phase, "backend": backend, "void_class": None, "void_reason": None,
+                  "c_ms": 90.0} for _ in range(n_valid)]
+        instrument = [{"phase": phase, "backend": backend, "void_class": "instrument",
+                        "void_reason": "t1_not_found"} for _ in range(n_instrument)]
+        return valid + instrument
+
+    legacy_clean = _rows(3, 0, "legacy")
+    spark_majority_void_at_floor = _rows(3, 4, "spark")  # 3/7 valid = floor met, 4/7 = 57% instrument
+    v1 = compute_verdict(legacy_clean, spark_majority_void_at_floor, floor=3)
+    ok1 = v1 == "INCONCLUSIVE"
+
+    spark_exactly_half = _rows(3, 3, "spark")  # 3/6 = exactly 50%, NOT over half - ceiling must not fire
+    v2 = compute_verdict(legacy_clean, spark_exactly_half, floor=3)
+    ok2 = v2 != "INCONCLUSIVE" or len([r for r in spark_exactly_half if not r.get("void_reason")]) < 3
+
+    spark_clean = _rows(5, 0, "spark")
+    v3 = compute_verdict(legacy_clean, spark_clean, floor=3)
+    ok3 = v3 == "PASS"
+    return (ok1 and ok2 and ok3,
+            f"majority_void_at_floor_inconclusive={ok1} (verdict={v1}) "
+            f"exactly_50pct_not_over_ceiling={ok2} (verdict={v2}) clean_pass={ok3} (verdict={v3})")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
-        ("F13", _f13), ("F14", _f14),
+        ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17),
     ]
     failures = 0
     for name, fn in fixtures:
