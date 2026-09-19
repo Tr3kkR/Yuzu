@@ -23,6 +23,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -987,6 +988,19 @@ TEST_CASE("a mechanism that ACQUIRES then throws from start() still gets release
     //
     // This pins the ENGINE half of the contract: a mechanism that threw from start()
     // must still have stop() called on it, so a resource-guarded stop() can release.
+    //
+    // #2050 DELIBERATE TIMING-CONTRACT CHANGE, stated explicitly (not a silent
+    // assertion flip): start() now carries its own function-wide rollback
+    // guard, which calls the SAME teardown as stop() on a mid-startup throw — so the
+    // throwing mechanism's stop() (and therefore its release) now runs SYNCHRONOUSLY
+    // inside start(), before start() returns the exception to its caller. The OLD
+    // contract asserted release only at ~SparkEngine (cleanup-at-destruction); the NEW
+    // one asserts it immediately (cleanup-at-throw). This does NOT reopen B1: the fix
+    // that actually prevented the leak was guarding stop() on RESOURCE OWNERSHIP
+    // (LeakyThrowingMechanism::stop() below), not on a started_ bool — that guard is
+    // orthogonal to WHEN stop() is called, so moving the call earlier cannot
+    // reintroduce the bug. See spark_engine.cpp's start() for the rollback guard and
+    // its exact scope-placement rationale.
     bool held = false;
     {
         auto engine = std::make_unique<SparkEngine>();
@@ -996,10 +1010,13 @@ TEST_CASE("a mechanism that ACQUIRES then throws from start() still gets release
                     .has_value());
         CHECK_FALSE(held);
         CHECK_THROWS(engine->start()); // acquires, then throws
-        CHECK(held);                   // resource is currently owned
-        engine.reset();                // ~SparkEngine → stop() → mechanism stop()
+        // NEW: released BEFORE engine.reset() — start()'s own rollback guard already
+        // drove the teardown (and set teardown_complete_) by the time start() returns.
+        CHECK_FALSE(held);
+        engine.reset(); // ~SparkEngine → stop(): now a no-op (already torn down); must
+                        // still not crash/hang, and must not re-acquire anything.
     }
-    CHECK_FALSE(held); // released, not leaked
+    CHECK_FALSE(held); // still released after destruction — teardown fully completed
 }
 
 TEST_CASE("stop() racing ~SparkEngine does not terminate or use-after-free",
@@ -1113,9 +1130,20 @@ TEST_CASE("a throwing teardown is retried by the next stop(), not latched away",
     // The early-out is on teardown_complete_, NOT stopped_ — conflating them was a
     // regression during this fix's own review (Gate-8 security-guardian), and this
     // test is what makes that regression go red instead of shipping green: if stop()
-    // early-outed on stopped_, the second stop() below would be a no-op and the
-    // Service mechanism (never reached on the throwing first pass — File < Service
-    // in the map) would never be stopped.
+    // early-outed on stopped_, the second stop() below would be a no-op and a
+    // never-stopped mechanism would stay that way forever.
+    //
+    // #2050 DELIBERATE CONTRACT CHANGE, stated explicitly (not a silent assertion
+    // flip): stop()'s mechanism-teardown loop is now PER-ITERATION isolated — one
+    // mechanism's stop() throwing no longer skips every mechanism after it in map
+    // order. So on THIS test's first pass, Service (File < Service in the map, so it
+    // iterates second) now DOES get its stop() called even though File's throws —
+    // where the OLD contract left it at 0 until the retry pass ("never reached past
+    // the throw"). What is UNCHANGED: a per-mechanism failure still leaves
+    // teardown_complete_ false, so File — the one that actually failed — is still
+    // retried (idempotently) on the next pass, and that retry now re-drives EVERY
+    // mechanism again (idempotent by interface contract), not just the one that
+    // failed last time.
     int file_stops = 0;
     int service_stops = 0;
     SparkEngine engine;
@@ -1130,22 +1158,345 @@ TEST_CASE("a throwing teardown is retried by the next stop(), not latched away",
     engine.start();
     REQUIRE(engine.is_running());
 
-    // First stop(): File's stop() throws mid-iteration. stop() is noexcept — the
-    // throw must be swallowed (a terminate here fails the whole test binary), and
-    // the teardown must NOT be marked complete.
+    // First stop(): File's stop() throws. stop() is noexcept — the throw must be
+    // contained WITHOUT skipping Service (per-iteration isolation), and the teardown
+    // must NOT be marked complete (File's own failure this pass).
     engine.stop();
     CHECK(file_stops == 1);
-    CHECK(service_stops == 0); // never reached past the throw — the honest failure shape
+    CHECK(service_stops == 1); // NEW: reached despite File's throw, same pass
     CHECK_FALSE(engine.is_running());
 
     // Second stop() (in production: ~SparkEngine's) must RE-DRIVE the mechanism
-    // teardown — both mechanisms this time — and complete.
+    // teardown — both mechanisms again — and complete cleanly this time.
     engine.stop();
     CHECK(file_stops == 2);    // re-driven (idempotent contract), no throw this time
-    CHECK(service_stops == 1); // the leaked teardown is recovered
+    CHECK(service_stops == 2); // re-driven too — the whole pass retries, not just File
 
     // Third stop(): teardown_complete_ is finally latched — a genuine no-op now.
     engine.stop();
     CHECK(file_stops == 2);
-    CHECK(service_stops == 1);
+    CHECK(service_stops == 2);
+}
+
+namespace {
+/// #2050: benign resource-tracking mechanism — start() acquires (held=true), stop()
+/// releases (held=false), set_established_sink() is the boring default (returns
+/// false, never throws). Used as the FIRST-STARTED SIBLING in the sink-fallibility
+/// tests below: SparkType::File (3) sorts before Service (4) in mechanisms_'s
+/// std::map, so this one's start() has ALREADY COMPLETED by the time a
+/// Service-registered sink throws — the rollback must reach this already-started
+/// sibling too, not only the mechanism that threw.
+struct ResourceTrackingMechanism : ISparkMechanism {
+    bool& held;
+    explicit ResourceTrackingMechanism(bool& h) : held(h) {}
+    void start(SparkEmitFn, SparkFaultFn) override { held = true; }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override { held = false; }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+
+/// #2050: set_established_sink() throws BEFORE performing its own "store" (mirrors
+/// spark_service.cpp's `established_ = std::move(sink)` member assignment — the
+/// EARLIER of the two fallibility windows). set_established_sink() is called BEFORE
+/// this mechanism's OWN start() in start()'s per-mechanism loop, so this throw
+/// preempts that start() entirely — stop_calls, not a resource flag, is what proves
+/// the rollback still reached this mechanism via the authoritative mechanisms_ map.
+struct SinkThrowsBeforeStoreMechanism : ISparkMechanism {
+    int& stop_calls;
+    explicit SinkThrowsBeforeStoreMechanism(int& c) : stop_calls(c) {}
+    void start(SparkEmitFn, SparkFaultFn) override {}
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    bool set_established_sink(SparkEstablishedFn) override {
+        throw std::runtime_error("sink boom before store");
+    }
+    void stop() override { ++stop_calls; }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+
+/// #2050: set_established_sink() completes its "store" (models
+/// `established_ = std::move(sink)`), THEN throws — the LATER of the two
+/// fallibility windows. Same preemption note as the BeforeStore sibling above: this
+/// mechanism's own start() never runs either, since the throw escapes before
+/// start()'s per-mechanism loop reaches the m->start() call for this entry.
+struct SinkThrowsAfterStoreMechanism : ISparkMechanism {
+    int& stop_calls;
+    SparkEstablishedFn sink; ///< the "store"
+    explicit SinkThrowsAfterStoreMechanism(int& c) : stop_calls(c) {}
+    void start(SparkEmitFn, SparkFaultFn) override {}
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    bool set_established_sink(SparkEstablishedFn s) override {
+        sink = std::move(s); // store completes before the throw
+        throw std::runtime_error("sink boom after store");
+    }
+    void stop() override { ++stop_calls; }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+} // namespace
+
+TEST_CASE("start()'s rollback guard covers set_established_sink() throwing, both "
+          "before and after its store",
+          "[spark][teardown]") {
+    // #2050 scope item 2: set_established_sink() (spark_mechanism.hpp:271,
+    // [[nodiscard]] bool, no noexcept) is a confirmed-fallible site the start()
+    // rollback guard must cover — installed BEFORE m->start() FOR THE SAME
+    // mechanism (spark_engine.cpp), so a throw here preempts that mechanism's own
+    // start(). Two mechanisms are registered so the assertions actually distinguish
+    // "rollback ran" from "nothing happened yet" (a single sink-thrower's own
+    // start() never runs, so a resource flag on it alone would pass vacuously):
+    // File starts first and fully completes, Service's sink then throws, and the
+    // rollback must reach BOTH — the already-started File sibling (file_held) and
+    // the throwing Service mechanism itself (service_stops), against the shipped
+    // overrides' actual shape (spark_service.cpp:283-288 / :1542-1547 assign a
+    // member then return).
+    SECTION("throws BEFORE storing the callback") {
+        bool file_held = false;
+        int service_stops = 0;
+        auto engine = std::make_unique<SparkEngine>();
+        REQUIRE(engine
+                    ->register_mechanism(SparkType::File,
+                                         std::make_unique<ResourceTrackingMechanism>(file_held))
+                    .has_value());
+        REQUIRE(engine
+                    ->register_mechanism(
+                        SparkType::Service,
+                        std::make_unique<SinkThrowsBeforeStoreMechanism>(service_stops))
+                    .has_value());
+        CHECK_THROWS(engine->start());
+        CHECK_FALSE(file_held);    // File fully started, then rolled back
+        CHECK(service_stops == 1); // Service's stop() reached despite never starting
+        engine.reset();
+        CHECK_FALSE(file_held);
+    }
+    SECTION("throws AFTER storing the callback") {
+        bool file_held = false;
+        int service_stops = 0;
+        auto engine = std::make_unique<SparkEngine>();
+        REQUIRE(engine
+                    ->register_mechanism(SparkType::File,
+                                         std::make_unique<ResourceTrackingMechanism>(file_held))
+                    .has_value());
+        REQUIRE(engine
+                    ->register_mechanism(
+                        SparkType::Service,
+                        std::make_unique<SinkThrowsAfterStoreMechanism>(service_stops))
+                    .has_value());
+        CHECK_THROWS(engine->start());
+        CHECK_FALSE(file_held);
+        CHECK(service_stops == 1);
+        engine.reset();
+        CHECK_FALSE(file_held);
+    }
+}
+
+TEST_CASE("start()'s rollback guard covers Replay collection, mechanism-pointer "
+          "collection, and wheel-thread spawn — none reachable via a mechanism fake",
+          "[spark][teardown]") {
+    // #2050: none of these three in-`{ lock_guard lk(mu_); ... }` sites is reachable
+    // through a mechanism fake — they run before/around the per-mechanism loop — so
+    // the start_fault_hook_for_test seam (fires with mu_ HELD, exactly where each of
+    // these three statements sits) is the only way to deterministically exercise
+    // start()'s rollback guard for them. All three fire with running_ already true
+    // (latched right after the reject-check, before any of them can run), so a
+    // correct rollback must always leave is_running() false afterward.
+    //
+    // CountingStopMechanism (never actually started at any of these three phases —
+    // all fire before the per-mechanism start loop) proves rollback reaches it
+    // anyway via the authoritative mechanisms_ map. A second start() call afterward
+    // pins "terminal rollback, not restoration": stopped_ is latched by the
+    // rollback's own teardown_locked(), so a restart attempt is refused, exactly
+    // like an ordinary post-stop() restart attempt.
+    SECTION("Replay collection fails") {
+        int stop_calls = 0;
+        auto engine = std::make_unique<SparkEngine>();
+        REQUIRE(engine
+                    ->register_mechanism(SparkType::Service,
+                                         std::make_unique<CountingStopMechanism>(stop_calls))
+                    .has_value());
+        engine->set_start_fault_hook_for_test([](int phase) {
+            if (phase == SparkEngine::kStartFaultPhaseReplayCollection)
+                throw std::runtime_error("forced Replay-collection fault");
+        });
+        CHECK_THROWS(engine->start());
+        CHECK_FALSE(engine->is_running());
+        CHECK(stop_calls == 1); // rollback reached a never-started mechanism
+        engine->start();        // terminal rollback: restart is refused, not retried
+        CHECK_FALSE(engine->is_running());
+        engine.reset(); // must not crash/hang — rollback already tore this down
+    }
+    SECTION("mechanism-pointer collection fails") {
+        int stop_calls = 0;
+        auto engine = std::make_unique<SparkEngine>();
+        REQUIRE(engine
+                    ->register_mechanism(SparkType::Service,
+                                         std::make_unique<CountingStopMechanism>(stop_calls))
+                    .has_value());
+        engine->set_start_fault_hook_for_test([](int phase) {
+            if (phase == SparkEngine::kStartFaultPhaseMechCollection)
+                throw std::runtime_error("forced mechanism-pointer-collection fault");
+        });
+        CHECK_THROWS(engine->start());
+        CHECK_FALSE(engine->is_running());
+        CHECK(stop_calls == 1);
+        engine->start();
+        CHECK_FALSE(engine->is_running());
+        engine.reset();
+    }
+    SECTION("wheel-thread spawn fails (std::system_error, mirroring a real thread-ctor "
+            "failure)") {
+        int stop_calls = 0;
+        auto engine = std::make_unique<SparkEngine>();
+        REQUIRE(engine
+                    ->register_mechanism(SparkType::Service,
+                                         std::make_unique<CountingStopMechanism>(stop_calls))
+                    .has_value());
+        engine->set_start_fault_hook_for_test([](int phase) {
+            if (phase == SparkEngine::kStartFaultPhaseWheelSpawn)
+                throw std::system_error(
+                    std::make_error_code(std::errc::resource_unavailable_try_again),
+                    "forced wheel-thread-spawn fault");
+        });
+        CHECK_THROWS(engine->start());
+        CHECK_FALSE(engine->is_running());
+        CHECK(stop_calls == 1);
+        engine->start();
+        CHECK_FALSE(engine->is_running());
+        engine.reset(); // wheel_thread_ was never assigned — joinable() is false;
+                        // must not hang trying to join a non-existent thread
+    }
+}
+
+namespace {
+/// #2050: the direct regression fake for the rollback guard's EXACT scope placement
+/// (start()'s own comment explains why it matters). Stores the fault callback from
+/// start(), then throws — start()'s rollback then calls this mechanism's stop(),
+/// which SYNCHRONOUSLY calls the stored fault callback, landing in report_fault(),
+/// which takes mu_. Under the CORRECT guard scope (declared after `life`, before the
+/// `{ lk }` block) mu_ has already been released by the time rollback runs, so this
+/// completes; under the WRONG scope (guard declared inside `{ lk }`) the guard would
+/// destruct before `lk` on unwind and run this while mu_ is STILL held — the same
+/// thread re-locking a non-recursive mutex it already owns, which hangs rather than
+/// crashing (TSan cannot catch this; it is a lock-order/self-deadlock property, not
+/// a race).
+///
+/// NOTE: a real shipped mechanism must NEVER emit/fault synchronously from
+/// watch()/unwatch()/stop() (spark_engine.hpp's mech_ops_mu_by_type_ doc). This fake
+/// violates that deliberately, and only from stop(), purely to pin the lock-scope
+/// property under test.
+struct SyncFaultOnStopMechanism : ISparkMechanism {
+    SparkFaultFn fault_fn;
+    void start(SparkEmitFn, SparkFaultFn fault) override {
+        fault_fn = std::move(fault);
+        throw std::runtime_error("start boom, rollback's stop() then faults synchronously");
+    }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override {
+        if (fault_fn)
+            fault_fn("nonexistent-key", true, "synchronous fault from rollback's stop()");
+    }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+} // namespace
+
+TEST_CASE("start()'s rollback runs with mu_ released — a mechanism that synchronously "
+          "faults from its rollback stop() must not deadlock",
+          "[spark][teardown][deadlock]") {
+    // Direct regression test for #2050's guard-scope requirement. Bounded via
+    // std::future so a future regression here is a red assertion, not a wedged CI
+    // job; Catch2 assertions stay on the main thread (this codebase's own
+    // convention — see the register_consumer/stop() stress test above) and the
+    // worker thread only reports whether start() threw.
+    //
+    // Raw pointer into a unique_ptr (not a shared_ptr captured by value), matching
+    // this file's own convention for exactly this shape (see the "stop() racing
+    // ~SparkEngine" test above) — and load-bearing here for a second reason: `engine`
+    // is declared BEFORE `fut`, so on the FAILING path (wrong guard scope, genuine
+    // deadlock) unwind destroys `fut` first. A future obtained from std::async
+    // blocks in its destructor until its shared state is ready, so that destructor
+    // never returns — `engine` is therefore NEVER reached and NEVER freed while the
+    // still-hung async thread might still be dereferencing it. A shared_ptr captured
+    // by value into the async lambda would instead tie the object's lifetime to
+    // implementation-defined packaged_task teardown timing — avoided entirely here.
+    auto engine = std::make_unique<SparkEngine>();
+    REQUIRE(engine
+                ->register_mechanism(SparkType::Service,
+                                     std::make_unique<SyncFaultOnStopMechanism>())
+                .has_value());
+    SparkEngine* raw = engine.get();
+
+    auto fut = std::async(std::launch::async, [raw]() -> bool {
+        try {
+            raw->start();
+            return false; // did not throw — unexpected
+        } catch (const std::exception&) {
+            return true;
+        }
+    });
+    const auto status = fut.wait_for(5s);
+    REQUIRE(status == std::future_status::ready); // else: wrong guard scope, deadlocked
+    CHECK(fut.get());
+    engine.reset(); // must not hang either — rollback already tore this down
+    SUCCEED("rollback ran with mu_ released, so the mechanism's synchronous fault report "
+            "completed instead of self-deadlocking");
+}
+
+namespace {
+/// #2050: throws from BOTH start() and stop() with DISTINCT messages — models a
+/// mechanism whose own cleanup path is unreliable. Proves the ORIGINAL startup
+/// exception is what escapes start(), not whatever the rollback's own
+/// teardown_locked() call encounters while cleaning up. This stop() throw is
+/// contained by teardown_locked()'s own per-iteration mechanism-teardown catch (the
+/// step-2 loop) — it never reaches the rollback guard's outer try/catch at all,
+/// which exists for a throw from teardown_locked() ITSELF (wheel join, consumer
+/// swap, spdlog), not from an individual mechanism. Either containment layer would
+/// have to hold for this test to pass; this fake exercises the one it actually hits.
+struct DoubleThrowMechanism : ISparkMechanism {
+    void start(SparkEmitFn, SparkFaultFn) override {
+        throw std::runtime_error("original startup failure");
+    }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override { throw std::runtime_error("cleanup boom"); }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+} // namespace
+
+TEST_CASE("a cleanup throw during start()'s rollback does not replace the original "
+          "startup exception",
+          "[spark][teardown]") {
+    auto engine = std::make_unique<SparkEngine>();
+    REQUIRE(engine
+                ->register_mechanism(SparkType::Service, std::make_unique<DoubleThrowMechanism>())
+                .has_value());
+
+    bool caught = false;
+    try {
+        engine->start();
+    } catch (const std::exception& e) {
+        caught = true;
+        CHECK(std::string(e.what()) == "original startup failure");
+    }
+    CHECK(caught);
+    // teardown_complete_ stays false (this mechanism's stop() throw is contained by
+    // teardown_locked()'s own per-iteration mechanism catch, step 2 — see
+    // DoubleThrowMechanism's comment) — the destructor retries the same
+    // always-throwing stop() and must still not hang or crash; this mechanism never
+    // fully tears down, which is the honest outcome for a mechanism whose stop() is
+    // itself broken.
+    engine.reset();
+    SUCCEED("the rollback's own cleanup failure did not mask the original exception, "
+            "and the destructor's retry completed without hanging or crashing");
 }

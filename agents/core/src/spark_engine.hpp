@@ -381,6 +381,22 @@ public:
     /// whose incarnation has moved on, not merely a key that is still present.
     /// Same set-then-use contract as the other test seams: set before start().
     void set_on_start_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2050): if set, invoked at each labelled phase inside start()'s
+    /// in-mu_ startup sequence (Replay collection, mechanism-pointer collection,
+    /// wheel-thread spawn). None of these three sites is reachable through a
+    /// mechanism fake — they run before/around the per-mechanism loop — so this is
+    /// the only way to deterministically exercise start()'s rollback guard for them.
+    /// CONTRACT: fires with the non-recursive mu_ HELD (all three phases run inside
+    /// start()'s `{ lock_guard lk(mu_); ... }` block) — throw or observe only;
+    /// re-entering the engine self-deadlocks. Same set-then-use contract as the
+    /// other test seams: set before start().
+    void set_start_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Reached immediately before the Replay-collection loop iterates armed_.
+    static constexpr int kStartFaultPhaseReplayCollection = 1;
+    /// Reached immediately before the mechanism-pointer collection loop.
+    static constexpr int kStartFaultPhaseMechCollection = 2;
+    /// Reached immediately before wheel_thread_ is constructed.
+    static constexpr int kStartFaultPhaseWheelSpawn = 3;
     /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
@@ -572,6 +588,27 @@ private:
     /// like report_fault().
     void report_established(const std::string& key, SparkIncarnation incarnation,
                             std::chrono::steady_clock::time_point at, SparkCoverage coverage);
+    /// #2050: stop()'s teardown body, factored out so start()'s own rollback guard can
+    /// drive the identical teardown on a startup failure. REQUIRES lifecycle_mu_
+    /// ALREADY HELD by the caller — stop() holds it via its own `life` lock_guard;
+    /// start()'s rollback guard runs while start()'s `life` lock_guard is still live
+    /// (the guard is declared after `life` and destructs before it unwinds — see
+    /// start()'s definition for why that ordering is deadlock-load-bearing, not
+    /// cosmetic). Never call this without lifecycle_mu_ held, and never re-enter it on
+    /// the same thread — lifecycle_mu_ is non-recursive.
+    ///
+    /// MAY THROW, exactly as stop()'s body always could (joins, map ops, spdlog can
+    /// all raise). Each of the two callers contains that itself: stop()'s own outer
+    /// `noexcept try { } catch (...) { }` (unchanged by this refactor), and the
+    /// rollback guard's own inline try/catch (a destructor must never let an
+    /// exception escape mid-unwind).
+    ///
+    /// Mechanism teardown is per-iteration-isolated: one mechanism's stop() throwing
+    /// does not skip the rest, and `teardown_complete_` is set ONLY when every phase
+    /// — including every mechanism this pass — completed without throwing, so a
+    /// partial pass is retried (idempotently) by the next caller instead of being
+    /// latched away as done.
+    void teardown_locked();
     void wheel_loop();
     void deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs);
     /// Signal one consumer to stop (set stopping + notify). Non-blocking.
@@ -722,6 +759,7 @@ private:
     std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
     std::function<void()> on_start_hook_for_test_;      ///< test seam (E13); null = no-op (set-then-use)
+    std::function<void(int)> start_fault_hook_for_test_; ///< test seam (#2050); null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The
