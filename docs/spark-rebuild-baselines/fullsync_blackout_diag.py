@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """#3990 full_sync blackout diagnostic driver (ruling-13 on #3850).
 
-One-time rig-scoped instrument, not production tooling (see the plan's
-"Sol feedback declined" section for why this stays simple rather than
-production-hardened). Measures B = T1 - T0, the synchronous full_sync
+One-time rig-scoped instrument, not production tooling - a prior local review
+round declined production-hardening it (that round's own notes were not
+separately committed; see this file's own "KNOWN BUG"/governance-fix comments
+below for what was and wasn't addressed instead). Measures B = T1 - T0, the
+synchronous full_sync
 apply-window proxy, on a single Windows agent under two detection backends
 (legacy IGuard vs spark), triggered two ways: a baseline (re)deploy, and a
 bare rule-create in no baseline (the heartbeat-reconcile trigger that is
@@ -13,7 +15,8 @@ See docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md for the
 measurand definitions, void rules, and decision criterion this implements -
 this file is the mechanism, that doc is the record of what it measured.
 
-Environment: YUZU_BASE (default http://127.0.0.1:8130), YUZU_ADMIN_USER,
+Environment: YUZU_BASE (default http://localhost:8080, inherited from
+generate_resgate_load.py's own G.BASE), YUZU_ADMIN_USER,
 YUZU_ADMIN_PASS (defaults match generate_resgate_load.py's UAT defaults -
 override for a non-default rig). YUZU_DGRHP_SSH (ssh destination for the
 agent-log reads, e.g. "-S /tmp/sock -i ~/.ssh/key user@host" as a single
@@ -57,9 +60,11 @@ separate attempts both run with label="clean"). Re-running `report` against a re
 containing more than one such attempt silently pools their rows together. Add a run
 identifier before trusting `report`'s output across multiple attempts.
 
-This is a real property of the agent's --log-file output worth flagging as its own product
-finding (live-tailing --log-file for near-real-time diagnostics is unreliable without a flush
-policy) - not filed as an issue by this diagnostic; left for whoever picks that up next.
+The flush-lag gap above is a real property of the agent's --log-file output worth flagging as
+its own product finding (live-tailing --log-file for near-real-time diagnostics is unreliable
+without a flush policy) - filed as https://github.com/Tr3kkR/Yuzu/issues/4608 (2026-09-19,
+after a later re-measurement round on this same diagnostic's methodology hit the identical
+gap a second time).
 """
 
 import argparse
@@ -101,6 +106,14 @@ BLACKOUT_SVC_OVERRIDE = {1: "LSM", 2: "DcomLaunch", 4: "RpcEptMapper", 5: "nsi",
 RIGA_ALLOWLIST_RE = re.compile(r"^riga-")
 PROTECTED_RULE_IDS = {"dgrhp-drift-test-file"}
 PROTECTED_BASELINE_NAMES = {"DGRHP File Drift Test"}
+# Governance Gate 4 (happy-path/unhappy-path/chaos, converged independently): hbr_counter
+# increments once per ATTEMPT (not per valid repeat) with no cross-invocation cap below the
+# attempts ceiling (max(repeats*2, 10) - up to 10 even for a K=3 run, see max_attempts below),
+# so a Phase B2 run routinely mints more than 3 hbr ids. teardown_cohort used to delete only a
+# hardcoded hbr-01..03 range; confirmed live (run doc "Cleanup" notes) that hbr-04..06 and
+# higher were left behind and needed manual purge. Scan-and-delete by this prefix instead,
+# same pattern cmd_inventory/cmd_purge already use for riga-*.
+HBR_RULE_RE = re.compile(rf"^{re.escape(COHORT_PREFIX)}hbr-\d+$")
 
 LOG_TS_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] \[(\w+)\] \[(\d+)\] (.*)$"
@@ -439,19 +452,28 @@ def cmd_purge(op, apply=False):
         return 1
 
     failed_baselines, failed_rules = [], []
-    for i, bid in enumerate(fresh["riga_baseline_ids"], 1):
-        try:
-            G.delete_baseline_form(op, bid)
-        except Exception as e:  # noqa: BLE001
-            print(f"[purge] baseline delete FAILED {bid}: {e}", file=sys.stderr)
-            failed_baselines.append(bid)
-        if i % 10 == 0 or i == len(fresh["riga_baseline_ids"]):
-            print(f"[purge] baselines {i}/{len(fresh['riga_baseline_ids'])}")
-    for i, rid in enumerate(fresh["riga_rule_ids"], 1):
-        if not G.delete_rule(op, rid):
-            failed_rules.append(rid)
-        if i % 500 == 0 or i == len(fresh["riga_rule_ids"]):
-            print(f"[purge] rules {i}/{len(fresh['riga_rule_ids'])}")
+    # Governance (unhappy-path UP-9): `except Exception` deliberately does NOT catch
+    # KeyboardInterrupt (a Ctrl-C should interrupt, not be swallowed as a delete failure) -
+    # but a mid-loop interrupt used to lose the "what got deleted this run" tally entirely,
+    # only printed at the end. try/finally prints the partial tally on any exit path,
+    # interrupted or not; a subsequent --apply re-verifies against a fresh dry-run regardless.
+    try:
+        for i, bid in enumerate(fresh["riga_baseline_ids"], 1):
+            try:
+                G.delete_baseline_form(op, bid)
+            except Exception as e:  # noqa: BLE001
+                print(f"[purge] baseline delete FAILED {bid}: {e}", file=sys.stderr)
+                failed_baselines.append(bid)
+            if i % 10 == 0 or i == len(fresh["riga_baseline_ids"]):
+                print(f"[purge] baselines {i}/{len(fresh['riga_baseline_ids'])}")
+        for i, rid in enumerate(fresh["riga_rule_ids"], 1):
+            if not G.delete_rule(op, rid):
+                failed_rules.append(rid)
+            if i % 500 == 0 or i == len(fresh["riga_rule_ids"]):
+                print(f"[purge] rules {i}/{len(fresh['riga_rule_ids'])}")
+    finally:
+        print(f"[purge] tally so far: failed_baselines={len(failed_baselines)} "
+              f"failed_rules={len(failed_rules)}")
 
     post = cmd_inventory(op, out_path=None)
     ok = (
@@ -511,13 +533,51 @@ def cmd_ensure(op):
 
 
 def cmd_teardown_cohort(op):
-    G.teardown_deployed_baseline(op, TRIGGER_BASELINE)
-    G.teardown_deployed_baseline(op, COHORT_BASELINE)
+    # Governance (unhappy-path UP-8): per-item try/except + tally, same pattern cmd_purge's
+    # own delete loops already use - a bare call here only caught HTTPError (via delete_rule's
+    # own internals) not URLError, so a REST connectivity blip mid-sequence used to abort with
+    # no record of what was actually removed; safety on re-run was incidental (404-idempotent
+    # deletes), not by design.
+    failed = []
+    for label, fn in (
+        (f"baseline {TRIGGER_BASELINE}", lambda: G.teardown_deployed_baseline(op, TRIGGER_BASELINE)),
+        (f"baseline {COHORT_BASELINE}", lambda: G.teardown_deployed_baseline(op, COHORT_BASELINE)),
+    ):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] {label} delete FAILED: {e}", file=sys.stderr)
+            failed.append(label)
     for r in cohort_rules():
-        G.delete_rule(op, r["rule_id"])
-    G.delete_rule(op, TRIGGER_RULE_ID)
-    for n in range(1, 4):
-        G.delete_rule(op, f"{COHORT_PREFIX}hbr-{n:02d}")
+        try:
+            if not G.delete_rule(op, r["rule_id"]):
+                failed.append(r["rule_id"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] rule {r['rule_id']} delete FAILED: {e}", file=sys.stderr)
+            failed.append(r["rule_id"])
+    try:
+        if not G.delete_rule(op, TRIGGER_RULE_ID):
+            failed.append(TRIGGER_RULE_ID)
+    except Exception as e:  # noqa: BLE001
+        print(f"[teardown] trigger rule delete FAILED: {e}", file=sys.stderr)
+        failed.append(TRIGGER_RULE_ID)
+    # Scan-and-delete every live hbr-* rule rather than a hardcoded range - see HBR_RULE_RE's
+    # own comment for why a fixed range leaks rules whenever an invocation's attempt count
+    # exceeds 3 (routine, not an edge case - confirmed live).
+    rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
+    hbr_ids = sorted(r["rule_id"] for r in rules if HBR_RULE_RE.match(r["rule_id"]))
+    for rid in hbr_ids:
+        try:
+            if not G.delete_rule(op, rid):
+                failed.append(rid)
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] hbr rule {rid} delete FAILED: {e}", file=sys.stderr)
+            failed.append(rid)
+    if hbr_ids:
+        print(f"[teardown] deleted {len(hbr_ids)} hbr rule(s): {', '.join(hbr_ids)}")
+    if failed:
+        print(f"[teardown] {len(failed)} item(s) failed to delete, safe to re-run: "
+              f"{', '.join(failed)}", file=sys.stderr)
     try:
         ssh_ps(
             f"Remove-Item -Recurse -Force -Path '{SCRATCH_DIR_WIN}' -ErrorAction SilentlyContinue; "
@@ -651,7 +711,14 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms):
 
 
 def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger_id_cache):
-    m0 = get_metrics(op)
+    # Governance (unhappy-path UP-3, chaos CH-2): guarded like the trigger call just below -
+    # an unguarded REST blip here used to crash the whole cmd_run loop instead of voiding one
+    # attempt, asymmetric with every other REST call in this function.
+    try:
+        m0 = get_metrics(op)
+    except Exception as e:  # noqa: BLE001
+        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
+                 "void_reason": f"metrics_unavailable:{e}"}
     window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
     trig_ts = time.time()
     http_status = None
@@ -675,7 +742,16 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
                      "void_reason": f"trigger_failed:{e}"}
         t0_timeout, t1_timeout = ROOT_CAUSED_T0_TIMEOUT, ROOT_CAUSED_T1_TIMEOUT
 
-    obs = observe_window(window_start_ts, t0_timeout, t1_timeout)
+    # Governance (unhappy-path UP-2): observe_window polls over SSH for up to t0_timeout+
+    # t1_timeout seconds; an uncaught subprocess.TimeoutExpired or SSH control-socket failure
+    # from ssh_ps() (via _fetch_window/agent_log_size) used to propagate all the way out and
+    # crash the whole cmd_run loop, compounding UP-1, instead of voiding this one attempt the
+    # way trigger_failed/metrics_unavailable already do.
+    try:
+        obs = observe_window(window_start_ts, t0_timeout, t1_timeout)
+    except Exception as e:  # noqa: BLE001
+        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
+                 "trigger_http_status": http_status, "void_reason": f"observe_failed:{e}"}
     if obs.get("void_reason"):
         return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                 "trigger_http_status": http_status, "void_reason": obs["void_reason"]}
@@ -694,7 +770,11 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
         (t1["ts"] - last_arm["ts"]).total_seconds() * 1000 if last_arm else None
     )
 
-    m1 = get_metrics(op)
+    try:
+        m1 = get_metrics(op)
+    except Exception as e:  # noqa: BLE001
+        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
+                 "trigger_http_status": http_status, "void_reason": f"metrics_unavailable:{e}"}
     reconcile_sent_delta = metric_sum(m1, 'yuzu_server_guardian_reconciles_total{result="sent"}') \
         - metric_sum(m0, 'yuzu_server_guardian_reconciles_total{result="sent"}')
     pushes_policy_change_delta = (
@@ -705,7 +785,14 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
     phase_is_clean_verdict = phase in ("B", "B2")
     void_reason = None
     if phase_is_clean_verdict:
-        if obs["failed"] > 0:
+        # Governance (unhappy-path UP-5): full_sync is captured by T1_RE but was never
+        # asserted - an apply_rules ok line with full_sync=false still matched and was
+        # silently accepted as this measurement's T1, though no such line was observed in
+        # any of the 16 counted clean-v2 repeats (Gate 3 independently re-derived that
+        # result from the raw JSONL).
+        if obs["full_sync"] != "true":
+            void_reason = f"not_full_sync({obs['full_sync']})"
+        elif obs["failed"] > 0:
             void_reason = "failed_gt_0"
         elif obs["applied"] != obs["total"]:
             void_reason = "applied_ne_total"
@@ -814,25 +901,24 @@ def cmd_run_phase_a(op, backend, label, out_path, cap_seconds=1200, target_windo
     deploy trigger (would never settle: failed riga-* rules hold the
     generation, so the server reconcile-pushes on its own ~every 25s)."""
     start = time.time()
-    results = []
+    n_windows = 0
     window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
-    while len(results) < target_windows and (time.time() - start) < cap_seconds:
+    while n_windows < target_windows and (time.time() - start) < cap_seconds:
         obs = observe_phase_a_window(window_start_ts)
         window_start_ts = obs.get("next_window_start") or dgrhp_now()
         obs.pop("next_window_start", None)
-        obs.update({"phase": "A", "backend": backend, "label": label,
-                     "repeat": len(results) + 1})
-        results.append(obs)
+        n_windows += 1
+        obs.update({"phase": "A", "backend": backend, "label": label, "repeat": n_windows})
+        # Governance (unhappy-path UP-1): write through per window, same reasoning as cmd_run.
+        with open(out_path, "a") as f:
+            f.write(json.dumps(obs) + "\n")
         status = "VOID:" + obs["void_reason"] if obs.get("void_reason") else \
             f"b_ms={obs['b_ms']:.1f} applied={obs['applied']} failed={obs['failed']} total={obs['total']}"
-        print(f"[run-a] {label} {backend} window={len(results)} {status}")
+        print(f"[run-a] {label} {backend} window={n_windows} {status}")
         if obs.get("void_reason") in ("log_rotated_mid_window",):
             break
     elapsed = time.time() - start
-    with open(out_path, "a") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-    print(f"[run-a] {label} {backend} DONE windows={len(results)} elapsed_s={elapsed:.0f} "
+    print(f"[run-a] {label} {backend} DONE windows={n_windows} elapsed_s={elapsed:.0f} "
           f"cap_hit={elapsed >= cap_seconds}")
     return 0
 
@@ -846,14 +932,21 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path):
         trigger_id_cache["trigger_baseline_id"] = tb
     cohort_ids = [r["rule_id"] for r in cohort_rules()]
 
-    results = []
     valid = 0
     attempts = 0
-    max_attempts = repeats * 2  # cap: 10 for K=5, 6 for K=3 - "up to a cap of 10 attempts" for K=5
+    # Effective cap is ALWAYS max(repeats*2, 10) - i.e. 10 for K=5 AND K=3, never 6. The old
+    # comment claimed 6 for K=3; governance (unhappy-path UP-7) found this directly feeds the
+    # hbr-rule-leak class HBR_RULE_RE's comment above describes, since a K=3 run reaching the
+    # real 10-attempt floor mints hbr-01..10, not hbr-01..06.
+    max_attempts = repeats * 2  # nominal; the real floor below is what actually applies
     while valid < repeats and attempts < max(max_attempts, 10):
         attempts += 1
         r = run_repeat(op, phase, backend, trigger_kind, cohort_ids, attempts, trigger_id_cache)
-        results.append(r)
+        # Governance (unhappy-path UP-1, chaos CH-1): write through per attempt, not batched
+        # after the loop - a kill/SSH-drop/uncaught exception mid-run used to discard every
+        # already-valid repeat collected in this invocation, forcing a full re-run.
+        with open(out_path, "a") as f:
+            f.write(json.dumps({**r, "label": label}) + "\n")
         status = "VOID:" + r["void_reason"] if r.get("void_reason") else \
             f"b_ms={r['b_ms']:.1f}"
         print(f"[run] {label} {backend} {phase} attempt={attempts} {status}")
@@ -863,9 +956,6 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path):
             time.sleep(gap)
 
     inconclusive = valid < repeats
-    with open(out_path, "a") as f:
-        for r in results:
-            f.write(json.dumps({**r, "label": label}) + "\n")
     print(f"[run] {label} {backend} {phase} DONE valid={valid}/{repeats} "
           f"attempts={attempts} inconclusive={inconclusive}")
     return 0
@@ -934,7 +1024,10 @@ def main():
         cmd_inventory(op, out_path=os.path.join(SCRATCH_DIR, "inventory.json"))
         return 0
     if args.cmd == "purge":
-        return cmd_purge(op, apply=args.apply)
+        # Governance (happy-path Finding 4): --dry-run was parsed but never read, so
+        # `purge --apply --dry-run` together still deleted with no override protection.
+        # --dry-run now wins if both are given.
+        return cmd_purge(op, apply=args.apply and not args.dry_run)
     if args.cmd == "ensure":
         return cmd_ensure(op)
     if args.cmd == "teardown-cohort":
