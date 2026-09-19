@@ -482,6 +482,18 @@ now-false basis).** The two causes are split:
    choice between "hold everything" and "replace everything" is forced on the server just because two
    different causes are active on the same agent at once.
 
+**Consent-loss disarm has a real, acknowledged residual window while a device is offline — "the
+moment its consent basis becomes false" above describes how promptly the SERVER reacts to the
+triggering re-tag or membership change (it queues the disarming push right away), not when the
+DEVICE actually stops.** The sole delivery mechanism for the disarm is the removal push described in
+this section; v1 has no agent-side consent lease, expiry, or dequeue-time recheck. An agent that is
+offline when its consent basis turns false keeps running its previously-armed dangerous Reaction,
+unchanged, until it reconnects and applies the removal. This is a genuine gap on D4 — the platform's
+headline consent guarantee, not an ordinary admin-scope decision — and it is unresolved here, not
+merely restated push latency: closing it (an agent-side lease/expiry, or narrowing the "moment" claim
+above to explicitly cover only connected devices) is future design work, not decided by this
+document.
+
 - **Identical generation is a no-op.** If the agent's already-applied generation matches the
   incoming push's generation, the agent applies nothing and re-arms nothing — an ordinary reconnect
   that re-delivers the same snapshot must not spuriously re-fire `fire_on_arm` Reflexes or reset
