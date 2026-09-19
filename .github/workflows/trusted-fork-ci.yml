@@ -81,11 +81,12 @@ jobs:
           }
 
           review_json=$(gh run view "$REVIEW_RUN_ID" --repo "$REPOSITORY" \
-            --json workflowName,displayTitle,status,conclusion)
+            --json workflowName,displayTitle,status,conclusion,headBranch)
           workflow_name=$(jq -r '.workflowName' <<<"$review_json")
           display_title=$(jq -r '.displayTitle' <<<"$review_json")
           status=$(jq -r '.status' <<<"$review_json")
           conclusion=$(jq -r '.conclusion' <<<"$review_json")
+          review_head_branch=$(jq -r '.headBranch' <<<"$review_json")
           expected_title="Fork review PR #$PR_NUMBER @ $APPROVED_SHA"
           [[ "$workflow_name" == "Fork dynamic review" ]] || {
             echo "::error::Review run is not Fork dynamic review."
@@ -93,6 +94,18 @@ jobs:
           }
           [[ "$display_title" == "$expected_title" ]] || {
             echo "::error::Review run title does not bind it to PR #$PR_NUMBER @ $APPROVED_SHA"
+            exit 1
+          }
+          # The title above binds (PR#, SHA) only, never the branch -- a
+          # quarantine branch is reused-or-fresh across approval rounds by
+          # design (docs/ci-troubleshooting.md 1.2), so a stale/reused branch
+          # name can otherwise cite a genuinely successful review run from a
+          # DIFFERENT quarantine branch and pass every check above. Since this
+          # workflow only ever runs via workflow_dispatch on a branch ref,
+          # GITHUB_REF is authoritative for "which branch is this run on".
+          dispatch_branch="${GITHUB_REF#refs/heads/}"
+          [[ "$review_head_branch" == "$dispatch_branch" ]] || {
+            echo "::error::Review run's branch ($review_head_branch) does not match the branch this gate is dispatched on ($dispatch_branch) -- see docs/ci-troubleshooting.md 1.2."
             exit 1
           }
           [[ "$status" == "completed" && "$conclusion" == "success" ]] || {
