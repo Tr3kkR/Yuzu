@@ -114,12 +114,17 @@ message ReflexSet {
   uint64 version = 3;
   bool enabled = 4;
 
-  // SHA-256 over the canonical (key-sorted) spec JSON plus the assignment
-  // list (reflex_set_spec.cpp `canonical_reflex_digest`) — NOT a member-ID
-  // list. The server recomputes and compares this at every compile
-  // (ADR-0021 Decision 9); a mismatch means the approval no longer covers
-  // the content and reflex_push_builder.cpp OMITS the set from the push
-  // (never a silent downgrade).
+  // SHA-256 over the canonical (key-sorted) spec JSON plus the resolved
+  // device-id list the assignment expands to at digest-compute time (sorted,
+  // deduplicated — not the raw group/tag reference alone; a membership
+  // change that alters the resolved list changes the digest, which is how a
+  // management-group membership change invalidates a standing approval).
+  // The server recomputes and compares this at every compile (ADR-0021
+  // Decision 9). A mismatch HOLDS the agent's last accepted generation for
+  // this set, never a bare omission from the push — see docs/reflex-design.md
+  // "Generation, undeploy, and push semantics" Rule 1 for the exact
+  // full_sync=true/false mechanics (omitting a refused set from a
+  // full_sync=true push would DISARM it, not hold it).
   string digest = 5;
   string approval_id = 6;
   string approved_by = 7;

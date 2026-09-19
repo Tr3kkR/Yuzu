@@ -221,9 +221,11 @@ ADR-0033 §7's identity-resolution rule — not merely "a different principal st
 approving through their own second API token must not satisfy this gate, and R9's implementation is
 responsible for resolving every identity surface (session, API token, MCP principal) back to the
 underlying human before comparing. Approval is bound to a **canonical digest**
-(`canonical_reflex_digest(spec_json, assignment)`, SHA-256 over key-sorted `spec_json` plus the
-resolved assignment/device-set — not a member-ID list) — editing a Reaction's params or the
-assignment growing invalidates the approval.
+(`canonical_reflex_digest(spec_json, assignment)`) — SHA-256 over key-sorted `spec_json` plus the
+**resolved device-id list the assignment expands to at digest-compute time**, sorted and deduplicated,
+not the raw group/tag reference alone. Editing a Reaction's params, or a management-group membership
+change that alters the resolved id list, invalidates the approval; see "Device-set binding, re-tag,
+and membership drift" below.
 
 **The approval REQUEST carries the digest the reviewer actually reviewed, and the server rejects on
 drift.** If the content changes between review and approve (an editor saves a new version mid-review),
@@ -325,9 +327,10 @@ a plugin honesty bug, not a hole in the D4 consent gate — v1's consent gate ne
 
 **Device-set binding, re-tag, and membership drift.** The two-person approval (D9 below) binds its
 digest to the **resolved device set at approval time**, not group IDs alone — a management-group
-membership growing after approval invalidates it, and the next compile refuses until re-approved
-(see D9). Re-tagging a device (`device_class` changes) or a membership change on an
-already-deployed, already-armed set triggers a **recompile**: the affected set's consent is
+membership change **in either direction, growth or shrink**, invalidates it (the digest hashes the
+resolved id list, so removing a device changes it exactly as adding one does), and the next compile
+refuses until re-approved (see D9). Re-tagging a device (`device_class` changes) or a membership
+change on an already-deployed, already-armed set triggers a **recompile**: the affected set's consent is
 re-evaluated, and if it no longer holds, the set is **disarmed** on the affected device(s) via the
 explicit removal push described in "Generation, undeploy, and push semantics" below (a
 generation-advancing removal, never a compile-refusal HOLD, and never left silently armed under a
