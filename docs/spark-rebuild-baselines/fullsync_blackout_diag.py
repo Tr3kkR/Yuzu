@@ -732,9 +732,22 @@ def sweep_row_pure(events, epoch, floor, missing_rule_ids, backend, t0_ts, t0d_t
     scoped to just the missing rule_ids, makes the sweep's membership rule
     identical to the primary classifier's by construction - not merely
     documented as identical, which is what the docstring claimed before this
-    fix and was not true. Returns (found{rid:{...}}, still_missing[rid,...])."""
+    fix and was not true.
+
+    Also returns whether the fuller scan turned up a genuine fence violation
+    for one of the missing rule_ids (R5.7 adversarial-review-class fix, UP-2,
+    /governance unhappy-path): the caller must treat that as taking
+    precedence over BOTH "found on the second look" and "still missing" -
+    same fence-violation-first precedence as resolve_collect_t2_reason() -
+    or a genuine epoch-fence correctness defect gets silently declared
+    instrument-invalid (t2_late) just because a DIFFERENT valid line for the
+    same rule_id also happened to show up in the fuller window.
+
+    Returns (found{rid:{...}}, still_missing[rid,...], fence_violated: bool)."""
     result = classify_t2(events, epoch, floor, missing_rule_ids, own_push_raw, backend, t0_ts, t0d_ts)
-    return result["selected"], result["missing"]
+    fence_violated = bool(result["legacy_before_t0d"]) or any(
+        r["reason"] == "fence_violation_below_floor" for r in result["rejected"])
+    return result["selected"], result["missing"], fence_violated
 
 
 def compute_window_math(t0_ts, t0d_ts, t1_ts, selected):
@@ -784,9 +797,21 @@ def _instrument_void_ceiling_breached(rows):
 
 def compute_verdict(legacy_rows, spark_rows, floor):
     """§7 two-gate verdict: reliability (ALL attempts, both cells) then
-    latency (counted repeats only), margin = max(1000ms, legacy median)."""
-    legacy_valid = [r for r in legacy_rows if not r.get("void_reason")]
-    spark_valid = [r for r in spark_rows if not r.get("void_reason")]
+    latency (counted repeats only), margin = max(1000ms, legacy median).
+
+    /governance happy-path finding: fullsync-blackout-results.jsonl is a
+    single accumulated file spanning multiple, incompatible historical
+    schemas (label="clean"/"clean-v2" rows from an earlier diagnostic round
+    predate the c_ms/C-measurand convention entirely and have no "c_ms" key
+    at all) - a bare r["c_ms"] below would KeyError on such a row if it were
+    ever counted "valid". Requiring "c_ms" in r here means a schema-
+    incompatible row simply never counts as measurable under THIS verdict
+    definition (worst case that cell reads INCONCLUSIVE - floor not reached
+    - rather than crashing cmd_report); every real label="t2-v1" row already
+    carries c_ms whenever it is not void, so this changes nothing for the
+    data this fix round is actually about."""
+    legacy_valid = [r for r in legacy_rows if not r.get("void_reason") and "c_ms" in r]
+    spark_valid = [r for r in spark_rows if not r.get("void_reason") and "c_ms" in r]
     genuine = any(r.get("void_class") == "genuine" for r in legacy_rows + spark_rows)
     if genuine:
         return "FAIL-RELIABILITY"
@@ -854,12 +879,42 @@ def observe_t1(window_start_ts, t0d_ts, t1_timeout_s, poll=2.0):
     return None, "t1_not_found"
 
 
+def resolve_collect_t2_reason(result):
+    """Pure: given one classify_t2() result, decide collect_t2's void reason
+    with FENCE-VIOLATION-FIRST precedence. R5.7 adversarial-review-class fix
+    (found during /governance's unhappy-path review, UP-1): the original
+    collect_t2() checked `next_t0d_ts` (-> "double_full_sync") INSIDE the
+    polling loop and returned immediately, so a genuine fence violation
+    (`legacy_before_t0d`, or a rejected `fence_violation_below_floor` line)
+    already sitting in `result["rejected"]` at that exact moment was never
+    consulted - the same laundering shape resolve_post_t2_void() fixes for
+    failed_gt_0 vs a collection-stage reason, one level further in. Did not
+    manifest in this branch's own committed data (verified: none of the
+    double_full_sync rows carry a fence_violation_below_floor rejection) but
+    is a real, reachable bug in the classifier this tool is documented as
+    reusable for."""
+    if result["legacy_before_t0d"] or any(
+            r["reason"] == "fence_violation_below_floor" for r in result["rejected"]):
+        return "fence_violation"
+    if result["next_t0d_ts"] is not None:
+        return "double_full_sync"
+    if result["missing"]:
+        return "t2_incomplete"
+    if result["push_lines"]:
+        return "repush_confound"
+    return None
+
+
 def collect_t2(t0_ts, t0d, window_start_ts, own_push_raw, expected_rule_ids, backend,
                visibility_timeout_s=ROOT_CAUSED_T2_VISIBILITY_TIMEOUT, poll=2.0):
     """Live S4: poll until classify_t2() reports nothing missing, a next-
     application T0d appears, or the visibility deadline expires. Returns
     (classify_t2 result dict, void_reason or None, last fetched events -
-    the latter reused by the caller for the n_arm_lines continuity field)."""
+    the latter reused by the caller for the n_arm_lines continuity field).
+    t2_incomplete/repush_confound are decided only after the polling deadline
+    is exhausted (see resolve_collect_t2_reason() for the reason precedence
+    itself, checked every iteration so fence_violation/double_full_sync can
+    never be masked by continuing to poll)."""
     deadline = time.time() + visibility_timeout_s
     result, last_events = None, []
     while time.time() < deadline:
@@ -867,29 +922,25 @@ def collect_t2(t0_ts, t0d, window_start_ts, own_push_raw, expected_rule_ids, bac
         last_events = events
         result = classify_t2(events, t0d["epoch"], t0d["floor"], expected_rule_ids,
                               own_push_raw, backend, t0_ts, t0d["ts"])
-        if result["next_t0d_ts"] is not None:
-            return result, "double_full_sync", last_events
+        early_reason = resolve_collect_t2_reason(result)
+        if early_reason in ("fence_violation", "double_full_sync"):
+            return result, early_reason, last_events
         if not result["missing"]:
             break
         time.sleep(poll)
     if result is None:
         result = classify_t2([], t0d["epoch"], t0d["floor"], expected_rule_ids,
                               own_push_raw, backend, t0_ts, t0d["ts"])
-    if result["legacy_before_t0d"] or any(
-            r["reason"] == "fence_violation_below_floor" for r in result["rejected"]):
-        return result, "fence_violation", last_events
-    if result["missing"]:
-        return result, "t2_incomplete", last_events
-    if result["push_lines"]:
-        return result, "repush_confound", last_events
-    return result, None, last_events
+    return result, resolve_collect_t2_reason(result), last_events
 
 
 def sweep_incomplete(rows, window_start_ts):
     """R5.7 §2.2 item 8: one final, patient read of the whole log span at the
-    end of a cmd_run() invocation, reclassifying every t2_incomplete row
-    into t2_late (found on the second look - instrument-invalid) or
-    arm_never_confirmed (still missing - genuine)."""
+    end of a cmd_run() invocation, reclassifying every t2_incomplete row into
+    fence_violation (genuine, takes precedence over the other two - see
+    sweep_row_pure()'s fence_violated return), t2_late (found on the second
+    look - instrument-invalid), or arm_never_confirmed (still missing -
+    genuine)."""
     incomplete = [r for r in rows if r.get("void_reason") == "t2_incomplete"]
     if not incomplete:
         return rows
@@ -898,10 +949,12 @@ def sweep_incomplete(rows, window_start_ts):
         t0_ts = datetime.fromisoformat(r["t0"])
         t0d_ts = datetime.fromisoformat(r["t0d"]["ts"])
         own_push_raw = find_own_push_cmd_raw(events, t0_ts)
-        found, still_missing = sweep_row_pure(
+        found, still_missing, fence_violated = sweep_row_pure(
             events, r["t0d"]["epoch"], r["t0d"]["floor"], set(r["missing_rule_ids"]),
             r["backend"], t0_ts, t0d_ts, own_push_raw)
-        if not still_missing:
+        if fence_violated:
+            r["void_class"], r["void_reason"] = "genuine", "fence_violation"
+        elif not still_missing:
             for rid, v in found.items():
                 r["t2_selected"][rid] = {**v, "ts": v["ts"].isoformat()}
             r["missing_rule_ids"] = []
@@ -1540,16 +1593,14 @@ def _f11():
             "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
             "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
     ]
-    found, still_missing = sweep_row_pure(events_found, epoch=1, floor=5,
-                                           missing_rule_ids={"blackout-reg-01"},
-                                           backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts,
-                                           own_push_raw=None)
-    ok1 = "blackout-reg-01" in found and not still_missing
-    found2, still_missing2 = sweep_row_pure([], epoch=1, floor=5,
-                                             missing_rule_ids={"blackout-reg-01"},
-                                             backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts,
-                                             own_push_raw=None)
-    ok2 = not found2 and still_missing2 == ["blackout-reg-01"]
+    found, still_missing, fence_violated = sweep_row_pure(
+        events_found, epoch=1, floor=5, missing_rule_ids={"blackout-reg-01"},
+        backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
+    ok1 = "blackout-reg-01" in found and not still_missing and not fence_violated
+    found2, still_missing2, fence_violated2 = sweep_row_pure(
+        [], epoch=1, floor=5, missing_rule_ids={"blackout-reg-01"},
+        backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
+    ok2 = not found2 and still_missing2 == ["blackout-reg-01"] and not fence_violated2
     return ok1 and ok2, f"found_case={ok1} never_found_case={ok2}"
 
 
@@ -1683,10 +1734,11 @@ def _f16():
         # this arm line belongs to epoch 2's application, not epoch 1's
         _ev("2026-09-19 10:00:05.050", "Guardian: file guard armed for rule 'blackout-file-01'"),
     ]
-    found_a, still_missing_a = sweep_row_pure(
+    found_a, still_missing_a, fence_violated_a = sweep_row_pure(
         events_cross_app, epoch=1, floor=0, missing_rule_ids={"blackout-file-01"},
         backend="legacy", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
-    ok_a = "blackout-file-01" not in found_a and still_missing_a == ["blackout-file-01"]
+    ok_a = ("blackout-file-01" not in found_a and still_missing_a == ["blackout-file-01"]
+            and not fence_violated_a)
 
     # (b) spark below-floor non-adopt rejected, below-floor adopt accepted
     events_floor = [
@@ -1697,16 +1749,22 @@ def _f16():
             "Guardian spark: arm committed for rule 'blackout-reg-02' (epoch=1, incarnation=3, "
             "type=registry, via=callback-adopt, attach_to_commit_ms=1)"),
     ]
-    found_b, still_missing_b = sweep_row_pure(
+    found_b, still_missing_b, fence_violated_b = sweep_row_pure(
         events_floor, epoch=1, floor=5,
         missing_rule_ids={"blackout-reg-01", "blackout-reg-02"},
         backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts, own_push_raw=None)
     ok_b_reject_below_floor_non_adopt = "blackout-reg-01" not in found_b
     ok_b_accept_below_floor_adopt = "blackout-reg-02" in found_b
-    return (ok_a and ok_b_reject_below_floor_non_adopt and ok_b_accept_below_floor_adopt,
+    # blackout-reg-01's rejected line IS a genuine fence_violation_below_floor
+    # (R5.7 adversarial-review-class fix, UP-2) - sweep_row_pure must surface
+    # it via fence_violated, not silently swallow it now that reg-02 is found.
+    ok_b_fence_violated_surfaced = fence_violated_b is True
+    return (ok_a and ok_b_reject_below_floor_non_adopt and ok_b_accept_below_floor_adopt
+            and ok_b_fence_violated_surfaced,
             f"legacy_no_cross_app_attribution={ok_a} "
             f"spark_below_floor_non_adopt_rejected={ok_b_reject_below_floor_non_adopt} "
             f"spark_below_floor_adopt_accepted={ok_b_accept_below_floor_adopt} "
+            f"fence_violated_surfaced={ok_b_fence_violated_surfaced} "
             f"still_missing_a={still_missing_a}")
 
 
@@ -1738,11 +1796,89 @@ def _f17():
             f"exactly_50pct_not_over_ceiling={ok2} (verdict={v2}) clean_pass={ok3} (verdict={v3})")
 
 
+def _f18():
+    # resolve_collect_t2_reason()'s precedence rule (/governance unhappy-path
+    # UP-1): fence_violation must win over EVERY other reason, exactly like
+    # resolve_post_t2_void()'s genuine-wins rule one level up. Construct
+    # classify_t2()-shaped result dicts directly (pure function of a dict, no
+    # need to go through classify_t2 itself) covering every reason and every
+    # combination where fence_violation co-occurs with a later-checked one.
+    def _result(legacy_before_t0d=None, rejected=None, next_t0d_ts=None,
+                missing=None, push_lines=None):
+        return {"legacy_before_t0d": legacy_before_t0d or [],
+                "rejected": rejected or [], "next_t0d_ts": next_t0d_ts,
+                "missing": missing or [], "push_lines": push_lines or []}
+
+    fence_via_legacy = _result(legacy_before_t0d=["raw line"], next_t0d_ts="t")
+    ok1 = resolve_collect_t2_reason(fence_via_legacy) == "fence_violation"
+
+    fence_via_rejected = _result(rejected=[{"line": "x", "reason": "fence_violation_below_floor"}],
+                                  next_t0d_ts="t", missing=["r1"], push_lines=["p"])
+    ok2 = resolve_collect_t2_reason(fence_via_rejected) == "fence_violation"
+
+    double_full_sync_only = _result(next_t0d_ts="t")
+    ok3 = resolve_collect_t2_reason(double_full_sync_only) == "double_full_sync"
+
+    t2_incomplete_only = _result(missing=["r1"])
+    ok4 = resolve_collect_t2_reason(t2_incomplete_only) == "t2_incomplete"
+
+    repush_confound_only = _result(push_lines=["p"])
+    ok5 = resolve_collect_t2_reason(repush_confound_only) == "repush_confound"
+
+    clean = _result()
+    ok6 = resolve_collect_t2_reason(clean) is None
+
+    return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6,
+            f"fence_via_legacy_wins={ok1} fence_via_rejected_wins_over_double_full_sync={ok2} "
+            f"double_full_sync_only={ok3} t2_incomplete_only={ok4} repush_confound_only={ok5} "
+            f"clean={ok6}")
+
+
+def _f19():
+    # /governance consistency-auditor finding: void_class_for()'s
+    # GENUINE_FAILURE_REASONS / INSTRUMENT_INVALID_REASONS partition is
+    # enforced only by a default branch (any string not in the genuine set
+    # classifies instrument) - nothing pins today's actual membership, so a
+    # future new void_reason literal added at a call site without also being
+    # added to GENUINE_FAILURE_REASONS would silently become instrument, the
+    # exact laundering direction 2dbb9c7d1 fixed for a different code path.
+    # This fixture locks today's CLOSED, hand-verified list of every
+    # row-level void_reason literal actually produced by a call site in this
+    # file (excludes observe_phase_a_window()'s own ad-hoc "..._in_cap"/
+    # "..._within_120s_of_t0" dict keys, which are Phase-A-only, never passed
+    # through void_class_for, and not verdict-bearing per the run doc's own
+    # "context only" framing; also excludes "fence_violation_below_floor",
+    # which is a REJECTED-LINE-level reason inside result["rejected"], never
+    # itself a row-level void_reason).
+    genuine_literals = {"failed_gt_0", "arm_never_confirmed", "functional_invalid",
+                         "fence_violation"}
+    instrument_literals = {"t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete",
+                            "t2_late", "log_rotated_mid_window", "trigger_not_created",
+                            "repush_confound", "applied_ne_total", "double_full_sync",
+                            "cohort_composition", "teardown_size_mismatch"}
+    ok1 = genuine_literals == GENUINE_FAILURE_REASONS
+    ok2 = instrument_literals == INSTRUMENT_INVALID_REASONS
+    ok3 = not (GENUINE_FAILURE_REASONS & INSTRUMENT_INVALID_REASONS)
+    ok4 = all(void_class_for(r) == "genuine" for r in genuine_literals)
+    ok5 = all(void_class_for(r) == "instrument" for r in instrument_literals)
+    # the two documented dynamic-prefix reasons classify instrument by
+    # default (the comment above INSTRUMENT_INVALID_REASONS's own definition
+    # describes this; not a set-membership case).
+    ok6 = (void_class_for("trigger_failed:some error") == "instrument"
+           and void_class_for("push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)")
+           == "instrument")
+    return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6,
+            f"genuine_set_matches={ok1} instrument_set_matches={ok2} "
+            f"zero_overlap={ok3} genuine_classify_correct={ok4} "
+            f"instrument_classify_correct={ok5} dynamic_prefix_default_instrument={ok6}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
-        ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17),
+        ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
+        ("F19", _f19),
     ]
     failures = 0
     for name, fn in fixtures:
