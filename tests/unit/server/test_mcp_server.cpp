@@ -9914,6 +9914,79 @@ TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non
     CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+// Governance fix (#2146 A2-R1 re-review, adjudicated): this tool used the
+// plain get_execution(), which collapses "execution genuinely absent" and
+// "read degraded" (a transient pool/query failure) to the same nullopt --
+// MCP's denial branch fires unconditionally on `!exec` (not gated on
+// `gate.scope` the way the REST twin's audit call is), so an unconfined
+// caller hitting a degrade here still fell through to the SAME
+// not-found + `mcp_audit("denied", ...)` branch a genuine absence takes.
+// get_execution_checked's outer std::expected now distinguishes the two;
+// the degrade branch returns BEFORE any denial audit is recorded.
+TEST_CASE("MCP get_execution_status: a transient tracker degrade is kInternalError, "
+          "not a false not-found, and records no denial audit (#2146 A2-R1)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-degrade-status";
+    exec.scope_expression = "ostype = 'windows'";
+    exec.dispatched_by = "operator";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the tracker's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing "Execution tracker unavailable" branch
+    // above and mask this specific defect).
+    {
+        pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{
+            PQexec(conn.get(), "ALTER TABLE execution_tracker.executions RENAME TO "
+                               "executions_hidden_2146")};
+        REQUIRE(r.ok());
+    }
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":723,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    {
+        pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "ALTER TABLE execution_tracker.executions_hidden_2146 "
+                                          "RENAME TO executions")};
+        REQUIRE(r.ok());
+    }
+
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // MCP: transport-level 200, error lives in the JSON-RPC body
+    auto body = nlohmann::json::parse(res->body);
+    // (a) kInternalError, never the old false not-found (kInvalidParams).
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+
+    // (b) no denial audit row -- pre-fix, this recorded
+    // "mcp.get_execution_status|denied" (audit_log records "action|result"
+    // pairs, not target_id) even for this unconfined caller, since MCP's
+    // denial audit fires unconditionally on `!exec`, unlike the REST twin's
+    // audit call which is gated on gate.scope.
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.get_execution_status|denied");
+    for (const auto& d : ts.audit_details)
+        CHECK(d.find(exec_id) == std::string::npos);
+}
+
 // #1634 (adversarial-review K3/D3 follow-up): get_execution_status migrated onto
 // fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}. Real RBAC/mgmt-group
 // composition via ResponseExecutionAuthzPgRig — not a fake gate callback.

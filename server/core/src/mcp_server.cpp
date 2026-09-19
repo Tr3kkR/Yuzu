@@ -10260,7 +10260,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                auto exec = execution_tracker->get_execution(exec_id);
+                // Governance fix (#2146 A2-R1 re-review): was the plain
+                // get_execution(), which collapses "row genuinely absent" and
+                // "read degraded" (pool/query failure) to the same nullopt --
+                // a transient degrade here fell through to the not-found +
+                // denial-audit branch below, producing a FALSE 404 for a
+                // legitimate owner and a permanently wrong CC7.2 audit trail
+                // for a non-owner. get_execution_checked's outer
+                // std::expected distinguishes the two; the degrade branch
+                // below matches this same file's get_execution_children twin
+                // (a few hundred lines below) and MUST run BEFORE any denial
+                // audit is recorded.
+                auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                if (!exec_r) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& exec = *exec_r;
                 // #4030: optional per-agent expansion, MCP twin of the REST
                 // `?include=agents` decision on GET /api/v1/executions/{id} —
                 // same param name/value, same route (this tool), not a new

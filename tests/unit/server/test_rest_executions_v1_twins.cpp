@@ -13,6 +13,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -20,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
@@ -30,7 +32,24 @@
 #include <unordered_set>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
+
+namespace {
+// Fault-injection helper for the #2146 A2-R1 degrade test below: runs a raw
+// statement over a fresh side connection (never the harness's own pool, so
+// the tracker's `open_`/pool state stays otherwise healthy -- only the ONE
+// targeted query fails). Mirrors test_audit_store.cpp's identical
+// `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+} // namespace
 
 namespace {
 
@@ -234,6 +253,50 @@ TEST_CASE("GET /api/v1/executions/:id: bare request has no agents/kpi and is una
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body["data"].contains("agents"));
     CHECK_FALSE(body["data"].contains("kpi"));
+    for (const auto& c : h.audit_log)
+        CHECK(c.target_id != exec_id);
+}
+
+// Governance fix (#2146 A2-R1 re-review, adjudicated): this route used the
+// plain get_execution(), which collapses "execution genuinely absent" and
+// "read degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a genuine
+// absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("GET /api/v1/executions/:id: a transient tracker degrade is 503, not a "
+          "false 404, and records no denial audit (#2146 A2-R1)",
+          "[pg][rest][executions][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-degrade-1");
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes -- an unconfined caller
+    // never reaches that branch at all, which would make assertion (b)
+    // below pass trivially even against the unfixed code.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing tracker-unavailable/pool-exhaustion
+    // branch above and mask this specific defect).
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146");
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions_hidden_2146 RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.detail.fetch/denied here.
     for (const auto& c : h.audit_log)
         CHECK(c.target_id != exec_id);
 }
