@@ -691,20 +691,19 @@ def observe_window(window_start_ts, t0_timeout_s, t1_timeout_s, poll=2.0):
     }
 
 
-def cohort_events_d(op, rule_ids, t0_dt, deadline_ms):
+def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=2.0):
     # t0_dt is a log-native timestamp (local-labeled-as-UTC, see
     # dgrhp_utc_offset()) but event_id's embedded ms is a REAL UTC epoch
     # (std::chrono::system_clock, unaffected by display timezone) - subtract
     # the offset back out before comparing, or every lookup here silently
     # searches the wrong hour and reports "not_observed" for everything.
     t0_ms = int(t0_dt.timestamp() * 1000) - int(dgrhp_utc_offset().total_seconds() * 1000)
-    by_rule = {}
-    for rid in rule_ids:
+
+    def check_one(rid):
         try:
             data = get_json(op, f"/api/v1/guaranteed-state/events?rule_id={rid}&limit=10")["data"]
         except Exception:  # noqa: BLE001
-            by_rule[rid] = "not_observed"
-            continue
+            return None
         found = None
         for ev in data:
             if ev.get("event_type") != "guard.compliant":
@@ -716,7 +715,33 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms):
             if t0_ms <= ms <= t0_ms + deadline_ms:
                 if found is None or ms < found:
                     found = ms
-        by_rule[rid] = (found - t0_ms) if found is not None else "not_observed"
+        return found
+
+    # Governance (happy-path Finding 2, SHOULD): this used to be a single immediate query per
+    # rule despite deadline_ms implying a wait window - server-side event-ingestion lag (the
+    # same class of gap this whole diagnostic exists to characterize on the LOG side) could
+    # make a genuinely-valid repeat misclassify as functional_invalid just because the event
+    # hadn't landed yet at the one instant this function happened to check. Poll instead, same
+    # cadence as observe_window's own poll. The outer stopping condition deliberately uses a
+    # LOCAL elapsed-time budget (time.time() - start), NOT an absolute comparison against
+    # t0_ms/dgrhp_now() - t0_ms stays DGRHP-native for the per-event window check below, but
+    # the loop's own "have I waited long enough" question needs no cross-host clock comparison
+    # at all, avoiding the exact drift bug dgrhp_now()'s own docstring documents fixing twice.
+    remaining = set(rule_ids)
+    by_rule = {}
+    start = time.time()
+    budget_s = deadline_ms / 1000.0
+    while remaining:
+        for rid in list(remaining):
+            found = check_one(rid)
+            if found is not None:
+                by_rule[rid] = found - t0_ms
+                remaining.discard(rid)
+        if not remaining or (time.time() - start) >= budget_s:
+            break
+        time.sleep(poll)
+    for rid in remaining:
+        by_rule[rid] = "not_observed"
     return by_rule
 
 
