@@ -1472,9 +1472,44 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
     results = sweep_incomplete(results, window_start_for_sweep)
     inconclusive = valid < repeats
     swept_rows = [{**r, "label": label} for r in results]
-    with open(out_path, "r") as f:
-        lines = f.readlines()
+    # Governance (this round): out_path may not exist yet - repeats=0 (a degenerate but
+    # reachable CLI invocation) or a --out path that's never been written to leaves the
+    # write-through loop above never entered, so nothing created the file. The pre-write-
+    # through code tolerated this (its single unconditional "a"-mode open created the file
+    # regardless of whether anything was written); a bare "r"-mode open here would crash
+    # with FileNotFoundError where the old code silently produced an empty file - not a
+    # behavior change worth having, for a two-line guard.
+    lines = []
+    if os.path.exists(out_path):
+        with open(out_path, "r") as f:
+            lines = f.readlines()
     lines = replace_run_rows(lines, run_id, swept_rows)
+    # Governance (this round): this rewrite assumes single-writer usage (legacy/spark
+    # backends need different agent configs and cannot run concurrently against one agent
+    # - the documented operational model this tool is used under), but nothing in the code
+    # enforces that. Before this round, cmd_run's final write was a pure append, safe under
+    # a concurrent writer; this round's read-modify-write finalization is NOT - a second
+    # process appending to out_path between the readlines() above and the swap below would
+    # have its rows silently discarded by this process's own rewrite. Fail loud instead of
+    # silent: re-check the live line count immediately before the swap (this run's own
+    # per-attempt rows are already durably on disk via write-through above regardless of
+    # what happens next, so refusing here costs only the sweep-reclassification correction,
+    # never data). This narrows the race to the residual gap between this check and the
+    # os.replace() call below, not a full lock - proportionate to how unlikely concurrent
+    # invocation is under this tool's own operational model, not a claim of full atomicity.
+    # Same missing-file tolerance as the read above (repeats=0 against a path nothing has
+    # ever written to): live_count is simply 0 in that case, matching len(lines)==0.
+    live_count = 0
+    if os.path.exists(out_path):
+        with open(out_path) as f:
+            live_count = sum(1 for _ in f)
+    if live_count != len(lines):
+        print(f"[run] {label} {backend} {phase} ABORT: {out_path} changed size "
+              f"({live_count} lines now vs {len(lines)} expected) during this run's own "
+              f"finalization - a concurrent writer is the likely cause. Refusing to "
+              f"overwrite; re-run 'report' once the concurrent access is resolved.",
+              file=sys.stderr)
+        return 1
     tmp_path = f"{out_path}.tmp-{os.getpid()}"
     with open(tmp_path, "w") as f:
         f.writelines(lines)
