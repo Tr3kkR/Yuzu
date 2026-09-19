@@ -395,9 +395,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // idx_concurrency_claims_claimed_at was added while that table had
         // zero production rows), `executions` can already be non-empty on an
         // upgrading install, so this migration's plain CREATE INDEX takes a
-        // brief ACCESS EXCLUSIVE lock on it for the build -- an accepted
-        // one-time operational cost, since a CONCURRENT build is not an
-        // option this migration mechanism can offer.
+        // SHARE lock on it for the build (blocks concurrent writers, not
+        // readers, per Postgres's own CREATE INDEX locking rules) -- an
+        // accepted one-time operational cost, since a CONCURRENT build is
+        // not an option this migration mechanism can offer.
         {6, "CREATE INDEX IF NOT EXISTS idx_executions_parent_id ON executions(parent_id);"},
     };
     return kMigrations;
