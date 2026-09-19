@@ -1850,6 +1850,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // three metrics — the same reports_any definition DexPerfFleetNow uses,
     // so the gauge and the Performance tab's Reporting card agree.
     int perf_reporting = 0;
+    // C1: the SAME samples, additionally bucketed by normalize_os so
+    // recompute_perf_os_gauges can export per-OS families — parallel maps,
+    // not a restructure of the flat vectors above (the existing four
+    // yuzu_fleet_perf_* families stay on their original, untouched path).
+    std::unordered_map<std::string, std::vector<double>> perf_cpu_os, perf_commit_os,
+        perf_disk_lat_os;
+    std::unordered_map<std::string, int> perf_reporting_os;
     // Network heartbeat facts (slice 3) — same shared validators as the
     // /network read model (per-device parity); the dashboard is OS-blended while
     // these gauges are per-OS, so a mixed-fleet aggregate differs by design.
@@ -2114,21 +2121,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // A4 perf tags — validation rules live in dex_perf_rules.hpp, SHARED
         // with the F2a /dex Performance read model so the Prometheus gauges
         // and the in-product view can never disagree on the same sample.
+        // C1: each sample also feeds the *_os twin (same normalize_os the net
+        // families use) for recompute_perf_os_gauges — one parse, two pushes.
+        const std::string perf_os = normalize_os(os_val);
         bool perf_reported_any = false;
         if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct))) {
             perf_cpu.push_back(*v);
+            perf_cpu_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
         if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct))) {
             perf_commit.push_back(*v);
+            perf_commit_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
         if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs))) {
             perf_disk_lat.push_back(*v);
+            perf_disk_lat_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
-        if (perf_reported_any)
+        if (perf_reported_any) {
             ++perf_reporting;
+            ++perf_reporting_os[perf_os];
+        }
 
         // Network facts — validators shared with network_perf_model.cpp; bucketed
         // by the agent's OS so the rollup stays per-OS (never a cross-OS blend).
@@ -2414,6 +2429,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
+    recompute_perf_os_gauges(metrics, perf_reporting_os, perf_cpu_os, perf_commit_os,
+                             perf_disk_lat_os);
 
     // Network rollup: per-OS {stat,os} distributions + per-OS reporting
     // denominators — never a cross-OS blend (gov sre/consistency/UP-2). Families
@@ -2536,6 +2553,41 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));
+}
+
+void AgentHealthStore::recompute_perf_os_gauges(
+    yuzu::MetricsRegistry& metrics, std::unordered_map<std::string, int>& reporting_os,
+    std::unordered_map<std::string, std::vector<double>>& cpu_os,
+    std::unordered_map<std::string, std::vector<double>>& commit_os,
+    std::unordered_map<std::string, std::vector<double>>& disk_lat_os) {
+    // Absent-not-zero: clear every sweep so an OS that stops reporting leaves
+    // no stale series, mirroring the yuzu_fleet_net_*{os} precedent.
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_reporting");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_cpu_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_commit_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_disk_lat_ms");
+    for (auto& [os, n] : reporting_os)
+        metrics.gauge("yuzu_fleet_perf_os_reporting", {{"os", os}}).set(static_cast<double>(n));
+    auto set_stats_os = [&](const char* family, const std::string& os,
+                            std::vector<double>& vals) {
+        if (vals.empty())
+            return;
+        std::sort(vals.begin(), vals.end());
+        double sum = 0.0;
+        for (double v : vals)
+            sum += v;
+        metrics.gauge(family, {{"stat", "avg"}, {"os", os}})
+            .set(sum / static_cast<double>(vals.size()));
+        metrics.gauge(family, {{"stat", "p50"}, {"os", os}}).set(nearest_rank(vals, 0.50));
+        metrics.gauge(family, {{"stat", "p90"}, {"os", os}}).set(nearest_rank(vals, 0.90));
+        metrics.gauge(family, {{"stat", "max"}, {"os", os}}).set(vals.back());
+    };
+    for (auto& [os, vals] : cpu_os)
+        set_stats_os("yuzu_fleet_perf_os_cpu_pct", os, vals);
+    for (auto& [os, vals] : commit_os)
+        set_stats_os("yuzu_fleet_perf_os_commit_pct", os, vals);
+    for (auto& [os, vals] : disk_lat_os)
+        set_stats_os("yuzu_fleet_perf_os_disk_lat_ms", os, vals);
 }
 
 } // namespace yuzu::server::detail

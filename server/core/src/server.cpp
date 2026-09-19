@@ -189,6 +189,7 @@
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
+#include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -15656,14 +15657,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -15900,10 +15897,10 @@ private:
         //
         // #4035: extracted into a named variable (was inline at the
         // DexRoutes::register_routes call site below) so the SAME provider is
-        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
-        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
-        // REST twins read the identical fleet snapshot the dashboard renders
-        // against, never a second independently-computed copy.
+        // also handed to make_local_dex_api's FleetFn — the DexApi behind the
+        // GET /api/v1/dex/{health,trends,overview,catalogue/group} REST twins
+        // (and their MCP twins) reads the identical fleet snapshot the
+        // dashboard renders against, never a second independently-computed copy.
         auto dex_fleet_fn = [this]() -> DexFleet {
             DexFleet f;
             const auto ids = registry_.all_ids();
@@ -15913,18 +15910,19 @@ private:
                     std::string os = s->os;
                     for (auto& c : os)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // starts_with, NOT find — "darwin" contains "win"
-                    // (G4 UP-1; pre-existing here, fixed with the sibling).
-                    if (os.starts_with("win"))
-                        ++f.windows_online;
+                    // The shared normalizer (dex_perf_rules.hpp) folds the
+                    // "darwin contains win" G4 UP-1 fix into one place instead
+                    // of a duplicate copy of the comment at every call site.
+                    const std::string norm_os = detail::dex_perf_os_from_session(os);
                     // Per-OS online denominators (#1746) — same coverage-honest
                     // count as windows_online, so the Catalogue's single-OS
                     // filter can score a family against THAT OS's own fleet.
-                    if (os.starts_with("lin"))
+                    if (norm_os == "windows")
+                        ++f.windows_online;
+                    else if (norm_os == "linux")
                         ++f.linux_online;
-                    if (os.starts_with("darwin") || os.starts_with("macos"))
-                        ++f.macos_online; // prefix, like win/lin — keep in
-                                          // step with the store's write canon
+                    else if (norm_os == "macos")
+                        ++f.macos_online;
                     // Distinct connected OS tokens → the Catalogue's "All
                     // connected" coverage scope (render normalises darwin→macos).
                     if (!os.empty() && std::find(f.connected_os.begin(),
@@ -16060,6 +16058,19 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        std::shared_ptr<yuzu::server::DexApi> dex_api;
+        if (guaranteed_state_store_)
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -18268,11 +18279,11 @@ private:
             // /fragments/create-group-form fragment cannot disagree on scope
             // for the same caller.
             response_visible_set_fn,
-            // #4035: the SAME DexFleet provider DexRoutes::register_routes
-            // above already received — see its doc comment (defined once,
-            // just above the DexRoutes registration) for why this must be
-            // the identical lambda, not a second copy.
-            dex_fleet_fn,
+            // ADR-0031 WS-A4 (fifth family): the former dex_fleet_fn arg is
+            // RETIRED — the DEX read handlers obtain the fleet through the
+            // DexApi seam's own FleetFn (wired into make_local_dex_api below),
+            // not through a register_routes param. The `dex_fleet_fn` local is
+            // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
             // #4035 review fix (colleague review, BLOCKING): a DEDICATED
             // GuaranteedState:Read-scoped resolver (defined above, see its
             // own doc comment) — NOT the SAME visible_set_fn
@@ -18289,7 +18300,13 @@ private:
             // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
             // above and MCP list_agents/get_agent_details below use, so all
             // three GET /api/v1/devices[/{id}] siblings never disagree.
-            device_api);
+            device_api,
+            // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
+            // signal/experience handlers require this and answer 503 when it is
+            // null (constructed above iff the store is present, so `!dex_api`
+            // is the exact readiness signal the old `!guaranteed_state_store`
+            // guard was).
+            dex_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18481,11 +18498,16 @@ private:
             // preview_management_group_agent_count cannot disagree with its
             // REST/fragment siblings for the same caller.
             mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
-            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
-            // received above — see its doc comment (defined once, just above
-            // the DexRoutes registration) for why this must be the identical
-            // lambda, not a second copy.
-            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // ADR-0031 WS-A4 (fifth family): the MCP DEX signal tools obtain the
+            // fleet denominator through the DexApi seam's own FleetFn (wired into
+            // make_local_dex_api below), so the former mcp_server_->set_dex_fleet_fn
+            // wiring is retired — the tools no longer read a McpServer fleet member.
+            // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
+            // REST /api/v1/dex/* handlers use (constructed above, gated on
+            // store presence), so the MCP DEX signal tools and REST never
+            // disagree. nullptr when the store is absent → the tools' !dex_api_
+            // readiness guard answers "store unavailable" (byte-identical).
+            mcp_server_->set_dex_api(dex_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see
