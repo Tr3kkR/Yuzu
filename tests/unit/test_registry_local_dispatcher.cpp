@@ -74,8 +74,8 @@ namespace {
 // Mirrors test_plugin_loader.cpp's find_fixture_plugin, pointed at the
 // production plugin's own build output directory rather than tests/.
 // Returns an empty path (never fails) when not found -- a build invoked
-// without the agent plugins (e.g. -Dbuild_examples=false, which currently
-// gates the registry subdir()) must not fail this test, it must skip it.
+// without the agent plugins (e.g. -Dbuild_agent=false, which gates the
+// registry subdir()) must not fail this test, it must skip it.
 fs::path find_registry_plugin() {
     const std::string lib_name = "registry.dll";
 
@@ -185,7 +185,7 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
           "[registry][windows][local_dispatcher]") {
     auto plugin_path = find_registry_plugin();
     if (plugin_path.empty()) {
-        WARN("registry.dll not found (build_examples=false?) -- skipping "
+        WARN("registry.dll not found (build_agent=false?) -- skipping "
              "LocalDispatcher round-trip test");
         return;
     }

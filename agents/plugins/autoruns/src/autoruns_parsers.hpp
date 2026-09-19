@@ -28,6 +28,14 @@
 
 #include <yuzu/plugin.h> // YuzuSupportLevel
 
+// ConstraintAccumulator lives in agents/shared/ (Wave-7b prerequisite pass,
+// 2026-09-14) so execution_artifacts and app_usage can reuse it instead of
+// reinventing or copying it; see that header's banner for the full history.
+// This plugin's own call sites use it fully qualified
+// (`yuzu::shared::ConstraintAccumulator`), matching `posix_dir_walk.hpp`'s
+// existing convention in this same directory.
+#include <constraint_accumulator.hpp>
+
 // Real XML parsing for Windows Task Scheduler XML (parse_task_xml, below) --
 // see that function's banner for why this replaced hand-rolled scanning.
 // Same library this repo already trusts for equally-adversarial XML
@@ -41,6 +49,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -152,6 +162,10 @@ inline std::string sanitize_autorun_field(std::string_view value) {
 
 /// autorun|<source_id>|<catalog_version>|<location>|<entry>|<target>|<args>|
 ///        <enabled>|<scope>|<user>|<signed>|<mtime>
+/// Field index 7 (0-based, "autorun" itself at 0) is `enabled` --
+/// server/core/src/result_parsing.hpp's `cell_hints()` table hard-codes that
+/// index for the autoruns `enabled=unknown` dashboard hint (#4187); a column
+/// inserted before `enabled` here must update that table's index too.
 inline std::string format_row(const Row& row) {
     std::string out = "autorun|";
     out += source_id_string(row.source_id);
@@ -207,26 +221,71 @@ inline std::string format_source_status(SourceId id, YuzuSupportLevel support,
 /// reading past the buffer -- the truncation is silent by design here because
 /// callers that care (parse_reg_run_values) detect truncation themselves from
 /// the surrounding hex-byte count.
+namespace detail {
+inline void append_utf8(std::string& out, std::uint32_t cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+} // namespace detail
+
 inline std::string utf16le_to_utf8(std::span<const unsigned char> bytes) {
     std::string out;
     out.reserve(bytes.size());
     std::size_t i = 0;
+    // `i + 1 < bytes.size()`, not `<=`: a single dangling trailing byte (an
+    // odd total length -- a truncated final UTF-16 code unit) is silently
+    // dropped rather than emitting a replacement character for it. This is
+    // deliberate, matching this function's own documented contract (see the
+    // file banner above): a truncated code unit is not a decodable
+    // character at all, so there is nothing to represent -- callers that
+    // care about truncation (parse_reg_run_values) detect it from the
+    // surrounding hex-byte count, not from this function's output shape.
     while (i + 1 < bytes.size()) {
         const std::uint16_t unit =
             static_cast<std::uint16_t>(bytes[i]) | (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
         i += 2;
         if (unit == 0) break; // NUL terminator
-        const std::uint32_t cp = unit; // BMP-only, no surrogate pairing
-        if (cp < 0x80) {
-            out += static_cast<char>(cp);
-        } else if (cp < 0x800) {
-            out += static_cast<char>(0xC0 | (cp >> 6));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        } else {
-            out += static_cast<char>(0xE0 | (cp >> 12));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            // High surrogate -- pair with a following low surrogate into a
+            // real supplementary-plane code point (4-byte UTF-8), rather
+            // than encoding each surrogate half individually (CESU-8,
+            // technically invalid UTF-8). A high surrogate with no valid
+            // low surrogate following it (end of buffer, or the next unit
+            // isn't a low surrogate) is unpaired -- emit U+FFFD rather than
+            // a half-formed sequence.
+            if (i + 1 < bytes.size()) {
+                const std::uint16_t next = static_cast<std::uint16_t>(bytes[i]) |
+                                           (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
+                if (next >= 0xDC00 && next <= 0xDFFF) {
+                    i += 2;
+                    const std::uint32_t cp = 0x10000 +
+                                             ((static_cast<std::uint32_t>(unit) - 0xD800) << 10) +
+                                             (static_cast<std::uint32_t>(next) - 0xDC00);
+                    detail::append_utf8(out, cp);
+                    continue;
+                }
+            }
+            detail::append_utf8(out, 0xFFFD); // unpaired high surrogate
+            continue;
         }
+        if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            detail::append_utf8(out, 0xFFFD); // lone low surrogate
+            continue;
+        }
+        detail::append_utf8(out, unit);
     }
     return out;
 }
@@ -245,6 +304,20 @@ struct SplitCommand {
 /// first space; the DLL/entry-point tail travels in `args` unparsed, which is
 /// correct here since this function's job is target/args separation, not DLL
 /// entry-point resolution).
+/// Windows Run-key convention -- NOT CommandLineToArgvW's own backslash-
+/// collapsing rules (a different consumer this string never passes
+/// through): backslashes here are ordinary path separators, verbatim in
+/// the extracted target, never unescaped. The only thing this function
+/// decides about a backslash run is whether it makes the NEXT `"` a real
+/// closing quote or an escaped one -- an EVEN run (0, 2, 4, ...) means the
+/// quote terminates; an ODD run means it's escaped (`\"` embeds a literal
+/// quote character) and scanning continues past it. A bare single-
+/// backslash check (this function's prior form) gets this wrong for any
+/// run of 2 or more, e.g. `"C:\dir\\" -flag` -- two backslashes before
+/// the closing quote is an EVEN run (a plain trailing path separator, the
+/// quote genuinely closes there), but the old check saw ONE backslash
+/// immediately before it and treated the quote as escaped, scanning past
+/// the real close into the argument tail.
 inline SplitCommand split_command_line(std::string_view raw) {
     std::size_t start = raw.find_first_not_of(' ');
     if (start == std::string_view::npos) return {};
@@ -254,7 +327,15 @@ inline SplitCommand split_command_line(std::string_view raw) {
     if (raw.front() == '"') {
         std::size_t close = 1;
         while (close < raw.size()) {
-            if (raw[close] == '"' && (close == 0 || raw[close - 1] != '\\')) break;
+            if (raw[close] == '"') {
+                std::size_t backslashes = 0;
+                std::size_t k = close;
+                while (k > 1 && raw[k - 1] == '\\') {
+                    ++backslashes;
+                    --k;
+                }
+                if (backslashes % 2 == 0) break; // even run -- this quote terminates
+            }
             ++close;
         }
         out.target = std::string{raw.substr(1, close - 1)};
@@ -524,6 +605,109 @@ inline IfeoEntry parse_ifeo_debugger(std::string_view exe_name, std::string_view
     return out;
 }
 
+// ── 6b. resolve_profile_shell_folder (win_startup_folder_user redirect) ──
+
+/// Outcome of resolving a `User Shell Folders\Startup` registry value
+/// against a SPECIFIC enumerated profile -- `path` is the resolved
+/// directory, or nullopt when the value could not be turned into a usable
+/// path; `constraint` is a stable reason token for the caller's
+/// `constrained` status whenever `path` is nullopt AND the value wasn't
+/// simply absent (empty `value` in, empty `constraint` out, is the "not
+/// configured" case -- not a failure).
+struct ShellFolderResolution {
+    std::optional<std::string> path;
+    std::string_view constraint{};
+};
+
+namespace detail {
+inline bool ieq_ascii(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
+/// Resolves a `User Shell Folders\Startup` registry value against the
+/// ENUMERATED PROFILE's own identity, never the calling process's
+/// environment (#4219: the agent runs as LocalSystem, and Windows
+/// populates this value with `%USERPROFILE%`-style tokens on essentially
+/// every profile at creation -- expanding those against LocalSystem's own
+/// environment resolves to a path that normally doesn't exist, silently
+/// under-reporting the profile's real Startup entries).
+///
+/// `REG_SZ` is used as a literal path, no expansion. `REG_EXPAND_SZ` is
+/// scanned for `%NAME%` tokens by this function itself -- never handed to
+/// `ExpandEnvironmentStringsW`, which has no notion of "a different user's
+/// profile" to expand against -- with two token classes:
+///   - User-scoped (resolved from `profile_path`/`profile_name`, no lookup
+///     needed): `USERPROFILE`, `APPDATA` (`profile_path\AppData\Roaming`),
+///     `LOCALAPPDATA` (`profile_path\AppData\Local`), `USERNAME`.
+///   - Machine-scoped (identical for every user on this host, so reading
+///     the agent's OWN environment is correct for these specifically --
+///     `SystemDrive`, `SystemRoot`, `windir`, `ProgramData`,
+///     `ALLUSERSPROFILE`, `PUBLIC`, `ProgramFiles`, `ProgramFiles(x86)`):
+///     resolved via the caller-supplied `machine_var` lookup.
+/// Any other token name, an unterminated `%`, an empty `%%` token, or an
+/// allowlisted machine token `machine_var` can't supply is
+/// `startup_redirect_unresolved` -- never a silent guess. Any `type_name`
+/// other than `REG_SZ`/`REG_EXPAND_SZ` is `startup_redirect_bad_type`. An
+/// empty `value` is "not configured" (nullopt path, empty constraint) --
+/// the overwhelmingly common case for a profile with no real redirect.
+inline ShellFolderResolution resolve_profile_shell_folder(
+    std::string_view value, std::string_view type_name, std::string_view profile_path,
+    std::string_view profile_name,
+    const std::function<std::optional<std::string>(std::string_view)>& machine_var) {
+    if (value.empty()) return {};
+    if (type_name != "REG_SZ" && type_name != "REG_EXPAND_SZ")
+        return {std::nullopt, "startup_redirect_bad_type"};
+    if (type_name == "REG_SZ") return {std::string{value}, {}};
+
+    static constexpr std::array<const char*, 8> kMachineAllowlist{
+        "SystemDrive",     "SystemRoot", "windir",       "ProgramData",
+        "ALLUSERSPROFILE", "PUBLIC",     "ProgramFiles", "ProgramFiles(x86)"};
+
+    std::string out;
+    out.reserve(value.size());
+    std::size_t i = 0;
+    while (i < value.size()) {
+        if (value[i] != '%') {
+            out += value[i];
+            ++i;
+            continue;
+        }
+        const std::size_t close = value.find('%', i + 1);
+        if (close == std::string_view::npos) return {std::nullopt, "startup_redirect_unresolved"};
+        const std::string_view name = value.substr(i + 1, close - i - 1);
+        if (name.empty()) return {std::nullopt, "startup_redirect_unresolved"};
+
+        std::optional<std::string> resolved;
+        if (detail::ieq_ascii(name, "USERPROFILE")) {
+            resolved = std::string{profile_path};
+        } else if (detail::ieq_ascii(name, "APPDATA")) {
+            resolved = std::string{profile_path} + "\\AppData\\Roaming";
+        } else if (detail::ieq_ascii(name, "LOCALAPPDATA")) {
+            resolved = std::string{profile_path} + "\\AppData\\Local";
+        } else if (detail::ieq_ascii(name, "USERNAME")) {
+            resolved = std::string{profile_name};
+        } else {
+            for (const char* m : kMachineAllowlist) {
+                if (detail::ieq_ascii(name, m)) {
+                    resolved = machine_var(name);
+                    break;
+                }
+            }
+        }
+        if (!resolved.has_value()) return {std::nullopt, "startup_redirect_unresolved"};
+        out += *resolved;
+        i = close + 1;
+    }
+    return {out, {}};
+}
+
 // ── 7. parse_task_xml (libxml2-based Task Scheduler XML parser) ──────────
 
 /// One `<Exec>` action within a task's `<Actions>` block. Task Scheduler
@@ -535,6 +719,45 @@ struct TaskAction {
     std::string command;
     std::string arguments;
 };
+
+/// Why parse_task_xml rejected a document (TaskInfo::parsed_ok == false) --
+/// `none` when parsing succeeded. A caller that wants a single reason token
+/// can collapse most of these to "malformed" (they all mean "this was not a
+/// usable Task Scheduler document"); `oversized` is kept distinguishable
+/// because it is reachable from an entirely different cause (a runaway/
+/// corrupt get_Xml() BSTR) than a genuine XML syntax problem, and worth its
+/// own token for anyone triaging a fleet-wide reason breakdown (#4184).
+// A new value here MUST get its own case in task_reject_reason_token below --
+// the switch there deliberately has no `default:` label so -Wswitch flags a
+// missing case (non-fatal, werror=false project-wide, so this comment is the
+// backstop a human reviewer needs since the warning alone can be missed).
+enum class TaskReject { none, empty, malformed, dtd, wrong_root, oversized };
+
+/// The `win_scheduled_tasks` wire-reason token for a parse rejection --
+/// pure, so the mapping (not just TaskReject itself) is unit-testable on
+/// every build host, not only reachable by reading the Windows-only COM
+/// call site that consumes it. `oversized` gets its own token (a runaway/
+/// corrupt `get_Xml()` BSTR is a different failure shape than a genuine
+/// XML syntax problem, #4184); every other non-`none` TaskReject
+/// (`empty`/`malformed`/`dtd`/`wrong_root`) collapses to the existing
+/// `"malformed"` token -- a caller reading the wire reason doesn't need
+/// every rejection SHAPE distinguished, just this one different CAUSE.
+/// `none` (a successful parse) has no reason to report and returns "".
+inline std::string_view task_reject_reason_token(TaskReject reject) noexcept {
+    // No `default:` label -- see TaskReject's own comment above: a new enum
+    // value with no case here trips -Wswitch. The trailing return after the
+    // switch exists only to satisfy every compiler's return-path analysis,
+    // never to silently absorb a genuinely new, unhandled TaskReject value.
+    switch (reject) {
+    case TaskReject::none: return "";
+    case TaskReject::oversized: return "oversized";
+    case TaskReject::empty:
+    case TaskReject::malformed:
+    case TaskReject::dtd:
+    case TaskReject::wrong_root: return "malformed";
+    }
+    return "malformed";
+}
 
 struct TaskInfo {
     std::vector<TaskAction> actions; // one per <Exec>, in document order
@@ -558,6 +781,9 @@ struct TaskInfo {
     // "no elements" with "parse failed" is exactly the defect this field
     // exists to stop a caller from reintroducing (PR #4154 round 9 blocker).
     bool parsed_ok = false;
+    // Set alongside every parsed_ok=false return -- see TaskReject's own
+    // banner. Left at ::none whenever parsed_ok is true.
+    TaskReject reject = TaskReject::none;
 };
 
 namespace detail {
@@ -586,17 +812,30 @@ struct XmlDocGuard {
     XmlDocGuard& operator=(const XmlDocGuard&) = delete;
 };
 
-/// First direct-child element matching `local` by LOCAL NAME only. Task
-/// Scheduler XML uses exactly one default namespace
-/// (`xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"`) for
-/// every element -- unlike SAML's multi-namespace documents (which need
-/// find_child_ns's namespace-URI check to disambiguate), there's nothing
-/// here for a namespace check to distinguish, so local-name matching alone
-/// is correct.
+inline constexpr const char* kTaskSchedulerNamespaceUri =
+    "http://schemas.microsoft.com/windows/2004/02/mit/task";
+
+/// True when `n` sits in the Task Scheduler namespace this parser accepts at
+/// the root. Genuine `IRegisteredTask::get_Xml()` output uses exactly one
+/// default namespace for every element, so this is always true for real
+/// input; the check exists as a hardening layer against a document whose
+/// root passes the namespace check but whose descendants redeclare a
+/// foreign default namespace (schema-garbage that merely happens to share
+/// child tag names like `<Settings>`/`<Actions>`) -- without it, such a
+/// descendant would be silently interpreted as a genuine task element.
+inline bool in_task_scheduler_ns(xmlNodePtr n) {
+    return n && n->ns && n->ns->href && xmlStrEqual(n->ns->href, BAD_CAST kTaskSchedulerNamespaceUri);
+}
+
+/// First direct-child element matching `local` by local name AND namespace
+/// (`in_task_scheduler_ns`) -- see that function's comment for why the
+/// namespace check matters despite genuine Task Scheduler XML using exactly
+/// one namespace throughout.
 inline xmlNodePtr xml_find_child(xmlNodePtr parent, const char* local) {
     if (!parent) return nullptr;
     for (xmlNodePtr n = xmlFirstElementChild(parent); n; n = xmlNextElementSibling(n)) {
-        if (n->type == XML_ELEMENT_NODE && n->name && xmlStrEqual(n->name, BAD_CAST local))
+        if (n->type == XML_ELEMENT_NODE && n->name && xmlStrEqual(n->name, BAD_CAST local) &&
+            in_task_scheduler_ns(n))
             return n;
     }
     return nullptr;
@@ -632,10 +871,28 @@ inline std::string xml_get_text(xmlNodePtr node) {
 /// `XML_PARSE_NOENT` is deliberately absent (entities aren't expanded
 /// beyond the 5 predefined ones libxml2 always decodes), and a
 /// DOCTYPE/DTD is explicitly rejected rather than trusted. A parse failure,
-/// a rejected DTD, or a missing root/section leaves TaskInfo at its
+/// a rejected DTD, or a missing/wrong root leaves TaskInfo at its
 /// documented defaults -- this is still best-effort over possibly-truncated
 /// XML, not a validating parser; it just validates well-formedness instead
 /// of hand-scanning for it.
+///
+/// Bounded twice against an adversarial or corrupt document (#4184): an
+/// explicit `kMaxTaskXmlBytes` cap rejects an oversized document before
+/// `xmlReadMemory` ever sees it (also closing the `size_t` -> `int` length
+/// narrowing that call requires -- unreachable in practice once the byte cap
+/// is well under INT_MAX, but guarded explicitly rather than relying on that
+/// incidentally). Depth is NOT explicitly capped here: `XML_PARSE_HUGE` is
+/// deliberately never passed, so libxml2's own default ~256-level parser
+/// depth ceiling applies and a document nested deeper than that fails the
+/// parse cleanly (a real error, not a crash or unbounded resource use) --
+/// this function relies on that built-in ceiling rather than re-implementing
+/// its own depth tracking over the resulting tree.
+///
+/// The expected root is validated by BOTH local name (`Task`) and namespace
+/// URI (Task Scheduler's one documented default namespace) -- a document
+/// using unrelated element names that merely happen to share `<Settings>`/
+/// `<Actions>`/`<Triggers>` tags under some other root or namespace no
+/// longer parses as a plausible task with no signal it came from elsewhere.
 ///
 /// `xml` is ALWAYS real UTF-8 bytes by the time it reaches this function --
 /// the caller (autoruns_win.cpp) converts the raw `IRegisteredTask::get_Xml()`
@@ -648,22 +905,51 @@ inline std::string xml_get_text(xmlNodePtr node) {
 /// explicitly here overrides it with the encoding this call site actually
 /// guarantees, rather than trusting a label the upstream conversion already
 /// invalidated.
+inline constexpr std::size_t kMaxTaskXmlBytes = 1 << 20; // 1 MiB, same cap
+                                                          // and reasoning as
+                                                          // saml_provider.cpp's
+                                                          // XML size guard.
+
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
-    if (xml.empty()) return out; // nothing to parse -- parsed_ok stays false
+    if (xml.empty()) {
+        out.reject = TaskReject::empty;
+        return out; // nothing to parse -- parsed_ok stays false
+    }
+    if (xml.size() > kMaxTaskXmlBytes ||
+        xml.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        out.reject = TaskReject::oversized;
+        return out; // refuse before xmlReadMemory ever sees it -- also
+                    // closes the size_t -> int length narrowing below
+    }
 
     xmlDocPtr doc = xmlReadMemory(xml.data(), static_cast<int>(xml.size()), "task.xml", "UTF-8",
                                   XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
-    if (!doc) return out; // genuine parse failure -- parsed_ok stays false
+    if (!doc) {
+        out.reject = TaskReject::malformed;
+        return out; // genuine parse failure -- parsed_ok stays false
+    }
     detail::XmlDocGuard guard{doc};
-    if (doc->intSubset || doc->extSubset) return out; // DOCTYPE/DTD present -- malformed
+    if (doc->intSubset || doc->extSubset) {
+        out.reject = TaskReject::dtd;
+        return out; // DOCTYPE/DTD present -- malformed
+    }
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
-    // The expected task-XML root is exactly <Task> -- a missing root or an
-    // unexpected one (decoy/corrupt document that still happens to parse as
-    // well-formed XML) is ALSO a genuine parse failure from this function's
-    // point of view, not merely "a task with nothing interesting in it".
-    if (!root || !root->name || !xmlStrEqual(root->name, BAD_CAST "Task")) return out;
+    // The expected task-XML root is exactly <Task> in the Task Scheduler
+    // namespace -- a missing root, an unexpected element name, OR the right
+    // element name under an unrelated/absent namespace (schema-garbage that
+    // merely happens to share child tag names like <Settings>/<Actions>) is
+    // ALSO a genuine parse failure from this function's point of view, not
+    // merely "a task with nothing interesting in it" (#4184).
+    if (!root || !root->name || !xmlStrEqual(root->name, BAD_CAST "Task")) {
+        out.reject = TaskReject::wrong_root;
+        return out;
+    }
+    if (!detail::in_task_scheduler_ns(root)) {
+        out.reject = TaskReject::wrong_root;
+        return out;
+    }
 
     // From here on the document is well-formed AND <Task>-rooted -- every
     // early return below this point is a legitimate "this task has no X",
@@ -700,6 +986,7 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         for (xmlNodePtr child = xmlFirstElementChild(actions); child;
              child = xmlNextElementSibling(child)) {
             if (child->type != XML_ELEMENT_NODE || !child->name) continue;
+            if (!detail::in_task_scheduler_ns(child)) continue;
             if (xmlStrEqual(child->name, BAD_CAST "Exec")) {
                 TaskAction action;
                 action.command = detail::xml_get_text(detail::xml_find_child(child, "Command"));
@@ -734,6 +1021,7 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         for (xmlNodePtr trigger = xmlFirstElementChild(triggers); trigger && !out.has_triggers;
              trigger = xmlNextElementSibling(trigger)) {
             if (trigger->type != XML_ELEMENT_NODE || !trigger->name) continue;
+            if (!detail::in_task_scheduler_ns(trigger)) continue;
             bool is_known_trigger_type = false;
             for (const char* tag : kTriggerTags) {
                 if (xmlStrEqual(trigger->name, BAD_CAST tag)) {
@@ -748,6 +1036,61 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         }
     }
     return out;
+}
+
+/// Builds the win_scheduled_tasks row(s) for ONE already-parsed task -- pure,
+/// extracted out of the win.cpp COM call site so this leg's actual row-
+/// shaping logic (which action becomes which row, the multi-action
+/// "[action N]" entry suffix, how a task with zero decoded actions --
+/// whether genuinely action-less or carrying only an unmodelled action type
+/// like <ComHandler> -- still emits exactly one row rather than silently
+/// vanishing, #4184 AC1) is unit-testable on every build host, not just
+/// verified by reading COM code that only compiles on Windows. The caller
+/// (autoruns_win.cpp) still owns the row-count cap: it iterates the
+/// returned vector itself, re-checking the cap per row exactly as it did
+/// when this logic was inline.
+inline std::vector<Row> rows_for_task(const TaskInfo& info, std::string_view location,
+                                      std::string_view entry_base, std::string_view user,
+                                      std::int64_t mtime, Enabled enabled_state) {
+    std::vector<Row> rows;
+    const bool multi = info.actions.size() > 1;
+    if (info.actions.empty()) {
+        // Zero decoded actions -- either a genuinely action-less task, or
+        // one whose only action(s) are a type this scanner doesn't decode
+        // (has_unmodelled_action; the caller separately notes a
+        // "unmodelled_action_type" constraint for that case). Either way
+        // the task itself is real and must still surface as one row, with
+        // an empty target/args rather than being silently dropped.
+        Row row;
+        row.source_id = SourceId::win_scheduled_tasks;
+        row.catalog_version = kAutorunSourceCatalogVersion;
+        row.location = std::string{location};
+        row.entry = std::string{entry_base};
+        row.enabled = enabled_state;
+        row.scope = Scope::system;
+        row.user = std::string{user};
+        row.signed_state = Signed::not_checked;
+        row.mtime = mtime;
+        rows.push_back(std::move(row));
+        return rows;
+    }
+    for (std::size_t i = 0; i < info.actions.size(); ++i) {
+        Row row;
+        row.source_id = SourceId::win_scheduled_tasks;
+        row.catalog_version = kAutorunSourceCatalogVersion;
+        row.location = std::string{location};
+        row.entry = multi ? std::string{entry_base} + " [action " + std::to_string(i + 1) + "]"
+                          : std::string{entry_base};
+        row.target = info.actions[i].command;
+        row.args = info.actions[i].arguments;
+        row.enabled = enabled_state;
+        row.scope = Scope::system;
+        row.user = std::string{user};
+        row.signed_state = Signed::not_checked;
+        row.mtime = mtime;
+        rows.push_back(std::move(row));
+    }
+    return rows;
 }
 
 /// The Enabled decision for a `win_scheduled_tasks` row -- pulled out of
@@ -1056,11 +1399,20 @@ struct AnacronEntry {
     std::string command;
 };
 
+struct AnacrontabParseResult {
+    std::vector<AnacronEntry> entries;
+    int rejected_lines = 0; // a non-comment/blank/assignment line with != 4
+                            // fields -- REJECTED AND COUNTED, never silently
+                            // dropped, mirroring CrontabParseResult's
+                            // identical contract (see parse_crontab's own
+                            // banner).
+};
+
 /// anacrontab(5): `period  delay  job-identifier  command`. Comments, blank
 /// lines and VAR=VALUE lines (SHELL=, HOME=, LOGNAME=) are skipped exactly
 /// like crontab(5)'s.
-inline std::vector<AnacronEntry> parse_anacrontab(std::string_view text) {
-    std::vector<AnacronEntry> out;
+inline AnacrontabParseResult parse_anacrontab(std::string_view text) {
+    AnacrontabParseResult result;
     std::size_t pos = 0;
     while (pos <= text.size()) {
         std::size_t nl = text.find('\n', pos);
@@ -1069,14 +1421,16 @@ inline std::vector<AnacronEntry> parse_anacrontab(std::string_view text) {
         if (!detail::is_comment_or_blank_or_assignment(line)) {
             auto tokens = detail::split_ws(line, 4);
             if (tokens.size() == 4) {
-                out.push_back(AnacronEntry{std::string{tokens[0]}, std::string{tokens[1]},
-                                           std::string{tokens[2]}, std::string{tokens[3]}});
+                result.entries.push_back(AnacronEntry{std::string{tokens[0]}, std::string{tokens[1]},
+                                                       std::string{tokens[2]}, std::string{tokens[3]}});
+            } else {
+                ++result.rejected_lines;
             }
         }
         if (nl == std::string_view::npos) break;
         pos = nl + 1;
     }
-    return out;
+    return result;
 }
 
 // ── 11. parse_systemd_timer / timer_enabled_from_wants ───────────────────
@@ -1108,8 +1462,11 @@ inline SystemdTimerFields parse_systemd_timer(std::string_view text) {
         } else if (!trimmed.empty() && trimmed.front() != '#' && trimmed.front() != ';') {
             std::size_t eq = trimmed.find('=');
             if (eq != std::string_view::npos) {
-                std::string key = std::string{trimmed.substr(0, eq)};
-                std::string val = std::string{trimmed.substr(eq + 1)};
+                // systemd.syntax(7): whitespace around '=' is ignorable --
+                // "OnCalendar = daily" is equivalent to "OnCalendar=daily",
+                // not a different (unrecognized, silently dropped) key.
+                std::string key = detail::trim(trimmed.substr(0, eq));
+                std::string val = detail::trim(trimmed.substr(eq + 1));
                 if (section == "Timer") {
                     if (key == "OnCalendar") out.on_calendar = val;
                     else if (key == "OnBootSec") out.on_boot_sec = val;
@@ -1160,7 +1517,17 @@ struct DesktopEntry {
     std::string not_show_in;
     bool gnome_autostart_enabled_present = false;
     bool gnome_autostart_enabled = true;
+    // `DBusActivatable=true` per the Desktop Entry spec: the launch
+    // mechanism is D-Bus service activation, not `Exec` -- the spec
+    // requires `Exec` only when this is NOT true.
+    bool dbus_activatable = false;
     Enabled enabled = Enabled::enabled;
+    // True when this file has no `[Desktop Entry]` group at all, or that
+    // group has no (or an empty) `Exec` key AND is not `DBusActivatable` --
+    // there is nothing this leg can actually run or name, so a caller must
+    // not report a plain `enabled` row with an empty target as if it found
+    // a real autostart entry.
+    bool malformed = false;
 };
 
 /// Parses the `[Desktop Entry]` group of a `.desktop` file (XDG Desktop Entry
@@ -1171,6 +1538,7 @@ struct DesktopEntry {
 inline DesktopEntry parse_desktop_entry(std::string_view text) {
     DesktopEntry out;
     bool in_group = false;
+    bool group_seen = false;
     std::size_t pos = 0;
     while (pos <= text.size()) {
         std::size_t nl = text.find('\n', pos);
@@ -1178,19 +1546,23 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         if (!line.empty() && line.front() == '[') {
             in_group = (line == "[Desktop Entry]");
+            if (in_group) group_seen = true;
         } else if (in_group) {
             std::size_t eq = line.find('=');
             if (eq != std::string_view::npos) {
-                std::string_view key = line.substr(0, eq);
-                std::string_view val = line.substr(eq + 1);
-                if (key == "Exec") out.exec = std::string{val};
+                // XDG Desktop Entry spec: whitespace around '=' is
+                // ignorable, matching parse_systemd_timer's identical fix.
+                const std::string key = detail::trim(line.substr(0, eq));
+                const std::string val = detail::trim(line.substr(eq + 1));
+                if (key == "Exec") out.exec = val;
                 else if (key == "Hidden") out.hidden = (val == "true");
-                else if (key == "OnlyShowIn") out.only_show_in = std::string{val};
-                else if (key == "NotShowIn") out.not_show_in = std::string{val};
+                else if (key == "OnlyShowIn") out.only_show_in = val;
+                else if (key == "NotShowIn") out.not_show_in = val;
                 else if (key == "X-GNOME-Autostart-enabled") {
                     out.gnome_autostart_enabled_present = true;
                     out.gnome_autostart_enabled = (val == "true");
                 }
+                else if (key == "DBusActivatable") out.dbus_activatable = (val == "true");
             }
         }
         if (nl == std::string_view::npos) break;
@@ -1199,6 +1571,7 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
     out.enabled = (out.hidden || (out.gnome_autostart_enabled_present && !out.gnome_autostart_enabled))
                      ? Enabled::disabled
                      : Enabled::enabled;
+    out.malformed = !group_seen || (out.exec.empty() && !out.dbus_activatable);
     return out;
 }
 
@@ -1326,84 +1699,5 @@ inline Row parse_emond_rule_plist_fields(const EmondRuleFields& fields, std::str
     row.mtime = mtime;
     return row;
 }
-
-// ── 16. ConstraintAccumulator ─────────────────────────────────────────────
-
-/// Shared shape for a collector that walks multiple roots/entries (several
-/// directories, several per-directory files, several per-user scans) and
-/// must never let a genuine acquisition failure on ANY of them (a
-/// directory-open error, a per-entry stat/metadata failure, a per-file read
-/// error, a parse failure) be silently absorbed just because SOME roots
-/// succeeded. Generalizes the pattern `lnx_cron_d` (autoruns_linux.cpp) had
-/// already gotten right on its own -- a directory-level absent/permission_
-/// denied/other-errno trichotomy plus a per-file `classify_read_error`-driven
-/// dedup -- into one reusable type, after PR #4154 round 9 found six OTHER
-/// collectors in the same file had each independently reinvented a narrower
-/// version that tracked only EACCES/EPERM and dropped every other failure
-/// class (EIO, oversized reads, non-regular leaves, stat failures).
-///
-/// Exact-string deduplication (NOT `note_file_constraint`'s substring
-/// `reason.find(token)` check elsewhere in this codebase, which silently
-/// conflates e.g. "permission_denied" with "partial_permission_denied"
-/// since the former is a substring of the latter), insertion order
-/// preserved. A later successful sibling read never erases or hides an
-/// earlier recorded failure -- there is no operation that removes a token
-/// once added.
-class ConstraintAccumulator {
-public:
-    /// Records one failure token (e.g. "permission_denied", a lowercased
-    /// errno token, "oversized", "not_regular", "row_cap"). A caller that
-    /// already has a `FileStatus`/`(support, reason)` pair from
-    /// `classify_read_error` passes its `.reason` here directly.
-    void add_failure(std::string_view token) {
-        any_failure_ = true;
-        std::string s{token};
-        if (std::find(tokens_.begin(), tokens_.end(), s) == tokens_.end())
-            tokens_.push_back(std::move(s));
-    }
-
-    /// Marks that some acquisition step a downstream row/enablement decision
-    /// depends on (a directory listing, a wants-symlink scan, a cross-user
-    /// discovery pass) was genuinely incomplete -- distinct from
-    /// add_failure(): this carries no token of its own (the caller has
-    /// usually already added one), it exists so a caller computing e.g. an
-    /// Enabled decision can ask "was ANYTHING this decision depends on
-    /// incomplete" without re-deriving it from the token list.
-    void mark_incomplete() { incomplete_ = true; }
-
-    bool any_failure() const { return any_failure_; }
-    bool incomplete() const { return incomplete_; }
-
-    /// Every accumulated token, comma-joined -- this schema's existing
-    /// multi-token reason convention (see e.g. lnx_cron_periodic's own
-    /// hand-built "reason1,reason2" strings).
-    std::string reason() const {
-        std::string out;
-        for (const auto& t : tokens_) {
-            if (!out.empty()) out += ',';
-            out += t;
-        }
-        return out;
-    }
-
-    /// Composes with a caller-supplied PERMANENT catalog-level token (e.g.
-    /// lnx_systemd_timers_user's own narrow_search_path_coverage) --
-    /// appended after every accumulated failure token, never replacing or
-    /// being replaced by them. `permanent_token` empty is the common case
-    /// (most sources carry no permanent limitation) and is a no-op.
-    std::string reason_with(std::string_view permanent_token) const {
-        std::string out = reason();
-        if (!permanent_token.empty()) {
-            if (!out.empty()) out += ',';
-            out += permanent_token;
-        }
-        return out;
-    }
-
-private:
-    std::vector<std::string> tokens_;
-    bool any_failure_ = false;
-    bool incomplete_ = false;
-};
 
 } // namespace yuzu::autoruns

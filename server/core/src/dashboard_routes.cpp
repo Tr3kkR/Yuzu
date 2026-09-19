@@ -1144,6 +1144,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      } else if (dispatch_outcome.containment_unreadable) {
                          message = "Containment state is unreadable — dispatch is failing "
                                     "closed and reaching no agent; check the quarantine store.";
+                     } else if (dispatch_outcome.route_unreadable) {
+                         // WS-4 4.2b Task D: the exact sibling of the
+                         // containment branch above — a degraded gateway
+                         // routing-directory read, not a per-target fact.
+                         message = "The gateway routing directory could not be read for one "
+                                    "or more targets — dispatch is failing closed rather than "
+                                    "guessing where to route.";
                      } else if (dispatch_outcome.denied_quarantined_count > 0) {
                          message = "Every target is quarantined — dispatch was withheld, "
                                     "not attempted.";
@@ -2387,7 +2394,19 @@ std::string DashboardRoutes::render_results(
             for (size_t c = 0; c < rl.fields.size(); ++c) {
                 if (!is_visible(c + 1)) continue;
                 auto esc = html_escape(rl.fields[c]);
-                html += "<td title=\"" + esc + "\">" + esc + "</td>";
+                // #4187: a cell whose raw value has a documented non-obvious
+                // meaning (e.g. autoruns' enabled=unknown) gets an
+                // explanatory title= instead of the value echoed back at
+                // itself, plus a visible affordance so it's not hover-only
+                // discoverable -- matches the retention-paused table's
+                // existing badge-with-title precedent elsewhere in this file.
+                auto hint = cell_hint_for(plugin, rl.fields, c);
+                if (hint.empty()) {
+                    html += "<td title=\"" + esc + "\">" + esc + "</td>";
+                } else {
+                    html += "<td class=\"cell-hint\" title=\"" +
+                           html_escape(std::string{hint}) + "\">" + esc + "</td>";
+                }
             }
             html += "</tr>";
             // Detail drawer — show every column regardless of template

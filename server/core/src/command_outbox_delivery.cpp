@@ -4,6 +4,7 @@
 #include "command_outbox_store.hpp"
 #include "execution_tracker.hpp"
 #include "leader_elector.hpp" // kServerBackgroundLeaderLock, LeaderElector::epoch()
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 
 #include <yuzu/metrics.hpp>
 
@@ -59,7 +60,46 @@ bool decode_payload(const OutboxCommand& c, std::vector<std::string>& agent_ids,
 
 } // namespace
 
-CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {}
+CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
+    // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
+    // pre-seed both `cause` values `yuzu_server_command_outbox_deliver_retry_cause_total` can
+    // actually emit (see the increment call site below). Lazy-created-on-first-increment means a
+    // single isolated incident never crosses `rate()>0`/`increase()>0` — the first sample IS the
+    // incident, with no second sample in the window to diff against — so the alert this counter
+    // backs (`YuzuGatewayRouteUnreadable`, docs/prometheus/yuzu-alerts.yml) would stay silent on
+    // exactly the lone-incident case it exists to catch. Mirrors the desync/write-failed counter
+    // pre-seed pattern in gateway_service_impl.cpp's constructor.
+    if (d_.metrics) {
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_retry_cause_total",
+            "HA WS-4 4.2b Task D: additive breakdown, by `cause`, of the command outbox "
+            "delivery loop's retry decision when a systemic per-tick gate degrades instead of "
+            "answering - `containment_unreadable` (quarantine/containment read) or "
+            "`route_unreadable` (GatewayRouteStore directory read). Either cause reschedules the "
+            "WHOLE occurrence with back-off, even when some sends already succeeded.",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "containment_unreadable"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "route_unreadable"}});
+        // json-dump-depth-guard fix: the bare
+        // yuzu_server_command_outbox_deliver_decode_failed_total counter stays
+        // unchanged (dashboards/alerts-in-waiting keep working), but it now
+        // fires for two structurally different causes - pre-seed the labeled
+        // companion the same way, for the same lone-incident reason above.
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+            "Additive breakdown, by `cause`, of "
+            "yuzu_server_command_outbox_deliver_decode_failed_total - "
+            "payload_depth_exceeded (structurally valid JSON nested past kMcpMaxJsonDepth, "
+            "never parsed/dumped) or payload_decode_failed (genuinely malformed payload).",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                            {{"cause", "payload_depth_exceeded"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                            {{"cause", "payload_decode_failed"}});
+    }
+}
 
 void CommandOutboxDelivery::tick() {
     if (!d_.outbox || !d_.leader || !d_.dispatch_fn || !d_.resolve_caller)
@@ -125,12 +165,59 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         return;
     }
 
+    // #2437-class guard: depth-check the raw stored `parameters` text BEFORE
+    // decode_payload() ever parses or, worse, dumps it. `c.parameters` is
+    // sourced from ScheduleRunner's `parameter_values` (schedule CREATION is
+    // already guarded, schedule_routes.cpp:94), but a row written before that
+    // write-side guard shipped, or via any other write path that bypasses it,
+    // still reaches this read path, and decode_payload()'s `.dump()` of a
+    // non-string parameter value is unboundedly recursive. This tick processes
+    // EVERY pending row on EVERY tick with no operator action in the loop at
+    // all, so an unguarded poisoned row here would crash-loop this background
+    // worker on every restart, not just fail once. Checked on the RAW text,
+    // never on a parsed/re-dumped value (mirrors json_exceeds_depth's own
+    // "never construct the deep tree" rationale, mcp_jsonrpc.hpp).
+    //
+    // Treated exactly like the decode-failure path immediately below (same
+    // mark_failed/audit mechanism, same fencing/counting shape), so it looks
+    // like a normal permanent failure to every other part of this file's state
+    // machine. "payload_depth_exceeded" is a distinct reason (not lumped into
+    // "payload_decode_failed") in the audit trail AND in the labeled
+    // count_cause() companion counter below - both this branch and the
+    // structurally identical generic-inventory fix
+    // (gateway_service_impl.cpp's outcome="rejected_depth") reuse the SAME
+    // bare counter (docs/user-manual/metrics.md documents it as "a malformed
+    // row failed to decode", which a valid-but-too-deep payload is not) but
+    // give the two causes a distinguishing label so an operator diagnosing
+    // via the metric, not just the audit log, does not conflate them.
+    if (!c.parameters.empty() &&
+        mcp::json_exceeds_depth(c.parameters, mcp::kMcpMaxJsonDepth)) {
+        count("yuzu_server_command_outbox_deliver_decode_failed_total");
+        count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                    "payload_depth_exceeded");
+        spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) parameters "
+                      "nested past the depth guard (max {}), marking failed: cannot be safely "
+                      "parsed",
+                      c.occurrence_id, c.command_id, mcp::kMcpMaxJsonDepth);
+        // CDX-P1-02: own-the-mark gating, same as every other terminal path here.
+        auto marked =
+            d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_depth_exceeded");
+        if (marked.has_value() && *marked) {
+            if (d_.execution_tracker && !c.execution_id.empty())
+                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            audit(c, "failure", "payload_depth_exceeded");
+        }
+        return;
+    }
+
     // 2. Decode the opaque payload. A malformed row is a permanent failure —
     //    fail closed rather than dispatch with an empty target/param set.
     std::vector<std::string> agent_ids;
     std::unordered_map<std::string, std::string> params;
     if (!decode_payload(c, agent_ids, params)) {
         count("yuzu_server_command_outbox_deliver_decode_failed_total");
+        count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                    "payload_decode_failed");
         spdlog::error("command_outbox_delivery: occurrence '{}' payload decode failed — "
                       "marking failed",
                       c.occurrence_id);
@@ -170,13 +257,41 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
-    // 5. A systemic transient gate failure (a degraded containment read) is NOT
-    //    a delivered occurrence — retry with back-off, leave it pending.
-    if (outcome.containment_unreadable) {
+    // 5. A systemic transient gate/directory failure — a degraded containment
+    //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
+    //    (`route_unreadable`) — reschedules the WHOLE occurrence with back-off,
+    //    leaving it pending.
+    //
+    //    Unlike the store consumers of this same flag (deployment_engine's
+    //    `settle_claimed_batch`, policy_evaluator's `compute_delivered`, both of
+    //    which must NOT treat it all-or-nothing), this reschedule is correct
+    //    EVEN WHEN `outcome.sent > 0` — which `route_unreadable` permits and
+    //    `containment_unreadable` does not (see
+    //    `ConfinedDispatchOutcome::route_unreadable`). The re-drive re-sends the
+    //    STABLE `c.command_id` (step 4), so a device already reached on this
+    //    pass is suppressed by the agent's command_id dedup (WS-0) and its
+    //    terminal outcome replayed — effectively-once holds. That is what lets
+    //    this consumer honour ADR-2002 §7's "undeliverable command stays
+    //    pending and is re-driven" for the directory-degraded devices without
+    //    the double-EXECUTION a fresh command_id would cause. Do NOT "fix" this
+    //    to gate on `sent == 0`: that would drop the directory-degraded devices
+    //    instead of re-driving them.
+    if (outcome.containment_unreadable || outcome.route_unreadable) {
+        // The existing unlabeled retry counter keeps firing for EITHER cause
+        // (dashboards/alerts already key on it); the cause-labeled counter is
+        // additive so a route-store degradation is separately countable
+        // without redefining what the base counter means.
         count("yuzu_server_command_outbox_deliver_retry_total");
-        spdlog::warn("command_outbox_delivery: occurrence '{}' containment unreadable — "
-                     "rescheduling",
-                     c.occurrence_id);
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                         {{"cause", outcome.containment_unreadable ? "containment_unreadable"
+                                                                  : "route_unreadable"}})
+                .increment();
+        spdlog::warn("command_outbox_delivery: occurrence '{}' {} — rescheduling",
+                     c.occurrence_id,
+                     outcome.containment_unreadable ? "containment unreadable"
+                                                    : "gateway route directory unreadable");
         (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
         return;
     }
@@ -261,6 +376,11 @@ void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& res
 void CommandOutboxDelivery::count(const char* name) {
     if (d_.metrics)
         d_.metrics->counter(name).increment();
+}
+
+void CommandOutboxDelivery::count_cause(const char* name, const char* cause) {
+    if (d_.metrics)
+        d_.metrics->counter(name, {{"cause", cause}}).increment();
 }
 
 } // namespace yuzu::server

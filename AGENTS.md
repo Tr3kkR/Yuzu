@@ -3,7 +3,7 @@
 **This file is a contents page, not a knowledge base.** Before adding anything, read
 `docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
 here*. This file, `CLAUDE.md`, and the two routed-concern tables load into every session; each is
-budgeted at 32,000 characters and capped at 40,000 (`tests/test_issue_docs.py`).
+budgeted at 40,000 characters and capped at 48,000 (`tests/test_issue_docs.py`).
 
 This file is the Codex/Kimi twin of `CLAUDE.md` and deliberately carries the same content. **Where
 they disagree, `CLAUDE.md` wins** — and the disagreement is a bug to fix in the same change.

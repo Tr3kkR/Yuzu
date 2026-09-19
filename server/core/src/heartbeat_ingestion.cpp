@@ -39,9 +39,13 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     if (offline_store_) {
         std::string hostname;
         std::string os;
+        std::string agent_version;
+        std::string arch;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
+            agent_version = sess->agent_version;
+            arch = sess->arch;
         }
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
@@ -52,7 +56,12 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // SHOULD-1). Staleness is driven entirely by the server-side
         // last_heartbeat_ms. Wire a real agent ts here when one exists, or drop
         // the column — tracked as a follow-up.
-        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0);
+        //
+        // agent_version/arch: a session-lookup miss above leaves both blank,
+        // which upsert() treats as "preserve the last-known value" (round-3 v2
+        // columns) rather than blanking a value this store already learned.
+        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0, agent_version,
+                               arch);
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

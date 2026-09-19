@@ -157,6 +157,103 @@ groups:
             a full command-plane outage at rotation cutover. Fix it now (the
             gateway log names the entry).
 
+      # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
+      # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
+      # the Erlang gateway, despite living in this group — it is the same
+      # fenced agent->cluster routing-directory concern as the rules above.
+      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
+      # fresh-registration branch returns UNAVAILABLE on this); the other
+      # five writer SITES (announce_connected, both ProxyRegister renew
+      # branches, BatchHeartbeat's renew, deregister) — which collapse to
+      # three fail-OPEN `op` label values (announce_connected, renew_leases,
+      # deregister; see the label set in docs/user-manual/metrics.md) — are
+      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # no visible RPC failure. INITIAL / conservative threshold — no fleet
+      # background-rate data exists yet to tune against (same lesson as the
+      # #913 OTA-bounds alert thresholds, the single largest source of
+      # review findings on that PR); tighten once real data exists.
+      - alert: YuzuGatewayRouteWriteFailed
+        # HA WS-4 4.2b follow-up (#4344 MEDIUM 2): the rate window is 10m,
+        # DELIBERATELY WIDER than the 5m `for:`. A window == for-duration can
+        # never reach `firing` from a single isolated 0->1 increment (the
+        # rate()>0 straddle lasts only window-step, one step short of the `for:`
+        # it must hold across) — so with the counter now pre-seeded to 0, a lone
+        # write failure would otherwise reach `pending` and silently expire. The
+        # wider window keeps the 5m dampening (an instantaneous blip does not
+        # page immediately) while ensuring a genuine failure DOES fire ~5m after
+        # onset. Paired with the constructor pre-seed of every (op,reason) combo.
+        expr: |
+          rate(yuzu_server_gateway_route_write_failed_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway routing-directory write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            GatewayRouteStore write op="{{ $labels.op }}" has been failing
+            with reason="{{ $labels.reason }}" (Postgres pool-acquire timeout
+            or a query error) for at least 5 minutes. FIRST REMEDIATION: check
+            Postgres reachability and connection-pool saturation from the
+            server (pg_stat_activity, pool-acquire wait); a register_fresh
+            failure additionally refuses new ProxyRegister with UNAVAILABLE, so
+            gateway-fronted agents may be unable to (re)enroll until the store
+            recovers. TRIAGE BY op — the fail-open ops recover DIFFERENTLY, so do
+            not assume a uniform self-heal: op="register_fresh" (fail-CLOSED) is
+            the highest urgency, blocking new enrollment; op="renew_leases"
+            normally repairs on the next heartbeat; op="deregister" leaves a
+            stale row bounded by the ~90s lease TTL + the stale-route reaper; but
+            op="announce_connected" is the SOLE placement writer, so a lost
+            announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
+            NULL) — lease renewal does NOT repopulate placement, so it does NOT
+            self-heal on the lease TTL and needs another CONNECTED / agent
+            re-registration to restore routing. A lone fail-open failure is often
+            an early low-cost signal of the same shared-store root cause a
+            register_fresh failure hits harder. See ADR-2002 §7 "Ship the
+            write-failure fail-closed posture" and docs/user-manual/metrics.md's
+            Gateway routing directory section. INITIAL threshold, not yet tuned
+            against real fleet data.
+
+      # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
+      # GatewayRouteStore read during confined dispatch (store_unavailable/
+      # db_error), the closest available signal to `#4246` item #8's
+      # "route-directory desync" alert-rule half. This alert does NOT cover
+      # every yuzu_server_gateway_route_desync_total{op,outcome} guard
+      # rejection (session_mismatch/shortfall/unknown_session) — that
+      # counter is expected at a low background rate (see its own doc
+      # comment) and alerting on it needs real fleet data to set a threshold
+      # that doesn't page on a routine post-restart/failover baseline rise;
+      # it remains unalerted this slice. `route_unreadable` fires the
+      # command outbox's retry-with-backoff path (the SAME reschedule
+      # containment_unreadable takes, though the two flags are not otherwise
+      # interchangeable — route_unreadable, unlike a fail-closed containment
+      # read, does not force sent==0; see ConfinedDispatchOutcome::
+      # route_unreadable), so ANY occurrence is worth
+      # surfacing — but FALLBACK-ONLY on today's single-replica monolith
+      # (the reader only ever consults the directory on a local-registry
+      # miss), so this should be rare until the reader becomes behaviorally
+      # live at WS-5. INITIAL / conservative threshold; tune once fleet data
+      # exists.
+      - alert: YuzuGatewayRouteUnreadable
+        expr: |
+          increase(yuzu_server_command_outbox_deliver_retry_cause_total{cause="route_unreadable"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway routing-directory read degraded — commands rescheduling"
+          description: >-
+            The command outbox delivery loop hit ConfinedDispatchOutcome::
+            route_unreadable at least once in the last 15 minutes — a
+            GatewayRouteStore directory read degraded during confined
+            dispatch, so the affected occurrence(s) were rescheduled with
+            back-off instead of delivered. FIRST REMEDIATION: check Postgres
+            reachability / pool health (same root cause as
+            YuzuGatewayRouteWriteFailed); rescheduled commands re-drive
+            automatically once the store recovers (effectively-once via the
+            stable command_id), so no manual replay is needed. See ADR-2002 §7
+            and docs/user-manual/metrics.md's Command outbox delivery / Gateway
+            routing directory sections. INITIAL threshold, not yet tuned
+            against real fleet data.
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected
@@ -806,7 +903,9 @@ groups:
             sending arguments past the tool's published inputSchema bounds -
             check whether it read tools/list - or someone is probing the limits.
             Denials are audited as mcp.<tool>|denied with detail
-            "input bound exceeded: <reason>"; correlate there for the principal.
+            "input bound exceeded: <reason or field message>"; correlate there
+            for the principal (the #4353-follow-up tools carry a human-
+            readable field message here, not the bare reason label).
 
       - alert: YuzuMcpEngineRevalidateStoreUnreachable
         expr: |
@@ -977,15 +1076,25 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "A REST caller named a device target that resolved to nothing"
+          summary: "A dispatch-targeting or result-set-producer request was rejected - see description for the specific reason"
           description: >-
             yuzu_server_dispatch_target_rejected_total is non-zero on
-            {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
-            agent_ids, scope or parent_id that names no device - it believes it is
-            targeting specific machines and is not. Before #2500 these calls
-            dispatched to the ENTIRE FLEET and returned success, so any non-zero
-            rate here is a near-miss worth reading, not just a validation
-            failure - hence >3/15m rather than the MCP twin's >20. It is
+            {{ $labels.route }} (reason={{ $labels.reason }}). This counter
+            covers TWO different shapes, not one - read reason before assuming
+            which: for most reasons, a client supplied agent_ids, scope or
+            parent_id that names no device - it believes it is targeting
+            specific machines and is not, a caller-side targeting mistake
+            audited as a |denied event. For reason=
+            "query_truncated"/"poison_excluded"/"parse_error_excluded"
+            specifically (route="result_set_inventory_query"), it is the
+            OPPOSITE - a well-formed, correctly-targeted request refused
+            because the server's own stored data failed a read-side guard, a
+            server-side data-quality refusal audited as a |failure event (see
+            below for the full detail on that shape). For the caller-mistake
+            shape: before #2500 these calls dispatched to the ENTIRE FLEET and
+            returned success, so any non-zero rate here is a near-miss worth
+            reading, not just a validation failure - hence >3/15m rather than
+            the MCP twin's >20. It is
             deliberately NOT >0: a single malformed curl would page, the rule
             would be silenced within a week, and the genuine near-miss it exists
             for would be silenced with it. The AUDIT row is the durable
@@ -1003,7 +1112,17 @@ groups:
             it silenced, and take the genuine near-miss signal with it - the
             outcome the >3 threshold above was chosen to avoid. Quarantine
             denials are observed on yuzu_server_quarantine_gate_total and audited
-            as quarantine.dispatch_denied.
+            as quarantine.dispatch_denied. reason values
+            "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
+            route="result_set_inventory_query") are NOT excluded from the
+            expression, unlike quarantined above: a well-formed, correctly-targeted
+            request refused because the underlying inventory read hit its row/byte
+            cap, a candidate stored record nested past the JSON depth guard, or a
+            candidate stored record failed to parse as JSON at all, is
+            exactly the near-miss this alert exists to surface, not a caller-input
+            mistake like the reasons documented above. Audited as
+            result_set.create|failure (not |denied) with the same
+            detail="reason=<reason> source_kind=inventory_query" shape.
 
       - alert: YuzuDispatchFanoutThrew
         expr: |
@@ -2606,6 +2725,33 @@ groups:
             advances to its weekly full-floor). The framework wires ~1 source, so this
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryGenericBlobRejectedDepth
+        # json-dump-depth-guard fix: outcome=rejected_depth is a SEPARATE outcome
+        # from outcome=rejected above (whole-report source-cap) - it fires once
+        # per generic (non-typed) source blob that nests past kMcpMaxJsonDepth
+        # (32), never for a whole-report rejection. Kept as its own alert for
+        # the same reason it is kept as its own outcome value: aliasing it onto
+        # YuzuInventoryReportRejected's runbook would send an operator hunting
+        # a >64-source report that does not exist. The source label is always
+        # the fixed sentinel "__generic__", never the agent's real plugin name.
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="rejected_depth"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Generic inventory rejecting over-depth source blobs"
+          description: >-
+            yuzu_inventory_ingest_total{source="__generic__",outcome="rejected_depth"}
+            is non-zero: one or more agents are reporting a generic (non-typed)
+            inventory source blob that nests deeper than kMcpMaxJsonDepth (32) -
+            this blob is skipped (the rest of the report is still acknowledged),
+            never dumped, so it cannot crash the process, but the source stays
+            permanently absent from InventoryStore until the plugin stops
+            emitting the over-depth shape (see docs/user-manual/inventory.md's
+            Troubleshooting section). Check the warn-level "nests too deeply"
+            server logs for the agent_id and plugin name.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuGenericInventoryPersistenceDropped
         # Generic InventoryStore ingest is intentionally fail-soft. Alert on a

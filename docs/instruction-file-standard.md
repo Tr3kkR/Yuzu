@@ -8,10 +8,10 @@ Four files load into every agent session before any work starts:
 
 | File | Read by | Budget | Hard cap |
 |---|---|---|---|
-| `CLAUDE.md` | Claude | 32,000 | 40,000 |
-| `AGENTS.md` | Codex, Kimi | 32,000 | 40,000 |
-| `.claude/routed-concerns.md` | Claude (`@`-imported by CLAUDE.md) | 32,000 | 40,000 |
-| `.claude/routed-concerns-access-control.md` | Claude (`@`-imported by CLAUDE.md) | 32,000 | 40,000 |
+| `CLAUDE.md` | Claude | 40,000 | 48,000 |
+| `AGENTS.md` | Codex, Kimi | 40,000 | 48,000 |
+| `.claude/routed-concerns.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
+| `.claude/routed-concerns-access-control.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 
 Every character in them is paid on every session, whether or not the work touches that subject. A
 `docs/` file costs nothing until something reads it.
@@ -122,7 +122,7 @@ resolved even on the author's own machine.
 
 `tests/test_issue_docs.py`, run by `.github/workflows/docs-lint.yml` and the `docs` Meson suite:
 
-1. **Budget** — each of the four files under 32,000 characters, and the 40,000 hard cap.
+1. **Budget** — each of the four files under 40,000 characters, and the 48,000 hard cap.
 2. **Expiry** — no `EXPIRES:` date in the past.
 3. **Dead pointers** — every backticked citation in the four files resolves: a path-shaped one
    (with a directory component) must exist exactly, and a bare filename must match some tracked

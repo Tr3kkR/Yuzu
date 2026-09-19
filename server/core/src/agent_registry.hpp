@@ -483,16 +483,18 @@ struct PluginMeta {
 // fully populated BEFORE the session is installed in the registry and are
 // never mutated afterwards — re-registration REPLACES the shared_ptr, it
 // does not edit in place. Lock-free readers (scope evaluation, the DEX perf
-// provider) depend on this — NONE of them reads `gateway_node` or
-// `gateway_wire_capabilities` (verified: their only readers are
-// send_to/send_to_all, agent_registry.cpp, both under `stream_mu`), which is
-// exactly why those two are NOT in this list. Post-publication writes are
+// provider) depend on this — NONE of them reads `gateway_node`,
+// `gateway_wire_capabilities`, or `gateway_stream_home_id` (verified: their
+// only readers are send_to/send_to_all and agent_registry.cpp's own
+// gateway_stream_home_id() accessor, all under `stream_mu`), which is
+// exactly why those three are NOT in this list. Post-publication writes are
 // confined to stream/server_context/peer_cert_pem, gateway_node +
-// gateway_wire_capabilities (all under stream_mu — the trailing pair
-// published together by set_gateway_route, M1 review fix; an earlier
-// revision wrote gateway_node under the registry mu_ instead, which both
-// raced stream_mu's readers and contradicted this comment) and the atomic
-// last_activity_epoch_ms. (Governance G3 cpp-safety — keep it true.)
+// gateway_wire_capabilities + gateway_stream_home_id (all under stream_mu —
+// the trio published together by set_gateway_route, M1 review fix +
+// #4324; an earlier revision wrote gateway_node under the registry mu_
+// instead, which both raced stream_mu's readers and contradicted this
+// comment) and the atomic last_activity_epoch_ms. (Governance G3
+// cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
@@ -523,6 +525,17 @@ struct AgentSession {
     /// fields above: a reconnect (a fresh CONNECTED) REPLACES this set, it is
     /// never merged with a prior connection's advertisement (PLAN item 5).
     std::unordered_set<std::string> gateway_wire_capabilities;
+    /// HA WS-4 #4324: the opaque per-connection-instance id (minted once per
+    /// gateway-side `yuzu_gw_agent` process, task 1 of #4324) this session's
+    /// most recent CONNECTED `StreamStatusNotification` carried — published
+    /// by `set_gateway_route` under `stream_mu` alongside `gateway_node`/
+    /// `gateway_wire_capabilities`, same lock, same call, for the same
+    /// atomic-publish reason (see that field's comment). Empty for a direct
+    /// (non-gateway) agent, or a gateway build predating #4324. Read by
+    /// `gateway_stream_home_id()` to fence a stale DISCONNECTED from a
+    /// torn-down home against a NEWER re-home reusing the same `session_id`
+    /// (`GatewayUpstreamServiceImpl::NotifyStreamStatus`).
+    std::string gateway_stream_home_id;
     std::mutex stream_mu;
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
@@ -560,7 +573,16 @@ public:
     /// yields rather than overwriting a live session with a stale one (its own revoke already
     /// committed, so nothing is lost by not installing). This restores the ordering the old
     /// single-locked implementation gave for free; it does not add a NEW guarantee beyond that.
-    [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
+    ///
+    /// Follow-up (HA WS-4 4.2b, post-merge review #4344, MEDIUM finding 1): on success, returns
+    /// the `shared_ptr<AgentSession>` this call just installed — pointer identity a caller can
+    /// hand to `remove_agent_if_same` for an identity-guarded rollback if a LATER step in its own
+    /// registration flow (e.g. `GatewayRouteStore::register_fresh`) fails after this call already
+    /// installed the session. session_id is still empty at this point (mapped later by
+    /// `map_session`), so identity — not session_id string equality — is the only safe key for
+    /// that rollback; see `remove_agent_if_same`.
+    [[nodiscard]] std::expected<std::shared_ptr<AgentSession>, std::string>
+    register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
@@ -597,6 +619,18 @@ public:
     /// Subscribe cleanup from clobbering a newer reconnection).
     void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
 
+    /// HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): remove an agent ONLY
+    /// if the CURRENTLY installed session is the exact object `install` returned — pointer
+    /// identity, not session_id (which is empty until `map_session` runs, so a string key cannot
+    /// discriminate here). Ghost-session rollback: a caller whose `register_agent` succeeded but
+    /// a LATER step in its own registration flow failed (e.g. gateway `register_fresh`) calls
+    /// this with the shared_ptr `register_agent` returned, tearing the just-installed session
+    /// back down. A concurrent `register_agent` for the same `agent_id` that has already
+    /// superseded `installed` by the time this runs is left alone — this call is a no-op, exactly
+    /// like `remove_agent_if_session`'s own supersede tolerance.
+    void remove_agent_if_same(const std::string& agent_id,
+                              const std::shared_ptr<AgentSession>& installed);
+
     /// Clear stream only if the session_id matches the current session.
     void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);
 
@@ -614,8 +648,31 @@ public:
     /// (fresh CONNECTED) behind an upgraded — or downgraded — gateway build
     /// must not keep stacking capabilities the new connection never
     /// advertised. No-op if `agent_id` is not currently registered.
+    ///
+    /// `stream_home_id` (HA WS-4 #4324) is published in the SAME call, under
+    /// the SAME lock, for the SAME reason `node`/`capabilities` are — see
+    /// `AgentSession::gateway_stream_home_id`'s comment. Defaults to empty so
+    /// every pre-#4324 call site (tests, any caller not yet threading the
+    /// wire field through) keeps compiling and behaving exactly as before.
     void set_gateway_route(const std::string& agent_id, const std::string& node,
-                           std::vector<std::string> capabilities);
+                           std::vector<std::string> capabilities,
+                           std::string stream_home_id = {});
+
+    /// HA WS-4 #4324: the `stream_home_id` most recently published for
+    /// `agent_id` via `set_gateway_route`, IFF the presented `session_id`
+    /// still matches the CURRENTLY installed session — mirrors
+    /// `remove_agent_if_session`'s own session guard. Returns `nullopt` when
+    /// the agent is unknown, or when its currently-installed session's id
+    /// does not equal `session_id` (a genuinely different/superseded
+    /// session, already correctly handled by the legacy session-id guards on
+    /// `clear_stream_if_session`/`remove_agent_if_session`/
+    /// `GatewayRouteStore::deregister` — this accessor has nothing additional
+    /// to fence in that case). A present-but-empty result IS meaningful: it
+    /// means this session matched but was never stamped with a home id
+    /// (legacy/no-fence). Read under `stream_mu`, the same lock
+    /// `set_gateway_route` publishes under.
+    [[nodiscard]] std::optional<std::string>
+    gateway_stream_home_id(const std::string& agent_id, const std::string& session_id) const;
 
     /// PLAN item 5: drop every advertised wire capability for `agent_id`.
     /// Called on DISCONNECTED. `clear_stream_if_session` also clears this set
@@ -741,6 +798,23 @@ public:
     // never treated as an error for the other recipients.
     int send_to_all(const ClassifiedCommand& cmd);
 
+    // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
+    // local session for at all (the precondition every caller must have
+    // already established — this method does not itself check `agents_`).
+    // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
+    // already resolved `cluster_id` from a BATCHED GatewayRouteStore
+    // directory read. Mirrors `send_to`'s existing gateway_node branch: the
+    // same defensive `tag_is_valid` check, the same `gw_pending_` queue —
+    // just keyed off a directory-resolved cluster rather than a live
+    // session's advertised `gateway_node`. Returns false only on a
+    // malformed dispatch tag (the defensive check); queuing itself cannot
+    // fail. NEVER call this for an agent that DOES have a local session —
+    // `send_to` is the sole path for that (this method has no capability
+    // advertisement to check, because there is no session to have
+    // advertised one).
+    bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                            const std::string& cluster_id);
+
     struct GatewayPendingCmd {
         std::string agent_id;
         // Unwrapped to the raw wire type on purpose: by the time a command is
@@ -750,6 +824,14 @@ public:
         // only re-wraps this into a `SendCommandRequest`, never re-decides
         // classification or authorization.
         pb::CommandRequest cmd;
+        /// WS-4 4.2b Task C: the cluster this entry was routed via the
+        /// GatewayRouteStore directory FALLBACK path (`send_via_directory`),
+        /// as opposed to the pre-existing `gateway_node`-session path (`nullopt`
+        /// here — `forward_gateway_pending` has always had exactly one
+        /// `gw_mgmt_stub_` to forward to regardless of node/cluster, so the
+        /// pre-existing path never needed to carry one). Carried through for
+        /// 4.3 (multi-cluster fan-out); inert until then.
+        std::optional<std::string> cluster_id;
     };
 
     std::vector<GatewayPendingCmd> drain_gateway_pending();
@@ -986,6 +1068,20 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+
+    /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
+    /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},
+    /// cleared then rebuilt every sweep (absent-not-zero), mirroring the
+    /// existing yuzu_fleet_net_*{os} pattern. Pure export over data
+    /// recompute_metrics already accumulated — no snapshots_/mu_ access, so
+    /// it's static. `*_os` maps are non-const: set_stats-style helpers sort
+    /// their vector in place.
+    static void recompute_perf_os_gauges(
+        yuzu::MetricsRegistry& metrics,
+        std::unordered_map<std::string, int>& reporting_os,
+        std::unordered_map<std::string, std::vector<double>>& cpu_os,
+        std::unordered_map<std::string, std::vector<double>>& commit_os,
+        std::unordered_map<std::string, std::vector<double>>& disk_lat_os);
 };
 
 } // namespace yuzu::server::detail

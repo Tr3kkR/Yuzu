@@ -18,7 +18,8 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
-#include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
+#include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -256,17 +257,12 @@ public:
     /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
     /// invalid scope expression. Injected from server.cpp where the registry/scope live.
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
-    /// #4035: the SAME cross-store fleet denominator DexRoutes::FleetFn already
-    /// supplies to the dashboard fragments (windows/linux/macos-online counts +
-    /// connected-agent list) — reused verbatim (not re-derived) so the new
-    /// GET /api/v1/dex/{health,trends,overview,catalogue/group} twins read the
-    /// exact same fleet snapshot the fragments render against. Injected from
-    /// server.cpp, which already builds one `DexFleet` provider lambda for
-    /// DexRoutes; that SAME lambda is passed here too (see server.cpp). Trailing
-    /// optional (`{}`) for source-stability of existing call sites/tests — a
-    /// route that needs it treats an unwired fn as "no fleet data" (score/
-    /// crash-free suppressed), never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
+    // ADR-0031 WS-A4 (fifth family): the former `DexFleetFn` register_routes
+    // param is RETIRED. The DEX read handlers now route through the `DexApi`
+    // seam, which obtains the fleet denominator via its OWN FleetFn (wired into
+    // make_local_dex_api in server.cpp) — so no fleet provider is threaded into
+    // register_routes anymore. (DexRoutes' dashboard fragments still use their
+    // own fleet provider directly; that rewire is deferred, ISSUE #4576.)
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
     /// resolver `DexRoutes::register_routes`'s own `resolve_visible` (dex_routes.cpp)
     /// already applies to confine `/fragments/dex/app`'s and
@@ -275,7 +271,7 @@ public:
     /// enumerate the identical affected/top-devices lists and MUST apply the same
     /// confinement, not just the sibling service-scoped-token deny belt
     /// (`deny_fleet_wide_service_scoped`). Two independent belts are required
-    /// together, per the SCOPING NOTE on the `dex_fleet_fn` provider in server.cpp:
+    /// together, per the SCOPING NOTE on the `dex_visible_fn` provider in server.cpp:
     /// this fn closes the management-group-confined-OPERATOR axis,
     /// `deny_fleet_wide_service_scoped` closes the service-scoped-API-token axis —
     /// neither substitutes for the other. `nullopt` = unfiltered (global read /
@@ -477,11 +473,6 @@ public:
         // Response:Read scope resolver (see ResponseVisibleSetFn's doc
         // comment above). Trailing optional dep; `{}` = legacy-open.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035: see DexFleetFn's doc comment above. Trailing optional dep; `{}`
-        // degrades the fleet-dependent DEX twins (health/trends/overview/
-        // catalogue-group) to their "no reporting agents" suppressed shape —
-        // never a crash.
-        DexFleetFn dex_fleet_fn = {},
         // #4035 hardening (governance): see DexVisibleFn's doc comment above.
         // Trailing optional dep; `{}` degrades GET /api/v1/dex/app and GET
         // /api/v1/dex/overview to "no confinement" (matching the fragment's own
@@ -493,7 +484,22 @@ public:
         // dashboard fragments and the MCP compare_app_perf_versions tool call,
         // so REST/dashboard/MCP can never disagree. nullptr = the route answers
         // 503 (provider unwired), same degrade as the retired cohort provider.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam — backs
+        // GET /api/v1/devices[/{id}] (replaces the raw `agents_fn` read on
+        // this pair only; `agents_fn` itself stays wired for
+        // POST /api/v1/scope/preview, its other live consumer). The SAME
+        // instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details` use, so
+        // REST/dashboard/MCP can never disagree on device identity data.
+        // nullptr = both routes answer 503 (provider unwired).
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API
+        // seam — backs the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads (the SAME instance the MCP DEX signal tools
+        // use). The DEX signal handlers REQUIRE it: nullptr → those routes
+        // answer 503, equivalent to the old `!guaranteed_state_store` readiness
+        // guard (server.cpp wires this iff the store is present).
+        std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -573,16 +579,19 @@ public:
         // #4033: see the production overload's doc comment above; identical
         // trailing-optional-dep, legacy-open-when-unwired contract.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035: see the production overload's doc comment above; identical
-        // trailing-optional-dep, degrade-not-crash contract.
-        DexFleetFn dex_fleet_fn = {},
         // #4035 hardening (governance): see the production overload's doc
         // comment above (DexVisibleFn); identical trailing-optional-dep,
         // degrade-to-no-confinement contract.
         DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: see the production overload's doc comment
         // above; identical trailing-optional-dep, 503-when-unwired contract.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: see the production overload's doc comment
+        // above; identical trailing-optional-dep, 503-when-unwired contract.
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

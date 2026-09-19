@@ -69,6 +69,7 @@
 
 #include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
+#include <cassert> // UP-6 (#4221): reclassify_dispatching_race_locked()'s debug guard
 #include <new> // std::bad_alloc (detach_fault_here_for_test)
 #include <chrono>
 #include <condition_variable>
@@ -86,6 +87,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <unordered_map>
+#include <utility>  // std::exchange (CompensationPermit/RetainedGuard move ops)
 #include <vector>
 
 namespace yuzu::agent {
@@ -186,6 +188,97 @@ public:
 /// default is steady_clock::now.
 using RuntimeClock = std::function<std::chrono::steady_clock::time_point()>;
 
+/// rung 9c PR-5b hardening (#4221, Gate 3 cpp-safety adjudication, this governance
+/// run): move-only RAII permit for one slot in an atomic<int>-backed capacity pool.
+/// Replaces a plain bool-guarded manual acquire/release pairing that cpp-safety's
+/// RAII-floor adjudication declined to exempt - the proposer's "the resource crosses
+/// a stack boundary, so RAII can't span it" reasoning was correctly rejected: the
+/// permit doesn't need to live on a stack frame, only on the long-lived KeyClaim
+/// object that already outlives both the acquiring call and the async release.
+/// Engaging (constructing with a non-null slot pointer) is done under registry_mu_
+/// by the one true acquire site (GuardianSparkRuntime::try_reserve_compensation_
+/// locked()), paired atomically with the admission check that found capacity - but
+/// the RELEASE side is deliberately NOT lock-dependent: the slot is std::atomic<int>
+/// specifically so this guard's destructor is safe to run on ANY thread, without
+/// registry_mu_ held, which is what makes it a genuine structural backstop against a
+/// future call path that forgets an explicit release (the exact class of gap
+/// cpp-safety's adjudication identified in the pre-refactor manual pairing). Never
+/// copyable - a slot has exactly one owner; moving transfers ownership without
+/// touching the counter.
+///
+/// Lifetime precondition (Gate 8 re-review, this governance run, security-guardian):
+/// the pointer this permit holds is into GuardianSparkRuntime's own member storage
+/// (compensation_reserved_count_), so an engaged permit must never outlive the
+/// runtime it came from. This holds today because every async path that can hold a
+/// claim with an engaged permit (on_arm_complete, finalize_arm_compensation) is
+/// reached via a self = shared_from_this() capture, keeping the runtime alive until
+/// the same critical section that releases the permit - a precondition the old
+/// plain-bool field did not have (it read/wrote a value, not a pointer). A future
+/// caller that engages a permit without going through the runtime's own
+/// shared_from_this()-captured callback path would need to establish this same
+/// guarantee itself.
+class CompensationPermit {
+public:
+    CompensationPermit() = default;
+    explicit CompensationPermit(std::atomic<int>* slot) noexcept : slot_(slot) {}
+    CompensationPermit(const CompensationPermit&) = delete;
+    CompensationPermit& operator=(const CompensationPermit&) = delete;
+    CompensationPermit(CompensationPermit&& other) noexcept
+        : slot_(std::exchange(other.slot_, nullptr)) {}
+    CompensationPermit& operator=(CompensationPermit&& other) noexcept {
+        if (this != &other) {
+            reset();
+            slot_ = std::exchange(other.slot_, nullptr);
+        }
+        return *this;
+    }
+    ~CompensationPermit() { reset(); }
+    /// Idempotent: a no-op if already released or never engaged.
+    void reset() noexcept {
+        if (slot_) {
+            slot_->fetch_sub(1, std::memory_order_relaxed);
+            slot_ = nullptr;
+        }
+    }
+
+private:
+    std::atomic<int>* slot_{nullptr};
+};
+
+/// rung 9c PR-5b hardening (#4221, same cpp-safety adjudication as CompensationPermit
+/// above): move-only RAII guard for the disarm_retained_ live-lifecycle count (see
+/// GuardianSparkRuntime::disarm_retained()'s own doc comment). The target counter is
+/// already std::atomic<std::uint64_t>, so - same reasoning as CompensationPermit -
+/// the destructor is unconditionally safe to run off-lock, giving a structural
+/// backstop against a future terminal-removal path that forgets to release it.
+class RetainedGuard {
+public:
+    RetainedGuard() = default;
+    explicit RetainedGuard(std::atomic<std::uint64_t>* counter) noexcept : counter_(counter) {}
+    RetainedGuard(const RetainedGuard&) = delete;
+    RetainedGuard& operator=(const RetainedGuard&) = delete;
+    RetainedGuard(RetainedGuard&& other) noexcept
+        : counter_(std::exchange(other.counter_, nullptr)) {}
+    RetainedGuard& operator=(RetainedGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            counter_ = std::exchange(other.counter_, nullptr);
+        }
+        return *this;
+    }
+    ~RetainedGuard() { reset(); }
+    /// Idempotent: a no-op if already released or never engaged.
+    void reset() noexcept {
+        if (counter_) {
+            counter_->fetch_sub(1, std::memory_order_relaxed);
+            counter_ = nullptr;
+        }
+    }
+
+private:
+    std::atomic<std::uint64_t>* counter_{nullptr};
+};
+
 class YUZU_EXPORT GuardianSparkRuntime : public std::enable_shared_from_this<GuardianSparkRuntime> {
 public:
     /// A recovery emits a PAIR of entries (guard.healthy + the verdict) that
@@ -217,16 +310,17 @@ public:
         /// granularity floors at the owning convergence lane's sweep cadence (file:
         /// ~600s) since a refresh can only fire on a committed re-evaluation.
         std::uint64_t errored_refresh_ms{300'000};
-        /// M1 item (b): consecutive COMMITTED Convergence-reason Unknown sweeps after
-        /// which a still-pending-initial rule is demoted off the 5s priority lane to
-        /// its normal type-lane cadence (the read flood, not the wire flood - errored_
-        /// refresh_ms above already bounds the wire side). 0 disables the sweep-count
-        /// demotion arm.
+        /// M1 item (b): consecutive Convergence-reason Unknown READS (committed or
+        /// outbox-rejected - #2992) after which a still-pending-initial rule is
+        /// demoted off the 5s priority lane to its normal type-lane cadence (the read
+        /// flood, not the wire flood - errored_refresh_ms above already bounds the
+        /// wire side). 0 disables the sweep-count demotion arm.
         std::uint64_t pending_demote_sweeps{12};
         /// Elapsed-time companion to pending_demote_sweeps: demote once this much time
         /// has passed since the rule first went pending, even if convergence sweeps
-        /// were sparse (Event-driven eval alone never advances the sweep counter). 0
-        /// disables the elapsed-time demotion arm.
+        /// were sparse (Event-driven eval alone never advances the sweep counter).
+        /// Checked on every Unknown pass regardless of reason or enqueue outcome
+        /// (#2992). 0 disables the elapsed-time demotion arm.
         std::uint64_t pending_demote_ms{120'000};
     };
 
@@ -496,10 +590,10 @@ public:
         return unhealthy_refreshed_.load(std::memory_order_relaxed);
     }
     /// M1 item (b): rule_ids demoted off the 5s convergence priority lane to their
-    /// normal type-lane cadence after pending_demote_sweeps consecutive committed
-    /// Convergence-reason Unknowns or pending_demote_ms elapsed, whichever first. A
-    /// counted metric, not a silent behavior change (Option-A: every loss/suppression/
-    /// resource-shedding channel is observable).
+    /// normal type-lane cadence after pending_demote_sweeps consecutive Convergence-
+    /// reason Unknown reads (committed or outbox-rejected - #2992) or pending_demote_ms
+    /// elapsed, whichever first. A counted metric, not a silent behavior change
+    /// (Option-A: every loss/suppression/resource-shedding channel is observable).
     [[nodiscard]] std::uint64_t priority_demoted() const noexcept {
         return priority_demoted_.load(std::memory_order_relaxed);
     }
@@ -527,7 +621,18 @@ public:
     /// rung 9c R5.2: disarm claims the executor refused at admission (capacity, key,
     /// ceiling, launch) and that were RETAINED at the head of their key entry rather
     /// than dropped (the #3415 gap, now counted); each is re-driven by the next
-    /// same-key event. Lock-free.
+    /// same-key event.
+    ///
+    /// up-5 (#4221, rung 9c PR-5b): the number CURRENTLY retained - i.e. awaiting a
+    /// redrive and not yet finally resolved. Was a monotonic, cumulative-since-boot
+    /// event counter before this PR (correction recorded on issue #4221's own
+    /// comment thread: a monotonic counter cannot answer "is anything stuck right
+    /// now"); now a real lifecycle count, decremented on this same claim's own
+    /// successful completion or any other terminal removal (Stopped-drop,
+    /// DeadSubscription shortcut) - see mark_retained_locked()/clear_retained_
+    /// locked(). A repeated refusal on the SAME already-retained claim
+    /// (KeyClaim::retained_guard's own engaged check in mark_retained_locked())
+    /// never inflates this past 1 for that claim. Lock-free read.
     [[nodiscard]] std::uint64_t disarm_retained() const noexcept {
         return disarm_retained_.load(std::memory_order_relaxed);
     }
@@ -535,6 +640,49 @@ public:
     /// disarm claims the executor refused with Stopped. Lock-free.
     [[nodiscard]] std::uint64_t claims_dropped_at_stop() const noexcept {
         return claims_dropped_at_stop_.load(std::memory_order_relaxed);
+    }
+    /// up-3 (#4221): an arm was refused admission because its compensating-disarm
+    /// reservation pool was exhausted (compensation_reserved_count_ at capacity for
+    /// its IoClass) - the arm never dispatched, no backend call ran. Lock-free.
+    [[nodiscard]] std::uint64_t compensation_reservation_refused() const noexcept {
+        return compensation_reservation_refused_.load(std::memory_order_relaxed);
+    }
+    /// up-3 (#4221): a claim's compensation-observation deadline (KeyClaim::
+    /// compensation_deadline, from cfg_.backend_op_deadline) was observed elapsed by
+    /// expire_overdue_claims()'s maintenance pass, counted once per claim
+    /// (compensation_deadline_observed latches). Observation-only in 5b - see the
+    /// KeyClaim field's own doc comment; does not release anything. Lock-free.
+    [[nodiscard]] std::uint64_t compensation_deadline_elapsed() const noexcept {
+        return compensation_deadline_elapsed_.load(std::memory_order_relaxed);
+    }
+    /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant (different rule_id)
+    /// was refused immediately against a Wedged key's head. Lock-free.
+    [[nodiscard]] std::uint64_t wedged_refusals() const noexcept {
+        return wedged_refusals_.load(std::memory_order_relaxed);
+    }
+    /// up-2 (#4221, rung 9c PR-5c): an identical (rule_id, spec) retry re-observed
+    /// a Wedged key's existing head receipt instead of queuing a new claim.
+    /// Lock-free.
+    [[nodiscard]] std::uint64_t wedged_reobservations() const noexcept {
+        return wedged_reobservations_.load(std::memory_order_relaxed);
+    }
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): a wedged claim's
+    /// late arm success was refused adoption because `rules_` already held an
+    /// entry for its rule_id - NOT necessarily a bug. Reachable via entirely
+    /// ordinary desired-state churn, no fault injection needed: rule R wedges on
+    /// key A; R is redeployed to key B (commits normally, `rules_[R]` now live on
+    /// B); R is redeployed BACK to key A while the ORIGINAL key-A arm is still
+    /// in flight - `is_retained_wedge()` never consults `rg->active`, so the
+    /// still-outstanding claim is genuinely re-observed and its adoption
+    /// candidacy restored; when that original arm eventually completes, this
+    /// counter increments and the stale success is safely disarmed instead of
+    /// being adopted over the live key-B generation. A sustained, climbing rate
+    /// is worth investigating (a rule redeploying faster than its own arm calls
+    /// resolve), but a nonzero count alone is NOT itself evidence of a bug -
+    /// unlike wedged_refusals_/wedged_reobservations_ above, whose triggers are
+    /// narrower. Lock-free.
+    [[nodiscard]] std::uint64_t wedge_adopt_stale_refused() const noexcept {
+        return wedge_adopt_stale_refused_.load(std::memory_order_relaxed);
     }
     /// rung 9c R5.2: completion-callback drains whose OWN bookkeeping threw (not a
     /// commit throw, which is delivered to the waiter) - the firewall published a
@@ -597,12 +745,33 @@ public:
     /// asserting "the hook did not fire" on a plain successful attach pins that. Set
     /// before triggering the drain; copied under registry_mu_ at the drain's start.
     void set_drain_gap_hook_for_test(std::function<void()> hook);
+    /// rung 9c PR-5c (#4221) test seam: fires exactly once, at the very top of
+    /// dispatch_arm_off_lock(), before that function takes registry_mu_ at all - a
+    /// hook body is free to call expire_overdue_claims() or anything else needing
+    /// that lock without deadlocking. This is the window a caller-side timeout
+    /// needs to land in, racing either the reservation check or the executor
+    /// submission further down in that function, to reproduce the
+    /// Dispatching-window race deterministically. Set before triggering the
+    /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
+    void set_dispatch_entry_hook_for_test(std::function<void()> hook);
     /// R5.2 drain fault seam (C2/K5): consumed once by the next on_arm_complete.
     /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
     /// of a successful arm); 2 = a throw right after the first commit adopted the
     /// subscription (before its verdict is staged); 3 = a throw inside the publish
     /// after the verdicts were written into the claims but before the pop (governance
-    /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop). 0 = off.
+    /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop); 4 = a
+    /// throw before the compensating-disarm continuation's allocation, i.e. while `sub`
+    /// is captured in a local but before `built`/`cont` exist (adversarial review C1,
+    /// PR #4318 fjarvis: proves the direct-disarm-and-fall-through recovery, not a
+    /// std::terminate, is what happens here); 5 = a throw AFTER that allocation
+    /// succeeded but while copying `key` into it, i.e. `built` is alive but `cont`
+    /// is STILL null (Gate 8 re-review, cpp-safety + security-guardian, PR #4318: an
+    /// earlier fix shape assigned `cont` before the key copy was known to succeed,
+    /// so a throw here left `cont` non-null with an empty `key`, which made the
+    /// continuation branch below run on top of an already-issued direct disarm AND
+    /// made finalize_arm_compensation()'s claims_.find("") miss the real key,
+    /// permanently wedging it - `cont` is now assigned only as the LAST statement
+    /// of the try, so points 4 and 5 both leave it null identically). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -613,6 +782,19 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
+    /// rung 9c PR-5d adversarial-review fault seam (Blocker 2, widened at Gate 7 to
+    /// cover Blocker 1's own reorder fix): consumed once by WHICHEVER of the two
+    /// wedged_by_rule_.insert_or_assign() call sites reaches it first -
+    /// abandon_claim_locked()'s dispatched (non-Queued), non-stopping path, OR
+    /// attach_core()'s Reobserved-restore branch. Throws std::bad_alloc where that
+    /// insert's node allocation would, BEFORE the site's own irreversible write
+    /// (abandon_claim_locked: release_claim_index_locked/waiter_abandoned/end;
+    /// attach_core: rg->active=true). Proves a throw at either site leaves its
+    /// claim completely untouched/retry-safe rather than stranding a partially-
+    /// abandoned or wrongly-reactivated, adoption-eligible claim with no locator
+    /// entry to find it. A test driving one site must not assume the other is
+    /// unconsumed - the flag is one-shot across BOTH.
+    void set_wedge_locator_fault_for_test(bool on) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
     /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
@@ -649,6 +831,21 @@ public:
     [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
         return claim_index_release_failures_.load(std::memory_order_relaxed);
     }
+    /// rung 9c PR-5a (#4221 cs-103): detach_rule_locked's last-on-key branch sweeps
+    /// claims_[key] before constructing a new Disarm claim, on the belief (see the
+    /// reachability note at that call site) that nothing survives the sweep. This
+    /// counts every time that belief was WRONG - i.e. every time the debug-only
+    /// assert() next to this counter's increment site would have fired in a debug
+    /// build. Expected 0; unlike a bare assert() (compiled out under NDEBUG in a
+    /// release build), this counter and its accompanying log line survive into
+    /// release, matching this file's own established precedent at
+    /// dispatch_arm_off_lock's "not an Arm claim" guard for a should-never-happen
+    /// branch. A nonzero value here means the reachability note's call-graph
+    /// argument was incomplete somewhere - re-open the investigation rather than
+    /// assume it is safe to ignore.
+    [[nodiscard]] std::uint64_t detach_sweep_left_residue() const noexcept {
+        return detach_sweep_left_residue_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -667,6 +864,18 @@ public:
     [[nodiscard]] std::size_t rule_count() const;
     [[nodiscard]] std::size_t outbox_size() const;
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
+    /// rung 9c PR-3 (Decision 3, Option B): THIS instance's io_executor_ - summed
+    /// across IO classes - CeilingExhausted (R5.1's physical alive-worker ceiling)
+    /// refusal count. Deliberately narrow: NOT a general Counters/Stats egress -
+    /// #3415 (docs/spark-legacy-delta-registry.md row D10) is the broader, still-
+    /// open gap this accessor does not close (see io_executor_stats_for_test()'s
+    /// own doc comment on that gap); this is one signal Dave ruled to ship now
+    /// (~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md Decision 3), not
+    /// the start of #3415's general counter wiring. Only THIS runtime's arm/disarm
+    /// executor instance is reachable here - the state reader owns a separate
+    /// GuardianIoExecutor instance with no egress of its own yet, and per D10 its
+    /// run()-only usage means it structurally cannot hit CeilingExhausted anyway.
+    [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
     /// rule_ids still awaiting a first Known eval on `key` (the pending-initial
     /// dirty-set the convergence priority lane services). Includes DEMOTED rule_ids -
     /// this reflects "never Known", not priority-lane membership; use
@@ -793,9 +1002,14 @@ private:
     /// keys_with_pending_initial()'s priority-lane worklist. A demoted rule keeps
     /// converging (and keeps re-arming errored_refresh_ms) at its normal type-lane
     /// cadence, which is what makes 6b the staleness backstop for 6c.
+    /// commit_new_generation_locked() reseeds this fresh (first_seen=attach_now,
+    /// unknown_sweeps=0, demoted=false) on EVERY generation commit for a rule_id, not
+    /// only on first attach - a same-rule_id content-plane push mid-demotion-episode
+    /// restarts the demotion clock rather than carrying prior progress forward.
     struct PendingState {
         std::chrono::steady_clock::time_point first_seen{};
-        std::uint64_t unknown_sweeps{0}; ///< committed Convergence-reason Unknowns since first_seen
+        std::uint64_t unknown_sweeps{0}; ///< Convergence-reason Unknown reads since first_seen
+                                         ///< (committed or outbox-rejected - #2992)
         bool demoted{false};
     };
 
@@ -846,7 +1060,7 @@ private:
     /// replacement's mapping.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
-    /// fault-wiring rung (quarantine / K-bound / arm_failed reason) has something to
+    /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
     /// classify. PR-1 carries NO classification logic on it; the only reads are the
     /// bookkeeping guards (a `Committed` claim is a rules_ entry, never "pending":
     /// detach_rule_locked's Case-0 skip, and the drain's publish fill-in).
@@ -881,12 +1095,408 @@ private:
         std::string rule_name;
         const char* guard_type{""};
         std::chrono::steady_clock::time_point attach_now{};
+        /// rung 9c PR-2 Unit 2 (Astra opine review Blocker 2 / coordinator ruling
+        /// 2026-09-12): real monotonic deadline for THIS claim's own arm attempt, set
+        /// once in attach_core() at the same instant the blocking wrapper's own
+        /// wait_for_claim() deadline has always approximated - std::chrono::
+        /// steady_clock::now(), never the injected evaluation clock_() ("Record real
+        /// monotonic deadlines in the claim. Do not reuse the injected evaluation
+        /// clock."). Meaningful for Arm claims only - since Unit 3, a Disarm claim
+        /// has no caller-side deadline at all: submit_disarm_off_lock's submit()
+        /// call has none (guardian_io_executor.hpp: "there is no waiter to time
+        /// out"), so there is nothing for this field to bound. Consulted by
+        /// expire_overdue_claims() so a
+        /// non-waiting caller's claim still times out with nobody blocked in
+        /// wait_for_claim() to notice - the existing timeout-fails-attempt behavior,
+        /// just relocated out of a waiter, not removed.
+        std::chrono::steady_clock::time_point deadline{};
         // Disarm payload.
         std::uint64_t subscription{0};
+
+        // up-3/up-4 (#4221, rung 9c PR-5b): Arm-claim-only compensation bookkeeping.
+        // `compensation_permit`, when engaged, is this claim's held slot in the
+        // compensating-disarm reservation pool (rung 9c PR-5b hardening, this
+        // governance run: an RAII CompensationPermit - see that class's own doc
+        // comment - replacing a plain bool the pre-hardening cpp-safety RAII-floor
+        // adjudication declined to exempt). Engaged the instant
+        // dispatch_arm_off_lock() reserves this claim's slot, BEFORE the arm is
+        // ever submitted - see compensation_reserved_count_'s header comment.
+        // `compensation_finished` defaults true (nothing to track yet);
+        // dispatch_arm_off_lock() never touches it, on_arm_complete() sets it false
+        // the instant a live subscription becomes compensation-owed (entering the
+        // `if (compensating)` branch) and back to true - in the SAME critical
+        // section that pops/publishes the claim - once the compensating disarm has
+        // genuinely finished (or turned out never to be needed).
+        // expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to know a
+        // terminal/stranded head is safe to reap: never touch one whose compensation
+        // is not yet finished. `compensation_deadline` is set ONCE, when
+        // compensation first becomes owed, from cfg_.backend_op_deadline - never
+        // reset on a fallback retry. `compensation_deadline_observed` is a
+        // once-only latch: in 5b, an elapsed deadline only increments
+        // compensation_deadline_elapsed_ (see the class-level comment there) - it
+        // does not, and must not, release the reservation, the subscription, the
+        // FIFO head, or worker accounting; a blocked OS call cannot be
+        // force-cancelled.
+        std::optional<CompensationPermit> compensation_permit;
+        bool compensation_finished{true};
+        std::chrono::steady_clock::time_point compensation_deadline{};
+        bool compensation_deadline_observed{false};
+
+        // up-5 (#4221, rung 9c PR-5b): Disarm-claim-only. Engaged from this claim's
+        // FIRST retention (an admission refusal or worker throw) until it is either
+        // finally removed (success, Stopped-drop, DeadSubscription shortcut) or
+        // successfully redriven to completion - see disarm_retained()'s own doc
+        // comment on GuardianSparkRuntime for the full lifecycle contract. A
+        // repeated refusal on the SAME already-retained claim must never engage a
+        // second RetainedGuard (mark_retained_locked()'s own idempotency check on
+        // this member is what makes that safe). RAII (rung 9c PR-5b hardening, this
+        // governance run) replacing a plain bool for the same cpp-safety-adjudicated
+        // reason as compensation_permit above.
+        std::optional<RetainedGuard> retained_guard;
     };
     struct KeyClaimQueue {
         std::deque<std::shared_ptr<KeyClaim>> fifo; ///< front() = the current claim
     };
+
+    /// rung 9c PR-2, Unit 1 (shared attach core): attach_rule()'s outcome BEFORE any
+    /// wait. Armed/Failed mean already resolved - the caller need not wait further.
+    /// Pending means the claim returned alongside it is this call's own live claim,
+    /// already enqueued in claims_ and (if selected) already dispatched off-lock; the
+    /// public, blocking attach_rule() waits on it via wait_for_claim(). Vocabulary
+    /// matches docs/spark-stage2-guardian-consumer-design.md §R5.3 (Armed / Accepted
+    /// / Failed) - Pending, not a fourth outcome word, names the same "not yet
+    /// resolved" concept from the runtime's own side, where a future non-waiting
+    /// entry point (not yet added) would report it as Accepted.
+    ///
+    /// rung 9c PR-5c (#4221 up-2): Reobserved means this call created NO new claim
+    /// at all - it is an identical (rule_id, spec) retry onto a key whose head is
+    /// already Wedged, and the claim returned alongside it is that EXISTING,
+    /// already-owned head, handed back purely for observation. Like Pending, the
+    /// caller need not wait further in the sense that nothing further will ever
+    /// resolve differently by waiting - the head's own eventual resolution is
+    /// already in motion independently of this call.
+    enum class AttachCoreState { Armed, Pending, Failed, Reobserved };
+    struct AttachCoreResult {
+        AttachCoreState state{AttachCoreState::Failed};
+        std::uint64_t generation{0};      ///< valid iff state == Armed
+        std::string error;                ///< valid iff state == Failed
+        /// rung 9c PR-5c round 2 (#4221, UP-1 residual): valid iff state == Failed.
+        /// True iff THIS return happened BEFORE detach_rule_locked(rule_id) ran
+        /// anywhere in this call - i.e. rule_id's prior committed/claimed state (if
+        /// it had any) is untouched, exactly as it was when this call started.
+        /// False means detach_rule_locked(rule_id) already ran earlier in this same
+        /// call (and, on the inline-type backend-failure path, this attempt's own
+        /// newly-created state was also fully rolled back) - rule_id has nothing
+        /// left either way, so a caller's defensive cleanup afterward is a genuine
+        /// no-op. A caller MUST skip that defensive cleanup when this is true:
+        /// rule_id's real, still-live arm would otherwise be torn down one call
+        /// later by cleanup that assumes (the now-stale premise) "attach_rule
+        /// leaves nothing on failure" - see attach_rule(NonWaiting, ...)'s ArmError
+        /// and GuardianEngine::reconcile_rule_locked()'s own comment.
+        bool prior_state_preserved{false};
+        /// valid iff state == Pending OR Reobserved. An OBSERVATION handle only
+        /// (rung 9c PR-2, Astra opine review 2026-09-12): destroying it must never
+        /// withdraw the rule or abandon its operation - ownership of cancellation
+        /// stays in claims_ and the callback's own capture, exactly as it does
+        /// today for attach_rule's local `arm_claim`. For Reobserved specifically,
+        /// this call OWNS NOTHING NEW - the claim is the pre-existing head's own
+        /// object, already owned by whatever attach originally created it.
+        std::shared_ptr<KeyClaim> claim;
+    };
+
+public:
+    /// rung 9c PR-2 Unit 2 (Astra opine review, Blocker 3): tag selecting the
+    /// non-waiting attach_rule() overload below - a distinct type, not an easily
+    /// missed boolean, so a call site cannot silently pick the wrong overload.
+    struct NonWaiting {};
+
+    /// An OBSERVATION handle onto a claim the non-waiting attach_rule() overload
+    /// returned as Accepted (Astra opine review, Blocker 1: "The receipt should be
+    /// an observation handle. Destroying it must neither withdraw the rule nor
+    /// abandon its operation."). Wraps the SAME shared_ptr<KeyClaim> the blocking
+    /// attach_rule() would have waited on - no separate allocation, and ownership of
+    /// cancellation/commit stays entirely in claims_ and the completion callback's
+    /// own capture, exactly as it does today for attach_rule's local `arm_claim`.
+    struct ArmReceipt {
+        std::shared_ptr<KeyClaim> claim;
+    };
+
+    /// Authoritative, allocation-free status of an ArmReceipt's claim (Astra opine
+    /// review: "An asynchronous receipt needs an allocation-free authoritative
+    /// status, with diagnostic strings optional. An erased claim with no string
+    /// must not look pending forever."). receipt_status() derives this from
+    /// KeyClaim::end ALONE, not from `outcome`/`commit_exception` - `end` is a
+    /// nothrow enum write on every terminal path, set even when the accompanying
+    /// `outcome` string failed to allocate (see begin_stop's queued-claim drop and
+    /// publish_locked's own fill-in, both of which write `end` unconditionally),
+    /// which is exactly the case that must not read back as stuck Pending.
+    /// rung 9c PR-5c (#4221): `Expired` split into `CongestionExpired` (timed out
+    /// merely queued behind another claim - never reached dispatch, ordinary
+    /// backpressure) and `Wedged` (timed out while dispatching/dispatched - the
+    /// state up-2's immediate-refusal/re-observation logic keys off). "Wedged" is a
+    /// SLIGHT overclaim for this name: `Dispatching` doesn't prove the backend call
+    /// actually started, and compensation can remain outstanding even after an arm
+    /// eventually returns - read it as "an overdue retained dispatch episode," not
+    /// a guarantee the backend is literally hung.
+    enum class ReceiptStatus {
+        Pending, Committed, Failed, CongestionExpired, Wedged, Withdrawn, Stopped
+    };
+
+    /// registry_mu_ taken internally (short critical section, allocation-free). A
+    /// default-constructed (empty) receipt reports Failed - there is nothing to
+    /// observe.
+    ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
+    /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
+    bool is_terminal(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial-review-class finding,
+    /// cpp-safety): `status` exactly as receipt_status() would report, and
+    /// `wedge_eligible` (meaningful ONLY when `status == Wedged`, false otherwise)
+    /// exactly as receipt_wedge_k_eligible() would report - both computed under
+    /// ONE registry_mu_ acquisition. A caller needing BOTH facts about the same
+    /// receipt must use this, never receipt_status() followed by a separate call
+    /// to receipt_wedge_k_eligible() - the two-call sequence has the identical
+    /// TOCTOU shape the adversarial review found and fixed in
+    /// GuardianArmAckLedger::drain_locked()'s recovery-scan loop
+    /// (receipt_recovery_status()'s own doc comment), just reachable from
+    /// drain_locked()'s PRIMARY per-pending loop instead: a claim read as Wedged
+    /// by call 1 can be genuinely adopted-and-popped by on_arm_complete() in the
+    /// gap before call 2, which then (correctly, as of that later instant) reports
+    /// not-eligible - but the caller has already committed to treating the
+    /// receipt as a failure based on call 1's stale snapshot, permanently losing
+    /// the genuine success for this specific application (self-heals only on the
+    /// NEXT identical retry, via decide_retry()'s forced Reapply once
+    /// resolved_failed>0 - not truly unbounded, but a real, avoidable gap).
+    struct WedgeAwareStatus {
+        ReceiptStatus status{ReceiptStatus::Failed};
+        bool wedge_eligible{false};
+    };
+    [[nodiscard]] WedgeAwareStatus receipt_status_wedge_aware(const ArmReceipt& receipt) const;
+    /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
+    /// been ADOPTED - i.e. rules_ currently carries a live generation for that
+    /// claim's rule_id AND it is EXACTLY this claim's own (rule_id, generation)
+    /// incarnation, not a newer or older one that happens to share the rule_id.
+    /// `end`/`receipt_status()` never change on adoption (the sticky-Wedged
+    /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
+    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal for
+    /// noticing a late-success recovery on a claim still held as a retained
+    /// failure. rung 9c PR-5e (#4221, K-bound closeout - governance Gate 4/
+    /// consistency-auditor finding): `GuardianArmAckLedger::drain_locked()`'s
+    /// recovery-scan loop, this accessor's own original motivating caller, now
+    /// calls the atomic `receipt_recovery_status()` below instead (this standalone
+    /// accessor's own two-call combination with `receipt_wedge_k_eligible()` has a
+    /// TOCTOU `receipt_recovery_status()`'s own doc comment explains) - this
+    /// accessor stays live standalone API, currently with no production caller.
+    /// False for a default-constructed / empty receipt (nothing to recover) and
+    /// false for any receipt whose claim was never adopted. registry_mu_ taken
+    /// internally.
+    [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a
+    /// CURRENTLY, GENUINELY outstanding Wedged episode - the narrow subset of "sticky
+    /// Wedged" (see receipt_status()'s own doc comment) that K-bound may waive.
+    /// `end == ClaimEnd::WaiterTimedOutDispatched` alone is NOT sufficient - `end` is
+    /// sticky (never un-Wedges) but the underlying episode is NOT: (1) a caller-side
+    /// timeout can stamp WaiterTimedOutDispatched while the claim is still mid-dispatch
+    /// (abandon_claim_locked()'s Dispatching branch), racing dispatch_arm_off_lock()'s
+    /// own re-lock, which - on a synchronous admission refusal - corrects the REAL
+    /// outcome via reclassify_dispatching_race_locked() but ONLY while `dispatch` is
+    /// still Dispatching; `dispatch` itself never reaches Dispatched on that corrected
+    /// path (dispatch_arm_off_lock only ever writes Dispatched on a successful
+    /// submission, see its own body) - so requiring `dispatch == Dispatched` here
+    /// excludes exactly that unsettled/corrected window, never the genuinely-launched-
+    /// and-still-outstanding case (a claim that IS submitted reaches Dispatched
+    /// immediately, well before any real backend deadline, and simply stays there for
+    /// as long as the backend call genuinely runs). (2) A LATER real backend outcome
+    /// (a synchronous refusal on the worker, or any other on_arm_complete() resolution)
+    /// leaves `end` stuck at Wedged by design (the sticky-Wedged receipt is a fact
+    /// about the ORIGINAL episode, not a live status - R5.3 "Three separate
+    /// transitions, never collapsed") but POPS the claim from its key's FIFO the
+    /// instant that resolution is published - so requiring `claim` to still be
+    /// `claims_[claim->key]`'s FIFO FRONT is the "still-claimed" test
+    /// docs/spark-legacy-delta-registry.md's own K-bound row names: once popped, this
+    /// reads false forever for that claim, regardless of what `end` still says. Both
+    /// checks together, evaluated atomically under registry_mu_ (the same lock every
+    /// FIFO pop and every reclassify_dispatching_race_locked() call already holds), are
+    /// race-free: an external reader (GuardianArmAckLedger::drain_locked()) can only
+    /// ever observe the state strictly before or strictly after either transition, never
+    /// in between. False for a default-constructed / empty receipt, an unclaimed key, or
+    /// a key whose front is a different claim entirely. Never mutates state (a query
+    /// only, matching receipt_recovered()'s own contract) - registry_mu_ taken
+    /// internally.
+    [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    /// Codex Sol independently converging): the ATOMIC combination of
+    /// receipt_recovered() and receipt_wedge_k_eligible(), for a caller that needs
+    /// BOTH questions answered about the exact same instant. Calling the two
+    /// standalone accessors sequentially (each takes and releases registry_mu_
+    /// independently) is NOT equivalent to this - a genuine adoption can land in the
+    /// gap between them: the first call correctly observes "not yet recovered", the
+    /// adoption's on_arm_complete() pops the claim in the window, and the second call
+    /// then observes "not eligible either" (no longer FIFO-front) - so a caller
+    /// combining the two booleans with `if (recovered) ... else if (!eligible) ...`
+    /// can misclassify a genuine, just-landed recovery as "no longer eligible",
+    /// dropping it without recording the recovery (GuardianArmAckLedger::
+    /// drain_locked()'s own recovery-scan loop is exactly this caller - see its own
+    /// comment on why it uses this accessor instead of the two standalone ones).
+    /// `Recovered` takes priority over `WedgeEligible` when both could apply (they
+    /// cannot in practice - an adopted claim's rule generation match and an
+    /// unadopted claim's FIFO-front position are mutually exclusive states of the
+    /// SAME claim - but the priority is stated for clarity, not because the case is
+    /// reachable). `Blocking` covers every other case: an empty receipt, a claim
+    /// neither recovered nor currently wedge-eligible (settled to a genuine
+    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
+    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
+    [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
+
+    enum class ArmOutcomeKind { Armed, Accepted };
+    /// The non-waiting attach_rule() overload's success result. Never encodes
+    /// Accepted as a special generation number or makes it implicitly convertible
+    /// to a successful one (Astra opine review, Blocker 3) - callers must check
+    /// `kind` explicitly before reading `generation`.
+    struct ArmOutcome {
+        ArmOutcomeKind kind{ArmOutcomeKind::Armed};
+        std::uint64_t generation{0}; ///< valid iff kind == Armed
+        ArmReceipt receipt;          ///< valid iff kind == Accepted
+    };
+
+    /// rung 9c PR-5c round 2 (#4221, UP-1 residual): the non-waiting attach_rule()
+    /// overload's failure result. `message` is the same diagnostic text the
+    /// blocking overload returns as a bare std::string. `prior_state_preserved`
+    /// carries attach_core()'s own AttachCoreResult::prior_state_preserved bit
+    /// straight through (see its doc comment for the full contract) - true means
+    /// rule_id's prior live state, if it had any, was left completely untouched by
+    /// this failure. GuardianEngine::reconcile_rule_locked(), the production
+    /// caller, MUST check this bit before running its own defensive
+    /// spark_runtime_->detach_rule(rule_id) cleanup: skip that call when this is
+    /// true, or a real, still-live arm on a DIFFERENT key gets torn down one call
+    /// later - reproducing the exact defect this bit exists to prevent.
+    struct ArmError {
+        std::string message;
+        bool prior_state_preserved{false};
+    };
+
+    /// Non-waiting counterpart to attach_rule() above: shares the identical
+    /// preparation/dispatch/commit/cleanup path (attach_core(), the same
+    /// claim_rollback pattern and #3831 shape - see the blocking overload's own doc
+    /// comment) but never calls wait_for_claim(). On Armed/Failed this behaves
+    /// exactly like the blocking overload, including the case where completion races
+    /// ahead of this call and the claim is observed already-terminal before return
+    /// (Astra opine review: "A claim observed committed before return can also
+    /// return Armed"). On an unresolved claim it hands ownership to claims_/the
+    /// completion callback - never marking it waiter_abandoned, since Accepted means
+    /// the operation is still wanted, not abandoned - and returns Accepted(receipt)
+    /// immediately, without waiting.
+    ///
+    /// Exception (rung 9c PR-5c, #4221 up-2): AttachCoreState::Reobserved also
+    /// returns Accepted, but for a pre-existing, already-Wedged head this call did
+    /// NOT create and does not own - see attach_core()'s own doc comment for that
+    /// branch. That receipt is already terminal; nothing further resolves it.
+    ///
+    /// GuardianEngine::reconcile_rule_locked() is the production caller as of Unit 6.
+    /// Failure is reported as ArmError (rung 9c PR-5c round 2, #4221), not a bare
+    /// std::string, specifically so that caller can distinguish a refusal that
+    /// preserved rule_id's prior state from one that already tore it down - see
+    /// ArmError's own doc comment.
+    std::expected<ArmOutcome, ArmError> attach_rule(NonWaiting, std::string rule_id,
+                                                     SparkSpec spec, RuleAssertion assertion,
+                                                     bool emit_compliant_edge);
+
+    /// rung 9c PR-2 Unit 2 (Astra opine review Blocker 2 / coordinator ruling
+    /// 2026-09-12): registry-locked expiry transition, callable directly - nobody is
+    /// blocked in wait_for_claim() to notice a non-waiting claim's own deadline (see
+    /// KeyClaim::deadline) elapse. Does exactly what wait_for_claim's own timeout
+    /// branch has always done for the blocking caller - abandon_claim_locked() every
+    /// live Arm claim whose deadline has passed - so today's timeout-fails-attempt
+    /// behavior is preserved, just relocated out of a waiter, not removed. A Disarm
+    /// claim is never a target: since Unit 3, submit_disarm_off_lock() dispatches
+    /// disarms through submit() too, which has no deadline concept at all - see
+    /// redrive_retained_disarms() for the disarm-side maintenance pass instead.
+    /// Idempotent: a claim already terminal or already waiter_abandoned is
+    /// skipped. GuardianArmAckLedger::drain_locked() (Unit 5/6) is the production
+    /// caller, from GuardianEngine::journal_maintenance_tick()'s own heartbeat
+    /// cadence; exposed standalone here so a test can drive it directly. Returns
+    /// the number of claims this call expired.
+    ///
+    /// up-4 (#4221, rung 9c PR-5b): in the SAME acquisition, also runs
+    /// reap_stranded_claims_locked() - a SEPARATE terminal-recovery pass over every
+    /// key's FIFO front for two residue shapes this function's own overdue-live-
+    /// claim scan above deliberately excludes (a Dispatched terminal head; a
+    /// Queued, withdrawn/abandoned head with no outcome yet - see that function's
+    /// own doc comment for why each is reachable and what reaps it) and to observe
+    /// (count-only) any elapsed compensation_deadline. Any claim newly dispatchable
+    /// as a result is dispatched off-lock after this function's own lock releases,
+    /// exactly like every other refill site in this file. This return value's
+    /// meaning is unchanged - it still counts only THIS function's own overdue-
+    /// live-claim expiries, not the terminal-recovery pass's reaps.
+    std::size_t expire_overdue_claims();
+
+    /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
+    /// maintenance pass for retained disarms - one attempted re-submission per
+    /// currently-Queued Disarm head across every key, no sleeps/recursion/waiting
+    /// for quota. Without this, a disarm retained after an admission refusal (or
+    /// dropped by a caller-side throw between detach_rule_locked() and
+    /// submit_disarm_off_lock()) sits inert until a FUTURE same-key attach happens
+    /// to redrive it - which may never come for a key nothing re-attaches to. A
+    /// future heartbeat tick (Unit 5) is its production caller; exposed standalone
+    /// here so a test can drive it directly. Returns the number of claims this call
+    /// attempted to redrive (a redrive can itself be refused again; that retained
+    /// claim is picked up again on the next call).
+    std::size_t redrive_retained_disarms();
+
+private:
+    /// The shared body of attach_rule(), before any wait: derive the claim/inline/
+    /// shared-watcher decision, retire any prior generation, and (claim path only)
+    /// dispatch off-lock. `key` is precomputed by the caller (spark_key(spec)) since
+    /// the caller's own claim_rollback guard captures it before this call, and before
+    /// `spec` is moved in here. `arm_claim` is a REFERENCE to the caller's own local:
+    /// this function writes it (a noexcept pointer write, exactly at the point the
+    /// claim is enqueued) rather than returning the claim only inside the result, so
+    /// that a throw AFTER the enqueue but before this function returns still leaves
+    /// the caller's own claim_rollback (armed over that same local, per #3831) able
+    /// to find and abandon it - returning the claim solely via AttachCoreResult would
+    /// leave the caller's rollback guard looking at a still-null slot on exactly that
+    /// throw path, recreating #3831 one level up. The caller (attach_rule()) alone
+    /// owns claim_rollback's scope and commit point.
+    AttachCoreResult attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
+                                 RuleAssertion assertion, bool emit_compliant_edge,
+                                 std::shared_ptr<KeyClaim>& arm_claim);
+
+    /// rung 9c PR-5c round 2 governance fold (#4221): the retained-wedge
+    /// classification - a claim kind==Arm, dispatch in {Dispatching, Dispatched},
+    /// waiter_abandoned, and end==WaiterTimedOutDispatched - used to be duplicated
+    /// verbatim across attach_core()'s hoisted UP-1 pre-check and its original,
+    /// now-largely-superseded post-detach check (kept as defense-in-depth, not
+    /// removed). A future edit to one copy without the other could silently
+    /// reintroduce a UP-1-class bug, so both now read this one definition. Pure
+    /// read of `head`'s own fields - registry_mu_ held is the caller's
+    /// responsibility (both current call sites already hold it), not this
+    /// function's, since it never touches shared state itself.
+    [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
+    /// mapping receipt_status() applies - factored out so
+    /// receipt_status_wedge_aware() can compute the SAME mapping under its own
+    /// single registry_mu_ acquisition without duplicating the switch (and
+    /// therefore without the two ever silently drifting apart). No lock of its
+    /// own - a pure function of the enum value the caller already holds under
+    /// registry_mu_.
+    [[nodiscard]] static ReceiptStatus classify_claim_end(ClaimEnd end) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
+    /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
+    /// == Dispatched && still its key's FIFO front`) - factored out so
+    /// receipt_wedge_k_eligible(), receipt_recovery_status() and
+    /// receipt_status_wedge_aware() all read ONE definition instead of three
+    /// independently-maintained copies (the drift risk classify_claim_end() was
+    /// already extracted to prevent for the ClaimEnd->ReceiptStatus mapping,
+    /// applied here to the eligibility predicate too). registry_mu_ held by the
+    /// CALLER - every call site already holds it - not this function's own
+    /// responsibility, since it never touches shared state itself beyond the
+    /// read-only `claims_` lookup a caller already has the right to make.
+    [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
@@ -916,19 +1526,32 @@ private:
     /// rule on the key.
     void on_subscription_faulted(const std::string& key, std::uint64_t subscription_id,
                                   bool faulted, const std::string& detail);
-    /// Drive a DISARM claim that detach_rule_locked already queued at the head of its
-    /// key entry: run the bounded backend disarm (io_executor_.run(), holding its
-    /// class quota exactly as before), then pop the claim and dispatch the next
-    /// head ("refill" - an arm that queued behind it). Best-effort teardown of the OS
-    /// watcher only, as unconfirmed as the void `ISparkBackend::disarm()` call it
-    /// replaces. rung 9c R5.2: an executor ADMISSION refusal (capacity, key, ceiling,
-    /// launch, or a throw building the call) does NOT drop the claim - it is
-    /// RETAINED at the head, counted (disarm_retained_), and re-driven by the next
-    /// same-key event (an attach on the key, which then queues its own arm behind
-    /// it); only Stopped drops it, counted. No-op if the claim is no longer the
-    /// Queued head (another caller is already driving it, or it completed). Never
-    /// called with either runtime lock held.
+    /// Dispatch a DISARM claim that detach_rule_locked already queued at the head of
+    /// its key entry, through io_executor_.submit() (rung 9c PR-2 Unit 3: genuinely
+    /// non-blocking, replacing the earlier bounded run() - see on_disarm_complete()
+    /// for the actual pop/refill, which now happens in that completion callback, not
+    /// here). This function only handles SYNCHRONOUS admission: an executor
+    /// ADMISSION refusal (capacity, key, ceiling, launch, or a throw building the
+    /// call) does NOT drop the claim - it is RETAINED at the head, counted
+    /// (disarm_retained_), and re-driven by the next same-key event (an attach on
+    /// the key, which then queues its own arm behind it) or by
+    /// redrive_retained_disarms(); only Stopped drops it, counted, via
+    /// fail_all_claims_locked. No-op if the claim is no longer the Queued head
+    /// (another caller, or a prior retry, is already driving it, or it already
+    /// completed). Never called with either runtime lock held.
     void submit_disarm_off_lock(const std::shared_ptr<KeyClaim>& claim);
+    /// The submit() completion callback for a DISARM claim, on the detached worker
+    /// (rung 9c PR-2 Unit 3): pop it and dispatch the next head ("refill" - an arm
+    /// queued behind it) on a real completion; on a worker throw, retain it exactly
+    /// like a synchronous admission refusal (Astra opine review Blocker 4: "Record
+    /// actual worker failure; retain for bounded retry rather than pretend
+    /// admission failed"), just logged distinctly. Only WorkerThrew is reachable
+    /// here - submit() has no deadline (so no Timeout), and every other refusal is
+    /// synchronous, handled in submit_disarm_off_lock above before a worker ever
+    /// launches. Unlike on_arm_complete there is no commit and no compensation to
+    /// run - a disarm's only "verdict" is done-or-retry.
+    void on_disarm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
+                            IoResult<int>&& r) noexcept;
     /// registry_mu_ held. If `key`'s fifo has a Queued head, flip it to Dispatching and
     /// return it for the caller to dispatch off-lock; else nullptr.
     std::shared_ptr<KeyClaim> try_dispatch_head_locked(const std::string& key);
@@ -940,22 +1563,162 @@ private:
     /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
     /// Disarm). noexcept by construction (iterator erases + a noexcept release).
     void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
+    /// up-4 (#4221, rung 9c PR-5b): registry_mu_ held. Write a claim's fallback
+    /// outcome exactly as publish_arm_verdicts_locked's own fill-in loop would have,
+    /// had a double-fault not interrupted it before reaching this claim: an already-
+    /// committed rule (rules_ carries its generation) is honestly reported Armed;
+    /// anything else fails plainly ("arm drain failed"). A no-op if `c` already
+    /// carries an outcome or commit_exception. Shared by that fill-in loop's own
+    /// call sites are NOT yet routed through this (kept separate deliberately, to
+    /// avoid touching that already-hardened, already-tested code this late) - this
+    /// exists for reap_stranded_claims_locked() below, which needs the identical
+    /// synthesis for a claim publish_arm_verdicts_locked never got the chance to
+    /// finish deciding.
+    /// NOT noexcept (fixed, this governance run - Gate 2/3 cpp-expert/cpp-safety/
+    /// security-guardian independently found the same defect: this body's
+    /// allocating `std::unexpected(std::string{...})` line CAN throw, and a throw
+    /// escaping a noexcept function calls std::terminate() at the boundary itself,
+    /// never reaching a caller's catch - the previous `noexcept` plus this
+    /// function's own comment claiming the caller's try/catch "contains" it were
+    /// both wrong; reap_stranded_claims_locked()'s existing try/catch around its
+    /// call to this now genuinely does what it always claimed to, matching the
+    /// non-noexcept sibling line in publish_arm_verdicts_locked's own fill-in loop
+    /// this function mirrors).
+    void synthesize_fallback_outcome_locked(KeyClaim& c);
+    /// up-4 (#4221): registry_mu_ held. Reaps ONE residue shape neither
+    /// sweep_terminal_queued_locked (Queued-only, requires an outcome already
+    /// present), expire_overdue_claims's own overdue-live-claim pass (skips any
+    /// claim with an outcome/commit_exception/waiter_abandoned already set), nor
+    /// redrive_retained_disarms (Disarm claims only) ever reaches: a Queued,
+    /// withdrawn-or-waiter_abandoned head with NO outcome yet - a CONFIRMED real
+    /// defect (Fable review): on_arm_complete's and finalize_arm_compensation's own
+    /// deep-catch recovery hands a claim back to Queued, forever, when a double-
+    /// fault interrupts its own fill-in verdict; reachable via a genuine
+    /// std::bad_alloc, not a test-only seam. Left alone, a future same-key attach
+    /// would spuriously re-arm an already-resolved spec; a key nothing ever
+    /// revisits stays wedged.
+    ///
+    /// Deliberately does NOT also reap a Dispatched, terminal (outcome/
+    /// commit_exception already written) head - the kickoff's own literal ask, kept
+    /// out after this PR's own implementation measured it as UNSAFE: a Dispatched
+    /// head's outcome can be written EARLY by abandon_claim_locked (a caller-
+    /// deadline timeout) while the underlying async arm() call is still genuinely
+    /// running - compensation_finished defaults true and does not distinguish that
+    /// case from a genuinely stuck Dispatched head, and reaping it there ripped a
+    /// still-pending claim out from under its own not-yet-run completion callback
+    /// (regression measured directly against "expire_overdue_claims(): abandons a
+    /// non-waiting claim's own overdue arm ... the compensating disarm still runs
+    /// once the late success arrives"). Neither Astra's nor Fable's review could
+    /// construct a real reproduction of the Dispatched case either - see the PLAN
+    /// doc's own note on this; a future PR should only add it back with a genuinely
+    /// safe "the completion callback has actually run" signal, not outcome-
+    /// presence alone.
+    /// Never touches a head whose compensation_finished is still false (its own
+    /// compensating disarm is genuinely still outstanding). Also, as its own
+    /// maintenance pass, observes (once, via compensation_deadline_observed) any
+    /// STILL-outstanding compensation whose compensation_deadline has elapsed,
+    /// counting it (compensation_deadline_elapsed_) without touching anything else
+    /// about that claim - up-3's own deadline-semantics contract. Returns the number
+    /// of claims actually reaped. `refills` collects any newly-dispatchable head
+    /// (an arm queued behind a reaped entry) for the caller to dispatch off-lock.
+    std::size_t reap_stranded_claims_locked(std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
     void dispatch_arm_off_lock(const std::string& key, const std::shared_ptr<KeyClaim>& claim);
+    /// A staged, not-yet-published outcome for one claim - what on_arm_complete's own
+    /// staging decides, before publish_arm_verdicts_locked() writes it into the claim.
+    /// (Named ArmVerdict, not Verdict: was a local struct inside on_arm_complete's
+    /// body; rung 9c PR-2 Unit 4 promotes it to a member type so ArmCompensation
+    /// below can carry a batch of them across the async compensating-disarm gap.)
+    struct ArmVerdict {
+        std::optional<std::expected<std::uint64_t, std::string>> outcome;
+        std::exception_ptr ex;
+        ClaimEnd end{ClaimEnd::None};
+    };
+    /// rung 9c PR-2 Unit 4 (Astra opine review, "Compensating disarm is a separate,
+    /// harder case"): everything on_arm_complete's deferred (compensation-owed) path
+    /// needs to finish the job once the compensating disarm - now genuinely async
+    /// (submit(), not a bounded run()) - actually completes. Built BEFORE
+    /// `compensating` is relinquished ("Prepare continuation storage before
+    /// relinquishing existing subscription ownership"), so the only fallible step
+    /// between owning the live subscription and handing off responsibility for it is
+    /// the submit() call itself - the exact same shape dispatch_arm_off_lock's own
+    /// submit() call already tolerates.
+    struct ArmCompensation {
+        std::string key;
+        std::shared_ptr<KeyClaim> claim; ///< the head; identity-checked like everywhere else
+        std::uint64_t sub{0};            ///< the unadopted subscription owed a disarm
+        std::vector<std::shared_ptr<KeyClaim>> finished;
+        std::vector<std::pair<std::shared_ptr<KeyClaim>, ArmVerdict>> verdicts;
+        std::function<void()> waker;
+        std::function<void()> outbox_waker;
+        bool firewalled{false};
+    };
+    /// registry_mu_ held. Shared publish body for on_arm_complete's own immediate
+    /// path (nothing to disarm) and finalize_arm_compensation()'s deferred path
+    /// (rung 9c PR-2 Unit 4 - previously a local lambda inside on_arm_complete,
+    /// extracted so both paths run the identical logic instead of duplicating it).
+    /// PUBLISH `verdicts` onto the matching claims in `finished`, pop the finished
+    /// prefix from `key`'s fifo, and on `firewall` sweep a never-finished head too.
+    /// `refill` is an OUT param: an arm queued behind the finished prefix, for the
+    /// caller to dispatch off-lock once unlocked. Returns true once this call has
+    /// done everything it is going to do (including the "entry already vanished"
+    /// no-op case, mirroring a lambda's own captured "published" bool) - false ONLY
+    /// if this function itself throws before reaching either return.
+    bool publish_arm_verdicts_locked(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
+                                     const std::vector<std::shared_ptr<KeyClaim>>& finished,
+                                     std::vector<std::pair<std::shared_ptr<KeyClaim>, ArmVerdict>>& verdicts,
+                                     bool firewall, std::shared_ptr<KeyClaim>& refill);
+    /// Best-effort direct disarm call, off-lock, on whichever (already detached)
+    /// worker calls it - the shared fallback for a compensating disarm that either
+    /// could not be admitted via submit() (Stopped included - Astra opine review:
+    /// "Stopped cannot silently discard a subscription that the late arm just
+    /// produced") or whose admitted attempt itself threw on the worker. A disarm
+    /// exception here is best-effort teardown failure only, not proof an OS
+    /// resource is still live - contained and logged, never retried again beyond
+    /// this one attempt (mirrors the pre-Unit-4 run_compensating_disarm's own single
+    /// direct-fallback attempt).
+    void direct_disarm_fallback(const std::string& key, std::uint64_t sub) noexcept;
+    /// The submit() completion callback for an arm's compensating disarm (rung 9c
+    /// PR-2 Unit 4), OR called directly and synchronously, off-lock, by
+    /// on_arm_complete itself when submit() refuses admission for it (there is no
+    /// worker to call back in that case, so the caller finishes the job itself,
+    /// here, right away - no async gap). Finishes what on_arm_complete's own
+    /// deferred path could not: publish (via publish_arm_verdicts_locked), pop,
+    /// notify, fire wakers, dispatch a refill. Carries the SAME double-fault
+    /// recovery on_arm_complete's own fallback path always has (a throw publishing
+    /// hands the head back to Queued so the next same-key event re-drives it,
+    /// rather than wedging the key until restart).
+    void finalize_arm_compensation(std::shared_ptr<ArmCompensation> cont) noexcept;
     /// The submit() completion callback for an ARM claim, on the detached worker:
     /// the moved post-wait commit (rung 9c R5.2, commit-in-callback). Commits the
     /// head and every live sibling against the one subscription, or fails them all;
-    /// runs the compensating disarm (bounded run() on this worker; a direct call on any
-    /// non-timeout executor failure, Stopped included) BEFORE publishing outcomes, so no waiter can observe
-    /// its result while a subscription nobody wants is still live; then publishes,
-    /// erases the entry (unless new claims queued behind meanwhile, in which case the
-    /// next head is dispatched), wakes the waiters and fires the wakers. Firewalled:
-    /// an exception in its own bookkeeping still publishes a terminal outcome on
-    /// every claim and drops the entry (claim_drain_failures_).
+    /// if a compensating disarm is owed, ownership of finishing the job (publish,
+    /// pop, notify, wake, refill) transfers to finalize_arm_compensation() (rung 9c
+    /// PR-2 Unit 4) - genuinely async now (submit(), not a bounded run()), so this
+    /// function returns as soon as that hand-off is made, rather than waiting for
+    /// the compensating disarm itself. When nothing is owed a disarm, this function
+    /// finishes the job itself, immediately, exactly as before. Firewalled: an
+    /// exception in its own staging still eventually publishes a terminal outcome on
+    /// every claim and drops the entry (claim_drain_failures_), whichever path reaches
+    /// that publish.
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
+    /// The drain_fault_point_for_test_ seam on_arm_complete's own staging (and, since
+    /// rung 9c PR-2 Unit 4, publish_arm_verdicts_locked() when reached from
+    /// finalize_arm_compensation()) consult: 1 = bad_alloc before the fifo snapshot
+    /// (the window C2 found), 2 = a throw right after the first commit adopted the
+    /// subscription, 3 = a throw after the verdicts are staged and before the pop
+    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep), 4/5 = a throw
+    /// while building the ArmCompensation continuation itself - 4 before the
+    /// allocation, 5 after it but before the `key` copy completes (adversarial review
+    /// C1, PR #4318 fjarvis: the unguarded-allocation window under a live, un-disarmed
+    /// subscription; Gate 8 re-review, cpp-safety + security-guardian: split into two
+    /// points because the fix must leave `cont` null on EITHER fallible step, not just
+    /// the first one - see `on_arm_complete`'s own comment at the try). Consumed once
+    /// (compare_exchange against 0); a no-op if `point` is not currently armed.
+    void fault_here_for_test(int point);
     /// registry_mu_ held. Publish `reason` on every claim in `key`'s fifo, release their
     /// index entries, and erase the entry. Reached from on_arm_complete() (noexcept):
     /// every allocating step is contained per claim (r3 C2).
@@ -1070,6 +1833,89 @@ private:
     /// keys_/index_/rules_ above). See KeyClaim's doc; empty in steady state, an entry
     /// exists only while a key has an arm or disarm in flight, queued, or retained.
     std::unordered_map<std::string, KeyClaimQueue> claims_;
+    /// rung 9c PR-5d (concern 1, adoption): a locator from rule_id to its currently
+    /// wedged claim, if any - registry_mu_-guarded, same as claims_/rules_/index_
+    /// above. Populated by TWO sites, corrected here (this comment previously said
+    /// "Populated ONLY by abandon_claim_locked()", which is false and has been
+    /// since 2131dc973 ("Adversarial-review Blocker 1", rung 9c PR-5d) first gave
+    /// the Reobserved-restore branch its own insert_or_assign() - well before
+    /// 1cd9a0772, which only added a cross-key GUARD around that pre-existing
+    /// insert, not the insert itself; a pre-existing stale claim in this comment,
+    /// not introduced by either fix): (1) abandon_claim_locked() the instant a
+    /// claim's `end` settles to the sticky ClaimEnd::WaiterTimedOutDispatched
+    /// (never for a stopping-time abandonment - R5.5's disarm-unconditionally
+    /// policy never needs this); and (2) attach_core()'s Reobserved-restore branch,
+    /// which re-inserts a still-wedged claim an intervening detach_all() sweep (or
+    /// detach_rule_locked()) already erased from this map, the moment the SAME
+    /// (rule_id, spec) is genuinely reobserved - see that branch's own comment for
+    /// why reaching Reobserved is itself proof the rule is still desired. Exists
+    /// because a wedged claim is UNREACHABLE by any other lookup
+    /// detach_rule_locked()/detach_all() already have: it is neither in index_
+    /// (abandon_claim_locked releases that mapping unconditionally, before this map
+    /// is ever populated) nor in rules_ (it was never committed) - and
+    /// detach_rule_locked()'s own Case 0 FIFO scan deliberately EXCLUDES a
+    /// waiter_abandoned claim (see that function's own comment: "the search
+    /// excludes withdrawn AND abandoned claims"), which is exactly correct for
+    /// Case 0's own purpose but means a withdrawal of a purely-wedged rule_id
+    /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
+    /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
+    /// Erased (a) by detach_rule_locked() the moment it deactivates the entry's
+    /// rg->active - withdrawal ends the claim's adoption candidacy. Rung 9c PR-5d
+    /// (concern 1, 5th occurrence): this erasure runs UNCONDITIONALLY, FIRST,
+    /// before detach_rule_locked()'s own Case 0 FIFO scan even starts - not, as an
+    /// earlier version of this fix had it, only reached when Case 0 fell through
+    /// without matching anything (Case 0 `return nullptr;`s from inside its own
+    /// loop on a match, which used to skip this erasure entirely whenever a
+    /// DIFFERENT, non-abandoned claim for the same rule_id was live on another key
+    /// - see detach_rule_locked()'s own header comment for the reachable
+    /// interleaving and the proof the two blocks can never match the same claim);
+    /// erased likewise by detach_all()'s own equivalent, unconditional sweep;
+    /// (b) by on_arm_complete() the instant the wedge actually resolves (adopted
+    /// or not) - the episode is over either way and a stale entry must not
+    /// outlive the claim object it names; and (c) by
+    /// reclassify_dispatching_race_locked() when it corrects a claim's `end` away
+    /// from WaiterTimedOutDispatched (it is no longer a retained wedge once
+    /// that happens). Adversarial-review correction (rung 9c PR-5d follow-up):
+    /// a same-rule_id/same-spec Reobserved retry DOES reinstate a still-wedged
+    /// claim whose rg->active was deactivated by an intervening full-sync
+    /// detach_all() sweep - see attach_core()'s Reobserved branch, added as the
+    /// fix for exactly that case (a rule genuinely still desired must not
+    /// permanently lose adoption candidacy just because a routine retry's
+    /// blanket teardown ran first). Two narrower paths can still leave a stale
+    /// entry uncorrected today - a fault injected before on_arm_complete()'s
+    /// own erase at (b) (the `fault_here_for_test(1)` seam), and the compensating/
+    /// finalize path that pops a claim without consulting this map - both are
+    /// contained by the identity-check below: a STALE entry (one whose claim has
+    /// already resolved) is harmless because every consequential read
+    /// `.lock()`s and identity-checks it. External review correction (PR #4485,
+    /// fjarvis): a later same-rule wedge overwriting this map is NOT
+    /// automatically harmless the way a stale entry is - if the entry being
+    /// overwritten still names a LIVE, unresolved claim on a DIFFERENT key (an
+    /// ordinary flip-flop redeploy can wedge the same rule_id on two keys at
+    /// once), an unguarded overwrite orphans that live claim with no way for a
+    /// future withdrawal to ever find it again. Both of this map's writers now
+    /// guard against exactly this, in OPPOSITE directions, because the claim
+    /// each one is about to insert carries opposite provenance:
+    /// attach_core()'s Reobserved-restore branch inserts `pre_head`, a claim
+    /// just re-observed for the (rule_id, spec) the caller currently wants -
+    /// definitionally the desired claim - so it deactivates whatever DIFFERENT,
+    /// still-live claim it is about to DISPLACE, then overwrites the entry
+    /// unconditionally; abandon_claim_locked()'s wedge branch inserts `claim`, a
+    /// claim that just TIMED OUT and carries no such signal, so instead it
+    /// checks whether the map already names a different, still-live claim (that
+    /// occupant can only have arrived via a LATER attach_core() call, so it is
+    /// provably the fresher generation) and, if so, deactivates the INCOMING
+    /// `claim` and leaves the map's existing entry untouched rather than
+    /// overwriting it. See each call site's own comment for the full
+    /// interleaving and the fallible-first ordering that makes each guard
+    /// retry-safe under an insert-time throw.
+    /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
+    /// claim alive after claims_ itself has already dropped it (a defensive
+    /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on
+    /// some future edit, including the two known-stale paths just named) - a
+    /// caller consulting this map .lock()s it and treats a dead weak_ptr
+    /// exactly like "not found".
+    std::unordered_map<std::string, std::weak_ptr<KeyClaim>> wedged_by_rule_;
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
     /// and production has at most one waiter at a time (GuardianEngine's mtx_); the
@@ -1085,6 +1931,179 @@ private:
     /// independent failures and must not share a capacity budget or a single-flight
     /// key namespace with each other.
     GuardianIoExecutor io_executor_;
+
+    // up-3 (#4221, rung 9c PR-5b): a runtime-side reservation pool for the
+    // compensating-disarm fallback (direct_disarm_fallback()'s 3 entrances),
+    // deliberately NOT routed through io_executor_'s own submit()/run() admission.
+    // io_executor_ has no compensation-priority IoClass and rejects EVERY submission
+    // unconditionally once Stopped (guardian_io_executor.hpp: admit_locked checks
+    // state_->stopping first, no per-class exemption) - routing the fallback through
+    // it would silently break R5.5's "Stopped cannot discard a subscription the late
+    // arm just produced" requirement. This pool lives here instead, reserved per
+    // claim BEFORE its arm is ever dispatched (dispatch_arm_off_lock, while no
+    // subscription exists yet), so a claim that later needs compensation always has
+    // its slot - including after begin_stop(), since this pool is independent of
+    // io_executor_'s Stopped gate entirely.
+    //
+    // Sized 1:1 with io_executor_'s own per-class quota. io_executor_ is ALWAYS
+    // default-constructed here (GuardianIoExecutor() -> GuardianIoExecutor(Config{}):
+    // no constructor of this class threads a custom Config into it), so reading
+    // GuardianIoExecutor::Config{}'s default member initializers directly is exact,
+    // not an approximation - no accessor needed on GuardianIoExecutor, no risk of
+    // drift from whatever it is actually configured with. Worst case, every class
+    // simultaneously saturated: sum(reservations) + sum(quotas) ==
+    // kMaxAliveIoWorkers exactly (10 + 10 == 20) - the compensation population can
+    // never itself become the thing that drives alive-worker count past the existing
+    // ceiling.
+    static constexpr int kFileCompensationReservation = GuardianIoExecutor::Config{}.file_quota;
+    static constexpr int kRegistryCompensationReservation =
+        GuardianIoExecutor::Config{}.registry_quota;
+    static constexpr int kServiceCompensationReservation =
+        GuardianIoExecutor::Config{}.service_quota;
+    static_assert(kFileCompensationReservation + kRegistryCompensationReservation +
+                      kServiceCompensationReservation + GuardianIoExecutor::kMaxProcessIoWorkers ==
+                  GuardianIoExecutor::kMaxAliveIoWorkers,
+                  "up-3's compensation reservation must sum 1:1 with io_executor_'s own "
+                  "per-class quotas - see the comment above");
+    [[nodiscard]] static constexpr int compensation_capacity_for(IoClass c) noexcept {
+        switch (c) {
+        case IoClass::File:     return kFileCompensationReservation;
+        case IoClass::Registry: return kRegistryCompensationReservation;
+        case IoClass::Service:  return kServiceCompensationReservation;
+        }
+        return 0;
+    }
+    /// registry_mu_ held (both to serialize the capacity check itself and to keep it
+    /// atomic with the claim-identity recheck dispatch_arm_off_lock pairs it with).
+    /// Returns an engaged CompensationPermit iff capacity was available;
+    /// std::nullopt on refusal (nothing reserved, nothing to release). rung 9c
+    /// PR-5b hardening (this governance run, cpp-safety RAII-floor adjudication):
+    /// the returned permit's destructor/reset() is lock-independent-safe (see that
+    /// class's own doc comment) - release it via KeyClaim::compensation_permit's
+    /// own reset(), or release_compensation_locked() below, never by touching
+    /// compensation_reserved_count_ directly.
+    [[nodiscard]] std::optional<CompensationPermit> try_reserve_compensation_locked(IoClass c) noexcept {
+        const auto idx = io_class_index(c);
+        if (compensation_reserved_count_[idx].load(std::memory_order_relaxed) >= compensation_capacity_for(c))
+            return std::nullopt;
+        compensation_reserved_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        return CompensationPermit{&compensation_reserved_count_[idx]};
+    }
+    /// Gate 8 re-review (this governance run, unhappy-path UP-8): registry_mu_ IS
+    /// required here, and the scope of the earlier "lock not required" claim was
+    /// too broad - correct it precisely. What's actually lock-independent is ONLY
+    /// the atomic decrement inside CompensationPermit::reset() (see that class's
+    /// own doc comment). Accessing `claim.compensation_permit` itself - the
+    /// std::optional wrapper on KeyClaim - has no synchronization of its own, so a
+    /// caller reading/writing it concurrently with another registry_mu_-holding
+    /// caller of the SAME claim is a data race regardless of the target atomic's
+    /// own thread-safety. Every real call site already takes registry_mu_ for
+    /// locality with the rest of this claim's bookkeeping - that requirement is
+    /// not merely a style choice. Idempotent: a no-op if `claim` does not
+    /// currently hold a reservation (already released, or never took one - a
+    /// Disarm claim, or an Arm claim that never reached dispatch_arm_off_lock).
+    /// Always call this (or KeyClaim::compensation_permit.reset() directly, still
+    /// under registry_mu_) rather than touching compensation_reserved_count_
+    /// directly, so double-release and leaks are both structurally impossible.
+    void release_compensation_locked(KeyClaim& claim) noexcept {
+        claim.compensation_permit.reset();
+    }
+    /// up-5 (#4221, rung 9c PR-5b): registry_mu_ held. First retention of `claim`
+    /// (an admission refusal or worker throw) - idempotent: a claim already marked
+    /// retained does not engage a second RetainedGuard (and so does not increment
+    /// disarm_retained_ a second time) on a repeated refusal. Callers keep their
+    /// own `++claim->admission_rejections` (unconditional attempt history,
+    /// unchanged shape) - this touches ONLY the lifecycle count. Disarm claims
+    /// only, but harmless (a no-op guard) if ever called on anything else.
+    void mark_retained_locked(KeyClaim& claim) noexcept {
+        if (claim.retained_guard)
+            return;
+        disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+        claim.retained_guard.emplace(&disarm_retained_);
+    }
+    /// Gate 8 re-review (this governance run, unhappy-path UP-8): registry_mu_ IS
+    /// required here, same correction as release_compensation_locked() above -
+    /// only RetainedGuard's own atomic decrement is lock-independent; the
+    /// `claim.retained_guard` optional wrapper itself is not synchronized and every
+    /// real call site already takes registry_mu_ for that reason, not merely for
+    /// locality. Idempotent: a no-op if `claim` is not currently counted as
+    /// retained. Call at EVERY terminal removal of a Disarm claim (successful
+    /// completion, Stopped-drop, DeadSubscription shortcut) - never decrement
+    /// disarm_retained_ directly.
+    void clear_retained_locked(KeyClaim& claim) noexcept {
+        claim.retained_guard.reset();
+    }
+    /// rung 9c PR-5c (#4221, the Dispatching-window race): abandon_claim_locked()
+    /// can tag a claim WaiterTimedOutDispatched while its admission outcome is
+    /// still genuinely unresolved (a caller timeout racing dispatch_arm_off_lock's
+    /// own re-lock after building the executor submission). If admission then
+    /// resolves via fail_all_claims_locked(), that function's own per-claim guard
+    /// (`if (c->end == ClaimEnd::None) c->end = end;`) cannot overwrite the stale
+    /// value - the claim would report Wedged for what was really an ordinary
+    /// AdmissionRejected/Stopped outcome. Call this immediately before
+    /// fail_all_claims_locked() at both call sites the race can reach
+    /// (dispatch_arm_off_lock()'s reservation-exhaustion branch and its submission-
+    /// failure branch) - and only there: force-reclassifies this ONE claim's own
+    /// already-set `end` to the real outcome. Every other caller/claim's guard is
+    /// deliberately left untouched; this is not a relaxation of
+    /// fail_all_claims_locked()'s own contract, which stays conservative for
+    /// everything else in this file.
+    ///
+    /// UP-6 (#4221, rung 9c PR-5c follow-up governance): this correction is
+    /// verified safe today only because a Disarm claim structurally can never
+    /// carry WaiterTimedOutDispatched - no caller ever waits on a disarm with a
+    /// deadline, so abandon_claim_locked()'s `stopping ? Stopped :
+    /// WaiterTimedOutDispatched` branch is reachable only for an Arm claim's
+    /// waiter. That is not centrally enforced anywhere, so assert it here rather
+    /// than trust it silently: both current call sites already sit past
+    /// dispatch_arm_off_lock()'s own entry guard (a non-Arm claim returns before
+    /// reaching either call), so this is defense-in-depth - a future third or
+    /// fourth caller, or a change that gives Disarm claims their own deadline,
+    /// fails loudly here in a debug build instead of silently reintroducing the
+    /// Dispatching-window race this function exists to close.
+    void reclassify_dispatching_race_locked(KeyClaim& claim, ClaimEnd real_end) noexcept {
+        assert(claim.kind == ClaimKind::Arm);
+        if (claim.dispatch == ClaimDispatch::Dispatching &&
+            claim.end == ClaimEnd::WaiterTimedOutDispatched) {
+            claim.end = real_end;
+            // Adversarial-review minor fix (rung 9c PR-5d follow-up): this claim
+            // is no longer a retained wedge once `end` is corrected away from
+            // WaiterTimedOutDispatched - drop its wedged_by_rule_ entry too, so
+            // "erased the instant the wedge resolves" holds here as well, not
+            // only on the ordinary on_arm_complete path. Identity-checked: only
+            // erase if the map still points at THIS claim (a same-rule_id
+            // re-wedge could already have overwritten the entry).
+            if (const auto wit = wedged_by_rule_.find(claim.rule_id);
+                wit != wedged_by_rule_.end() && wit->second.lock().get() == &claim)
+                wedged_by_rule_.erase(wit);
+        }
+    }
+    /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
+    /// (was a plain std::array<int, kIoClassCount>) specifically so a
+    /// CompensationPermit's destructor can release a slot safely regardless of
+    /// which thread or lock state is active when its owning KeyClaim is finally
+    /// destroyed - see CompensationPermit's own doc comment. ENGAGING a slot
+    /// (try_reserve_compensation_locked) still requires registry_mu_, to keep the
+    /// capacity check atomic with the claim-identity recheck it's paired with.
+    std::array<std::atomic<int>, kIoClassCount> compensation_reserved_count_{};
+    /// up-3: #4221's own criterion text ("the fallback is deadline-bounded and
+    /// counted, and a ceiling hit is surfaced") - reservation-exhaustion refusals and
+    /// compensation-deadline elapses, counted separately from every pre-existing
+    /// counter. Fleet-visible egress is out of scope here; rides #3415's already-open
+    /// counter-egress scope like every other internal-only counter in this file.
+    std::atomic<std::uint64_t> compensation_reservation_refused_{0};
+    std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
+    /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant refused immediately
+    /// against a Wedged key, vs. an identical (rule_id, spec) retry that
+    /// re-observed the existing wedged head's receipt instead of queuing a new
+    /// claim. Same "internal-only, rides #3415" scope as the pair above.
+    std::atomic<std::uint64_t> wedged_refusals_{0};
+    std::atomic<std::uint64_t> wedged_reobservations_{0};
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): see
+    /// wedge_adopt_stale_refused()'s own doc comment - same "internal-only,
+    /// rides #3415" scope as the pair above.
+    std::atomic<std::uint64_t> wedge_adopt_stale_refused_{0};
+
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
     std::atomic<std::uint64_t> backend_op_late_arms_{0};  ///< #3816/R5.2: late-succeeding arm disarmed by the drain
@@ -1094,10 +2113,13 @@ private:
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
+    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (should never happen)
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
+    std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    std::atomic<bool> wedge_locator_fault_for_test_{false}; ///< see the setter
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
     std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
     /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
@@ -1114,6 +2136,11 @@ private:
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {
         if (detach_fault_for_test_.exchange(false))
+            throw std::bad_alloc{};
+    }
+    /// Seam body for set_wedge_locator_fault_for_test; consumed once.
+    void wedge_locator_fault_here_for_test() {
+        if (wedge_locator_fault_for_test_.exchange(false))
             throw std::bad_alloc{};
     }
 

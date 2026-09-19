@@ -1117,6 +1117,37 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
         REQUIRE(cat->size() == 1);
         CHECK((*cat)[0].name == "Google Chrome");
     }
+    SECTION("name_filter matches on PUBLISHER alone, not just the title (round-3 item 8)") {
+        // The store's ILIKE OR spans title AND publisher, one bound param reused in
+        // both arms (software_inventory_store.cpp's software_catalog) — a
+        // publisher-only substring ("adobe" surfacing every Adobe title) must
+        // return every title from that publisher, even when neither title itself
+        // contains the substring.
+        REQUIRE(store.apply_installed_software(
+                    "pub-a1", "", Rows{{"Widget One", "1.0", "Zylofex Systems", ""}}, 1) ==
+                InventoryIngestOutcome::kStored);
+        REQUIRE(store.apply_installed_software(
+                    "pub-a2", "", Rows{{"Widget Two", "2.0", "Zylofex Systems", ""}}, 1) ==
+                InventoryIngestOutcome::kStored);
+        REQUIRE(store.refresh_catalog_rollup());
+
+        yuzu::server::SoftwareCatalogQuery q;
+        q.name_filter = "zylofex"; // substring of the publisher only
+        auto cat = store.software_catalog(q);
+        REQUIRE(cat.has_value());
+        bool found_one = false, found_two = false;
+        for (const auto& r : *cat) {
+            if (r.name == "Widget One")
+                found_one = true;
+            if (r.name == "Widget Two")
+                found_two = true;
+        }
+        CHECK(found_one);
+        CHECK(found_two);
+        // Neither Chrome nor 7-Zip (the outer seed) match "zylofex" — the filter
+        // narrows, it does not fall back to matching everything.
+        CHECK(cat->size() == 2);
+    }
     SECTION("limit caps the returned rows to the most-installed") {
         yuzu::server::SoftwareCatalogQuery q;
         q.limit = 1;
