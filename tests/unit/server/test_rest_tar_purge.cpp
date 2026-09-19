@@ -133,7 +133,7 @@ struct PurgeHarness {
             /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr, /*license_store=*/nullptr,
             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr, dispatch,
-            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
             /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped,
             /*software_inventory_store=*/nullptr,
             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},

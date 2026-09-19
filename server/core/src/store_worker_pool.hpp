@@ -36,6 +36,8 @@
 /// they are not shared because the two build targets (agent, server) do not
 /// share a common internal library for something this small.
 
+#include "background_jobs.hpp"
+
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -59,6 +61,7 @@ public:
         num_threads = std::max<std::size_t>(num_threads, 1);
         num_threads = std::min<std::size_t>(num_threads, 16);
         workers_.reserve(num_threads);
+        YUZU_ASSERT_BACKGROUND_JOB("store_worker_pool.worker_loop"); // WS-10 ReplicaSafe (per-replica drain)
         // EXCEPTION-SAFE CONSTRUCTION (gov Gate 8 architect). std::thread's
         // ctor throws std::system_error under EAGAIN (thread/pid
         // exhaustion - plausible exactly at server boot, when both stores

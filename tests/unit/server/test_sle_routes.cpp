@@ -6,13 +6,14 @@
 ///     gate (in-scope 200 / out-of-scope 403, D-4), the per-open behavioural audit
 ///     (sle.agent.view) that FAILS CLOSED (503 + Sec-Audit-Failed) on a persist
 ///     failure (G-2), and 503-on-degrade (never an empty 200, Decision 4).
-///   * DELETE /sle/agents/{id} — the audited durable-erasure trigger: the scoped
-///     SoftwareLicensing:Delete AND Inventory:Delete CONJUNCTION (the cascade erases
-///     the ADR-0016 Inventory stores too, so it must authorize for its full blast
-///     radius), AUDIT-BEFORE-ERASE fail-closed, and honest outcome (r.ok() → 200
-///     decommissioned; a Failed store → 500).
-/// Plus the SoftwareLicensing D-9 securable matrix, the G-1 fail-closed primitive,
-/// and one [pg] end-to-end drill through a real SoftwareLicensingStore.
+///   * DELETE /sle/agents/{id} — the audited durable-erasure trigger: ONE scoped
+///     `Decommission:Delete` securable (ADR-0024 Decision 9, amended Wave 7 PR7.2 —
+///     replacing the old SoftwareLicensing:Delete AND Inventory:Delete AND
+///     GuaranteedState:Delete conjunction, which stopped scaling once a fourth
+///     securable, Forensics, joined the cascade), AUDIT-BEFORE-ERASE fail-closed, and
+///     honest outcome (r.ok() → 200 decommissioned; a Failed store → 500).
+/// Plus the SoftwareLicensing/Decommission D-9 securable matrix, the G-1 fail-closed
+/// primitive, and one [pg] end-to-end drill through a real SoftwareLicensingStore.
 ///
 /// The posture/compliance reads (`/sle/summary`, `/sle/licenses`) and the fan-out
 /// list are the SAM UCE module's interpretation surface — not built in-server, so
@@ -290,7 +291,7 @@ TEST_CASE("sle/agents/{id}: store degrade → 503 + audited failure, never an em
 
 // ─────────────── DELETE /sle/agents/{id} — audited durable-erasure trigger ───────
 
-TEST_CASE("sle erase: scoped SoftwareLicensing:Delete gate — out-of-scope 403, no erasure",
+TEST_CASE("sle erase: scoped Decommission:Delete gate — out-of-scope 403, no erasure",
           "[sle_routes]") {
     SleHarness h; // allow_scoped_all=false → denied
     h.decommission_result = ok_result();
@@ -298,64 +299,71 @@ TEST_CASE("sle erase: scoped SoftwareLicensing:Delete gate — out-of-scope 403,
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE(h.scoped_calls.size() == 1);
-    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-out"); // Delete, not Read
+    CHECK(h.scoped_calls[0] == "Decommission|Delete|agent-out");
     CHECK(h.audits.empty()); // denied before the attempt audit / cascade
 }
 
 // The route is NAMED for licences but the cascade erases FIVE per-agent stores spanning
-// THREE securables: SoftwareLicensing (software_licensing), Inventory (inventory,
-// software_inventory, device_inventory — ADR-0016), and GuaranteedState (app_perf_daily —
-// DEX behavioural PII, whose read routes gate on GuaranteedState:Read). The gate must
-// therefore authorize for what it DESTROYS, not for what it is named. Each conjunct is
-// tested for absence, because an operator-authored role may hold any subset (the seeded
-// Administrator / ITServiceOwner hold all three, so this is latent on the shipped matrix).
-TEST_CASE("sle erase: EVERY securable in the blast radius is required — missing any → 403",
+// THREE securables' READ (SoftwareLicensing/software_licensing, Inventory/inventory+
+// software_inventory+device_inventory, GuaranteedState/app_perf_daily). Rather than a
+// hand-maintained conjunction over all three — the shape ADR-0024 Decision 9 REVERSED
+// once a fourth securable was set to join (PLAN-01 ruling (b)) — the gate is now ONE
+// scoped securable, `Decommission:Delete`, that authorizes for the whole blast radius
+// regardless of how many stores it grows to cover.
+TEST_CASE("sle erase: lacking Decommission:Delete → 403 naming it, one gate call, no erasure",
           "[sle_routes][authz]") {
-    struct Case {
-        const char* missing;    // the "type|op" the custom role lacks
-        const char* in_body;    // how the denial names it ("type:op")
-        std::size_t asked;      // gate calls made before the refusal (order is fixed)
-    };
-    // Ordered exactly as the route asks them; a refusal short-circuits the rest.
-    const Case cases[] = {
-        {"SoftwareLicensing|Delete", "SoftwareLicensing:Delete", 1},
-        {"Inventory|Delete", "Inventory:Delete", 2},
-        // app_perf_daily — the conjunct the first cut of this gate MISSED, letting a
-        // role destroy a device's DEX performance series it could not even read.
-        {"GuaranteedState|Delete", "GuaranteedState:Delete", 3},
-    };
-    for (const auto& c : cases) {
-        CAPTURE(c.missing);
-        SleHarness h;
-        h.allow_scoped_all = true;    // in scope for the device...
-        h.denied_perms = {c.missing}; // ...but the role lacks this one permission
-        h.decommission_result = ok_result();
-        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
-        REQUIRE(res);
-        CHECK(res->status == 403);
-        CHECK(contains(res->body, c.in_body));      // the denial names the permission
-        REQUIRE(h.scoped_calls.size() == c.asked);  // short-circuited at the right conjunct
-        // Refused BEFORE the attempt audit and BEFORE the cascade — nothing was erased.
-        CHECK(h.audits.empty());
-        CHECK_FALSE(contains(res->body, "decommissioned"));
-    }
+    SleHarness h;
+    h.allow_scoped_all = true;                    // in scope for the device...
+    h.denied_perms = {"Decommission|Delete"};     // ...but lacks the erasure securable
+    h.decommission_result = ok_result();
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(contains(res->body, "Decommission:Delete"));
+    REQUIRE(h.scoped_calls.size() == 1); // exactly one gate call — no conjunction to walk
+    CHECK(h.scoped_calls[0] == "Decommission|Delete|agent-1");
+    // Refused BEFORE the attempt audit and BEFORE the cascade — nothing was erased.
+    CHECK(h.audits.empty());
+    CHECK_FALSE(contains(res->body, "decommissioned"));
 }
 
-TEST_CASE("sle erase: holding ALL THREE securables erases — the conjunction is not a wall",
+// COMPAT PIN: a custom role holding the three OLD per-store Delete grants but NOT the
+// new Decommission:Delete securable is refused — the promotion's whole point is that
+// those three grants no longer suffice. The three old grants keep gating their own
+// stores' OTHER routes; they are not consulted here at all.
+TEST_CASE("sle erase: holding the three OLD conjuncts without Decommission:Delete → 403",
           "[sle_routes][authz]") {
-    // The seeded Administrator / ITServiceOwner shape (full CRUD on all three) still
-    // erases: the conjunction narrows custom roles, it does not regress the shipped matrix.
     SleHarness h;
-    h.allow_scoped_all = true;
+    h.allow_scoped_all = true; // SoftwareLicensing/Inventory/GuaranteedState Delete all allowed...
+    h.denied_perms = {"Decommission|Delete"}; // ...but not the new securable
+    h.decommission_result = ok_result();
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(contains(res->body, "Decommission:Delete"));
+    REQUIRE(h.scoped_calls.size() == 1);
+    CHECK(h.scoped_calls[0] == "Decommission|Delete|agent-1");
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("sle erase: holding Decommission:Delete erases — the three old grants are NOT consulted",
+          "[sle_routes][authz]") {
+    // A harness that DENIES the three old per-store Delete grants (as a custom role
+    // lacking them would be) but allows scope in general — modelling holding
+    // Decommission:Delete but none of the old conjuncts — still erases with exactly
+    // ONE gate call: the old conjuncts are gone from this route entirely, never asked,
+    // so denying them has no effect on it.
+    SleHarness h;
+    h.allow_scoped_all = true; // the role holds Decommission:Delete (and scope)...
+    h.denied_perms = {"SoftwareLicensing|Delete", "Inventory|Delete", "GuaranteedState|Delete"};
     h.decommission_result = ok_result();
     auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    // All three conjuncts asked, in order, each scoped to the device.
-    REQUIRE(h.scoped_calls.size() == 3);
-    CHECK(h.scoped_calls[0] == "SoftwareLicensing|Delete|agent-1");
-    CHECK(h.scoped_calls[1] == "Inventory|Delete|agent-1");
-    CHECK(h.scoped_calls[2] == "GuaranteedState|Delete|agent-1");
+    // Exactly one gate call — scoped_calls.size()==1 is the compat pin: the old
+    // securables are neither asked nor needed.
+    REQUIRE(h.scoped_calls.size() == 1);
+    CHECK(h.scoped_calls[0] == "Decommission|Delete|agent-1");
     CHECK(json::parse(res->body)["data"]["decommissioned"] == true);
 }
 
@@ -442,6 +450,22 @@ TEST_CASE("SoftwareLicensing securable seeds the D-9 matrix EXACTLY", "[sle][rba
     // have accidentally landed on `License` nor vice-versa.
     CHECK(role_can(s, "Operator", "License", "Read"));
     CHECK_FALSE(role_can(s, "Operator", "License", "Write")); // License stays Operator-Read-only
+
+    // Decommission (ADR-0024 Decision 9, amended Wave 7 PR7.2): the device-level
+    // erasure securable the DELETE route now gates on, in place of the old
+    // per-store conjunction. Administrator + ITServiceOwner hold it by default
+    // (the unchanged seeded population — see the changelog compat story);
+    // nobody else does.
+    for (const auto* op : {"Read", "Write", "Execute", "Delete", "Approve"})
+        CHECK(role_can(s, "Administrator", "Decommission", op));
+    CHECK(role_can(s, "ITServiceOwner", "Decommission", "Delete"));
+    CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Read"));
+    CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Write"));
+    CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Execute"));
+    CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Approve"));
+    for (const auto* role :
+         {"Operator", "Viewer", "PlatformEngineer", "ApiTokenManager", "Reviewer"})
+        CHECK_FALSE(role_can(s, role, "Decommission", "Delete"));
 }
 
 // ── G-1: the SLE route gate is built on the FAIL-CLOSED enforcement primitive

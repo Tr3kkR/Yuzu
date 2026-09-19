@@ -37,19 +37,9 @@
 
 namespace yuzu::server {
 
-/// Max length of an operator-supplied app/version/group identifier across every
-/// app-perf surface (REST, MCP, dashboard) — one cap so the surfaces agree.
-inline constexpr std::size_t kAppPerfParamCap = 512;
-
-/// PURE: validate an operator-supplied app/version/group identifier before it
-/// reaches a store binding. Rejects oversize (> `kAppPerfParamCap`) or any C0
-/// control byte INCLUDING NUL — a NUL truncates a libpq text parameter, so the
-/// store would silently query a DIFFERENT key than supplied (a cross-surface
-/// semantic divergence, not injection — everything is bound). Does NOT reject
-/// empty: `version=""` is the all-versions sentinel; callers reject an empty
-/// `app`/`group_id` themselves. The ONE validator the three surfaces share so they
-/// cannot drift on the accepted charset/cap.
-[[nodiscard]] bool app_perf_param_valid(std::string_view s);
+/// `kAppPerfParamCap` / `app_perf_param_valid` moved to `app_perf_compare.hpp`
+/// (ADR-0031 WS-A4 #4250) — still visible here transitively via this file's own
+/// `#include "app_perf_compare.hpp"` above, so no existing caller changes.
 
 /// A percentile read off a fixed-bucket histogram. `value` is the LOWER EDGE of
 /// the bucket the percentile falls in (bucket-resolution approximation, not an
@@ -245,6 +235,26 @@ using AppPerfDeviceFn =
 using AppPerfGroupFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
     std::string_view group_id, std::string_view app_name, std::string_view version)>;
 
+/// Device-model (tag) cohort trend: the SAME on-the-fly B1 aggregate shape as
+/// `AppPerfGroupFn`, but membership resolves via `TagStore::agents_with_tag`
+/// (key defaults to "model", the asset-tagging recipe's conventional key)
+/// instead of `ManagementGroupStore::get_members`. A named tag-value cohort is
+/// de-facto individual behaviour exactly like a named management group, so the
+/// SAME `kDexCohortFloor` suppression applies at render time — this is NOT the
+/// devices-by-version drill (which is floor-free because it already names
+/// `agent_id`); this is a small-NAMED-GROUP aggregate, the case the floor
+/// exists for. nullopt = degrade (tag lookup OR the aggregate read failed);
+/// empty = no device carries this tag value.
+using AppPerfTagCohortFn = std::function<std::optional<std::vector<AppPerfFleetRow>>(
+    std::string_view tag_key, std::string_view tag_value, std::string_view app_name,
+    std::string_view version)>;
+
+/// Distinct values for a tag key across the fleet (F2c cohort-by-model picker) —
+/// mirrors the live Fleet Performance page's own "cohort by tag key" selector
+/// (`kDexDefaultCohortKey`), sorted. nullopt = degrade, never a silent empty.
+using AppPerfTagValuesFn =
+    std::function<std::optional<std::vector<std::string>>(std::string_view tag_key)>;
+
 /// What the `/auto` VERIFY cohort provider returns: the group's resolved member
 /// count (so the surface reports cohort_size vs paired vs no-data) PLUS the raw B1
 /// rows (`agent_id` preserved) for those members × app × the two compared
@@ -271,12 +281,32 @@ using AppPerfCohortFn = std::function<std::optional<CohortRead>(
     std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
     std::string_view candidate_version, int window_days)>;
 
+/// The version-row "which devices" drill: devices reporting `(app_name, version)`
+/// among their retained top-N daily summaries, one row per device at its most
+/// recent reporting day for that EXACT version. Mirrors
+/// `AppPerfDailyStore::list_devices_for_version` (nullopt = degrade; `truncated`
+/// out-param set when the cap clipped the list to the highest-CPU devices).
+/// `visible_agent_ids` mirrors the ADR-0017 admit-then-filter contract: nullopt =
+/// unfiltered, engaged (including empty) = restrict to exactly these agent_ids —
+/// the caller (route layer) resolves this from its OWN `require_fleet_read`
+/// scope and MUST pass it through unchanged, never widen it to nullopt. Deliberately
+/// fleet-wide only in this slice — a management-group-scoped trend does not
+/// additionally narrow this drill to the group's members (see the dashboard
+/// route's own registration comment for why that is a documented v1 gap, not an
+/// oversight).
+using AppPerfVersionDevicesFn = std::function<std::optional<std::vector<AppPerfVersionDeviceRow>>(
+    std::string_view app_name, std::string_view version,
+    const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated)>;
+
 struct AppPerfProviders {
     AppPerfFleetFn fleet;
     AppPerfAppListFn apps;
     AppPerfDeviceFn device;
     AppPerfGroupFn group;
     AppPerfCohortFn cohort; ///< VERIFY before/after compare (cohort-paired)
+    AppPerfVersionDevicesFn version_devices; ///< the version-row "which devices" drill
+    AppPerfTagCohortFn tag_cohort;   ///< the trend page's device-model filter
+    AppPerfTagValuesFn tag_values;   ///< populates the device-model selector
 };
 
 } // namespace yuzu::server

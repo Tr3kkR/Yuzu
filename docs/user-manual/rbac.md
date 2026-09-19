@@ -161,7 +161,7 @@ enabled = true
 
 ## The authorization topology floor (#2376)
 
-Three reads are treated as **authorization topology** rather than ordinary
+Five reads are treated as **authorization topology** rather than ordinary
 operational data, and require the `admin` session role no matter how the
 `[rbac] enabled` toggle is set:
 
@@ -170,14 +170,16 @@ operational data, and require the `admin` session role no matter how the
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*` |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
+| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
+| `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these three. On a default install (RBAC ships disabled) that
+that includes these five. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these three reads to a
+access. The floor closes that gap by denying these five reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -188,7 +190,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these three reads on an
+**If you are relying on a non-admin reaching one of these five reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -202,6 +204,13 @@ non-admin session to reach authorization topology while RBAC is off:
   **custom** role that was granted `Security:Read` specifically to reach
   these routes must be re-granted `EnginePrincipal:Read` — see "Upgrade
   Notes" in [`server-admin.md`](server-admin.md)).
+- For the enrollment auto-approve-rules/pending-agents reads: enable RBAC
+  and grant `Enrollment:Read` — no built-in non-admin role holds it
+  (`Administrator` only; unlike `EnginePrincipal`/`Directory`, `Viewer`
+  deliberately does not, since these surfaces gate the fleet's enrollment
+  admission policy).
+- For the OIDC SSO config status read: enable RBAC and grant
+  `OidcConfig:Read` — `Administrator`-only for the same reason.
 
 The floor is deliberately **not configurable** — there is no setting that
 widens it back open. It is keyed on `(securable, operation)`, not on route
@@ -249,7 +258,7 @@ Six roles are created automatically and cannot be deleted:
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState (91 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Decommission:Delete (92 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
@@ -277,6 +286,8 @@ Six roles are created automatically and cannot be deleted:
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection). Administrator-only by default (absent from the Viewer read-list); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
+| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
 
 ## Operations
 
@@ -440,7 +451,7 @@ curl -s -b cookies.txt \
 }
 ```
 
-(Truncated for brevity. The full ITServiceOwner role contains 91 permissions across 18 securable types.)
+(Truncated for brevity. The full ITServiceOwner role contains 92 permissions across 18 securable types — the 92nd is the targeted `Decommission:Delete` grant, Wave 7 PR7.2.)
 
 ### Custom Roles (Planned)
 

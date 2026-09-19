@@ -985,7 +985,7 @@ This tutorial covered the core instruction lifecycle: define, import, execute, p
 
 - **Capability map** -- `docs/capability-map.md` tracks all 139 planned capabilities and which ones are implemented. Use this to understand the full scope of what Yuzu is building toward.
 
-- **Roadmap** -- `docs/roadmap.md` has the 56 issues across 7 phases. The features introduced in this tutorial span Phases 1-3.
+- **Roadmap** -- `docs/roadmap.md` has the 126 issues across 17 tracked phases (0–16). The features introduced in this tutorial span Phases 1-3.
 
 - **PolicyFragments and compliance automation (Phase 5)** -- PolicyFragments compose a check instruction, a compliance expression, and a fix instruction into a single unit. Policies bind fragments to triggers and scopes for continuous compliance enforcement.
 

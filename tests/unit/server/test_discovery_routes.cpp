@@ -473,6 +473,115 @@ TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matchin
     CHECK(saw_string);
 }
 
+// json-dump-depth-guard fix (#2437-class): parameter_schema is stored
+// VERBATIM at write time. instruction_store.cpp's own import-path write-side
+// guard rejects a too-deep value from now on, but a row written before that
+// guard shipped, or via any path that bypasses import, still reaches this
+// read - build_discovery_doc's body.dump() below is the unboundedly
+// recursive call that would SIGSEGV the whole response. Seeded directly via
+// InstructionStore::create_definition (bypassing the now-guarded import
+// route), matching this branch's established "seed the poisoned state
+// directly to prove the read-side guard independently" pattern. The poisoned
+// text is an OBJECT at the top level ({"a": 35-deep bracket chain}), not a
+// bare array - both build_instructions_catalog and build_plugins_catalog
+// below only act on a value that separately passes an existing is_object()
+// filter, so an array-shaped payload would be excluded by that filter alone
+// and prove nothing about the depth guard specifically. 35 levels is
+// comfortably past kMcpMaxJsonDepth (32) and trivially safe to construct
+// here, orders of magnitude short of the ~100,000-level depth that actually
+// crashes the real dump().
+TEST_CASE("discover.instructions: parameter_schema nesting too deep excludes just that "
+          "definition, others unaffected (#2437-class)",
+          "[discovery][instructions][depth][pg]") {
+    DiscoverHarness h;
+    const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    auto poisoned_id = h.instr->create_definition(make_def("Poisoned", /*enabled=*/true, deep));
+    REQUIRE(poisoned_id.has_value());
+    auto healthy_id = h.instr->create_definition(
+        make_def("Healthy", /*enabled=*/true, R"({"type":"object"})"));
+    REQUIRE(healthy_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res); // no crash
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    const auto& arr = j["instructions"];
+    bool saw_poisoned = false, saw_healthy = false;
+    for (const auto& d : arr) {
+        if (d["id"] == *poisoned_id)
+            saw_poisoned = true;
+        if (d["id"] == *healthy_id) {
+            saw_healthy = true;
+            CHECK(d["parameter_schema"]["type"] == "object");
+        }
+    }
+    CHECK_FALSE(saw_poisoned); // excluded, never dumped
+    CHECK(saw_healthy);        // other definitions in the same response unaffected
+}
+
+// Same hazard, the build_plugins_catalog enrichment join: a too-deep stored
+// parameter_schema would otherwise be spliced into an action's entry and
+// crash on THIS catalog's own dump(). Two distinct plugin/action pairs so the
+// exclusion is provably scoped to the poisoned one.
+TEST_CASE("discover.plugins: parameter_schema nesting too deep skips enrichment for just "
+          "that action, other actions unaffected (#2437-class)",
+          "[discovery][plugins][depth][pg]") {
+    DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
+                      /*grant_instr_read=*/true);
+    // Object-shaped (see the comment on the sibling test above) - an
+    // array-shaped payload would already fail this function's own
+    // is_object() filter and never reach schema_by_action either way,
+    // proving nothing about the depth guard.
+    const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    // Matches make_def's default plugin/action (system_info/query).
+    auto poisoned_id = h.instr->create_definition(make_def("Poisoned Query", /*enabled=*/true, deep));
+    REQUIRE(poisoned_id.has_value());
+    auto healthy_def =
+        make_def("Healthy List", /*enabled=*/true, R"({"type":"object"})");
+    healthy_def.plugin = "processes";
+    healthy_def.action = "list";
+    REQUIRE(h.instr->create_definition(healthy_def).has_value());
+
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    auto* p1 = info.add_plugins();
+    p1->set_name("system_info");
+    p1->add_capabilities("query");
+    auto* p2 = info.add_plugins();
+    p2->set_name("processes");
+    p2->add_capabilities("list");
+    (void)h.registry.register_agent(info);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res); // no crash
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["actions_enriched_with_schema"].get<int>() == 1); // only the healthy action
+    bool checked_system_info = false, checked_processes = false;
+    for (const auto& pl : j["plugins"]) {
+        if (pl["name"] == "system_info") {
+            for (const auto& a : pl["actions"]) {
+                if (a["name"] == "query") {
+                    checked_system_info = true;
+                    CHECK_FALSE(a.contains("parameter_schema")); // excluded, never dumped
+                }
+            }
+        }
+        if (pl["name"] == "processes") {
+            for (const auto& a : pl["actions"]) {
+                if (a["name"] == "list") {
+                    checked_processes = true;
+                    REQUIRE(a.contains("parameter_schema"));
+                    CHECK(a["parameter_schema"]["type"] == "object");
+                }
+            }
+        }
+    }
+    CHECK(checked_system_info);
+    CHECK(checked_processes);
+}
+
 TEST_CASE("discover.instructions: null InstructionStore -> 503",
           "[discovery][instructions][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/false);
@@ -735,7 +844,7 @@ TEST_CASE("discover.plugins: parameter_schema enriched when caller holds Instruc
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
-    CHECK(j["version"] == 2);
+    CHECK(j["version"] == 3); // 2 -> 3: the per-plugin `docs` summary join
     REQUIRE(j.contains("actions_enriched_with_schema"));
     CHECK(j["actions_enriched_with_schema"].get<int>() >= 1);
     bool found_schema = false;
@@ -787,4 +896,215 @@ TEST_CASE("discover.plugins: null AgentRegistry -> 503", "[discovery][plugins][p
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
     CHECK(res->status == 503);
+}
+
+// ── /discover/plugin-docs (docs/plugin-readme-standard.md rule 10) ──────────
+//
+// The build-embedded per-plugin documentation manifests. Static like
+// scope-kinds: no store dependency, answers during warmup, publicly cacheable.
+// The manifests themselves are content (content/plugin-docs/*.json, generated
+// by tools/plugin-doc-gen and byte-gated by tests/test_plugin_readmes.py);
+// these cases pin the ENVELOPE, the join into /discover/plugins, and the gate.
+
+TEST_CASE("discover.plugin-docs: static manifest catalog shape + ETag revalidation",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    CHECK(h.last_securable_type == "Infrastructure");
+    CHECK(h.last_operation == "Read");
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["catalog"] == "plugin-docs");
+    CHECK(j["version"] == 1);
+    CHECK(j["source"] == "build-embedded");
+    REQUIRE(j.contains("plugins"));
+    REQUIRE(j["plugins"].is_array());
+    CHECK(j["plugin_count"].get<std::size_t>() == j["plugins"].size());
+    CHECK(j["skipped_invalid"] == 0);
+    // The two pilots ship with this tree; an empty table would make the loop
+    // below vacuous, so the count is asserted, not just the shape.
+    CHECK(j["plugin_count"].get<std::size_t>() >= 2);
+    for (const auto& m : j["plugins"]) {
+        CHECK(m["manifest_version"].is_number_integer());
+        CHECK(m["name"].is_string());
+        CHECK(m["description"].is_string());
+        CHECK(m["actions"].is_array());
+        CHECK(m["platforms"].is_object());
+        CHECK(m["readme"].is_string());
+    }
+
+    // Byte-identical to the shared builder the MCP resource serves.
+    CHECK(res->body == yuzu::server::plugin_docs_catalog().json);
+
+    // No store dependency — answers 200 even with everything unwired.
+    DiscoverHarness bare(/*wire_rbac=*/false, /*wire_instr=*/false, /*wire_registry=*/false);
+    auto bare_res = bare.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(bare_res);
+    CHECK(bare_res->status == 200);
+
+    auto cached = h.sink.Get("/api/v1/discover/plugin-docs", {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+}
+
+TEST_CASE("discover.plugin-docs: permission denied -> 403, no body leak",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"plugins\"") == std::string::npos);
+}
+
+TEST_CASE("discover.plugin-docs/{name}: single manifest shape + ETag + 404 (#4108)",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string name = catalog["plugins"][0]["name"].get<std::string>();
+
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs/" + name);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    // Same revalidation contract as the whole-catalog route (#4108 review):
+    // publicly cacheable, five-minute floor, not just "some ETag exists".
+    CHECK(res->get_header_value("Cache-Control") == "public, max-age=300");
+    CHECK(h.last_securable_type == "Infrastructure");
+    CHECK(h.last_operation == "Read");
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j == catalog["plugins"][0]);
+    // Same builder as the MCP resource template — byte-identical.
+    const auto* manifest = yuzu::server::plugin_docs_manifest(name);
+    REQUIRE(manifest != nullptr);
+    CHECK(res->body == manifest->json);
+
+    // No store dependency — answers 200 even with everything unwired, like
+    // the whole-catalog route.
+    DiscoverHarness bare(/*wire_rbac=*/false, /*wire_instr=*/false, /*wire_registry=*/false);
+    auto bare_res = bare.sink.Get("/api/v1/discover/plugin-docs/" + name);
+    REQUIRE(bare_res);
+    CHECK(bare_res->status == 200);
+
+    auto cached = h.sink.Get("/api/v1/discover/plugin-docs/" + name, {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+
+    // Unknown name: 404, A4 envelope, no leak of a real manifest's shape.
+    auto missing = h.sink.Get("/api/v1/discover/plugin-docs/no_such_plugin_for_docs");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    auto mj = nlohmann::json::parse(missing->body);
+    REQUIRE(mj.contains("error"));
+    CHECK(mj["error"]["code"] == 404);
+    CHECK(mj["error"]["correlation_id"].is_string());
+    CHECK_FALSE(mj["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(missing->body.find("\"actions\"") == std::string::npos);
+}
+
+TEST_CASE("discover.plugin-docs/{name}: every documented plugin resolves, not just the first "
+          "(#4108)",
+          "[discovery][plugin_docs][pg]") {
+    // #4108 review: the single-name cases above always pick plugins[0], which
+    // cannot detect an index-construction regression that only populates the
+    // first entry. Loop the whole catalog.
+    DiscoverHarness h;
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    for (const auto& expected : catalog["plugins"]) {
+        const std::string name = expected["name"].get<std::string>();
+        const auto* manifest = yuzu::server::plugin_docs_manifest(name);
+        REQUIRE(manifest != nullptr);
+        CHECK(nlohmann::json::parse(manifest->json) == expected);
+
+        auto res = h.sink.Get("/api/v1/discover/plugin-docs/" + name);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body == manifest->json);
+    }
+}
+
+TEST_CASE("discover.plugin-docs/{name}: permission denied -> 403 before the name lookup, "
+          "even for an unknown name",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs/no_such_plugin_for_docs");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"actions\"") == std::string::npos);
+}
+
+TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undocumented",
+          "[discovery][plugins][plugin_docs][pg]") {
+    DiscoverHarness h;
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    // A plugin whose README has adopted the standard — whichever manifest the
+    // embedded catalog lists first, so the case does not depend on which
+    // pilots ship — and one that has not.
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string documented_name = catalog["plugins"][0]["name"].get<std::string>();
+    auto* documented = info.add_plugins();
+    documented->set_name(documented_name);
+    documented->set_version("1.0.0");
+    documented->set_description("drive health");
+    documented->add_capabilities("smart");
+    auto* undocumented = info.add_plugins();
+    undocumented->set_name("no_such_plugin_for_docs");
+    undocumented->set_version("0.0.1");
+    undocumented->set_description("never documented");
+    undocumented->add_capabilities("noop");
+    (void)h.registry.register_agent(info);
+
+    // The join reads the same index the catalog serves — a manifest present
+    // there MUST surface as a summary here, and vice versa.
+    REQUIRE(yuzu::server::plugin_docs_summary(documented_name) != nullptr);
+    CHECK(yuzu::server::plugin_docs_summary("no_such_plugin_for_docs") == nullptr);
+
+    // Same shape for the #4108 per-plugin manifest accessor: present for a
+    // documented name, null for an undocumented one, and byte-identical to
+    // that plugin's own element in the whole catalog.
+    const auto* manifest = yuzu::server::plugin_docs_manifest(documented_name);
+    REQUIRE(manifest != nullptr);
+    CHECK(nlohmann::json::parse(manifest->json) == catalog["plugins"][0]);
+    CHECK(yuzu::server::plugin_docs_manifest("no_such_plugin_for_docs") == nullptr);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["version"] == 3);
+    bool saw_documented = false, saw_undocumented = false;
+    for (const auto& pl : j["plugins"]) {
+        REQUIRE(pl.contains("docs")); // always present: object or explicit null
+        if (pl["name"] == documented_name) {
+            saw_documented = true;
+            REQUIRE(pl["docs"].is_object());
+            CHECK(pl["docs"]["summary"].is_string());
+            CHECK_FALSE(pl["docs"]["summary"].get<std::string>().empty());
+            CHECK(pl["docs"]["platforms"].is_object());
+            REQUIRE(pl["docs"]["kind"].is_object());
+            CHECK(pl["docs"]["kind"]["collector"].is_boolean());
+            CHECK(pl["docs"]["kind"]["mutating"].is_boolean());
+            CHECK(pl["docs"]["kind"]["gathered"].is_boolean());
+            CHECK(pl["docs"]["readme"] == "agents/plugins/" + documented_name + "/README.md");
+            CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs/" + documented_name);
+        } else if (pl["name"] == "no_such_plugin_for_docs") {
+            saw_undocumented = true;
+            CHECK(pl["docs"].is_null());
+        }
+    }
+    CHECK(saw_documented);
+    CHECK(saw_undocumented);
 }

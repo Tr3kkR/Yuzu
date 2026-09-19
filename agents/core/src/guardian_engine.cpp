@@ -30,9 +30,12 @@
 #include "guaranteed_state.pb.h"
 
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
+#include "guardian_arm_ack.hpp" // rung 9c PR-2 Unit 5/6: GuardianArmAckLedger, guardian_push_content_id
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats (rung 9c PR-3)
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
@@ -57,6 +60,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::agent {
@@ -69,6 +73,14 @@ namespace apb = ::yuzu::agent::v1;
 constexpr std::string_view kKvNamespace = "__guardian__";
 constexpr std::string_view kRulePrefix  = "rule:";
 constexpr std::string_view kKeyGen      = "meta:policy_generation";
+// #4021: a captured file-hash-equals baseline, keyed by rule_id, NEVER swept by
+// full_sync (only kRulePrefix keys are - see the full_sync teardown block) and
+// never swept merely because a rule is absent from one push (the server omits
+// disabled/out-of-scope rules from every push - guardian_push_builder.cpp - so
+// absence is not deletion; a dormant baseline record for a rule that never comes
+// back is an accepted, deliberate trade against silently laundering a genuinely
+// still-drifted rule's compliance state - see guardian_seed_baseline's doc).
+constexpr std::string_view kBaselinePrefix = "baseline:";
 
 // #2303 sec-M. GuardianEngine persists rule state under kKvNamespace on the shared kv_store.db,
 // keyed the same way plugin storage is (yuzu_ctx_storage_* by the plugin's own declared name).
@@ -119,6 +131,239 @@ std::string hex_decode(std::string_view hex) {
         out += static_cast<char>((hi << 4) | lo);
     }
     return out;
+}
+
+// #4021: baseline-on-arm persistence. A `file-hash-equals` rule authored with no
+// `expected_hash` captures whatever the target contains at arm time as its "known
+// good" state (guardian_rule_eval.cpp's own "baseline-on-arm" comment; the legacy
+// FileGuard mirrors it independently in guard_file.cpp). Before this fix, that
+// captured state lived ONLY in the running guard's own memory - a full_sync
+// (any unrelated fleet rule mutation bumps the single global policy_generation,
+// this file's full_sync teardown/rearm) or an agent restart (start_local()'s
+// rearm loop) constructed a brand-new guard with no memory of the prior baseline,
+// so the NEXT read re-captured "whatever's on disk right now" - silently
+// reclassifying a rule that had been genuinely drifted for weeks as compliant,
+// with no remediation and no visible action. This persists the FIRST captured
+// baseline per rule_id in KvStore so every later arm re-seeds the SAME value
+// instead of recapturing current content.
+//
+// Scope of this fix (deliberate, documented - see #4021 PR description): wired for
+// the LEGACY FileGuard path only (start_guard_for_rule_locked below), the
+// currently-shipped detection backend (prefer_spark_ defaults false - "legacy
+// IGuard remains the sole live detection path"). The SEED lookup below also
+// benefits a rule armed via Spark (reconcile_rule_locked mutates the shared
+// RuleAssertion before the backend fork), so a baseline captured under legacy
+// survives a later flip to Spark. Spark's OWN capture (guardian_rule_eval.cpp /
+// guardian_spark_runtime.cpp) is NOT wired to this store - those files are
+// Spark-workstream-in-flight elsewhere; under prefer_spark_=true a first-ever
+// Spark-side capture is not yet persisted here, so the SAME full_sync-relaunder
+// gap remains for a rule that has NEVER been armed via legacy. Tracked as
+// #4045 rather than a bare prose follow-up (adversarial-review K4/C2-3).
+constexpr int kBaselineSchemaVersion = 1;
+
+std::string make_baseline_key(const std::string& rule_id) {
+    return std::string(kBaselinePrefix) + rule_id;
+}
+
+/// Identifies WHAT is asserted, not how it's authored/watched elsewhere: changing
+/// `settle_ms`/debounce/name/severity/enforcement_mode must NOT invalidate a
+/// captured baseline (those don't change what "compliant" means); changing the
+/// assertion TYPE or its TARGET must (a rule_id re-authored against a different
+/// path is a genuinely different target, and its "first good read" baseline
+/// captured under this fingerprint must never seed a mismatched one - a
+/// fingerprint mismatch is simply treated as "no baseline yet", never a failure).
+/// Only `file-hash-equals` baselines-on-arm today; a future baselining assertion
+/// kind extends this, never guesses a shared shape with an unrelated one.
+///
+/// Gate 2 governance (security-guardian): deliberately does NOT fold
+/// `kBaselineSchemaVersion` into this string (an earlier draft did, as a "v1|"
+/// prefix). A future schema bump would then change the fingerprint of every
+/// EXISTING record fleet-wide with no code change to the record's actual
+/// content — read_baseline_record's fingerprint-mismatch branch would silently
+/// treat every one of them as "a genuine retarget" and let the very next arm
+/// recapture fresh, a mass, unlogged version of the exact relaunder #4021
+/// exists to close. The schema version is carried ONLY in the stored record's
+/// own `j["schema"]` field (see guardian_persist_baseline) and validated there
+/// by read_baseline_record - version drift is a distinct failure (Malformed),
+/// never conflated with "different target".
+std::string guardian_baseline_fingerprint(std::string_view assertion_type,
+                                          std::string_view target) {
+    return std::string(assertion_type) + "|" + std::string(target);
+}
+
+bool is_valid_baseline_hash(const std::string& h) {
+    if (h.size() != 64) // lowercase hex SHA-256, matching sha256_file's own output format
+        return false;
+    for (char c : h)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+/// How a persisted baseline record read went. `Ok` means the record parsed and its
+/// hash is well-formed (the fingerprint may or may not match what the caller
+/// wanted — that's for the caller to compare); every other value means "nothing
+/// USABLE was read", collapsing "genuinely absent" and "read/parse/hash failure"
+/// into one non-throwing shape both `guardian_seed_baseline` and
+/// `guardian_persist_baseline` can switch on without duplicating the KV-read/JSON-
+/// parse plumbing between them (adversarial-review K1/C2-1: the persist side needs
+/// to distinguish "confirmed nothing there" from "read failed" too, not just the
+/// seed side).
+enum class BaselineReadOutcome { Ok, Absent, ReadError, Malformed };
+
+struct BaselineRecord {
+    std::string fingerprint;
+    std::string hash;
+};
+
+/// Gate 2 governance (security-guardian): NOT `_locked` despite the name every
+/// other `*_locked` helper in this file uses for "called under mtx_" - this one
+/// touches only `KvStore` (its own internal mutex) and is called from a guard
+/// worker thread that must NEVER take `GuardianEngine::mtx_` (guardian_persist_baseline's
+/// call site). Named without the suffix so a future maintainer doesn't add
+/// engine-state access here on the false assumption mtx_ is already held.
+BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id,
+                                         BaselineRecord& out) {
+    auto raw = kv.get_entry(kKvNamespace, make_baseline_key(rule_id));
+    if (!raw)
+        return BaselineReadOutcome::ReadError;
+    if (!raw->has_value())
+        return BaselineReadOutcome::Absent;
+    // Gate 3 governance (cpp-safety): the try below now covers EVERY
+    // nlohmann::json call on this record, not just parse() - a well-formed
+    // JSON document with a wrong-typed field (e.g. "schema" as a string, or a
+    // top-level array, so .value<int>()/.value<string>() throws type_error)
+    // must degrade to Malformed like every other corrupt-record case, never
+    // escape as an uncaught exception. Before this fix such a record threw
+    // out of read_baseline_record entirely: on the seed side that escaped
+    // into apply_rules's push-application loop (degrading the WHOLE push,
+    // not just this rule); on the persist side it escaped out of a guard
+    // worker thread's on_baseline callback into FileGuard::run()'s own
+    // top-level catch, permanently stopping that one guard until the next
+    // full_sync/restart - both contradicting this function's own "never
+    // propagated as an arm failure" contract.
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(**raw);
+        // Schema-version drift is a DISTINCT failure from a fingerprint
+        // mismatch (Gate 2 governance): a record from a future/incompatible
+        // schema must never be silently treated as "a different target,
+        // capture fresh" (which would recapture EVERY existing baseline
+        // fleet-wide, unlogged, the moment kBaselineSchemaVersion is ever
+        // bumped) - it needs its own migration path when one is written, not
+        // a silent reinterpretation as a retarget.
+        if (j.value("schema", -1) != kBaselineSchemaVersion)
+            return BaselineReadOutcome::Malformed;
+        out.fingerprint = j.value("fingerprint", std::string{});
+        out.hash = j.value("hash", std::string{});
+    } catch (const nlohmann::json::exception&) {
+        return BaselineReadOutcome::Malformed;
+    }
+    if (!is_valid_baseline_hash(out.hash))
+        return BaselineReadOutcome::Malformed;
+    return BaselineReadOutcome::Ok;
+}
+
+/// Look up a persisted baseline for `rule_id`, returning it ONLY when the stored
+/// fingerprint matches `fingerprint` (a mismatch is a genuinely different target,
+/// not a failure - the caller captures fresh, same as a rule with no baseline at
+/// all). A read failure or a malformed record is logged and treated as absent
+/// (capture fresh) rather than propagated as an arm failure: the legacy FileGuard
+/// has no "errored, don't arm" channel for this today (unlike Spark's Unhealthy
+/// verdict), and a KvStore read failure here is the same failure mode every other
+/// KV-backed read in this file already degrades-and-logs on (put_rule_locked's own
+/// json_to_rule parse-failure sites), not a new weaker posture introduced for
+/// baselines specifically.
+std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
+                                                   const std::string& fingerprint) {
+    BaselineRecord rec;
+    switch (read_baseline_record(kv, rule_id, rec)) {
+    case BaselineReadOutcome::Absent:
+        return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
+    case BaselineReadOutcome::ReadError:
+        spdlog::error("Guardian: baseline lookup for rule '{}' failed (KV read error) - "
+                     "arming as if no baseline is on record",
+                     rule_id);
+        return std::nullopt;
+    case BaselineReadOutcome::Malformed:
+        spdlog::error("Guardian: baseline record for rule '{}' is malformed (bad JSON or hash) "
+                     "- discarding and arming as if no baseline is on record",
+                     rule_id);
+        return std::nullopt;
+    case BaselineReadOutcome::Ok:
+        break;
+    }
+    if (rec.fingerprint != fingerprint)
+        return std::nullopt; // different target under this rule_id - not a failure, fresh capture
+    return rec.hash;
+}
+
+/// Persist a newly-captured baseline. Takes `KvStore*` by raw pointer (not
+/// `GuardianEngine&`/`this`) so it is safe to call from a guard worker thread via a
+/// callback: the worker must never reach back into GuardianEngine state or take
+/// its lock (see emit_guard_event's own doc), and `kv_` outlives every guard
+/// thread by construction (agent.cpp declares kv_store_ before guardian_, so it
+/// destructs AFTER - and stop_all_guards_locked()/withdraw join every guard thread
+/// before GuardianEngine itself is torn down).
+///
+/// adversarial-review K1/C2-1 (both Kimi and Codex, independently): a TRANSIENT
+/// failure of guardian_seed_baseline's read (not absence — an actual KV read
+/// error, or a momentarily-malformed record) makes the arm proceed as if there
+/// were no baseline, so the guard captures WHATEVER the target currently holds —
+/// which, if the target has genuinely drifted since the real baseline was
+/// captured, is the drifted content. Persisting that unconditionally would
+/// overwrite the still-good prior record with the drifted one, permanently
+/// losing the only durable copy of the real baseline — reproducing this issue's
+/// exact laundering through the read-failure path instead of the full_sync path
+/// it was written to close. So this re-reads the CURRENT record first: if one
+/// already exists, is well-formed, AND matches `fingerprint` (same target), this
+/// write is refused — that combination is otherwise unreachable on the happy path
+/// (a matching well-formed record means guardian_seed_baseline would have seeded
+/// `expected_hash` and the guard's capture branch would never have fired at all),
+/// so its only reachable cause is a failed seed lookup, and keeping the existing
+/// record is always safer than trusting a capture that may be re-recording
+/// drift. A genuinely ABSENT record, a malformed one (self-heals — it was
+/// already unrecoverable), or one for a DIFFERENT fingerprint (a genuine
+/// retarget) all still write normally. A read failure on THIS (persist-side) re-
+/// read degrades to "write anyway" — the pre-existing, narrower posture — logged
+/// distinctly, so a KV outage cannot indefinitely wedge a rule out of ever
+/// getting a persisted baseline at all.
+void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
+                               const std::string& fingerprint, const std::string& hash) {
+    if (!kv)
+        return;
+    BaselineRecord existing;
+    switch (read_baseline_record(*kv, rule_id, existing)) {
+    case BaselineReadOutcome::Ok:
+        if (existing.fingerprint == fingerprint) {
+            spdlog::warn("Guardian: refusing to overwrite rule '{}''s persisted baseline with a "
+                        "fresh capture for the SAME target - a capture attempt only reaches "
+                        "here for an already-baselined target via a failed seed lookup "
+                        "(adversarial-review K1/C2-1); keeping the existing record",
+                        rule_id);
+            return;
+        }
+        break; // different fingerprint - a genuine retarget, write below
+    case BaselineReadOutcome::Absent:
+    case BaselineReadOutcome::Malformed:
+        break; // nothing usable on record - safe to write
+    case BaselineReadOutcome::ReadError:
+        spdlog::warn("Guardian: could not re-check rule '{}''s persisted baseline before "
+                    "writing (KV read error) - writing the fresh capture anyway rather than "
+                    "risk wedging the rule out of ever getting a persisted baseline",
+                    rule_id);
+        break;
+    }
+    nlohmann::json j;
+    j["schema"] = kBaselineSchemaVersion;
+    j["fingerprint"] = fingerprint;
+    j["hash"] = hash;
+    if (!kv->set(kKvNamespace, make_baseline_key(rule_id), j.dump())) {
+        spdlog::error("Guardian: failed to persist captured baseline for rule '{}' - a later "
+                     "full_sync or restart will re-capture current content instead of this "
+                     "one (#4021)",
+                     rule_id);
+    }
 }
 
 nlohmann::json block_to_json(const gpb::GuardianSpecBlock& b) {
@@ -185,7 +430,8 @@ std::string make_rule_key(std::string_view rule_id) {
 } // namespace
 
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
-    : kv_{kv}, agent_id_{std::move(agent_id)}, prefer_spark_{prefer_spark} {}
+    : kv_{kv}, agent_id_{std::move(agent_id)}, prefer_spark_{prefer_spark},
+      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
@@ -228,6 +474,38 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), parsed);
         if (ec == std::errc{})
             policy_generation_ = parsed;
+    }
+
+    // rung 9c PR-2 Unit 6 (§R5.3's own boot note: "start_local() also receives
+    // asynchronous reconciliation results - handle their eventual failures without
+    // inventing a new server-generation acknowledgment"). Opens an application AT
+    // the already-loaded policy_generation_ - not a new one - so the tick's own
+    // `gen > policy_generation_` check can never advance anything from it; boot
+    // re-arm's Accepted receipts are still drained and their failures still logged
+    // (ack_ledger_'s drain, not reconcile_rule_locked's now-synchronous-only warn),
+    // they just never move the generation. No content_id: nothing here is compared
+    // against a later push (decide_retry() is apply_rules()-only), so the field is
+    // unused for this application - left empty rather than computed for nothing.
+    //
+    // Defensive, not exercised by SparkReconcileFixture (test_guardian_engine_spark_
+    // reconcile.cpp): that fixture calls start_local() BEFORE wire_spark_engine(), so
+    // spark_availability_ is still Unwired here and reconcile_rule_locked's Arm branch
+    // never reaches spark_runtime_->attach_rule() during ITS boot walk - nothing this
+    // application could ever hold pending. Production wires first (agent.cpp calls
+    // wire_spark_engine() before start_local()), so a real boot CAN re-arm via spark
+    // here; this call exists for that ordering, not the test fixture's.
+    // Governance finding UP-1 (Gate 4, folded): same unguarded-allocation class as
+    // apply_rules()'s own begin_application() call, fixed alongside it. Non-fatal
+    // here - a failure to open the boot bookkeeping application must not block
+    // startup; the boot re-arm loop below re-arms every cached rule directly via
+    // reconcile_rule_locked() regardless of whether this ledger call succeeded.
+    try {
+        ack_ledger_->begin_application(policy_generation_, "", /*full_sync=*/false,
+                                       /*applied=*/0);
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
+    } catch (...) {
+        spdlog::warn("Guardian: failed to begin boot ack application: unknown exception");
     }
 
     // A2 (restart re-arm). A restarted agent must keep enforcing without waiting
@@ -364,6 +642,12 @@ void GuardianEngine::stop() {
     }
     if (spark_runtime_)
         spark_runtime_->begin_stop();
+    // rung 9c PR-2 Unit 6 (§R5.5): retire acknowledgment candidates and prevent
+    // subsequent tick advancement - journal_maintenance_tick() itself already
+    // no-ops after stopped_, so this is belt-and-suspenders against a tick that
+    // raced this call and read stopped_ as still false, plus it stops watching
+    // receipts whose claims begin_stop() just started tearing down.
+    ack_ledger_->retire();
     if (spark_scheduler_)
         spark_scheduler_->stop();
     if (spark_drain_worker_)
@@ -394,13 +678,28 @@ void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
     // __SANITIZE_THREAD__/__SANITIZE_ADDRESS__, Clang answers __has_feature. A release build
     // without sanitizers compiles this away entirely, so the production hot path pays
     // nothing for an invariant CI proves.
-    if (!on_guardian_joined_thread())
+    const bool joined = on_guardian_joined_thread();
+    const bool detached = on_guardian_detached_worker_thread();
+    if (!joined && !detached)
         return;
     try {
-        spdlog::critical("Guardian: a worker thread that stop() joins took GuardianEngine::"
-                         "mtx_ - this deadlocks against stop(), which holds mtx_ while joining "
-                         "it. Aborting rather than hanging. See "
-                         "guardian_joined_thread_role.hpp (#2298).");
+        if (joined) {
+            spdlog::critical("Guardian: a worker thread that stop() joins took GuardianEngine::"
+                             "mtx_ - this deadlocks against stop(), which holds mtx_ while joining "
+                             "it. Aborting rather than hanging. See "
+                             "guardian_joined_thread_role.hpp (#2298).");
+        } else {
+            // rung 9c R5.1: the second role. A detached GuardianIoExecutor worker (run()
+            // or submit() body, or its on_abandoned/on_complete callback) can never be
+            // joined and may outlive stop() - blocking it here either stalls the F3
+            // orphan grace into a hard_exit() or resumes it into a torn-down engine.
+            spdlog::critical("Guardian: a detached GuardianIoExecutor worker (run()/submit() "
+                             "body or its completion/abandon callback) took GuardianEngine::"
+                             "mtx_ - such a worker may outlive the engine and can never be "
+                             "joined: this either stalls the F3 orphan grace into a hard_exit "
+                             "or resumes into a destroyed engine. Aborting rather than "
+                             "wedging. See guardian_detached_worker_role.hpp (R5.1).");
+        }
     } catch (...) {
     }
     // Deliberately std::abort, not assert: assert is a no-op under NDEBUG, which would have
@@ -457,6 +756,13 @@ void GuardianEngine::journal_maintenance_tick() {
     // No worker kick after a successful persist: paging is already MORE frequent than before
     // (the worker's 30 s page cadence, kicked immediately on reconnect, vs this 30 s tick), so a kick would add an mtx_ -> Signal.mu
     // lock edge on the heartbeat path for latency the page cadence already bounds.
+    //
+    // rung 9c PR-2 Unit 6: also THE ack-bookkeeping drain (§R5.3) - reused rather than a
+    // second heartbeat call site, since both are "periodic maintenance under mtx_,
+    // prefer_spark_-gated, firewalled" already. Runs AFTER the journal persist above (an
+    // arbitrary but harmless ordering choice: neither reads the other's result) and BEFORE
+    // agent.cpp reads policy_generation() for the heartbeat's own guardian_generation tag,
+    // so an acknowledgment this tick produces is visible on the SAME heartbeat, not one late.
     std::lock_guard lock(mtx_);
     if (stopped_ || !prefer_spark_)
         return;
@@ -474,6 +780,50 @@ void GuardianEngine::journal_maintenance_tick() {
                                         kJournalPersistMaxRecordsPerTick);
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!spark_runtime_)
+        return;
+    // Own firewall (distinct counter): a throw here must not prevent the journal work
+    // above (already done) from having happened, and must not escape onto the bare
+    // heartbeat thread either.
+    try {
+        // UP-3 (Gate 4, folded): drain_locked()'s failed_out feeds the durable
+        // fleet-visible arm_failures_ counter - an async-resolved arm failure used
+        // to update only this ledger's own internal bookkeeping and a local log
+        // line, never the counter a synchronous refusal already bumps.
+        std::size_t ack_arm_failures_this_tick = 0;
+        ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick,
+                                  &ack_arm_failures_this_tick);
+        if (ack_arm_failures_this_tick > 0)
+            arm_failures_.fetch_add(ack_arm_failures_this_tick, std::memory_order_relaxed);
+        if (ack_ledger_->can_advance()) {
+            const auto gen = ack_ledger_->pending_generation();
+            // Persist BEFORE publishing, and check the result: a false return or a
+            // throw (kv_->set() is not noexcept) must leave policy_generation_
+            // unchanged, so this same `gen > policy_generation_` condition is still
+            // true on the NEXT tick and retries the write with no separate retry
+            // bookkeeping - publishing first and discarding the result (the old
+            // shape) could strand policy_generation_ already advanced with nothing
+            // durable behind it, silently and permanently halting the server's
+            // re-push (coordinator finding, rung 9c PR-2 Unit 6 gate).
+            if (gen > policy_generation_) {
+                if (persist_generation_locked(gen))
+                    policy_generation_ = gen;
+                else
+                    // Governance finding (Gate 6, sre + compliance-officer): this
+                    // branch was previously silent on failure - no log, no counter -
+                    // making a stuck generation undetectable from either the agent
+                    // or the server side. Warn-once-per-tick is cheap and closes the
+                    // detection gap; the actual retry is the `gen > policy_generation_`
+                    // condition remaining true next tick.
+                    spdlog::warn("Guardian: failed to persist policy_generation={} from "
+                                 "the ack-drain tick (kv write returned false) - held at "
+                                 "{}, retried next tick",
+                                 gen, policy_generation_);
+            }
+        }
+    } catch (...) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -588,6 +938,37 @@ std::optional<GuardianJournalAgeStats> GuardianEngine::journal_age_stats() const
     return s;
 }
 
+std::size_t GuardianEngine::ack_pending_count_for_test() const {
+    std::lock_guard lock(mtx_);
+    return ack_ledger_->pending_count_for_test();
+}
+
+std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
+    std::lock_guard lock(mtx_);
+    // Check A (rung 9c PR-3 KICKOFF-v2, see this accessor's own doc comment in
+    // guardian_engine.hpp): begin_application() runs unconditionally in
+    // apply_rules() regardless of prefer_spark_, so ack_ledger_->arm_stats() alone
+    // cannot distinguish "spark dormant" from "spark live, currently clean" - a
+    // legacy agent has a live, empty Application on every push. Gate on all three
+    // engine-level dormancy conditions explicitly (governance fix, adversarial
+    // review CODEX-1/K1: `prefer_spark_` alone left `stopped_` and
+    // `spark_availability_ != Available` - Unwired/SparkFailed/SparkDisabled -
+    // emitting a false-present {0,0} pair), mirroring journal_age_stats()'s own
+    // dormancy gate immediately above plus reconcile_rule_locked()'s own
+    // try_spark condition for the availability check, or a reachable agent state
+    // would read as "arming, healthy" while nothing is actually being observed.
+    // The ledger's own arm_stats() supplies the fourth, orthogonal "no current
+    // application yet" absence case.
+    if (!prefer_spark_ || stopped_ || spark_availability_ != SparkAvailability::Available)
+        return std::nullopt;
+    return ack_ledger_->arm_stats();
+}
+
+std::uint64_t GuardianEngine::io_ceiling_rejections() const {
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->io_ceiling_rejections() : 0;
+}
+
 std::uint64_t GuardianEngine::unhealthy_suppressed() const {
     std::lock_guard lock(mtx_);
     return spark_runtime_ ? spark_runtime_->unhealthy_suppressed() : 0;
@@ -624,6 +1005,55 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
+    // rung 9c PR-2 Unit 6 (§R5.3 duplicate-retry suppression): the server's 25s
+    // full_sync heartbeat retry re-sends an identical push while episodes from the
+    // PRIOR call are still genuinely pending - without this, every such retry would
+    // re-run the full teardown+re-arm below, withdrawing and re-dispatching a claim
+    // that was already correctly in flight (a spurious detach_all() per retry; an
+    // arm slower than the retry interval would never converge). content_id is
+    // computed BEFORE begin_application() below can supersede the application this
+    // checks against. guardian_push_content_id() allocates on the unguarded dispatch
+    // thread (#2037) - contained; on a throw, an empty id never matches a real one,
+    // so this degrades to Reapply (always safe), never a wrongly-suppressed retry.
+    // Counted via ack_maint_exceptions_, not arm_failures_ - hashing a push's content
+    // is ack-bookkeeping housekeeping, not a rule arm failing (advisor review).
+    std::string content_id;
+    try {
+        content_id = guardian_push_content_id(push);
+    } catch (...) {
+        content_id.clear();
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (spark_runtime_ &&
+        ack_ledger_->decide_retry(push.policy_generation(), content_id, push.full_sync(),
+                                  *spark_runtime_) == GuardianArmAckLedger::RetryDecision::Suppress)
+        return ack_ledger_->applied_count();
+
+    // Supersedes whatever the previous push's application still had pending (a stale
+    // receipt from a superseded generation can never satisfy this one - see
+    // GuardianArmAckLedger's own doc). `applied` is a placeholder here - the real
+    // count is not known until the loop below finishes; set_applied() near the
+    // bottom of this function corrects it before any later Suppress decision reads
+    // applied_count().
+    //
+    // Governance finding UP-1 (Gate 4, unhappy-path, verified): this allocation
+    // (std::make_unique<Application>() inside begin_application()) sat immediately
+    // after the ONE call this preamble already firewalls (guardian_push_content_id(),
+    // #2037) with no firewall of its own - a bad_alloc here would have escaped onto
+    // the unfirewalled dispatch thread before GuardianRollback's own scope guard is
+    // even declared below. Nothing has been reconciled or staged yet at this point,
+    // so returning std::unexpected is a clean, side-effect-free abort of this push.
+    try {
+        ack_ledger_->begin_application(push.policy_generation(), content_id, push.full_sync(),
+                                       /*applied=*/0);
+    } catch (const std::exception& e) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected(std::string("failed to begin ack application: ") + e.what());
+    } catch (...) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected("failed to begin ack application: unknown exception");
+    }
+
     // Flush staged lifecycle records to the durable journal on EVERY exit - the normal
     // return, the put_rule early return below, and any un-firewalled throw. GuardianRollback
     // is the codebase's terminate-safe scope guard; left un-committed it becomes an
@@ -645,6 +1075,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
 
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
+    // rung 9c PR-2 Unit 6 (R5.3): rules ACCEPTED this push whose arm has not yet
+    // resolved - a diagnostic count only (the "pending" field in the log line
+    // below); the actual generation-hold gate reads ack_ledger_->can_advance(),
+    // never this counter (arm_failures_/reconcile_failures stay a genuine-failure
+    // signal only, unaffected by Accepted).
+    std::size_t pending_arms = 0;
     // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below.
     // guards_/spark_runtime_ don't need this - they're unconditionally torn down and
     // rebuilt fresh by stop_all_guards_locked()/detach_all() + the loop below.
@@ -653,11 +1089,78 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // it needs this set instead.
     std::set<std::string> full_sync_ids;
     if (push.full_sync()) {
-        const int cleared = kv_->clear(kKvNamespace);
-        if (cleared > 0)
-            spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
-        // Re-persist the policy generation marker after clear() wiped everything.
-        persist_generation_locked();
+        // #4021: NEVER kv_->clear(kKvNamespace) here — a blanket clear would also
+        // wipe every kBaselinePrefix baseline record, reintroducing exactly the
+        // silent-relaunder bug this file's baseline persistence exists to close (a
+        // rule's captured "known good" state must survive a full_sync). Scoped to
+        // kRulePrefix keys only — the ONLY other keys ever written under this
+        // namespace are kKeyGen (rewritten unconditionally just below regardless)
+        // and kBaselinePrefix records (deliberately untouched by full_sync — see
+        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
+        // a baseline either).
+        // Gate 4 governance BLOCKING-class finding (unhappy-path UP-1): `list()`'s
+        // bare `while (step()==SQLITE_ROW)` loop cannot distinguish end-of-rows
+        // from a mid-scan I/O error (kv_store.cpp's own comment on `list_entries`
+        // names this exact gap) - the OLD full_sync teardown used a single atomic
+        // `clear()` DELETE statement, which has no partial-failure mode at all, so
+        // switching to list()+del_keys() for the #4021 baseline-preserving scoped
+        // sweep introduced a genuinely NEW one: a mid-scan error would silently
+        // return a TRUNCATED key list, and the (fully transactional) del_keys()
+        // would then "successfully" delete only that truncated subset - some
+        // rule: keys gone, others surviving, with the cleared-count log line
+        // reporting it as an ordinary success. A surviving stale rule: key is
+        // re-armed by start_local()'s restart re-arm loop even after the server
+        // removed it from policy, silently re-enforcing on next restart - a
+        // genuine compliance-evidence integrity gap for a product whose whole
+        // point is Guaranteed State. Use the fallible list_entries() (which DOES
+        // check the post-loop rc) instead, and on a genuine read failure, hold
+        // the generation for retry and skip the sweep entirely THIS pass rather
+        // than risk a partial delete - stale rule: keys lingering one extra cycle
+        // is safe; a truncated delete masquerading as success is not.
+        auto rule_key_rows = kv_->list_entries(kKvNamespace, kRulePrefix);
+        if (!rule_key_rows) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::error("Guardian: full_sync rule-key sweep failed ({}) - holding "
+                         "policy_generation for retry rather than risk a partial delete",
+                         rule_key_rows.error().message);
+        } else {
+            std::vector<std::string> rule_keys;
+            rule_keys.reserve(rule_key_rows->size());
+            for (auto& row : *rule_key_rows)
+                rule_keys.push_back(std::move(row.key));
+            if (!rule_keys.empty()) {
+                const int cleared = kv_->del_keys(kKvNamespace, rule_keys);
+                if (static_cast<std::size_t>(cleared) == rule_keys.size()) {
+                    spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+                } else {
+                    // del_keys() is transactional (all-or-nothing) but returns 0 on
+                    // EITHER a genuine BEGIN/step/COMMIT failure OR (defensively) a
+                    // prepare failure - indistinguishable from here, and it does not
+                    // throw. Gate 5 CH-1 (#4021 follow-up): treat any undercount as
+                    // suspect and hold the generation for retry, mirroring the
+                    // list_entries() failure branch immediately above - a stale
+                    // rule: key lingering one extra cycle is safe, a failed delete
+                    // silently reported as ordinary success is not.
+                    ++reconcile_failures;
+                    arm_failures_.fetch_add(1, std::memory_order_relaxed);
+                    spdlog::error("Guardian: full_sync del_keys cleared {}/{} rule(s) - "
+                                 "holding policy_generation for retry rather than trust a "
+                                 "failed delete",
+                                 cleared, rule_keys.size());
+                }
+            }
+        }
+        // Re-persist the policy generation marker (rewritten unconditionally here,
+        // same as before this change — harmless whether or not the key survived).
+        // Deliberately NOT given the publish-after-persist treatment the other two
+        // call sites got (rung 9c PR-2 Unit 6 gate, coordinator finding): this site
+        // does not GATE an advance decision - policy_generation_ is already whatever
+        // it was, unchanged by this call either way - it only re-affirms the CURRENT
+        // value defensively after a full_sync KV clear. A failed write here just
+        // means the durable marker can lag the in-memory value for one more cycle,
+        // never a wrong "caught up" signal to the server; out of scope for this fix.
+        (void)persist_generation_locked(policy_generation_);
         // Full sync replaces the active set - tear down BOTH backends before
         // re-arming (rung 7: a spark-attached rule the new push omits must be
         // withdrawn too, not left dangling - Sol's rev-2 review). FIREWALLED like the
@@ -696,6 +1199,10 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (push.full_sync())
             full_sync_ids.insert(rule.rule_id()); // F7
         if (!put_rule_locked(rule)) {
+            // This return skips the reconcile_failures > 0 latch below entirely -
+            // latch explicitly, so a later heartbeat tick can never advance this
+            // generation past a partially-applied push (§R5.3).
+            ack_ledger_->latch_failure();
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
         // Per-rule exception firewall: reconcile can throw (a spark attach OOM, a
@@ -729,6 +1236,22 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             continue; // not counted as applied - reconcile_rule_locked already logged why
         }
+        // rung 9c PR-2 Unit 6 (§R5.3): Accepted is not a failure - the rule was
+        // eligible and its arm attempt was accepted (dispatched, queued behind an
+        // in-flight/retained claim on the same key (R5.2), or - rung 9c PR-5c
+        // (#4221 up-2) - re-observing an already-Wedged head via an identical
+        // same-rule_id/same-spec retry, which constructs no new claim at all) - so
+        // it is counted as applied exactly like Armed/Inert, never added to
+        // reconcile_failures/arm_failures_. reconcile_rule_locked() already
+        // registered the receipt with ack_ledger_ for THIS application (this
+        // application was begun before this loop started) - including for a
+        // re-observed retry, whose receipt is registered fresh by THIS call, not
+        // inherited from whatever application the original attach ran under (see
+        // the add_pending() call site's own doc comment below, ~:1940); the
+        // generation-hold gate below now reads ack_ledger_->can_advance(), not this
+        // counter - pending_arms is kept only for the diagnostic log line.
+        if (outcome == ReconcileOutcome::Accepted)
+            ++pending_arms;
         ++applied;
     }
 
@@ -751,6 +1274,18 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
     }
 
+    // rung 9c PR-2 Unit 6: a reconcile_failures increment anywhere above (the full_sync
+    // teardown block's own kv-sweep/del_keys/teardown-throw sites, or a per-rule
+    // ReconcileOutcome::Failed/throw in the loop just above) must survive past THIS
+    // function's own return, because it is a local variable that does not - a later
+    // heartbeat tick only ever consults ack_ledger_->can_advance(), which would
+    // otherwise see nothing latched and no resolved_failed once every accepted rule's
+    // arm eventually commits, and wrongly advance a generation that had a genuine
+    // failure this call.
+    if (reconcile_failures > 0)
+        ack_ledger_->latch_failure();
+    ack_ledger_->set_applied(applied);
+
     // Do NOT advance the policy generation when any rule failed to arm. The server's
     // heartbeat reconcile fn re-pushes only while the agent reports a generation BEHIND
     // current (server.cpp), so advancing here would tell the server "caught up" and
@@ -759,15 +1294,47 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // live so a transient OOM/thread-exhaustion self-heals. (Sol B1 / Fable.) A later
     // successful push can still advance past a persistently-failing rule; arm_failures_
     // (surfaced via the heartbeat, item 9) is the durable fleet-visible signal for that.
-    if (reconcile_failures == 0 && push.policy_generation() > policy_generation_) {
-        policy_generation_ = push.policy_generation();
-        persist_generation_locked();
+    // rung 9c PR-2 Unit 6: ack_ledger_->can_advance() replaces the old pending_arms == 0
+    // check - true for the ordinary case (nothing Accepted this push, matching today's
+    // behavior exactly) and false whenever an accepted arm is still genuinely pending
+    // OR has resolved to anything but Committed OR this call latched a failure above
+    // (R5.3: "the policy generation advances ... only once every rule accepted under it
+    // has ... armed ... never on acceptance alone"). If something IS still pending,
+    // this call does not advance the generation at all - journal_maintenance_tick()'s
+    // own drain does, once it resolves.
+    // Persist BEFORE publishing (coordinator finding, rung 9c PR-2 Unit 6 gate - this
+    // call site has the identical shape as journal_maintenance_tick()'s own, fixed
+    // alongside it): a failed or throwing persist leaves policy_generation_ at its
+    // prior value, so the same condition is still true on a repeat push, retrying
+    // naturally - "naturally" depends on decide_retry() above never Suppressing a
+    // repeat push while nothing is genuinely pending (governance finding
+    // sec-1/arch-1, fixed in GuardianArmAckLedger::decide_retry() this same round:
+    // an empty `pending` map used to reach a vacuous Suppress and this gate was
+    // never reached again at all on a repeat push). NOTE the asymmetry with
+    // journal_maintenance_tick()'s own retry (Gate 8, sre): that path is gated
+    // `if (stopped_ || !prefer_spark_) return;` and therefore does NOT retry at
+    // today's production default - a repeat PUSH is the only live recovery lane
+    // at prefer_spark_=false, not a heartbeat tick. Do not conflate the two in a
+    // future edit here or in the log line below.
+    if (reconcile_failures == 0 && ack_ledger_->can_advance() &&
+        push.policy_generation() > policy_generation_) {
+        if (persist_generation_locked(push.policy_generation()))
+            policy_generation_ = push.policy_generation();
+        else
+            // Governance finding (Gate 6, sre + compliance-officer): previously
+            // silent on failure. See journal_maintenance_tick()'s identical warn
+            // for the matching drain-triggered gate.
+            spdlog::warn("Guardian: failed to persist policy_generation={} (kv write "
+                         "returned false) - held at {}, retried on the server's next "
+                         "identical repeat push",
+                         push.policy_generation(), policy_generation_);
     }
 
     refresh_count_locked();
     spdlog::info(
-        "Guardian: apply_rules ok (applied={}, failed={}, full_sync={}, generation={}, total={})",
-        applied, reconcile_failures, push.full_sync(), policy_generation_, rule_count_);
+        "Guardian: apply_rules ok (applied={}, failed={}, pending={}, full_sync={}, generation={}, "
+        "total={})",
+        applied, reconcile_failures, pending_arms, push.full_sync(), policy_generation_, rule_count_);
     return applied;
 }
 
@@ -897,6 +1464,16 @@ std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
     return last_rearm_degrade_message_for_test_;
 }
 
+std::string GuardianEngine::last_file_expected_hash_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_file_expected_hash_for_test_;
+}
+
+bool GuardianEngine::last_file_on_baseline_wired_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_file_on_baseline_wired_for_test_;
+}
+
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
     return policy_generation_;
@@ -916,9 +1493,9 @@ void GuardianEngine::refresh_count_locked() {
     rule_count_ = kv_->list(kKvNamespace, kRulePrefix).size();
 }
 
-void GuardianEngine::persist_generation_locked() {
-    if (!kv_) return;
-    kv_->set(kKvNamespace, kKeyGen, std::to_string(policy_generation_));
+bool GuardianEngine::persist_generation_locked(std::uint64_t gen) {
+    if (!kv_) return false;
+    return kv_->set(kKvNamespace, kKeyGen, std::to_string(gen));
 }
 
 void GuardianEngine::set_event_sink(EventSink sink) {
@@ -1062,6 +1639,45 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 fcfg.max_hash_bytes = clamped;
             }
             fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
+
+            // #4021: seed a previously-captured baseline before this guard ever gets
+            // to baseline-on-arm itself, so a full_sync/restart re-arm of an
+            // already-baselined rule re-asserts the SAME known-good state instead of
+            // silently recapturing whatever the (possibly still-drifted) target
+            // currently contains. A fingerprint mismatch (this rule_id's target
+            // genuinely changed) is not seeded — that IS a fresh target, and a fresh
+            // capture is correct for it. See guardian_baseline_fingerprint/
+            // guardian_seed_baseline's doc for the full rationale and this fix's
+            // documented scope.
+            const auto baseline_fingerprint =
+                guardian_baseline_fingerprint("file-hash-equals", fcfg.path);
+            if (fcfg.expected_hash.empty()) {
+                if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), baseline_fingerprint))
+                    fcfg.expected_hash = *seeded;
+            }
+            last_file_expected_hash_for_test_ = fcfg.expected_hash; // test-only observability
+            // Persist the FIRST-ever capture (fires at most once per FileGuard
+            // lifetime — FileGuard's own `!baseline_set` guard ensures that; a
+            // seeded rule never re-enters the capture branch at all, since
+            // expected_hash is no longer empty from FileGuard's point of view).
+            // Captures kv_ BY VALUE (a raw pointer, not `this`/GuardianEngine&) —
+            // see guardian_persist_baseline's doc for why that's safe from a guard
+            // worker thread.
+            fcfg.on_baseline = [kv = kv_, rule_id = rule.rule_id(),
+                               fp = baseline_fingerprint](const std::string& hash) {
+                guardian_persist_baseline(kv, rule_id, fp, hash);
+            };
+            // Gate 3 quality-engineer follow-up, hardened per Gate 4 happy-path
+            // (the two statements were independent — deleting the assignment
+            // above while leaving this one untouched still left the flag true
+            // and the regression test green, exactly the gap the flag exists to
+            // catch). Derives the flag FROM the assignment's own observable
+            // result instead of asserting it separately: last_file_expected_hash_
+            // for_test_ only proves the SEED lookup ran, not that the capture
+            // callback was actually attached — deleting the assignment above
+            // now flips this false too, since `fcfg.on_baseline` would then be
+            // empty.
+            last_file_on_baseline_wired_for_test_ = static_cast<bool>(fcfg.on_baseline);
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else
             // (default "present") → drift when the file is missing / has been deleted.
@@ -1250,6 +1866,21 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         return ReconcileOutcome::Inert;
     }
 
+    // #4021: seed a persisted baseline into the Spark-side assertion BEFORE the
+    // backend fork below, so a rule that was previously armed (and baselined) via
+    // legacy survives a later flip to Spark instead of Spark re-capturing current
+    // content fresh. This does NOT cover Spark's OWN first-ever capture (see
+    // guardian_seed_baseline's doc for the documented scope of this fix) — only
+    // seeds a value that ALREADY exists in the durable store.
+    if (assertion->kind == AssertionKind::FileHashEquals && assertion->expected_hash.empty()) {
+        std::string path;
+        if (auto it = rule.assertion().params().find("path"); it != rule.assertion().params().end())
+            path = it->second;
+        const auto fingerprint = guardian_baseline_fingerprint("file-hash-equals", path);
+        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint))
+            assertion->expected_hash = *seeded;
+    }
+
     // spark_availability_ is set exactly once by wire_spark_engine() and never
     // changes afterward. prefer_spark_ is immutable for this object's
     // lifetime. SparkFailed and Unwired NEVER fall back to legacy - a failure
@@ -1276,21 +1907,58 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
             unsupported_rules_.erase(rule.rule_id()); // F7: about to arm (or fail arming) - not Unsupported either way
-            auto gen = spark_runtime_->attach_rule(rule.rule_id(), std::move(*spec),
+            // rung 9c PR-2 Unit 6: non-waiting entry point - attach_rule() no longer blocks
+            // for its own claim's outcome. `res` resolves to Armed (already committed,
+            // synchronously - an inline-type arm, or a same-key claim whose owner already
+            // resolved by the time attach_core rechecked) or Accepted (dispatched, queued
+            // behind an in-flight/retained claim - not yet resolved, or - rung 9c PR-5c
+            // (#4221 up-2) - re-observing an already-Wedged head via an identical retry,
+            // whose receipt is in that case already terminal) before ever throwing a
+            // synchronous error.
+            auto res = spark_runtime_->attach_rule(GuardianSparkRuntime::NonWaiting{},
+                                                   rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),
                                                    /*emit_compliant_edge=*/true);
-            if (gen)
+            if (!res) {
+                // Synchronous refusal only - a genuine arm ATTEMPT that did not succeed
+                // (admission rejection or a same-key busy rejection at attach_core's own
+                // decision point). A rule that resolves ASYNCHRONOUSLY to a non-Committed
+                // status is a DIFFERENT outcome (Accepted below); its own failure is logged
+                // by ack_ledger_'s drain, not here.
+                spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
+                             res.error().message);
+                // rung 9c PR-5c round 2 (#4221, UP-1 residual): the old comment here
+                // read "defensive; attach_rule leaves nothing on failure" - true for
+                // every OTHER Failed path, but FALSE for exactly the case UP-1's own
+                // fix (round 1) introduced: a retarget refused onto a key wedged by a
+                // DIFFERENT rule_id refuses BEFORE tearing down rule_id's own,
+                // still-live arm on its previous key, specifically so that arm
+                // survives. Calling detach_rule() unconditionally here would undo
+                // that preservation one call later - detach_rule_locked() finds
+                // rule_id's real, committed arm (untouched by attach_rule's own
+                // refusal) and tears it down for real, reproducing UP-1's "zero live
+                // arms, no recovery" defect one function call downstream of where
+                // round 1 closed it. ArmError::prior_state_preserved is the signal
+                // that distinguishes the two: only run this defensive cleanup when
+                // attach_rule() itself did NOT already leave rule_id untouched.
+                if (!res.error().prior_state_preserved)
+                    spark_runtime_->detach_rule(rule.rule_id());
+                return ReconcileOutcome::Failed;
+            }
+            if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
                 return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry
-            // Arm failure: errored, NEVER a fallback to legacy (mutual exclusion). A
-            // genuine arm ATTEMPT that did not succeed - synchronous refusal, a
-            // #2233 item 3 bounded-wait timeout, or a same-key busy rejection - so
-            // this counts (ReconcileOutcome::Failed), unlike this function's other
-            // false-shaped outcomes: the caller's policy_generation hold-on-failure
-            // gate must not treat a timed-out rule's push as fully applied.
-            spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
-                         gen.error());
-            spark_runtime_->detach_rule(rule.rule_id()); // defensive; attach_rule leaves nothing on failure
-            return ReconcileOutcome::Failed;
+            // Accepted: register the receipt with whichever application is currently open
+            // (apply_rules()'s per-push application, or none at boot - start_local()'s own
+            // re-arm loop opens its own application before this ever runs, §R5.3's "handle
+            // their eventual failures without inventing a new server-generation
+            // acknowledgment"). A genuine arm ATTEMPT that did not (yet) succeed - the
+            // caller's policy_generation hold-on-failure gate must not treat this push as
+            // fully applied until it resolves. (Exception: a re-observed retry, rung 9c
+            // PR-5c #4221 up-2, registers a receipt that is already terminal - the
+            // Wedged head it observes - so ack_ledger_'s very next drain resolves it
+            // immediately rather than waiting on anything new.)
+            ack_ledger_->add_pending(rule.rule_id(), std::move(res->receipt));
+            return ReconcileOutcome::Accepted;
         }
         if (placement == RulePlacement::Unrecognized) {
             // Structurally unreachable here: spec/assertion validation above
@@ -1408,7 +2076,13 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     try {
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
-        spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_);
+        // set_spark_backend_op_deadline_for_test: only the one Config field tests need
+        // crosses the header's forward-declaration boundary (see that setter's doc).
+        GuardianSparkRuntime::Config spark_runtime_cfg{};
+        if (test_spark_backend_op_deadline_)
+            spark_runtime_cfg.backend_op_deadline = *test_spark_backend_op_deadline_;
+        spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_,
+                                                                spark_runtime_cfg);
         // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
         // object built to survive the agent via a detached SparkEngine handler, so a
         // provider that reached back into GuardianEngine would be the same class of
@@ -1421,6 +2095,20 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The durable journal is engine-owned and borrows kv_ (may be null → it durably
         // writes nothing). Constructed whenever spark is wired; persist stays gated on
         // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
+        //
+        // GUARDRAIL (#4153 round 4): the journal's constructor accepts any IJournalStore*
+        // so tests can pass an in-memory FakeJournalStore - production must always pass a
+        // real KvStore. That is enforced today by kv_'s own declared type (KvStore*, not
+        // IJournalStore*), not by anything at this call site - so if a future refactor
+        // ever widens kv_'s type, this assert fires as a compile error right here, forcing
+        // that change to be a conscious, reviewed decision rather than a silent widening.
+        // Scope, stated honestly: this only catches kv_'s TYPE being widened. It cannot
+        // catch a future refactor that leaves kv_'s type alone but substitutes a
+        // different pointer at the construction call site below.
+        static_assert(std::is_same_v<decltype(kv_), KvStore*>,
+                      "GuardianEngine::kv_ must stay KvStore*, not IJournalStore* - "
+                      "production must never construct GuardianLifecycleJournal against "
+                      "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
 
         auto id = engine->register_consumer("guardian-spark",
@@ -1579,6 +2267,26 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 // that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
 void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
     engine.emit_guard_event(drift);
+}
+
+// Test-support helpers — see guardian_engine.hpp (#4021 adversarial-review
+// K1/C2-1 regression net). Not friends: `guardian_persist_baseline`/
+// `guardian_seed_baseline` are free functions in this file's anonymous
+// namespace above (internal linkage), so these two thin, externally-linked
+// forwarders are the only way a different translation unit reaches them —
+// nothing else about them changes. Needed because the real call site
+// (`FileGuard::Config::on_baseline`) fires only from a running Windows-only
+// guard worker thread, which this platform's tests cannot exercise end-to-end.
+void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                        const std::string& fingerprint,
+                                        const std::string& hash) {
+    guardian_persist_baseline(&kv, rule_id, fingerprint, hash);
+}
+
+std::optional<std::string> guardian_seed_baseline_for_test(KvStore& kv,
+                                                           const std::string& rule_id,
+                                                           const std::string& fingerprint) {
+    return guardian_seed_baseline(kv, rule_id, fingerprint);
 }
 
 } // namespace yuzu::agent

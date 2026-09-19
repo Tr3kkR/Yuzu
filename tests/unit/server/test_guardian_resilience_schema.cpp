@@ -11,6 +11,7 @@
  * constexpr, no link (see tests/meson.build).
  */
 
+#include "guardian_push_builder.hpp" // guardian::kKnownGuardSparkTypes (cross-check)
 #include "guardian_resilience_schema.hpp"
 #include "guardian_rule_spec.hpp" // derive_rule_spec + dangerous-key denylist (H1)
 #include "guardian_schema_registry.hpp"
@@ -292,6 +293,43 @@ TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent s
         CHECK(std::find(agent.begin(), agent.end(), "REG_BINARY") == agent.end());
         CHECK(std::find(agent.begin(), agent.end(), "REG_MULTI_SZ") == agent.end());
     }
+}
+
+TEST_CASE("CROSS-CHECK: spark-kind schema catalog == guardian::kKnownGuardSparkTypes "
+          "(#4252 consolidated-round drift guard)",
+          "[guardian][spark][crosscheck]") {
+    // Governance Gate 4 (consistency-auditor) finding on the #4252 double-count fix:
+    // the new platform-support-stale counter's closed label set was a THIRD
+    // independent enumeration of Guardian spark types, alongside the published
+    // schema catalog (build_catalog(), guardian_schema_registry.cpp) and
+    // guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp) — with nothing
+    // binding them, unlike this file's existing G9/H2 cross-checks for the same
+    // class of drift. guardian_routes.cpp's counter now aliases
+    // kKnownGuardSparkTypes instead of keeping its own list, so this test binds
+    // the REMAINING two: the schema catalog's "spark"-kind entries must be
+    // exactly kKnownGuardSparkTypes.
+    //
+    // This does NOT bind guardian_guard_supported_on_platform's actual if-chain
+    // (governance Gate 8 re-review, architect + consistency-auditor) — that
+    // function matches string LITERALS, not this array, so a 4th entry added
+    // here and to the catalog with no corresponding branch there would pass
+    // THIS test while the platform-support matrix silently defaults the new
+    // type to Windows-only. test_guardian_push_builder.cpp's platform test
+    // pins the array against those literal branches directly; both tests must
+    // be updated when a spark type is added, not just this one.
+    auto j = json::parse(guardian_schema_catalog().json);
+    std::vector<std::string> published;
+    for (const auto& e : j["schemas"])
+        if (e["kind"] == "spark")
+            published.push_back(e["type"].get<std::string>());
+    std::sort(published.begin(), published.end());
+
+    std::vector<std::string> matrix;
+    for (std::string_view t : yuzu::server::guardian::kKnownGuardSparkTypes)
+        matrix.emplace_back(t);
+    std::sort(matrix.begin(), matrix.end());
+
+    CHECK(published == matrix);
 }
 
 TEST_CASE("CROSS-CHECK: service-state schema == server set == agent set (H2 drift guard)",

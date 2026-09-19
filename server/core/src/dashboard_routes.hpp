@@ -38,6 +38,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct TarRetentionPausedScan; // tar_tree_routes.hpp — #4027 REST+MCP twin shape
 
 namespace detail {
 class AgentRegistry;
@@ -199,6 +200,52 @@ public:
     /// `this` at registration and read the member per request, so an
     /// injection after `register_routes` still takes live effect.
     void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
+
+    /// #4027: the data-gathering half of render_tar_retention_paused, extracted so
+    /// the HTML fragment renderer, the new `GET /api/v1/tar/retention-paused` REST
+    /// twin, and the `list_tar_retention_paused` MCP twin share ONE read of the scan
+    /// state / response store / visibility filter (api-twin-recipe.md Rule 1) instead
+    /// of the REST/MCP surface re-deriving it. Public (unlike the private renderer
+    /// above) — `McpServer` calls it via a `DashboardRoutes*` threaded in through
+    /// server.cpp, the same pattern other route classes use for cross-class access.
+    ///
+    /// `extra_scope` (#4027 fix round, CDX-P1-01/K4): an ADDITIONAL visibility
+    /// constraint ANDed into the existing per-response `visible_set` check —
+    /// nullopt (default) preserves the pre-fix behavior exactly (the HTML
+    /// fragment renderer's caller passes nothing). The REST/MCP twins pass
+    /// `fleet_read_fn_`'s/McpServer's own `FleetReadGate::scope` here so a
+    /// dropped-for-scope row is folded into `agents_filtered_out_of_scope`
+    /// the SAME way an existing out-of-management-scope row is — NOT applied
+    /// as a post-hoc filter over the returned `rows`, which would leave
+    /// `agents_responded` counting agents whose rows were silently discarded
+    /// (the exact "silently incomplete" class both round-1 reviewers flagged
+    /// on a different finding — this function's honesty counters must not
+    /// repeat it). (#4143 review fix, HISTORY-1: this doc comment previously
+    /// said "ORed" — wrong; the code, the .cpp comment, and the fix-round
+    /// commit message all say/implement "ANDed", which is what a narrowing
+    /// intersection actually is.)
+    ///
+    /// `extra_scope_is_authoritative` (#4143 review fix, BLOCKING — confirmed
+    /// against ADR-0017 INV-4/INV-7 by direct source inspection): `visible_set`
+    /// (built from `mgmt_group_store_->get_visible_agents`, direct-membership
+    /// only, no ancestor walk) predates the ADR-0017 ancestor-ward resolution
+    /// the REST/MCP twins' `fleet_read_fn_`/`gate.scope` DOES perform. ANDing
+    /// them together unconditionally (the original design) meant an operator
+    /// admitted via an ancestor management-group role — not a DIRECT member —
+    /// could be ADMITTED (200) yet see rows silently dropped by `visible_set`
+    /// alone: admit and filter disagreeing, exactly the INV-4/INV-7 violation.
+    /// When `true` (the REST/MCP twins), `extra_scope` (= `gate.scope`, the
+    /// ADR-0017-authorized set) is the SOLE filter — `visible_set` is skipped
+    /// entirely, matching the two device pickers' identical fix
+    /// (`TarTreeRoutes::all_devices_fn_`). Default `false` preserves the HTML
+    /// fragment caller's existing membership-only behavior unchanged (it has
+    /// no `fleet_read_fn_` gate to defer to yet — out of scope this round,
+    /// same recorded exception as the two un-migrated device-picker
+    /// fragments).
+    TarRetentionPausedScan
+    gather_tar_retention_paused(const std::string& username,
+                                const authz::VisibleSet& extra_scope = std::nullopt,
+                                bool extra_scope_is_authoritative = false) const;
 
 private:
     std::vector<std::string> csrf_trusted_origins_;

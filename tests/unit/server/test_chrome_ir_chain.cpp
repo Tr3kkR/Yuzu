@@ -144,7 +144,7 @@ struct ChromeIrHarness {
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr, store.get(), dispatch_fn,
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
-                            /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},

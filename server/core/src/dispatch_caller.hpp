@@ -88,9 +88,15 @@ struct DispatchCaller {
     /// an audit reader nor a future maintainer can mistake one for the
     /// other. Trust-by-construction, exactly like `system` above: set ONLY
     /// at these three production sites, closed list —
-    ///   1. `ScheduleRunner::dispatch_tracked` (`schedule_runner.cpp`) —
-    ///      `Ticket` when the fire carries a non-empty `approval_id`
-    ///      (an approved ticket), `None` on a direct `auto`-mode fire.
+    ///   1. `CommandOutboxDelivery::deliver` (`command_outbox_delivery.cpp`,
+    ///      WS-3 3.3) — `Ticket` when the outbox occurrence carries a non-empty
+    ///      `approval_id`, `None` otherwise. This SUPERSEDES the former
+    ///      `ScheduleRunner::dispatch_tracked` site: scheduled fires no longer
+    ///      dispatch inline — `ScheduleRunner` records the `approval_id` on the
+    ///      outbox row at enqueue time and the delivery loop stamps the
+    ///      provenance here at send time (a re-authorized AlwaysApproval action
+    ///      still clears the #1398 ExecuteGate because the approval that
+    ///      admitted the occurrence already happened).
     ///   2. MCP `execute_instruction` / `quarantine_device` handlers
     ///      (`mcp_server.cpp`) — `Ticket`, stamped only after
     ///      `approval_ticket_just_consumed` is true (supervised tier).

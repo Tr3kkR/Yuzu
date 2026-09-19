@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <grpcpp/grpcpp.h>
@@ -24,6 +25,7 @@
 #include "agent_registry.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
+#include "gateway_route_store.hpp"
 
 // Forward declarations
 namespace yuzu::server {
@@ -33,6 +35,7 @@ class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
+class AppUsageStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -54,6 +57,13 @@ public:
                                yuzu::MetricsRegistry* metrics = nullptr,
                                AgentHealthStore* health_store = nullptr);
 
+    /// HA WS-4 slice 4.1: born-on-PG agent->cluster routing directory (see
+    /// gateway_route_store.hpp). Written on connect/heartbeat/disconnect below;
+    /// INERT this slice — nothing reads it for dispatch yet. nullptr (default,
+    /// and set back to nullptr in server.cpp's stop() before the store resets)
+    /// disables the writes — every write site below is fail-OPEN and tolerates
+    /// a null store the same way it tolerates a degraded write.
+    void set_gateway_route_store(GatewayRouteStore* store) { gateway_route_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -68,6 +78,9 @@ public:
     void set_software_licensing_store(SoftwareLicensingStore* store) {
         software_licensing_store_ = store;
     }
+    /// Typed per-agent last-used app-usage projection (Wave 7 PR7.2, ADR-0016
+    /// §5) — receives the app_usage daily-sync source via ProxyInventory.
+    void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
     // topology store so BatchHeartbeat ingests pushes from agents that
@@ -153,12 +166,14 @@ private:
     auth::AutoApproveEngine& auto_approve_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
+    GatewayRouteStore* gateway_route_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
+    AppUsageStore* app_usage_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
@@ -171,6 +186,19 @@ private:
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;
     std::unordered_map<std::string, std::string> gateway_sessions_;
+
+    // HA WS-4 4.2a #8: sessions whose `register_fresh` lost the connection
+    // epoch race (RegisterFreshResult::won == false) at ProxyRegister time.
+    // The session still enrolls/connects normally (unchanged from before this
+    // slice — see the ProxyRegister "fresh" branch), but its directory row
+    // belongs to a NEWER connection, so the FOLLOW-UP NotifyStreamStatus
+    // CONNECTED for this session must not call announce_connected — doing so
+    // would report `matched=false` and pollute the desync counter with a
+    // benign, expected race loss (see record_directory_desync's header
+    // comment). Same lock (sessions_mu_) as gateway_sessions_, entries added
+    // at ProxyRegister time and removed together with gateway_sessions_'s
+    // entry on DISCONNECTED.
+    std::unordered_set<std::string> lost_race_sessions_;
 };
 
 // -- ManagementServiceImpl (placeholder) --------------------------------------

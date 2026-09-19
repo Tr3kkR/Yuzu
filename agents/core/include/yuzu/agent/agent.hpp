@@ -142,14 +142,25 @@ public:
     [[nodiscard]] virtual bool startup_failed() const noexcept = 0;
 
     /**
-     * Live count of detached Guardian bounded-I/O workers (F3, ADR-0021 rung
-     * 7.6 - see guardian_io_executor.hpp's "ORPHAN PROCESS-EXIT CONTRACT").
-     * Zero whenever Guardian's spark path was never wired (today's default -
-     * rung 7.7 is what wires it). main()/the Windows SCM path poll this after
-     * run() returns and hard_exit() with a nonzero code if it has not
-     * reached zero within a bounded grace, rather than let normal process
-     * exit run C++ static/DSO teardown concurrently with a worker that may
-     * still be executing library code through a wedged syscall.
+     * Live count of every detached worker the process must not race normal
+     * C++ teardown against (F3). Two additive sources, summed:
+     *   - Guardian's own bounded-I/O workers (ADR-0021 rung 7.6 - see
+     *     guardian_io_executor.hpp's "ORPHAN PROCESS-EXIT CONTRACT"). Zero
+     *     whenever Guardian's spark path was never wired (today's default -
+     *     rung 7.7 is what wires it).
+     *   - Spark mechanisms' own detached probe/arm workers (#2012/#3840
+     *     plan, "F3 orphan-exit accounting - Route A (corrected)" -
+     *     spark_detached_call.hpp's SparkDetachedLane). Summed from an
+     *     agent-lifetime counter that is NEVER read through the SparkEngine
+     *     pointer or its boot-completion latch - a source gated behind
+     *     either of those would go uncounted in exactly the windows (pre-
+     *     boot, mid-boot, post-exception-reset, post-sticky-stop-skip-
+     *     wiring) where an orphaned worker is most likely to exist.
+     * main()/the Windows SCM path poll this after run() returns and
+     * hard_exit() with a nonzero code if it has not reached zero within a
+     * bounded grace, rather than let normal process exit run C++
+     * static/DSO teardown concurrently with a worker that may still be
+     * executing library code through a wedged syscall.
      */
     [[nodiscard]] virtual std::size_t guardian_active_io_workers() const noexcept = 0;
 };

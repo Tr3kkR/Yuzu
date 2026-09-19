@@ -232,3 +232,28 @@ Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
 `dex.app_perf.compare.drill` verb so per-machine access stays separately countable.
 (Over MCP, `compare_app_perf_versions` is recorded under the generic
 `mcp.compare_app_perf_versions` tool-call audit.)
+
+## REST / MCP access
+
+The saved-runs rail (`GET /fragments/auto`'s runs half) and the deploy-config go/warn preview
+(`GET /fragments/auto/deploy`) are also reachable as versioned REST + MCP twins — see
+[`rest-api.md`](rest-api.md#pre-flight--deploy) and [`mcp-server.md`](../mcp-server.md) for the
+full request/response shapes. Both twins are **owner-scoped** (your own runs only) and read-only —
+they never create a run or a deployment.
+
+- `GET /api/v1/preflight/runs` / MCP `list_preflight_runs` — your saved runs. The config-options
+  half of the fragment (available management groups for the scope dropdown) is deliberately **not**
+  duplicated here — that catalogue already has its own twin, `GET /api/v1/management-groups` /
+  `list_management_groups`, gated `ManagementGroup:Read`. Denial of a service-scoped API token is
+  audited under `preflight.run.view` — a distinct verb from `preflight.run` (the run-**creation**
+  verb) so a denied list read can never be mistaken for a run being created.
+- `GET /api/v1/deployments/preview?run={id}` / MCP `get_deployment_preview` — the go/warn preview
+  for one pre-flight run, gated `SoftwareDeployment:Read`. Reuses the existing `deployment.config.view`
+  verb (already distinct from `deployment.create`).
+
+Both REST routes are unaudited on a successful read (the response is run scope/lifecycle metadata,
+not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
+denial under their own verb. Their MCP twins instead call the generic
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
+`docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.

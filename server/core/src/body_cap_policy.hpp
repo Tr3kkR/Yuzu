@@ -270,6 +270,12 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // rejects anything the handler itself would still admit.
     {"POST", "/api/v1/ca/import-chain", 256u * 1024, false, "ca_import_chain"},
 
+    // POST /api/v1/ca/issue-code-signing — code-signing leaf issuance via CSR
+    // custody (gap-matrix #10; ca_routes.cpp kMaxIssueCodeSigningBody,
+    // enforced before nlohmann::json::parse). Mirrors that bound exactly —
+    // same two-authority-split precedent as ca_import_chain/ca_revoke below.
+    {"POST", "/api/v1/ca/issue-code-signing", 64u * 1024, false, "ca_issue_code_signing"},
+
     // POST /api/v1/ca/revoke — serial-scoped cert revocation, JSON body
     // (ca_routes.cpp:24 kMaxRevokeBody, enforced at ca_routes.cpp:394 before
     // the body reaches nlohmann::json::parse). Mirrors that bound exactly —
@@ -434,7 +440,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
 
     // POST /api/instructions/import — JSON instruction-definition import,
     // whole raw body forwarded verbatim to `import_definition_json`
-    // (server.cpp:11130 -> instruction_store.cpp:954 -> create_definition_
+    // (instruction_routes.cpp -> instruction_store.cpp:954 -> create_definition_
     // impl:434, which DOES hard-reject an oversized `yaml_source` field at
     // 1048576 bytes via validate_definition_scope, instruction_store.cpp:
     // 411). That real check does NOT bound the whole request, though: an
@@ -453,8 +459,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // yaml, POST /fragments/instructions/yaml-preview — three FORM-encoded
     // (application/x-www-form-urlencoded) twins of one shape: a single
     // `yaml_source` field (save also carries a small `id` field), all three
-    // routed through the SAME check — server.cpp:6493 `validate_yaml_source`
-    // -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
+    // routed through the SAME check — instruction_store.cpp's
+    // `validate_yaml_source` -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
     // `yaml_source.size() > 1048576` at instruction_yaml.cpp:165 (the exact
     // 1 MiB decoded-value contract create/update also enforce). This is the
     // SAME raw-vs-decoded shape as tar_dashboard_sql (C1) — the pre-routing
@@ -471,6 +477,23 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/instructions/yaml", 3149824u, false, "instruction_yaml"},
     {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml"},
     {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml"},
+
+    // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
+    // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
+    // GET /api/v1/hardware/{id} are bodyless list/record reads; only
+    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
+    // JSON object with one short "source" token (one of 5 fixed literals,
+    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // generous headroom over that real shape while keeping this three orders
+    // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
+    // had no reviewed entry, per the routed-concern row's requirement that
+    // every new mutating route get one). requires_measurable = true: the
+    // route's own `scoped_perm_fn` gate lives in the HANDLER, after httplib
+    // buffers the body, so without a pre-read bound an unauthenticated
+    // caller reaching this prefix with a chunked (no Content-Length) body
+    // would be uncapped up to httplib's 100 MiB default — the same class the
+    // /api/v1/uploads entry above closes.
+    {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

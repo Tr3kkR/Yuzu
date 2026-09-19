@@ -590,6 +590,46 @@ TEST_CASE("require_fleet_read: non-service token, RBAC genuinely disabled ⇒ "
     CHECK(result->unfiltered());
 }
 
+TEST_CASE("require_fleet_read: RBAC genuinely disabled, floored securable (Enrollment:Read), "
+          "non-admin session ⇒ Forbidden (#4031 topology-floor fix — closes the gap "
+          "require_list_read's own doc comment warns a future floored-securable caller must "
+          "close itself; GET /api/v1/enrollment/pending-agents is the first floored securable "
+          "ever routed through this gate)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    auto cookie_token =
+        r.auth_mgr.create_local_session("minter", auth::Role::user, /*mfa_verified=*/true);
+    httplib::Request req;
+    req.headers.emplace("Cookie", "yuzu_session=" + cookie_token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("admin role required") != std::string::npos);
+}
+
+TEST_CASE("require_fleet_read: RBAC genuinely disabled, floored securable (Enrollment:Read), "
+          "admin session ⇒ unfiltered (the floor never blocks admin — parity with "
+          "require_permission on the same pair)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    auto cookie_token =
+        r.auth_mgr.create_local_session("minter", auth::Role::admin, /*mfa_verified=*/true);
+    httplib::Request req;
+    req.headers.emplace("Cookie", "yuzu_session=" + cookie_token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered());
+}
+
 TEST_CASE("require_fleet_read: no bearer token ⇒ Unauthenticated",
           "[pg][auth_routes][authz_gates][service_scope]") {
     Config cfg{};

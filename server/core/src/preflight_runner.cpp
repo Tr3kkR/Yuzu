@@ -1,5 +1,7 @@
 #include "preflight_runner.hpp"
 
+#include "background_jobs.hpp" // WS-10 YUZU_ASSERT_BACKGROUND_JOB gate
+
 #include "preflight_eval.hpp"
 #include "preflight_parse.hpp"
 #include "preflight_run_store.hpp"
@@ -29,9 +31,11 @@ void PreflightRunner::tick() {
         return;
     const std::int64_t t = now_ms();
 
-    // Retention prune (best-effort; cascades run_device).
-    const std::int64_t cutoff = t - static_cast<std::int64_t>(d_.retention_days) * 86400000LL;
-    d_.run_store->prune_older_than(cutoff);
+    // Retention prune (best-effort; cascades run_device). WS-10: the store reads
+    // Postgres now() itself (single shared clock, skew-safe) and clock-guards the
+    // delete — pass the retention WINDOW, not a replica-clock cutoff.
+    YUZU_ASSERT_BACKGROUND_JOB("preflight_run_store.run_retention_prune");
+    d_.run_store->run_retention_prune(static_cast<std::int64_t>(d_.retention_days) * 86400000LL);
 
     for (auto& run : d_.run_store->list_running()) {
         // #3495: bounds how many MORE runs a single tick() call starts once

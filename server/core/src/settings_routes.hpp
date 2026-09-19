@@ -49,6 +49,30 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// #4028 — bool-returning audit hook for the fail-closed REST read-twins
+    /// (`GET /api/v1/settings/tls|https|plugin-signing|analytics` +
+    /// `GET /api/v1/agent/plugin-policy`). Distinct from `AuditFn` above
+    /// (fire-and-forget void, used by every existing dashboard-fragment
+    /// mutation in this class) because docs/api-twin-recipe.md §4 requires a
+    /// REST JSON read to FAIL CLOSED (503) on an audit-persist failure,
+    /// which needs the real persisted-or-not bool that `rest_audit.hpp`'s
+    /// `try_persist_audit`/`emit_behavioral_audit` return — `AuditFn`'s void
+    /// return erases that. Optional (defaults empty): when unset, calling
+    /// `try_persist_audit`/`emit_behavioral_audit` with it behaves exactly
+    /// like an audit-off deployment (returns `true`, never blocks a read) —
+    /// see `rest_audit.hpp`'s "null/empty audit_fn is not a persistence
+    /// failure" contract. Not all 8 sub-areas are wired to it: only the four
+    /// judged high/mixed-high sensitivity in #4028's Evidence section
+    /// (tls, https, plugin-signing, analytics) call it; the other four
+    /// (gateway, server-config, mcp, data-retention — "nothing secret" per
+    /// the same Evidence section) issue no audit call at all, matching the
+    /// unaudited posture the existing `/fragments/settings/*` HTML renderers
+    /// for those four already have today.
+    using AuditReadFn =
+        std::function<bool(const httplib::Request&, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail)>;
+
     /// Callback to get agents JSON from AgentRegistry (avoids incomplete-type dep).
     using AgentsJsonFn = std::function<std::string()>;
 
@@ -126,7 +150,7 @@ public:
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                          yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         StepUpFn step_up_fn = {});
+                         StepUpFn step_up_fn = {}, AuditReadFn audit_read_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesized requests directly,
@@ -145,7 +169,7 @@ public:
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                          yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         StepUpFn step_up_fn = {});
+                         StepUpFn step_up_fn = {}, AuditReadFn audit_read_fn = {});
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -252,6 +276,7 @@ private:
     AdminFn admin_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;
+    AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};

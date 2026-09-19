@@ -148,7 +148,7 @@ struct QuarantineRouteHarness {
                             /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
-                            /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, scoped_fn);
     }
 

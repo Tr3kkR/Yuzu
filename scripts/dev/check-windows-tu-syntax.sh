@@ -54,7 +54,12 @@ SHIM
 tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
     agents/plugins/power_health/src/power_health_plugin.cpp
+    agents/plugins/autoruns/src/autoruns_win.cpp
+    agents/plugins/peripherals/src/peripherals_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
+    agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
+    agents/core/src/dism_bounded_call.cpp
+    agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
@@ -75,6 +80,21 @@ for candidate in vcpkg_installed/*/include; do
     fi
 done
 
+# autoruns_win.cpp transitively includes autoruns_parsers.hpp, which parses
+# Task Scheduler XML via real libxml2 (<libxml/parser.h>, <libxml/tree.h>) --
+# same rationale as the nlohmann case just above: libxml2's real headers are
+# triplet-independent and genuinely needed (not a handful of calls a shim
+# could faithfully cover), so discover any populated vcpkg_installed copy
+# and skip gracefully when none is bootstrapped, rather than failing the
+# whole check or hand-rolling an XML-parser shim.
+libxml2_include=""
+for candidate in vcpkg_installed/*/include; do
+    if [ -d "$candidate/libxml2/libxml" ]; then
+        libxml2_include="$candidate/libxml2"
+        break
+    fi
+done
+
 rc=0
 for tu in "${tus[@]}"; do
     [ -f "$tu" ] || { echo "  SKIP  $tu (not present)"; continue; }
@@ -88,11 +108,18 @@ for tu in "${tus[@]}"; do
             echo "  SKIP  $tu (needs nlohmann/json.hpp — bootstrap vcpkg_installed to check it)"
             continue
         fi
-        extra_inc=(-I "$nlohmann_include")
+        extra_inc+=(-I "$nlohmann_include")
+    fi
+    if grep -lq "libxml/parser.h" "$src_dir"/*.hpp "$src_dir"/*.cpp 2>/dev/null; then
+        if [ -z "$libxml2_include" ]; then
+            echo "  SKIP  $tu (needs libxml/parser.h — bootstrap vcpkg_installed to check it)"
+            continue
+        fi
+        extra_inc+=(-I "$libxml2_include")
     fi
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
         -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
-        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include -I agents/core/include \
+        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
         "${extra_inc[@]}" "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else

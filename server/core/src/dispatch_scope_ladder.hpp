@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -15,8 +16,10 @@
 #include "authz_model.hpp"
 #include "custom_properties_store.hpp"
 #include "dispatch_confined_arms.hpp"
+#include "dispatch_route_fallback.hpp"
 #include "dispatch_target_shape.hpp"
 #include "execution_tracker.hpp"
+#include "gateway_route_store.hpp"
 #include "management_group_store.hpp"
 #include "result_set_store.hpp"
 #include "scope_engine.hpp"
@@ -208,6 +211,7 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
 
@@ -230,6 +234,7 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
 
@@ -251,6 +256,7 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     outcome.not_sent = r.not_sent;
     outcome.unknown_plugin = r.unknown_plugin;
     outcome.unknown_plugin_count = r.unknown_plugin_count;
+    outcome.route_unreadable = r.route_unreadable;
     return outcome;
 }
 
@@ -286,7 +292,13 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     const std::string& scope_expr, const yuzu::server::authz::VisibleSet& exec_visible,
     bool broadcast_on_none, const ContainmentGate& gate,
     const yuzu::server::detail::ClassifiedCommand& cmd, const std::string& definition_id = {},
-    const std::string& concurrency_mode = {}) {
+    const std::string& concurrency_mode = {},
+    // WS-4 4.2b Task C: trailing, defaulted-null so every existing caller
+    // (including every test in test_dispatch_confined_arms.cpp) is
+    // unaffected — a null store means `GatewayRouteFallback::prepare` is a
+    // pure no-op (see its own doc comment) and behaviour is byte-identical
+    // to before this slice.
+    GatewayRouteStore* gateway_route_store = nullptr) {
     DispatchResolvers resolvers;
     resolvers.group_members_fn = [mgmt_group_store](const std::string& group_id) {
         std::vector<std::string> members;
@@ -325,10 +337,26 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
             audit);
     };
 
+    // WS-4 4.2b Task C: one fallback instance per dispatch (never an
+    // AgentRegistry/ServerImpl member — see dispatch_route_fallback.hpp's
+    // file header). Shared, via shared_ptr capture, between `send_to` (the
+    // per-id consult) and `prepare_route_fallback` (the batched read).
+    auto route_fallback =
+        std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
     yuzu::server::ConfinedDispatchSink sink{
-        [&registry, &cmd](const std::string& aid) { return registry.send_to(aid, cmd); },
+        [&registry, &cmd, route_fallback](const std::string& aid) {
+            // A local session ALWAYS wins (route_fallback->prepare() never
+            // even looks up an id with one) — this fallback fires ONLY for a
+            // candidate this replica has no local session for at all.
+            if (auto cluster = route_fallback->cluster_for(aid))
+                return registry.send_via_directory(aid, cmd, *cluster);
+            return registry.send_to(aid, cmd);
+        },
         [&registry, &cmd] { return registry.send_to_all(cmd); },
-        [&registry] { return registry.all_ids(); }};
+        [&registry] { return registry.all_ids(); },
+        [route_fallback](const std::vector<std::string>& candidates) {
+            return route_fallback->prepare(candidates);
+        }};
 
     // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`
     // (built once by the caller before this function runs) -- never

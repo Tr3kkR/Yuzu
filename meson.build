@@ -289,6 +289,27 @@ endif
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'],
   required: true, include_type: 'system')
 
+# libxml2 — real XML parsing for the autoruns plugin's Task Scheduler XML
+# (agents/plugins/autoruns) and its portable test TU (both include
+# autoruns_parsers.hpp, which parses via libxml2 unconditionally on every
+# platform, not just Windows), AND for server/core's Windows-deferred SAML
+# feature (server/core/meson.build reuses this SAME declaration rather than
+# re-declaring it — do not add a second libxml2_dep anywhere; one global
+# declaration, reused by every consumer). Declared here at root scope,
+# UNCONDITIONALLY (no host_machine.system() guard) because autoruns needs it
+# on every platform including Windows, even though SAML's own consumption of
+# it is Windows-deferred — that gate says nothing about whether libxml2
+# itself links on Windows. It does: libxml2 is not in
+# triplets/x64-windows.cmake's static-linkage override list (scoped to
+# abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only, the #375 landmine), so
+# it resolves as an ordinary dynamic DLL + import lib on Windows, same shape
+# as sqlite3/libpq/openssl above.
+libxml2_dep = dependency('LibXml2', method: 'cmake', modules: ['LibXml2::LibXml2'],
+  required: false, include_type: 'system')
+if not libxml2_dep.found()
+  libxml2_dep = dependency('libxml-2.0', required: true, include_type: 'system')
+endif
+
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
 # ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
 # (-Dbuild_server=false) and cross builds must not require libpq at configure.
@@ -348,6 +369,48 @@ if host_os == 'darwin'
   corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
   grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
+
+  # ── Endpoint Security (shared probe, A0) ────────────────────────────────────
+  # CORRECTION (A0 governance fix round): EndpointSecurity is NOT an
+  # `.framework` bundle -- it ships as `usr/lib/libEndpointSecurity.tbd` +
+  # `usr/include/EndpointSecurity/` in BOTH the Command Line Tools SDK and the
+  # full Xcode SDK. The `dependency('appleframeworks', modules:
+  # ['EndpointSecurity'])` probe below therefore NEVER succeeds on any SDK --
+  # it always falls to the `else` branch below, so the real ES client never
+  # compiles today. The correct probe (`cxx.find_library('EndpointSecurity')`
+  # + `cxx.has_header('EndpointSecurity/EndpointSecurity.h')`) is a separate,
+  # deliberately isolated behaviour change -- see the follow-up slice
+  # (feat/macos-spark-a0.5-es-probe) rather than this comment-only fix. This
+  # is the SINGLE probe site for every ES consumer in the tree: TAR's process
+  # stream (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp)
+  # both consume endpoint_security_dep/_deps/_args instead of probing
+  # independently (a shared full ES client lands in a later slice). Found:
+  # real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks
+  # because the ES client passes an Objective-C block literal to
+  # es_new_client, which Apple Clang does not enable by default for a .cpp
+  # TU) and libbsm links (audit_token_to_pid / audit_token_to_ruid). Absent:
+  # every consumer's #if-guarded no-op path is used instead -- see
+  # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
+  endpoint_security_dep = dependency('appleframeworks', modules: ['EndpointSecurity'],
+                                     required: false, include_type: 'system')
+  endpoint_security_deps = []
+  endpoint_security_args = []
+  if endpoint_security_dep.found()
+    endpoint_security_deps += endpoint_security_dep
+    endpoint_security_deps += cxx.find_library('bsm')
+    endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
+  else
+    # rd-1 (governance A0 round-4, MEDIUM): this branch fires on EVERY host,
+    # SDK present or not -- see the accurate CORRECTION comment 8 lines above
+    # (the appleframeworks probe can never find EndpointSecurity, because it
+    # is not a `.framework` bundle). The previous wording here ("EndpointSecurity
+    # SDK not found") claimed the opposite and could resurrect the exact
+    # "needs full Xcode SDK" myth this A0 slice exists to correct.
+    message('EndpointSecurity probe cannot succeed on this SDK shape (appleframeworks '
+          + 'has no EndpointSecurity.framework to find -- see the CORRECTION comment '
+          + 'above; the SDK itself may well have the lib+header pair) -- ES-dependent '
+          + 'code compiles as a no-op on this host.')
+  endif
 
   # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
   # Meson has no user-defined functions, so "template" here means: the parts
@@ -419,59 +482,74 @@ subdir('sdk')
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')
+  # build_examples gates ONLY the four genuinely decorative demo plugins
+  # below -- every other plugin is a real, shipped capability (several are
+  # unconditional link_depends of tests/meson.build's yuzu_agent_tests
+  # target) and must build regardless of this flag (#4262). Verified via
+  # a grep sweep of every subdir name against the rest of the tree before
+  # narrowing this list -- `netstat` (a real `attribution` action + a
+  # dedicated real-plugin-by-path test) and `status` (a
+  # dashboard-consumed key-value plugin) were the two closest calls and
+  # are real, shipped plugins, not demos.
   if build_examples
     subdir('agents/plugins/example')
     subdir('agents/plugins/chargen')
     subdir('agents/plugins/procfetch')
-    subdir('agents/plugins/netstat')
     subdir('agents/plugins/netprobe')
-    subdir('agents/plugins/status')
-    subdir('agents/plugins/device_identity')
-    subdir('agents/plugins/os_info')
-    subdir('agents/plugins/hardware')
-    subdir('agents/plugins/users')
-    subdir('agents/plugins/installed_apps')
-    subdir('agents/plugins/msi_packages')
-    subdir('agents/plugins/network_config')
-    subdir('agents/plugins/diagnostics')
-    subdir('agents/plugins/agent_actions')
-    subdir('agents/plugins/processes')
-    subdir('agents/plugins/services')
-    subdir('agents/plugins/filesystem')
-    subdir('agents/plugins/filesystem_posture')
-    subdir('agents/plugins/windows_updates')
-    subdir('agents/plugins/disk_actions')
-    subdir('agents/plugins/disk_space')
-    subdir('agents/plugins/event_logs')
-    subdir('agents/plugins/sccm')
-    subdir('agents/plugins/script_exec')
-    subdir('agents/plugins/software_actions')
-    subdir('agents/plugins/network_diag')
-    subdir('agents/plugins/network_actions')
-    subdir('agents/plugins/firewall')
-    subdir('agents/plugins/antivirus')
-    subdir('agents/plugins/bitlocker')
-    subdir('agents/plugins/vuln_scan')
-    subdir('agents/plugins/tags')
-    subdir('agents/plugins/asset_tags')
-    subdir('agents/plugins/quarantine')
-    subdir('agents/plugins/certificates')
-    subdir('agents/plugins/ioc')
-    subdir('agents/plugins/storage')
-    subdir('agents/plugins/interaction')
-    subdir('agents/plugins/agent_logging')
-    subdir('agents/plugins/http_client')
-    subdir('agents/plugins/content_dist')
-    subdir('agents/plugins/registry')
-    subdir('agents/plugins/rdp_control')
-    subdir('agents/plugins/wmi')
-    subdir('agents/plugins/tar')
-    subdir('agents/plugins/wifi')
-    subdir('agents/plugins/wol')
-    subdir('agents/plugins/discovery')
-    subdir('agents/plugins/license_scan')
-    subdir('agents/plugins/power_health')
   endif
+  subdir('agents/plugins/netstat')
+  subdir('agents/plugins/status')
+  subdir('agents/plugins/device_identity')
+  subdir('agents/plugins/os_info')
+  subdir('agents/plugins/hardware')
+  subdir('agents/plugins/users')
+  subdir('agents/plugins/installed_apps')
+  subdir('agents/plugins/msi_packages')
+  subdir('agents/plugins/network_config')
+  subdir('agents/plugins/diagnostics')
+  subdir('agents/plugins/agent_actions')
+  subdir('agents/plugins/processes')
+  subdir('agents/plugins/services')
+  subdir('agents/plugins/filesystem')
+  subdir('agents/plugins/filesystem_posture')
+  subdir('agents/plugins/windows_updates')
+  subdir('agents/plugins/disk_actions')
+  subdir('agents/plugins/disk_space')
+  subdir('agents/plugins/event_logs')
+  subdir('agents/plugins/sccm')
+  subdir('agents/plugins/script_exec')
+  subdir('agents/plugins/software_actions')
+  subdir('agents/plugins/network_diag')
+  subdir('agents/plugins/network_actions')
+  subdir('agents/plugins/firewall')
+  subdir('agents/plugins/antivirus')
+  subdir('agents/plugins/bitlocker')
+  subdir('agents/plugins/vuln_scan')
+  subdir('agents/plugins/tags')
+  subdir('agents/plugins/asset_tags')
+  subdir('agents/plugins/quarantine')
+  subdir('agents/plugins/certificates')
+  subdir('agents/plugins/ioc')
+  subdir('agents/plugins/storage')
+  subdir('agents/plugins/interaction')
+  subdir('agents/plugins/agent_logging')
+  subdir('agents/plugins/http_client')
+  subdir('agents/plugins/content_dist')
+  subdir('agents/plugins/registry')
+  subdir('agents/plugins/rdp_control')
+  subdir('agents/plugins/wmi')
+  subdir('agents/plugins/tar')
+  subdir('agents/plugins/wifi')
+  subdir('agents/plugins/wol')
+  subdir('agents/plugins/discovery')
+  subdir('agents/plugins/license_scan')
+  subdir('agents/plugins/power_health')
+  subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
+  subdir('agents/plugins/windows_optional_features')  # Wave 9 PR9.2b
+  subdir('agents/plugins/peripherals')  # Wave 9 PR9.1a
+  subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
+  subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
+  subdir('agents/plugins/printing')  # Wave 9 PR9.1b
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────
@@ -501,15 +579,31 @@ endif
 # ── Capability-matrix generator (PR1.1 / #2204; IT-2) ────────────────────────
 # Placed AFTER the build_fuzzers endif — OUTSIDE that conditional (PLAN-04: an
 # insert right after subdir('tests/fuzz') would bury it inside the fuzzer gate
-# and normal CI would never build it). Guarded on build_agent (the tool
-# dlopens the built plugin shared objects to read their ABI4 descriptors) AND
-# build_examples (build-ci B1: with no agents/plugins/*/ subdirs configured
-# there is nothing for the generator to inspect — building it anyway would
-# leave scripts/ci/check-capability-matrix.sh looking for plugin artifacts
-# that were never going to exist).
-if build_agent and build_examples
+# and normal CI would never build it). Guarded on build_agent alone (the tool
+# dlopens the built plugin shared objects to read their ABI4 descriptors) —
+# every real plugin now builds unconditionally under build_agent regardless
+# of build_examples (#4262), so there is always something for the generator
+# to inspect; the former build_examples half of this guard predated that fix
+# and no longer applies.
+if build_agent
   subdir('tools/capmatrix-gen')
+  # plugin-capture (docs/plugin-readme-standard.md rule 5): same guard, same
+  # reason — it exists to run the built plugins.
+  subdir('tools/plugin-capture')
 endif
+
+# docs-regen: rewrite every plugin README fence, the user-manual plugin index,
+# the site nav fragment and the content/plugin-docs manifests from the
+# committed sources (docs/plugin-readme-standard.md rule 9). Pure Python over
+# the checked-in tree — no build products are read, so it is a run_target
+# rather than a custom_target and never enters the default build graph.
+run_target('docs-regen',
+  command: [
+    find_program('python3', 'python'),
+    files('tools/plugin-doc-gen/plugin_doc_gen.py'),
+    '--all', '--repo-root', meson.project_source_root(),
+  ],
+)
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)

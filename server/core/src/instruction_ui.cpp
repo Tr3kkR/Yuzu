@@ -152,7 +152,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   <a href="/guardian" class="nav-link">Guardian</a>
   <a href="/dex" class="nav-link">DEX</a>
   <a href="/tar" class="nav-link">TAR</a>
-  <a href="/inventory" class="nav-link">Inventory</a>
+  <a href="/hardware" class="nav-link">Hardware</a>
+  <a href="/software" class="nav-link">Software</a>
   <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
   <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
@@ -914,9 +915,9 @@ extern const char* const kInstructionEditorHtml = R"HTM(
                 </div>
                 <div class="form-group">
                     <label>Concurrency Mode</label>
-                    <select name="concurrency_mode" title="Only Per-device is enforced (ADR-1007), and only for dispatch that names this definition (POST /api/instructions/:id/execute or a schedule) — a raw MCP/REST command, or an explicit Broadcast/all-fleet dispatch, is never gated. The other modes are accepted and stored but currently have no effect.">
+                    <select name="concurrency_mode" title="Only Per-device is enforced (ADR-1007), and only for POST /api/instructions/:id/execute — a raw MCP/REST command, an explicit Broadcast/all-fleet dispatch, or a SCHEDULED fire (as of WS-3 3.3 scheduled fires go through the durable command outbox and are NOT concurrency-gated) is never gated. The other modes are accepted and stored but currently have no effect.">
                         <option value="unlimited" {{SEL_CC_UNLIM}}>Unlimited</option>
-                        <option value="per-device" {{SEL_CC_DEV}}>Per-device (enforced for definition-driven dispatch)</option>
+                        <option value="per-device" {{SEL_CC_DEV}}>Per-device (enforced only for POST /api/instructions/:id/execute, not scheduled fires)</option>
                         <option value="per-definition" {{SEL_CC_DEF}}>Per-definition (not enforced)</option>
                         <option value="per-set" {{SEL_CC_SET}}>Per-set (not enforced)</option>
                         {{SEL_CC_OTHER_OPTION}}

@@ -1,7 +1,9 @@
 #include "discover_routes.hpp"
 
 #include "agent_registry.hpp"
+#include "bundled_content.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
 
@@ -14,6 +16,75 @@ namespace yuzu::server {
 namespace {
 
 using json = nlohmann::json;
+
+// Parsed once, shared by plugin_docs_catalog() and the /discover/plugins join.
+// A manifest that fails to parse is skipped and COUNTED — the catalog reports
+// `skipped_invalid` so an embed defect is visible to the reader, never a
+// silent gap — although embed_content.py already refuses to emit one, so the
+// count is expected to stay 0.
+DiscoveryDoc build_discovery_doc(json body); // forward decl: PluginDocsIndex below needs it
+                                               // per-manifest, ahead of its definition at file scope.
+
+struct PluginDocsIndex {
+    std::vector<json> manifests; // embed order (name-sorted by the embedder)
+    std::unordered_map<std::string, json> summary_by_name;
+    // Per-plugin manifest, pre-serialised with its own content ETag — same
+    // builder/idiom as the whole-catalog doc, so REST/MCP twins for
+    // /discover/plugin-docs/{name} serve byte-identical bytes to the matching
+    // plugins[] element (#4108).
+    std::unordered_map<std::string, DiscoveryDoc> manifest_by_name;
+    int skipped_invalid{0};
+};
+
+const PluginDocsIndex& plugin_docs_index() {
+    static const PluginDocsIndex idx = [] {
+        PluginDocsIndex out;
+        for (const auto& text : kBundledPluginDocs) {
+            auto m = json::parse(text, nullptr, /*allow_exceptions=*/false);
+            // The generator always writes name, description, platforms and
+            // readme; a manifest missing any of them is not one it produced, so
+            // it is skipped and counted rather than repaired here (the path
+            // rule has one home: plugin_doc_gen.py). Every key this index reads
+            // is checked here — nlohmann's value() throws on a present key of
+            // the wrong type, and a throw from this initialiser would 500
+            // every surface built on this index (the whole-catalog and
+            // per-plugin REST routes, the matching MCP resource and resource
+            // template, and the discover_plugins join) on every request.
+            const auto is_str = [&m](const char* key) {
+                return m.contains(key) && m[key].is_string();
+            };
+            const auto is_obj = [&m](const char* key) {
+                return m.contains(key) && m[key].is_object();
+            };
+            if (m.is_discarded() || !m.is_object() || !is_str("name") || !is_str("readme") ||
+                !is_str("description") || !is_obj("platforms") || !is_obj("kind")) {
+                ++out.skipped_invalid;
+                spdlog::warn("discover/plugin-docs: skipping embedded manifest #{} ({}…): not a JSON "
+                             "object with string name/description/readme and object platforms/kind",
+                             out.manifests.size() + out.skipped_invalid, text.substr(0, 64));
+                continue;
+            }
+            const std::string name = m["name"].get<std::string>();
+            // The summary is what discover_plugins joins per plugin: enough for
+            // an agentic caller to decide whether to read the full resource —
+            // what it is, whether it mutates, where it runs, where the README is.
+            // "resource" names the narrow per-plugin read path (#4108), not the
+            // whole catalog, matching the summary's own stated purpose.
+            json summary = {
+                {"summary", m["description"]},
+                {"kind", m["kind"]},
+                {"platforms", m["platforms"]},
+                {"readme", m["readme"]},
+                {"resource", "yuzu://plugin-docs/" + name},
+            };
+            out.summary_by_name.emplace(name, std::move(summary));
+            out.manifest_by_name.emplace(name, build_discovery_doc(m));
+            out.manifests.push_back(std::move(m));
+        }
+        return out;
+    }();
+    return idx;
+}
 
 // FNV-1a 64-bit content hash -> a strong ETag, same idiom as
 // guardian_schema_registry.cpp's content_etag (not shared directly — that
@@ -168,6 +239,23 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
 
     json arr = json::array();
     for (const auto& d : defs) {
+        // #2437-class guard: parameter_schema is stored VERBATIM at write
+        // time (instruction_store.cpp import path) with no depth check
+        // until this branch's own write-side guard shipped - a row written
+        // before that, or via any other write path, still reaches this
+        // read. nlohmann::json::parse handles very deep input fine, so
+        // parsed.is_object() below would be true and the poisoned tree
+        // would be moved into this array unnoticed; build_discovery_doc's
+        // body.dump() further down is the unboundedly recursive call that
+        // would then SIGSEGV the whole catalog response for every OTHER
+        // definition too. Exclude the poisoned definition instead of
+        // crashing the build; log its id, never its payload.
+        if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("discover/instructions: excluding instruction definition {} - "
+                         "parameter_schema nests too deeply (#2437-class)",
+                         d.id);
+            continue;
+        }
         json param_schema; // null unless the stored value parses as a JSON object
         auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
         // Attach only an OBJECT schema — a stored value that parses to
@@ -346,6 +434,43 @@ const DiscoveryDoc& scope_kinds_catalog() {
 
 // ── /discover/plugins ───────────────────────────────────────────────────────
 
+const DiscoveryDoc& plugin_docs_catalog() {
+    static const DiscoveryDoc doc = [] {
+        const auto& idx = plugin_docs_index();
+        json body = {
+            {"catalog", "plugin-docs"},
+            {"version", 1},
+            {"source", "build-embedded"},
+            {"description",
+             "Per-plugin documentation as data: one manifest per agent plugin that has "
+             "adopted the README standard (docs/plugin-readme-standard.md), generated by "
+             "tools/plugin-doc-gen from agents/plugins/<name>/README.md and embedded at build "
+             "time. Each manifest carries how the plugin works, per-OS support/rung/mechanism "
+             "per action, privileges, inputs, output columns with vocabularies, sample rows, "
+             "caveats and source paths. Compiled-in content only — never fleet-derived. A "
+             "plugin absent here has not adopted the standard yet; GET /discover/plugins "
+             "reports docs:null for it. Same bytes as the MCP resource yuzu://plugin-docs."},
+            {"plugin_count", idx.manifests.size()},
+            {"skipped_invalid", idx.skipped_invalid},
+            {"plugins", idx.manifests},
+        };
+        return build_discovery_doc(std::move(body));
+    }();
+    return doc;
+}
+
+const json* plugin_docs_summary(std::string_view plugin_name) {
+    const auto& idx = plugin_docs_index();
+    auto it = idx.summary_by_name.find(std::string{plugin_name});
+    return it == idx.summary_by_name.end() ? nullptr : &it->second;
+}
+
+const DiscoveryDoc* plugin_docs_manifest(std::string_view plugin_name) {
+    const auto& idx = plugin_docs_index();
+    auto it = idx.manifest_by_name.find(std::string{plugin_name});
+    return it == idx.manifest_by_name.end() ? nullptr : &it->second;
+}
+
 DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry,
                                    InstructionStore* instruction_store) {
     auto help = json::parse(agent_registry.help_json(), nullptr, /*allow_exceptions=*/false);
@@ -376,6 +501,19 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
             for (const auto& d : *defs_result) {
                 if (d.plugin.empty() || d.action.empty())
                     continue;
+                // #2437-class guard: same hazard as build_instructions_catalog
+                // above - a too-deep stored parameter_schema would otherwise be
+                // moved into schema_by_action below, spliced into an action's
+                // entry further down, and crash on this catalog's own
+                // build_discovery_doc dump(). Skip enrichment for just this
+                // action rather than the whole catalog build; log the
+                // definition id, never its payload.
+                if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+                    spdlog::warn("discover/plugins: excluding parameter_schema enrichment for "
+                                "instruction definition {} - nests too deeply (#2437-class)",
+                                d.id);
+                    continue;
+                }
                 auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
                 // Attach only an OBJECT schema — a stored value that parses to
                 // null/number/array/string is not a usable JSON Schema (UP-9).
@@ -405,15 +543,34 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
         }
     }
 
+    // Documentation join (docs/plugin-readme-standard.md rule 10): every
+    // observed plugin carries a build-embedded `docs` summary when a manifest
+    // exists for it, else an explicit null — so a reader can tell "documented,
+    // read yuzu://plugin-docs" from "not yet documented" without a second
+    // request. Catalog version 3 (2 -> 3: the `docs` key).
+    if (plugins.is_array()) {
+        for (auto& p : plugins) {
+            if (!p.is_object())
+                continue;
+            const auto* summary = plugin_docs_summary(p.value("name", ""));
+            p["docs"] = summary ? *summary : json(nullptr);
+        }
+    }
+
     json body = {
-        {"version", 2},
+        {"version", 3},
         {"description",
          "Plugin/action catalog observed across currently-connected agents "
          "(deduplicated by plugin name; the richest reported action list wins). "
          "NOT a build-time manifest — a plugin no currently-connected agent "
          "reports is absent from this list. To dispatch an action, call "
          "execute_instruction / POST /api/v1/instructions/execute with its "
-         "plugin+action; supply the params from parameter_schema where present."},
+         "plugin+action; supply the params from parameter_schema where present. "
+         "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
+         "readme, resource} when the plugin has adopted the README standard, else "
+         "null; resource names that plugin's own GET /discover/plugin-docs/<name> / "
+         "yuzu://plugin-docs/<name> for the full manifest, or read the whole catalog "
+         "at GET /discover/plugin-docs / yuzu://plugin-docs."},
         {"limitation",
          "An action carries an inline parameter_schema ONLY when it has a "
          "published InstructionDefinition (matched on plugin+action). Actions "
@@ -509,6 +666,35 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  serve_doc(req, res, scope_kinds_catalog(), DocAudience::Everyone);
+             });
+
+    // Plugin README standard (docs/plugin-readme-standard.md rule 10): the
+    // build-embedded per-plugin manifests. Static like scope-kinds — no store,
+    // answers during warmup — and caller-independent, so publicly cacheable.
+    sink.Get("/api/v1/discover/plugin-docs",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Infrastructure", "Read"))
+                     return;
+                 serve_doc(req, res, plugin_docs_catalog(), DocAudience::Everyone);
+             });
+
+    // Per-plugin narrow read (#4108): same manifest_by_name builder as the MCP
+    // resource template yuzu://plugin-docs/{name}. Gate BEFORE the lookup so a
+    // denied caller learns nothing about which plugin names exist.
+    sink.Get(R"(/api/v1/discover/plugin-docs/([^/]+))",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Infrastructure", "Read"))
+                     return;
+                 const auto* doc = plugin_docs_manifest(req.matches[1].str());
+                 if (!doc) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "no documentation manifest for that plugin",
+                                                       {.remediation = "GET /api/v1/discover/plugin-docs "
+                                                                       "lists the documented plugins"}),
+                                     "application/json");
+                     return;
+                 }
+                 serve_doc(req, res, *doc, DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/plugins",

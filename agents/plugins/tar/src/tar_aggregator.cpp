@@ -8,6 +8,7 @@
 
 #include "tar_aggregator.hpp"
 #include "tar_schema_registry.hpp"
+#include "tar_usage.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -18,6 +19,7 @@
 #include <ctime>
 #include <format>
 #include <limits>
+#include <tuple>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -164,6 +166,35 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // tri-state ("errored" is "not validly enabled") makes the recovery clear it.
     const std::string_view prev_canon = canonical_source_enabled(prev);
     auto paused_at_key = std::format("{}_paused_at", source);
+
+    // `usage` (Wave 7 PR7.2b): every side effect of an enable/disable edge --
+    // the flag write, paused_at, and the activation-generation bump that
+    // forces a fresh baseline before the NEXT fold -- commits as ONE checked
+    // transaction (yuzu::tar::usage::usage_set_enabled, tar_usage.cpp). This
+    // is `usage`'s own path around the #2490 discarded-write gap every
+    // OTHER source below still has (out of scope to fix generally here): a
+    // failed persist refuses the transition outright rather than report
+    // success while the flag silently did not move. `usage` has no
+    // snapshot-diff baseline (diff_state_key maps nothing for it) and needs
+    // no marker-clear of its own -- the generation bump on the disable leg
+    // already invalidates the current activation, so a later re-enable
+    // always lands PendingBaseline (tar_usage.hpp's file banner), never a
+    // retrospective fold over whatever accrued during the pause.
+    if (source == "usage") {
+        if (new_value != "true" && new_value != "false")
+            return false; // usage has no "errored" writer path; defensive only
+        if (prev_canon == new_value)
+            return true; // idempotent re-assert -- nothing to invalidate
+        if (!yuzu::tar::usage::usage_set_enabled(db, new_value == "true", now_epoch))
+            return false;
+        if (new_value == "true") {
+            // Boot, configure (here), and every fast tick all call this SAME
+            // function -- see tar_usage.hpp. Best-effort: run_usage_fold()
+            // retries on every fast tick if this attempt fails.
+            std::ignore = yuzu::tar::usage::usage_ensure_baselined(db, now_epoch);
+        }
+        return true;
+    }
 
     if (new_value == "false" && prev_canon != "false") {
         // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
@@ -605,6 +636,81 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         persist_failed = true;
     }
 
+    // Shared clock-guard decision for ONE time-based table's OWN population --
+    // factored out (Wave 7 PR7.2b) so `usage_daily_user` can run through the
+    // IDENTICAL probe/Facts/classify/guard-bookkeeping logic as every
+    // registry-driven table below, keyed by its own table_name in `guard`,
+    // WITHOUT sharing a verdict derived from a different table's population
+    // (round 2 finding: it used to run only inside usage_daily's own
+    // per-pass iteration, sharing that parent's guard verdict despite an
+    // independent, typically larger, cap -- so once the smaller parent
+    // drained first, the child's backlog could be permanently stranded with
+    // no path ever reaching it again). Returns true iff this table's delete
+    // should proceed this pass; false covers decline, no-op (nothing
+    // expired), and unreadable alike -- the caller does not need to
+    // distinguish them, only `plans`/counters do, and this function already
+    // recorded whichever applies.
+    auto decide_time_based_table = [&](const std::string& table_name, std::string_view ts_col,
+                                       int64_t cutoff, int64_t horizon) -> bool {
+        auto has_expired = exists_where(db, table_name, std::format("{} < {}", ts_col, cutoff));
+        auto has_survivor = exists_where(
+            db, table_name, std::format("{} BETWEEN {} AND {}", ts_col, cutoff, horizon));
+
+        std::lock_guard lock(guard.mu);
+        if (!has_expired || !has_survivor) {
+            ++guard.failures[table_name];
+            guard.last_reported.erase(table_name);
+            ++unreadable_tables;
+            return false;
+        }
+        if (!*has_expired) {
+            guard.last_reported.erase(table_name);
+            return false;
+        }
+
+        const bool would_wipe = !*has_survivor;
+        const int64_t step_threshold = kTarMinBigStepSec;
+        const bool big_step = prev_pass_now && now_epoch - *prev_pass_now > step_threshold;
+        const bool no_anchor = !prev_pass_now;
+        const audit_retention::Facts facts{.has_expired = true,
+                                           .would_wipe = would_wipe,
+                                           .big_step = big_step,
+                                           .prev_unusable = prev_implausible,
+                                           .no_anchor = no_anchor};
+        const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
+        const auto reported = guard.last_reported.find(table_name);
+        const bool already_reported =
+            reported != guard.last_reported.end() && reported->second == facts;
+
+        if (anomaly != audit_retention::Anomaly::None && !already_reported) {
+            if (anomaly != audit_retention::Anomaly::NoAnchor)
+                guard.last_reported[table_name] = facts;
+            else
+                guard.last_reported.erase(table_name);
+            ++guard.declines[table_name];
+            ++declined_tables;
+            spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, no_anchor={}, "
+                          "{}s since last pass, threshold {}s)",
+                          table_name, would_wipe, prev_implausible, no_anchor,
+                          prev_pass_now ? now_epoch - *prev_pass_now : 0, step_threshold);
+            return false;
+        }
+
+        bool cap_will_bind = false;
+        if (would_wipe) {
+            const auto more = exists_where(
+                db, table_name,
+                std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
+                            kMaxTarDeletesPerTablePerPass));
+            cap_will_bind = !more || *more;
+        }
+        if (would_wipe && cap_will_bind)
+            guard.last_reported[table_name] = facts;
+        else
+            guard.last_reported.erase(table_name);
+        return true;
+    };
+
     for (const auto& src : capture_sources()) {
         // #539: Skip retention for disabled sources. The configure docstring and
         // user-manual promise that disabling a collector "leaves existing rows
@@ -673,173 +779,44 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             const std::string ts_col{ts_column_for_suffix(g.suffix)};
             const int64_t horizon = now_epoch + kTarRetentionFutureSlackSec;
 
-            // Two yes/no questions, not two counts.
-            //
-            // `would_wipe` was `datable > 0 && expired == datable`. Since a row
-            // older than `cutoff` is necessarily at or below `now + slack`
-            // (cutoff < now < horizon), every expired row is also datable -- so
-            // `datable > 0` is implied by `expired > 0` and was dead, and
-            // `expired == datable` is exactly "no datable row survives the
-            // cutoff". That reduces to a single EXISTS over the half-open band
-            // [cutoff, horizon], which short-circuits on the first survivor
-            // instead of counting the whole table.
-            //
-            // The upper bound is what excludes rows stamped implausibly far
-            // ahead: they can never be too old, so letting one answer the
-            // question would disarm the guard for the life of the endpoint.
-            auto has_expired = exists_where(db, table_name, std::format("{} < {}", ts_col, cutoff));
-            auto has_survivor = exists_where(
-                db, table_name, std::format("{} BETWEEN {} AND {}", ts_col, cutoff, horizon));
-
-            std::lock_guard lock(guard.mu);
-            if (!has_expired || !has_survivor) {
-                // Fail closed: a probe we could not read is not evidence that
-                // deleting is safe. Skip the table this pass, count the failure,
-                // and RE-ARM the guard -- carrying a recorded fact set across a
-                // failed pass would let the next pass that really would wipe the
-                // table delete with no decline and no counter. Same rule the
-                // audit store applies to its own probe failures.
-                ++guard.failures[table_name];
-                guard.last_reported.erase(table_name);
-                ++unreadable_tables; // aggregated into ONE warn below
-                continue;
-            }
-            if (!*has_expired) {
-                // Nothing to delete, so nothing to guard against -- and the
-                // anomaly this table's entry covered is over. Same rule the
-                // accepting path applies below.
-                guard.last_reported.erase(table_name);
-                continue;
+            if (decide_time_based_table(table_name, ts_col, cutoff, horizon)) {
+                // Capped, oldest-first. Every warehouse table has `id INTEGER
+                // PRIMARY KEY` plus an `idx_{table}_{ts_col}` index
+                // (generate_warehouse_ddl), so the subquery is an index scan,
+                // not a sort.
+                plans.push_back(Plan{table_name,
+                                     std::format("DELETE FROM {} WHERE id IN ("
+                                                 "SELECT id FROM {} WHERE {} < {} "
+                                                 "ORDER BY {} ASC, id ASC LIMIT {})",
+                                                 table_name, table_name, ts_col, cutoff, ts_col,
+                                                 kMaxTarDeletesPerTablePerPass)});
             }
 
-            const bool would_wipe = !*has_survivor;
-            // Supplement, not a replacement. The outcome test only fires when a
-            // jump exceeds this table's WHOLE retention window, AND it is
-            // defeated by any row written after the jump -- which `do_rollup`
-            // reliably produces, since run_aggregation runs first and mints rows
-            // into these very tables. The step check is durable across restarts
-            // (see above), so it is what actually covers the wrong-RTC case.
-            // ABSOLUTE, not derived from the tier's retention window -- same
-            // correction as the audit sibling. max(window, floor) made the
-            // threshold a YEAR on the monthly tier, so the check could never fire
-            // there. How far the clock moved is unrelated to how long that tier
-            // keeps rows.
-            const int64_t step_threshold = kTarMinBigStepSec;
-            const bool big_step =
-                prev_pass_now && now_epoch - *prev_pass_now > step_threshold;
-
-            // NO TRUSTED ANCHOR is its own decline trigger, exactly as on the
-            // audit sibling. Without it the guard had a bootstrap hole covering
-            // the case it exists for: on the first pass after an agent upgrade
-            // or a restore there is no stored reading, so `big_step` is false by
-            // construction, and `do_rollup` runs `run_aggregation` FIRST and
-            // mints fresh rows into these very tables -- which makes
-            // `would_wipe` false too. Every trigger false, so an endpoint that
-            // boots with a dead RTC deletes up to the cap on every table with no
-            // decline and no counter, then persists the bad clock as the anchor.
-            // That is the dead-CMOS endpoint this guard was written for
-            // (#2361, Sol adversarial review).
-            const bool no_anchor = !prev_pass_now;
-            // Deliberately raw anchor-PRESENCE, not a verdict-scoped marker
-            // (`audit_retention_rules.hpp`'s own doc comment names this exact
-            // pattern and says NOT to use it -- `Facts::no_anchor` documents
-            // "the audit store passes !bootstrap_settled here", a durable flag
-            // settled only once a verdict is actually reached). TAR has no
-            // per-table verdict-scoped marker to pass instead: the anchor is
-            // ONE store-wide `tar_config` key shared by every table, written
-            // unconditionally near the top of this function before any table's
-            // outcome is known. The gap this could in principle open -- a table
-            // reading `no_anchor=false` because SOME earlier pass populated the
-            // shared anchor, even if THIS table itself never reached a verdict
-            // on that pass -- is bounded by `run_aggregation` running first
-            // every tick (see the comment above): a table with anything to
-            // decide always gets fresh data to decide it with. The recording
-            // rule below is what actually protects TAR's own bootstrap
-            // fail-safe (never recording NoAnchor); this raw-presence choice is
-            // a narrower, deliberate divergence, not the same one.
-            const audit_retention::Facts facts{.has_expired = true, // guaranteed above
-                                               .would_wipe = would_wipe,
-                                               .big_step = big_step,
-                                               .prev_unusable = prev_implausible,
-                                               .no_anchor = no_anchor};
-            const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
-            const auto reported = guard.last_reported.find(table_name);
-            const bool already_reported =
-                reported != guard.last_reported.end() && reported->second == facts;
-
-            if (anomaly != audit_retention::Anomaly::None && !already_reported) {
-                // #2573: the dedup key is the WHOLE fact set, not a single bool,
-                // so a DIFFERENT anomaly arriving while one is already recorded
-                // reports again instead of deleting silently (MEASURED: a bool
-                // latch cannot carry anomaly identity).
-                //
-                // NoAnchor is the one exception, and deliberately NOT recorded.
-                // The audit sibling needs no such carve-out because its
-                // bootstrap-settled write commits in the SAME transaction as
-                // the verdict; TAR's anchor persist (further up, `set_config`)
-                // is independent of this map, so if it keeps failing,
-                // `no_anchor` stays true forever -- recording it would make
-                // every later identical pass a suppressed drain, silently
-                // defeating the fail-safe this trigger exists to provide. A
-                // stale non-NoAnchor entry is also cleared here: it cannot
-                // still be valid once the verdict classifies as NoAnchor.
-                if (anomaly != audit_retention::Anomaly::NoAnchor)
-                    guard.last_reported[table_name] = facts;
-                else
-                    guard.last_reported.erase(table_name);
-                ++guard.declines[table_name];
-                ++declined_tables;
-                spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, no_anchor={}, "
-                              "{}s since last pass, threshold {}s)",
-                              table_name, would_wipe, prev_implausible, no_anchor,
-                              prev_pass_now ? now_epoch - *prev_pass_now : 0, step_threshold);
-                continue;
+            // usage_daily_user (Wave 7 PR7.2b): an INDEPENDENTLY reachable
+            // retention target, not a piggyback on usage_daily's verdict
+            // (round 2 finding #4 -- see decide_time_based_table's own
+            // comment for why sharing a verdict across two tables with
+            // different caps and typically very different cardinality
+            // permanently strands the child once the smaller parent
+            // drains). Same 31-day window as usage_daily
+            // (docs/clock-guarded-retention.md), its own probes, its own
+            // Facts, its own entry in `guard` keyed by "usage_daily_user".
+            // No `id` column (see tar_db.cpp's v6 migration) so the delete
+            // is keyed on its composite PRIMARY KEY instead of the generic
+            // id-ordered form every other table above uses.
+            if (src.name == "usage" && g.suffix == "daily") {
+                ++time_based_tables;
+                const std::string user_table = "usage_daily_user";
+                constexpr std::string_view user_ts_col = "day_ts";
+                if (decide_time_based_table(user_table, user_ts_col, cutoff, horizon)) {
+                    plans.push_back(Plan{
+                        user_table,
+                        std::format("DELETE FROM usage_daily_user WHERE (day_ts, exe_key, user) "
+                                    "IN (SELECT day_ts, exe_key, user FROM usage_daily_user "
+                                    "WHERE day_ts < {} ORDER BY day_ts ASC LIMIT {})",
+                                    cutoff, kMaxTarDeletesPerTablePerPass)});
+                }
             }
-            // Accepted: either no anomaly, or a suppressed repeat of the fact
-            // set already recorded for this table -- either way the pass
-            // proceeds, paced by the cap below.
-            //
-            // Keep the entry recorded only while the wipe condition is STILL
-            // BEING WORKED OFF: it held AND the cap will leave rows behind.
-            // Keying purely on `would_wipe` left an entry recorded after a pass
-            // that drained the whole backlog (#2361 Gate 8 / Sol) -- a fresh
-            // identical anomaly arriving before the next 900s tick would then
-            // be indistinguishable from the just-finished one and silently
-            // suppressed.
-            //
-            // The probe asks whether a (cap+1)th expired row exists: bounded,
-            // index-driven, and only for a table already in the wipe condition.
-            //
-            // UNREADABLE defaults to "yes", i.e. KEEP the entry recorded, which
-            // PERMITS the next delete. That is the one default here that leans
-            // toward deleting; every other unknown in this guard leans toward
-            // preserving. It is safe because it cannot grant permission from
-            // nothing -- `would_wipe` implies an anomaly, so reaching here with
-            // it true means an entry was already recorded -- and cheap to be
-            // wrong about: clearing it would at worst give alternate-pass
-            // deletion on a quiet table, while an active one mints fresh rows
-            // via `run_aggregation` and deletes at full rate regardless.
-            bool cap_will_bind = false;
-            if (would_wipe) {
-                const auto more = exists_where(
-                    db, table_name,
-                    std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
-                                kMaxTarDeletesPerTablePerPass));
-                cap_will_bind = !more || *more;
-            }
-            if (would_wipe && cap_will_bind)
-                guard.last_reported[table_name] = facts;
-            else
-                guard.last_reported.erase(table_name);
-            // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
-            // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl),
-            // so the subquery is an index scan, not a sort.
-            plans.push_back(Plan{table_name,
-                                 std::format("DELETE FROM {} WHERE id IN ("
-                                             "SELECT id FROM {} WHERE {} < {} "
-                                             "ORDER BY {} ASC, id ASC LIMIT {})",
-                                             table_name, table_name, ts_col, cutoff, ts_col,
-                                             kMaxTarDeletesPerTablePerPass)});
         }
     }
 

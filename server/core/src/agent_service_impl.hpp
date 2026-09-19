@@ -49,6 +49,7 @@ class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
+class AppUsageStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -204,6 +205,9 @@ public:
     void set_software_licensing_store(SoftwareLicensingStore* store) {
         software_licensing_store_ = store;
     }
+    /// Typed per-agent last-used app-usage projection (Wave 7 PR7.2, ADR-0016
+    /// §5) — receives the app_usage daily-sync source via ReportInventory.
+    void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
     /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
@@ -366,6 +370,18 @@ public:
                                                     bool client_identity_matches,
                                                     const std::vector<std::string>& trusted_nat_cidrs);
 
+    /// The metadata key carrying the session id on the direct Subscribe path
+    /// (see Subscribe's own use below). Public — HA WS-4 4.1's
+    /// GatewayUpstreamServiceImpl::ProxyRegister reuses this SAME key + reader
+    /// to recognise a gateway circuit-recovery replay, so the two paths cannot
+    /// silently drift onto different metadata keys.
+    static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
+
+    /// Read a single gRPC client-metadata value by key, or empty if absent.
+    /// Public for the same reason as `kSessionMetadataKey` above.
+    static std::string client_metadata_value(const grpc::ServerContext& context,
+                                             std::string_view key);
+
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
 
@@ -392,7 +408,6 @@ private:
     auth::AutoApproveEngine& auto_approve_;
     yuzu::MetricsRegistry& metrics_;
 
-    static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
 
     // -- PendingRegistration (must be complete before use in unordered_map) -----
@@ -534,6 +549,7 @@ private:
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
+    AppUsageStore* app_usage_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};
@@ -555,8 +571,6 @@ private:
     static std::string extract_peer_cert_pem(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
                                                const std::string& agent_id);
-    static std::string client_metadata_value(const grpc::ServerContext& context,
-                                             std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);
 

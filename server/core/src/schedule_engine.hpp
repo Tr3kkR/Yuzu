@@ -63,6 +63,27 @@ struct ScheduleQuery {
     bool enabled_only{false};
 };
 
+/// Honest counterpart to the older `query_schedules()` (kept as-is for the
+/// pre-existing dashboard fragment): `std::unexpected` distinguishes a real
+/// store failure (engine not open / pool exhausted / query error) from a
+/// genuinely empty table, which the older method collapses into the same
+/// empty vector either way. #4030 review finding: REST v1 `GET
+/// /api/v1/schedules` and MCP `list_schedules` were built on the older
+/// method and could not tell their caller "the store failed" from "there are
+/// no schedules" — see docs/user-manual/rest-api.md's schedules section.
+///
+/// `truncated` is a second, independent #4030 review finding: the query is
+/// hard-capped at `kScheduleListCap` rows (schedule_engine.cpp) with no
+/// caller-visible limit/cursor, so a fleet with more schedules than the cap
+/// silently loses the alphabetical tail. `truncated` tells REST/MCP callers
+/// when that happened so they can say so (precedent: MCP query_responses's
+/// `result_truncated_by_cap`) instead of presenting the capped count as the
+/// true total.
+struct ScheduleListResult {
+    std::vector<InstructionSchedule> schedules;
+    bool truncated{false};
+};
+
 class ScheduleEngine {
 public:
     explicit ScheduleEngine(pg::PgPool& pool);
@@ -80,6 +101,15 @@ public:
     void stop();
 
     std::vector<InstructionSchedule> query_schedules(const ScheduleQuery& q = {}) const;
+
+    /// #4030 review finding (blocking): the machine-facing REST v1/MCP
+    /// twins need to distinguish "the store failed" from "there are no
+    /// schedules" — `query_schedules()` above cannot, by design, for its
+    /// existing HTML-fragment caller (a human viewing "No schedules
+    /// configured" tolerates the ambiguity a machine consumer cannot).
+    std::expected<ScheduleListResult, std::string>
+    query_schedules_checked(const ScheduleQuery& q = {}) const;
+
     std::expected<std::string, std::string> create_schedule(const InstructionSchedule& sched);
 
     /// Owner-scoped delete (M-01, #1806): `created_by` is REQUIRED (no

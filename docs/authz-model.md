@@ -324,6 +324,75 @@ Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read
 day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
 this PR.
 
+## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (34th/35th securables)
+
+Two more securables appended to `rbac_store.cpp`'s `types[]` (33→35) and its `mcp_server.cpp`
+mirror (`kRbacSecurables`):
+
+| Securable | Purpose | Consumed operations | Roles |
+|---|---|---|---|
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator only. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — a forensic read is never a Viewer-tier operation |
+| `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
+
+`Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005
+twin-existence exception #2102). It is still listed in `kRbacSecurables` purely so the
+seeded-catalogues binding test (`test_rbac_store.cpp`, "seeded catalogues match the MCP C8
+validator mirrors") keeps the two mirrors equal; no MCP tool or dispatch path ever checks it.
+
+**Forensics is SINGLE-TARGET, not Destructive-classified.** `dispatch_destructive_gate.hpp`'s
+`requires_explicit_targets` extends the existing Destructive-class targeting rule to any row on
+the `Forensics` securable: exactly one explicit, in-scope `agent_id`, no `scope` key (including
+`"__all__"`) — a fan-out (zero ids, more than one id, or any scope) is refused with a distinct
+message (`kForensicUntargetedMessage`) from the Destructive refusal
+(`kDestructiveUntargetedMessage`, unchanged byte-for-byte). A Forensics row that passes
+(`Targeted`) is still run through `confine_destructive_targets`: **mgmt-group confinement APPLIES
+to the read** — a forensic read never reaches an agent outside the operator's visible set, and the
+existing 404 `no reachable in-scope agent` answers an out-of-group id, same as a Destructive row.
+
+**The single exception to the rule just stated, and it is narrow and explicit:**
+`ScheduleRunner`'s approval-gated fan-out (D3 in `dispatch_destructive_gate.hpp`) runs a
+DIFFERENT dispatch path from the three route handlers `requires_explicit_targets` gates — a
+scheduled fire never reaches `evaluate_destructive_targeting` at all, so this rule neither narrows
+that path nor widens what any of those three route handlers themselves accept. An approved
+scheduled forensics read remains permitted by the schedule-approval posture alone (four-eyes at
+schedule-creation time), never by a broadcast exemption carved into this targeting gate. No other
+surface may cite this exception; every other caller of a Forensics-classified row stays
+single-target, no exceptions.
+
+**`execution_artifacts` — planned, not yet built.** This PR ships the `Forensics` securable and
+its single-target dispatch rule with zero registered consumers: no plugin, no
+`capability_decls/*.hpp` row classifies anything `Forensics` yet. `execution_artifacts` (a future
+companion package, referenced elsewhere in this codebase only as a forward-looking name and as a
+synthetic fixture string in `test_dispatch_destructive_gate.cpp`) is planned to be the first
+Forensics-class plugin, but its default-off posture, its kill-switch mechanism, and its enable
+endpoint are planned, not yet designed in detail — there is no `seed_kill_switch_default_off` (or
+equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
+infrastructure only.
+
+**Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
+The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
+to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
+`usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is designed to be
+reachable only through that surface (see the residual read-path caveat below). It is deliberately
+unreachable through the generic `tar.sql` endpoint (`Infrastructure:Read`,
+`plugin_action_catalogue_a.hpp`): the three usage tables are excluded from `is_queryable_table()`'s
+allowlist in `tar_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
+access path to them — direct name, `$Usage_*` placeholder, alias, JOIN, or subquery — with the same
+no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked this gap; closed by
+this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
+above and closes without a code change.
+
+**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
+*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
+window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
+path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
+from that window — or a failed purge — stays readable via the far lower-privileged
+`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
+architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
+comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
+in favor of purge-on-upgrade over a read-time filter.
+
 ## Testing
 
 `tests/unit/server/test_authz_model.cpp` covers:

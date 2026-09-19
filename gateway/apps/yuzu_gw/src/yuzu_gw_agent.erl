@@ -44,7 +44,14 @@
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
-    peer_addr   :: binary()
+    peer_addr   :: binary(),
+    %% Opaque random id minted ONCE per process instance (HA WS-4, #4324) —
+    %% stamped on both the CONNECTED (init/1) and DISCONNECTED (do_cleanup)
+    %% StreamStatusNotification this process ever sends, so the server can
+    %% fence a stale DISCONNECTED from a torn-down placement against a
+    %% newer re-home reusing the same session id. NOT a counter — must stay
+    %% collision-safe across gateway nodes and mixed-version clusters.
+    stream_home_id :: binary()
 }).
 
 %%%===================================================================
@@ -85,6 +92,13 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% still works — replay just skips agents whose req is empty.
     RegisterReq = maps:get(register_req, Args, #{}),
 
+    %% Opaque per-process-instance id (HA WS-4, #4324): minted once here,
+    %% never regenerated, and reused verbatim on the DISCONNECTED
+    %% notification in do_cleanup/1. A CSPRNG value, not a counter —
+    %% erlang:unique_integer/1 was rejected as per-BEAM-node and therefore
+    %% collision-prone across gateway cluster nodes.
+    StreamHomeId = string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16))),
+
     %% Monitor the stream handler process.
     StreamMon = case StreamPid of
         undefined -> undefined;
@@ -101,7 +115,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         plugins     = Plugins,
         pending     = #{},
         connected_at = erlang:system_time(millisecond),
-        peer_addr   = PeerAddr
+        peer_addr   = PeerAddr,
+        stream_home_id = StreamHomeId
     },
 
     %% Register in routing table and join pg groups. The RegisterRequest
@@ -126,7 +141,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
                 [AgentId, PeerAddr, SessionId]),
 
     %% Notify C++ server about the stream connection.
-    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                           StreamHomeId),
 
     case StreamPid of
         undefined -> {ok, connecting, Data};
@@ -288,11 +304,27 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
                                       #{agent_id => AgentId, plugin => Plugin, status => Status}),
-                    %% Notify router so it can complete the fanout.
-                    case whereis(yuzu_gw_router) of
-                        undefined  -> ok;
-                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-                    end,
+                    %% Notify the router that is actually TRACKING this
+                    %% fanout. HA WS-4 4.3a fix: that router lives on the
+                    %% DISPATCHING node, which — once cross-node routing
+                    %% exists (`yuzu_gw_registry:lookup/1`'s `pg` fallback)
+                    %% — is not necessarily THIS (the agent process's) node.
+                    %% `ReplyTo` is the fanout's `CallerPid` (mgmt-service
+                    %% handler process, `yuzu_gw_router.erl`'s `#fanout.from`),
+                    %% always co-located with its own node's `yuzu_gw_router`
+                    %% (`yuzu_gw_router.erl`'s `?SERVER` is a LOCAL-only
+                    %% `gen_server:start_link({local, ...})`) — so
+                    %% `node(ReplyTo)` names the right node. The prior local
+                    %% `whereis(yuzu_gw_router)` silently no-oped on a
+                    %% cross-node dispatch (this agent's OWN node's router,
+                    %% which was never tracking a fanout it didn't originate),
+                    %% stranding the fanout until the 300s `fanout_timeout`
+                    %% fallback — invisible until cross-node routing made this
+                    %% reachable. `{Name, Node} ! Msg` is fire-and-forget: an
+                    %% unreachable node or unregistered name is silently
+                    %% dropped, matching the previous local `undefined -> ok`
+                    %% no-op semantics exactly.
+                    {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId},
                     maps:remove(CmdId, Pending)
             end,
             {keep_state, Data#data{pending = Pending2}};
@@ -304,7 +336,7 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
 
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
-                  peer_addr = PeerAddr}) ->
+                  peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
     %% Deregister from routing table and pg groups.
     yuzu_gw_registry:deregister_agent(AgentId),
 
@@ -312,10 +344,9 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
     %% and notify router so it can complete fanout tracking.
     maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
         ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
-        case whereis(yuzu_gw_router) of
-            undefined -> ok;
-            RouterPid -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-        end
+        %% HA WS-4 4.3a fix: route to the DISPATCHING node's router, same
+        %% reasoning as handle_stream_response/2 above.
+        {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId}
     end, Pending),
 
     Duration = case ConnectedAt of
@@ -327,11 +358,14 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                       #{count => 1, duration_ms => Duration},
                       #{agent_id => AgentId, reason => normal}),
 
-    %% Notify C++ server.
+    %% Notify C++ server. Same StreamHomeId minted at CONNECTED (init/1) —
+    %% never a freshly-minted value — so the server can match this
+    %% DISCONNECTED to the placement it actually tears down (HA WS-4).
     yuzu_gw_upstream:notify_stream_status(AgentId,
                                            SessionId,
                                            disconnected,
-                                           PeerAddr),
+                                           PeerAddr,
+                                           StreamHomeId),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,

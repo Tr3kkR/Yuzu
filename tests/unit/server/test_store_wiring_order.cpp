@@ -271,14 +271,22 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
         R"(,\s*(?:std::move\()?response_visible_set_fn\)?\s*\))");
     CHECK(std::regex_search(text, wired_re));
 
-    // Exactly two occurrences of the identifier total: one definition, one
-    // use. A THIRD occurrence would mean a second, possibly divergent, copy
-    // was introduced somewhere -- this codebase's established anti-pattern
-    // this test's own file header (and response_scope_filter.hpp elsewhere)
-    // explicitly warns against duplicating a chokepoint like this one.
+    // #4033 (#2146 Batch A): the SAME resolver instance now has THREE
+    // consumers -- DashboardRoutes::register_routes (original, #1712),
+    // RestApiV1::register_routes (GET /api/v1/management-groups/agent-count-
+    // preview), and McpServer::set_response_visible_set_fn
+    // (preview_management_group_agent_count) -- one definition + three uses =
+    // 4 occurrences. This is deliberate CONVERGENCE, not the divergent-copy
+    // anti-pattern the original 2-occurrence floor guarded against: all three
+    // surfaces share the identical std::function so REST, MCP, and the
+    // dashboard fragment cannot disagree on scope for the same caller
+    // (docs/api-twin-recipe.md Rule 1). A FIFTH occurrence (a second,
+    // independently-defined `response_visible_set_fn` variable, or a fourth
+    // consumer wired to a DIFFERENT resolver under the same name) would still
+    // be the anti-pattern this floor exists to catch.
     static const std::regex occurrence_re(R"(\bresponse_visible_set_fn\b)");
     auto count = static_cast<std::ptrdiff_t>(
         std::distance(std::sregex_iterator(text.begin(), text.end(), occurrence_re),
                       std::sregex_iterator()));
-    CHECK(count == 2);
+    CHECK(count == 4);
 }

@@ -264,7 +264,7 @@ gate.
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
 - **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
   `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
-  (`server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
+  (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
   Gate 2 review and deliberately deferred to a dedicated issue rather than folded into that PR.
   **DONE (#3789, closed):** all seven migrated onto `require_fleet_read`/`authz::in_scope`, matching
   the `GET /api/v1/executions/{id}` shape documented in `docs/auth-architecture.md`'s "Fourth

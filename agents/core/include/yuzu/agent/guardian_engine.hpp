@@ -63,11 +63,13 @@ class CommandRequest;
 namespace yuzu::agent {
 class SparkEngine;
 class GuardianSparkRuntime;
+class GuardianArmAckLedger;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
 struct GuardianJournalStats;
 struct GuardianJournalAgeStats;
+struct GuardianArmStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -90,7 +92,8 @@ namespace yuzu::agent {
 #  define YUZU_WORKER_MUTEX_GUARD 1
 #endif
 
-/// True iff taking GuardianEngine::mtx_ on a thread stop() joins aborts the process.
+/// True iff taking GuardianEngine::mtx_ on a thread stop() joins, or on a detached
+/// GuardianIoExecutor worker (rung 9c R5.1), aborts the process.
 [[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
 #ifdef YUZU_WORKER_MUTEX_GUARD
     return true;
@@ -191,6 +194,52 @@ public:
     /// engine because prefer_spark_ is deliberately not exposed; the heartbeat just forwards
     /// whatever this returns.
     [[nodiscard]] std::optional<GuardianJournalAgeStats> journal_age_stats() const;
+
+    /// rung 9c PR-3: a re-statable snapshot of the ack ledger's CURRENT
+    /// application (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed - see
+    /// guardian_arm_heartbeat.hpp's GuardianArmStats for the field semantics and
+    /// emit_guardian_arm_heartbeat_tags for the emission posture). Returns nullopt
+    /// while the signal is dormant: `prefer_spark_` false, the engine stopped, Spark
+    /// itself unavailable (Unwired/SparkFailed/SparkDisabled), or the ledger has no
+    /// current application yet.
+    ///
+    /// ALL FOUR conditions are LOAD-BEARING, not belt-and-braces (Check A,
+    /// ~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md Decision 1;
+    /// governance fix, adversarial review CODEX-1/K1 - the original shipped gate
+    /// checked only `prefer_spark_`, silently emitting a false-present-healthy
+    /// {0,0} pair whenever Spark was stopped or unavailable while prefer_spark_
+    /// stayed true, which is the READIEST state at cutover for exactly this to
+    /// matter): unlike journal_age_stats() above, whose dormancy the drain-worker's
+    /// own zero-timestamp check would eventually catch even without the flag,
+    /// ack_ledger_->arm_stats() alone cannot tell "spark dormant" from "spark live,
+    /// currently clean" - GuardianEngine::apply_rules() calls
+    /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY on every push,
+    /// regardless of prefer_spark_, so a legacy (non-spark) agent has a live,
+    /// empty Application (pending={}, resolved_failed=0) exactly like a spark
+    /// agent with nothing currently pending or failed - the ledger's own
+    /// arm_stats() now separately returns nullopt only when there is genuinely NO
+    /// current application (see guardian_arm_ack.hpp), which is a DIFFERENT
+    /// absence reason than any of the three engine-level ones above and must stay
+    /// additive to them, not a substitute. Reading `prefer_spark_` alone as
+    /// sufficient - or `current_ != nullptr` as sufficient - would each make some
+    /// reachable agent state emit arm_pending=0/arm_failed=0 - read by a fleet
+    /// consumer as "spark arming, healthy" - when nothing is actually being
+    /// observed. This four-way check is what prevents that in every reachable
+    /// state, not just the one that happens to be live in every released agent
+    /// today.
+    [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
+
+    /// rung 9c PR-3 (Decision 3, Option B): the arm/disarm executor's cumulative
+    /// physical-ceiling refusal count (R5.1's CeilingExhausted;
+    /// GuardianSparkRuntime::io_ceiling_rejections()), surfaced as
+    /// yuzu.guardian_io_arm_disarm_rejected_ceiling. A plain monitor-only
+    /// counter, zero when dormant or simply never hit - unlike arm_stats() above
+    /// this needs no prefer_spark_ dormancy gate: a zero count is equally
+    /// truthful whether spark is dormant or has just never hit the ceiling, so
+    /// there is no "always-present empty state" trap to gate around here. Zero
+    /// when prefer_spark is off / no runtime, matching
+    /// outbox_backpressure_drops()'s own shape.
+    [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
@@ -329,6 +378,22 @@ public:
         return lifecycle_journal_.get();
     }
 
+    /// TEST-ONLY: the spark runtime, for fault injection (e.g.
+    /// GuardianSparkRuntime::set_detach_fault_for_test - rung 9c PR-2 Unit 6's own
+    /// "full_sync teardown throws" regression net). Null until wire_spark_engine
+    /// runs. No production caller.
+    [[nodiscard]] GuardianSparkRuntime* spark_runtime_for_test() {
+        return spark_runtime_.get();
+    }
+
+    /// TEST-ONLY: the current application's still-pending accepted-arm count (see
+    /// GuardianArmAckLedger::pending_count_for_test) - lets a test settle on "every
+    /// arm the last apply_rules() push accepted has resolved" without reaching into
+    /// the ledger directly. Defined out-of-line (guardian_engine.cpp): GuardianArmAckLedger
+    /// is only forward-declared here. Takes mtx_ (matches every other _for_test
+    /// accessor that reads engine-owned state). No production caller.
+    [[nodiscard]] std::size_t ack_pending_count_for_test() const;
+
     /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
     /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
     /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
@@ -359,6 +424,21 @@ public:
         test_periodic_bound_ms_ = periodic_bound_ms;
         test_page_interval_ = page_interval;
         test_prune_interval_ = prune_interval;
+    }
+
+    /// TEST-ONLY: shrink the bounded wait `GuardianSparkRuntime::attach_rule()`/
+    /// `submit_disarm_off_lock()` place on their own backend arm/disarm claim
+    /// (`GuardianSparkRuntime::Config::backend_op_deadline`, production default 5s) —
+    /// a test can drive a deterministic "backend parked" scenario without a real
+    /// multi-second wait. MUST be called BEFORE wire_spark_engine(), which is what
+    /// constructs the runtime (the same ordering constraint as
+    /// set_drain_worker_timing_for_test above); a call afterward is silently inert.
+    /// `GuardianSparkRuntime::Config` is not usable here directly — this header only
+    /// forward-declares GuardianSparkRuntime (ABI boundary), so only the one field
+    /// tests actually need is threaded through; unset means "keep the production
+    /// default". No production caller.
+    void set_spark_backend_op_deadline_for_test(std::chrono::milliseconds deadline) {
+        test_spark_backend_op_deadline_ = deadline;
     }
 
     /// Spread this agent's journal-maintenance phase and its forced pages over their
@@ -417,6 +497,32 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
+    /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
+    /// attempt ended up with — empty if never armed as file-hash-equals, the
+    /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
+    /// if one existed for this rule_id/target. This is what
+    /// start_guard_for_rule_locked built INTO `FileGuard::Config` before calling
+    /// `start()` — set regardless of whether `start()` itself actually arms
+    /// (FileGuard is Windows-only for the MVP; off Windows this is the only
+    /// observable proof the seed-lookup ran and produced the right value, since no
+    /// FileGuard object survives to observe otherwise). Locked, returned by value
+    /// — same rationale as last_rearm_degrade_message_for_test above. No
+    /// production caller.
+    [[nodiscard]] std::string last_file_expected_hash_for_test() const;
+
+    /// Gate 3 quality-engineer follow-up (#4021): `last_file_expected_hash_for_test`
+    /// only proves the SEED lookup ran — it says nothing about whether the
+    /// CAPTURE callback (`FileGuard::Config::on_baseline`) was actually attached,
+    /// since a seeded (non-empty `expected_hash`) rule never re-enters the
+    /// capture branch at all. Set unconditionally, right after the assignment,
+    /// on every file-hash-equals arm attempt — true regardless of seeding, so a
+    /// test can assert the wiring itself happened (deleting the assignment
+    /// would otherwise leave every Linux test green, since no real FileGuard
+    /// runs off Windows to observe the callback firing). Locked, returned by
+    /// value — same rationale as the sibling accessors above. No production
+    /// caller.
+    [[nodiscard]] bool last_file_on_baseline_wired_for_test() const;
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -437,13 +543,20 @@ private:
     /// BasicLockable, so every `std::lock_guard lock(mtx_)` site is unchanged by CTAD.
     ///
     /// Holds NO reference to the worker: it asks a thread-local role marker
-    /// (on_guardian_drain_worker_thread()) instead. A pointer to the worker would have to
+    /// (on_guardian_joined_thread()) instead. A pointer to the worker would have to
     /// be read here BEFORE mu_ is held - an unsynchronised cross-thread read - and wiring
     /// rollback can destroy the worker while another thread holds that pointer, which made
     /// the safety device itself a use-after-free (#2298 Sol review).
     ///
     /// Aborts rather than asserts: `assert` is a no-op under NDEBUG, so a release build
     /// with sanitizers would have logged the violation and then walked into the deadlock.
+    ///
+    /// Second role, rung 9c R5.1 (guardian_detached_worker_role.hpp): a DETACHED
+    /// GuardianIoExecutor worker - either dispatch form, including the consumer-injected
+    /// on_abandoned/on_complete callback it runs after the backend call - is a different
+    /// hazard class (lock-vs-lifetime, not lock-vs-join: it can never be joined and may
+    /// outlive stop() or the F3 orphan grace) with the same remedy. The tripwire consults
+    /// both markers and names the role that fired.
     class WorkerHostileMutex {
     public:
         void lock() {
@@ -470,7 +583,16 @@ private:
 
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
-    void persist_generation_locked();
+    /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
+    /// success bool (false if kv_ is null) - callers publish policy_generation_
+    /// ONLY after a true return, never before, so a failed (or throwing - kv_->set()
+    /// is not noexcept) write leaves policy_generation_ at its prior value and the
+    /// caller's own advance condition (gen > policy_generation_) is still true next
+    /// time it is checked, retrying naturally with no separate bookkeeping needed
+    /// (coordinator finding, rung 9c PR-2 Unit 6 gate: the old void-returning form
+    /// let a failed or throwing persist strand policy_generation_ already advanced
+    /// with nothing durable behind it - a silent, permanent stop to server re-push).
+    [[nodiscard]] bool persist_generation_locked(std::uint64_t gen);
     /// Flush the runtime's staged lifecycle records to the durable journal (item 7
     /// PR-Ag). mtx_ held; snapshot → persist → erase-persisted-prefix, circuit-broken
     /// on the first write failure. prefer_spark_-gated (inert when spark is not the
@@ -517,7 +639,34 @@ private:
     /// count a genuine per-push arm failure (else a timed-out rule's push is
     /// silently treated as fully applied and the server never retries it) without
     /// also holding generation on routine/expected inert outcomes (#2233 item 3).
-    enum class ReconcileOutcome { Armed, Failed, Inert };
+    ///
+    /// Accepted (rung 9c PR-2): the rule was eligible and a spark arm attempt was
+    /// ACCEPTED — dispatched to the backend, OR queued behind an in-flight/retained
+    /// claim already occupying its key (R5.2's per-key claim/queue model: a queued
+    /// sibling is accepted without triggering its own backend submission) — but has
+    /// not yet resolved, as opposed to Armed (resolved, successfully). Named after
+    /// docs/spark-stage2-guardian-consumer-design.md §R5.3's own vocabulary
+    /// ("'Accepted' means reconcile_rule_locked() returned Accepted specifically —
+    /// the async-arm outcome, as opposed to Armed").
+    ///
+    /// Exception (rung 9c PR-5c, #4221 up-2): a same-rule_id/same-spec retry that
+    /// RE-OBSERVES an already-Wedged head is also Accepted, but its receipt is
+    /// ALREADY TERMINAL at registration time — no async resolution is pending for
+    /// it. The generation-hold gate still treats it like any other Accepted episode
+    /// (ack_ledger_->can_advance() reads the receipt's actual status), so it simply
+    /// resolves on the ledger's very next drain instead of waiting on anything new.
+    ///
+    /// Production status as of this comment (rung 9c PR-2 Unit 6): PRODUCED -
+    /// reconcile_rule_locked() calls GuardianSparkRuntime::attach_rule(NonWaiting{},
+    /// ...), so a rule whose arm is genuinely still in flight resolves to Accepted
+    /// here instead of waiting (bounded) for it. apply_rules' generation-hold gate
+    /// (ack_ledger_->can_advance()) treats it exactly like an unresolved episode
+    /// (holds the generation), never like Failed (it is not a failure) or like
+    /// Armed (it is not yet resolved) - the receipt itself is registered with
+    /// ack_ledger_ (guardian_arm_ack.hpp), which the heartbeat's
+    /// journal_maintenance_tick() drains and, once every accepted episode this
+    /// generation resolves, advances policy_generation_ from.
+    enum class ReconcileOutcome { Armed, Accepted, Failed, Inert };
 
     /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,
     /// replacing the direct start_guard_for_rule_locked call apply_rules and
@@ -572,6 +721,8 @@ private:
     std::uint64_t test_periodic_bound_ms_{0};
     std::chrono::milliseconds test_page_interval_{0};
     std::chrono::milliseconds test_prune_interval_{0};
+    /// TEST-ONLY (see set_spark_backend_op_deadline_for_test); nullopt = production default.
+    std::optional<std::chrono::milliseconds> test_spark_backend_op_deadline_;
     /// Maintenance phase/forced-page jitter (see set_maintenance_jitter). OFF unless the
     /// production wiring turns it on, so every test's cadence stays deterministic.
     bool maintenance_jitter_{false};
@@ -579,6 +730,12 @@ private:
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
     std::string last_rearm_degrade_message_for_test_;
+    /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
+    /// arm attempt has run yet.
+    std::string last_file_expected_hash_for_test_;
+    /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
+    /// file-hash-equals arm attempt has run yet.
+    bool last_file_on_baseline_wired_for_test_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
@@ -601,6 +758,16 @@ private:
     std::shared_ptr<GuardianStateReader> spark_reader_;
     std::shared_ptr<GuardianSparkEngineBackend> spark_backend_;
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
+    /// rung 9c PR-2 Unit 5/6 (§R5.3 ack bookkeeping): the current push's accepted-
+    /// but-unresolved arm episodes. Constructed unconditionally in the constructor
+    /// (no backend dependency, unlike spark_runtime_) - engine-owned, never null.
+    /// apply_rules() begins/feeds it; journal_maintenance_tick() drains it and
+    /// advances policy_generation_ once it can_advance(); stop() retires it.
+    std::unique_ptr<GuardianArmAckLedger> ack_ledger_;
+    /// rung 9c PR-2 Unit 6: a throw from ack_ledger_->drain_locked() or the
+    /// generation-advance it gates, caught on the bare heartbeat thread exactly
+    /// like journal_maint_exceptions_ below (same B4a firewall posture).
+    std::atomic<std::uint64_t> ack_maint_exceptions_{0};
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
     /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.
@@ -664,5 +831,20 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 /// by the #1307 regression test to assert the event_id embeds the agent_id.
 YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
                                               const GuardDrift& drift);
+
+/// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
+/// the persist-side overwrite guard and the seed-side lookup directly, since the
+/// real call site (`FileGuard::Config::on_baseline`) fires only from a running
+/// Windows-only guard worker thread — not exercisable end-to-end on this
+/// platform's tests. Both are thin forwarders into guardian_engine.cpp's
+/// anonymous-namespace `guardian_persist_baseline`/`guardian_seed_baseline`
+/// (internal linkage) — not friends, no GuardianEngine state involved. No
+/// production caller.
+YUZU_EXPORT void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                                    const std::string& fingerprint,
+                                                    const std::string& hash);
+YUZU_EXPORT std::optional<std::string>
+guardian_seed_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                const std::string& fingerprint);
 
 } // namespace yuzu::agent

@@ -1,4 +1,7 @@
 #include "instruction_store.hpp"
+#include "instruction_definition_model.hpp" // #4029: export_definition_json delegates to the shared builder
+#include "instruction_yaml.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -299,6 +302,26 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
     auto asn = yaml_scan::extract_yaml_section(yaml_source, "spec.assignment");
     return validate_scope_block(sb, yaml_scan::extract_yaml_value(asn, "mode"),
                                 !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+}
+
+// #2542 PR-7: promoted verbatim from ServerImpl::validate_yaml_source
+// (server.cpp) — see instruction_store.hpp's doc comment for why this is a
+// promotion, not a duplication (a #2557 json_extract.hpp-style call site
+// straddling an extraction boundary: /fragments/instructions/yaml-preview,
+// now in instruction_fragment_routes.cpp (#2542 PR-12), shares this exact
+// function).
+std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
+    // Shared with the POST /api/instructions/yaml save path so validate
+    // and save can never diverge on what a complete definition is (#1993).
+    auto errors = instruction_yaml::validate_definition_yaml(yaml_source);
+    // Also run the store-level gates (scope-walking combos, flow-mapping
+    // scope) that create/update enforce — same contract, one verdict
+    // (governance UP-3). Skip when byte-level errors already fired.
+    if (errors.empty()) {
+        if (auto err = validate_definition_scope(yaml_source))
+            errors.push_back(*err);
+    }
+    return errors;
 }
 
 // ---------------------------------------------------------------------------
@@ -742,33 +765,12 @@ InstructionStore::export_definition_json(const std::string& id) const {
     if (!*def)
         return std::string("{}");
 
-    nlohmann::json j;
-    j["id"] = (*def)->id;
-    j["name"] = (*def)->name;
-    j["version"] = (*def)->version;
-    j["type"] = (*def)->type;
-    j["plugin"] = (*def)->plugin;
-    j["action"] = (*def)->action;
-    j["description"] = (*def)->description;
-    j["enabled"] = (*def)->enabled;
-    j["instruction_set_id"] = (*def)->instruction_set_id;
-    j["gather_ttl_seconds"] = (*def)->gather_ttl_seconds;
-    j["response_ttl_days"] = (*def)->response_ttl_days;
-    j["created_by"] = (*def)->created_by;
-    j["created_at"] = (*def)->created_at;
-    j["updated_at"] = (*def)->updated_at;
-    j["yaml_source"] = (*def)->yaml_source;
-    j["parameter_schema"] = (*def)->parameter_schema;
-    j["result_schema"] = (*def)->result_schema;
-    j["approval_mode"] = (*def)->approval_mode;
-    j["concurrency_mode"] = (*def)->concurrency_mode;
-    j["platforms"] = (*def)->platforms;
-    j["min_agent_version"] = (*def)->min_agent_version;
-    j["required_plugins"] = (*def)->required_plugins;
-    j["readable_payload"] = (*def)->readable_payload;
-    j["visualization_spec"] = (*def)->visualization_spec;
-    j["response_templates_spec"] = (*def)->response_templates_spec;
-    return j.dump(2);
+    // #4029: delegates to the shared pure builder (instruction_definition_model.hpp)
+    // so this store's export format, GET /api/v1/instructions/{id}/export, and MCP
+    // export_definition are the same shape by construction — nlohmann::json's
+    // default (map-backed, key-sorted) container makes this dump(2) byte-identical
+    // to the field-by-field construction it replaces.
+    return instruction_definition_export_json(**def).dump(2);
 }
 
 std::expected<std::string, std::string>
@@ -783,6 +785,23 @@ InstructionStore::import_definition_json_trusted(const std::string& json_str) {
 
 std::expected<std::string, std::string>
 InstructionStore::import_definition_json_impl(const std::string& json_str, bool check_signature) {
+    // #2437-class guard: check nesting on the RAW body text BEFORE any parse
+    // of it runs. Two sub-trees copied verbatim from this body reach
+    // nlohmann::json::dump() below: visualization_spec via
+    // normalize_to_array_helper and response_templates_spec via
+    // normalise_templates_array. Rejecting here means the deep tree is never
+    // even parsed, closing both sinks at once (mirrors the guaranteed-state
+    // rule create/update guard's ordering in rest_api_v1.cpp). The
+    // JSON-encoded-STRING form of either field is a SEPARATE admission
+    // boundary (see the dedicated checks at their own re-parse sites below),
+    // because a string literal's bracket characters are invisible to this
+    // whole-body text scan by design (it must not count structure inside a
+    // string value).
+    if (mcp::json_exceeds_depth(json_str, mcp::kMcpMaxJsonDepth))
+        return std::unexpected(std::format(
+            "instruction-import request body nests too deeply (flatten to at most {} levels)",
+            mcp::kMcpMaxJsonDepth));
+
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
         return std::unexpected("invalid JSON");
@@ -908,8 +927,23 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
         def.created_by = parsed.value("created_by", "");
     if (parsed.contains("yaml_source"))
         def.yaml_source = parsed.value("yaml_source", "");
-    if (parsed.contains("parameter_schema"))
+    if (parsed.contains("parameter_schema")) {
         def.parameter_schema = parsed.value("parameter_schema", "{}");
+        // #2437-class guard: parameter_schema is stored VERBATIM as a
+        // caller-supplied string, with no re-serialization or validation at
+        // write time otherwise - unlike visualization_spec/
+        // response_templates_spec above, nothing here would ever dump() it
+        // at import time. The crash lands later, on the discover-catalog
+        // READ side (discover_routes.cpp), reached by a completely different
+        // caller than whoever imported it. Rejecting the too-deep string
+        // here at write time prevents new poison; discover_routes.cpp's own
+        // guard protects rows already written before this check shipped.
+        if (mcp::json_exceeds_depth(def.parameter_schema, mcp::kMcpMaxJsonDepth))
+            return std::unexpected(std::format(
+                "instruction-import parameter_schema nests too deeply (flatten to at most {} "
+                "levels)",
+                mcp::kMcpMaxJsonDepth));
+    }
     if (parsed.contains("result_schema"))
         def.result_schema = parsed.value("result_schema", "{}");
     if (parsed.contains("approval_mode"))
@@ -947,6 +981,21 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
         return std::nullopt;
     };
     if (auto v = pick_spec_field(); v) {
+        // #2437-class guard, string-form companion: the whole-body guard
+        // above scans raw text and correctly does NOT count brackets inside
+        // a string literal as structure, so a visualization_spec supplied as
+        // a JSON-ENCODED STRING reads as an ordinary shallow field there
+        // while its own decoded content, re-parsed by normalize_to_array
+        // just below, can nest arbitrarily deep. This is a SEPARATE
+        // admission boundary on the string's own text, checked before its
+        // internal re-parse.
+        if (v->is_string() &&
+            mcp::json_exceeds_depth(v->get_ref<const std::string&>(), mcp::kMcpMaxJsonDepth)) {
+            return std::unexpected(std::format(
+                "instruction-import visualization_spec nests too deeply (flatten to at most "
+                "{} levels)",
+                mcp::kMcpMaxJsonDepth));
+        }
         def.visualization_spec = normalize_to_array(*v);
     }
 
@@ -996,6 +1045,20 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                              "string exceeds {} bytes; dropped (governance sec-M4 / UP-15)",
                              kMaxImportTemplateStringBytes);
                 def.response_templates_spec = "[]";
+            } else if (mcp::json_exceeds_depth(s, mcp::kMcpMaxJsonDepth)) {
+                // #2437-class guard, string-form companion (see the
+                // visualization_spec sibling check above): the 256 KiB cap
+                // just above leaves comfortably enough room for well over
+                // 100,000 levels of nesting, and this string's own decoded
+                // content is re-parsed just below. Rejects the WHOLE import
+                // outright - unlike the oversized/invalid-JSON siblings
+                // here, which drop the field and let the import proceed, a
+                // too-deep string is evidence of a hostile payload, not a
+                // benign-but-oversized one.
+                return std::unexpected(std::format(
+                    "instruction-import response_templates_spec nests too deeply (flatten to "
+                    "at most {} levels)",
+                    mcp::kMcpMaxJsonDepth));
             } else {
                 auto inner = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
                 if (inner.is_discarded()) {

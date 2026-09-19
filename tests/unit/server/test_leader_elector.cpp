@@ -12,6 +12,7 @@
 // exercises runtime dispatch — this binds the coordination primitive alone.
 
 #include "leader_elector.hpp"
+#include "leader_gate.hpp"
 
 #include "pg/pg_raii.hpp"
 
@@ -21,14 +22,18 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
+using yuzu::server::background_job_class;
 using yuzu::server::LeaderElector;
 using yuzu::server::kServerBackgroundLeaderLock;
+using yuzu::server::leader_gate_permits;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgResult;
 
@@ -242,6 +247,125 @@ TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elect
     CHECK(a.heartbeat()); // leader, connection live
     a.resign();
     CHECK_FALSE(a.heartbeat()); // resigned
+}
+
+TEST_CASE("LeaderElector heartbeat drops leadership after its backend is terminated (#4013)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.try_acquire());
+    REQUIRE(a.is_leader());
+
+    // Kill a's dedicated backend out from under it (leaving the killer alone).
+    auto killer = connect(db.dsn());
+    PgResult k{PQexec(killer.get(),
+                      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                      "WHERE datname = current_database() AND pid <> pg_backend_pid()")};
+    REQUIRE(k.status() == PGRES_TUPLES_OK);
+
+    // pg_terminate_backend signals ASYNCHRONOUSLY — the victim session may still
+    // answer one more SELECT 1 before it tears down, so poll heartbeat() to false
+    // with a deadline rather than asserting the very first call fails (adversarial
+    // review K4). The first false drops leadership + reconnects; epoch_ is then
+    // nullopt so every subsequent heartbeat() stays false.
+    bool dropped = false;
+    for (int i = 0; i < 40 && !dropped; ++i) {
+        if (!a.heartbeat())
+            dropped = true;
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(dropped);
+    CHECK_FALSE(a.is_leader());
+    CHECK_FALSE(a.epoch().has_value());
+
+    // And it heals: a later acquire re-leads on the reconnected backend once the
+    // dead session's advisory lock is gone.
+    bool led = false;
+    for (int i = 0; i < 40 && !led; ++i) {
+        led = a.try_acquire();
+        if (!led)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(led);
+    CHECK(a.is_leader());
+    CHECK(a.epoch().has_value());
+}
+
+TEST_CASE("LeaderElector releases the advisory lock when epoch minting fails (#4013)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    // Break epoch minting: drop the sequence the acquire's nextval() needs. The
+    // session try-lock still SUCCEEDS, then the epoch INSERT fails — exactly the
+    // path that must RELEASE the lock rather than leak it (acquired-but-unrecorded).
+    auto admin = connect(db.dsn());
+    PgResult d{PQexec(admin.get(), "DROP SEQUENCE leader_elector.leader_epoch_seq")};
+    REQUIRE(d.status() == PGRES_COMMAND_OK);
+
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.is_open());
+    CHECK_FALSE(a.try_acquire()); // took the lock, failed to mint the epoch
+    CHECK_FALSE(a.is_leader());
+    CHECK_FALSE(a.epoch().has_value());
+
+    // Prove the lock did NOT leak: restore the sequence, and a SECOND elector can
+    // now acquire — only possible if a released the session advisory lock.
+    PgResult c{PQexec(admin.get(), "CREATE SEQUENCE leader_elector.leader_epoch_seq AS bigint")};
+    REQUIRE(c.status() == PGRES_COMMAND_OK);
+    LeaderElector b(cfg(db.dsn(), "holder-b"));
+    REQUIRE(b.is_open());
+    CHECK(b.try_acquire());
+    CHECK(b.is_leader());
+}
+
+TEST_CASE("leader_gate_permits gates a FencedLeaderOnly pass on live leadership",
+          "[pg][store][leader-elector][leader-gate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector e(cfg(db.dsn(), "holder-a"));
+    REQUIRE(e.is_open());
+    // Before acquiring: a FencedLeaderOnly pass is DENIED; a ReplicaSafe pass (the
+    // WS-2a event poll) runs regardless.
+    CHECK_FALSE(leader_gate_permits<background_job_class("schedule_runner.tick")>(&e));
+    CHECK(leader_gate_permits<background_job_class("execution_tracker.poll_event_outbox_once")>(&e));
+    // After acquiring leadership: the FencedLeaderOnly pass is now PERMITTED.
+    REQUIRE(e.try_acquire());
+    CHECK(leader_gate_permits<background_job_class("schedule_runner.tick")>(&e));
+    // Resign: denied again — the gate tracks live leadership.
+    e.resign();
+    CHECK_FALSE(leader_gate_permits<background_job_class("schedule_runner.tick")>(&e));
+}
+
+TEST_CASE("LeaderElector lock-free reads run concurrently with the election writer (TSan)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    LeaderElector e(cfg(db.dsn(), "holder-a"));
+    REQUIRE(e.is_open());
+    // Exercise the lock-free is_leader()/epoch() reader path (the worker-tick path)
+    // concurrently with the acquire/resign writer path (the election loop). The
+    // real value is under TSan (nightly): the release/acquire publish of live_epoch_
+    // must be race-free. Functionally we assert only liveness (no deadlock, the
+    // reader ran) and a QUIESCENT final consistency — is_leader() iff epoch(), read
+    // with NO writer running. We deliberately do NOT assert that consistency WHILE
+    // the writer runs: is_leader() and epoch() are two separate atomic loads, so
+    // they may legitimately straddle a concurrent acquire/resign, which is not a bug.
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            (void)e.is_leader();
+            (void)e.epoch();
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    for (int i = 0; i < 50; ++i) {
+        (void)e.try_acquire();
+        e.resign();
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+    CHECK(reads.load() > 0);                        // the reader actually ran
+    CHECK(e.is_leader() == e.epoch().has_value());  // quiescent: internally consistent
+    CHECK_FALSE(e.is_leader());                     // the last write was resign()
 }
 
 TEST_CASE("LeaderElector distinct lock names hold independent locks",

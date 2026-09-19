@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "command_capability.hpp"
+#include "dispatch_target_shape.hpp" // kReasonDestructiveUntargeted
 
 /// @file dispatch_destructive_gate.hpp
 /// #3685 — the pure Destructive-class TARGETING decision for `/api/command`
@@ -136,6 +138,23 @@
 /// `.claude/routed-concerns-access-control.md`'s "Dispatch targeting" row: a
 /// second copy of a chokepoint is exactly the drift the chokepoint exists to
 /// remove.
+/// WAVE 7 PR7.2 — FORENSICS SINGLE-TARGET RULE. A row on the `Forensics`
+/// securable (e.g. `execution_artifacts.shimcache`) is `ReadOnly`, not
+/// `Destructive` — it never reaches `evaluate_destructive_targeting`'s
+/// Destructive branch — but it is still confined by
+/// `requires_explicit_targets` to exactly one explicit, in-scope `agent_id`:
+/// a forensic read is per-device by nature and a fan-out (`__all__`, a scope
+/// key, or more than one id) is refused with `kForensicUntargetedMessage`,
+/// distinct wording from the Destructive refusal. A Forensics row that
+/// PASSES (verdict `Targeted`) is still run through
+/// `confine_destructive_targets` exactly like a Destructive row: mgmt-group
+/// confinement APPLIES to the read — a forensic read never reaches an agent
+/// outside the operator's visible set, and the existing 404
+/// `kDestructiveNoVisibleAgentMessage` ("no reachable in-scope agent")
+/// answers an out-of-group id, same as today. `ScheduleRunner`'s
+/// approval-gated fan-out (D3 above) is UNCHANGED by this addition: an
+/// approved scheduled forensics read remains permitted by the
+/// schedule-approval posture, not by this gate.
 namespace yuzu::server {
 
 /// The two refusal messages, spelled ONCE so `/api/command`, a future MCP
@@ -149,6 +168,57 @@ inline constexpr std::string_view kDestructiveUntargetedMessage{
     "scope fan-out are refused"};
 inline constexpr std::string_view kDestructiveNoVisibleAgentMessage{
     "no reachable in-scope agent"};
+
+/// Wave 7 PR7.2 (forensics single-target rule). The `Forensics` securable
+/// name, spelled once so this header, `rbac_store.cpp`'s seed and any future
+/// caller never risk a typo'd literal drifting apart.
+inline constexpr std::string_view kForensicsSecurable{"Forensics"};
+/// The forensic-read refusal message — distinct wording from
+/// `kDestructiveUntargetedMessage` (a forensic read is not a Destructive-class
+/// row; it fails a narrower single-target rule, not the broadcast/fan-out
+/// rule) — spelled once for the same reason as the pair above.
+inline constexpr std::string_view kForensicUntargetedMessage{
+    "forensic read requires exactly one explicit in-scope agent_id; "
+    "broadcast and scope fan-out are refused"};
+/// Metric-label / audit-detail reason string, engaged on
+/// `DestructiveTargetingDecision::refusal_reason` for a Forensics refusal.
+/// The Destructive-row counterpart (`kReasonDestructiveUntargeted`) already
+/// exists in `dispatch_target_shape.hpp` (#3685) — reused here, not
+/// redefined, to avoid a second copy of that reason string drifting apart.
+inline constexpr std::string_view kReasonForensicUntargeted{"forensic_untargeted"};
+
+/// The two `RefuseUntargeted` remediation strings, spelled ONCE so both
+/// `execute_instruction` refusal sites in `mcp_server.cpp` never re-diverge
+/// (they previously both hardcoded the Destructive wording unconditionally,
+/// even for a Forensics refusal — a Forensics row is a distinct, read-only
+/// classification with its own single-target rule, not "classified
+/// Destructive"). Branch on `DestructiveTargetingDecision::refusal_reason`
+/// via `remediation_for_refusal_reason` below rather than re-deriving which
+/// applies from the capability.
+inline constexpr std::string_view kDestructiveUntargetedRemediation{
+    "this plugin.action is classified Destructive: name explicit agent_ids "
+    "(no scope, no broadcast) and re-call"};
+inline constexpr std::string_view kForensicUntargetedRemediation{
+    "this is a single-target forensic read: specify exactly one explicit, "
+    "in-scope agent_id (no scope, no broadcast) and re-call"};
+
+/// The remediation text for a `RefuseUntargeted` decision, discriminated by
+/// `refusal_reason` — never assume Destructive wording unconditionally.
+[[nodiscard]] inline std::string_view
+remediation_for_refusal_reason(std::string_view refusal_reason) noexcept {
+    return refusal_reason == kReasonForensicUntargeted ? kForensicUntargetedRemediation
+                                                        : kDestructiveUntargetedRemediation;
+}
+
+/// True for a row this gate's single-target rule applies to: every
+/// `DispatchClass::Destructive` row (the existing rule), OR any row on the
+/// `Forensics` securable (Wave 7 PR7.2 — a forensic read is not Destructive
+/// but still must name exactly one explicit, in-scope `agent_id`; see the
+/// file-level doc comment for why mgmt-group confinement still applies to a
+/// Targeted forensic read).
+[[nodiscard]] inline bool requires_explicit_targets(const CommandCapability& cap) noexcept {
+    return cap.dispatch_class == DispatchClass::Destructive || cap.securable == kForensicsSecurable;
+}
 
 /// Verdict of the Destructive-dispatch targeting decision.
 ///
@@ -185,6 +255,16 @@ struct DestructiveTargetingDecision {
     /// evidence off it (e.g. a Policy-A caller answering with the same
     /// taxonomy `build_classified_command` uses).
     std::optional<ClassificationError> miss;
+    /// Engaged only on `RefuseUntargeted` — the `yuzu_server_dispatch_target_
+    /// rejected_total{reason}` metric label and audit detail
+    /// (`reason=<this> <plugin>:<action>`): `kReasonDestructiveUntargeted` for
+    /// a Destructive row, `kReasonForensicUntargeted` for a Forensics row.
+    /// Wave 7 PR7.2 — added so the three call sites never re-derive which
+    /// reason/message pair applies from the capability themselves.
+    std::string_view refusal_reason;
+    /// Engaged only on `RefuseUntargeted` — the exact 400/-32602 response
+    /// body: `kDestructiveUntargetedMessage` or `kForensicUntargetedMessage`.
+    std::string_view refusal_message;
 };
 
 /// Pure, total, `noexcept` — the whole decision is a handful of comparisons
@@ -212,23 +292,43 @@ struct DestructiveTargetingDecision {
 ///     to the ids-vs-scope conflict rule) — so that combination reaches
 ///     this function and MUST still refuse here, even though the ids list
 ///     itself is well-formed.
+///   - `agent_id_count` (Wave 7 PR7.2): the number of entries in the
+///     validated `agent_ids` array. DEFAULTED to 0 so a caller that omits it
+///     FAILS CLOSED for a `Forensics` row (0 != 1 -> `RefuseUntargeted`) —
+///     a caller that has not been updated to count ids can never
+///     accidentally admit a forensic broadcast by silent omission. Unused
+///     for a Destructive row, which keeps its existing
+///     `valid_nonempty_agent_ids`-based rule unchanged.
 [[nodiscard]] inline DestructiveTargetingDecision evaluate_destructive_targeting(
     const std::expected<CommandCapability, ClassificationError>& classified,
-    bool valid_nonempty_agent_ids, bool scope_key_present) noexcept {
+    bool valid_nonempty_agent_ids, bool scope_key_present,
+    std::size_t agent_id_count = 0) noexcept {
     if (!classified) {
         return DestructiveTargetingDecision{DestructiveTargetingVerdict::ClassifyMiss,
-                                            std::nullopt, classified.error()};
+                                            std::nullopt, classified.error(), {}, {}};
     }
-    if (classified->dispatch_class != DispatchClass::Destructive) {
+    if (!requires_explicit_targets(*classified)) {
         return DestructiveTargetingDecision{DestructiveTargetingVerdict::NotDestructive,
-                                            *classified, std::nullopt};
+                                            *classified, std::nullopt, {}, {}};
     }
+    if (classified->securable == kForensicsSecurable) {
+        // Forensics: SINGLE-TARGET — exactly one explicit agent_id, no scope.
+        if (agent_id_count != 1 || scope_key_present) {
+            return DestructiveTargetingDecision{
+                DestructiveTargetingVerdict::RefuseUntargeted, *classified, std::nullopt,
+                kReasonForensicUntargeted, kForensicUntargetedMessage};
+        }
+        return DestructiveTargetingDecision{DestructiveTargetingVerdict::Targeted, *classified,
+                                            std::nullopt, {}, {}};
+    }
+    // Destructive: today's rule — non-empty ids, no scope.
     if (!valid_nonempty_agent_ids || scope_key_present) {
-        return DestructiveTargetingDecision{DestructiveTargetingVerdict::RefuseUntargeted,
-                                            *classified, std::nullopt};
+        return DestructiveTargetingDecision{
+            DestructiveTargetingVerdict::RefuseUntargeted, *classified, std::nullopt,
+            kReasonDestructiveUntargeted, kDestructiveUntargetedMessage};
     }
     return DestructiveTargetingDecision{DestructiveTargetingVerdict::Targeted, *classified,
-                                        std::nullopt};
+                                        std::nullopt, {}, {}};
 }
 
 /// #3685 (Sol's header-design review) — the input type for

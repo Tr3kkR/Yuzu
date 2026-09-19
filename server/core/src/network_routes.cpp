@@ -31,20 +31,20 @@ std::string unavailable_placeholder() {
 } // namespace
 
 void NetworkRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                    AuditFn audit_fn, PerfFn perf_fn) {
+                                    AuditFn audit_fn, NetworkApiPtr api) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors DexRoutes / GuardianRoutes).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    std::move(perf_fn));
+                    std::move(api));
 }
 
 void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                    AuditFn audit_fn, PerfFn perf_fn) {
+                                    AuditFn audit_fn, NetworkApiPtr api) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
-    perf_fn_ = std::move(perf_fn);
+    api_ = std::move(api);
 
     // -- Page shell (auth-only static chrome; the fragment it loads gates on Read) --
     sink.Get("/network", [this](const httplib::Request& req, httplib::Response& res) {
@@ -77,14 +77,14 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                                                    httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
-        if (!perf_fn_) {
+        if (!api_) {
             res.set_content(unavailable_placeholder(), "text/html; charset=utf-8");
             return;
         }
         std::string key = req.has_param("key") ? req.get_param_value("key") : "";
         if (key.size() > 64) // light guard; the provider validates against TagStore
             key.clear();
-        res.set_content(render_network_overview_fragment(perf_fn_(key)),
+        res.set_content(render_network_overview_fragment(api_->fleet_now(key)),
                         "text/html; charset=utf-8");
     });
 
@@ -126,7 +126,7 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         }
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
-        if (!perf_fn_) {
+        if (!api_) {
             res.set_content(unavailable_placeholder(), "text/html; charset=utf-8");
             return;
         }
@@ -156,8 +156,19 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         (void)detail::try_persist_audit(audit_fn_, req, "network.device.view", "success",
                                         "GuaranteedState", "",
                                         "fleet-wide network device list via dashboard fragment");
-        res.set_content(render_network_devices_fragment(perf_fn_(key), metric, not_reporting, cooc,
-                                                        cohort_filter, limit),
+        NetDeviceQuery q;
+        q.metric = metric;
+        q.not_reporting = not_reporting;
+        q.cooc = cooc;
+        q.cohort_key = key;
+        q.cohort_filter = cohort_filter;
+        q.limit = limit;
+        const auto rows = api_->device_list(q);
+        // Same memoized snapshot as device_list (5s TTL, keyed by `key`) —
+        // cheap to ask again just for the cohort picker's key list.
+        const auto available_keys = api_->fleet_now(key).available_keys;
+        res.set_content(render_network_devices_fragment(rows, available_keys, key, metric,
+                                                        not_reporting, cooc, cohort_filter, limit),
                         "text/html; charset=utf-8");
     });
 }

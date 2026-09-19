@@ -121,6 +121,25 @@ void ConvergenceScheduler::priority_loop() {
             seen = sig_->priority_gen;
         }
         firewalled_sweep([this] { sweep_pending_initial(); });
+        // #2818 poll backstop, folded into this already-running ~5s lane rather than a
+        // new thread: catches a Dead subscription whose Lost notification was silently
+        // dropped by a full Queued consumer channel. Independent firewalled_sweep so a
+        // throw in one does not skip the other.
+        firewalled_sweep([this] { rt_.revalidate_subscriptions(); });
+        // up-5 (#4221, rung 9c PR-5b): a SEPARATE firewalled sweep - an exception in
+        // revalidation above must never skip disarm recovery. redrive_retained_
+        // disarms() itself walks claims_ directly (not keys_), so it reaches a
+        // retained disarm even behind a torn-down rule/key (ar-402, resolved: see
+        // that function's own doc comment) - no different closure mechanism is
+        // needed. Elapsed-time-gated, not every tick: a burst of priority wakes
+        // (e.g. several attaches in quick succession) must not drive redundant full
+        // claims_ scans. The deadline advances BEFORE the sweep runs, so a throwing
+        // sweep still paces correctly - no catch-up bursts.
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_redrive_) {
+            next_redrive_ = now + std::chrono::milliseconds(std::max<std::uint64_t>(1, cfg_.priority_poll_ms));
+            firewalled_sweep([this] { rt_.redrive_retained_disarms(); });
+        }
     }
 }
 
@@ -133,5 +152,9 @@ void ConvergenceScheduler::sweep_pending_initial() {
     for (const std::string& key : rt_.keys_with_pending_initial())
         rt_.evaluate_key(key, EvalReason::Convergence);
 }
+
+void ConvergenceScheduler::revalidate_subscriptions() { rt_.revalidate_subscriptions(); }
+
+void ConvergenceScheduler::redrive_retained_disarms() { rt_.redrive_retained_disarms(); }
 
 } // namespace yuzu::agent

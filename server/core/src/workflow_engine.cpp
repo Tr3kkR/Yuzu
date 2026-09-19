@@ -1,5 +1,6 @@
 #include "workflow_engine.hpp"
 
+#include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -850,13 +851,55 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
             for (const auto& params : dispatch_params) {
                 auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
-                if (dispatch_result) {
-                    foreach_results.push_back(
-                        nlohmann::json::parse(*dispatch_result, nullptr, false));
+                // #2437-class guard: StepDispatchFn's documented contract (workflow_engine.hpp)
+                // is "returns a JSON result string" with no depth bound. Today's one wired
+                // caller (workflow_routes.cpp's dispatch_fn) only ever returns a small
+                // fixed-shape dispatch acknowledgment, but that closure's own comment notes the
+                // step-dispatch path does not yet correlate a step's real agent-reported
+                // response back through this same return value (tracked as future work) - so
+                // this is the chokepoint that has to hold regardless of which caller is wired
+                // today, not a guard against a live exploit path. Reject on the RAW text BEFORE
+                // the parse below (or anything else) interprets it: nlohmann::json::parse
+                // tolerates very deep input, but .dump() a few lines down, and every downstream
+                // consumer chained off prev_result_json (expand_foreach's array-iteration branch
+                // AND its "treat whole result as single item" fallback, plus the step condition
+                // evaluator) IS unboundedly recursive and SIGSEGVs the whole process well under
+                // 1 MiB of nesting. A depth violation here closes every one of those downstream
+                // traversals at once, since none of them can ever be reached with unchecked
+                // content that didn't pass through this one call first. Fails CLOSED onto the
+                // SAME error path an ordinary dispatch failure already uses just below:
+                // foreach_failed=true, a safe (non-nested) placeholder recorded in
+                // foreach_results, and NO poisoned structure ever enters
+                // foreach_results/step_result/prev_result_json. Never logs the payload, only
+                // identifiers.
+                const bool depth_exceeded =
+                    dispatch_result && yuzu::server::mcp::json_exceeds_depth(
+                                            *dispatch_result, yuzu::server::mcp::kMcpMaxJsonDepth);
+                if (dispatch_result && !depth_exceeded) {
+                    // #4030 Gate 8 fix (Gate 4 unhappy-path finding UP-2):
+                    // an un-guarded parse embeds the nlohmann `<discarded>`
+                    // sentinel as literal text when `*dispatch_result` is
+                    // not valid JSON, producing an invalid JSON document
+                    // once `.dump()`'d downstream (verified via compile+
+                    // run). Matches the read-side guard already applied at
+                    // workflow_model.cpp's `confined_workflow_step_result_json`.
+                    auto parsed = nlohmann::json::parse(*dispatch_result, nullptr, false);
+                    foreach_results.push_back(parsed.is_discarded() ? nlohmann::json(nullptr)
+                                                                    : parsed);
                 } else {
                     foreach_failed = true;
-                    foreach_results.push_back(
-                        nlohmann::json({{"error", dispatch_result.error()}}));
+                    if (depth_exceeded) {
+                        spdlog::error(
+                            "WorkflowEngine: step {} (execution {}, instruction {}, agents {}) "
+                            "dispatch result nested past the depth guard (max {}); treating as "
+                            "a failed dispatch, cannot be safely parsed",
+                            step.index, exec_id, step.instruction_id, agent_str,
+                            yuzu::server::mcp::kMcpMaxJsonDepth);
+                    }
+                    foreach_results.push_back(nlohmann::json(
+                        {{"error", depth_exceeded
+                                       ? "dispatch result exceeded maximum JSON nesting depth"
+                                       : dispatch_result.error()}}));
                 }
             }
 

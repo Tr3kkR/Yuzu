@@ -16,7 +16,7 @@ related: >-
   downstream consumer for license/entitlement matching). docs/roadmap.md Issue 18.5 ("SBOM
   Ingest" — companion, import-side of the same capability) and Issue 18.7 (this capability,
   generation-side; added to `docs/roadmap.md` Phase 18, status: Proposed, 2026-07-08).
-  1005-headless-platform-use-case-engines (`status: proposed`, not yet accepted —
+  1005-headless-platform-use-case-engines (`status: accepted` since 2026-09-07, #4099; proposed when this ADR was written —
   this capability is mechanism under that ADR's Decision-2 test, and stays core/agent-side
   regardless of how the use-case-engine question resolves). The existing vuln_scan plugin
   (agents/plugins/vuln_scan/ — considered and rejected as a host for this capability, Decision 2;
@@ -43,6 +43,8 @@ supersedes: >-
 ---
 
 # 0028 — Agent-Side Component Inventory Collection (Bundled & Filesystem-Resident Dependencies)
+
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero `sync_source_component*` files in `agents/core/src`. Deferred, not started; agent-side mechanism — stays core under ADR-1005, not use-case-engine scope (#4099).
 
 > **Naming note (resolved during grill-with-docs review, 2026-07-07):** this capability is called
 > the **component inventory**, not "SBOM." **SBOM** (CycloneDX/SPDX) is a standardized *export/import
@@ -84,7 +86,7 @@ see `supersedes`). It is split out into its own ADR because:
    Software Licensing & Entitlements proposal, PR #1920) needs exactly this per-component data;
    supply-chain/attack-surface visibility is a distinct, independently valuable use.
 2. **It is *mechanism*, not *interpretation*, under ADR-1005's own test**
-   (`docs/adr/1005-headless-platform-use-case-engines.md`, `status: proposed`) — collection stays
+   (`docs/adr/1005-headless-platform-use-case-engines.md`, accepted 2026-09-07) — collection stays
    core/agent-side regardless of how the still-open use-case-engine relocation debate resolves for
    CVE-matching *interpretation*. This ADR is safe to accept and build independent of that outcome.
 3. **It is a materially different collection posture** from registry/package-manager enumeration —

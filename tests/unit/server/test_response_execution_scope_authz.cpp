@@ -22,8 +22,16 @@ httplib::Request bearer_request(const std::string& token) {
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
 
-std::string read_server_cpp() {
-    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+// #2542 PR-11: reads response_routes.cpp (the extracted owner file), not
+// server.cpp — the 3-route legacy pre-v1 Responses API moved from
+// server.cpp's inline `web_server_->` registrations onto the HttpRouteSink
+// seam (`sink.Get`, `deps.fleet_read_fn`/`deps.store`/`deps.audit_fn`
+// replacing the bare `require_fleet_read`/`response_store_`/`audit_log`
+// calls). Handler bodies are otherwise byte-identical (verified against the
+// pre-move source before this update); mirrors
+// test_legacy_executions_scope_authz.cpp's identical #2542 PR-7 adaptation.
+std::string read_response_routes_cpp() {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "response_routes.cpp");
     REQUIRE(input.is_open());
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
@@ -37,7 +45,9 @@ std::string read_source_file(const std::string& filename) {
 std::string route_block(const std::string& source, const std::string& marker) {
     const auto begin = source.find(marker);
     REQUIRE(begin != std::string::npos);
-    const auto end = source.find("web_server_->", begin + marker.size());
+    // #2542 PR-11: end-of-block sentinel updated from server.cpp's
+    // `web_server_->` receiver to response_routes.cpp's `sink.` receiver.
+    const auto end = source.find("sink.", begin + marker.size());
     return source.substr(begin, (end == std::string::npos ? source.size() : end) - begin);
 }
 
@@ -82,20 +92,19 @@ TEST_CASE("legacy response list: real fleet-read scope excludes Alice's response
 
 TEST_CASE("legacy response routes retain the fleet gate and pre-serve scope filters",
           "[response][scope][1634][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_response_routes_cpp();
     const auto aggregate = route_block(source, R"(/api/responses/([^/]+)/aggregate)");
     const auto export_route = route_block(source, R"(/api/responses/([^/]+)/export)");
     const auto list = route_block(source, R"(/api/responses/(.+))");
 
     for (const auto* block : {&aggregate, &export_route, &list}) {
-        CHECK(block->find("require_fleet_read(req, res, \"Response\", \"Read\")") !=
+        CHECK(block->find("deps.fleet_read_fn(req, res, \"Response\", \"Read\")") !=
               std::string::npos);
-        CHECK(block->find("require_permission(req, res, \"Response\", \"Read\")") ==
-              std::string::npos);
+        CHECK(block->find("deps.perm_fn(req, res, \"Response\", \"Read\")") == std::string::npos);
         CHECK(block->find("authz::in_scope") != std::string::npos);
     }
-    CHECK(aggregate.find("response_store_->aggregate") != std::string::npos);
-    CHECK(aggregate.find("agg_scope") < aggregate.find("response_store_->aggregate"));
+    CHECK(aggregate.find("deps.store->aggregate") != std::string::npos);
+    CHECK(aggregate.find("agg_scope") < aggregate.find("deps.store->aggregate"));
     CHECK(list.find(R"({"count", arr.size()})") != std::string::npos);
 }
 

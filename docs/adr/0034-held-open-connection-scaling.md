@@ -27,6 +27,8 @@ related: >-
 
 # ADR-0034 — Held-open connections must not own a worker thread
 
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — mitigated, not solved. The shipped fix is a `StreamBudget` admission cap (`stream_budget.hpp`, wired at `server.cpp:12172`) over the existing thread-per-connection httplib pool (`server.cpp:12091-12125`), not the Drogon rewrite this ADR's Decision 4 target architecture describes (conditional on G10, framework port separately estimated, per frontmatter `deciders:`).
+
 ## Context
 
 The server's HTTP surface is cpp-httplib, which is **thread-per-connection**. A response

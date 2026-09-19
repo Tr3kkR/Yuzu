@@ -702,6 +702,7 @@ std::string io_failure_detail(const char* kind, IoFailure f) {
     case IoFailure::AlreadyRunning:    return std::string{kind} + " read already in flight (single-flight)";
     case IoFailure::LaunchFailed:      return std::string{kind} + " read worker launch failed";
     case IoFailure::WorkerThrew:       return std::string{kind} + " read worker failed";
+    case IoFailure::CeilingExhausted:  return std::string{kind} + " read rejected (I/O executor alive-worker ceiling: completion callbacks outstanding)";
     }
     return std::string{kind} + " read failed";
 }

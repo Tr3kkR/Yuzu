@@ -15,6 +15,18 @@
 
 namespace yuzu::server {
 
+std::string derive_cert_audit_target_type(CaStore& ca_store, const std::string& serial_hex) {
+    std::string target_type = "Certificate";
+    if (auto rec_or_err = ca_store.get_issued(serial_hex); rec_or_err && rec_or_err->has_value()) {
+        const std::string& purpose = (*rec_or_err)->purpose;
+        if (purpose == "agent")
+            target_type = "AgentCertificate";
+        else if (purpose == "code-signing")
+            target_type = "CodeSigningCertificate";
+    }
+    return target_type;
+}
+
 namespace {
 
 using detail::error_json_a4;
@@ -26,6 +38,22 @@ constexpr std::size_t kMaxRevokeBody = 64 * 1024; // bound the revoke POST body
 // + parent chain is a few KB; 256 KiB is generous headroom while still refusing
 // a multi-MB POST on this privileged trust-root-switching endpoint (PR6).
 constexpr std::size_t kMaxImportBody = 256 * 1024;
+// Bound the code-signing issuance POST body before parsing (gap-matrix #10).
+// The JSON body wraps a PEM CSR (server.cpp's issue_code_signing_leaf enforces
+// the same 16 KiB CSR-PEM ceiling sign_agent_csr uses) as an escaped JSON
+// string — each PEM newline costs 2 bytes escaped ("\n") — plus a <=64 byte
+// label and a small validity_days integer. 64 KiB is 4x the raw 16 KiB CSR
+// ceiling: generous headroom over the worst-case ~2x JSON-escaping cost, with
+// room to spare for the other two fields and JSON framing, while still three
+// orders of magnitude under httplib's 100 MiB backstop on this privileged
+// endpoint. Mirrored exactly by body_cap_policy.hpp's ca_issue_code_signing
+// row — same two-authority-split precedent as kMaxRevokeBody/kMaxImportBody.
+constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
+// gov F6/UP-7: mirrors server.cpp's issue_code_signing_leaf ceiling exactly
+// (its own locally-declared constant — same per-signing-path style as
+// kMaxCsrPemBytes there) so REST rejects an out-of-range validity_days at the
+// door instead of deferring entirely to the server-side refusal.
+constexpr int kMaxCodeSigningValidityDaysRest = 730;
 
 int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
     auto it = req.params.find(key);
@@ -234,16 +262,22 @@ std::string render_ca_fragment(CaStore* ca_store) {
 
 void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), ca_store,
-                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn));
+                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn),
+                    std::move(issue_code_signing_fn));
 }
 
 void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
-    (void)auth_fn; // principal is resolved inside audit_fn/perm_fn from the request
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
+    // auth_fn is captured by the new /issue-code-signing handler below (to
+    // attribute IssuedCertRecord::issued_by to the calling operator); every
+    // other handler in this file still resolves its principal from
+    // audit_fn/perm_fn alone.
     spdlog::info("CA routes: registering /api/v1/ca/* + Settings CA panel");
 
     // Shared revoke core (REST + dashboard wrapper) over an ALREADY-normalised
@@ -253,12 +287,24 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
                            const std::string& reason) -> RevokeResult {
+        // gov B2 (F1: arch-1 + compliance HIGH; HIGH-1): derive the audit
+        // target_type from the cert's OWN recorded purpose — now that
+        // code-signing certs (gap-matrix #10) are revocable through this same
+        // route, hardcoding "AgentCertificate" would durably mis-audit a
+        // code-signing revocation. A read failure (genuine store error,
+        // distinct from "not found" — see get_issued()'s contract) and a
+        // genuine "no such serial" both fall back to the neutral
+        // "Certificate": the StoreError/NotFound outcomes below already carry
+        // the more specific signal for that case. Shared with MCP's
+        // revoke_certificate via derive_cert_audit_target_type (ca_routes.hpp)
+        // so both surfaces classify identically.
+        const std::string target_type = derive_cert_audit_target_type(*ca_store, serial);
         auto revoked_or_err = ca_store->revoke(serial, reason);
         if (!revoked_or_err) {
             // ADR-0053: a genuine DB/lease failure — distinct from "not found or already
             // revoked" (a business fact). Must NOT be folded into "denied": that would falsely
             // audit a database outage as a rejected revoke attempt.
-            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", target_type, serial,
                                      revoked_or_err.error());
             return {RevokeOutcome::StoreError, ok};
         }
@@ -266,11 +312,11 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             // #1240: unknown/already-revoked is reject-without-state-change →
             // result="denied" (matches every destructive sibling + idempotent
             // retry-safe); "failure" is reserved for an authorized-but-errored op.
-            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
+            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", target_type, serial,
                                      "serial not found or already revoked");
             return {RevokeOutcome::NotFound, ok};
         }
-        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial,
+        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", target_type, serial,
                                  reason);
         // publish_crl() now fails honestly (#1240 B-1): has_value() is true ONLY
         // when the new CRL was persisted, so crl_ok never falsely claims success.
@@ -508,6 +554,210 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                               {"meta", {{"api_version", "v1"}}}};
         res.set_content(out.dump(), kJson);
     });
+
+    // ── POST /api/v1/ca/issue-code-signing ── Security:Write: code-signing ────
+    // leaf issuance via CSR custody (gap-matrix #10). The operator holds the
+    // private key and submits a CSR; the server signs and returns ONLY the
+    // leaf + chain. Body: {"csr_pem","label","validity_days"?}. SAFE because
+    // the injected issue_code_signing_fn (ServerImpl) hard-pins usage to
+    // {.code_signing=true} and sets CN=label — see this file's ca_routes.hpp
+    // header for why that never reaches the #1118 agent-identity gate.
+    sink.Post(
+        "/api/v1/ca/issue-code-signing",
+        [perm_fn, audit_fn, auth_fn, ca_store, issue_code_signing_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!ca_store || !ca_store->is_open() || !issue_code_signing_fn) {
+                res.status = 503;
+                res.set_content(error_json_a4(503, "CA not available", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (req.body.size() > kMaxIssueCodeSigningBody) {
+                res.status = 413;
+                res.set_content(
+                    error_json_a4(413, "request body too large", make_correlation_id()), kJson);
+                return;
+            }
+            nlohmann::json body;
+            try {
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            } catch (...) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            // Mass-assignment guard (mirrors POST /ca/revoke above).
+            for (const auto& [k, v] : body.items()) {
+                if (k != "csr_pem" && k != "label" && k != "validity_days") {
+                    res.status = 400;
+                    res.set_content(
+                        error_json_a4(400, "unknown field in request body", make_correlation_id(),
+                                     "only csr_pem, label and validity_days are accepted"),
+                        kJson);
+                    return;
+                }
+            }
+            // gov F9 (cpp-1): a present-but-non-string csr_pem/label throws
+            // nlohmann's type_error.302 out of `.value<std::string>()` — an
+            // uncaught throw here is a bare 500 with no A4 envelope. Guard the
+            // same way the validity_days check below already does.
+            if (body.contains("csr_pem") && !body["csr_pem"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (body.contains("label") && !body["label"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            const std::string csr_pem = body.value("csr_pem", "");
+            const std::string label = body.value("label", "");
+            if (csr_pem.empty()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem is required", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!is_valid_code_signing_label(label)) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must match ^[A-Za-z0-9._-]{1,64}$",
+                                              make_correlation_id()),
+                                kJson);
+                return;
+            }
+            std::optional<int> validity_days;
+            if (body.contains("validity_days") && !body["validity_days"].is_null()) {
+                if (!body["validity_days"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be an integer",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                // gov F6/UP-7: read as int64 and range-check BEFORE narrowing to
+                // int — get<int>() on an out-of-int-range JSON integer (e.g.
+                // 2^32+365) silently truncates, and a truncated value landing
+                // INSIDE [1,730] would sail past a post-narrowing check. Also
+                // makes REST reject >730 explicitly, matching MCP's schema
+                // maximum:730 (the two twins now reject identically) instead of
+                // deferring the ceiling entirely to the server-side refusal.
+                int64_t v64 = 0;
+                try {
+                    v64 = body["validity_days"].get<int64_t>();
+                } catch (...) {
+                    // A JSON integer outside int64_t range (e.g. an unsigned
+                    // value > INT64_MAX) — definitely outside [1,730].
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                if (v64 < 1 || v64 > kMaxCodeSigningValidityDaysRest) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                validity_days = static_cast<int>(v64);
+            }
+            // Re-derive the session (perm_fn above already authenticated this
+            // request) ONLY to attribute IssuedCertRecord::issued_by to the
+            // calling operator — matches the discovery_routes.cpp/
+            // command_routes.cpp precedent for a post-perm_fn auth_fn re-read.
+            std::string issued_by = "operator:unknown";
+            if (auth_fn) {
+                if (auto session = auth_fn(req, res))
+                    issued_by = "operator:" + session->username;
+            }
+            auto issued = issue_code_signing_fn(csr_pem, label, validity_days, issued_by);
+            if (!issued) {
+                const std::string& err = issued.error();
+                const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
+                const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                // gov B1 / F6/UP-5/UP-7: two more caller-attributable
+                // classifications, each with its own message so a weak key or a
+                // bad validity_days is never reported as "csr_pem is invalid".
+                const bool weak_key = err.starts_with(kCodeSigningWeakKeyPrefix);
+                const bool bad_validity = err.starts_with(kCodeSigningBadValidityPrefix);
+                int status = 500;
+                std::string result = "failure";
+                std::string msg = "code-signing issuance failed";
+                if (no_root) {
+                    status = 409;
+                    result = "denied";
+                    msg = "no CA root to issue from (generate default certs first)";
+                } else if (bad_csr) {
+                    status = 400;
+                    result = "denied";
+                    msg = "csr_pem is invalid or fails proof-of-possession";
+                } else if (weak_key) {
+                    status = 400;
+                    result = "denied";
+                    // Already caller-safe — crafted at the server.cpp call site.
+                    msg = err.substr(std::string_view(kCodeSigningWeakKeyPrefix).size());
+                } else if (bad_validity) {
+                    status = 400;
+                    result = "denied";
+                    msg = err.substr(std::string_view(kCodeSigningBadValidityPrefix).size());
+                }
+                const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
+                                               "CodeSigningCertificate", label,
+                                               "purpose=code-signing reason=" + err);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
+                return;
+            }
+            const bool audit_ok =
+                audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
+                         issued->serial_hex, "purpose=code-signing label=" + label);
+            if (!audit_ok) {
+                // gov HIGH-2 (ADR-1005 "mutations fail closed on audit
+                // failure", mirrors #2466/#2406's engine-credential-mint
+                // precedent above): the leaf IS already durably recorded in
+                // ca_store via record_issued — only the audit row failed to
+                // persist — so it is discoverable and reissuable rather than
+                // lost. WITHHOLD certificate_pem/chain_pem instead of
+                // returning them in an unaudited 200; Sec-Audit-Failed alone
+                // (the REVOKE convention, unchanged elsewhere in this file) is
+                // not enough here because that header is easy for a caller to
+                // miss while still consuming the 200 body's secret material.
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    error_json_a4(503,
+                                 "code-signing certificate " + issued->serial_hex +
+                                     " was issued but its audit record could not be "
+                                     "persisted; the certificate was withheld. Check GET "
+                                     "/api/v1/ca/issued and reissue if the serial is not "
+                                     "recorded",
+                                 make_correlation_id()),
+                    kJson);
+                return;
+            }
+            nlohmann::json out = {{"certificate_pem", issued->certificate_pem},
+                                  {"chain_pem", issued->chain_pem},
+                                  {"serial_hex", issued->serial_hex},
+                                  {"not_after", issued->not_after},
+                                  {"purpose", "code-signing"},
+                                  {"meta", {{"api_version", "v1"}}}};
+            res.set_content(out.dump(), kJson);
+        });
 
     // ── GET /api/v1/ca/root-csr ── Security:Read: export the install CA's CSR ──
     // (PR6) for an enterprise root to sign into a subordinate-CA intermediate.

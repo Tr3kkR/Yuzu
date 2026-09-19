@@ -6,11 +6,34 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 
 namespace yuzu::server {
 
 namespace {
+
+/// True if the DSN (or the PGOPTIONS env) already sets libpq `options` — the only
+/// route to a server-side statement_timeout/lock_timeout. Mirrors pg_pool's
+/// operator-wins rule (PR #4134): when the operator set their own, the elector does
+/// not override them.
+bool dsn_sets_options(const std::string& dsn) {
+    bool has = false;
+    char* errmsg = nullptr;
+    if (PQconninfoOption* parsed = PQconninfoParse(dsn.c_str(), &errmsg)) {
+        for (PQconninfoOption* o = parsed; o && o->keyword; ++o) {
+            if (std::strcmp(o->keyword, "options") == 0 && o->val && o->val[0] != '\0') {
+                has = true;
+                break;
+            }
+        }
+        PQconninfoFree(parsed);
+    }
+    if (errmsg != nullptr)
+        PQfreemem(errmsg);
+    const char* env = std::getenv("PGOPTIONS");
+    return has || (env != nullptr && env[0] != '\0');
+}
 
 /// A leadership lock name must be a strict lowercase identifier so it can be
 /// embedded in the advisory-key SQL expression without an injection risk (the
@@ -91,6 +114,20 @@ LeaderElector::LeaderElector(Config cfg)
     }
     std::lock_guard<std::mutex> lk(mu_);
     connect_locked();
+    if (open_) {
+        // #4013: log the RESOLVED coordination endpoint (never the DSN, which may
+        // carry a password) so an operator can confirm the elector is on a
+        // dedicated, direct-to-primary connection — not the app pool, not a
+        // transaction-mode pooler (§10). PQhost/PQport/PQdb read the connection's
+        // own resolved parameters.
+        const char* host = PQhost(conn_.get());
+        const char* port = PQport(conn_.get());
+        const char* dbn = PQdb(conn_.get());
+        spdlog::info("leader_elector: coordination connection established "
+                     "(host={} port={} dbname={}; dedicated, never-recycled)",
+                     host && *host ? host : "?", port && *port ? port : "?",
+                     dbn && *dbn ? dbn : "?");
+    }
 }
 
 LeaderElector::~LeaderElector() {
@@ -116,6 +153,31 @@ bool LeaderElector::connect_locked() {
                      conn_.get() != nullptr ? PQerrorMessage(conn_.get()) : "null conn");
         return false;
     }
+    // Bound this dedicated connection server-side so a wedged lock-holder or a
+    // stalled-but-LIVE backend (TCP healthy — the connect_timeout/keepalive/
+    // tcp_user_timeout knobs never fire) fails fast instead of hanging the election
+    // loop and stop() indefinitely (PR #4134 review; the pg_pool statement/
+    // lock-timeout pattern, same constants). SET as SESSION GUCs BEFORE the schema
+    // migration below, so its blocking pg_advisory_xact_lock inherits lock_timeout.
+    // Best-effort. Skipped when the operator set their own options=/PGOPTIONS —
+    // their GUCs win, matching pg_pool's operator-override rule.
+    if (dsn_sets_options(cfg_.dsn)) {
+        // The operator set options=/PGOPTIONS; leave the timeouts to their config
+        // (matching pg_pool), but say so — otherwise the absence of the bound is
+        // invisible if they did NOT set statement_timeout/lock_timeout (K3).
+        spdlog::debug("leader_elector: operator options=/PGOPTIONS present; not injecting "
+                      "statement/lock timeouts on the coordination connection");
+    } else {
+        // Best-effort but OBSERVABLE (K4): a swallowed SET failure would silently
+        // leave this connection UNBOUNDED, re-opening the very wedge fix #2 closes.
+        for (const char* stmt : {"SET statement_timeout = 30000", "SET lock_timeout = 10000"}) {
+            pg::PgResult r = pg::exec_params(conn_.get(), stmt, std::vector<std::string>{});
+            if (r.status() != PGRES_COMMAND_OK)
+                spdlog::warn("leader_elector: '{}' failed ({}); the coordination connection is "
+                             "UNBOUNDED — a wedged lock-holder could stall the election loop + stop()",
+                             stmt, r.get() != nullptr ? PQresultErrorMessage(r.get()) : "no result");
+        }
+    }
     if (!pg::PgMigrationRunner::run(conn_.get(), kLeaderElectorStore, migrations())) {
         spdlog::error("leader_elector: schema migration failed; elector non-open");
         return false;
@@ -127,6 +189,10 @@ bool LeaderElector::connect_locked() {
 void LeaderElector::drop_leadership_locked() {
     lock_guard_.reset(); // runs pg_advisory_unlock on conn_ if it was held
     epoch_.reset();
+    // Publish "not leader" (slice 3.2, #4013). Release-ordered so a reader that
+    // observes 0 has seen every write the drop performed; ordered BEFORE any
+    // subsequent reconnect so a live follower never reads a stale leader epoch.
+    live_epoch_.store(0, std::memory_order_release);
 }
 
 bool LeaderElector::is_open() const {
@@ -173,7 +239,25 @@ bool LeaderElector::try_acquire() {
 
     // Lock granted: emplace the release guard IMMEDIATELY so the lock cannot
     // leak on any subsequent failure path, then mint + record the new epoch.
-    lock_guard_.emplace(conn_.get(), lock_key_, "server background leader");
+    //
+    // If the guard's constructor THROWS (it is deliberately non-noexcept and can
+    // throw bad_alloc), the advisory lock is held on conn_ but UNTRACKED. PostgreSQL
+    // session advisory locks are RE-ENTRANT, so a later try_acquire() on this same
+    // never-recycled connection would re-grant a SECOND stacked hold that a single
+    // guard can only half-release — a DURABLE leadership wedge locking out every
+    // other process until the connection dies (PR #4134 review). So on any throw
+    // here, CLOSE the connection: the backend's death releases every stacked hold,
+    // and open_=false forces a fresh reconnect on the next attempt (no re-entrancy).
+    try {
+        lock_guard_.emplace(conn_.get(), lock_key_, "server background leader");
+    } catch (...) {
+        spdlog::error("leader_elector: lock-guard construction threw after the advisory lock was "
+                      "granted; closing the coordination connection to release the untracked hold");
+        drop_leadership_locked(); // guard not emplaced (no-op reset) + clears epoch_ + publishes 0
+        conn_ = pg::PgConn{};     // finish the connection → session death releases ALL stacked holds
+        open_ = false;            // fail closed; next try_acquire() reconnects fresh
+        return false;
+    }
 
     pg::PgResult ep = pg::exec_params(
         conn_.get(),
@@ -198,18 +282,25 @@ bool LeaderElector::try_acquire() {
         return false;
     }
     epoch_ = *parsed;
+    // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 1, so a
+    // non-zero value unambiguously means "leader at this epoch" to a lock-free
+    // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
+    live_epoch_.store(*epoch_, std::memory_order_release);
     spdlog::info("leader_elector: acquired leadership '{}' at epoch {}", cfg_.lock_name, *epoch_);
     return true;
 }
 
 bool LeaderElector::is_leader() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return epoch_.has_value();
+    // Lock-free (slice 3.2, #4013): see the header note. A libpq probe stalled
+    // under mu_ in the election loop must never block this reader.
+    return live_epoch_.load(std::memory_order_acquire) > 0;
 }
 
 std::optional<std::int64_t> LeaderElector::epoch() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return epoch_;
+    const std::int64_t v = live_epoch_.load(std::memory_order_acquire);
+    if (v <= 0)
+        return std::nullopt;
+    return v;
 }
 
 bool LeaderElector::heartbeat() {

@@ -179,7 +179,8 @@ struct ExecHarness {
                                /*instruction_store=*/nullptr);
         // One registration pass only — two would register every route twice
         // and first-match-wins would serve handlers bound to the first call.
-        REQUIRE(sink.route_count() == 12);
+        // #4027: +1 for GET /api/v1/tar/retention-paused.
+        REQUIRE(sink.route_count() == 13);
 
         if (wire_classifier)
             routes.set_capability_classify_fn(yuzu::test::real_classify_fn());

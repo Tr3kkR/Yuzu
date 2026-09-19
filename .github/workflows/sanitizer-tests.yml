@@ -89,10 +89,18 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 75
     env:
-      # detect_odr_violation=0 mirrors ci.yml's sanitize-asan job: gRPC's
-      # libgpr.so embeds a static copy of abseil's kToUpper while the
-      # application links abseil dynamically (vcpkg port-linkage artefact),
-      # so ASan otherwise aborts before any Yuzu test runs.
+      # detect_odr_violation=0: kept as belt-and-braces post-#4019, not
+      # because the original trigger still applies. It was added because
+      # gRPC's libgpr.so embedded a static copy of abseil's kToUpper while
+      # the rest of the dep tree linked abseil dynamically -- #4019's
+      # triplets/x64-linux-asan.cmake switch to static linkage eliminated
+      # that specific split (confirmed: no separate libgpr.so in the built
+      # binaries). A narrower, still-live instance of the same ODR class
+      # survives at the libyuzu_agent_core.so/test-binary boundary (each
+      # independently embeds its own abseil kSeed) -- confirmed empirically
+      # NOT to trip this detector across a full agent-suite run, but not
+      # proven absent under every code path. Re-enabling is tracked
+      # separately; don't assume this line is dead weight.
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
       # Big Tam runs 4 runners on one host; a gateway eunit test that boots

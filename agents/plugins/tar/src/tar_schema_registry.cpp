@@ -37,11 +37,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
                  "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
                  "path, accurate ppid, owning user from the audit token) where the "
-                 "framework + entitlement are present (full Xcode SDK build, "
-                 "com.apple.developer.endpoint-security.client, root). Falls back to "
-                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
-                 "— no command line (works-council posture); the poll blanks the "
-                 "proc_pidpath image it would otherwise place in cmdline."},
+                 "ES SDK was detected at build time and the entitlement + root are "
+                 "present at runtime (com.apple.developer.endpoint-security.client). "
+                 "Falls back to the KERN_PROC_ALL sysctl poll otherwise. Names-only "
+                 "on BOTH paths — no command line (works-council posture); the poll "
+                 "blanks the proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
@@ -386,8 +386,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "top-N representative only (<= 2N/tick), failures → empty."},
                 {"linux",   OsSupportStatus::kSupported,  "procfs",
                  "One /proc/[pid]/stat pass per tick — comm, utime+stime, rss, "
-                 "starttime; no ptrace, no per-process handles. Names are the "
-                 "kernel's 15-char comm (joins process_live). version is "
+                 "starttime, flags; no ptrace, no per-process handles. Names are "
+                 "the kernel's 15-char comm (joins process_live). version is "
                  "always '' (on-disk version capture is a follow-up)."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
@@ -405,6 +405,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"instances",   "INTEGER"},
                         {"cpu_pct",     "REAL"},
                         {"ws_bytes",    "INTEGER"},
+                        {"is_kthread",  "INTEGER"},
                     },
                 },
                 {
@@ -415,6 +416,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"hour_ts",       "INTEGER"},
                         {"name",          "TEXT"},
                         {"version",       "TEXT"},
+                        {"is_kthread",    "INTEGER"},
                         {"samples",       "INTEGER"},
                         {"instances_max", "INTEGER"},
                         {"cpu_avg",       "REAL"},
@@ -1092,6 +1094,74 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+        // ── Usage (Wave 7 PR7.2b) — DERIVED from `process`: a checked_
+        // transaction fold (tar_usage.cpp run_usage_fold) pairs started/
+        // stopped by (pid, exe_key) into runs; usage_live holds OPEN runs
+        // (deleted when closed), usage_daily the per-executable daily
+        // aggregate. No collector, no rollup_sql; the fold is driven from
+        // collect_fast after the process insert and carries its own gap
+        // check against process_live's row-cap prune. DEFAULT-ON per
+        // Alex's 2026-09-04 ruling (see docs/user-manual/tar.md).
+        // usage_daily_user (per-day username membership) and the two
+        // UNIQUE indexes (usage_live(pid, exe_key), usage_daily(day_ts,
+        // exe_key)) are created by tar_db.cpp's v6 migration, NOT here --
+        // usage_daily_user's PRIMARY KEY(day_ts, exe_key, user) shape (no
+        // `id` column) does not fit the generic per-tier layout below.
+        {
+            .name = "usage",
+            .dollar_name = "Usage",
+            .default_enabled = true,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (ETW feeder); names-only, no cmdline."},
+                {"linux",   OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (/proc); comm names are 15-char truncated."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "derived_process",
+                 "Derived from the process source; inherits its ES-or-poll granularity."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Backstop only. The fold bounds the open set itself
+                    // (cap_open_runs, 20000, oldest closed as `capped` and
+                    // ACCOUNTED in expired_runs); this generic prune firing
+                    // would delete open runs unaccounted, so it is set far
+                    // above the fold's cap and must never be the operative bound.
+                    .retention_default = 200000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"},
+                        {"pid",         "INTEGER"},
+                        {"exe_key",     "TEXT"},
+                        {"user",        "TEXT"},
+                        {"start_ts",    "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days, as process_daily
+                    .columns = {
+                        {"day_ts",          "INTEGER"},
+                        {"exe_key",         "TEXT"},
+                        {"run_count",       "INTEGER"},
+                        {"total_seconds",   "INTEGER"},
+                        {"first_seen",      "INTEGER"},
+                        {"last_seen",       "INTEGER"},
+                        {"distinct_users",  "INTEGER"},
+                        {"superseded_runs", "INTEGER"},
+                        {"expired_runs",    "INTEGER"},
+                        // No fold_hwm replay-guard column (Wave 7 PR7.2's
+                        // original shape): checked_transaction (tar_db.hpp)
+                        // makes a partial commit of this fold structurally
+                        // impossible, so there is nothing for a replay guard
+                        // to guard against -- see tar_usage.cpp's file banner.
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -1340,6 +1410,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
+        // #4260: app-usage tables are read ONLY through the Forensics-gated
+        // single-target app_usage plugin reads, never through generic tar.sql
+        // (Infrastructure:Read). Remove them from the allowlist after the loop
+        // above so the SQLite authorizer (tar_query_authorizer) denies every
+        // access path -- direct name, $Usage_* placeholder, alias, JOIN, or
+        // subquery -- post-translation, matching the tar_events #760 UP-8
+        // no-oracle reasoning this function already documents.
+        for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
+            s.erase(usage_table);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));
@@ -1480,16 +1559,20 @@ GROUP BY (ts / 3600) * 3600)";
     }
 
     // ── Per-app perf rollups (BRD A2) — per (hour, app name, version) ────
+    // is_kthread rides the GROUP BY as an identity column (module_hourly's
+    // is_kernel precedent) — never aggregated, since every instance sharing
+    // one (name, version) group agrees on it (derive_proc_samples OR's it
+    // across instances of the same name).
     if (source_name == "procperf") {
         if (target_suffix == "hourly") {
-            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max,
-    cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
-SELECT (ts / 3600) * 3600, name, version, COUNT(*), MAX(instances),
+            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, is_kthread, samples,
+    instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
+SELECT (ts / 3600) * 3600, name, version, is_kthread, COUNT(*), MAX(instances),
        AVG(cpu_pct), MAX(cpu_pct),
        CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, version)";
+GROUP BY (ts / 3600) * 3600, name, version, is_kthread)";
         }
     }
 

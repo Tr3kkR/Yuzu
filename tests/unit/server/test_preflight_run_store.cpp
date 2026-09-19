@@ -153,10 +153,16 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
         CHECK(done->status == "complete");
     }
 
-    SECTION("prune removes old runs + cascades") {
-        const auto old_t = t - 100000;
+    SECTION("prune removes old runs + cascades (clock-guarded, bootstrap-declines once)") {
+        const auto old_t = t - 100000; // 100s ago (t == now_ms())
         REQUIRE(store.create_run(make_run("rOld", "carol", old_t), {tgt("o1")}));
-        int n = store.prune_older_than(t - 50000); // cutoff between old and new
+        // WS-10: run_retention_prune reads Postgres now() itself and takes the
+        // retention WINDOW, not a cutoff. 75s sits between rOld (100s) and the
+        // recent runs (~now). The clock guard's part-6 Decline means the FIRST
+        // pass on a store that has data but no persisted anchor DECLINES (records
+        // the anchor + settled marker, deletes nothing); the next pass proceeds.
+        CHECK(store.run_retention_prune(75000) == 0); // bootstrap decline
+        int n = store.run_retention_prune(75000);
         CHECK(n >= 1);
         CHECK_FALSE(store.get_run("rOld").has_value());
         CHECK(store.get_devices("rOld").empty()); // cascaded

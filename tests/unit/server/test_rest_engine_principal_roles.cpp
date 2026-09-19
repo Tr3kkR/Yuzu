@@ -182,7 +182,7 @@ struct RestEngineRolesHarness {
                             /*step_up_fn=*/{}, // no MFA gate in this harness (mirrors token tests)
                             /*guardian_push_fn=*/{},
                             /*dex_perf_fn=*/{},
-                            /*net_perf_fn=*/{},
+                            /*network_api=*/{},
                             /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr,
                             /*scoped_perm_fn=*/{},

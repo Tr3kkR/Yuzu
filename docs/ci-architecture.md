@@ -35,6 +35,17 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
+  **Scheduled nightlies always run the DEFAULT branch's copy of the workflow**
+  (currently `main`) — `dev` gets zero nightly ASan/TSan/coverage coverage
+  outside a manual `workflow_dispatch` (#4018). `workflow_dispatch.inputs.jobs`
+  (choice `all`/`windows-asan`, default `all`) exists so a `windows-asan`-only
+  recurrence check can be dispatched against `dev` without paying for the full
+  Big Tam matrix each time: it skips `sanitize-asan`/`sanitize-tsan`/`coverage`
+  and — so a diagnostic dev-branch dispatch never touches the shared
+  `nightly-broken` discipline gate — also skips `alert`/`close-on-green`. A
+  plain `jobs=all` dispatch (or the omitted-input schedule trigger) is
+  unaffected and runs exactly as before.
+
   The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
   `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
   calling thread. Required because cpp-httplib enables
@@ -134,6 +145,26 @@ required check; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
+
+### Plugin README gates (`docs` suite + `docs-lint.yml`, `docs/plugin-readme-standard.md`)
+
+Two gates keep each plugin's `agents/plugins/<name>/README.md` honest. The
+meson `docs` suite runs `tests/test_plugin_readmes.py` on every leg: the
+README-existence ratchet (the count of plugin directories without a README
+may only fall), the section contract, and a byte-diff of every generated
+artefact — the README fences, the user-manual plugin index,
+`site/src/nav.plugins.mjs` and the `content/plugin-docs/*.json` manifests —
+against what `tools/plugin-doc-gen` produces from the committed sources
+(the same contract `check-capability-matrix.sh` enforces for the
+capability matrix, and it needs no build). A stale sample leg-hash fails
+it too; regenerate with `python3 tools/plugin-doc-gen/plugin_doc_gen.py
+--all`. The `plugin-readme-touch-rule` job in `docs-lint.yml` (pull
+requests only, not a required check today) runs
+`scripts/ci/check-plugin-readme-touch.sh`: a change under
+`agents/plugins/<name>/src/**` must also touch that README, or the PR body
+must carry a visible `docs-unchanged: <section> — <reason>` line, which
+the job prints. Both scripts carry a fixture self-test that the `docs`
+suite also runs.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -428,6 +459,13 @@ leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 (one consolidated invocation now covers what used to be five separate
 suites plus the four non-pg server shards).
 
+`nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
+gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
+ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares
+the script's default slot namespace with `ci.yml`'s Windows legs above (no
+`YUZU_TEST_SLOT_NAME` override on either side), so a nightly run and a
+concurrent PR/push genuinely compete for the same 2 slots.
+
 **Staged widening — the decision rule (stated once here; each push's
 paragraph below references it, doesn't restate it).** The pg-shards step
 widens `2 → 4 → 6 → 8` in separate, individually-measured pushes, never
@@ -590,7 +628,9 @@ just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
 no `--suite`/name filter at all. Fix: split the Test step into 3
 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
 across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
-the 3 non-pg server tests, both uncapped (neither touches Postgres); the 8 pg
+the 3 non-pg server tests, both uncapped (neither touches Postgres) — status as
+of that day; see "Within-job cap extended to the non-pg step" at the end of
+this section for what changed; the 8 pg
 shards, isolated by exact name into their own `with-test-slot.sh`-gated call,
 run last with the pool dedicated entirely to them. 21+3+8 = 32, verified as an
 exact partition of the full registered test set before trusting it in CI.
@@ -954,6 +994,33 @@ correlation yet; building that is a real #3443 follow-up, not assumed
 done here. Response to either trigger is rebalancing/splitting the
 affected shard(s) or reverting to slots=2, never another timeout
 increase. Tracked: #3443.
+
+**Within-job cap extended to the non-pg step (2026-09-18).** The "3 non-pg
+server tests, both uncapped" status above (now 6 named entries, see the
+count-drift note on `ci.yml`'s comment) turned out to matter even though those
+tests don't touch Postgres: `--num-processes 2` was added to both
+`flake-retry.py` invocations in the "Test (non-pg suites)" step, matching the
+value already established for this box's pg-shard step. Evidence: on two
+independently-diagnosed CI runs (PR #4532 run 35307458479, PR #4566 run
+35361987460, no diff in common), that step's own `meson test` invocation
+failed exactly one Catch2 case each time — both async/timing assertions in
+the spark/guardian suite — consistent with the same within-job CPU-steal
+mechanism this section already proved for the pg shards, just flipping a
+timing assertion instead of hitting a hard per-shard timeout.
+
+This is **not** a fix for the much larger ~20-case failure list CI actually
+reported for those same two runs (`content_dist`/`script_exec`/`event_logs`/
+`wifi`/`windows_updates`/`software_actions`/`license_scan`). A `build-ci`
+review found that list is produced by `flake-retry.py`'s `catch2_failed_cases()`
+classifier, which re-runs the whole failed binary a second time, solo, outside
+meson's orchestrator entirely — untouched by `--num-processes` or by
+`with-test-slot.sh`. Why that solo re-run reports a different failure set than
+the original run (and drops the original run's own failing case from its own
+list) is not diagnosed; tracked as #4580. Cross-job `with-test-slot.sh` gating
+was deliberately not added to the non-pg step yet — this step's own duration
+is still short, so the within-job cap ships first per this section's "one axis
+at a time" practice; #4580's outcome may argue for cross-job gating here too,
+once the actual mechanism is understood.
 
 ### Persistent runner-local test history
 

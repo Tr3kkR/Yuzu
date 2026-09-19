@@ -9,6 +9,8 @@ supersedes-direction: CONTEXT.md's `Chokepoint` entry's "not by generic graph ce
 
 # 4003 — CAVM v20 adoption on Yuzu's reachability graph
 
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero crown-jewel/trust-zone/AMAPC/chain-centrality implementation in `server/core/src` (the only "crown jewel" hits are unrelated CA-root-key comments in `ca_store.hpp`/`key_provider.hpp`/`server.cpp`). Deferred, not withdrawn: re-homes into a use-case engine under ADR-1005 Phase 7 (not started, #4099); NOT grandfathered — faces ADR-1005 Decision 2 at implementation.
+
 > Records how Yuzu adopts the CAVM v20 whitepaper (Andy Younie, July 2026 — an external design document, not tracked in this repo) into the reachability-graph architecture ADR-0002/0005 already committed, and into the observed-reachability MVP trade-off ADR-4002 already accepted. CAVM v20 is a substantially more complete graph-theoretic prioritization framework (formal metrics, an operational stability layer, remediation batching, speculative scoring) than anything scoped when 4001/4002 landed. This ADR decides what's adopted now, what's deferred, and — critically — how CAVM's own default graph model (coarser, asset-level, no existing integration) maps onto Yuzu's *already more precise* service-level graph, rather than adopting CAVM's model wholesale and discarding what Yuzu already has.
 
 ## Context

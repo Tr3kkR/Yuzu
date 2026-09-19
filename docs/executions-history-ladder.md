@@ -178,7 +178,8 @@ the cap, never an out-of-scope row), so this is not a security regression, but i
 not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
 tracked separately as #3805.
 
-**#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`server.cpp`) — the one
+**#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`execution_routes.cpp` as
+of #2542 PR-7, extracted from `server.cpp` onto the `HttpRouteSink` seam) — the one
 execution-reading surface with NO confinement of any kind, not even a post-fetch filter — is now
 on `require_fleet_read`, and its LIST route uses the SQL-pushdown pattern this paragraph describes
 (a correlated `EXISTS` over `agent_exec_status`, since `executions` carries no per-row `agent_id`

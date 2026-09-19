@@ -96,6 +96,12 @@ public:
         engine_->disarm(subscription);
     }
 
+    SubscriptionHealth subscription_health(std::uint64_t subscription) override {
+        if (!bound_)
+            return SubscriptionHealth::Dead; // unbound adapter never armed anything
+        return engine_->subscription_health(subscription);
+    }
+
 private:
     SparkEngine* engine_; // BORROWED - see the lifetime note above
     SparkEngine::ConsumerId consumer_{0};

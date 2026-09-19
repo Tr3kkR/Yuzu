@@ -21,6 +21,7 @@
 /// surface stays /api/v1/guaranteed-state/* until the dedicated rename PR.
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -67,6 +68,10 @@ public:
     /// Register all Guardian routes on the given server.
     /// `store` may be null (degrades to fully-mock rendering). `baseline_store`
     /// may also be null (Baseline fragments degrade to the mock/empty state).
+    /// `metrics` may be null (degrades to no instrumentation, matching every
+    /// other `set_metrics`-style store/route dependency in this codebase) —
+    /// wired for the #4252 platform-support-matrix-stale counter (see
+    /// guardian_routes.cpp's detectability block).
     void register_routes(httplib::Server& svr,
                          AuthFn auth_fn,
                          PermFn perm_fn,
@@ -75,7 +80,8 @@ public:
                          GuaranteedStateStore* store,
                          BaselineStore* baseline_store,
                          AgentsJsonFn agents_json_fn,
-                         PushFn push_fn);
+                         PushFn push_fn,
+                         yuzu::MetricsRegistry* metrics = nullptr);
 
     /// HttpRouteSink overload — same registration, against the polymorphic
     /// route-sink seam so the handlers can be dispatched in-process by an
@@ -89,7 +95,8 @@ public:
                          GuaranteedStateStore* store,
                          BaselineStore* baseline_store,
                          AgentsJsonFn agents_json_fn,
-                         PushFn push_fn);
+                         PushFn push_fn,
+                         yuzu::MetricsRegistry* metrics = nullptr);
 
 private:
     /// Reject a service-scoped API token on a fleet-wide/identity-bearing
@@ -219,6 +226,7 @@ private:
     BaselineStore* baseline_store_{};
     AgentsJsonFn agents_json_fn_;
     PushFn push_fn_{};
+    yuzu::MetricsRegistry* metrics_{};
 };
 
 } // namespace yuzu::server

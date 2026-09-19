@@ -43,6 +43,12 @@
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
+#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
+#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
+#include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
+#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
+#include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -68,7 +74,12 @@ using yuzu::server::evaluate_destructive_targeting;
 using yuzu::server::ExecuteGate;
 using yuzu::server::kDestructiveNoVisibleAgentMessage;
 using yuzu::server::kDestructiveUntargetedMessage;
+using yuzu::server::kForensicsSecurable;
+using yuzu::server::kForensicUntargetedMessage;
+using yuzu::server::kReasonDestructiveUntargeted;
+using yuzu::server::kReasonForensicUntargeted;
 using yuzu::server::Mutability;
+using yuzu::server::requires_explicit_targets;
 
 namespace {
 
@@ -126,6 +137,36 @@ inline constexpr std::array<CommandCapability, 1> kCollidingFragment{{
         .securable = "Infrastructure",
         .operation = yuzu::server::authz::Operation::Delete,
         .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+}};
+
+// Wave 7 PR7.2 — a local Forensics fixture: `ReadOnly`/`None`, never
+// `Destructive`, but still subject to the single-target rule via
+// `requires_explicit_targets`'s securable-name branch. Also a plain
+// Inventory `ReadOnly` row (no relation to Forensics) proving the rule does
+// NOT leak onto every ReadOnly securable.
+inline constexpr std::array<CommandCapability, 2> kForensicsFixture{{
+    {
+        .plugin = "execution_artifacts",
+        .action = "shimcache",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "inventory",
+        .action = "list",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Low,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
     },
@@ -264,6 +305,167 @@ TEST_CASE("ReadOnly and Mutating rows: NotDestructive regardless of targeting sh
     CHECK(gate2.capability->plugin == "tags");
 }
 
+// ──────────────────────────── Wave 7 PR7.2: Forensics single-target rule ──
+
+TEST_CASE("Forensics ReadOnly row, exactly one explicit agent_id, no scope: Targeted",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("execution_artifacts", "shimcache");
+    REQUIRE(classified.has_value());
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/true,
+                                                      /*scope_key_present=*/false,
+                                                      /*agent_id_count=*/1);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::Targeted);
+    REQUIRE(gate.capability.has_value());
+    CHECK(gate.capability->securable == kForensicsSecurable);
+}
+
+TEST_CASE("Forensics ReadOnly row: RefuseUntargeted for 0 ids, 2 ids, ids+scope, and an "
+          "omitted count (fail-closed default)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("execution_artifacts", "shimcache");
+    REQUIRE(classified.has_value());
+
+    // 0 ids.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/false,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/0);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // 2 ids (fan-out — not a broadcast, but still more than the one target
+    // the single-target rule permits).
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/2);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // Exactly one id, but scope ALSO present.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/true,
+                                                          /*agent_id_count=*/1);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // The count parameter OMITTED entirely — defaults to 0, so a caller that
+    // has not been updated to count ids FAILS CLOSED rather than admitting a
+    // forensic broadcast by silent omission.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
+TEST_CASE("execution_artifacts: the REAL catalogue fragment (not the independent kForensicsFixture "
+          "copy above) is Forensics-securable and gates identically to a targeted single-agent "
+          "dispatch for all three real actions — a static_assert only proves the fragment's three "
+          "rows share ONE securable literal with EACH OTHER, never that the literal is still "
+          "\"Forensics\"; this pins the real fragment against evaluate_destructive_targeting so a "
+          "drift in the shipped securable string (kForensicsFixture's local copy would not see it) "
+          "fails here",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts()};
+
+    for (const char* action : {"shimcache", "amcache", "prefetch"}) {
+        auto classified = registry.classify("execution_artifacts", action);
+        REQUIRE(classified.has_value());
+        CHECK(classified->securable == kForensicsSecurable);
+        CHECK(requires_explicit_targets(*classified));
+
+        const auto targeted = evaluate_destructive_targeting(classified,
+                                                              /*valid_nonempty_agent_ids=*/true,
+                                                              /*scope_key_present=*/false,
+                                                              /*agent_id_count=*/1);
+        CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+        REQUIRE(targeted.capability.has_value());
+        CHECK(targeted.capability->securable == kForensicsSecurable);
+
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                              /*valid_nonempty_agent_ids=*/true,
+                                                              /*scope_key_present=*/false,
+                                                              /*agent_id_count=*/2);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+        CHECK(refused.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
+TEST_CASE("Inventory ReadOnly row stays NotDestructive — the single-target rule does not leak "
+          "onto every ReadOnly securable",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("inventory", "list");
+    REQUIRE(classified.has_value());
+    CHECK_FALSE(requires_explicit_targets(*classified));
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false,
+                                                      /*agent_id_count=*/0);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::NotDestructive);
+}
+
+// Wave 7b PR7b.3 — pins the REAL app_usage fragment (not the hand-built
+// kForensicsFixture above) through the same Forensics single-target rule:
+// app_usage's three rows are ReadOnly/AdminOrApproval under the Forensics
+// securable, so they must be targeted exactly as execution_artifacts is.
+TEST_CASE("app_usage.summary (real fragment): Forensics single-target rule — 1 agent Targeted, "
+          "2 agents RefuseUntargeted",
+          "[server][dispatch][security]") {
+    namespace capdecls = yuzu::server::capdecls;
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_app_usage()};
+    auto classified = registry.classify("app_usage", "summary");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+
+    const auto refused = evaluate_destructive_targeting(classified,
+                                                         /*valid_nonempty_agent_ids=*/true,
+                                                         /*scope_key_present=*/false,
+                                                         /*agent_id_count=*/2);
+    CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+    CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+}
+
+TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
+          "Forensics pair",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
+    auto classified = registry.classify("tar", "purge_source");
+    REQUIRE(classified.has_value());
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+    CHECK(gate.refusal_reason == kReasonDestructiveUntargeted);
+    CHECK(gate.refusal_message == kDestructiveUntargetedMessage);
+}
+
 // ──────────────────────────────────────────────── confine_destructive_targets ──
 
 TEST_CASE("confine_destructive_targets: drops out-of-visible entries, preserves order and "
@@ -337,7 +539,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 9> sources{{
+    const std::array<std::span<const CommandCapability>, 15> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -346,6 +548,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
+        capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_app_usage(),
+        capdecls::plugin_action_catalogue_execution_artifacts(),
+        capdecls::plugin_action_catalogue_windows_optional_features(),
+        capdecls::plugin_action_catalogue_peripherals(),
+        capdecls::plugin_action_catalogue_printing(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -381,7 +589,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same eight spans compose into a real registry
+    // `build_registry`: the same fifteen spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -393,6 +601,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
+        capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_app_usage(),
+        capdecls::plugin_action_catalogue_execution_artifacts(),
+        capdecls::plugin_action_catalogue_windows_optional_features(),
+        capdecls::plugin_action_catalogue_peripherals(),
+        capdecls::plugin_action_catalogue_printing(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");

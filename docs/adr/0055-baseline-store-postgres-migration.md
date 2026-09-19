@@ -1,6 +1,7 @@
 # ADR-0055: BaselineStore → PostgreSQL
 
-- **Status:** Proposed
+- **Status:** Accepted — shipped PR #3517, merged 2026-08-24; `baseline_store.cpp` is PG-native
+  (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified 2026-09-07.
 - **Date:** 2026-08-19
 - **Deciders:** pg workstream, security-guardian + docs-writer review (Guardian routing per CLAUDE.md)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012; ADR-0038

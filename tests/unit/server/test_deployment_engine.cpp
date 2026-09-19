@@ -83,6 +83,14 @@ struct Harness {
             // engine must settle the claim on ANY zero-sent outcome.
             if (gate_unreadable)
                 return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            // WS-4 4.2b Task D fix (#3424/#3511 under-count): `route_unreadable`
+            // is NOT `containment_unreadable`'s shape. A fail-closed containment
+            // gate withholds every id BEFORE its send, forcing `sent == 0` — the
+            // early return above. A degraded GatewayRouteStore directory read
+            // does NOT: the arm walk still runs, so this flag is folded into the
+            // NORMAL outcome below (alongside `offline_agents`/`not_sent`, etc.)
+            // rather than short-circuiting the whole batch — a locally-connected
+            // agent in the SAME call can still land in `sent`.
             // Mirrors dispatch_confined_arms.hpp's own `filter_to_scope`
             // pre-loop drop: an id outside the caller's exec_visible set
             // never enters the arm walk at all, so it lands in NONE of
@@ -118,13 +126,15 @@ struct Harness {
                    .command_id = "cmd",
                    .not_sent = offline,
                    .unknown_plugin = withheld,
-                   .unknown_plugin_count = withheld.size()};
+                   .unknown_plugin_count = withheld.size(),
+                   .route_unreadable = route_unreadable};
         };
         return d;
     }
 
     bool deny_dispatch{false};
     bool gate_unreadable{false};
+    bool route_unreadable{false};
     std::unordered_set<std::string> unknown_plugin_agents;
     std::unordered_set<std::string> offline_agents;
     std::unordered_set<std::string> denied_quarantined_agents;
@@ -320,6 +330,139 @@ TEST_CASE("deployment engine retries after a transient containment-gate failure 
     advance(deps, id, cfg, authorized, test_caller());
     CHECK(h.dispatch_count("stage", "a1") == 2);
     CHECK(step_of(store, id, "a1") == "staging");
+}
+
+TEST_CASE("deployment engine retries after a transient GatewayRouteStore directory-read "
+          "failure that this device could not be routed through, instead of permanently "
+          "failing the claim (WS-4 4.2b Task D, #3424/#3511 under-count)",
+          "[pg][deployment][engine]") {
+    // UNLIKE the containment-gate-unreadable test immediately above,
+    // `route_unreadable` (WS-4 4.2b Task C) is NOT the same shape as
+    // `containment_unreadable` — see settle_claimed_batch's own comment. A
+    // fail-closed containment gate withholds EVERY id before its send,
+    // forcing `sent == 0` for the whole batch; a degraded GatewayRouteStore
+    // directory read does not, so a device the walk actually reaches still
+    // lands in `sent`. This single-device case exercises the sibling where
+    // the one device in the batch could NOT be routed (offline_agents) while
+    // the directory read was also degraded — it reverts INDIVIDUALLY via
+    // the ordinary `not_sent` path (see the mixed two-device case below for
+    // the case this individual-vs-whole-batch distinction actually matters:
+    // a genuinely-reached sibling must NOT be reverted alongside it).
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-route-unreadable";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1")}));
+
+    Harness h{store};
+    h.route_unreadable = true;
+    h.offline_agents = {"a1"}; // the directory could not resolve a route for it
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1"};
+
+    // Tick 1: the device is claimed into 'staging', the route directory
+    // read itself is unreadable and this device could not be routed — not a
+    // permanent fact about this device — so the claim must be UNDONE (back
+    // to 'pending'), never settled to a permanent 'failed'.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a1") == "pending");
+
+    // Tick 2: the directory read recovers — the device is reclaimed (a
+    // SECOND stage dispatch, since the first was never actually delivered)
+    // and this time reaches the agent.
+    h.route_unreadable = false;
+    h.offline_agents.clear();
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 2);
+    CHECK(step_of(store, id, "a1") == "staging");
+}
+
+TEST_CASE("deployment engine reverts ONLY the route-degraded device in a MIXED "
+          "route_unreadable execute-phase batch, leaving the genuinely-reached sibling "
+          "in flight instead of double-executing it (WS-4 4.2b Task D fix regression, "
+          "UP-1 HIGH — settle_claimed_batch's `containment_unreadable || route_unreadable` "
+          "whole-batch revert was REMOVED because reverting an already-EXECUTING device "
+          "lets a later tick's claim_for_exec re-claim and re-dispatch it under a FRESH "
+          "command_id, which the agent's command_id dedup (WS-0) does NOT absorb — a "
+          "double-execution of the installer)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-mixed-route-unreadable-exec";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2")}));
+
+    Harness h{store};
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2"};
+
+    // Tick 1: both devices claimed + dispatched into 'staging'.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(step_of(store, id, "a1") == "staging");
+    CHECK(step_of(store, id, "a2") == "staging");
+
+    // Tick 2: both stage OK — response-derived transition moves them to
+    // 'staged' at the TOP of this same tick, so the fresh re-read below
+    // immediately claims + dispatches EXECUTE for both in the SAME tick.
+    // Configure the EXECUTE-phase outcome the fake dispatch_fn will now
+    // return: a1 is genuinely reached (sent); a2's route lookup degraded
+    // and it lands in not_sent — a MIXED batch under a single degraded
+    // directory read, exactly the shape settle_claimed_batch must not
+    // whole-batch-revert.
+    h.poll[stage_execution_id(id)] = {{"a1", {1, "status|ok\nstaged_path|/p"}},
+                                      {"a2", {1, "status|ok\nstaged_path|/p"}}};
+    h.route_unreadable = true;
+    h.offline_agents = {"a2"};
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("execute_staged", "a1") == 1);
+    CHECK(h.dispatch_count("execute_staged", "a2") == 1); // claimed + dispatched, in the SAME call
+
+    // a1 was genuinely SENT (part of outcome.sent) — it must be LEFT ALONE
+    // in 'executing', awaiting its real agent response. Reverting it here
+    // (the pre-fix whole-batch behaviour) would let a LATER tick's
+    // claim_for_exec re-claim and re-dispatch it under a fresh command_id —
+    // a second, unintended execution of the installer on a1.
+    CHECK(step_of(store, id, "a1") == "executing");
+    // a2 was route-degraded (in outcome.not_sent) — reverted INDIVIDUALLY
+    // back to 'staged' so a later tick's own candidate scan reclaims it,
+    // never permanently 'failed' (the directory read is typically
+    // transient) and never left stuck (the pre-fix under-count this PR's
+    // routed concern names).
+    CHECK(step_of(store, id, "a2") == "staged");
+
+    // A repeated advance() with the directory read STILL degraded must not
+    // re-touch a1 (still genuinely in flight, unresolved, not a candidate
+    // for claim_for_exec) — proving a1's 'executing' step is stable, not an
+    // accidental one-tick snapshot. a2, back in 'staged' from the revert
+    // above, IS a fresh candidate and is reclaimed + re-dispatched again
+    // (a SECOND execute_staged call for it — the first was never actually
+    // delivered) — and, the directory read still being degraded, reverts to
+    // 'staged' again for a further retry, symmetric with the single-device
+    // case above.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("execute_staged", "a1") == 1); // still exactly one
+    CHECK(step_of(store, id, "a1") == "executing");
+    CHECK(h.dispatch_count("execute_staged", "a2") == 2);
+    CHECK(step_of(store, id, "a2") == "staged");
+
+    // Once the directory read recovers, a2 is reclaimed a THIRD time and
+    // this time reaches the agent, while a1 remains untouched throughout.
+    h.route_unreadable = false;
+    h.offline_agents.clear();
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("execute_staged", "a2") == 3);
+    CHECK(step_of(store, id, "a2") == "executing");
+    CHECK(h.dispatch_count("execute_staged", "a1") == 1); // still exactly one -- no double-execution
+    CHECK(step_of(store, id, "a1") == "executing");
 }
 
 TEST_CASE("deployment engine fails a quarantined device in a mixed batch the same way it "

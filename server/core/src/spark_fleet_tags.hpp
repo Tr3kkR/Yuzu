@@ -116,7 +116,8 @@ inline constexpr const char* kSparkMechTokens[] = {kSparkMechFile, kSparkMechReg
 
 // Per-type metric suffixes. The first three are SparkMechanismStats health
 // counters surfaced per type (the ones that back the fleet alerts). `retiring`/
-// `retiring_cap` is a Windows-file IOCP teardown-backpressure internal (0 without
+// `retiring_cap` is a per-mechanism teardown-backpressure internal (File's IOCP
+// retirements; Registry's detached callback drains since PR-B1; 0 without
 // arming churn) - it is summed at engine level in SparkEngineStats but its
 // per-{os,mechanism} fleet rollup is deferred to rung 2, when arming makes it
 // non-zero.

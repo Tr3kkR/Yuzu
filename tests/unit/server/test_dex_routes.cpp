@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -1005,6 +1006,19 @@ TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[pg][de
     CHECK(html.find("No crashes") != std::string::npos);
 }
 
+TEST_CASE("DEX app drill-down: performance cross-link uses the EXACT process-name "
+          "key, never normalized (no case-fold, no .exe strip) — shown even with no "
+          "crash history",
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto html = render_dex_app_fragment(&store, "MyApp.EXE", "7d");
+    CHECK(html.find("/fragments/dex/perf/app?app=MyApp.EXE&window=7d") != std::string::npos);
+    CHECK(html.find("myapp.exe") == std::string::npos);    // no case-fold
+    CHECK(html.find("app=MyApp&window=") == std::string::npos); // no .EXE stripping
+}
+
 TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
           "[pg][dex][routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
@@ -1861,13 +1875,19 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(done);
         CHECK(done->body.find("<svg") != std::string::npos);
         CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
+        // #4035: the poll route is where the parsed data actually reaches the
+        // operator, so it must carry its own audit row (the dispatch's
+        // "success" audit above is a SEPARATE row for the request, not the read).
+        CHECK(audited == "dex.device.perf.query|rendered|WS-1");
 
+        audited.clear();
         fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
         auto err =
             sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(err);
         CHECK(err->body.find("reported an error") != std::string::npos);
         CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+        CHECK(audited.empty()); // an agent-reported error is not an audited data access
     }
 
     SECTION("result poll: a valid-but-empty result renders 'no history', stops polling (gov S3)") {
@@ -1988,6 +2008,28 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(dispatched == 1);
         CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    // #4035: both /result poll routes previously had NO audit call at all — only
+    // the dispatch half was audited. The poll is where the parsed data actually
+    // reaches the operator, so it needs its own row (fires only when data is
+    // actually rendered, never on a still-pending re-poll).
+    SECTION("procperf result poll: rendered data is audited under its own verb") {
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+                      "chrome.exe|10|3|25.5|40.0|1000000|2000000|5\n",
+                      ""}};
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(audited == "dex.device.procperf.query|rendered|WS-1");
+    }
+    SECTION("procperf result poll: still pending is NOT audited (no per-attempt spam)") {
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("hx-trigger") != std::string::npos); // re-polling
+        CHECK(audited.empty());
     }
     SECTION("perf clean path sets NO Sec-Audit-Failed header") {
         auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
@@ -2195,5 +2237,462 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         REQUIRE(r);
         CHECK(audited.empty()); // denied before the behavioural-PII audit fires
         CHECK(r->body.find("chrome.exe") == std::string::npos);
+    }
+}
+
+TEST_CASE("DEX version-devices drill fragment: gate, param validation, audit, "
+          "visible-set threading",
+          "[dex][app_perf][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    std::string audited_result;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string& ttype, const std::string& tid, const std::string& d) -> bool {
+        audited = a + "|" + r + "|" + ttype + "|" + tid + "|" + d;
+        audited_result = r;
+        return true;
+    };
+
+    std::optional<std::vector<std::string>> seen_visible_ids;
+    bool seen_visible_ids_set = false;
+    bool degrade = false;
+    AppPerfProviders providers;
+    providers.version_devices =
+        [&](std::string_view app, std::string_view version,
+            const std::optional<std::vector<std::string>>& visible_ids,
+            bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+        CHECK(app == "chrome.exe");
+        seen_visible_ids = visible_ids;
+        seen_visible_ids_set = true;
+        truncated = false;
+        if (degrade)
+            return std::nullopt;
+        (void)version;
+        AppPerfVersionDeviceRow r;
+        r.agent_id = "WS-1";
+        r.last_day = 1'700'000'000;
+        r.samples = 5;
+        r.cpu_avg = 42.0;
+        r.ws_avg_bytes = 100;
+        return std::vector<AppPerfVersionDeviceRow>{r};
+    };
+
+    auto admit_unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) {
+        return authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    };
+    auto admit_scoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                           const std::string&) {
+        return authz::FleetReadGate{
+            .admitted = true,
+            .scope = authz::VisibleSet{std::unordered_set<std::string>{"WS-1"}}};
+    };
+    auto deny = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) {
+        res.status = 403;
+        return authz::FleetReadGate{.admitted = false};
+    };
+
+    SECTION("gate unwired -> 200 note, no read, no audit (fails closed, never falls back)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}); // fleet_read_fn = {} (unwired)
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("authorization gate not configured") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set); // provider never called
+        CHECK(audited.empty());
+    }
+
+    SECTION("gate denies -> the gate's own status stands, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, deny);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK_FALSE(seen_visible_ids_set);
+        CHECK(audited.empty());
+    }
+
+    SECTION("missing app -> 200 note, gate never called, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("missing version (absent, not empty) -> 200 note -- omission is NOT "
+            "'all versions' on this route") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("EMPTY version (present, explicit) IS accepted -- the unknown-version bucket") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_visible_ids_set); // reached the provider — "" was accepted
+        CHECK(r->body.find("WS-1") != std::string::npos);
+    }
+
+    SECTION("nullopt gate scope (unfiltered) threads through as nullopt, not an empty vector") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        CHECK_FALSE(seen_visible_ids.has_value()); // unfiltered, not deny-all
+        CHECK(r->body.find("WS-1") != std::string::npos);
+        CHECK(r->body.find("42.0%") != std::string::npos);
+        // Audit fires AFTER the read with the real device count.
+        CHECK(audited.find("dex.app_perf.devices.view|success|GuaranteedState|") == 0);
+        CHECK(audited.find("devices=1") != std::string::npos);
+    }
+
+    SECTION("engaged gate scope threads through the EXACT set (ADR-0017 push-into-query)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_scoped);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        REQUIRE(seen_visible_ids.has_value());
+        REQUIRE(seen_visible_ids->size() == 1);
+        CHECK((*seen_visible_ids)[0] == "WS-1");
+    }
+
+    SECTION("store degrade -> 200 honest note, audit fires with result=failure") {
+        degrade = true;
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read") != std::string::npos);
+        CHECK(audited_result == "failure");
+    }
+
+    SECTION("no provider wired -> graceful note, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               {}, {}, admit_unfiltered); // app_perf_providers = {}
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no app-perf device provider wired") != std::string::npos);
+        CHECK(audited.empty());
+    }
+}
+
+// Regression pin for a raw/canonical `version` split at the route seam: the
+// handler used to thread the RAW query value to the provider call while ALSO
+// passing it as `render_dex_app_perf_trend`'s `active_version` label — since the
+// store canonicalizes via `canon_version` before filtering (empty OR
+// non-numeric -> "", a short/leading-zero form -> its 4-group canonical form),
+// a mismatched pair let the page claim "Filtered to version X" over data the
+// store never actually filtered (X non-canonicalizable -> store applied NO
+// filter), or echo the wrong string for a value that WAS correctly filtered
+// (X short-form -> store filtered on the canonical form, banner showed the
+// raw one). The fix canonicalizes ONCE in the handler and reuses that single
+// value for both the provider call and the render call — these tests assert
+// the provider and the rendered banner agree, not just that each looks right
+// in isolation.
+TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
+          "rendered banner never disagree",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("short-form version canonicalizes before reaching the fleet provider AND the banner") {
+        std::string seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{}; // empty rows: banner still renders pre-empty-state
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=1.2");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // provider got the canonical form, not raw "1.2"
+        // Exact tag-boundary check (not a bare substring) — "1.2.0.0" contains
+        // "1.2" as a substring, so a loose check would pass even if the banner
+        // still echoed the raw value.
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+        CHECK(r->body.find(">1.2</span>") == std::string::npos);
+        CHECK(r->body.find("Filtered to version") != std::string::npos);
+    }
+
+    SECTION("non-canonicalizable version folds to unfiltered -- never rendered as \"filtered\"") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=latest");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty()); // "latest" canonicalizes to "" -> the store's own
+                                     // all-versions sentinel, same as if version were omitted
+        // The page must not claim a filter is active when none was applied.
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    // `canon_version` folds an all-zero quad to "" via a DIFFERENT predicate
+    // (`all_zero`) than a non-numeric string ("latest" above, `ngroups==0`) —
+    // distinct branches that happen to share an outcome, so covering one at
+    // this (route) level doesn't exercise the other.
+    SECTION("all-zero version (\"0.0.0.0\") also folds to unfiltered") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=0.0.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty());
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    SECTION("group path threads the SAME canonical version as the fleet path") {
+        std::string seen_group, seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view group, std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_group = std::string(group);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_group == "G1");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // leading-zero form canonicalized, matching the fleet path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("model path fires tag_cohort with the SAME canonical version as the fleet path") {
+        std::string seen_key, seen_value, seen_app, seen_version;
+        bool group_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view key, std::string_view value,
+                                   std::string_view app,
+                                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_key = std::string(key);
+            seen_value = std::string(value);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(group_called); // model= alone must dispatch tag_cohort, not group
+        CHECK(seen_key == "model"); // default key
+        CHECK(seen_value == "Latitude 5420");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // canonicalized, matching every other scope path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("group wins when both group= and model= are present") {
+        bool group_called = false, tag_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view, std::string_view, std::string_view,
+                                   std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            tag_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(group_called);
+        CHECK_FALSE(tag_called);
+    }
+
+    SECTION("model path: unwired tag_cohort reader -> honest placeholder, never a crash") {
+        AppPerfProviders providers; // .tag_cohort left null
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200); // dashboard htmx drops 4xx/5xx bodies -- always 200 + a note
+        CHECK(r->body.find("no device-model cohort reader wired") != std::string::npos);
+    }
+
+    SECTION("model path: store degrade (tag_cohort returns nullopt) -> honest placeholder") {
+        AppPerfProviders providers;
+        providers.tag_cohort = [](std::string_view, std::string_view, std::string_view,
+                                  std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read right now") != std::string::npos);
+    }
+
+    SECTION("tag_values populates the Model selector regardless of active scope branch") {
+        AppPerfProviders providers;
+        providers.fleet = [](std::string_view,
+                             std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_values = [](std::string_view key) -> std::optional<std::vector<std::string>> {
+            CHECK(key == "model");
+            return std::vector<std::string>{"Latitude 5420", "OptiPlex 7090"};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo"); // fleet-wide, no scope selected
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Latitude 5420") != std::string::npos);
+        CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
+    }
+}
+
+TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
+          "function raw (normalization/filtering happens there)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+
+    AppPerfProviders providers;
+    providers.apps = [](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 3, .last_day = 200},
+            {.app_name = "sshd", .versions = 1, .last_day = 100},
+        };
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {}, {}, providers,
+                           {});
+
+    SECTION("no params: both apps render, unfiltered") {
+        auto r = sink.Get("/fragments/dex/perf/apps");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find("sshd") != std::string::npos);
+    }
+
+    SECTION("q= substring-filters by name") {
+        auto r = sink.Get("/fragments/dex/perf/apps?q=chrome");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("platform=windows keeps only the .exe-suffixed row") {
+        auto r = sink.Get("/fragments/dex/perf/apps?platform=windows");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("sort=name orders alphabetically") {
+        auto r = sink.Get("/fragments/dex/perf/apps?sort=name");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
 }

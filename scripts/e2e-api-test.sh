@@ -497,9 +497,36 @@ assert_eq "GET /api/v1/definitions returns 200" "200" "$HTTP_STATUS"
 http_get "$SERVER_URL/api/v1/audit"
 assert_eq "GET /api/v1/audit returns 200" "200" "$HTTP_STATUS"
 
-# GET /api/v1/openapi.json (no auth required) -> 200
+# #2057: /api/v1/openapi.json now gates Infrastructure:Read — unauthenticated
+# gets a 401, authenticated (the session logged in above) gets 200. A caller
+# with NO session at all never reaches the route's own perm_fn/A4 gate: the
+# pre-routing chokepoint's session-resolution check (server.cpp, "if
+# (!session)") short-circuits every unauthenticated /api/* request with its
+# own pre-existing, non-A4 401 body ({"error":{"code","message"},"meta"} —
+# no correlation_id) BEFORE routing — verified identical on GET /api/v1/me
+# unauthenticated too, so this is a uniform pre-existing gap across every
+# /api/v1/* route, not something #2057 introduced or scoped to fix.
 http_get_noauth "$SERVER_URL/api/v1/openapi.json"
-assert_eq "GET /api/v1/openapi.json returns 200" "200" "$HTTP_STATUS"
+assert_eq "GET /api/v1/openapi.json (unauthenticated) returns 401" "401" "$HTTP_STATUS"
+assert_contains "GET /api/v1/openapi.json (unauthenticated) body contains error code 401" \
+    '"code":401' "$HTTP_BODY"
+
+http_get "$SERVER_URL/api/v1/openapi.json"
+assert_eq "GET /api/v1/openapi.json (authenticated) returns 200" "200" "$HTTP_STATUS"
+# Not assert_contains: that helper's `echo "$haystack" | grep -q "$needle"`
+# pipeline can spuriously report no-match under `pipefail` when the needle
+# is found on an early line of a large multi-line haystack — grep(1) exits
+# the instant it matches, echo(1) is still mid-write of the remaining
+# ~200KB spec body, SIGPIPE kills echo, and pipefail surfaces THAT non-zero
+# exit rather than grep's success. The pretty-printed OpenAPI doc (its
+# "openapi" key is on line 2) triggers this every time. Plain bash glob
+# match has no subshell/pipe to race.
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *openapi* ]]; then
+    pass "GET /api/v1/openapi.json (authenticated) body contains openapi"
+else
+    fail "GET /api/v1/openapi.json (authenticated) body contains openapi (expected to contain 'openapi')"
+fi
 
 # GET /api/v1/tag-compliance -> 200
 http_get "$SERVER_URL/api/v1/tag-compliance"
