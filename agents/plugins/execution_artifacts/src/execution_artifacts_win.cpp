@@ -104,13 +104,13 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
-#include <aclapi.h>   // GetSecurityInfo (scratch_dir_is_ours's owner check)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
                             // enumerate_value_names, to_wide/from_wide
 
 #include "execution_artifacts_legs.hpp" // also pulls in <yuzu/plugin.hpp> -- yuzu_create_temp_dir
 #include "execution_artifacts_parsers.hpp"
+#include "execution_artifacts_scratch_identity.hpp" // detail::scratch_dir_is_ours (A1: hoisted, also used by the sweep)
 
 #include <constraint_accumulator.hpp>
 #include <yuzu/agent/offline_hive_mutex.hpp> // ScopedOfflineHiveLock
@@ -376,86 +376,26 @@ private:
 /// rename of the underlying directory OBJECT (ERROR_SHARING_VIOLATION to
 /// the would-be deleter), so the object scratch_dir_is_ours() verifies
 /// below is PROVABLY the same object the raw hive is later copied into.
+///
+/// DELETE is REQUESTED (never exercised -- this handle only ever reads
+/// attributes) specifically so this handle counts as one of the object's
+/// "Deleters" in Windows' own share-access bookkeeping (IoCheckShareAccess's
+/// per-object SHARE_ACCESS counters). Confirmed empirically on real
+/// Windows/MSVC (governance's own DELETE-access gate-fix -- see
+/// execution_artifacts_scratch_sweep_win.cpp's open_candidate_relative
+/// banner -- was verified on this exact handle shape and found NOT
+/// sufficient on its own): a handle whose DesiredAccess never claims DELETE
+/// is never counted as a Deleter regardless of its ShareMode, so a LATER
+/// opener that itself requests DELETE is never blocked by this handle's
+/// lack of FILE_SHARE_DELETE -- the sharing violation this banner's own
+/// prior revision claimed only fires once THIS side also claims DELETE.
 /// FILE_FLAG_OPEN_REPARSE_POINT opens a junction/symlink AS the reparse
 /// point itself rather than following it, so the reparse check below sees
 /// the object actually being opened, never its target.
 ScopedHandle open_scratch_dir_handle(const std::wstring& dir) {
     return ScopedHandle(CreateFileW(
-        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-}
-
-/// Returns the current process token's owner (TOKEN_OWNER) as an
-/// in-process buffer, or an empty vector on any failure -- the two-call
-/// GetTokenInformation idiom already used by process_enum.cpp/
-/// tar_proc_etw.cpp, requesting TokenOwner (a PSID) rather than TokenUser.
-/// The PSID inside the returned buffer is only valid for the buffer's
-/// lifetime.
-std::vector<BYTE> current_process_token_owner_buf() {
-    HANDLE raw_token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
-        return {};
-    ScopedHandle token(raw_token);
-
-    DWORD needed = 0;
-    GetTokenInformation(token.get(), TokenOwner, nullptr, 0, &needed);
-    if (needed == 0)
-        return {};
-    std::vector<BYTE> buf(needed);
-    if (!GetTokenInformation(token.get(), TokenOwner, buf.data(), needed, &needed))
-        return {};
-    return buf;
-}
-
-/// Verifies an already-open, freshly-created scratch-directory handle is
-/// the object this process itself created: not a reparse point, and owned
-/// by the SAME SID as the current process token's owner -- never a
-/// hardcoded SYSTEM/Administrators pair, so this holds unchanged under a
-/// future least-privilege NT SERVICE\YuzuAgent identity too (#1442/#4450).
-///
-/// yuzu_create_temp_dir() already gives CREATE_NEW semantics (ANY failure,
-/// including ERROR_ALREADY_EXISTS, is treated as a hard failure -- see
-/// temp_file.cpp) over a 128-bit crypto-random name, so this check is not
-/// what makes the directory safe to use -- a name nobody else can predict
-/// and a create that refuses to reuse an existing object already do that.
-/// It is a second, independent proof that the specific object this handle
-/// refers to really is the one collect_amcache just created, covering the
-/// narrow window between that create and this open during which a
-/// principal with FILE_DELETE_CHILD on agent.data_dir could in principle
-/// have deleted and resubstituted it.
-///
-/// Takes the HANDLE, not a path: every check below resolves against the
-/// OPEN OBJECT, never re-resolving the path -- combined with the caller
-/// holding this same handle open (no FILE_SHARE_DELETE) through the
-/// subsequent copy, this is what closes the TOCTOU a path-based
-/// verify-then-use would otherwise have.
-bool scratch_dir_is_ours(HANDLE dir_handle) {
-    BY_HANDLE_FILE_INFORMATION info{};
-    if (!GetFileInformationByHandle(dir_handle, &info))
-        return false;
-    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-        return false; // a junction/symlink -- never follow it.
-
-    const auto owner_buf = current_process_token_owner_buf();
-    if (owner_buf.empty())
-        return false;
-    const PSID token_owner = reinterpret_cast<const TOKEN_OWNER*>(owner_buf.data())->Owner;
-
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    PSID dir_owner = nullptr;
-    const DWORD rc = GetSecurityInfo(dir_handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                                     &dir_owner, nullptr, nullptr, nullptr, &sd);
-    if (rc != ERROR_SUCCESS)
-        return false;
-    struct SdGuard {
-        PSECURITY_DESCRIPTOR p;
-        ~SdGuard() {
-            if (p)
-                LocalFree(p);
-        }
-    } sd_guard{sd};
-
-    return EqualSid(dir_owner, token_owner);
+        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
 }
 
 /// The ERROR_SHARING_VIOLATION fallback: SeBackupPrivilege + backup-semantics
@@ -519,6 +459,106 @@ std::string copy_amcache_via_backup_semantics(const wchar_t* dest) {
     if (!ok)
         DeleteFileW(dest);
     return token; // empty on success
+}
+
+// real_enum_key/real_open_subkey wrap the two Win32 calls.
+// walk_amcache_inventory below routes through AmcacheWalkFns, at the exact
+// call shape collect_amcache used inline before this seam existed (#4392).
+LSTATUS real_enum_key(HKEY root, DWORD idx, wchar_t* name, DWORD* name_len) {
+    return RegEnumKeyExW(root, idx, name, name_len, nullptr, nullptr, nullptr, nullptr);
+}
+
+LSTATUS real_open_subkey(HKEY root, const wchar_t* name, HKEY* out) {
+    return RegOpenKeyExW(root, name, 0, KEY_READ, out);
+}
+
+/// Injectable seam for collect_amcache's subkey walk (#4392): every Win32
+/// call in the loop below is routed through `fns`, whose defaults bind to
+/// the real Reg*W/enumerate_value_names/read_reg_value calls -- so the real
+/// dispatch path (fns == {}) is byte-identical to this function's body
+/// before this seam existed.
+/// tests/unit/test_execution_artifacts_win_internals.cpp is the only caller
+/// that ever passes a non-default `fns` or `max_subkeys`.
+struct AmcacheWalkFns {
+    LSTATUS (*enum_key)(HKEY root, DWORD idx, wchar_t* name, DWORD* name_len) = &real_enum_key;
+    LSTATUS (*open_subkey)(HKEY root, const wchar_t* name, HKEY* out) = &real_open_subkey;
+    yuzu::win::ValueNameEnumeration (*enum_values)(HKEY) = &yuzu::win::enumerate_value_names;
+    yuzu::win::ReadValueStatus (*read_value)(HKEY, const std::string&, std::string&,
+                                             std::string&) = &yuzu::win::read_reg_value;
+};
+
+using AmcacheSubkeys = std::vector<std::pair<std::string, std::map<std::string, std::string>>>;
+
+/// Body moved verbatim (routed through `fns`/`max_subkeys`) out of
+/// collect_amcache's inline loop -- see AmcacheWalkFns's docblock above for
+/// why this split changes no production behaviour (fns == {} is
+/// byte-identical to the old inline body).
+AmcacheSubkeys walk_amcache_inventory(HKEY root_key, yuzu::shared::ConstraintAccumulator& acc,
+                                      const AmcacheWalkFns& fns = {},
+                                      DWORD max_subkeys = kAmcacheMaxSubkeys) {
+    AmcacheSubkeys subkeys;
+    constexpr DWORD kNameBufLen = 256;
+    wchar_t name_buf[kNameBufLen];
+    DWORD idx = 0;
+    for (;;) {
+        // Capped on attempted entries (idx), not on subkeys.size() --
+        // a denied/vanished RegOpenKeyExW below still advances idx via
+        // RegEnumKeyExW without ever growing subkeys, so gating on the
+        // successful-open count let a subkey run with many denials
+        // enumerate/open far more than kAmcacheMaxSubkeys times while
+        // holding the shared offline-hive lock.
+        if (idx >= max_subkeys) {
+            acc.add_failure("subkey_cap");
+            acc.mark_incomplete();
+            break;
+        }
+        DWORD name_len = kNameBufLen;
+        const LSTATUS enum_rc = fns.enum_key(root_key, idx, name_buf, &name_len);
+        if (enum_rc != ERROR_SUCCESS) {
+            if (enum_rc != ERROR_NO_MORE_ITEMS) { // a genuine mid-walk failure, not exhaustion
+                acc.add_failure("enum_" + std::to_string(enum_rc));
+                acc.mark_incomplete();
+            }
+            break;
+        }
+        ++idx;
+
+        std::string subkey_name = yuzu::win::from_wide(name_buf, static_cast<int>(name_len));
+        yuzu::win::RegKey subkey;
+        if (fns.open_subkey(root_key, name_buf, subkey.put()) != ERROR_SUCCESS) {
+            // vanished/denied mid-walk -- real loss, not silent
+            acc.add_failure("subkey_open_failed");
+            acc.mark_incomplete();
+            continue;
+        }
+
+        auto value_names = fns.enum_values(subkey.get());
+        if (!value_names.complete) {
+            acc.add_failure("value_enum_incomplete");
+            acc.mark_incomplete();
+        }
+
+        std::map<std::string, std::string> values;
+        for (const auto& vname : value_names.names) {
+            std::string out_value, out_type;
+            if (fns.read_value(subkey.get(), vname, out_value, out_type) ==
+                yuzu::win::ReadValueStatus::ok) {
+                values.emplace(vname, std::move(out_value));
+            } else {
+                // win_profiles.hpp's ReadValueStatus exists specifically
+                // so a caller can tell "value read failed" apart from
+                // "value absent" -- collapsing every non-ok status
+                // (denied, oversized, malformed, changed-during-read)
+                // into silent omission throws that signal away and
+                // reports a row with a missing field as if the read had
+                // been complete (SYN-02).
+                acc.add_failure("value_read_failed");
+                acc.mark_incomplete();
+            }
+        }
+        subkeys.emplace_back(std::move(subkey_name), std::move(values));
+    }
+    return subkeys;
 }
 
 // ── Prefetch ─────────────────────────────────────────────────────────────
@@ -616,7 +656,216 @@ std::string decompress_mam(std::span<const uint8_t> raw, std::vector<uint8_t>& o
     return {};
 }
 
+HANDLE real_find_first(const wchar_t* glob, WIN32_FIND_DATAW* out) {
+    return FindFirstFileW(glob, out);
+}
+
+BOOL real_find_next(HANDLE h, WIN32_FIND_DATAW* out) {
+    return FindNextFileW(h, out);
+}
+
+/// Best-effort read of `EnablePrefetcher` (PrefetchParameters). Returns
+/// nullopt on ANY failure -- missing key/value, wrong type, access denied --
+/// never throws, never logs above debug. Used only to classify an already-
+/// empty Prefetch directory (#4391); a populated directory never calls this.
+/// Moved above collect_prefetch_from (dev merge, #4564): this used to sit
+/// directly above the un-refactored collect_prefetch it was written for.
+std::optional<uint32_t> read_enable_prefetcher() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, kPrefetchParamsSubkey, kEnablePrefetcherValue,
+                           RRF_RT_REG_DWORD, nullptr, &value, &size);
+    if (rc != ERROR_SUCCESS)
+        return std::nullopt;
+    return value;
+}
+
+/// Injectable seam for collect_prefetch's enumeration + caps (#4392):
+/// FindFirstFileW/FindNextFileW route through `fns` (raw function pointers
+/// wrapping the two calls, so the pointer type carries no WINAPI-convention
+/// mismatch), the three caps route through `limits`. Defaults bind to the
+/// real calls/constants, so the real dispatch path (fns == {}, limits == {})
+/// is byte-identical to this function's body before this seam existed.
+struct PrefetchEnumFns {
+    HANDLE (*find_first)(const wchar_t* glob, WIN32_FIND_DATAW* out) = &real_find_first;
+    BOOL (*find_next)(HANDLE h, WIN32_FIND_DATAW* out) = &real_find_next;
+};
+
+struct PrefetchLimits {
+    size_t max_files = kPrefetchMaxFiles;
+    uint64_t per_file_max_bytes = kPrefetchPerFileMaxBytes;
+    uint64_t total_max_bytes = kPrefetchTotalMaxBytes;
+};
+
+/// Body moved (routed through `fns`/`limits`, and through the
+/// `glob`/`dir_with_trailing_backslash` parameters in place of
+/// kPrefetchGlob/kPrefetchDir) out of collect_prefetch, which becomes a
+/// one-line wrapper over this function below. Zero-files absence
+/// classification (dev merge, #4564) ported in alongside the move: a bare
+/// `"prefetch_disabled"` literal can't distinguish the prefetcher being
+/// genuinely off from it being on with no evidence yet or the registry
+/// state being unreadable -- see prefetch_absence_token's own doc comment.
+int collect_prefetch_from(yuzu::CommandContext& ctx, const wchar_t* glob,
+                          const wchar_t* dir_with_trailing_backslash,
+                          const PrefetchLimits& limits = {}, const PrefetchEnumFns& fns = {}) {
+    try {
+        WIN32_FIND_DATAW find_data{};
+        ScopedFindHandle find(fns.find_first(glob, &find_data));
+        if (!find) {
+            const DWORD err = GetLastError();
+            // Zero files could mean the prefetcher is off (expected), configured
+            // on but with no evidence (prefetch_evidence_absent), or unknown
+            // (registry unreadable / undocumented value) -- see
+            // prefetch_absence_token's own comment for the forensic distinction.
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                return emit_constrained(
+                    ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
+            return emit_constrained(ctx, "prefetch_enum_" + std::to_string(err));
+        }
+
+        size_t files_seen = 0;
+        size_t rows_emitted = 0;
+        uint64_t total_bytes = 0;
+        // file_cap / byte_cap / a mid-walk enumeration fault -> acc.mark_incomplete()
+        // (the enumeration was TRUNCATED); a single .pf skipped with a
+        // prefetch_error| row -> acc.add_failure() only (enumeration completed).
+        yuzu::shared::ConstraintAccumulator acc;
+
+        do {
+            if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+
+            if (files_seen >= limits.max_files) {
+                acc.add_failure("file_cap");
+                acc.mark_incomplete();
+                break;
+            }
+            ++files_seen;
+
+            const std::string fname =
+                yuzu::util::safe_output_field(yuzu::win::from_wide(find_data.cFileName));
+            const uint64_t file_bytes =
+                (static_cast<uint64_t>(find_data.nFileSizeHigh) << 32) | find_data.nFileSizeLow;
+
+            if (file_bytes > limits.per_file_max_bytes) {
+                ctx.write_output("prefetch_error|" + fname + "|file_oversized");
+                acc.add_failure("file_oversized");
+                continue;
+            }
+            if (total_bytes + file_bytes > limits.total_max_bytes) {
+                acc.add_failure("byte_cap");
+                acc.mark_incomplete();
+                break;
+            }
+
+            const std::wstring full_path =
+                std::wstring{dir_with_trailing_backslash} + find_data.cFileName;
+            ScopedHandle fh(CreateFileW(full_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!fh) {
+                ctx.write_output("prefetch_error|" + fname + "|read_failed");
+                acc.add_failure("read_failed");
+                continue;
+            }
+            std::vector<uint8_t> bytes(static_cast<size_t>(file_bytes));
+            DWORD read_bytes = 0;
+            const bool read_ok =
+                bytes.empty() || (ReadFile(fh.get(), bytes.data(), static_cast<DWORD>(bytes.size()),
+                                          &read_bytes, nullptr) &&
+                                 read_bytes == bytes.size());
+            if (!read_ok) {
+                ctx.write_output("prefetch_error|" + fname + "|read_failed");
+                acc.add_failure("read_failed");
+                continue;
+            }
+            total_bytes += bytes.size();
+
+            std::vector<uint8_t> decompressed;
+            std::span<const uint8_t> payload = bytes;
+            if (is_mam_compressed(payload)) {
+                const std::string dec_token = decompress_mam(payload, decompressed);
+                if (!dec_token.empty()) {
+                    ctx.write_output("prefetch_error|" + fname + "|" + dec_token);
+                    acc.add_failure(dec_token);
+                    continue;
+                }
+                payload = decompressed;
+            }
+
+            auto parsed = parse_prefetch(payload);
+            if (!parsed) {
+                ctx.write_output("prefetch_error|" + fname + "|" + parsed.error().token);
+                acc.add_failure(parsed.error().token);
+                continue;
+            }
+
+            ctx.write_output(format_prefetch_row(parsed->exe_name, parsed->hash_hex,
+                                                 parsed->version, parsed->run_count,
+                                                 parsed->last_runs_epoch_ms, parsed->volume_count,
+                                                 parsed->file_ref_count));
+            ++rows_emitted;
+        } while (fns.find_next(find.get(), &find_data));
+
+        // FindNextFileW returning false is ambiguous on its own --
+        // ERROR_NO_MORE_FILES is the normal, expected end of enumeration,
+        // but any other GetLastError() means a genuine I/O fault ended the
+        // walk early, indistinguishable from clean exhaustion without this
+        // check (SYN-03). Skip it when the loop instead exited via one of
+        // the caps above (acc.incomplete() already set) -- that path breaks
+        // out of the loop body before FindNextFileW runs again, so
+        // GetLastError() would reflect a stale prior call, not the reason
+        // the walk stopped.
+        if (!acc.incomplete()) {
+            const DWORD find_err = GetLastError();
+            if (find_err != ERROR_NO_MORE_FILES) {
+                acc.add_failure("prefetch_enum_" + std::to_string(find_err));
+                acc.mark_incomplete();
+            }
+        }
+
+        if (files_seen == 0 && !acc.any_failure())
+            return emit_constrained(
+                ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
+
+        if (acc.incomplete())
+            ctx.write_output("constrained|" + acc.reason());
+
+        // Exit code agrees with the typed status (legs.hpp contract: 0 only on OK):
+        //   - a cap fired -> the enumeration was TRUNCATED -> CONSTRAINED/PARTIAL, rc 1;
+        //   - only per-file errors -> the enumeration COMPLETED and every skipped file
+        //     is already on the stream as a prefetch_error| row -> OK/PARTIAL, rc 0
+        //     (the-rig 2026-09-07: one truncated WERFAULT .pf must not fail 302 good rows);
+        //   - neither -> OK/FULL, rc 0.
+        const YuzuResultStatus status =
+            acc.incomplete() ? YUZU_RESULT_STATUS_CONSTRAINED : YUZU_RESULT_STATUS_OK;
+        const YuzuResultCompleteness completeness =
+            acc.any_failure() ? YUZU_RESULT_COMPLETENESS_PARTIAL : YUZU_RESULT_COMPLETENESS_FULL;
+        ctx.set_result_status(status, completeness, acc.reason());
+        (void)rows_emitted; // kept for readability at call sites reading this function
+        return acc.incomplete() ? 1 : 0;
+    } catch (...) {
+        return emit_constrained(ctx, "internal_error");
+    }
+}
+
 } // namespace
+
+// The three exported entry points below (through the end of
+// collect_prefetch) are excluded when the guard macro just below is defined
+// -- the seam tests/unit/test_execution_artifacts_win_internals.cpp uses to
+// #include this TU directly and reach the internal-linkage
+// AmcacheWalkFns/walk_amcache_inventory/PrefetchEnumFns/PrefetchLimits/
+// collect_prefetch_from/ScratchDirGuard for a constructed-fixture unit test
+// (#4392), without pulling collect_shimcache/collect_amcache/
+// collect_prefetch's own symbols into a second definition. This TU never
+// statically links the real plugin either way (the test binary loads the
+// real DLL via PluginHandle at runtime for its own separate win_local/
+// local_dispatcher cases), so a second compilation of the same free
+// functions here creates no ODR/duplicate-symbol conflict. Never defined by
+// this TU's own (real) build -- meson.build does not set it. Mirrors
+// autoruns_macos.cpp's identical seam for
+// YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY.
+#ifndef YUZU_EXECUTION_ARTIFACTS_WIN_UNIT_TEST_INTERNALS_ONLY
 
 // ═══════════════════════════════════════════════════════════ ShimCache ════
 
@@ -704,7 +953,7 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
         if (!dest_dir_handle)
             return emit_constrained(ctx, "dest_dir_open_" + std::to_string(GetLastError()));
 
-        if (!scratch_dir_is_ours(dest_dir_handle.get()))
+        if (!detail::scratch_dir_is_ours(dest_dir_handle.get()))
             return emit_constrained(ctx, "dest_dir_acl");
 
         const std::wstring dest_hve = scratch.path() + L"\\amcache.hve";
@@ -783,72 +1032,8 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
                           root_key.put()) != ERROR_SUCCESS)
             return emit_constrained(ctx, "amcache_root_missing");
 
-        std::vector<std::pair<std::string, std::map<std::string, std::string>>> subkeys;
         yuzu::shared::ConstraintAccumulator acc;
-        constexpr DWORD kNameBufLen = 256;
-        wchar_t name_buf[kNameBufLen];
-        DWORD idx = 0;
-        for (;;) {
-            // Capped on attempted entries (idx), not on subkeys.size() --
-            // a denied/vanished RegOpenKeyExW below still advances idx via
-            // RegEnumKeyExW without ever growing subkeys, so gating on the
-            // successful-open count let a subkey run with many denials
-            // enumerate/open far more than kAmcacheMaxSubkeys times while
-            // holding the shared offline-hive lock.
-            if (idx >= kAmcacheMaxSubkeys) {
-                acc.add_failure("subkey_cap");
-                acc.mark_incomplete();
-                break;
-            }
-            DWORD name_len = kNameBufLen;
-            const LSTATUS enum_rc =
-                RegEnumKeyExW(root_key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr,
-                             nullptr);
-            if (enum_rc != ERROR_SUCCESS) {
-                if (enum_rc != ERROR_NO_MORE_ITEMS) { // a genuine mid-walk failure, not exhaustion
-                    acc.add_failure("enum_" + std::to_string(enum_rc));
-                    acc.mark_incomplete();
-                }
-                break;
-            }
-            ++idx;
-
-            std::string subkey_name = yuzu::win::from_wide(name_buf, static_cast<int>(name_len));
-            yuzu::win::RegKey subkey;
-            if (RegOpenKeyExW(root_key.get(), name_buf, 0, KEY_READ, subkey.put()) !=
-                ERROR_SUCCESS) {
-                // vanished/denied mid-walk -- real loss, not silent
-                acc.add_failure("subkey_open_failed");
-                acc.mark_incomplete();
-                continue;
-            }
-
-            auto value_names = yuzu::win::enumerate_value_names(subkey.get());
-            if (!value_names.complete) {
-                acc.add_failure("value_enum_incomplete");
-                acc.mark_incomplete();
-            }
-
-            std::map<std::string, std::string> values;
-            for (const auto& vname : value_names.names) {
-                std::string out_value, out_type;
-                if (yuzu::win::read_reg_value(subkey.get(), vname, out_value, out_type) ==
-                    yuzu::win::ReadValueStatus::ok) {
-                    values.emplace(vname, std::move(out_value));
-                } else {
-                    // win_profiles.hpp's ReadValueStatus exists specifically
-                    // so a caller can tell "value read failed" apart from
-                    // "value absent" -- collapsing every non-ok status
-                    // (denied, oversized, malformed, changed-during-read)
-                    // into silent omission throws that signal away and
-                    // reports a row with a missing field as if the read had
-                    // been complete (SYN-02).
-                    acc.add_failure("value_read_failed");
-                    acc.mark_incomplete();
-                }
-            }
-            subkeys.emplace_back(std::move(subkey_name), std::move(values));
-        }
+        auto subkeys = walk_amcache_inventory(root_key.get(), acc);
 
         const AmCacheResult parsed = parse_amcache_inventory_application_file(subkeys);
         if (parsed.rows.empty())
@@ -896,159 +1081,11 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
 
 // ═══════════════════════════════════════════════════════════════ Prefetch ═
 
-/// Best-effort read of `EnablePrefetcher` (PrefetchParameters). Returns
-/// nullopt on ANY failure -- missing key/value, wrong type, access denied --
-/// never throws, never logs above debug. Used only to classify an already-
-/// empty Prefetch directory (#4391); a populated directory never calls this.
-std::optional<uint32_t> read_enable_prefetcher() {
-    DWORD value = 0;
-    DWORD size = sizeof(value);
-    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, kPrefetchParamsSubkey, kEnablePrefetcherValue,
-                           RRF_RT_REG_DWORD, nullptr, &value, &size);
-    if (rc != ERROR_SUCCESS)
-        return std::nullopt;
-    return value;
-}
-
 int collect_prefetch(yuzu::CommandContext& ctx) {
-    try {
-        WIN32_FIND_DATAW find_data{};
-        ScopedFindHandle find(FindFirstFileW(kPrefetchGlob, &find_data));
-        if (!find) {
-            const DWORD err = GetLastError();
-            // Zero files could mean the prefetcher is off (expected), configured
-            // on but with no evidence (prefetch_evidence_absent), or unknown
-            // (registry unreadable / undocumented value) -- see
-            // prefetch_absence_token's doc comment for the forensic distinction.
-            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-                return emit_constrained(
-                    ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
-            return emit_constrained(ctx, "prefetch_enum_" + std::to_string(err));
-        }
-
-        size_t files_seen = 0;
-        size_t rows_emitted = 0;
-        uint64_t total_bytes = 0;
-        // file_cap / byte_cap / a mid-walk enumeration fault -> acc.mark_incomplete()
-        // (the enumeration was TRUNCATED); a single .pf skipped with a
-        // prefetch_error| row -> acc.add_failure() only (enumeration completed).
-        yuzu::shared::ConstraintAccumulator acc;
-
-        do {
-            if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                continue;
-
-            if (files_seen >= kPrefetchMaxFiles) {
-                acc.add_failure("file_cap");
-                acc.mark_incomplete();
-                break;
-            }
-            ++files_seen;
-
-            const std::string fname =
-                yuzu::util::safe_output_field(yuzu::win::from_wide(find_data.cFileName));
-            const uint64_t file_bytes =
-                (static_cast<uint64_t>(find_data.nFileSizeHigh) << 32) | find_data.nFileSizeLow;
-
-            if (file_bytes > kPrefetchPerFileMaxBytes) {
-                ctx.write_output("prefetch_error|" + fname + "|file_oversized");
-                acc.add_failure("file_oversized");
-                continue;
-            }
-            if (total_bytes + file_bytes > kPrefetchTotalMaxBytes) {
-                acc.add_failure("byte_cap");
-                acc.mark_incomplete();
-                break;
-            }
-
-            const std::wstring full_path = std::wstring{kPrefetchDir} + find_data.cFileName;
-            ScopedHandle fh(CreateFileW(full_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-            if (!fh) {
-                ctx.write_output("prefetch_error|" + fname + "|read_failed");
-                acc.add_failure("read_failed");
-                continue;
-            }
-            std::vector<uint8_t> bytes(static_cast<size_t>(file_bytes));
-            DWORD read_bytes = 0;
-            const bool read_ok =
-                bytes.empty() || (ReadFile(fh.get(), bytes.data(), static_cast<DWORD>(bytes.size()),
-                                          &read_bytes, nullptr) &&
-                                 read_bytes == bytes.size());
-            if (!read_ok) {
-                ctx.write_output("prefetch_error|" + fname + "|read_failed");
-                acc.add_failure("read_failed");
-                continue;
-            }
-            total_bytes += bytes.size();
-
-            std::vector<uint8_t> decompressed;
-            std::span<const uint8_t> payload = bytes;
-            if (is_mam_compressed(payload)) {
-                const std::string dec_token = decompress_mam(payload, decompressed);
-                if (!dec_token.empty()) {
-                    ctx.write_output("prefetch_error|" + fname + "|" + dec_token);
-                    acc.add_failure(dec_token);
-                    continue;
-                }
-                payload = decompressed;
-            }
-
-            auto parsed = parse_prefetch(payload);
-            if (!parsed) {
-                ctx.write_output("prefetch_error|" + fname + "|" + parsed.error().token);
-                acc.add_failure(parsed.error().token);
-                continue;
-            }
-
-            ctx.write_output(format_prefetch_row(parsed->exe_name, parsed->hash_hex,
-                                                 parsed->version, parsed->run_count,
-                                                 parsed->last_runs_epoch_ms, parsed->volume_count,
-                                                 parsed->file_ref_count));
-            ++rows_emitted;
-        } while (FindNextFileW(find.get(), &find_data));
-
-        // FindNextFileW returning false is ambiguous on its own --
-        // ERROR_NO_MORE_FILES is the normal, expected end of enumeration,
-        // but any other GetLastError() means a genuine I/O fault ended the
-        // walk early, indistinguishable from clean exhaustion without this
-        // check (SYN-03). Skip it when the loop instead exited via one of
-        // the caps above (acc.incomplete() already set) -- that path breaks
-        // out of the loop body before FindNextFileW runs again, so
-        // GetLastError() would reflect a stale prior call, not the reason
-        // the walk stopped.
-        if (!acc.incomplete()) {
-            const DWORD find_err = GetLastError();
-            if (find_err != ERROR_NO_MORE_FILES) {
-                acc.add_failure("prefetch_enum_" + std::to_string(find_err));
-                acc.mark_incomplete();
-            }
-        }
-
-        if (files_seen == 0 && !acc.any_failure())
-            return emit_constrained(
-                ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
-
-        if (acc.incomplete())
-            ctx.write_output("constrained|" + acc.reason());
-
-        // Exit code agrees with the typed status (legs.hpp contract: 0 only on OK):
-        //   - a cap fired -> the enumeration was TRUNCATED -> CONSTRAINED/PARTIAL, rc 1;
-        //   - only per-file errors -> the enumeration COMPLETED and every skipped file
-        //     is already on the stream as a prefetch_error| row -> OK/PARTIAL, rc 0
-        //     (the-rig 2026-09-07: one truncated WERFAULT .pf must not fail 302 good rows);
-        //   - neither -> OK/FULL, rc 0.
-        const YuzuResultStatus status =
-            acc.incomplete() ? YUZU_RESULT_STATUS_CONSTRAINED : YUZU_RESULT_STATUS_OK;
-        const YuzuResultCompleteness completeness =
-            acc.any_failure() ? YUZU_RESULT_COMPLETENESS_PARTIAL : YUZU_RESULT_COMPLETENESS_FULL;
-        ctx.set_result_status(status, completeness, acc.reason());
-        (void)rows_emitted; // kept for readability at call sites reading this function
-        return acc.incomplete() ? 1 : 0;
-    } catch (...) {
-        return emit_constrained(ctx, "internal_error");
-    }
+    return collect_prefetch_from(ctx, kPrefetchGlob, kPrefetchDir);
 }
+
+#endif // !YUZU_EXECUTION_ARTIFACTS_WIN_UNIT_TEST_INTERNALS_ONLY
 
 } // namespace yuzu::execution_artifacts
 

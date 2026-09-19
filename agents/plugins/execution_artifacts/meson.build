@@ -24,7 +24,10 @@ if host_machine.system() == 'windows'
   execution_artifacts_deps += [
     cxx.find_library('advapi32'),
   ]
-  execution_artifacts_sources += files('src/execution_artifacts_win.cpp')
+  execution_artifacts_sources += files(
+    'src/execution_artifacts_win.cpp',
+    'src/execution_artifacts_scratch_sweep_win.cpp',
+  )
 endif
 
 # Assigned to a variable (mirrors disk_actions_plugin_lib /
