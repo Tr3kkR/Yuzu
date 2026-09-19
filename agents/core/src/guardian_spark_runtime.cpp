@@ -1723,6 +1723,17 @@ bool GuardianSparkRuntime::wedge_candidate_exists_locked(
     return false;
 }
 
+void GuardianSparkRuntime::log_wedge_withdrawal_postcondition_violation(
+    std::optional<std::string_view> rule_id) const noexcept {
+    try {
+        spdlog::critical(
+            "Guardian spark #4508: a wedge candidate survived a withdrawal of rule "
+            "'{}' - the sweep was skipped or reordered",
+            rule_id ? std::string{*rule_id} : std::string{"<all>"});
+    } catch (...) {
+    }
+}
+
 std::size_t GuardianSparkRuntime::wedge_candidate_count_for_test(const std::string& rule_id) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     std::size_t count = 0;

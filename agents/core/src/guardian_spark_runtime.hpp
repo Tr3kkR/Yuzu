@@ -1531,11 +1531,43 @@ private:
     /// registry_mu_ held; caller has already swept wedge candidates for rule_id.
     [[nodiscard]] std::shared_ptr<KeyClaim> withdraw_rule_after_wedge_sweep_locked(
         const std::string& rule_id, std::string_view lifecycle_kind);
+    /// registry_mu_ held (called from WedgeWithdrawalPostcondition's destructor,
+    /// still under the lock). spdlog::critical, try/catch-guarded - never throws,
+    /// never masks the real failure. Out-of-line so this header stays spdlog-free.
+    void log_wedge_withdrawal_postcondition_violation(
+        std::optional<std::string_view> rule_id) const noexcept;
+    /// #4508: debug-only postcondition tripwire for instance-5's shape (an early
+    /// return or a reordered edit skipping the sweep). Plain assert() - compiles
+    /// out under NDEBUG, though this repo leaves b_ndebug unset so it is live in
+    /// every buildtype this repo actually configures today. NOT a release-build
+    /// structural guarantee: deleting this guard or calling
+    /// withdraw_rule_after_wedge_sweep_locked directly bypasses it silently.
+    /// Construct FIRST (before the sweep, before any withdrawal work) so its
+    /// destructor - which runs LAST, per reverse construction order - observes
+    /// every exit path (normal return, Case 0's early return, an unwind), still
+    /// under registry_mu_. Copy disabled: the guard is stack-scoped RAII, never
+    /// meant to be duplicated or outlive the call it guards (matches this file's
+    /// own CompensationPermit/RetainedGuard convention for a scope-owned guard).
     struct WedgeWithdrawalPostcondition {
         const GuardianSparkRuntime& runtime;
         std::optional<std::string_view> rule_id;
+        WedgeWithdrawalPostcondition(const GuardianSparkRuntime& rt,
+                                     std::optional<std::string_view> rid) noexcept
+            : runtime(rt), rule_id(rid) {}
+        WedgeWithdrawalPostcondition(const WedgeWithdrawalPostcondition&) = delete;
+        WedgeWithdrawalPostcondition& operator=(const WedgeWithdrawalPostcondition&) = delete;
         ~WedgeWithdrawalPostcondition() noexcept {
-            assert(!runtime.wedge_candidate_exists_locked(rule_id, nullptr));
+            // sg-1 (governance Gate 6, sre): unlike #3388's routine-input-gap ruling
+            // (aa081485f) against a bare abort, this IS the right invariant to abort
+            // on - a survived candidate means real state corruption, not a modeled
+            // gap with a safe fallback. But a bare assert leaves no breadcrumb before
+            // the process dies, so log first (this file's own detach_sweep_left_
+            // residue_ precedent, :2668-2706) via an out-of-line .cpp helper (keeps
+            // spdlog out of this header, matching every other log call in this file).
+            const bool survived = runtime.wedge_candidate_exists_locked(rule_id, nullptr);
+            if (survived)
+                runtime.log_wedge_withdrawal_postcondition_violation(rule_id);
+            assert(!survived);
         }
     };
 
@@ -1884,8 +1916,7 @@ private:
     /// rung 9c R5.2: per-spark_key claim entries (registry_mu_-guarded, same as
     /// keys_/index_/rules_ above). See KeyClaim's doc; empty in steady state, an entry
     /// exists only while a key has an arm or disarm in flight, queued, or retained.
-    std::unordered_map<std::string, KeyClaimQueue> claims_;
-    /// #4508: claims_ is the sole source of pending wedge adoption candidacy:
+    /// #4508: claims_ is ALSO the sole source of pending wedge adoption candidacy:
     /// is_retained_wedge(c) && c.rg && c.rg->active && !generation_committed_locked(c).
     /// Receipt history (end / waiter_abandoned) is independent of candidacy.
     /// Commitment is identified by rules_' generation, not a second adopted bit;
@@ -1903,6 +1934,8 @@ private:
     /// for both withdrawal loops. Its debug postcondition runs on unwind too.
     /// A receipt can outlive its claim's FIFO membership, so test accessors must
     /// check that membership separately from the candidate predicate.
+    std::unordered_map<std::string, KeyClaimQueue> claims_;
+
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
     /// and production has at most one waiter at a time (GuardianEngine's mtx_); the

@@ -10523,6 +10523,11 @@ TEST_CASE("#4508 CH-2: candidate reads follow claim outcomes and dispatch state"
         CHECK_FALSE(result.has_value());
         REQUIRE(observed.claim);
         CHECK(rt->receipt_status(observed) == RT::ReceiptStatus::Stopped);
+        // Discriminate WHY candidacy went false: the claim has already left
+        // claims_ by the time the outer attach_rule call returns, so it's
+        // membership (not the outcome/end classification) that the accessor's
+        // false result rests on here - confirmed empirically, not assumed.
+        CHECK(rt->claim_queue_depth_for_test(key) == 0);
         CHECK_FALSE(rt->receipt_wedge_candidate_for_test(observed));
         CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
         CHECK(b->arm_entries.load() == 0);
