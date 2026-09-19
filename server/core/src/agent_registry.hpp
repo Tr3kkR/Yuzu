@@ -483,16 +483,18 @@ struct PluginMeta {
 // fully populated BEFORE the session is installed in the registry and are
 // never mutated afterwards — re-registration REPLACES the shared_ptr, it
 // does not edit in place. Lock-free readers (scope evaluation, the DEX perf
-// provider) depend on this — NONE of them reads `gateway_node` or
-// `gateway_wire_capabilities` (verified: their only readers are
-// send_to/send_to_all, agent_registry.cpp, both under `stream_mu`), which is
-// exactly why those two are NOT in this list. Post-publication writes are
+// provider) depend on this — NONE of them reads `gateway_node`,
+// `gateway_wire_capabilities`, or `gateway_stream_home_id` (verified: their
+// only readers are send_to/send_to_all and agent_registry.cpp's own
+// gateway_stream_home_id() accessor, all under `stream_mu`), which is
+// exactly why those three are NOT in this list. Post-publication writes are
 // confined to stream/server_context/peer_cert_pem, gateway_node +
-// gateway_wire_capabilities (all under stream_mu — the trailing pair
-// published together by set_gateway_route, M1 review fix; an earlier
-// revision wrote gateway_node under the registry mu_ instead, which both
-// raced stream_mu's readers and contradicted this comment) and the atomic
-// last_activity_epoch_ms. (Governance G3 cpp-safety — keep it true.)
+// gateway_wire_capabilities + gateway_stream_home_id (all under stream_mu —
+// the trio published together by set_gateway_route, M1 review fix +
+// #4324; an earlier revision wrote gateway_node under the registry mu_
+// instead, which both raced stream_mu's readers and contradicted this
+// comment) and the atomic last_activity_epoch_ms. (Governance G3
+// cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
@@ -523,6 +525,17 @@ struct AgentSession {
     /// fields above: a reconnect (a fresh CONNECTED) REPLACES this set, it is
     /// never merged with a prior connection's advertisement (PLAN item 5).
     std::unordered_set<std::string> gateway_wire_capabilities;
+    /// HA WS-4 #4324: the opaque per-connection-instance id (minted once per
+    /// gateway-side `yuzu_gw_agent` process, task 1 of #4324) this session's
+    /// most recent CONNECTED `StreamStatusNotification` carried — published
+    /// by `set_gateway_route` under `stream_mu` alongside `gateway_node`/
+    /// `gateway_wire_capabilities`, same lock, same call, for the same
+    /// atomic-publish reason (see that field's comment). Empty for a direct
+    /// (non-gateway) agent, or a gateway build predating #4324. Read by
+    /// `gateway_stream_home_id()` to fence a stale DISCONNECTED from a
+    /// torn-down home against a NEWER re-home reusing the same `session_id`
+    /// (`GatewayUpstreamServiceImpl::NotifyStreamStatus`).
+    std::string gateway_stream_home_id;
     std::mutex stream_mu;
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
@@ -635,8 +648,31 @@ public:
     /// (fresh CONNECTED) behind an upgraded — or downgraded — gateway build
     /// must not keep stacking capabilities the new connection never
     /// advertised. No-op if `agent_id` is not currently registered.
+    ///
+    /// `stream_home_id` (HA WS-4 #4324) is published in the SAME call, under
+    /// the SAME lock, for the SAME reason `node`/`capabilities` are — see
+    /// `AgentSession::gateway_stream_home_id`'s comment. Defaults to empty so
+    /// every pre-#4324 call site (tests, any caller not yet threading the
+    /// wire field through) keeps compiling and behaving exactly as before.
     void set_gateway_route(const std::string& agent_id, const std::string& node,
-                           std::vector<std::string> capabilities);
+                           std::vector<std::string> capabilities,
+                           std::string stream_home_id = {});
+
+    /// HA WS-4 #4324: the `stream_home_id` most recently published for
+    /// `agent_id` via `set_gateway_route`, IFF the presented `session_id`
+    /// still matches the CURRENTLY installed session — mirrors
+    /// `remove_agent_if_session`'s own session guard. Returns `nullopt` when
+    /// the agent is unknown, or when its currently-installed session's id
+    /// does not equal `session_id` (a genuinely different/superseded
+    /// session, already correctly handled by the legacy session-id guards on
+    /// `clear_stream_if_session`/`remove_agent_if_session`/
+    /// `GatewayRouteStore::deregister` — this accessor has nothing additional
+    /// to fence in that case). A present-but-empty result IS meaningful: it
+    /// means this session matched but was never stamped with a home id
+    /// (legacy/no-fence). Read under `stream_mu`, the same lock
+    /// `set_gateway_route` publishes under.
+    [[nodiscard]] std::optional<std::string>
+    gateway_stream_home_id(const std::string& agent_id, const std::string& session_id) const;
 
     /// PLAN item 5: drop every advertised wire capability for `agent_id`.
     /// Called on DISCONNECTED. `clear_stream_if_session` also clears this set
@@ -1032,6 +1068,20 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+
+    /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
+    /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},
+    /// cleared then rebuilt every sweep (absent-not-zero), mirroring the
+    /// existing yuzu_fleet_net_*{os} pattern. Pure export over data
+    /// recompute_metrics already accumulated — no snapshots_/mu_ access, so
+    /// it's static. `*_os` maps are non-const: set_stats-style helpers sort
+    /// their vector in place.
+    static void recompute_perf_os_gauges(
+        yuzu::MetricsRegistry& metrics,
+        std::unordered_map<std::string, int>& reporting_os,
+        std::unordered_map<std::string, std::vector<double>>& cpu_os,
+        std::unordered_map<std::string, std::vector<double>>& commit_os,
+        std::unordered_map<std::string, std::vector<double>>& disk_lat_os);
 };
 
 } // namespace yuzu::server::detail

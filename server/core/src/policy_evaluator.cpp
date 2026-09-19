@@ -5,6 +5,7 @@
 #include "custom_properties_store.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "policy_store.hpp"
 #include "response_store.hpp"
 #include "result_envelope.hpp"
@@ -136,8 +137,9 @@ latest_per_agent(const std::vector<StoredResponse>& rows) {
 }
 
 /// Evaluate one agent's check response into a status string.
-std::string verdict_for(const StoredResponse& r, const std::string& instruction_id,
-                        const std::string& cel, InstructionStore* istore) {
+std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
+                        const std::string& instruction_id, const std::string& cel,
+                        InstructionStore* istore) {
     if (is_terminal_failure(r.status))
         return "error"; // the check plugin itself failed/timed out/was rejected
 
@@ -148,6 +150,45 @@ std::string verdict_for(const StoredResponse& r, const std::string& instruction_
     // error so it surfaces distinctly instead of inflating the posture number.
     if (cel.empty())
         return "error";
+
+    // #2437-class guard: r.output is agent-reported plugin output with no
+    // write-side type bound (unlike check_parameters, already confirmed
+    // Bucket-E safe), so an agent can freely report a deeply-nested shape
+    // here. parse_result's nlohmann::json::parse tolerates very deep input,
+    // but the structured-result branch a few lines below calls val.dump() on
+    // every non-string row value, which IS unboundedly recursive and SIGSEGVs
+    // the whole process well under 1 MiB of nesting (see mcp_jsonrpc.hpp's
+    // json_exceeds_depth doc comment, measured not assumed). Reject on the
+    // RAW text before parse_result, or anything else, ever interprets it.
+    //
+    // This must fail CLOSED: this evaluator's whole job is a compliance
+    // verdict that can trigger real remediation, so a poisoned response is
+    // routed onto the SAME "error" outcome already used above for a failed
+    // check or misconfigured policy, never silently falling through to CEL
+    // evaluation over a partially-salvaged shape (which could coincidentally
+    // read as compliant depending on the policy's own CEL expression), and
+    // never "compliant". Never logs the payload itself, only identifiers.
+    //
+    // Accepted tradeoff: r.output is not guaranteed to BE JSON at all (see
+    // parse_result's raw-text fallback below for genuinely non-JSON output),
+    // and json_exceeds_depth is a raw-text bracket scanner, not a JSON
+    // validator - plain-text output with 33+ net unclosed '['/'{' (rare;
+    // balanced brackets cancel in the depth counter) now reads as "error"
+    // instead of reaching parse_result's raw-text fallback and being
+    // CEL-evaluated. This is a narrowing of what output this evaluator can
+    // interpret, not a correctness or security defect: the direction is
+    // still fail-closed (never "compliant"), so it cannot manufacture a
+    // false-compliant verdict. Checking depth only after confirming valid
+    // JSON would require a second, DOM-based depth check downstream of
+    // parse_result - i.e. exactly the recursive traversal this guard exists
+    // to avoid - so the guard deliberately stays a pre-parse text scan.
+    if (yuzu::server::mcp::json_exceeds_depth(r.output, yuzu::server::mcp::kMcpMaxJsonDepth)) {
+        spdlog::error("policy_evaluator: policy {} check {} response from agent {} has output "
+                     "nested past the depth guard (max {}); treating as evaluation error, "
+                     "cannot be safely parsed",
+                     policy_id, instruction_id, r.agent_id, yuzu::server::mcp::kMcpMaxJsonDepth);
+        return "error";
+    }
 
     std::string schema;
     if (istore) {
@@ -803,8 +844,8 @@ void PolicyEvaluator::collect_ready() {
                 if (it == best.end() || it->second.status == kStatusRunning) {
                     status = "unknown"; // no terminal response within the grace window
                 } else {
-                    status = verdict_for(it->second, f.instruction_id, f.compliance_expr,
-                                         d_.instruction_store);
+                    status = verdict_for(it->second, f.policy_id, f.instruction_id,
+                                         f.compliance_expr, d_.instruction_store);
                     cr = make_check_result(it->second);
                 }
                 if (d_.policy_store) {

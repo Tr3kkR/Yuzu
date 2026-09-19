@@ -37,15 +37,162 @@
 /// newer re-home: `announce_connected` no-ops (falls through to an
 /// `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
 /// `deregister` tombstones zero rows.
-/// LIMIT — a SAME-session late notification is NOT fenced by this guard: the
-/// re-announce path deliberately REUSES the session id, so `session_id`
-/// equality alone cannot distinguish an old home's teardown from a newer
-/// re-home under the same id. This is unreachable under the shipped gateway
-/// (at most one `CONNECTED(S)` and one `DISCONNECTED(S)` per session — see the
-/// #4246 #4 bullet in ADR-2002 §7), and the per-home generation that would
-/// fence it is a precondition of the first slice that re-CONNECTs under a
-/// reused session id — NOT a 4.2a change. Invariant to preserve:
-/// `session_id` ≡ exactly one gateway stream placement.
+/// LIMIT (as of 4.2a) — a SAME-session late notification was NOT fenced by
+/// `session_id` alone: the re-announce path deliberately REUSES the session
+/// id, so `session_id` equality cannot distinguish an old home's teardown
+/// from a newer re-home under the same id. This was unreachable under the
+/// shipped gateway (at most one `CONNECTED(S)` and one `DISCONNECTED(S)` per
+/// session — see the #4246 #4 bullet in ADR-2002 §7). SLICE #4324 below adds
+/// the per-home generation (`stream_home_id`) that closes this gap
+/// end-to-end (store predicate below AND the RPC-handler wiring in
+/// `gateway_service_impl.cpp` — CLOSED, both halves, as of #4324 task 3/3).
+/// Invariant to preserve: `session_id` ≡ exactly one gateway stream
+/// placement.
+///
+/// SLICE #4324 (HA WS-4, store layer) — `stream_home_id` is an opaque,
+/// per-connection-instance id (minted once per gateway process instance,
+/// task 1 of #4324) stamped on both the CONNECTED and DISCONNECTED
+/// notification a given stream instance ever sends. `announce_connected`
+/// writes it into the row on every winning placement write, exactly like
+/// `cluster_id`/`gateway_node` (it IS placement, not a session property —
+/// `announce_connected` stays the sole writer of it); `register_fresh` NULLs
+/// it on a winning re-register for the same reason it NULLs `cluster_id`/
+/// `gateway_node` (4.2b Task A). `deregister`'s tombstone predicate is
+/// `stream_home_id IS NULL OR stream_home_id = $3` — an EMPTY/NULL stored
+/// home ADMITS ANY incoming `$3` (stamped or not); a STAMPED stored home
+/// requires an EXACT match. This closes the SESSION GUARDS LIMIT above for a
+/// rolling gateway upgrade (mixed-version cluster is the NORMAL state of
+/// one): an old-build gateway node's late DISCONNECTED — unstamped — must
+/// not tombstone a new-build node's stamped re-home reusing the same session
+/// id (a stamped `$3` never satisfies `stream_home_id IS NULL` against a
+/// stamped stored value, and `stream_home_id = $3` needs an exact match), but
+/// a genuinely-matching stamped DISCONNECTED must still tear down its own
+/// stamped row, and a legacy DISCONNECTED against a legacy (never-stamped,
+/// stored-NULL) row must still behave exactly as before. The naive symmetric
+/// predicate (`$3 = '' OR stream_home_id = $3`) would let ANY unstamped
+/// DISCONNECTED tear down ANY row regardless of its stamped home id,
+/// re-opening exactly this race — do not "fix" this predicate back to that
+/// shape. `reap_stale_routes`'s tombstone sweep NULLs `stream_home_id`
+/// alongside `session_id`/`lease_until`/`cluster_id`/`gateway_node` for the
+/// same reason: a tombstoned row must have a fully cleared placement. CLOSED
+/// under today's shipped-gateway producer invariant (#4324 task 3/3): the
+/// RPC handler (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) threads
+/// the caller's REAL `stream_home_id` into both `announce_connected` and
+/// `deregister`, AND resolves an identical fence against `AgentRegistry`'s
+/// in-memory `gateway_stream_home_id` — resolved ONCE, at the top of the
+/// DISCONNECTED branch, before ANY of the registry-clear/store-deregister/
+/// session-map-erase effects run (all-or-nothing; see that handler's own
+/// comment for why splitting them is a correctness bug, not a style choice).
+/// A gateway build predating #4324 (empty `stream_home_id` on every call) is
+/// unaffected — a stored-NULL row always admits an empty incoming value too.
+///
+/// PREDICATE FIX (PR #4492 review, HIGH, fixed pre-merge): the ORIGINAL form
+/// of this predicate was `stream_home_id = $3 OR (stream_home_id IS NULL AND
+/// $3 = '')` — requiring the INCOMING value to ALSO be empty before a
+/// stored-NULL row would admit it. That was wrong: a stored-NULL home does
+/// NOT only mean "legacy, never stamped" — under the single-producer
+/// invariant it can equally mean "this session's own `announce_connected`
+/// (called from the CONNECTED branch) simply hasn't run yet." The gateway
+/// dispatches CONNECTED and DISCONNECTED as two independently
+/// `spawn_monitor`'d RPC workers with NO ordering guarantee between them
+/// (`yuzu_gw_upstream.erl`), so an ORDINARY connect/disconnect — no re-home,
+/// no second CONNECTED/DISCONNECTED pair, just the FIRST and ONLY one for a
+/// brand-new session — can have its DISCONNECTED reach this server before
+/// its own paired CONNECTED. The original predicate rejected that stamped,
+/// entirely legitimate DISCONNECTED (stored NULL, incoming non-empty), so
+/// the deregister/fence silently no-opped, and the delayed CONNECTED then
+/// published a route for an already-dead stream — a regression vs. the
+/// pre-#4324 unfenced behavior, where the same reordering self-corrected.
+/// This is DIFFERENT FROM, and reachable WITHOUT, the FORWARD NOTE gaps
+/// below (which all require a producer of a SECOND CONNECTED/DISCONNECTED
+/// pair for the same session — live re-home, not shipped until 4.3/4.4); it
+/// needed only the ordinary FIRST pair, reordered, which is reachable today
+/// under ordinary operational churn. The identical gap existed in the
+/// in-memory fence (`gateway_service_impl.cpp`'s `home_matches`) and is
+/// fixed there the same way — the two predicates must never diverge.
+///
+/// SCOPE OF "CLOSED" (adversarial review, 2026-09-17): the fence is a
+/// check-then-act, not a single atomic operation — `gateway_stream_home_id()`
+/// reads and releases `stream_mu` before the three DISCONNECTED effects run
+/// under their own separate lock acquisitions. Under the CURRENT shipped
+/// gateway this remains safe with the predicate fix above, because at most
+/// one `CONNECTED(S)` and one `DISCONNECTED(S)` are ever emitted per session
+/// id (see the SESSION GUARDS LIMIT above) — there is no producer of a
+/// second, genuinely concurrent `CONNECTED(S, home2)` for the fence's
+/// read-then-act window to race against. "CLOSED end-to-end" means closed
+/// against every interleaving that invariant permits (which, after the
+/// predicate fix, now correctly includes an out-of-order first pair), NOT
+/// atomic against arbitrary concurrent RPC execution for a SECOND pair. See
+/// the FORWARD NOTE immediately below for what 4.3/4.4 must add before
+/// same-session re-home makes that second-pair producer real.
+///
+/// FORWARD NOTE for #4324's 4.3/4.4, RESOLVED (enterprise-architect
+/// adjudication, 2026-09-18, confidence HIGH, spot-checked against the cited
+/// call sites): all three directions below share ONE precondition — a
+/// same-session, different-home CONNECTED (`CONNECTED(S, home2)` published
+/// for a session `S` already at `home1`) — and NO producer of that
+/// precondition exists today, nor is one planned for 4.3/4.4. The agent
+/// reconnect loop always re-`Register`s on a new connection (a new
+/// `session_id`, `agent.cpp`'s Register-retry loop), and the gateway's
+/// `Subscribe` REFUSES any presented session with no pending registration
+/// (`yuzu_gw_agent_service.erl`, `NOT_FOUND` on a `take_pending` miss) — a
+/// gRPC stream cannot migrate BEAM nodes, so a physical stream move is
+/// ALWAYS agent-reconnect-shaped: new session, new `stream_home_id`. The
+/// EARLIER draft of this note proposed "the gateway mints a fresh session on
+/// re-home" as a design choice; that was WRONG — a gateway-synthesized
+/// session the agent does not hold starves on the next heartbeat (heartbeats
+/// carry the agent's OWN `session_id_`; `BatchHeartbeat` excludes an unknown
+/// session from `renew_leases`), reproducing the `#4246` #6 S′-vs-S desync
+/// deliberately. The invariant is agent-driven reconnect, never a
+/// server/gateway-synthesized session substitution.
+///
+/// (a) STORE-SIDE ordering: unreachable — `home2` never gets a CONNECTED
+/// under a `session_id` that already published `home1`; a genuine re-home
+/// arrives as `register_fresh(S_new)`, not `CONNECTED(S, home2)`.
+///
+/// (b) IN-MEMORY check-then-act: unreachable, and closed WITHOUT a new CAS
+/// primitive — the check-then-act window only matters when ONE `session_id`
+/// key is shared across two homes. With a distinct `session_id` per
+/// placement, every DISCONNECTED-branch effect is already an individually
+/// atomic, session-guarded conditional (`remove_agent_if_session`,
+/// `clear_stream_if_session`, `gateway_stream_home_id`'s nullopt-on-mismatch,
+/// the store's session-guarded `deregister` UPDATE, `gateway_sessions_`
+/// erase-by-key) — a stale `DISCONNECTED(S_old, home1)` interleaved anywhere
+/// around `register_agent(S_new)`/`CONNECTED(S_new, home2)` either no-ops
+/// per effect or tears down only `S_old` state, never `S_new`'s.
+///
+/// (c) CONNECTED-reorder: unreachable for the same reason as (a) — there is
+/// no second CONNECTED for the same session to reorder against.
+///
+/// STANDING INVARIANT (load-bearing going forward, not just historical
+/// analysis): 4.3/4.4 MUST NOT introduce ANY path that emits
+/// `CONNECTED(S, home2)` for a session `S` already published at `home1` —
+/// every physical placement change is agent-originated re-`Register`. This
+/// replaces the former "atomic home-CAS primitive" acceptance criterion
+/// (`#4490`) with a server-side TRIPWIRE instead: a CONNECTED for a known
+/// `(agent_id, session_id)` whose stored `stream_home_id` is non-empty and
+/// differs from the incoming one must be REJECTED (not published) and
+/// counted (folds into `#4464`'s `duplicate_connected` tripwire), backed by
+/// a deterministic interleaving test (the existing
+/// `register_agent_interleave_hook_for_test_` seam) proving a stale
+/// `DISCONNECTED(S_old, home1)` interleaved at every point of
+/// `register_agent(S_new)`/`map_session`/`CONNECTED(S_new, home2)` leaves
+/// `S_new` live in registry, store, and `gateway_sessions_`. `4.4`'s `#4246`
+/// #6 fix (session writeback) must follow the same rule: mechanism (c) must
+/// ADOPT the presented session into `gateway_sessions_`/registry only if the
+/// directory `renew_leases` call matched >= 1 row (a store-side CAS proving
+/// the row still belongs to that session) — NEVER write back a
+/// server-minted session to a gateway whose agent still holds the original.
+///
+/// WOULD REOPEN THIS: a 4.3 design where the logical home (the
+/// `yuzu_gw_agent` process / `stream_home_id`) moves or is re-spawned
+/// WITHOUT the agent reconnecting — e.g. a node-A-holds-socket/
+/// node-B-owns-agent proxy hop. That would create a same-session
+/// different-home producer this analysis assumes does not exist, and the
+/// full atomic home-CAS primitive + store-side re-arm this note originally
+/// proposed would become necessary again. Treat "no such producer" as a
+/// design CONSTRAINT on 4.3, not an assumption to re-verify only after the
+/// fact.
 ///
 /// `renew_leases` is a single batched statement, correlated on BOTH
 /// `agent_id` AND `session_id` (a parallel-array unnest() join — #4246 #10) —
@@ -70,8 +217,12 @@
 /// only intra-replica with a live session. The epoch orders by server PROCESSING
 /// time, so a stale replay whose session has left `gateway_sessions_` takes the
 /// fresh branch and wins; the re-announce reuses the session id (a late
-/// DISCONNECTED then tombstones — logically tears down — the re-homed route,
-/// #4/#4324, RE-SCOPED) and its known-session check is
+/// DISCONNECTED would otherwise tombstone — logically tear down — the
+/// re-homed route, #4/#4324 — CLOSED under today's single-producer
+/// invariant by SLICE #4324 below: both the store's asymmetric predicate AND
+/// the RPC-handler's `stream_home_id` wiring + `AgentRegistry` in-memory
+/// fence — see the SCOPE OF "CLOSED" note above for the check-then-act
+/// residual 4.3/4.4 must still close) and its known-session check is
 /// per-replica in-memory; re-announce refreshes the lease, not cluster/node; and
 /// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
 /// trusts this directory for routing.
@@ -79,11 +230,12 @@
 /// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting. This closes the
 /// late-CONNECTED RESURRECTION direction (#5 in the 4.2 design doc): a late
 /// CONNECTED for a now-gone session no-ops against the tombstone instead of
-/// reviving a dead route. It does NOT close #4 (a same-session late
-/// DISCONNECTED tombstoning a newer re-home) — that needs a per-home
-/// generation fence and is RE-SCOPED to the first same-session re-CONNECT
-/// slice (unreachable under the shipped gateway today; see the SESSION GUARDS
-/// LIMIT above and ADR-2002 §7 #4246 #4). A tombstone is `session_id IS NULL
+/// reviving a dead route. It did NOT close #4 (a same-session late
+/// DISCONNECTED tombstoning a newer re-home) on its own — that needed the
+/// per-home generation fence SLICE #4324 below adds, now closed under
+/// today's single-producer invariant (see the SESSION GUARDS LIMIT above,
+/// its SCOPE OF "CLOSED" note, and ADR-2002 §7 #4246 #4). A
+/// tombstone is `session_id IS NULL
 /// AND lease_until IS NULL`; `connection_epoch` is retained. Rationale: a bare
 /// DELETE lets `announce_connected`'s fallback `ON CONFLICT DO NOTHING`
 /// INSERT resurrect a dead route if a late/reordered CONNECTED notification
@@ -294,10 +446,11 @@ public:
     /// previously stored (the CAS in the file header) — a caller whose
     /// `register_fresh` reports `won == false` lost to a newer connection
     /// and MUST NOT proceed to `announce_connected` with this epoch/session.
-    /// `cluster_id`/`gateway_node` are NULLed (4.2b) on a winning re-register
-    /// — `announce_connected` is the SOLE writer of placement, so a fresh
-    /// registration never carries forward a superseded connection's cluster/
-    /// node until its own CONNECTED confirms them.
+    /// `cluster_id`/`gateway_node`/`stream_home_id` are NULLed (4.2b; #4324
+    /// for the last) on a winning re-register — `announce_connected` is the
+    /// SOLE writer of placement, so a fresh registration never carries
+    /// forward a superseded connection's cluster/node/home-id until its own
+    /// CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
     register_fresh(std::string_view agent_id, std::string_view session_id);
 
@@ -306,19 +459,31 @@ public:
     /// Session-guarded (see file header): a no-op against a row now held by a
     /// DIFFERENT session. If no row exists yet for `agent_id` at all, inserts
     /// one (`ON CONFLICT DO NOTHING`) rather than overwriting a differently-
-    /// sessioned row.
+    /// sessioned row. `stream_home_id` (SLICE #4324, file header) is this
+    /// connection instance's opaque per-home generation id — written into the
+    /// row exactly like `cluster_id`/`gateway_node`, since it IS placement;
+    /// an empty string (the default — a gateway build predating #4324, or a
+    /// caller not yet threading it through) means "unknown", same convention
+    /// as `cluster_id`.
     [[nodiscard]] std::expected<AnnounceResult, GatewayRouteStoreError>
     announce_connected(std::string_view agent_id, std::string_view session_id,
                        std::string_view cluster_id, std::string_view gateway_node,
-                       int lease_ttl_secs);
+                       int lease_ttl_secs, std::string_view stream_home_id = {});
 
     /// TOMBSTONE the agent's route row (session_id/lease_until/cluster_id/
-    /// gateway_node -> NULL; `connection_epoch` retained), but ONLY if the row
-    /// still belongs to `session_id` (a stale DISCONNECTED from a superseded
-    /// session must not tear down a newer re-home). See the file header
-    /// "SLICE 4.2a" note for why this is an UPDATE, not a DELETE.
+    /// gateway_node/stream_home_id -> NULL; `connection_epoch` retained), but
+    /// ONLY if the row still belongs to `session_id` AND the incoming
+    /// `stream_home_id` clears the fence (file header SLICE #4324):
+    /// `stream_home_id IS NULL OR stream_home_id = $3` — a NULL/empty
+    /// STORED home admits ANY incoming value (it never represents a live
+    /// placement worth protecting — see the file header's PREDICATE FIX
+    /// note); a STAMPED stored home requires an EXACT match against `$3`, so
+    /// it can never be torn down by an unstamped or differently-stamped
+    /// incoming value from a superseded home. See the file header "SLICE
+    /// 4.2a" note for why this is an UPDATE, not a DELETE.
     [[nodiscard]] std::expected<DeregisterResult, GatewayRouteStoreError>
-    deregister(std::string_view agent_id, std::string_view session_id);
+    deregister(std::string_view agent_id, std::string_view session_id,
+              std::string_view stream_home_id = {});
 
     /// Batched lease renewal: bumps `lease_until` for every row whose
     /// `(agent_id, session_id)` matches a pair in the two PARALLEL arrays
@@ -419,9 +584,10 @@ public:
     [[nodiscard]] std::expected<ReapRoutesResult, GatewayRouteStoreError>
     reap_stale_routes();
 
-    /// The schema migrations for this store (version 2: v1 the `agent_routes`
-    /// table, v2 the `route_meta` reaper-anchor table). Exposed for tests and
-    /// the migration ladder.
+    /// The schema migrations for this store (version 3: v1 the `agent_routes`
+    /// table, v2 the `route_meta` reaper-anchor table, v3 the nullable
+    /// `stream_home_id` column — SLICE #4324). Exposed for tests and the
+    /// migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 
 private:

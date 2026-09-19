@@ -18,6 +18,8 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -83,10 +85,14 @@ public:
     static std::string lock() { return kServerBackgroundLeaderLock; }
 
     // Build a delivery loop whose dispatch/arming seams the test controls.
-    CommandOutboxDelivery make_delivery(DispatchProbe& probe, bool arming_allow) {
+    // `metrics` is optional (defaulted) - most tests here assert on the
+    // OutboxCommand state machine, not on observability, and don't need it.
+    CommandOutboxDelivery make_delivery(DispatchProbe& probe, bool arming_allow,
+                                        yuzu::MetricsRegistry* metrics = nullptr) {
         CommandOutboxDelivery::Deps d;
         d.outbox = store_.get();
         d.leader = elector_.get();
+        d.metrics = metrics;
         d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
                                  const std::vector<std::string>&, const std::string&,
                                  const std::unordered_map<std::string, std::string>&,
@@ -261,6 +267,119 @@ TEST_CASE("CommandOutboxDelivery[pg]: a malformed payload fails the occurrence, 
 
     CHECK(probe.calls == 0); // decode failed before any send
     CHECK(fx.raw_state("occ-bad") == "failed");
+}
+
+// json-dump-depth-guard fix (#2437-class): `c.parameters` is sourced from
+// ScheduleRunner's `parameter_values`. Schedule CREATION already guards this
+// text (schedule_routes.cpp:94), but a row written before that write-side
+// guard shipped, or via any other write path that bypasses it, still reaches
+// this READ path on every tick with no operator action in the loop at all.
+TEST_CASE("CommandOutboxDelivery[pg]: a parameters payload nested past the depth guard fails "
+          "the occurrence; another pending occurrence in the same tick still delivers normally",
+          "[command_outbox][pg][delivery][depth]") {
+    DeliveryPg fx;
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth. kMcpMaxJsonDepth is 32; the 40-deep array below is
+    // comfortably past it and still trivially safe to construct/parse/dump
+    // directly in this test process, orders of magnitude short of the
+    // ~100,000-level depth that actually SIGSEGVs the real background worker
+    // this guard exists to protect.
+    auto poisoned = fx.req("occ-depth", "cmd-depth");
+    poisoned.parameters = R"({"nested":)" + std::string(40, '[') + std::string(40, ']') + R"(})";
+    REQUIRE(fx.store().claim_and_enqueue(poisoned, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A second, healthy occurrence enqueued right after: the tick must not
+    // stop processing the rest of the batch just because one occurrence up
+    // front is poisoned.
+    auto healthy = fx.req("occ-depth-ok", "cmd-depth-ok");
+    REQUIRE(fx.store().claim_and_enqueue(healthy, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.sent = 1;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-depth") == "failed");  // marked failed, never dispatched
+    CHECK(fx.raw_state("occ-depth-ok") == "sent");  // the OTHER occurrence still delivered
+    CHECK(probe.calls == 1);                        // only the healthy occurrence dispatched
+    CHECK(probe.last_command_id == "cmd-depth-ok");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a repeated tick against the same depth-poisoned "
+          "occurrence behaves identically each time, no crash, no re-drive",
+          "[command_outbox][pg][delivery][depth]") {
+    DeliveryPg fx;
+    auto poisoned = fx.req("occ-depth-repeat", "cmd-depth-repeat");
+    poisoned.parameters = R"({"nested":)" + std::string(40, '[') + std::string(40, ']') + R"(})";
+    REQUIRE(fx.store().claim_and_enqueue(poisoned, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+
+    // mark_failed is a PERMANENT transition (mirrors the malformed-payload
+    // case above): once failed, list_pending no longer returns it, so a
+    // second/third tick must not re-process, re-count, or re-dispatch it (no
+    // unbounded retry loop for this failure class).
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        INFO("attempt " << attempt);
+        loop.tick();
+        CHECK(fx.raw_state("occ-depth-repeat") == "failed");
+        CHECK(probe.calls == 0);  // never dispatched, on any attempt
+    }
+}
+
+// Governance Gate 4/6 finding: the bare yuzu_server_command_outbox_deliver_decode_failed_total
+// counter fires identically for a depth-exceeded rejection and a genuinely
+// malformed payload, contradicting its own documented meaning
+// (docs/user-manual/metrics.md said "a malformed row failed to decode"). This
+// proves the labeled companion counter distinguishes the two causes, mirroring
+// the structurally identical gateway_service_impl.cpp fix
+// (outcome="rejected_depth").
+TEST_CASE("CommandOutboxDelivery[pg]: depth-exceeded and genuinely-malformed payloads increment "
+          "DISTINCT cause labels on the companion counter, not the same one",
+          "[command_outbox][pg][delivery][depth][observability]") {
+    DeliveryPg fx;
+    yuzu::MetricsRegistry metrics;
+
+    auto poisoned = fx.req("occ-depth-metric", "cmd-depth-metric");
+    poisoned.parameters = R"({"nested":)" + std::string(40, '[') + std::string(40, ']') + R"(})";
+    REQUIRE(fx.store().claim_and_enqueue(poisoned, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    auto malformed = fx.req("occ-malformed-metric", "cmd-malformed-metric");
+    malformed.parameters = "not json{{{";
+    REQUIRE(fx.store().claim_and_enqueue(malformed, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    CHECK(metrics
+              .counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                       {{"cause", "payload_depth_exceeded"}})
+              .value() == 0.0);
+    CHECK(metrics
+              .counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                       {{"cause", "payload_decode_failed"}})
+              .value() == 0.0);
+
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-depth-metric") == "failed");
+    CHECK(fx.raw_state("occ-malformed-metric") == "failed");
+    CHECK(metrics
+              .counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                       {{"cause", "payload_depth_exceeded"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                       {{"cause", "payload_decode_failed"}})
+              .value() == 1.0);
+    // The pre-existing bare counter still fires for both causes unchanged -
+    // this is what created the ambiguity the labeled counter above resolves.
+    CHECK(metrics.counter("yuzu_server_command_outbox_deliver_decode_failed_total").value() ==
+          2.0);
 }
 
 TEST_CASE("CommandOutboxDelivery[pg]: does nothing when this replica is not leader",

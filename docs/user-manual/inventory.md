@@ -440,6 +440,35 @@ restart sends a full list. Note that app *counts* can rise slightly after the
 fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
 
+**A generic (non-typed) inventory source never appears, with no error visible
+to the reporting agent.** Reachable only via gateway-proxied agents
+(`GatewayUpstreamServiceImpl::ProxyInventory`); the direct
+`AgentServiceImpl::ReportInventory` path never writes generic sources to
+`InventoryStore` at all, by design, regardless of depth, so a direct-connect
+agent cannot hit this case. For a gateway-proxied agent: the agent's own
+report is still acknowledged even when the server silently rejects one
+over-depth source blob (nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard
+fix) - unlike a store/pool degrade, this is not surfaced back to the agent. Because ADR-0016's hash-skip only
+resends a source when its content changes, an agent whose plugin keeps
+reporting the SAME malformed shape never resends it, so the source stays
+permanently, silently absent from `InventoryStore` until the plugin itself
+stops emitting the over-depth shape. **Restarting the agent alone does not
+help** - unlike the non-ASCII-names case above, there is no cached mismatch
+for a restart to force-resend against. Diagnose via
+`yuzu_inventory_ingest_total{source="__generic__",outcome="rejected_depth"}`
+(non-zero means at least one agent has hit this) and the accompanying
+`spdlog::warn` log line, which names the real agent/plugin identifiers.
+This is a WRITE-TIME rejection (the source blob never reaches `InventoryStore`
+at all); the distinct READ-TIME signal for a record that already made it into
+the store but is excluded when a later query evaluates it (over-nested or
+malformed `data_json`, #4496 + follow-up) is documented under
+[REST API → `POST /api/v1/inventory/evaluate`](rest-api.md#post-apiv1inventoryevaluate).
+The two share a root cause only for the over-depth shape: the write-time guard
+above checks nesting depth on the raw wire bytes and never attempts a JSON
+parse, so a syntactically malformed but shallow blob passes it untouched, is
+stored, and is caught only at read time as `parse_error_excluded` - there is
+no write-time signal for that shape.
+
 **A `need_full` spike right after deploying the blob-v2 release is expected.**
 The v2 contract reformats the canonical content hash (12 fields instead of 4),
 so every agent's first post-upgrade report mismatches its stored v1 hash and the
@@ -453,10 +482,16 @@ and it ends when the lagging side upgrades. Deploy **server first, then agents**
 (the platform's normal order).
 
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
-(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
-the last for a whole report rejected at the source-map cap) — watch the
-`need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing. Four further series sharpen the picture:
+(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected` /
+`rejected_depth`: `rejected` is a whole report rejected at the source-map cap,
+`rejected_depth` is a single generic (non-typed) source blob rejected for
+nesting past `kMcpMaxJsonDepth`, kept as its own outcome specifically so it
+does not page the `YuzuInventoryReportRejected` alert's source-map-cap
+runbook - its `source` label is always the fixed sentinel `__generic__`,
+never the reporting plugin's actual name, so a query for a specific
+plugin's `source` label will not find it there) - watch the `need_full`
+and `error` rates to spot a fleet whose hash-skip is degrading or whose
+ingest is failing. Four further series sharpen the picture:
 
 - `yuzu_inventory_ingest_duration_seconds{source,phase}` (histogram) — how long
   applying one source's report holds a pooled Postgres connection (advisory lock +
@@ -467,7 +502,7 @@ whose ingest is failing. Four further series sharpen the picture:
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
-  `software_licensing` / `product_registry` / `generic`) — an
+  `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
@@ -533,6 +568,8 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
 payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
+`YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
+nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
 `YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
 leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
@@ -589,6 +626,42 @@ sync, defeating the hash-skip protocol.
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
 columns, fields, and audit/degrade posture.
+
+## App usage inventory (`app_usage`)
+
+A further daily-sync source, **`app_usage`**, is live on the agent and server. It
+derives machine-scope executable usage evidence read-only from TAR's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
+seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
+
+- **Scope / privacy.** No pid, command line, or user name is ever emitted —
+  `distinct_users` is a `COUNT(DISTINCT user)` only. Even so, executable names and
+  run times are a working-hours/presence proxy: a host whose interactive tools
+  cluster their usage in a narrow daily window says something about when its
+  operator is active, regardless of who that operator is — treat this source as
+  behaviorally sensitive. The same **`--inventory-disable`** flag suppresses
+  `app_usage` along with the other sources (it gates the whole daily-sync thread).
+- **Observability.** Ingest shares `yuzu_inventory_ingest_total{source="app_usage"}`
+  + `yuzu_inventory_ingest_duration_seconds{source="app_usage"}`; read degrades use
+  `yuzu_inventory_read_degrade_total{source="app_usage"}`. The store joins
+  `/readyz` + `/healthz`.
+- **Read surface.** Unlike the sources above, `app_usage` is NOT exposed through
+  the generic inventory read endpoints — it is gated behind the **`Forensics`**
+  securable (`GET /api/v1/forensics/agents/{id}/app-usage` + MCP
+  `get_agent_app_usage`), scoped to the device and floored to Administrator under
+  RBAC-off. See `docs/authz-model.md` §4 and the `execution_artifacts`/`app_usage`
+  rows in `.claude/routed-concerns.md`.
+- **Per-host executable cap.** The agent-side `last_used` action is capped at 5000
+  distinct executables in the retained window; a host past the cap still reports
+  5000 of them (lexicographically first by `exe_key`, not by recency or any usage
+  metric) plus a trailing truncation marker (never a silent drop). Known
+  limitation, tracked in
+  [#4489](https://github.com/Tr3kkR/Yuzu/issues/4489): a host that stays
+  *continuously* over the cap has its whole daily-sync cycle skipped rather than
+  syncing a partial result — build servers, CI runners and dev workstations with
+  heavy toolchain churn are the plausible case. There is currently no
+  operator-facing alert for this state.
 
 ## See also
 

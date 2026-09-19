@@ -161,8 +161,11 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
+#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
+#include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -184,6 +187,9 @@
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
+#include "device_lens_routes.hpp"
+#include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
+#include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -1425,6 +1431,16 @@ public:
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // #4496 (+ follow-up): the from-inventory-query result-set producer
+        // (REST and its MCP twin) - its OWN reachable set, same discipline as
+        // `result_set_parent` above: this route can only ever emit these
+        // three data-quality reasons, never the targeting-shape ones.
+        for (const auto reason : {yuzu::server::kReasonQueryTruncated,
+                                  yuzu::server::kReasonPoisonExcluded,
+                                  yuzu::server::kReasonParseErrorExcluded})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_inventory_query"},
+                              {"reason", std::string(reason)}});
         // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
         // It refuses `scope` outright (PolicyEvaluator::remediate takes only
         // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
@@ -1758,7 +1774,7 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
                           "counter");
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
@@ -3296,6 +3312,20 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // json-dump-depth-guard fix: a rule whose stored spec_json nests past
+        // kMcpMaxJsonDepth is excluded from every push it would otherwise be
+        // included in (build_agent_push, guardian_push_builder.cpp) - this is
+        // the fleet-wide signal that a rule silently stopped enforcing (the
+        // rule's own detail page also shows an "invalid data" state, but an
+        // operator who never opens that specific rule would otherwise have no
+        // tell). Pre-seed the one closed reason value so the series exists at
+        // zero on a healthy fleet.
+        metrics_.describe("yuzu_guardian_push_rule_excluded_total",
+                          "Guardian rules excluded from a push, by reason (currently only "
+                          "depth_exceeded)",
+                          "counter");
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "depth_exceeded"}});
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
         // Deliberately a bounded `reason` label set (currently one value,
         // "successor_unused") and NOT `event="security"` — this is an
@@ -5274,7 +5304,7 @@ public:
                             scope_member.emplace(expr, member);
                             return member;
                         },
-                        /*full_sync=*/true, current);
+                        /*full_sync=*/true, current, &metrics_);
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
                     const auto command_id =
@@ -15627,14 +15657,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -15871,10 +15897,10 @@ private:
         //
         // #4035: extracted into a named variable (was inline at the
         // DexRoutes::register_routes call site below) so the SAME provider is
-        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
-        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
-        // REST twins read the identical fleet snapshot the dashboard renders
-        // against, never a second independently-computed copy.
+        // also handed to make_local_dex_api's FleetFn — the DexApi behind the
+        // GET /api/v1/dex/{health,trends,overview,catalogue/group} REST twins
+        // (and their MCP twins) reads the identical fleet snapshot the
+        // dashboard renders against, never a second independently-computed copy.
         auto dex_fleet_fn = [this]() -> DexFleet {
             DexFleet f;
             const auto ids = registry_.all_ids();
@@ -15884,18 +15910,19 @@ private:
                     std::string os = s->os;
                     for (auto& c : os)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // starts_with, NOT find — "darwin" contains "win"
-                    // (G4 UP-1; pre-existing here, fixed with the sibling).
-                    if (os.starts_with("win"))
-                        ++f.windows_online;
+                    // The shared normalizer (dex_perf_rules.hpp) folds the
+                    // "darwin contains win" G4 UP-1 fix into one place instead
+                    // of a duplicate copy of the comment at every call site.
+                    const std::string norm_os = detail::dex_perf_os_from_session(os);
                     // Per-OS online denominators (#1746) — same coverage-honest
                     // count as windows_online, so the Catalogue's single-OS
                     // filter can score a family against THAT OS's own fleet.
-                    if (os.starts_with("lin"))
+                    if (norm_os == "windows")
+                        ++f.windows_online;
+                    else if (norm_os == "linux")
                         ++f.linux_online;
-                    if (os.starts_with("darwin") || os.starts_with("macos"))
-                        ++f.macos_online; // prefix, like win/lin — keep in
-                                          // step with the store's write canon
+                    else if (norm_os == "macos")
+                        ++f.macos_online;
                     // Distinct connected OS tokens → the Catalogue's "All
                     // connected" coverage scope (render normalises darwin→macos).
                     if (!os.empty() && std::find(f.connected_os.begin(),
@@ -16023,10 +16050,38 @@ private:
                     return make_device_row(a);
             return std::nullopt;
         };
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam (identity/
+        // list data) — the SAME instance DeviceRoutes, REST GET /api/v1/devices[/{id}]
+        // and MCP list_agents/get_agent_details use, so all three surfaces can never
+        // disagree. `make_device_row`/`devices_fn`/`lookup_fn` above are NOT retired
+        // by this rewire — they are shared infrastructure with other live consumers
+        // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
+        // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
+        auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        std::shared_ptr<yuzu::server::DexApi> dex_api;
+        if (guaranteed_state_store_)
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        // Per-row/per-page DEX score — wraps dex_device_score against the SAME
+        // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
+        // itself already returns -1 on a null store, so no separate null-guard is
+        // needed here (matches the prior `if (store_) {...}` guard's net effect).
+        auto dex_score_fn = [this](const std::string& agent_id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), agent_id, dex_iso_since(7));
+        };
         device_routes_ = std::make_unique<DeviceRoutes>();
         device_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
-            guaranteed_state_store_.get(),
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, device_api, visible_set_fn,
+            dex_score_fn,
             // "Get live info" dispatches real read-only plugin instructions through the
             // shared chokepoint — the live-snapshot cards (processes/list_tree +
             // network_diag/connections, services/list, users/logged_on,
@@ -16061,6 +16116,13 @@ private:
                 return out;
             },
             audit_fn);
+
+        // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
+        // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
+        // banner). Same store/scope/audit wiring the lenses had inside DeviceRoutes.
+        device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
+        device_lens_routes_->register_routes(*web_server_, scoped_perm_fn,
+                                             guaranteed_state_store_.get(), audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
@@ -18093,7 +18155,7 @@ private:
                     auto push = guardian::build_agent_push(
                         rules, agent_os,
                         [&](const std::string& expr) { return agent_in_scope(aid, expr); },
-                        full_sync, generation);
+                        full_sync, generation, &metrics_);
 
                     // Unique per push (random suffix) so two pushes in the same second
                     // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
@@ -18203,11 +18265,12 @@ private:
             // authorization gate — see rest_api_v1.cpp's route comment for
             // why it must never be stacked with perm_fn.
             fleet_read_fn,
-            // #4033: GET /api/v1/devices[/{id}]'s raw registry snapshot — the
-            // SAME underlying call as the MCP AgentsJsonFn wired into
-            // McpServer below (registry_.to_json_obj()), so the two
-            // transports read from the identical unfiltered source and can
-            // only diverge on the scope filter each applies on top.
+            // Raw registry snapshot for POST /api/v1/scope/preview. (ADR-0031
+            // WS-A4 device seam: GET /api/v1/devices[/{id}] no longer use this
+            // param — they source from DeviceApi::list_devices/lookup_device,
+            // which read the SAME registry_.to_json_obj() underneath, so the
+            // data stays identical; this closure is retained solely for
+            // /scope/preview.)
             [this]() { return registry_.to_json_obj(); },
             // #4033: GET /api/v1/management-groups/agent-count-preview's D3
             // Response:Read scope resolver — the SAME instance passed to
@@ -18216,11 +18279,11 @@ private:
             // /fragments/create-group-form fragment cannot disagree on scope
             // for the same caller.
             response_visible_set_fn,
-            // #4035: the SAME DexFleet provider DexRoutes::register_routes
-            // above already received — see its doc comment (defined once,
-            // just above the DexRoutes registration) for why this must be
-            // the identical lambda, not a second copy.
-            dex_fleet_fn,
+            // ADR-0031 WS-A4 (fifth family): the former dex_fleet_fn arg is
+            // RETIRED — the DEX read handlers obtain the fleet through the
+            // DexApi seam's own FleetFn (wired into make_local_dex_api below),
+            // not through a register_routes param. The `dex_fleet_fn` local is
+            // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
             // #4035 review fix (colleague review, BLOCKING): a DEDICATED
             // GuaranteedState:Read-scoped resolver (defined above, see its
             // own doc comment) — NOT the SAME visible_set_fn
@@ -18233,7 +18296,17 @@ private:
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
-            verify_api);
+            verify_api,
+            // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+            // above and MCP list_agents/get_agent_details below use, so all
+            // three GET /api/v1/devices[/{id}] siblings never disagree.
+            device_api,
+            // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
+            // signal/experience handlers require this and answer 503 when it is
+            // null (constructed above iff the store is present, so `!dex_api`
+            // is the exact readiness signal the old `!guaranteed_state_store`
+            // guard was).
+            dex_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18425,11 +18498,16 @@ private:
             // preview_management_group_agent_count cannot disagree with its
             // REST/fragment siblings for the same caller.
             mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
-            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
-            // received above — see its doc comment (defined once, just above
-            // the DexRoutes registration) for why this must be the identical
-            // lambda, not a second copy.
-            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // ADR-0031 WS-A4 (fifth family): the MCP DEX signal tools obtain the
+            // fleet denominator through the DexApi seam's own FleetFn (wired into
+            // make_local_dex_api below), so the former mcp_server_->set_dex_fleet_fn
+            // wiring is retired — the tools no longer read a McpServer fleet member.
+            // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
+            // REST /api/v1/dex/* handlers use (constructed above, gated on
+            // store presence), so the MCP DEX signal tools and REST never
+            // disagree. nullptr when the store is absent → the tools' !dex_api_
+            // readiness guard answers "store unavailable" (byte-identical).
+            mcp_server_->set_dex_api(dex_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see
@@ -18721,10 +18799,12 @@ private:
                 // the six read tools + the yuzu://compliance/fleet resource +
                 // get_fleet_posture_fast never disagree with those siblings.
                 compliance_api,
-                // Wave 7 PR7.2: the app_usage store, TRUE LAST parameter in every
-                // build_handler/register_routes overload — server.cpp's own
-                // positional call here terminates at compliance_api in every OTHER
-                // overload, so this parameter had to land after it.
+                // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+                // and REST GET /api/v1/devices[/{id}] use, so list_agents/
+                // get_agent_details never disagree with those siblings.
+                device_api,
+                // Wave 7 PR7.2: the app_usage store, TRUE LAST parameter (kept last
+                // across the device_api merge).
                 app_usage_store_.get());
         }
 
@@ -19010,8 +19090,11 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
         yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
+        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
         yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
+        yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
+        yuzu::server::capdecls::plugin_action_catalogue_printing(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
@@ -19296,6 +19379,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;

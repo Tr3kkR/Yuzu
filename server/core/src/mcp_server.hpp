@@ -29,8 +29,9 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
+#include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
-#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
@@ -659,16 +660,15 @@ public:
         response_visible_set_fn_ = std::move(fn);
     }
 
-    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
-    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
-    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
-    /// twin can never read a different fleet snapshot for the same request.
-    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
-    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
-    /// to their "no reporting agents" suppressed shape — never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
-    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
+    /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
+    /// the REST `/api/v1/dex/*` handlers use — server.cpp wires the IDENTICAL
+    /// instance so the MCP DEX signal tools can never disagree with REST on the
+    /// signal/experience model. The DEX signal tools REQUIRE it: their
+    /// harmonized `if (!dex_api_)` readiness guard returns the "Guaranteed State
+    /// store unavailable" error when it is null — server.cpp wires it iff the
+    /// store is present, so null ⟺ store absent, mirroring verify_api's
+    /// null→error contract.
+    void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
 
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
     /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
@@ -883,10 +883,17 @@ public:
                             // disagree. Trailing optional dep; nullptr leaves those
                             // tools on the pre-seam "Policy store unavailable" degrade.
                             std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                            // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API
+                            // seam — backs `list_agents`/`get_agent_details`. The SAME
+                            // instance `DeviceRoutes`/REST GET /api/v1/devices[/{id}]
+                            // use, so all three surfaces can never disagree. Trailing
+                            // optional dep; nullptr leaves both tools on the pre-seam
+                            // "internal error"/unwired degrade.
+                            std::shared_ptr<const DeviceApi> device_api = nullptr,
                             // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
-                            // of GET /api/v1/forensics/agents/{id}/app-usage). Placed as the TRUE
-                            // last parameter so adding it can never shift a later positional
-                            // caller's arguments.
+                            // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                            // (kept last across the device_api merge) so adding it can never shift a
+                            // later positional caller's arguments.
                             AppUsageStore* app_usage_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
@@ -1000,10 +1007,12 @@ public:
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
                          std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
                          // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
-                         // of GET /api/v1/forensics/agents/{id}/app-usage). Placed as the TRUE
-                         // last parameter so adding it can never shift a later positional
-                         // caller's arguments.
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
@@ -1066,10 +1075,12 @@ public:
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
                          std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
                          // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
-                         // of GET /api/v1/forensics/agents/{id}/app-usage). Placed as the TRUE
-                         // last parameter so adding it can never shift a later positional
-                         // caller's arguments.
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
 private:
@@ -1123,8 +1134,8 @@ private:
     DashboardRoutes* dashboard_routes_{nullptr};
     // #4033 — see set_response_visible_set_fn above.
     ResponseVisibleSetFn response_visible_set_fn_;
-    // #4035 — see set_dex_fleet_fn above.
-    DexFleetFn dex_fleet_fn_;
+    // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
+    std::shared_ptr<const DexApi> dex_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
 };

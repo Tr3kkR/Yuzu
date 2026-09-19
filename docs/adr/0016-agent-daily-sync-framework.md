@@ -436,4 +436,35 @@ Mechanics:
   (common on community/COPR-built packages) — that is third-party data-subject
   data, not the monitored end-user's, and is out of scope for the
   co-determination analysis above. `distro_id`/`distro_version` add no new
+
+### 2026-09-17 — source `app_usage` (machine-scope usage evidence) CATASTROPHIC clauses
+
+A new sync source, **`app_usage`**, ships the agent-side `app_usage` plugin's
+`last_used` projection to the server once a day. Its own plugin README and the
+header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
+per-file contracts; this entry is the routed-concerns.md pointer's full text
+(kept here, not duplicated inline in that file, to stay under its per-file
+character budget — see `docs/instruction-file-standard.md`'s placement
+ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+CATASTROPHIC-IF-VIOLATED:
+
+1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
+   contributes only a distinct-user COUNT, never a name. A negative test greps
+   the plugin source for the raw process-event table name and `cmdline` and
+   must find zero hits.
+2. **`exe_key` pipe-escaping is a byte-for-byte contract.** Every emitted row
+   pipe-escapes `exe_key` via `yuzu::util::safe_output_field`, and this
+   source's `split_pipe` parser only splits on UNESCAPED pipes and unescapes
+   the producer's backslash-pipe escape sequence — changing one side without
+   the other silently corrupts or drops rows whose executable name contains a
+   delimiter character.
+3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+   `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
+   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   `Enabled` is the opposite of fail-closed.
+4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
+   instead — an empty blob reads server-side as "genuinely zero usage" on a
+   host that is actually constrained or disabled, which is a false negative a
+   downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).

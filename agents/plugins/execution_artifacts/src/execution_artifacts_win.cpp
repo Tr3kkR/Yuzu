@@ -125,6 +125,7 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -564,6 +565,9 @@ AmcacheSubkeys walk_amcache_inventory(HKEY root_key, yuzu::shared::ConstraintAcc
 
 constexpr wchar_t kPrefetchGlob[] = L"C:\\Windows\\Prefetch\\*.pf";
 constexpr wchar_t kPrefetchDir[] = L"C:\\Windows\\Prefetch\\";
+constexpr wchar_t kPrefetchParamsSubkey[] =
+    L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters";
+constexpr wchar_t kEnablePrefetcherValue[] = L"EnablePrefetcher";
 constexpr size_t kPrefetchMaxFiles = 2048;
 constexpr uint64_t kPrefetchPerFileMaxBytes = 8ull * 1024 * 1024;   // 8 MiB
 constexpr uint64_t kPrefetchTotalMaxBytes = 256ull * 1024 * 1024;   // 256 MiB
@@ -660,6 +664,22 @@ BOOL real_find_next(HANDLE h, WIN32_FIND_DATAW* out) {
     return FindNextFileW(h, out);
 }
 
+/// Best-effort read of `EnablePrefetcher` (PrefetchParameters). Returns
+/// nullopt on ANY failure -- missing key/value, wrong type, access denied --
+/// never throws, never logs above debug. Used only to classify an already-
+/// empty Prefetch directory (#4391); a populated directory never calls this.
+/// Moved above collect_prefetch_from (dev merge, #4564): this used to sit
+/// directly above the un-refactored collect_prefetch it was written for.
+std::optional<uint32_t> read_enable_prefetcher() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, kPrefetchParamsSubkey, kEnablePrefetcherValue,
+                           RRF_RT_REG_DWORD, nullptr, &value, &size);
+    if (rc != ERROR_SUCCESS)
+        return std::nullopt;
+    return value;
+}
+
 /// Injectable seam for collect_prefetch's enumeration + caps (#4392):
 /// FindFirstFileW/FindNextFileW route through `fns` (raw function pointers
 /// wrapping the two calls, so the pointer type carries no WINAPI-convention
@@ -677,10 +697,14 @@ struct PrefetchLimits {
     uint64_t total_max_bytes = kPrefetchTotalMaxBytes;
 };
 
-/// Body moved verbatim (routed through `fns`/`limits`, and through the
+/// Body moved (routed through `fns`/`limits`, and through the
 /// `glob`/`dir_with_trailing_backslash` parameters in place of
 /// kPrefetchGlob/kPrefetchDir) out of collect_prefetch, which becomes a
-/// one-line wrapper over this function below.
+/// one-line wrapper over this function below. Zero-files absence
+/// classification (dev merge, #4564) ported in alongside the move: a bare
+/// `"prefetch_disabled"` literal can't distinguish the prefetcher being
+/// genuinely off from it being on with no evidence yet or the registry
+/// state being unreadable -- see prefetch_absence_token's own doc comment.
 int collect_prefetch_from(yuzu::CommandContext& ctx, const wchar_t* glob,
                           const wchar_t* dir_with_trailing_backslash,
                           const PrefetchLimits& limits = {}, const PrefetchEnumFns& fns = {}) {
@@ -689,8 +713,13 @@ int collect_prefetch_from(yuzu::CommandContext& ctx, const wchar_t* glob,
         ScopedFindHandle find(fns.find_first(glob, &find_data));
         if (!find) {
             const DWORD err = GetLastError();
+            // Zero files could mean the prefetcher is off (expected), configured
+            // on but with no evidence (prefetch_evidence_absent), or unknown
+            // (registry unreadable / undocumented value) -- see
+            // prefetch_absence_token's own comment for the forensic distinction.
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-                return emit_constrained(ctx, "prefetch_disabled");
+                return emit_constrained(
+                    ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
             return emit_constrained(ctx, "prefetch_enum_" + std::to_string(err));
         }
 
@@ -795,7 +824,8 @@ int collect_prefetch_from(yuzu::CommandContext& ctx, const wchar_t* glob,
         }
 
         if (files_seen == 0 && !acc.any_failure())
-            return emit_constrained(ctx, "prefetch_disabled");
+            return emit_constrained(
+                ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
 
         if (acc.incomplete())
             ctx.write_output("constrained|" + acc.reason());

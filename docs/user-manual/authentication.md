@@ -954,6 +954,17 @@ creating a token ([`ApiToken:Write`](#creating-a-token)) and to
 operation) — all three operations are held by the same two roles and no
 others; rotation does not change it.
 
+**Under the default RBAC-off configuration, self-rotate now works for any
+owner.** RBAC ships off, and independently of the RBAC-on grant above, any
+authenticated non-admin owner of a token — a plain cookie session or an
+untiered personal access token — can rotate/confirm their own token in the
+shipped default configuration. This was not always true: before a fix, the
+same admin-only rule that gates create/delete also blocked self-rotate for
+everyone but an admin under RBAC-off, which left the feature reachable by
+nobody but an admin out of the box. Ownership is still the actual security
+boundary either way — this only changes who may *attempt* the call, never
+who it can succeed for.
+
 **Lifetime-neutral by design.** The successor token always inherits the
 predecessor's expiry exactly — a non-expiring token stays non-expiring, a
 30-day token stays a 30-day token from its *original* grant. There is no
@@ -979,30 +990,44 @@ sibling's predecessor is destroyed) plus cross-consumer credential capture
 (the caller sees the sibling's new raw secret) within one principal's own
 tokens.
 
-**The de-escalating direction is blocked too — this is a real capability
-gap, not a bug.** The guard is EQUALITY, not "no broader than": a cookie
-(dashboard) or JIT-elevated interactive session carries an empty
-`mcp_tier`/`scope_service`, same as an untiered token — but it therefore
-does **not** match a token that itself carries an `mcp_tier` or
-`scope_service`. The practical effect: **you cannot rotate or confirm your
-own MCP-tiered or service-scoped token from the dashboard or a cookie
-session at all** — only a caller presenting that token's own credential (or
-an equally-tiered one) can. This is backwards precisely when you suspect
-the token's secret, which is the main reason anyone rotates a credential;
-there is currently no dashboard-driven remediation for a suspected
-MCP-tiered token short of [revoking](#revoking-a-token) it outright.
-Whether to widen the guard to admit a higher-authority session rotating a
-narrower token is an open product decision, not yet made.
+**You can now rotate your own MCP-tiered or service-scoped token from a
+plain dashboard/cookie session.** The guard was originally bare EQUALITY,
+not "no broader than": a cookie or JIT-elevated interactive session
+carries an empty `mcp_tier`/`scope_service`, which matched an untiered
+token but not one that itself carried a tier or scope — so you could not
+rotate or confirm your own MCP-tiered or service-scoped token from the
+dashboard at all, only a caller presenting that token's own credential (or
+an equally-tiered one) could. That was backwards precisely when you
+suspect the token's secret, which is the main reason anyone rotates a
+credential. This is now fixed: a session holding **no** standing
+`mcp_tier`/`scope_service` at all — a plain cookie or JIT-elevated
+interactive session — may rotate or confirm ANY token it owns regardless
+of that token's own tier/scope. This is a single special case, not a
+general "no broader than" rule: such a session already holds a strict
+superset of what any tiered/scoped token can do, and the successor still
+inherits the *token's own* narrower tier/scope, never your session's — you
+cannot use this to mint yourself a broader credential. A session holding
+SOME tier/scope of its own still must match the target token's exactly.
 
-**The `400` rejection text is misleading for this case.** Both the
-ownership mismatch and the authority-inheritance mismatch above return the
-identical `"no such token to rotate"` / `"no such token to confirm"`
-wording (by design — see "Self-service only" above for why this is not an
-enumeration oracle), so if you own the token and it genuinely exists, that
-message does not mean what it says; it means your current session's
-authority doesn't match the token's own. This wording is deliberate and is
-not being changed to disambiguate the two cases, since doing so would
-reopen the oracle it exists to close.
+**The `400` rejection text stays folded for a genuine mismatch.** A
+non-owner and a genuine tier/scope mismatch (one non-empty tier/scope
+against a different one) both still return the identical
+`"no such token to rotate"` / `"no such token to confirm"` wording (by
+design — see "Self-service only" above for why this is not an enumeration
+oracle). This wording is deliberate and is not being changed to
+disambiguate the two cases, since doing so would reopen the oracle it
+exists to close.
+
+**A token within 24 hours of its own expiry cannot be rotated.** This is
+by design, not a gap: rotation is lifetime-neutral (see above) and the
+overlap window has a 24-hour floor, so there is no way to fit a
+lifetime-neutral overlap inside a shorter remaining window without either
+extending the token's life or shrinking the floor below the point where
+both secrets are reliably live for a cutover — neither is acceptable. The
+store's `400` names this directly
+(`"overlap window would exceed the predecessor credential's expiry"`).
+Rotation is not a renewal mechanism; if a token is nearing expiry, create
+a fresh one instead of trying to rotate the old one.
 
 See the [REST API reference](rest-api.md) `POST /api/v1/tokens/{token_id}/rotate`
 and `.../confirm` for the full error matrix.

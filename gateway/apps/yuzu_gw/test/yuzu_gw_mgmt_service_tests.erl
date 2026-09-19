@@ -87,7 +87,7 @@ ctx_setup() ->
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(telemetry),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
-    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
+    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.
@@ -177,3 +177,38 @@ get_agent_ctx() ->
     yuzu_gw_agent:disconnect(AgentPid),
     StreamPid ! stop,
     timer:sleep(50).
+
+%%%===================================================================
+%%% get_agent stale-pid handling (governance finding, external PR review)
+%%%===================================================================
+
+%% `yuzu_gw_registry:lookup/1`'s cross-node `pg` fallback (`lookup_remote/1`,
+%% HA WS-4 4.3a) never verifies a REMOTE member's liveness — it trusts `pg`'s
+%% own asynchronous cleanup. A stale pid reaching `get_agent/2` used to crash
+%% the request handler (`gen_statem:call/3` raises `exit({noproc, _})`
+%% uncaught) instead of returning the same NOT_FOUND response the `error`
+%% branch already produces for "never was connected". Mock the registry to
+%% return a genuinely-dead pid deterministically, rather than racing a real
+%% kill against a real lookup.
+get_agent_maps_stale_pid_to_not_found_test() ->
+    DeadPid = spawn(fun() -> ok end),
+    wait_dead(DeadPid, 100),
+    ?assertEqual(false, is_process_alive(DeadPid)),
+
+    meck:new(yuzu_gw_registry, [passthrough]),
+    meck:expect(yuzu_gw_registry, lookup, fun(_) -> {ok, DeadPid} end),
+
+    Result = yuzu_gw_mgmt_service:get_agent(#{agent_id => <<"stale-agent">>}, #{}),
+    ?assertMatch({error, #{status := 5}}, Result),
+
+    meck:unload(yuzu_gw_registry).
+
+wait_dead(_Pid, 0) ->
+    ok;
+wait_dead(Pid, Attempts) ->
+    case is_process_alive(Pid) of
+        false -> ok;
+        true ->
+            timer:sleep(5),
+            wait_dead(Pid, Attempts - 1)
+    end.

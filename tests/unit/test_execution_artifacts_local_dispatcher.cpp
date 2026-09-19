@@ -15,7 +15,7 @@
  * RUNS ON ALL THREE PLATFORMS unconditionally, per
  * test_filesystem_posture_local_dispatcher.cpp's precedent for why a
  * platform-guarded dispatcher TU hides a dead leg. On Linux/macOS every
- * action must report `unsupported|windows_only_artefact`, exit code 1 —
+ * action must report `<action>|unsupported|windows_only_artefact`, exit code 1 —
  * this is THIS package's (P31) portion of the contract, and is fully
  * exercised on every build host. The Windows branch (P32's
  * execution_artifacts_win.cpp) is extended by P32's own test additions;
@@ -195,7 +195,7 @@ TEST_CASE("execution_artifacts plugin: dispatching one action never affects anot
 
 #if !defined(_WIN32)
 
-TEST_CASE("execution_artifacts plugin: every action reports unsupported|windows_only_artefact "
+TEST_CASE("execution_artifacts plugin: every action reports <action>|unsupported|windows_only_artefact "
           "on a non-Windows build, exit 1",
           "[execution_artifacts][actions]") {
     auto plugin = load_execution_artifacts_plugin();
@@ -213,10 +213,12 @@ TEST_CASE("execution_artifacts plugin: every action reports unsupported|windows_
 
         CHECK(result.rc == 1);
         CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "windows_only_artefact");
 
         const auto rows = captured_rows(result.captured);
         REQUIRE(rows.size() == 1);
-        CHECK(rows.front() == "unsupported|windows_only_artefact");
+        CHECK(rows.front() == std::string{action} + "|unsupported|windows_only_artefact");
     }
 }
 

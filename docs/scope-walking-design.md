@@ -74,7 +74,7 @@ CREATE INDEX idx_result_sets_parent    ON result_sets(parent_id);
 CREATE INDEX idx_result_set_members_dev ON result_set_members(device_id);
 ```
 
-The schema deliberately mirrors `audit_store` retention discipline: lineage edges and source payloads are immutable once written; `ttl_at` extension is the only post-write mutation. This makes the table a forensic record of the operator's reasoning chain — a `SELECT` walking `parent_id` reconstructs every narrowing step end to end, even after the underlying device state has moved on.
+The schema deliberately mirrors `audit_store` retention discipline: lineage edges and source payloads are immutable once written; `ttl_at` extension is the only post-write mutation. This makes the table a forensic record of the operator's reasoning chain — a `SELECT` walking `parent_id` reconstructs every narrowing step end to end, even after the underlying device state has moved on. Two documented exceptions to "immutable": ADR-0036 (`docs/adr/0036-result-set-store-postgres-migration.md`) lets `mark_failed` merge a failure reason into `source_payload` on a permanent-failure transition; the json-dump-depth-guard fix additionally lets that same `mark_failed` call DISCARD (not merge into) a `source_payload` that nests past `kMcpMaxJsonDepth`, replacing it with a small fixed placeholder so the row can still transition to `failed` without ever re-dumping the poisoned original.
 
 ### 3.2 `source_payload` JSON shapes
 
@@ -293,7 +293,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`. `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |

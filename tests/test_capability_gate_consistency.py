@@ -33,9 +33,11 @@ Three things checked against the real, integrated tree:
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
      `.plugin`/`.action` pair for, and both must equal EXPECTED_TOTAL_ROWS
-     (4+5+45+55+34+42+2+3+4+2+2 across the eleven fragments) — architect review requirement: a regex that
-     silently fails to associate a gate with its row must read as a hard
-     failure, never as an absent gate.
+     (see the itemized sum next to that constant's own definition below,
+     not repeated here — this second copy is what drifted stale first)
+     — architect review requirement: a regex that silently fails to
+     associate a gate with its row must read as a hard failure, never as
+     an absent gate.
 
 Mode-defaulting semantics are replicated EXACTLY from
 `server/core/scripts/embed_content.py`'s `def_envelope`
@@ -89,18 +91,35 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
 # disk_actions and the trailing 4 is power_health
-# (battery/thermal/power_plan/set_power_plan), both Wave 6.
+# (battery/thermal/power_plan/set_power_plan), both Wave 6. The leading 4
+# (core_dispatch_capabilities.hpp) already includes the hardware CI
+# sync-on-demand row (`__sync__.now`) — it is NOT a separate increment on
+# top of this base sum; an earlier revision of this comment listed it as
+# one anyway ("+1 core") and a reader naively adding every bullet below
+# got 204, one over the true total, which is exactly the trap this note
+# now exists to flag. (The stale EXPECTED_TOTAL_ROWS=206 this replaces was
+# off by a further 2 rows for reasons lost to history — 203 is the value
+# re-derived from the fragments themselves, not from reconciling 206.)
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
+# Wave 7b PR7b.3: +3 app_usage (summary/last_used/foreground).
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
-# Hardware CI sync-on-demand: +1 core (__sync__.now).
-EXPECTED_TOTAL_ROWS = 201
+# Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
+# Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
+# focused follow-up PR on top of this one.
+# Running total: 194 (base, already includes __sync__.now — see above) +
+# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
+# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) = 209.
+EXPECTED_TOTAL_ROWS = 209
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
