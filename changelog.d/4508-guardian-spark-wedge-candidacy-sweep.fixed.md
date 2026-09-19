@@ -1,0 +1,1 @@
+- **Guardian Spark wedge withdrawal tracks pending claims directly.** Derive late-arm adoption candidacy from retained claims, preserve committed generations during publication failures, and sweep candidacy before rule withdrawal and full-sync teardown (#4508).
