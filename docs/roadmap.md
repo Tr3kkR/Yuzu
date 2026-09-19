@@ -2115,7 +2115,9 @@ before acting on any "open" / "in progress" claim:
    `docs/adr-1005-execution-plan.md` Phase 7. (No dependency on Phase 9 — see Phase 9's own entry.)
 2. **High Availability (ADR-2002).** As of dev @ `d295db964` (11:01 UTC) — verified by merge-commit
    ancestry (`git merge-base --is-ancestor`), not `gh pr view` state: Phase A partly done — WS-0/WS-1/
-   WS-7/WS-2a (both 2a-1 and 2a-2, #3924 merged 2026-09-03, IS an ancestor) are done; **WS-10 is NOT
+   WS-7/WS-2a (both 2a-1 and 2a-2, #3924 merged 2026-09-03, IS an ancestor) are done — 2a-2's own row
+   text names loss-free cross-replica reconnect (durable outbox replay `ORDER BY event_id`) as a
+   still-outstanding 2nd-replica precondition (see the gate note below); **WS-10 is NOT
    done at the pin** — #4092 merged 2026-09-07 12:58 UTC, ~1h *after* the pin, confirmed NOT an
    ancestor, so WS-10 stays PR #4092 open here. Phase B has one early slice landed — WS-3 3.1 (fenced
    `LeaderElector` primitive, #4011 merged 2026-09-06, IS an ancestor) is done but **inert** (no loop
@@ -2133,7 +2135,17 @@ before acting on any "open" / "in progress" claim:
    4.2), so the 2nd-replica gate is now the rest of WS-4 plus WS-5, WS-6, WS-8-readyz and WS-13 — plus
    the two `DisabledUntilFixed` named fixes (`nvd_sync`'s engine-tier migration, the concurrency-claims
    reconciler's PG-clock fix #4093) that `leader_gate.hpp` holds out of the safe-to-scale set regardless
-   of WS-10's status. That gate is procedural: nothing in code refuses a 2nd replica today. See
+   of WS-10's status — plus WS-2a's own unshipped precondition (loss-free cross-replica reconnect via
+   durable outbox replay `ORDER BY event_id`; WS-2a shows "done" at the row-status level, but its own
+   row text in `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica
+   precondition, corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID`
+   mechanism) — plus #4014 (WS-11 leader identity/epoch + CRL-freshness-staleness metrics +
+   split-brain alert + the `/readyz` decision), which the WS-3 3.2 exit-criteria note names a **hard
+   prerequisite before a 2nd replica or any WS-9 failover scenario** and which is distinct from
+   WS-8-readyz's per-tier health contract already in this list — and #4098 (verify webhook/offload
+   emit sites are per-replica-origin before a 2nd replica, tracked against
+   `StoreWorkerPool::worker_loop`, or a fleet-triggered emit double-delivers). That gate is procedural:
+   nothing in code refuses a 2nd replica today. See
    `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
