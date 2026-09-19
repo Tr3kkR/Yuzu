@@ -833,19 +833,32 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
                             f"{reconcile_sent_delta},pushes_delta={pushes_policy_change_delta})")
 
     deadline_ms = max(2 * b_ms, 30000)
-    d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
-    functional_valid = all(v != "not_observed" for v in d_by_rule.values())
-    d_ms = max((v for v in d_by_rule.values() if isinstance(v, (int, float))), default=None)
+    # Governance Gate 8 (self-review, third pass - same UP-2 class the two prior rounds
+    # fixed elsewhere in this function): cohort_events_d() calls dgrhp_utc_offset() which,
+    # on a cache miss (the common case - it's lazily computed once per process, and this is
+    # the FIRST call site reached on the B/B2 path), makes its own unguarded ssh_ps() round
+    # trip - a failure here used to crash the whole cmd_run loop after T0/T1 had already been
+    # successfully observed, discarding real data. dgrhp_utc_offset() is called a second time
+    # just below (t0_true_epoch) - guarded by the same try, since a cache-miss failure there
+    # is the identical condition.
+    try:
+        d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
+        functional_valid = all(v != "not_observed" for v in d_by_rule.values())
+        d_ms = max((v for v in d_by_rule.values() if isinstance(v, (int, float))), default=None)
+        # t0["ts"] is log-native (local-labeled-as-UTC); trig_ts is a true
+        # time.time() epoch from this (BigColin) host - convert t0 back to true
+        # UTC before diffing, same correction as cohort_events_d. Still an
+        # uncalibrated cross-host interval (informational only, not
+        # verdict-bearing) - two different machines' clocks, not two
+        # differently-labeled reads of the same one.
+        t0_true_epoch = t0["ts"].timestamp() - dgrhp_utc_offset().total_seconds()
+    except Exception as e:  # noqa: BLE001
+        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
+                 "trigger_http_status": http_status,
+                 "void_reason": f"dgrhp_clock_unavailable:{type(e).__name__}:{str(e)[:200]}"}
     if phase_is_clean_verdict and void_reason is None and not functional_valid:
         void_reason = "functional_invalid"
 
-    # t0["ts"] is log-native (local-labeled-as-UTC); trig_ts is a true
-    # time.time() epoch from this (BigColin) host - convert t0 back to true
-    # UTC before diffing, same correction as cohort_events_d. Still an
-    # uncalibrated cross-host interval (informational only, not
-    # verdict-bearing) - two different machines' clocks, not two
-    # differently-labeled reads of the same one.
-    t0_true_epoch = t0["ts"].timestamp() - dgrhp_utc_offset().total_seconds()
     create_to_t0_lag_ms = ((t0_true_epoch - trig_ts) * 1000) if trigger_kind == "rule-create" else None
 
     return {
