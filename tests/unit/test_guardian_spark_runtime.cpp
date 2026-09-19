@@ -3529,7 +3529,7 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
     //
     // What THIS test does verify, and does so via a genuine two-OS-thread race for
     // registry_mu_ (not the fully-sequenced "detach_all withdraws a rule that is
-    // still only CLAIMED" test above, which always calls detach_all() only after
+    // still only CLAIMED" test below, which always calls detach_all() only after
     // confirming the arm is parked, so detach_all() deterministically wins): that
     // BOTH legal resolutions of that race - the claim being withdrawn before its
     // callback can commit, or the callback committing before detach_all() begins
@@ -3571,15 +3571,31 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
         // cpp-safety Gate-3 finding (this review round): a Cleanup guard between
         // `fut`'s declaration and the throwing REQUIRE below, matching the
         // established idiom elsewhere in this file (see the "detach_all withdraws
-        // a rule that is still only CLAIMED" test above) - without it, a REQUIRE
+        // a rule that is still only CLAIMED" test below) - without it, a REQUIRE
         // failure here would unwind straight into fut's destructor, which blocks
         // until the parked worker resolves; nothing on that path ever calls
         // release_hang(), so the worker - and the whole runtime/backend graph its
         // completion closure keeps alive - would leak for the rest of the process.
+        // cpp-expert Gate-3 finding (this review round): `releaser` is declared
+        // default-constructed HERE, alongside `cleanup`, rather than at its
+        // construction point below - `detach_all()` is not noexcept, and a
+        // joinable `std::thread` destroyed mid-unwind is std::terminate(), not a
+        // catchable exception. `cleanup`'s destructor now joins it too (harmless
+        // no-op if never started, or already joined on the normal path), matching
+        // this file's own "stop_everything" precedent (declare the thread first,
+        // the guard after, so the guard's destructor - which runs first - can
+        // safely join a still-live thread before that thread's own destructor
+        // would otherwise abort the process).
+        std::thread releaser;
         struct Cleanup {
             FakeBackend* backend;
-            ~Cleanup() { backend->release_hang(); }
-        } cleanup{b.get()};
+            std::thread* releaser_thread;
+            ~Cleanup() {
+                backend->release_hang();
+                if (releaser_thread->joinable())
+                    releaser_thread->join();
+            }
+        } cleanup{b.get(), &releaser};
         REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
         // Race: release the parked arm (letting its completion callback try to
@@ -3589,16 +3605,26 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
         // timing - both orderings are legal (a clean withdraw-then-disarm, or a
         // legitimate commit-then-detach); what must never happen is either thread
         // observing torn/partial state.
-        std::thread releaser([&] { b->release_hang(); });
+        releaser = std::thread([&] { b->release_hang(); });
         if (i % 2 == 1)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         rt->detach_all();
         releaser.join();
         const auto fut_result = fut.get(); // either a real generation or "withdrawn" is valid here
-        if (fut_result.has_value())
+        if (fut_result.has_value()) {
             saw_committed = true;
-        else
+        } else {
+            // cpp-expert Gate-3 finding (this review round): check the SPECIFIC
+            // error, matching the precedent this comment cites (the "detach_all
+            // withdraws a rule that is still only CLAIMED" test's own
+            // CHECK(gen.error() == "withdrawn")) - a bare has_value()==false would
+            // silently misclassify a future, different error class (e.g. a
+            // deadline timeout, unreachable today per Config::backend_op_deadline's
+            // 5s default and this race resolving in milliseconds) as the expected
+            // "withdrawn" outcome instead of catching the drift.
+            CHECK(fut_result.error() == "withdrawn");
             saw_withdrawn = true;
+        }
 
         const auto epoch_after = rt->application_fence_for_test().first;
         INFO("iteration " << i << " epoch_before=" << epoch_before << " epoch_after=" << epoch_after
