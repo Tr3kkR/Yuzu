@@ -347,6 +347,7 @@ agent_test_exe = executable(
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
     'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
+    'unit/test_certificates_linux_store.cpp',  # WS-A a1: real syscall-level delete against a TempDir (certificates_linux_store.hpp; POSIX-guarded, runs on macOS too)
     'unit/test_certificates_macos_actions.cpp',  # WS-B: action-level LocalDispatcher tests for the SecItem
                                                   # sentinel + console-owner recheck orchestration (#4374 fix
                                                   # shape 2 + 3); __APPLE__-guarded, empty TU elsewhere.
@@ -505,6 +506,7 @@ agent_test_exe = executable(
     'unit/test_peripherals_local_dispatcher.cpp',  # Wave 9 PR9.1a: real peripherals dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_peripherals_linux_parsers.cpp',     # Wave 9 PR9.1a: pure sysfs walk/attr parsers over a committed fixture tree
     'unit/test_peripherals_macos_parsers.cpp',     # Wave 9 PR9.1a: pure IOKit OSData decoders over this-Mac REAL CAPTURE fixtures
+    'unit/test_peripherals_win_parsers.cpp',       # Wave 9 PR9.1a2: pure SetupAPI hardware-id parsers over the-rig REAL CAPTURE fixtures
     'unit/test_app_usage_parsers.cpp',           # Wave 7b PR7b.3: pure sqlite seam, :memory: db seeded from the REAL CAPTURE export
     'unit/test_app_usage_local_dispatcher.cpp',  # Wave 7b PR7b.3: real plugin via LocalDispatcher, unguarded on every OS; seeded via StandalonePluginContext
     'unit/test_sync_source_app_usage.cpp',       # Wave 7b PR7b.3: app_usage daily-sync source
@@ -581,7 +583,8 @@ agent_test_exe = executable(
              # REQUIRE(exists), never skip. Wave 9 PR9.2a: test_windows_optional_features_parsers.cpp
              # reads the-rig REAL CAPTURE fixtures via this same define. Wave 9 PR9.1a:
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
-             # CAPTURE fixtures via this same define.
+             # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
+             # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
