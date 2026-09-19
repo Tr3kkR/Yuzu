@@ -3507,26 +3507,48 @@ TEST_CASE("R5.7: commit_path_name() renders every CommitPath value distinctly",
 TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for registry_mu_ "
           "never leaves a stale live rule or a double epoch bump (TSan checkpoint)",
           "[spark][runtime][tsan]") {
-    // Doomgoose review (PR #4614): the two R5.7 tests above pin the
-    // epoch counter and commit_path_name() sequentially, single-threaded - neither
-    // leaves an arm-completion callback genuinely in flight ACROSS a detach_all()
-    // call, so neither would catch a regression that moved the epoch bump (or the
-    // claimed-rules withdrawal loop, or the wedged_by_rule_ deactivation) to the
-    // wrong place inside detach_all()'s locked block, or a commit path that reads
-    // detach_epoch_/rules_/claims_ without registry_mu_. This is exactly the shape
-    // of the Astra opine round-1 counterexample (docs/spark-stage2-guardian-
-    // consumer-design.md): a previous application's ordinary callback committing
-    // between the engine's "full_sync cleared" log line and detach_all() actually
-    // running, with no single lock spanning both. Constructed here as a genuine
-    // race for registry_mu_ - not sequenced, unlike the existing "detach_all
-    // withdraws a rule that is still only CLAIMED" test above, which always calls
-    // detach_all() only after confirming the arm is parked (so detach_all()
-    // deterministically wins). Looped so TSan/helgrind sees many interleavings.
+    // Doomgoose review (PR #4614), corrected in a follow-up round after cpp-safety
+    // AND quality-engineer independently found the same false-assurance gap: this
+    // test's own comment used to claim protection against a regression that moved
+    // the epoch bump "to the wrong place inside detach_all()'s locked block". Two
+    // separate proofs showed that claim cannot hold. (1) detach_all()'s entire body
+    // (guardian_spark_runtime.cpp) runs under ONE unbroken registry_mu_ acquisition
+    // - a pure reordering WITHIN that single critical section is unobservable to
+    // any other thread by construction, so no concurrency test can ever detect it.
+    // (2) Even the more realistic regression - SPLITTING that one lock scope into
+    // two separately-locked sections - was reproduced directly (a temporary mutant
+    // built and run 3000 iterations, plain AND under a real -Db_sanitize=thread
+    // build, both 100% green): the callback landing in the gap still gets cleaned
+    // up by the second lock scope's own rules_ walk, so rule_count()/
+    // armed_key_count()/the epoch counter all still converge correctly, and TSan
+    // does not flag a compositional atomicity violation across two individually
+    // well-locked sections the way it flags a raw unsynchronized access. Neither
+    // this test nor any runtime test can enforce that invariant - it is enforced by
+    // detach_all()'s own single lock_guard scope today, and by code review on any
+    // future change to it, not by this file.
+    //
+    // What THIS test does verify, and does so via a genuine two-OS-thread race for
+    // registry_mu_ (not the fully-sequenced "detach_all withdraws a rule that is
+    // still only CLAIMED" test above, which always calls detach_all() only after
+    // confirming the arm is parked, so detach_all() deterministically wins): that
+    // BOTH legal resolutions of that race - the claim being withdrawn before its
+    // callback can commit, or the callback committing before detach_all() begins
+    // its walk - leave the runtime in a fully-converged, self-consistent state
+    // (no double-commit, no stale live rule, exactly one epoch bump). As originally
+    // written the timing meant detach_all() won every single time (150/150 and
+    // 3000/3000 runs respectively, per cpp-safety's and quality-engineer's own
+    // independent sampling) - the "commit wins" branch and its cleanup path were
+    // never actually exercised despite the loop. A small deliberate stagger on
+    // alternating iterations now biases the race the other way often enough that
+    // this test asserts BOTH outcomes were actually observed, not merely legal in
+    // theory.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
 
+    bool saw_withdrawn = false;
+    bool saw_committed = false;
     constexpr int kIters = 30;
     for (int i = 0; i < kIters; ++i) {
         REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
@@ -3546,21 +3568,37 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
         auto fut = std::async(std::launch::async, [&] {
             return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", false), true);
         });
+        // cpp-safety Gate-3 finding (this review round): a Cleanup guard between
+        // `fut`'s declaration and the throwing REQUIRE below, matching the
+        // established idiom elsewhere in this file (see the "detach_all withdraws
+        // a rule that is still only CLAIMED" test above) - without it, a REQUIRE
+        // failure here would unwind straight into fut's destructor, which blocks
+        // until the parked worker resolves; nothing on that path ever calls
+        // release_hang(), so the worker - and the whole runtime/backend graph its
+        // completion closure keeps alive - would leak for the rest of the process.
+        struct Cleanup {
+            FakeBackend* backend;
+            ~Cleanup() { backend->release_hang(); }
+        } cleanup{b.get()};
         REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
         // Race: release the parked arm (letting its completion callback try to
-        // commit) on one thread while detach_all() runs on this one. Whichever
-        // wins registry_mu_ first is unconstrained by design - both orderings are
-        // legal (a clean withdraw-then-disarm, or a legitimate commit-then-detach)
-        // - what must never happen is either thread observing torn/partial state.
+        // commit) on one thread while detach_all() runs on this one. On odd
+        // iterations, give the callback thread a small head start so it sometimes
+        // wins registry_mu_ instead of detach_all() always winning by default
+        // timing - both orderings are legal (a clean withdraw-then-disarm, or a
+        // legitimate commit-then-detach); what must never happen is either thread
+        // observing torn/partial state.
         std::thread releaser([&] { b->release_hang(); });
+        if (i % 2 == 1)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         rt->detach_all();
         releaser.join();
-        auto fut_result = fut.get(); // either a real generation or "withdrawn" is a valid outcome here
-        std::cerr << "[DGRDIAG] iter=" << i << " outcome="
-                  << (fut_result.has_value() ? std::string("armed:") + std::to_string(*fut_result)
-                                              : std::string("error:") + fut_result.error())
-                  << std::endl;
+        const auto fut_result = fut.get(); // either a real generation or "withdrawn" is valid here
+        if (fut_result.has_value())
+            saw_committed = true;
+        else
+            saw_withdrawn = true;
 
         const auto epoch_after = rt->application_fence_for_test().first;
         INFO("iteration " << i << " epoch_before=" << epoch_before << " epoch_after=" << epoch_after
@@ -3575,6 +3613,10 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
         REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
                                        std::chrono::seconds(10)));
     }
+    // The claim this test actually makes - both orderings converge safely - is
+    // only checked if both orderings actually happened at least once.
+    CHECK(saw_withdrawn);
+    CHECK(saw_committed);
 }
 
 TEST_CASE("status_for_rule reflects the last committed verdict; nullopt for an unattached rule",
