@@ -1714,6 +1714,21 @@ TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tet
         CHECK(blob.find(std::string(fam.name)) != std::string::npos);
 }
 
+// #2146 A2-R1 Gate 8 fix: this test's `nlohmann::json::parse(res->body)` call
+// is ALSO, incidentally but genuinely, a whole-catalogue JSON-validity net
+// over every served tool's inputSchema/outputSchema -- `tools/list`'s
+// handler splices each kTools[] schema string in VERBATIM via JObj::raw
+// (mcp_server.cpp), so a single malformed schema anywhere in kTools[] makes
+// the ENTIRE response body fail to parse here, not just the one tool. This
+// is exactly what caught round 1's own malformed get_execution_children
+// output schema (a `result_truncated_by_cap` property landing outside
+// "properties", with a trailing-garbage closing brace) -- confirmed by
+// running this test against that commit: `json.exception.parse_error.101`.
+// The gap this test does NOT cover: it fails LOUDLY but does not say WHICH
+// tool broke it (a byte offset into the merged body, not a tool name), and
+// it cannot catch a schema that is syntactically valid JSON but
+// STRUCTURALLY wrong (e.g. a property nested at the wrong level) -- see the
+// dedicated get_execution_children schema-shape test below for that case.
 TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness tether B)",
           "[mcp][2g]") {
     McpTestServer ts;
@@ -1734,6 +1749,44 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
     for (const auto& t : tools)
         live.insert(t["name"].get<std::string>());
     CHECK(family_tools == live);
+}
+
+// #2146 A2-R1 Gate 8 fix: a TARGETED regression for the specific defect
+// shape staleness tether B (above) cannot catch on its own -- a schema that
+// is valid JSON but has a property nested at the WRONG level. Round 1's own
+// mistake put `result_truncated_by_cap` as a sibling of the top-level
+// "properties" key instead of nested inside it alongside "children"; that
+// particular malformed literal also happened to produce invalid JSON (an
+// extra closing brace), which is why tether B caught it too -- but a
+// same-shape defect that stayed valid JSON (e.g. if the trailing content
+// had balanced correctly) would not have been. Assert the STRUCTURE
+// directly: both declared output properties live under "properties", and
+// "result_truncated_by_cap" is NOT a stray top-level sibling of it.
+TEST_CASE("MCP: get_execution_children's output schema nests "
+          "result_truncated_by_cap inside properties (#2146 A2-R1 Gate 8 fix)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* schema = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"].get<std::string>() == "get_execution_children") {
+            schema = &t["outputSchema"];
+            break;
+        }
+    }
+    REQUIRE(schema != nullptr);
+    REQUIRE(schema->contains("properties"));
+    const auto& properties = (*schema)["properties"];
+    CHECK(properties.contains("children"));
+    CHECK(properties.contains("result_truncated_by_cap"));
+    // The exact shape of round 1's mistake: a stray top-level sibling of
+    // "properties", rather than nested inside it.
+    CHECK_FALSE(schema->contains("result_truncated_by_cap"));
+    REQUIRE(schema->contains("required"));
+    CHECK((*schema)["required"] == nlohmann::json::array({"children"}));
 }
 
 TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labeled counter",

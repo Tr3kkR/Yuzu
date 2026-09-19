@@ -866,13 +866,16 @@ static const ToolDef kTools[] = {
      "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
      "GET /api/executions/{id}/children (same shared row builder, "
      "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
-     "at 500 rows (governance re-review fix, #2146 A2-R1) with no caller-"
-     "visible limit/cursor; result_truncated_by_cap:true means the parent "
-     "has more children than the cap dropped -- applied before the "
-     "per-child visibility filter, so a truncated:false confined response "
-     "still means every child this caller can see was returned.",
+     "at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1) with no "
+     "caller-visible limit/cursor. #2146 A2-R1 Gate 8 fix: the cap is now "
+     "pushed down WITH the caller's own visibility scope, before LIMIT -- a "
+     "confined caller's cap applies to their OWN visible children, not the "
+     "fleet-wide raw row set, so an invisible sibling can no longer displace "
+     "a visible child out of the capped window. result_truncated_by_cap:true "
+     "means that scoped row set exceeded the cap; false means every child "
+     "this caller can see was returned.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 500-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
+     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
