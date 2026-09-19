@@ -124,12 +124,16 @@ server-side series store).
   each showing avg / p50 / p90 / max plus the **Reporting** population card
   (the honest denominator: an average over 12 devices is never silently
   presented as fleet-wide truth). Perf telemetry is collected by **Windows and
-  Linux agents** today; macOS is absent from these numbers, not zero.
-  **Known limitation:** the Reporting card's caption still counts **Windows
-  devices online** as its denominator, so on a mixed fleet the reporting count
-  can legitimately exceed it, and the card's *not-reporting* drill lists
-  Windows devices only (a Linux device whose perf breaks does not appear
-  there). An OS-aware denominator is a tracked follow-up.
+  Linux agents** today; macOS agents show as online but are absent from these
+  numbers, not zero. The Reporting card's caption is **per-OS** (Windows W ·
+  Linux L · macOS M online), fixing the previous known limitation where the
+  denominator only counted Windows devices and could be legitimately exceeded
+  by a mixed-fleet reporting count; the *not-reporting* drill now spans every
+  OS with a real collector (Windows + Linux), not Windows only. `GET
+  /api/v1/dex/perf/fleet` and the MCP `get_dex_perf_fleet` tool carry the same
+  breakdown as additive `linux_online`/`macos_online`/`reporting_windows`/
+  `reporting_linux`/`reporting_macos` fields alongside the original
+  `windows_online`/`reporting`.
 - **Cohort benchmarking** — fleet-relative percentiles per **cohort**: the
   distinct values of an operator-chosen **tag key** (default `model`; pick any
   key from the selector — e.g. an `image` key compares a vanilla VDI image
