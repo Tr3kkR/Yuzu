@@ -5,21 +5,22 @@
 //
 // DOCUMENT-TITLE POSTURE (decided): `jobs` ships `document` (the job's
 // name/title) because it is the identifier an operator needs to read in
-// order to distinguish two jobs from the same owner on the same printer —
-// a focused follow-up PR on top of this one adds a `clear_queue` action
-// that targets one job by this same id, and `document` is how an operator
-// picks which one. This is user content (an end user's document name
-// reaches the operator's screen), so it carries the same posture as any
-// other instruction-result field: retained only as part of the server's
-// ordinary instruction-result history, never forwarded to daily-sync, TAR,
-// or DEX. Retaining COMPLETED job history beyond a single `jobs` call is
-// explicitly deferred (D4) — this plugin has no history store of its own.
+// order to pick which job a subsequent `clear_queue` call should target —
+// there is no other operator-facing way to distinguish two jobs from the
+// same owner on the same printer. This is user content (an end user's
+// document name reaches the operator's screen), so it carries the same
+// posture as any other instruction-result field: retained only as part of
+// the server's ordinary instruction-result history, never forwarded to
+// daily-sync, TAR, or DEX. Retaining COMPLETED job history beyond a single
+// `jobs` call is explicitly deferred (D4) — this plugin has no history
+// store of its own.
 #pragma once
 
 #include "printing_ipp.hpp"
 
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
+#include <charconv>
 #include <cstdint>
 #include <ctime>
 #include <format>
@@ -328,6 +329,34 @@ inline constexpr uint32_t kJobStatusRestart = 0x00000800;
     return std::format("job|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(r.printer), r.job_id,
                         yuzu::util::safe_output_field(r.owner), yuzu::util::safe_output_field(r.document),
                         r.status, r.submitted_at, r.size_bytes);
+}
+
+/// `outcome`: canceled | not_found | refused | error.
+[[nodiscard]] inline std::string format_clear_queue_row(std::string_view printer, int64_t job_id,
+                                                          std::string_view outcome,
+                                                          std::string_view detail) {
+    return std::format("clear_queue|{}|{}|{}|{}", yuzu::util::safe_output_field(printer), job_id, outcome,
+                        yuzu::util::safe_output_field(detail));
+}
+
+/// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never
+/// negative, never zero, never hex/scientific notation, and a 10+-digit
+/// string is refused outright rather than risking a silent 64-bit wrap on a
+/// platform where `int64_t` parsing of a huge digit run could overflow.
+[[nodiscard]] inline std::optional<int64_t> parse_job_id(std::string_view s) {
+    if (s.empty() || s.size() > 9)
+        return std::nullopt;
+    for (const char c : s) {
+        if (c < '0' || c > '9')
+            return std::nullopt;
+    }
+    int64_t v = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
+    if (v < 1)
+        return std::nullopt;
+    return v;
 }
 
 } // namespace yuzu::printing

@@ -5,23 +5,29 @@
  *
  * FIXTURE PROVENANCE — two tiers, honestly named (see each fixture's own
  * <name>.ipp.provenance.txt for the full detail):
- *   - Tier A, `real_*.ipp` (3 files): REAL CAPTURE, taken unprivileged
+ *   - Tier A, `real_*.ipp` (5 files): REAL CAPTURE, taken unprivileged
  *     (uid 501, no sudo) against the live `/private/var/run/cupsd` socket
- *     on this Mac. The tests below assert the RECORDED status and
+ *     on this Mac by `tests/unit/fixtures/wave9/printing/macos/capture.sh`
+ *     Phase A. The tests below assert the RECORDED status and
  *     status-message each fixture's own provenance file states, not a
  *     hardcoded table independent of the capture.
- *   - Tier B, `synthetic_*.ipp` (2 files): SYNTHETIC, hand-assembled
+ *   - Tier B, `synthetic_*.ipp` (3 files): SYNTHETIC, hand-assembled
  *     against printing_ipp.hpp's own wire grammar to exercise decoder
- *     shapes (a populated printer row, a populated job row) that no real
- *     capture on this host can reach — this host has no configured print
- *     queues. NOT evidence of cupsd wire behaviour; never cited as such
- *     anywhere in this plugin.
+ *     shapes (a populated printer row, a populated job row, a successful
+ *     cancel) that no real capture on this host can reach — this host has
+ *     no configured print queues. NOT evidence of cupsd wire behaviour;
+ *     never cited as such anywhere in this plugin.
  *   - Tier C, the winspool bit-mapper cases below: split per-case into
  *     REAL CAPTURE the-rig (a literal (status, cJobs)/Status triplet
  *     copied from tests/unit/fixtures/wave9/printing/windows/enum_*.txt,
  *     P93-2/P93-3) and RECONSTRUCTION (a bit this host's spooler was never
  *     observed to set — documented PRINTER_STATUS_ / JOB_STATUS_ meaning
  *     only).
+ *   - Tier D, `cancel_job_*.ipp` (3 files, tests/unit/fixtures/wave9/
+ *     printing/linux/): REAL CAPTURE, taken inside a throwaway ubuntu:26.04
+ *     cupsd container (I93-7) — the identity-mismatch control no macOS
+ *     capture can provide (every local macOS account is a print operator).
+ *     See each fixture's own .provenance.txt.
  */
 
 #include "printing_ipp.hpp"
@@ -97,6 +103,31 @@ TEST_CASE("encode_request/decode round-trip: a request with no extra operation a
     CHECK(decoded->groups[0].second[0].values == std::vector<std::string>{"utf-8"});
     CHECK(decoded->groups[0].second[1].name == "attributes-natural-language");
     CHECK(decoded->groups[0].second[1].values == std::vector<std::string>{"en"});
+}
+
+TEST_CASE("encode_request/decode round-trip: Cancel-Job with printer-uri/job-id/"
+          "requesting-user-name",
+          "[printing][ipp][codec]") {
+    const std::vector<ipp::OperationAttr> attrs{
+        {ipp::kTagUri, "printer-uri", "ipp://localhost/printers/yuzu_test"},
+        {ipp::kTagInteger, "job-id", ipp::encode_int32(42)},
+        {ipp::kTagNameWithoutLanguage, "requesting-user-name", "alex"},
+    };
+    const auto req = ipp::encode_request(ipp::kCancelJob, 99, attrs);
+    const auto decoded =
+        ipp::decode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(req.data()), req.size()));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->op_or_status == ipp::kCancelJob);
+    CHECK(decoded->request_id == 99);
+    REQUIRE(decoded->groups.size() == 1);
+    const auto& op_attrs = decoded->groups[0].second;
+    REQUIRE(op_attrs.size() == 5); // 2 mandatory + 3 given
+    CHECK(op_attrs[2].name == "printer-uri");
+    CHECK(op_attrs[2].values == std::vector<std::string>{"ipp://localhost/printers/yuzu_test"});
+    CHECK(op_attrs[3].name == "job-id");
+    CHECK(op_attrs[3].values == std::vector<std::string>{ipp::encode_int32(42)});
+    CHECK(op_attrs[4].name == "requesting-user-name");
+    CHECK(op_attrs[4].values == std::vector<std::string>{"alex"});
 }
 
 TEST_CASE("decode: additional-value continuation appends to the preceding attribute",
@@ -279,6 +310,14 @@ TEST_CASE("job_state_from_ipp_enum: every IPP job-state integer 3..9 maps to its
     CHECK(detail::job_state_from_ipp_enum(10) == "unknown");
 }
 
+TEST_CASE("synthetic_cancel_job_ok.ipp decodes to successful-ok (decoder-shape coverage only)",
+          "[printing][ipp][fixtures]") {
+    const auto bytes = read_fixture("synthetic_cancel_job_ok.ipp");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->op_or_status == 0x0000);
+}
+
 TEST_CASE("Tier A REAL CAPTURE fixtures decode to their recorded status + status-message",
           "[printing][ipp][fixtures][real-capture]") {
     // Every expectation below is the value each fixture's own
@@ -305,6 +344,71 @@ TEST_CASE("Tier A REAL CAPTURE fixtures decode to their recorded status + status
         CHECK(decoded->op_or_status == 0x0406);
         CHECK(status_message(*decoded) == "The printer or class does not exist.");
     }
+    {
+        const auto bytes = read_fixture("real_cancel_job_not_found.ipp");
+        const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+        REQUIRE(decoded.has_value());
+        CHECK(decoded->op_or_status == 0x0406);
+        CHECK(status_message(*decoded) == "Job #424242 does not exist.");
+    }
+    {
+        const auto bytes = read_fixture("real_cancel_job_not_found_peercred.ipp");
+        const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+        REQUIRE(decoded.has_value());
+        CHECK(decoded->op_or_status == 0x0406);
+        CHECK(status_message(*decoded) == "Job #424242 does not exist.");
+    }
+}
+
+TEST_CASE("real_cancel_job_not_found[_peercred].ipp are byte-identical — the header-framing "
+          "control (proves framing only, NOT authorisation outcome; see provenance)",
+          "[printing][ipp][fixtures][real-capture]") {
+    const auto without_header = read_fixture("real_cancel_job_not_found.ipp");
+    const auto with_header = read_fixture("real_cancel_job_not_found_peercred.ipp");
+    CHECK(without_header == with_header);
+}
+
+// ─────────────────────────────── REAL CAPTURE ubuntu:26.04 cupsd container ──
+// The identity-mismatch control macOS could not provide (P93-1's capture.sh
+// banner: every local macOS account is a print operator via _lpoperator's
+// nested groups, so no principal there can be refused purely by identity).
+// I93-7 captured these against a real Debian/Ubuntu cupsd (2.4.16) in a
+// throwaway ubuntu:26.04 container: `Require user @OWNER @SYSTEM` on
+// Cancel-Job, `SystemGroup root lpadmin` — see each fixture's own
+// .provenance.txt for the exact command, decoded status, and what each
+// capture does/does not prove.
+TEST_CASE("REAL CAPTURE ubuntu:26.04 cupsd container 2026-09-08: root (real uid 0, "
+          "@SYSTEM via SystemGroup root lpadmin) cancelling a job it does not own "
+          "(owned by nobody) succeeds, WITH the PeerCred header",
+          "[printing][ipp][fixtures][real-capture][linux]") {
+    const auto bytes = read_fixture("cancel_job_root_vs_nobody.ipp", "linux");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->op_or_status == 0x0000); // successful-ok
+}
+
+TEST_CASE("REAL CAPTURE ubuntu:26.04 cupsd container 2026-09-08: root (real uid 0, "
+          "@SYSTEM) cancelling another user's job succeeds even with NO "
+          "Authorization header at all — cupsd resolves the real SO_PEERCRED "
+          "identity off the Unix socket, not the header",
+          "[printing][ipp][fixtures][real-capture][linux]") {
+    const auto bytes = read_fixture("cancel_job_root_no_peercred.ipp", "linux");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->op_or_status == 0x0000); // successful-ok
+}
+
+TEST_CASE("REAL CAPTURE ubuntu:26.04 cupsd container 2026-09-08: nobody (real uid "
+          "65534, neither @OWNER nor @SYSTEM) cancelling root's job is refused at "
+          "the HTTP layer (403 Forbidden) before ever reaching the IPP handler — "
+          "the body is cupsd's HTML error page, not an IPP message, so decode() "
+          "safely returns nullopt (the same non-IPP shape "
+          "printing_plugin.cpp's do_clear_queue short-circuits on via "
+          "result.http_status before ever calling decode())",
+          "[printing][ipp][fixtures][real-capture][linux]") {
+    const auto bytes = read_fixture("cancel_job_nobody_vs_root.ipp", "linux");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    CHECK_FALSE(decoded.has_value());
 }
 
 // ────────────────────────────────────────────────── winspool bit mappers ──
@@ -314,11 +418,12 @@ TEST_CASE("Tier A REAL CAPTURE fixtures decode to their recorded status + status
 // tests/unit/fixtures/wave9/printing/windows/enum_printers.txt's
 // `EnumPrintersW(LOCAL|CONNECTIONS, level 2)` section — the-rig
 // (desktop-04dnsig), captured under BOTH the admin SSH identity and the
-// SYSTEM scheduled task, byte-identical in shape either way.
-// `Microsoft Print to PDF` is the only printer this host had paused with a
-// nonzero queue, so it is the only live triplet exercising
-// `kPrinterStatusPaused`; the other three rows (`OneNote (Desktop)`,
-// `Microsoft XPS Document Writer`, `Fax`) are all status=0x0/cJobs=0.
+// SYSTEM scheduled task, byte-identical in shape either way (see
+// the-rig-print-probe-findings.md). `Microsoft Print to PDF` is the only
+// printer this host had paused with a nonzero queue, so it is the only
+// live triplet exercising `kPrinterStatusPaused`; the other three rows
+// (`OneNote (Desktop)`, `Microsoft XPS Document Writer`, `Fax`) are all
+// status=0x0/cJobs=0.
 TEST_CASE("printer_state_from_winspool: REAL CAPTURE the-rig triplets", "[printing][winspool]") {
     using namespace winspool_bits;
     CHECK(printer_state_from_winspool(0x00000000, 0) == "idle");                  // OneNote (Desktop)
@@ -346,8 +451,10 @@ TEST_CASE("job_status_from_winspool: REAL CAPTURE the-rig triplet", "[printing][
 }
 
 // RECONSTRUCTION: every other Status bit — this printer's paused queue
-// never produced a printing/completed/canceled/aborted/held job —
-// documented JOB_STATUS_* meaning only.
+// never produced a printing/completed/canceled/aborted/held job, and the
+// cancelled jobs (setjob_cancel.txt) were removed from the queue outright
+// rather than left in a readable cancelled state (GetJobW readback failed
+// ERROR_INVALID_PARAMETER) — documented JOB_STATUS_* meaning only.
 TEST_CASE("job_status_from_winspool: RECONSTRUCTION (untested bits)", "[printing][winspool]") {
     using namespace winspool_bits;
     CHECK(job_status_from_winspool(kJobStatusSpooling) == "pending");
@@ -359,9 +466,29 @@ TEST_CASE("job_status_from_winspool: RECONSTRUCTION (untested bits)", "[printing
     CHECK(job_status_from_winspool(kJobStatusUserIntervention) == "held");
 }
 
+// ─────────────────────────────────────────────────────────── parse_job_id ──
+
+TEST_CASE("parse_job_id: accepts ^[0-9]{1,9}$ with value >= 1", "[printing][parse_job_id]") {
+    CHECK(parse_job_id("1") == 1);
+    CHECK(parse_job_id("42") == 42);
+    CHECK(parse_job_id("999999999") == 999999999);
+}
+
+TEST_CASE("parse_job_id: rejects every documented non-match", "[printing][parse_job_id]") {
+    CHECK_FALSE(parse_job_id("all").has_value());
+    CHECK_FALSE(parse_job_id("*").has_value());
+    CHECK_FALSE(parse_job_id("-a").has_value());
+    CHECK_FALSE(parse_job_id("0").has_value());
+    CHECK_FALSE(parse_job_id("-1").has_value());
+    CHECK_FALSE(parse_job_id("1e3").has_value());
+    CHECK_FALSE(parse_job_id("0x10").has_value());
+    CHECK_FALSE(parse_job_id("").has_value());
+    CHECK_FALSE(parse_job_id("1234567890").has_value()); // 10 digits
+}
+
 // ───────────────────────────────────────────────────────── row formatting ──
 
-TEST_CASE("format_printer_row / format_job_row shapes",
+TEST_CASE("format_printer_row / format_job_row / format_clear_queue_row shapes",
           "[printing][format]") {
     PrinterRow p;
     p.name = "Office-LaserJet";
@@ -383,4 +510,7 @@ TEST_CASE("format_printer_row / format_job_row shapes",
     j.submitted_at = "-";
     j.size_bytes = 512;
     CHECK(format_job_row(j) == "job|Office-LaserJet|5|alex|hosts|pending|-|512");
+
+    CHECK(format_clear_queue_row("Office-LaserJet", 5, "canceled", "-") ==
+          "clear_queue|Office-LaserJet|5|canceled|-");
 }
