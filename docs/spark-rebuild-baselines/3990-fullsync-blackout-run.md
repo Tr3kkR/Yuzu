@@ -622,3 +622,115 @@ not assumed. Agent stopped and relaunched on **spark** (no `--spark-disable`, un
 `detection backend = spark` boot line present (PID 21788). `run_agent_legacy.ps1` (new this
 round, adds `--spark-disable` to the existing script) left on-box, not committed. Server and
 Postgres tunnel untouched throughout this session.
+
+## R5.7 T2 re-measurement - pre-registration (2026-09-19, rung 9c PR-6 item 2)
+
+Everything above this section describes the **clean-v2 PASS** measured on the WAITING attach
+model (`origin/dev@65f2938156a19` + the flip one-liner, pre-dating rung 9c PR-2). That result
+stands as recorded - it is not edited or retroactively reinterpreted here. This section
+pre-registers a SEPARATE re-measurement under the current NonWaiting attach model
+(`reconcile_rule_locked()` -> `attach_rule(GuardianSparkRuntime::NonWaiting{}, ...)`), per
+`docs/spark-stage2-guardian-consumer-design.md` "R5.7 - Re-measurement methodology" and its
+"Rung 9c PR-6 item 1" follow-on paragraph. Committed BEFORE any rig time, per this diagnostic's
+own established discipline: define the measurand and pass/fail criterion first, never relax
+an unmet precondition after the fact.
+
+**Why a re-measurement is needed at all**: on current `origin/dev`, `apply_rules ok` gained a
+`pending=` field (rung 9c PR-2), which alone breaks the existing driver's `T1_RE`. More
+substantively, T1 no longer waits for every rule's arm to commit under the NonWaiting model, so
+Window B (`T1 - T0`) no longer brackets synchronous arm completion the way it did for the
+waiting-model clean-v2 result. A runtime-side confirmation independent of `apply_rules`'s own
+return is required - see `docs/spark-stage2-guardian-consumer-design.md`'s R5.7 section for the
+full reasoning this implements.
+
+**Estimand.** Time from the existing `full_sync cleared` marker (T0) to confirmation of the
+current application's expected runtime commits - spark: the 62 epoch-member T2 lines
+(`Guardian spark: arm committed for rule ...`, epoch-identity-filtered against that
+application's own `detach_all()` teardown); legacy: the 62 `guard armed for rule` lines after
+that same teardown's `Guardian spark: detach_all complete (...)` marker (T0d - logged on both
+backends, since `spark_runtime_` is wired unconditionally regardless of which backend is
+selected for arming). This is a **commit-latency proxy on both backends**, not a claim of
+end-to-end detection blackout or notification-establishment coverage: for spark, `arm()`
+returning success does not itself prove the OS watch/subscription is established for any of the
+three cohort mechanism types (file/registry/service - see the design doc's establishment-limit
+discussion), and for legacy `FileGuard::start()` similarly returns before its watch exists. The
+comparison is not claimed to be conservative in either direction.
+
+**Primary measurand: C = T2_last - T0** (spark) / legacy's equivalent last-arm-line - T0. This
+is the HEADLINE number this re-run decides on.
+
+**Continuity measurand: B = T1 - T0**, reported alongside C, NOT decision-bearing. Under the
+NonWaiting model B no longer brackets synchronous arm completion, so a drop in B relative to
+clean-v2's 127-140ms spark figures is a MODEL CHANGE, not a speed improvement, and must be
+reported as such rather than as evidence of anything getting faster.
+
+**Hypotheses, recorded before running (none of these bears on the pass/fail verdict - each is
+reported confirmed or refuted after the run):**
+  (i) spark B on the NonWaiting binary lands below clean-v2's 127-140ms figures;
+  (ii) spark `t1_to_t2_last_ms > 0` on most repeats, with T2 lines observed in all three
+      positions relative to T1 (before/tie/after) across the sample;
+  (iii) spark C falls in the 100-200ms range, legacy C within ~3ms of its own B;
+  (iv) `n_reobserved_adopt == 0` and the `repush_confound` void rate stays under 5%.
+
+**Cohort, triggers, order.** Unchanged cohort composition from clean-v2: 60 cohort rules (20
+file + 20 registry + 20 service, `BLACKOUT_SVC_OVERRIDE` unchanged) + the trigger rule + the
+pre-existing protected rule = 62 expected rule_ids per full_sync. Phase B = baseline re-deploy
+trigger; Phase B2 = bare rule-create trigger (`run_id`-scoped ids this round, closing the
+existing trigger-ID-reuse trap documented above). Pre-registered invocation order: **legacy B,
+spark B, spark B2, legacy B2** - alternating at the invocation level (not full ABBA within a
+phase; each phase's two backend cells still run once each, in this fixed order). One binary per
+backend switch (`--spark-disable` selects at relaunch); the run-order confound this introduces
+(backend is not randomized against phase) is not eliminated, only stated.
+
+**Sample floor.** K = 5 counted repeats per cell for Phase B, K = 3 for Phase B2, within the
+driver's existing attempt cap (2K, minimum 10). A cell that does not reach its floor is
+INCONCLUSIVE for that cell - never relaxed after the fact, per this diagnostic's own prior
+rounds' hard-learned lesson (Sol's round-3 catch, see the retraction above).
+
+**A repeat counts (is "valid") iff ALL of:** `failed == 0`; `total == 62`
+(`cohort_composition` void otherwise); `detached_rules == 62` on spark / `== 0` on legacy
+(`teardown_size_mismatch` void otherwise); `applied == total`; every one of the 62 expected
+rule_ids has an eligible epoch-member confirmation line found within the 240s visibility
+deadline, with no intervening next-application `T0d` (`t2_incomplete` / `double_full_sync`
+void otherwise, `t2_incomplete` rows get one further look via the post-invocation sweep before
+their final classification); `fence_violation == 0`; the existing push-counter deltas match;
+functional validity (`guard.compliant` observed for all 60 cohort rules within `max(2C, 30s)`
+of T0, polled with a 60s ingestion grace). `pending > 0` at T1 and any nonzero
+`n_reobserved_adopt` / `repush_confound` are RECORDED on the row, never voids by themselves
+(`repush_confound` from an in-window push command IS its own void reason, separate from these).
+
+**Verdict per phase - a ONE-RIG EMPIRICAL ACCEPTANCE GATE, explicitly NOT a statistical
+non-inferiority demonstration** (no uncertainty criterion, small K, the order confound noted
+above):
+1. *Latency gate*: spark median C <= legacy median C + max(1000ms, legacy median C), computed
+   on counted (valid) repeats only. The 1000ms floor on the margin is carried unchanged from
+   clean-v2's own acceptance choice (see "Decision rule and outcome" above) - permissive
+   relative to the historical numbers, not derived from any SLO.
+2. *Reliability gate*: zero genuine-failure attempts (`failed_gt_0`, `arm_never_confirmed`,
+   `functional_invalid`, `fence_violation`) across BOTH backend cells of the phase, counting
+   EVERY attempt, not just counted repeats. Any genuine failure fails the phase regardless of
+   what the latency gate would otherwise say, and is filed as its own product finding separate
+   from this diagnostic. Instrument-invalid voids never fail a phase on their own; if they
+   exceed 50% of a cell's attempts that cell is INCONCLUSIVE instead.
+
+PASS requires both gates to hold, at floor, in both cells of the phase. FAIL-LATENCY /
+FAIL-RELIABILITY name which gate failed. INCONCLUSIVE otherwise (floor not reached, or void
+rate too high to interpret). Every attempt - valid or voided - is reported in the raw JSONL and
+in `report`'s per-cell breakdown; nothing is silently dropped.
+
+**Build under measurement.** One `origin/dev`-merged branch SHA (`feat/3990-r57-t2-remeasure`)
+plus the single `agent.cpp:853` flip one-liner for the spark half only
+(`/*prefer_spark=*/!cfg_.spark_disable`); `git diff` against that branch tip must show nothing
+else. `yuzu-agent --version` and the `detection backend = <x>` boot line recorded per relaunch.
+
+**Fields to fill in before/during the actual run** (literal placeholders below, replaced when
+the rig run happens - Commit 1's C++ instrumentation must land and be built into the agent
+binary first):
+- Build SHA under measurement: `TBD-before-run`
+- DGRHP heartbeat interval / rig settings (H12 in the delivery plan): `TBD-before-run`
+- Actual invocation order executed (confirm matches the pre-registered order above):
+  `TBD-before-run`
+- `comparison_id` used to group the four invocations: `TBD-before-run`
+
+This section's own commit hash is the pre-registration timestamp; results are appended as a new
+section below it once the run completes, never edited into this section.
