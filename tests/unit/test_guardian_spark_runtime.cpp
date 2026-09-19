@@ -3504,6 +3504,75 @@ TEST_CASE("R5.7: commit_path_name() renders every CommitPath value distinctly",
     CHECK(names.size() == 5);
 }
 
+TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for registry_mu_ "
+          "never leaves a stale live rule or a double epoch bump (TSan checkpoint)",
+          "[spark][runtime][tsan]") {
+    // Governance Gate-8 external review (PR #4614): the two R5.7 tests above pin the
+    // epoch counter and commit_path_name() sequentially, single-threaded - neither
+    // leaves an arm-completion callback genuinely in flight ACROSS a detach_all()
+    // call, so neither would catch a regression that moved the epoch bump (or the
+    // claimed-rules withdrawal loop, or the wedged_by_rule_ deactivation) to the
+    // wrong place inside detach_all()'s locked block, or a commit path that reads
+    // detach_epoch_/rules_/claims_ without registry_mu_. This is exactly the shape
+    // of the Astra opine round-1 counterexample (docs/spark-stage2-guardian-
+    // consumer-design.md): a previous application's ordinary callback committing
+    // between the engine's "full_sync cleared" log line and detach_all() actually
+    // running, with no single lock spanning both. Constructed here as a genuine
+    // race for registry_mu_ - not sequenced, unlike the existing "detach_all
+    // withdraws a rule that is still only CLAIMED" test above, which always calls
+    // detach_all() only after confirming the arm is parked (so detach_all()
+    // deterministically wins). Looped so TSan/helgrind sees many interleavings.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    constexpr int kIters = 30;
+    for (int i = 0; i < kIters; ++i) {
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+        const auto epoch_before = rt->application_fence_for_test().first;
+
+        // A same-key re-attach disarms the live subscription and queues a fresh arm
+        // behind it (confirmed by the "same-id re-attach" test above: armed,
+        // disarmed, armed) - park THAT fresh arm, not the initial one. reset_hang()
+        // is required before each REUSE of the hang gate on the same FakeBackend
+        // (its own doc comment: entered_hang_/released_ latch permanently true
+        // after one release_hang() cycle) - without it, wait_entered_hang() below
+        // returns immediately-true on iteration 1+ from the STALE prior cycle's
+        // flag, before the redeploy's own claim even exists yet, which raced
+        // detach_all() against nothing and produced a false failure here.
+        b->reset_hang();
+        b->hang_next_arm.store(true);
+        auto fut = std::async(std::launch::async, [&] {
+            return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", false), true);
+        });
+        REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+        // Race: release the parked arm (letting its completion callback try to
+        // commit) on one thread while detach_all() runs on this one. Whichever
+        // wins registry_mu_ first is unconstrained by design - both orderings are
+        // legal (a clean withdraw-then-disarm, or a legitimate commit-then-detach)
+        // - what must never happen is either thread observing torn/partial state.
+        std::thread releaser([&] { b->release_hang(); });
+        rt->detach_all();
+        releaser.join();
+        (void)fut.get(); // either a real generation or "withdrawn" is a valid outcome here
+
+        const auto epoch_after = rt->application_fence_for_test().first;
+        INFO("iteration " << i << " epoch_before=" << epoch_before << " epoch_after=" << epoch_after
+                          << " rule_count=" << rt->rule_count()
+                          << " armed_key_count=" << rt->armed_key_count());
+        CHECK(epoch_after == epoch_before + 1); // detach_all() ran exactly once, bumped exactly once
+        // Both race outcomes settle asynchronously off-lock (submit_disarm_off_lock /
+        // the executor's own completion dispatch) - spin rather than a bare CHECK
+        // immediately after detach_all() returns.
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 0 && rt->armed_key_count() == 0; },
+                                       std::chrono::seconds(10)));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
+                                       std::chrono::seconds(10)));
+    }
+}
+
 TEST_CASE("status_for_rule reflects the last committed verdict; nullopt for an unattached rule",
           "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();

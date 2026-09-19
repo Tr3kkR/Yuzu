@@ -1205,10 +1205,19 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
     deadline_ms], or until that event-time deadline plus a 60s ingestion
     grace has elapsed on the driver clock. t0_dt is log-native
     (local-labeled-as-UTC); event_id's embedded ms is real UTC - the offset
-    is subtracted back out before comparing, same correction as before."""
+    is subtracted back out before comparing, same correction as before.
+
+    Returns (by_rule, never_fetched): a rule left "not_observed" whose EVERY
+    poll attempt raised (never_fetched) is an instrument failure (we have
+    zero evidence about it), not a genuine "the guard never fired" - the
+    caller must not fold the two together (governance Gate-8 external
+    review, PR #4614: a bare `except Exception: continue` here used to
+    launder a REST-fetch failure for the whole polling window into the
+    same "not_observed" state a genuinely-never-fired guard produces)."""
     t0_ms = int(t0_dt.timestamp() * 1000) - int(dgrhp_utc_offset().total_seconds() * 1000)
     grace_deadline = time.time() + (deadline_ms / 1000.0) + 60.0
     by_rule = {rid: "not_observed" for rid in rule_ids}
+    fetch_ever_succeeded = {rid: False for rid in rule_ids}
     while time.time() < grace_deadline:
         pending = [rid for rid, v in by_rule.items() if v == "not_observed"]
         if not pending:
@@ -1216,8 +1225,11 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
         for rid in pending:
             try:
                 data = get_json(op, f"/api/v1/guaranteed-state/events?rule_id={rid}&limit=100")["data"]
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                print(f"[cohort_events_d] fetch failed for rule '{rid}': "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
                 continue
+            fetch_ever_succeeded[rid] = True
             found = None
             for ev in data:
                 if ev.get("event_type") != "guard.compliant":
@@ -1233,7 +1245,9 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
                 by_rule[rid] = found - t0_ms
         if any(v == "not_observed" for v in by_rule.values()):
             time.sleep(poll)
-    return by_rule
+    never_fetched = {rid for rid in rule_ids
+                     if by_rule[rid] == "not_observed" and not fetch_ever_succeeded[rid]}
+    return by_rule, never_fetched
 
 
 # --------------------------------------------------------------------------
@@ -1491,7 +1505,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     # pre-existing void_reason to preserve at this point in this branch's flow (every earlier
     # void condition above already returns immediately), unlike v1's flatter structure.
     try:
-        d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
+        d_by_rule, cohort_never_fetched = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
     except Exception as e:  # noqa: BLE001
         row.update(void_class="instrument",
                     void_reason=f"cohort_events_failed:{type(e).__name__}:{str(e)[:200]}")
@@ -1500,7 +1514,15 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["compliant_restored_ms_by_rule"] = d_by_rule
     row["functional_valid"] = functional_valid
     if phase_is_clean_verdict and not functional_valid:
-        row.update(void_class="genuine", void_reason="functional_invalid")
+        if cohort_never_fetched:
+            # At least one rule's cohort-event poll never once succeeded for the
+            # whole grace window - we have zero evidence about it, not evidence
+            # the guard never fired. Instrument failure, not a genuine void.
+            row.update(void_class="instrument",
+                       void_reason="cohort_fetch_never_succeeded:" +
+                                   ",".join(sorted(cohort_never_fetched)))
+        else:
+            row.update(void_class="genuine", void_reason="functional_invalid")
         return row
 
     row.update(void_class=None, void_reason=None)
@@ -2286,7 +2308,7 @@ def _f19():
     ok5 = all(void_class_for(r) == "instrument" for r in instrument_literals)
     # The documented dynamic-prefix reasons classify instrument by default (the
     # comment above INSTRUMENT_INVALID_REASONS's own definition describes this;
-    # not a set-membership case). Grown from 2 to 11 across the R5.7-driver-merge
+    # not a set-membership case). Grown from 2 to 12 across the R5.7-driver-merge
     # governance round and its hardening follow-on (2026-09-19): the ported per-site
     # SSH/REST guards each mint their own dynamic-prefix reason (metrics_unavailable/
     # dgrhp_clock_unavailable/observe_t0_failed/own_events_fetch_failed/
@@ -2294,7 +2316,11 @@ def _f19():
     # t2_collect_failed - the last one found missing from this list by
     # quality-engineer, a fixture-completeness gap only: void_class_for's default-
     # instrument fallback already classified it correctly, this list just didn't
-    # pin it).
+    # pin it), plus cohort_fetch_never_succeeded (governance Gate-8 external review,
+    # PR #4614: cohort_events_d()'s bare `except Exception: continue` used to
+    # launder a REST-fetch failure for the whole polling window into the same
+    # "not_observed" a genuinely-never-fired guard produces, folding it into
+    # functional_invalid's genuine bucket - see cohort_events_d()'s own docstring).
     dynamic_prefix_reasons = [
         "trigger_failed:some error",
         "push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)",
@@ -2307,6 +2333,7 @@ def _f19():
         "m1_unavailable:TimeoutExpired:cmd timed out",
         "cohort_events_failed:TimeoutExpired:cmd timed out",
         "t2_collect_failed:TimeoutExpired:cmd timed out",
+        "cohort_fetch_never_succeeded:r1,r2",
     ]
     ok6 = all(void_class_for(r) == "instrument" for r in dynamic_prefix_reasons)
     # not_full_sync(...) is the ONE deliberate exception (D1, driver-merge follow-on
@@ -2501,12 +2528,63 @@ def _f23():
                 f"own_run_rows_excluded={ok_own_run_excluded}")
 
 
+def _f24():
+    # cohort_events_d() (governance Gate-8 external review, PR #4614): a rule
+    # whose EVERY poll attempt raises must come back in `never_fetched` (we have
+    # zero evidence about it - instrument failure), distinct from a rule that
+    # fetched successfully at least once and simply never saw a matching event
+    # (genuine - the guard never fired). Mutation: reverting the fix (dropping
+    # `fetch_ever_succeeded`/`never_fetched` and returning bare `by_rule`) makes
+    # this fixture fail with a TypeError unpacking the return value - the
+    # strongest possible signal the caller no longer has the distinction to
+    # consult at all.
+    global get_json, time, _DGRHP_UTC_OFFSET
+    orig_get_json = get_json
+    orig_sleep = time.sleep
+    orig_time = time.time
+    orig_offset = _DGRHP_UTC_OFFSET
+    fake_now = [1_800_000_000.0]
+    seen_once = {"once_ok_then_fails": False}
+    try:
+        time.time = lambda: fake_now[0]  # noqa: E731
+        time.sleep = lambda s: fake_now.__setitem__(0, fake_now[0] + s)  # noqa: E731
+        _DGRHP_UTC_OFFSET = timedelta(0)  # avoid dgrhp_utc_offset()'s real ssh_ps() round trip
+
+        def fake_get_json(_op, path):
+            if "rule_id=always_fails" in path:
+                raise RuntimeError("simulated REST failure")
+            if "rule_id=once_ok_then_fails" in path:
+                if not seen_once["once_ok_then_fails"]:
+                    seen_once["once_ok_then_fails"] = True
+                    return {"data": []}  # one real, empty fetch - no matching event
+                raise RuntimeError("simulated REST failure")
+            return {"data": []}
+
+        get_json = fake_get_json
+        t0_dt = datetime(2026, 9, 19, 10, 0, 0, tzinfo=timezone.utc)
+        by_rule, never_fetched = cohort_events_d(
+            "op", ["always_fails", "once_ok_then_fails"], t0_dt, deadline_ms=1000, poll=1.0)
+    finally:
+        get_json = orig_get_json
+        time.sleep = orig_sleep
+        time.time = orig_time
+        _DGRHP_UTC_OFFSET = orig_offset
+
+    always_fails_never_fetched = "always_fails" in never_fetched
+    once_ok_excluded = "once_ok_then_fails" not in never_fetched
+    both_not_observed = (by_rule["always_fails"] == "not_observed"
+                         and by_rule["once_ok_then_fails"] == "not_observed")
+    ok = always_fails_never_fetched and once_ok_excluded and both_not_observed
+    return (ok, f"always_fails_never_fetched={always_fails_never_fetched} "
+                f"once_ok_excluded={once_ok_excluded} both_not_observed={both_not_observed}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
-        ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23),
+        ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23), ("F24", _f24),
     ]
     failures = 0
     for name, fn in fixtures:
