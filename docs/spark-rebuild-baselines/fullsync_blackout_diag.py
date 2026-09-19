@@ -76,6 +76,7 @@ gap a second time).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -234,7 +235,18 @@ def ssh_ps(cmd_ps1, timeout=30):
     import base64
     encoded = base64.b64encode(cmd_ps1.encode("utf-16-le")).decode("ascii")
     argv = _ssh_argv() + ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded]
-    r = subprocess.run(argv, capture_output=True, timeout=timeout)
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Governance (this round, security-guardian): subprocess.TimeoutExpired's own
+        # str() embeds the full argv - the ssh destination/user and any -i key path from
+        # YUZU_DGRHP_SSH - at the START of the message. Every caller that truncates a
+        # caught exception's str() to a bounded length (str(e)[:200], to keep committed
+        # JSONL evidence rows bounded) truncates from the END, which does NOT remove that
+        # prefix - several call sites' own comments claimed it did, which was false as
+        # written (that reasoning was about payload SIZE, not argv POSITION). Sanitize
+        # once, here, at the source, rather than trying to fix every caller's truncation.
+        raise TimeoutError(f"ssh_ps timed out after {timeout}s") from None
     stdout = r.stdout.decode("utf-8", errors="replace")
     stderr = r.stderr.decode("utf-8", errors="replace")
     if r.returncode != 0 and not stdout:
@@ -1053,24 +1065,49 @@ def sweep_incomplete(rows, window_start_ts):
         print(f"[sweep] log fetch failed, skipping reclassification for {len(incomplete)} "
               f"t2_incomplete row(s): {type(e).__name__}:{str(e)[:200]}", file=sys.stderr)
         return rows
+    # Governance (this round, unhappy-path UP-2/UP-3): unlike observe_t0(), this was the
+    # only _fetch_window() caller with no saturation check at all - a many-repeat or
+    # noisy run can roll TAIL_LINES past an EARLY attempt's own T0d/T2 lines by the time
+    # this single post-loop sweep runs, well before a LATER attempt's own lines are at
+    # any risk. The check is therefore PER-ROW, against THAT row's own t0d_ts, not one
+    # blanket check against the whole sweep's window_start_ts - a blanket check would
+    # misfire on every row whose own events legitimately start some time after
+    # window_start_ts, which in a multi-repeat run is nearly every later repeat, even
+    # when nothing was actually truncated (window_start_ts is captured once, before the
+    # very first repeat). A truncated re-scan can fabricate a false GENUINE
+    # arm_never_confirmed from an instrument gap (no void-ceiling escape applies to a
+    # genuine classification, unlike an instrument one) - a row this affects skips
+    # reclassification, not the whole sweep.
+    earliest_fetched_ts = events[0]["ts"] if events else None
     for r in incomplete:
         t0_ts = datetime.fromisoformat(r["t0"])
         t0d_ts = datetime.fromisoformat(r["t0d"]["ts"])
+        if earliest_fetched_ts is not None and earliest_fetched_ts > t0d_ts:
+            print(f"[sweep] fetched tail's earliest event ({earliest_fetched_ts.isoformat()}) "
+                  f"is already after this row's own T0d ({t0d_ts.isoformat()}) - the window "
+                  f"between them was truncated. Skipping reclassification for this row rather "
+                  f"than reclassify from data known incomplete.", file=sys.stderr)
+            continue
         own_push_raw = find_own_push_cmd_raw(events, t0_ts)
         found, still_missing, fence_violated = sweep_row_pure(
             events, r["t0d"]["epoch"], r["t0d"]["floor"], set(r["missing_rule_ids"]),
             r["backend"], t0_ts, t0d_ts, own_push_raw)
+        # Governance (this round, quality-engineer + consistency-auditor, independently):
+        # resolve_sweep_reclassification() already returns the authoritative
+        # (void_class, void_reason) tuple - a prior version of this loop re-dispatched on
+        # the resulting string with only "t2_late"/"arm_never_confirmed" named branches
+        # and a catch-all `else` that unconditionally overwrote ANY other outcome -
+        # including "fence_violation" - back to ("genuine", "arm_never_confirmed"),
+        # silently discarding the exact cross-application fence-violation signal this
+        # whole epoch-fence redesign exists to catch. Assign once, from the function's
+        # own return; never re-derive or overwrite it from the resulting string.
         r["void_class"], r["void_reason"] = resolve_sweep_reclassification(
             fence_violated, still_missing)
+        r["missing_rule_ids"] = still_missing
         if r["void_reason"] == "t2_late":
             for rid, v in found.items():
                 r["t2_selected"][rid] = {**v, "ts": v["ts"].isoformat()}
             r["missing_rule_ids"] = []
-        elif r["void_reason"] == "arm_never_confirmed":
-            r["missing_rule_ids"] = still_missing
-        else:
-            r["missing_rule_ids"] = still_missing
-            r["void_class"], r["void_reason"] = "genuine", "arm_never_confirmed"
     return rows
 
 
@@ -1114,11 +1151,41 @@ def replace_run_rows(lines, run_id, swept_rows):
         except (json.JSONDecodeError, ValueError):
             out.append(line)
             continue
-        if parsed.get("run_id") == run_id and parsed.get("repeat") in by_repeat:
+        # Governance (this round, security-guardian): a line that parses as valid JSON
+        # but isn't an object (e.g. a bare `123`/`[]`/`null`) previously raised
+        # AttributeError on `.get(...)`, uncaught - contradicting this function's own
+        # docstring claim that such a line "passes through unchanged". Guard explicitly.
+        if (isinstance(parsed, dict) and parsed.get("run_id") == run_id
+                and parsed.get("repeat") in by_repeat):
             out.append(by_repeat[parsed["repeat"]])
         else:
             out.append(line)
     return out
+
+
+def _foreign_fingerprint(lines, run_id):
+    """Count + content hash of every line NOT belonging to `run_id`, order-preserved -
+    used by cmd_run() to detect a concurrent writer between its initial read and its
+    atomic swap (governance, this round, unhappy-path UP-1). A bare line count (the
+    prior check) cannot catch a same-length concurrent write - e.g. two invocations
+    racing with an equal number of counted repeats - since it only notices the file
+    getting longer or shorter, never merely DIFFERENT. Hashing only the foreign lines
+    (never our own run's rows, which this process is legitimately about to rewrite)
+    means the check fires on any change to evidence this process has no business
+    touching, without false-positiving on this process's own in-place correction.
+    A non-dict-JSON or unparseable line counts as foreign, matching
+    replace_run_rows()'s own pass-through rule."""
+    foreign = []
+    for line in lines:
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            foreign.append(line)
+            continue
+        if not (isinstance(parsed, dict) and parsed.get("run_id") == run_id):
+            foreign.append(line)
+    digest = hashlib.sha256("".join(foreign).encode()).hexdigest()
+    return len(foreign), digest
 
 
 def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
@@ -1231,11 +1298,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         t0, t0_source, reason, tail_saturated = observe_t0(
             window_start_ts, allow_fallback_t0, ROOT_CAUSED_T0_TIMEOUT)
     except Exception as e:  # noqa: BLE001
-        # Governance Gate 8 (quality-engineer, second pass, ported): this exception domain
-        # can include subprocess.TimeoutExpired from ssh_ps() - its str() embeds the full
-        # argv (SSH destination/user/key path, the base64-encoded PowerShell payload). Name
-        # and truncate rather than embed raw, so a committed JSONL row never carries rig
-        # connection details or a multi-KB payload dump.
+        # Governance Gate 8 (quality-engineer, second pass, ported; corrected this round,
+        # security-guardian): ssh_ps() itself now sanitizes a raw subprocess.TimeoutExpired
+        # before it can escape (its str() embedded the full argv - SSH destination/user/key
+        # path - at the message's START, which str(e)[:200]'s END-truncation did NOT
+        # remove, contrary to this comment's own earlier claim). Name and truncate here
+        # too, defensively, for any other exception type reaching this point.
         row.update(void_class="instrument",
                     void_reason=f"observe_t0_failed:{type(e).__name__}:{str(e)[:200]}")
         return row
@@ -1433,7 +1501,18 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
     if phase in ("B", "B2") and not comparison_id:
         print("[run] --comparison is required for phase B/B2", file=sys.stderr)
         return 1
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Governance (this round, unhappy-path UP-1b): a bare timestamp is only
+    # second-granular - two cmd_run() invocations started within the same second
+    # (a real operator pattern: legacy+spark or Phase B+B2 launched as separate
+    # background processes moments apart) would share run_id, and
+    # replace_run_rows() matches purely on (run_id, repeat) - both loops number
+    # attempts 1, 2, 3..., so one invocation's finalizer would silently overwrite
+    # the OTHER's rows by matching repeat index. Each invocation is a distinct OS
+    # process (cmd_run() is called exactly once per process, from main()'s CLI
+    # dispatch), so the pid makes run_id unique across any concurrent invocation
+    # regardless of phase/backend, with no downstream parser expecting a bare
+    # timestamp shape (grepped every run_id use site).
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
     trigger_id_cache = {"hbr_counter": 1}
     if trigger_kind == "deploy":
         tb = find_baseline_id(op, TRIGGER_BASELINE)
@@ -1483,31 +1562,37 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
     if os.path.exists(out_path):
         with open(out_path, "r") as f:
             lines = f.readlines()
+    # Governance (this round, unhappy-path UP-1): fingerprint the FOREIGN lines (not
+    # this run's own, which we are legitimately about to rewrite) before touching
+    # anything, and re-check the fingerprint - not a bare line count - immediately
+    # before the swap. Before this round, cmd_run's final write was a pure append,
+    # safe under a concurrent writer; this round's read-modify-write finalization is
+    # NOT - a second process's own equal-length in-place rewrite (e.g. two invocations
+    # racing with the same repeat count) changed the file's CONTENT without changing
+    # its LINE COUNT, so a bare-count check passed while silently reverting the other
+    # process's sweep corrections. A content hash catches that; a count cannot. This
+    # run's own per-attempt rows are already durably on disk via write-through above
+    # regardless of what happens next, so refusing here costs only THIS run's own
+    # sweep-reclassification correction, never data - and relies on run_id (now
+    # pid-suffixed, see above) actually being unique per invocation, or two racing
+    # invocations of the SAME run_id would exclude each other's rows from "foreign"
+    # on both sides and this check would not see them either.
+    before_count, before_digest = _foreign_fingerprint(lines, run_id)
     lines = replace_run_rows(lines, run_id, swept_rows)
-    # Governance (this round): this rewrite assumes single-writer usage (legacy/spark
-    # backends need different agent configs and cannot run concurrently against one agent
-    # - the documented operational model this tool is used under), but nothing in the code
-    # enforces that. Before this round, cmd_run's final write was a pure append, safe under
-    # a concurrent writer; this round's read-modify-write finalization is NOT - a second
-    # process appending to out_path between the readlines() above and the swap below would
-    # have its rows silently discarded by this process's own rewrite. Fail loud instead of
-    # silent: re-check the live line count immediately before the swap (this run's own
-    # per-attempt rows are already durably on disk via write-through above regardless of
-    # what happens next, so refusing here costs only the sweep-reclassification correction,
-    # never data). This narrows the race to the residual gap between this check and the
-    # os.replace() call below, not a full lock - proportionate to how unlikely concurrent
-    # invocation is under this tool's own operational model, not a claim of full atomicity.
-    # Same missing-file tolerance as the read above (repeats=0 against a path nothing has
-    # ever written to): live_count is simply 0 in that case, matching len(lines)==0.
-    live_count = 0
+    live_lines = []
     if os.path.exists(out_path):
         with open(out_path) as f:
-            live_count = sum(1 for _ in f)
-    if live_count != len(lines):
-        print(f"[run] {label} {backend} {phase} ABORT: {out_path} changed size "
-              f"({live_count} lines now vs {len(lines)} expected) during this run's own "
-              f"finalization - a concurrent writer is the likely cause. Refusing to "
-              f"overwrite; re-run 'report' once the concurrent access is resolved.",
+            live_lines = f.readlines()
+    live_count, live_digest = _foreign_fingerprint(live_lines, run_id)
+    if live_count != before_count or live_digest != before_digest:
+        print(f"[run] {label} {backend} {phase} ABORT: {out_path}'s other-run evidence "
+              f"changed ({before_count} foreign lines before this finalization, "
+              f"{live_count} now, digest {'unchanged' if live_digest == before_digest else 'CHANGED'}) "
+              f"- a concurrent writer is the likely cause. Refusing to overwrite. This "
+              f"run's own {len(results)} attempt row(s) are already durable on disk via "
+              f"write-through; only THIS run's sweep-reclassification correction is lost "
+              f"- 'report' re-reads the file as-is and does NOT re-run the sweep, so it "
+              f"will not recover it. Re-run the measurement if the correction matters.",
               file=sys.stderr)
         return 1
     tmp_path = f"{out_path}.tmp-{os.getpid()}"
@@ -2183,11 +2268,15 @@ def _f19():
     ok5 = all(void_class_for(r) == "instrument" for r in instrument_literals)
     # The documented dynamic-prefix reasons classify instrument by default (the
     # comment above INSTRUMENT_INVALID_REASONS's own definition describes this;
-    # not a set-membership case). Grown from 2 to 10 in the R5.7-driver-merge
-    # governance round (2026-09-19): the ported per-site SSH/REST guards each
-    # mint their own dynamic-prefix reason (metrics_unavailable/
+    # not a set-membership case). Grown from 2 to 11 across the R5.7-driver-merge
+    # governance round and its hardening follow-on (2026-09-19): the ported per-site
+    # SSH/REST guards each mint their own dynamic-prefix reason (metrics_unavailable/
     # dgrhp_clock_unavailable/observe_t0_failed/own_events_fetch_failed/
-    # observe_t0d_failed/observe_t1_failed/m1_unavailable/cohort_events_failed).
+    # observe_t0d_failed/observe_t1_failed/m1_unavailable/cohort_events_failed/
+    # t2_collect_failed - the last one found missing from this list by
+    # quality-engineer, a fixture-completeness gap only: void_class_for's default-
+    # instrument fallback already classified it correctly, this list just didn't
+    # pin it).
     dynamic_prefix_reasons = [
         "trigger_failed:some error",
         "push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)",
@@ -2199,6 +2288,7 @@ def _f19():
         "observe_t1_failed:TimeoutExpired:cmd timed out",
         "m1_unavailable:TimeoutExpired:cmd timed out",
         "cohort_events_failed:TimeoutExpired:cmd timed out",
+        "t2_collect_failed:TimeoutExpired:cmd timed out",
     ]
     ok6 = all(void_class_for(r) == "instrument" for r in dynamic_prefix_reasons)
     # not_full_sync(...) is the ONE deliberate exception (D1, driver-merge follow-on
@@ -2275,12 +2365,110 @@ def _f21():
             f"no_matching_run_is_noop={ok_no_matching_run_is_noop}")
 
 
+def _f22():
+    # sweep_incomplete() INTEGRATION test (R5.7 driver-merge follow-on hardening round;
+    # quality-engineer + consistency-auditor, independently: F20 only exercises
+    # resolve_sweep_reclassification() in isolation, never sweep_incomplete() itself -
+    # the function's only real caller, and the one that actually shipped the
+    # fence_violation-clobbering bug this round fixes). Monkeypatches the module-level
+    # _fetch_window() (this function's only live-I/O dependency) to return synthetic
+    # events, then calls sweep_incomplete() directly - the real code path cmd_run()
+    # exercises, not a hand-derivation of what it should do.
+    global _fetch_window
+    orig_fetch_window = _fetch_window
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    window_start = t0_ts - timedelta(seconds=1)
+
+    def base_row(missing_rule_id):
+        return {
+            "void_reason": "t2_incomplete", "t0": t0_ts.isoformat(),
+            "t0d": {"ts": t0d_ts.isoformat(), "epoch": 1, "floor": 5},
+            "missing_rule_ids": [missing_rule_id], "backend": "spark",
+            "t2_selected": {},
+        }
+
+    try:
+        # Case A: a below-floor NON-adopt commit for the still-missing rule (F16's own
+        # events_floor scenario, proven to produce fence_violated=True via
+        # sweep_row_pure) - sweep_incomplete's end-to-end result must be
+        # ("genuine", "fence_violation"), not silently overwritten to
+        # ("genuine", "arm_never_confirmed") by its own dispatch. Includes a realistic
+        # T0d line AT this row's own t0d_ts as the earliest fetched event (a real sweep
+        # fetch spans the whole run and would include it) so the new per-row
+        # not-truncated check correctly does not fire here - a fetch containing only the
+        # later arm-commit line would not represent a real, non-truncated re-scan.
+        fence_events = [
+            _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete "
+                "(epoch=1, incarnation_floor=0, detached_rules=1, withdrawn_claims=0)"),
+            _ev("2026-09-19 10:00:05.000",
+                "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, "
+                "incarnation=3, type=registry, via=inline-arm, attach_to_commit_ms=1)"),
+        ]
+        _fetch_window = lambda _ws: (fence_events, 1000)  # noqa: E731
+        out_fence = sweep_incomplete([base_row("blackout-reg-01")], window_start)
+        fence_ok = (out_fence[0]["void_reason"] == "fence_violation"
+                    and out_fence[0]["void_class"] == "genuine")
+
+        # Case B: genuinely never confirmed, no fence violation - must still classify
+        # arm_never_confirmed (the fix must not swing the other way and start
+        # mislabeling a real non-fence outcome as something else).
+        _fetch_window = lambda _ws: ([], 1000)  # noqa: E731
+        out_missing = sweep_incomplete([base_row("blackout-reg-02")], window_start)
+        missing_ok = (out_missing[0]["void_reason"] == "arm_never_confirmed"
+                      and out_missing[0]["void_class"] == "genuine")
+
+        # Case C: a saturated tail (earliest fetched event already after THIS row's own
+        # t0d_ts - nothing at or before t0d_ts survived in the fetch) must skip
+        # reclassification for this row, leaving it exactly t2_incomplete - not
+        # fabricate a genuine finding from data known truncated (UP-2/UP-3). Per-row,
+        # not blanket: window_start_ts itself is irrelevant to the check now.
+        saturated_events = [_ev("2026-09-19 10:00:04.000", "unrelated line")]
+        _fetch_window = lambda _ws: (saturated_events, 1000)  # noqa: E731
+        row_c = base_row("blackout-reg-03")
+        out_saturated = sweep_incomplete([row_c], window_start)
+        saturated_ok = out_saturated[0]["void_reason"] == "t2_incomplete"
+    finally:
+        _fetch_window = orig_fetch_window
+
+    ok = fence_ok and missing_ok and saturated_ok
+    return (ok, f"fence_violation_survives_sweep_incomplete={fence_ok} "
+                f"arm_never_confirmed_still_correct={missing_ok} "
+                f"saturated_tail_skips_reclassification={saturated_ok}")
+
+
+def _f23():
+    # _foreign_fingerprint() (R5.7 driver-merge follow-on hardening round, unhappy-path
+    # UP-1): the concurrent-writer guard it replaces used a bare line count, which
+    # cannot catch two invocations racing to an EQUAL final line count - the exact
+    # shape of the bug this fixture locks. Two "foreign" (different run_id) lines with
+    # the SAME COUNT but DIFFERENT CONTENT must fingerprint differently; the current
+    # run's own rows must be excluded entirely (their presence/absence/edits must never
+    # change the fingerprint, since this process is legitimately about to rewrite them).
+    foreign_v1 = ['{"run_id": "OTHER", "repeat": 1, "c_ms": 74.0}\n']
+    foreign_v2 = ['{"run_id": "OTHER", "repeat": 1, "c_ms": 999.0}\n']  # same count, different content
+    ok_count_equal = _foreign_fingerprint(foreign_v1, "THIS_RUN")[0] == \
+        _foreign_fingerprint(foreign_v2, "THIS_RUN")[0]
+    ok_digest_differs = _foreign_fingerprint(foreign_v1, "THIS_RUN")[1] != \
+        _foreign_fingerprint(foreign_v2, "THIS_RUN")[1]
+
+    this_run_line = '{"run_id": "THIS_RUN", "repeat": 1, "c_ms": 1.0}\n'
+    fp_without_ours = _foreign_fingerprint(foreign_v1, "THIS_RUN")
+    fp_with_ours = _foreign_fingerprint(foreign_v1 + [this_run_line], "THIS_RUN")
+    ok_own_run_excluded = fp_without_ours == fp_with_ours
+
+    ok = ok_count_equal and ok_digest_differs and ok_own_run_excluded
+    return (ok, f"equal_length_same_count={ok_count_equal} "
+                f"different_content_different_digest={ok_digest_differs} "
+                f"own_run_rows_excluded={ok_own_run_excluded}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
-        ("F19", _f19), ("F20", _f20), ("F21", _f21),
+        ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23),
     ]
     failures = 0
     for name, fn in fixtures:
