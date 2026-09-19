@@ -564,8 +564,18 @@ def cmd_teardown_cohort(op):
     # Scan-and-delete every live hbr-* rule rather than a hardcoded range - see HBR_RULE_RE's
     # own comment for why a fixed range leaks rules whenever an invocation's attempt count
     # exceeds 3 (routine, not an edge case - confirmed live).
-    rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
-    hbr_ids = sorted(r["rule_id"] for r in rules if HBR_RULE_RE.match(r["rule_id"]))
+    # Governance Gate 8 (quality-engineer, second pass): guard this scan itself - the rest of
+    # this function was just made robust to a REST blip, and an unguarded call right here
+    # would abort AFTER baselines/cohort-rules/trigger-rule are already deleted but skip the
+    # failed-tally print and the SSH scratch cleanup below, self-inconsistent with that fix.
+    try:
+        rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
+        hbr_ids = sorted(r["rule_id"] for r in rules if HBR_RULE_RE.match(r["rule_id"]))
+    except Exception as e:  # noqa: BLE001
+        print(f"[teardown] hbr rule scan FAILED, skipping hbr cleanup this run: {e}",
+              file=sys.stderr)
+        hbr_ids = []
+        failed.append("hbr-scan")
     for rid in hbr_ids:
         try:
             if not G.delete_rule(op, rid):
@@ -719,7 +729,15 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
     except Exception as e:  # noqa: BLE001
         return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                  "void_reason": f"metrics_unavailable:{e}"}
-    window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    # Governance Gate 8 (unhappy-path, second pass): dgrhp_now() is its own unguarded ssh_ps()
+    # round trip, and the single most frequent SSH call site in this function (once per
+    # attempt) - UP-2's fix wrapped observe_window() but missed this earlier, higher-frequency
+    # site, which still crashed the whole cmd_run loop on an SSH blip.
+    try:
+        window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    except Exception as e:  # noqa: BLE001
+        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
+                 "void_reason": f"dgrhp_clock_unavailable:{type(e).__name__}:{str(e)[:200]}"}
     trig_ts = time.time()
     http_status = None
     if trigger_kind == "deploy":
@@ -750,8 +768,14 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
     try:
         obs = observe_window(window_start_ts, t0_timeout, t1_timeout)
     except Exception as e:  # noqa: BLE001
+        # Governance Gate 8 (quality-engineer, second pass): this is the first void_reason
+        # whose exception domain can include subprocess.TimeoutExpired from ssh_ps() - its
+        # str() embeds the full argv (SSH destination/user/key path, the base64-encoded
+        # PowerShell payload). Name and truncate rather than embed raw, so a committed JSONL
+        # row never carries rig connection details or a multi-KB payload dump.
+        reason = f"observe_failed:{type(e).__name__}:{str(e)[:200]}"
         return {"phase": phase, "backend": backend, "repeat": repeat_idx,
-                 "trigger_http_status": http_status, "void_reason": f"observe_failed:{e}"}
+                 "trigger_http_status": http_status, "void_reason": reason}
     if obs.get("void_reason"):
         return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                 "trigger_http_status": http_status, "void_reason": obs["void_reason"]}
@@ -787,9 +811,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
     if phase_is_clean_verdict:
         # Governance (unhappy-path UP-5): full_sync is captured by T1_RE but was never
         # asserted - an apply_rules ok line with full_sync=false still matched and was
-        # silently accepted as this measurement's T1, though no such line was observed in
-        # any of the 16 counted clean-v2 repeats (Gate 3 independently re-derived that
-        # result from the raw JSONL).
+        # silently accepted as this measurement's T1. This is purely prospective: full_sync
+        # was never a stored field in any committed JSONL row (Gate 8 quality-engineer,
+        # second pass, confirmed by parsing the file), so whether any of the 16 counted
+        # clean-v2 repeats actually had one is not re-derivable from the committed evidence
+        # and is not claimed here - only that future runs will now void on it instead of
+        # silently accepting it.
         if obs["full_sync"] != "true":
             void_reason = f"not_full_sync({obs['full_sync']})"
         elif obs["failed"] > 0:
@@ -902,10 +929,34 @@ def cmd_run_phase_a(op, backend, label, out_path, cap_seconds=1200, target_windo
     generation, so the server reconcile-pushes on its own ~every 25s)."""
     start = time.time()
     n_windows = 0
-    window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    # Governance Gate 8 (unhappy-path, second pass): Phase A never got UP-2's SSH-exception
+    # guarding at all - only Phase B/B2's observe_window() was wrapped. Phase A is context-only
+    # (never verdict-bearing, see the run doc), but an unguarded SSH blip here still crashed
+    # the whole cmd_run_phase_a invocation rather than ending the observation early or voiding
+    # one window, same UP-2 symptom class.
+    try:
+        window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    except Exception as e:  # noqa: BLE001
+        print(f"[run-a] {label} {backend} ABORT: dgrhp clock unavailable before first window: "
+              f"{type(e).__name__}:{str(e)[:200]}", file=sys.stderr)
+        return 1
     while n_windows < target_windows and (time.time() - start) < cap_seconds:
-        obs = observe_phase_a_window(window_start_ts)
-        window_start_ts = obs.get("next_window_start") or dgrhp_now()
+        try:
+            obs = observe_phase_a_window(window_start_ts)
+        except Exception as e:  # noqa: BLE001
+            obs = {"void_reason": f"observe_failed:{type(e).__name__}:{str(e)[:200]}"}
+        try:
+            window_start_ts = obs.get("next_window_start") or dgrhp_now()
+        except Exception as e:  # noqa: BLE001
+            n_windows += 1
+            obs.pop("next_window_start", None)
+            obs.update({"phase": "A", "backend": backend, "label": label, "repeat": n_windows})
+            with open(out_path, "a") as f:
+                f.write(json.dumps(obs) + "\n")
+            print(f"[run-a] {label} {backend} window={n_windows} dgrhp clock unavailable for "
+                  f"next window, ending observation early: {type(e).__name__}:{str(e)[:200]}",
+                  file=sys.stderr)
+            break
         obs.pop("next_window_start", None)
         n_windows += 1
         obs.update({"phase": "A", "backend": backend, "label": label, "repeat": n_windows})

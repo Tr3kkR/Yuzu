@@ -318,8 +318,10 @@ THIS diagnostic's own driver, fair game to fix and re-run), the flush policy liv
 agent binary under test, and touching it here would invalidate the very B numbers this run
 exists to produce. The underlying observability gap (no flush policy makes `--log-file`
 unreliable for any near-real-time external tailing, not just this driver) is real and worth
-its own product fix, but is explicitly OUT OF SCOPE for this diagnostic to carry - flagged in
-"Open, needs Dave" below rather than left as an implied someone-else's-problem.
+its own product fix, but is explicitly OUT OF SCOPE for this diagnostic to carry - flagged
+below rather than left as an implied someone-else's-problem (filed as
+[#4608](https://github.com/Tr3kkR/Yuzu/issues/4608); see the "Status update" note near the end
+of this document).
 
 **Re-run results, 2026-09-07, same rig/build/cohort as the retracted run (agent untouched
 since - `0.13.1+7899 (65f2938156a19)`, spark flip one-liner unchanged), fresh `ensure` after
@@ -531,11 +533,17 @@ that round failed on**:
   claim") still apply in full: this is one rig, not fleet scale; two specific triggers, not
   every mutation kind; B as defined here, not end-to-end detection blackout.
 
-**Resolved (2026-09-19)**: (1) whether this pass is sufficient to cite #3990 as accepted-neutral
-in §5, and how to word it - `docs/spark-flip-gate.md`'s `#3990` §5 entry now carries this
-result scoped explicitly to the pre-rung-9c-PR-2 WAITING attach model, alongside a later,
-separate re-measurement under the current NonWaiting model. (2) The agent `--log-file`
-flush-policy gap (no `flush_on` call, `spdlog` default `flush_level_=off`, `main.cpp`) - filed
+**Status update (2026-09-19)** on the two items above: (2) is resolved; (1) is NOT resolved,
+and this note does not claim it is - whether this pass is sufficient to cite #3990 as
+accepted-neutral in §5 remains Dave's call, per the paragraph immediately above and per the
+`#3990` §5 entry's own closing line, both unchanged. What DID happen: `docs/spark-flip-gate.md`'s
+`#3990` §5 entry now carries this result scoped explicitly to the pre-rung-9c-PR-2 WAITING
+attach model, alongside a later, separate re-measurement under the current NonWaiting model -
+so the sufficiency question, when Dave does make it, has both results in front of him rather
+than just this one.
+
+(2) The agent `--log-file` flush-policy gap (no `flush_on` call, `spdlog` default
+`flush_level_=off`, `main.cpp`) - filed
 as [#4608](https://github.com/Tr3kkR/Yuzu/issues/4608), after a later re-measurement round on
 this same diagnostic's methodology hit the identical gap a second time. Fixing it here remained
 out of scope (it would alter the executable under measurement).
