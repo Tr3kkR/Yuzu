@@ -11,6 +11,7 @@
 
 #include "spark_engine.hpp"
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags (rung-1 tag composition)
+#include "test_helpers.hpp" // kSpinScale
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1460,7 +1461,12 @@ TEST_CASE("start()'s rollback runs with mu_ released — a mechanism that synchr
             return true;
         }
     });
-    const auto status = fut.wait_for(5s);
+    // Scaled by yuzu::test::kSpinScale (adversarial-review/Gate-3 quality-engineer,
+    // 2026-09-19): a bare 5s bound on a liveness wait in the shared agent_test_exe
+    // binary is exactly the shape that already caused two nightly-sanitizer false
+    // failures elsewhere in this suite (test_helpers.hpp's kSpinScale doc comment) —
+    // this test isn't tagged [tsan-heavy], so it runs under every sanitizer leg.
+    const auto status = fut.wait_for(5s * yuzu::test::kSpinScale);
     REQUIRE(status == std::future_status::ready); // else: wrong guard scope, deadlocked
     CHECK(fut.get());
     engine.reset(); // must not hang either — rollback already tore this down

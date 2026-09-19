@@ -1530,6 +1530,14 @@ void SparkEngine::start() {
             // watcher is running" violation UP-7 closed on the live arm_impl path.
             // watch_guarded() turns a throw into a returned failure; unlike arm_impl
             // we fault in place (subscribers already hold ids — do NOT roll back).
+            //
+            // #2050 COVERAGE NOTE (Gate-3 quality-engineer): this loop runs with the
+            // startup rollback guard still armed, but has no fault-injection test
+            // exercising a throw escaping FROM here — deliberately, because
+            // watch_guarded()'s own contract (this comment, above) is that it never
+            // lets one escape. If that contract ever regresses, THIS is the untested
+            // path the rollback guard would have to cover; a future change to
+            // watch_guarded()'s throw behavior should add that coverage here.
             w = watch_guarded(r.mech, r.key, r.params, r.incarnation, r.err,
                               arm_fault_hook_for_test_);
         }
@@ -1539,8 +1547,16 @@ void SparkEngine::start() {
             // silent log, mirroring the runtime fault channel. (The post-start
             // arm path rolls back instead; a pre-start replay's subscribers
             // already hold ids, so we keep the entry but flag it deaf.)
-            spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}", r.key,
-                          w.error());
+            // Wrapped (Gate-3 cpp-safety, #2050): this loop runs BEFORE
+            // `rollback_armed = false` below, so the rollback guard is still
+            // armed here — an allocation failure formatting this line must not
+            // trigger a full rollback of an engine that has, in substance,
+            // already started (mechanisms are running).
+            try {
+                spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}",
+                              r.key, w.error());
+            } catch (...) {
+            }
             report_fault(r.key, true, "pre-start replay watch failed");
         }
     }

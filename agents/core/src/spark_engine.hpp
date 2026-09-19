@@ -266,7 +266,11 @@ public:
     void disarm(SubscriptionId id);
 
     /// Start the mechanism threads. Interval/poll deadlines are (re)based on
-    /// the start instant; startup sparks fire immediately. Single-shot.
+    /// the start instant; startup sparks fire immediately. Single-shot. On a
+    /// failure (#2050), an internal rollback guard tears the partial startup
+    /// back down and the original exception propagates — the engine is left
+    /// TERMINALLY stopped (mirrors stop()'s own sticky-stop invariant), never
+    /// restartable, not restored to a pre-start state.
     void start();
 
     /// Stop watchers (wheel + mechanisms), then consumer dispatch threads.
