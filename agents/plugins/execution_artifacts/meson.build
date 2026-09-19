@@ -3,7 +3,7 @@
 # (execute()/descriptors, this package/P31) plus a single Windows-only leg TU
 # (execution_artifacts_win.cpp, P32) that is CONDITIONALLY appended only when
 # building for Windows — a single-OS non-Windows build simply omits the leg
-# source, since every action on those platforms is the fixed unsupported|
+# source, since every action on those platforms is the fixed <action>|unsupported|
 # windows_only_artefact outcome the portable TU already handles with no OS
 # call at all. (disk_actions/meson.build's shape differs: it lists every
 # per-OS leg TU unconditionally, internally #ifdef-gated — not this plugin's
@@ -24,7 +24,10 @@ if host_machine.system() == 'windows'
   execution_artifacts_deps += [
     cxx.find_library('advapi32'),
   ]
-  execution_artifacts_sources += files('src/execution_artifacts_win.cpp')
+  execution_artifacts_sources += files(
+    'src/execution_artifacts_win.cpp',
+    'src/execution_artifacts_scratch_sweep_win.cpp',
+  )
 endif
 
 # Assigned to a variable (mirrors disk_actions_plugin_lib /

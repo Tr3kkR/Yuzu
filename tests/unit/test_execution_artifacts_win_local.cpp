@@ -10,7 +10,7 @@
  * -- so this exercises the real compiled leg, never a mock. UNGUARDED TU
  * (compiles and runs on every OS, test_filesystem_posture_local_dispatcher
  * .cpp's precedent for why a platform-guarded test TU hides a dead leg):
- * non-Windows hosts assert the fixed unsupported|windows_only_artefact
+ * non-Windows hosts assert the fixed <action>|unsupported|windows_only_artefact
  * outcome (P31's contract, this package's own copy of that assertion so the
  * check lives with the rest of this file's per-artifact coverage); Windows
  * hosts get this package's (P32) per-artifact assertions below.
@@ -149,7 +149,7 @@ bool current_process_is_elevated() {
 #if !defined(_WIN32)
 
 TEST_CASE("execution_artifacts win-local: non-Windows still reports "
-          "unsupported|windows_only_artefact for all three actions",
+          "<action>|unsupported|windows_only_artefact for all three actions",
           "[execution_artifacts][win_local]") {
     auto plugin = load_execution_artifacts_plugin();
     if (!plugin) {
@@ -164,7 +164,10 @@ TEST_CASE("execution_artifacts win-local: non-Windows still reports "
         CHECK(result.rc == 1);
         const auto rows = captured_rows(result.captured);
         REQUIRE(rows.size() == 1);
-        CHECK(rows.front() == "unsupported|windows_only_artefact");
+        CHECK(rows.front() == std::string{action} + "|unsupported|windows_only_artefact");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "windows_only_artefact");
     }
 }
 
