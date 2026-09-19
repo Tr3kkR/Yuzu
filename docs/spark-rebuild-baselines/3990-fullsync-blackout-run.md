@@ -37,9 +37,12 @@ two prior wrong conclusions kept visible.
 
 **Measurand: B = T1 - T0, the synchronous `full_sync` apply-window proxy** - NOT a claim of
 end-to-end detection blackout. T0 = `Guardian: full_sync cleared N prior rule(s)`
-(`guardian_engine.cpp:658`, agent log, logged immediately before `stop_all_guards_locked()`/
-`detach_all()`); T1 = `Guardian: apply_rules ok (applied=N, failed=0, full_sync=true, ...)`
-(`guardian_engine.cpp:768`). `apply_rules` holds `mtx_` for the whole call and runs inline on
+(`guardian_engine.cpp:658` as of `65f2938156a19`, agent log, logged immediately before
+`stop_all_guards_locked()`/`detach_all()`); T1 = `Guardian: apply_rules ok (applied=N, failed=0,
+full_sync=true, ...)` (`guardian_engine.cpp:768`, same build). Both citations are a point-in-time
+forensic record for the build in "Build" below - the log statements have since moved and the T1
+format has gained a `pending=` field on later `origin/dev`; do not re-grep current `origin/dev`
+for these line numbers. `apply_rules` holds `mtx_` for the whole call and runs inline on
 the agent's run() thread, so [T0,T1] is strictly all-guards-down-then-all-back-up on both
 backends. Excluded from B: push transit, OS-watch re-establishment (legacy `FileGuard::start()`
 returns before the watch exists; spark's `attach_rule` returns after the blocking
@@ -63,7 +66,10 @@ below (harmless for the B values themselves, a same-host subtraction; do not tru
 absolute `+00:00` tag as real UTC).
 
 **Build**: agent core AND all plugins rebuilt at `origin/dev@65f2938156a19` plus the single
-flip one-liner at `agents/core/src/agent.cpp:836`:
+flip one-liner at `agents/core/src/agent.cpp:836`. This build predates rung 9c PR-2's async-arm
+rework - `GuardianSparkRuntime::attach_rule()` here is the blocking (non-`NonWaiting`) overload,
+what `docs/spark-flip-gate.md`'s `#3990` §5 entry calls "the WAITING attach model" when scoping
+this result against later re-measurements under the newer NonWaiting model:
 ```diff
 -        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
 +        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
@@ -525,13 +531,14 @@ that round failed on**:
   claim") still apply in full: this is one rig, not fleet scale; two specific triggers, not
   every mutation kind; B as defined here, not end-to-end detection blackout.
 
-**Open, needs Dave**: (1) whether this pass, on top of the scope limits below, is sufficient
-to cite #3990 as accepted-neutral in §5, and how to word that entry. (2) Whether the agent
-`--log-file` flush-policy gap (no `flush_on` call, `spdlog` default `flush_level_=off`,
-`main.cpp`) should be filed as its own product issue - it's real, reproducible, and affects any
-external near-real-time log tailing, not just this diagnostic's driver, but fixing it here was
-deliberately out of scope (it would alter the executable under measurement). Not filed yet;
-this document is not the place to decide that on its own.
+**Resolved (2026-09-19)**: (1) whether this pass is sufficient to cite #3990 as accepted-neutral
+in §5, and how to word it - `docs/spark-flip-gate.md`'s `#3990` §5 entry now carries this
+result scoped explicitly to the pre-rung-9c-PR-2 WAITING attach model, alongside a later,
+separate re-measurement under the current NonWaiting model. (2) The agent `--log-file`
+flush-policy gap (no `flush_on` call, `spdlog` default `flush_level_=off`, `main.cpp`) - filed
+as [#4608](https://github.com/Tr3kkR/Yuzu/issues/4608), after a later re-measurement round on
+this same diagnostic's methodology hit the identical gap a second time. Fixing it here remained
+out of scope (it would alter the executable under measurement).
 
 ## Does NOT claim
 
