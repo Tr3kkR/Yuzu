@@ -54,9 +54,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "IOKit IOServiceMatching(IOUSBHostDevice)", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
+        {YUZU_SUPPORT_SUPPORTED, 1,
          "SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS",
-         "Windows leg lands in a focused follow-up PR on top of this one"},
+         nullptr},
     },
     {
         /* .action      = */ "pci",
@@ -65,8 +65,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "IOKit IOServiceMatching(IOPCIDevice)", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "SetupAPI (PCI enumerator)",
-         "Windows leg lands in a focused follow-up PR on top of this one"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "SetupAPI (PCI enumerator)", nullptr},
     },
     {
         /* .action      = */ "thunderbolt",
@@ -77,9 +76,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "IOKit IOServiceMatching(IOThunderboltSwitch)", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
+        {YUZU_SUPPORT_CONSTRAINED, 1,
          "SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4",
-         "Windows leg lands in a focused follow-up PR on top of this one"},
+         "string-heuristic identification; no Thunderbolt device class in SetupAPI"},
     },
 };
 
