@@ -39,12 +39,28 @@
 
 -export([start_link/0]).
 %% exported for testing
--export([resolve_targets/0, targets_from_addrs/1, own_short_name/0, own_short_name/1,
-         do_tick/1]).
+-export([resolve_targets/0, targets_from_addrs/1, sanitize_addrs/1,
+         own_short_name/0, own_short_name/1, do_tick/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_INTERVAL_MS, 5000).
+
+%% Cap on resolved/configured peer addresses processed per tick (BLOCKING
+%% fix, PR review — FortitudeEtc/Kimi+Codex, empirically reproduced:
+%% 10,000 distinct addresses -> +10,000 permanent atoms, no reclaim, OTP
+%% 28.4.2). `targets_from_addrs/1` atomizes one address per entry, and
+%% Erlang atoms are NEVER garbage-collected — a hostile or misconfigured
+%% seed-name DNS answer that rotates through fresh, syntactically-VALID
+%% A-records on every 5s tick (this module's own threat model already
+%% treats hostile DNS as adversarial, see `?MIN_COOKIE_LENGTH` in
+%% `yuzu_gw_app.erl`) would otherwise permanently grow the VM-global atom
+%% table (default cap ~1,048,576) until the whole gateway aborts, dropping
+%% every connected agent, recurring on every restart while DNS stays
+%% hostile. 64 is generously above any realistic cluster size
+%% (`docs/erlang-gateway-blueprint.md` sizes ~1M AGENTS per gateway NODE,
+%% so a cluster of dozens of nodes is already a large deployment).
+-define(MAX_TARGET_ADDRS, 64).
 
 -record(state, {interval :: pos_integer()}).
 
@@ -60,7 +76,12 @@ start_link() ->
 %%%===================================================================
 
 init([]) ->
-    Interval = application:get_env(yuzu_gw, cluster_redial_interval_ms, ?DEFAULT_INTERVAL_MS),
+    %% Clamped to a 1s floor (PR review finding): an unvalidated
+    %% `YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS=0` would hot-loop DNS lookups
+    %% every tick, and a negative value would raise `badarg` in
+    %% `erlang:send_after/3`.
+    RawInterval = application:get_env(yuzu_gw, cluster_redial_interval_ms, ?DEFAULT_INTERVAL_MS),
+    Interval = max(RawInterval, 1000),
     %% Non-distributed VM (a plain unit-test run, or a hand-run `rebar3 shell`
     %% without `-name`) has no distribution to form a mesh over — idle rather
     %% than crash `net_kernel:monitor_nodes/1` with `{error, not_alive}`.
@@ -135,8 +156,15 @@ do_tick(Targets) ->
     %% count EXTERNAL peers on the same basis (found + empirically verified,
     %% HA WS-4 #4555 governance Gate 4 happy-path review).
     ExternalTargets = Targets -- [node()],
+    %% SCOPED to ExternalTargets, not a bare length(nodes()) (PR review
+    %% finding): an unrelated inbound distributed connection (a stale node
+    %% still holding the cluster cookie, a dev-shell someone left connected)
+    %% would otherwise inflate `peers_connected` and could mask a genuinely
+    %% failed seed peer — the YuzuGatewayClusterPartiallyFormed alert
+    %% (`resolved - connected > 0`) staying clear when it shouldn't.
+    ConnectedTargets = [T || T <- ExternalTargets, lists:member(T, nodes())],
     telemetry:execute([yuzu, gw, cluster, peers_resolved], #{count => length(ExternalTargets)}, #{}),
-    telemetry:execute([yuzu, gw, cluster, peers_connected], #{count => length(nodes())}, #{}),
+    telemetry:execute([yuzu, gw, cluster, peers_connected], #{count => length(ConnectedTargets)}, #{}),
     case FailedTargets of
         [] ->
             ok;
@@ -165,10 +193,19 @@ do_tick(Targets) ->
 %% "who do I still need to dial". Exported for testing.
 -spec resolve_targets() -> [node()].
 resolve_targets() ->
-    case application:get_env(yuzu_gw, cluster_seed_nodes, []) of
-        [] -> targets_from_addrs(resolve_seed_dns_addrs());
-        Addrs -> targets_from_addrs([binary_to_list(A) || A <- Addrs])
-    end.
+    RawAddrs = case application:get_env(yuzu_gw, cluster_seed_nodes, []) of
+        [] -> resolve_seed_dns_addrs();
+        Addrs -> [addr_to_string(A) || A <- Addrs]
+    end,
+    targets_from_addrs(sanitize_addrs(RawAddrs)).
+
+%% @private A `cluster_seed_nodes` entry is a binary via the
+%% `YUZU_GW_SEED_NODES` env-override path, but a hand-edited `sys.config`
+%% written in ordinary Erlang string style (`["10.0.0.1"]`) is equally
+%% valid config syntax — accept both rather than crashing this gen_server
+%% every tick on the string form (PR review finding).
+addr_to_string(A) when is_binary(A) -> binary_to_list(A);
+addr_to_string(A) when is_list(A)   -> A.
 
 %% @private A records for the configured seed name, as dotted-decimal
 %% strings. `inet_res:lookup/3` returns `[]` on any resolution failure
@@ -188,11 +225,43 @@ resolve_seed_dns_addrs() ->
 %% interchangeable and distinguished only by address (ADR-2002 §7b) — so a
 %% dialed node atom is always `<my own short name>@<peer address>`, never a
 %% hardcoded literal duplicated between this module and `vm.args.src`.
-%% Exported for testing.
+%% Callers MUST route candidate addresses through `sanitize_addrs/1` first
+%% (`resolve_targets/0` does) — this function itself does not re-validate,
+%% so it stays a simple, directly-testable map. Exported for testing.
 -spec targets_from_addrs([string()]) -> [node()].
 targets_from_addrs(AddrStrs) ->
     Short = own_short_name(),
     [list_to_atom(Short ++ "@" ++ AddrStr) || AddrStr <- AddrStrs].
+
+%% @doc Pure: the SINGLE chokepoint both the DNS and static-override paths
+%% in `resolve_targets/0` funnel through before any address becomes an
+%% atom (BLOCKING PR review fix — see `?MAX_TARGET_ADDRS`'s comment for the
+%% atom-table-exhaustion threat this closes). Validates each entry is a
+%% well-formed IPv4 literal (rejects a garbage/typo'd static-override entry
+%% too, not just a hostile DNS answer), dedupes, and caps the count.
+%% Exported for testing.
+-spec sanitize_addrs([string()]) -> [string()].
+sanitize_addrs(AddrStrs) ->
+    Valid = lists:filter(fun is_valid_ipv4_literal/1, AddrStrs),
+    Deduped = lists:usort(Valid),
+    case length(Deduped) > ?MAX_TARGET_ADDRS of
+        true ->
+            logger:warning(
+                "Cluster discovery: ~p resolved/configured addresses exceeds "
+                "the ~p-address cap — truncating. Check the seed DNS name "
+                "isn't returning an unexpectedly large or hostile answer.",
+                [length(Deduped), ?MAX_TARGET_ADDRS]),
+            lists:sublist(Deduped, ?MAX_TARGET_ADDRS);
+        false ->
+            Deduped
+    end.
+
+-spec is_valid_ipv4_literal(string()) -> boolean().
+is_valid_ipv4_literal(AddrStr) ->
+    case inet:parse_ipv4_address(AddrStr) of
+        {ok, _}    -> true;
+        {error, _} -> false
+    end.
 
 %% @doc This node's own short-name portion (before `@`). Exported for testing.
 -spec own_short_name() -> string().

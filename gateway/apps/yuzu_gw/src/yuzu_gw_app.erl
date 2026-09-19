@@ -91,9 +91,16 @@ check_distribution_cookie() ->
 %% anything able to influence what the seed name resolves to (a compromised or
 %% misconfigured DNS answer) gets an offline brute-force oracle against the
 %% cookie from a legitimately-configured node dialing out — a stronger position
-%% than an inbound attacker against a normal listener ever gets. 32 chars
-%% matches the `openssl rand -hex 32` this module's own guidance already
-%% recommends operators generate.
+%% than an inbound attacker against a normal listener ever gets. 32 is HALF
+%% the output length of the `openssl rand -hex 32` this module's own
+%% guidance already recommends operators generate (that command emits 64
+%% hex characters, i.e. 256 bits) — the floor is comfortably cleared by the
+%% recommended generator, not merely equal to it. This is a LENGTH check
+%% only, not an entropy check: a hand-typed 32-character string that isn't
+%% genuinely random also clears it. That residual is a deliberate,
+%% documented trade-off (ADR-2002 §7b) — going further (mandating a
+%% specific generation method, or verifying character-class distribution)
+%% was judged disproportionate here.
 -define(MIN_COOKIE_LENGTH, 32).
 
 %% @doc Pure cookie policy decision — exported for testing.

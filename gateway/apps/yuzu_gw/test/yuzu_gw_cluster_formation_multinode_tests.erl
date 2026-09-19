@@ -74,6 +74,7 @@ do_tick_survives_an_unreachable_target_test_() ->
         yuzu_gw_registry_multinode_tests:ensure_distributed(),
         Self = self(),
         HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        ensure_telemetry_started(),
         telemetry:attach(
             HandlerId,
             [yuzu, gw, cluster, connect_failed],
@@ -110,6 +111,7 @@ do_tick_excludes_self_from_peers_resolved_test_() ->
         yuzu_gw_registry_multinode_tests:ensure_distributed(),
         Self = self(),
         HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        ensure_telemetry_started(),
         telemetry:attach(
             HandlerId,
             [yuzu, gw, cluster, peers_resolved],
@@ -128,6 +130,42 @@ do_tick_excludes_self_from_peers_resolved_test_() ->
             ?assertEqual(#{count => 1}, Received)
         after
             telemetry:detach(HandlerId)
+        end
+    end}.
+
+%% Regression pin for the `peers_connected` SCOPING fix (PR review, MEDIUM):
+%% an unrelated distribution connection (a real peer this tick's target
+%% list does NOT include) must not inflate `peers_connected` — it is
+%% scoped to `ExternalTargets`, not a bare `length(nodes())`.
+do_tick_scopes_peers_connected_to_targets_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        {ok, UnrelatedPeer, _UnrelatedNode} = start_peer(),
+        {ok, TargetPeer, TargetNode} = start_peer(),
+        Self = self(),
+        HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        ensure_telemetry_started(),
+        telemetry:attach(
+            HandlerId,
+            [yuzu, gw, cluster, peers_connected],
+            fun(_Event, Measurements, _Meta, _Config) ->
+                Self ! {peers_connected, Measurements}
+            end,
+            #{}),
+        try
+            %% Both peers are connected (start_peer auto-connects), but only
+            %% TargetNode is in do_tick/1's own target list.
+            ok = yuzu_gw_cluster_discovery:do_tick([TargetNode]),
+            Received = receive
+                {peers_connected, Meas} -> Meas
+            after 2000 ->
+                {error, timeout}
+            end,
+            ?assertEqual(#{count => 1}, Received)
+        after
+            telemetry:detach(HandlerId),
+            stop_peer(UnrelatedPeer),
+            stop_peer(TargetPeer)
         end
     end}.
 
@@ -159,6 +197,7 @@ running_server_telemeters_nodeup_and_nodedown_test_() ->
         end,
         Self = self(),
         HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        ensure_telemetry_started(),
         telemetry:attach_many(
             HandlerId,
             [[yuzu, gw, cluster, node_up], [yuzu, gw, cluster, node_down]],
@@ -197,6 +236,20 @@ running_server_telemeters_nodeup_and_nodedown_test_() ->
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+%% BLOCKING fix (FortitudeEtc/Kimi+Codex PR review): `telemetry:attach/4`
+%% crashes with `{noproc, telemetry_handler_table}` if the `telemetry` OTP
+%% application hasn't been started yet — the standard `rebar3 eunit --dir
+%% apps/yuzu_gw/test` full-suite invocation does NOT guarantee that by the
+%% time this module's tests run (module execution order is not something
+%% any test file here should depend on). This module's own earlier
+%% "in isolation only" assumption for this exact crash (recorded in the
+%% governance ledger, deferred to #4599) was wrong — it reproduced on live
+%% CI on both platforms. Matches the in-tree precedent
+%% (`yuzu_gw_authz_tests.erl`'s `telemetry_counter_test_/0` setup).
+ensure_telemetry_started() ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    ok.
 
 await_telemetry(_Event, _PeerNode, TimeoutMs) when TimeoutMs =< 0 ->
     {error, timeout};

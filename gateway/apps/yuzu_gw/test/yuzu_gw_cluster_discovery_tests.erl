@@ -51,6 +51,41 @@ targets_from_addrs_uses_own_short_name_test() ->
         yuzu_gw_cluster_discovery:targets_from_addrs(["10.0.0.1", "10.0.0.2"])).
 
 %%%===================================================================
+%%% sanitize_addrs/1 — pure (BLOCKING PR review fix: atom-table exhaustion)
+%%%===================================================================
+
+sanitize_addrs_empty_test() ->
+    ?assertEqual([], yuzu_gw_cluster_discovery:sanitize_addrs([])).
+
+sanitize_addrs_rejects_malformed_ipv4_test() ->
+    ?assertEqual([],
+        yuzu_gw_cluster_discovery:sanitize_addrs(["not-an-address", "gateway", "999.999.999.999"])).
+
+sanitize_addrs_accepts_well_formed_ipv4_test() ->
+    ?assertEqual(["10.0.0.1", "10.0.0.2"],
+        yuzu_gw_cluster_discovery:sanitize_addrs(["10.0.0.2", "10.0.0.1"])).
+
+sanitize_addrs_dedupes_test() ->
+    ?assertEqual(["10.0.0.1"],
+        yuzu_gw_cluster_discovery:sanitize_addrs(["10.0.0.1", "10.0.0.1", "10.0.0.1"])).
+
+%% Regression pin for the BLOCKING atom-table-exhaustion fix (FortitudeEtc/
+%% Kimi+Codex PR review, empirically reproduced upstream: 10,000 distinct
+%% addresses -> +10,000 permanent atoms, no reclaim). A resolved/configured
+%% address list larger than the cap must be truncated, never passed through
+%% whole — this is the one property that actually prevents the VM-crash,
+%% so it gets its own explicit test rather than trusting the cap constant
+%% alone.
+sanitize_addrs_caps_at_max_target_addrs_test() ->
+    ManyAddrs = [lists:flatten(io_lib:format("10.0.~p.~p", [N div 256, N rem 256]))
+                 || N <- lists:seq(1, 200)],
+    Result = yuzu_gw_cluster_discovery:sanitize_addrs(ManyAddrs),
+    ?assertEqual(64, length(Result)),
+    %% Every element of the truncated result must still be one of the
+    %% original (valid, deduped) candidates -- truncation, not corruption.
+    ?assert(lists:all(fun(A) -> lists:member(A, ManyAddrs) end, Result)).
+
+%%%===================================================================
 %%% resolve_targets/0 — static-override path (deterministic; no network)
 %%%===================================================================
 
@@ -70,6 +105,49 @@ resolve_targets_static_override_test_() ->
                Expected = [list_to_atom(Short ++ "@10.1.2.3"),
                            list_to_atom(Short ++ "@10.1.2.4")],
                ?assertEqual(Expected, yuzu_gw_cluster_discovery:resolve_targets())
+           end}]
+     end}.
+
+%% A hand-edited sys.config written in ordinary Erlang string style
+%% (`["10.0.0.1"]`) is equally valid config syntax to the env-override
+%% path's binaries — LOW PR review finding, previously crashed this
+%% gen_server every tick on the string form.
+resolve_targets_accepts_mixed_binary_and_string_entries_test_() ->
+    {setup,
+     fun() ->
+         Prev = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+         application:set_env(yuzu_gw, cluster_seed_nodes,
+                              [<<"10.1.2.3">>, "10.1.2.4"]),
+         Prev
+     end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"accepts both binary and plain-string entries",
+           fun() ->
+               Short = yuzu_gw_cluster_discovery:own_short_name(),
+               Expected = [list_to_atom(Short ++ "@10.1.2.3"),
+                           list_to_atom(Short ++ "@10.1.2.4")],
+               ?assertEqual(Expected, yuzu_gw_cluster_discovery:resolve_targets())
+           end}]
+     end}.
+
+%% A garbage/typo'd static-override entry is filtered by sanitize_addrs/1
+%% rather than reaching list_to_atom unfiltered.
+resolve_targets_filters_malformed_static_entry_test_() ->
+    {setup,
+     fun() ->
+         Prev = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+         application:set_env(yuzu_gw, cluster_seed_nodes,
+                              [<<"10.1.2.3">>, <<"not-an-address">>]),
+         Prev
+     end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"drops the malformed entry, keeps the valid one",
+           fun() ->
+               Short = yuzu_gw_cluster_discovery:own_short_name(),
+               ?assertEqual([list_to_atom(Short ++ "@10.1.2.3")],
+                             yuzu_gw_cluster_discovery:resolve_targets())
            end}]
      end}.
 
