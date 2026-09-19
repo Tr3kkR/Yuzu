@@ -574,11 +574,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 18, not 17: power_health's set_power_plan is a Destructive row and the
-// mirror must include it, or a FUTURE Destructive row in that fragment
-// lands with the aggregate tripwire still passing -- which is exactly the
-// drift this test's own title forbids.
-    CHECK(destructive_count == 18);
+    // 19, not 17: power_health's set_power_plan and printing's clear_queue are
+// each a Destructive row and the mirror must include both, or a FUTURE
+// Destructive row in either fragment lands with the aggregate tripwire
+// still passing -- which is exactly the drift this test's own title
+// forbids.
+    CHECK(destructive_count == 19);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS
