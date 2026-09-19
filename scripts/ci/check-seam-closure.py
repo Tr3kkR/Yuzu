@@ -6,7 +6,7 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers four families — `network`, `verify`, `compliance`, `device` (see FAMILIES below).
+covers five families — `network`, `verify`, `compliance`, `device`, `dex` (see FAMILIES below).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -77,8 +77,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks four families — `network`, `verify`, `compliance` and
-`device` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks five families — `network`, `verify`, `compliance`,
+`device` and `dex` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -161,9 +161,97 @@ FORBIDDEN_HEADER_PATTERNS = [
     "*_api_local.hpp",
 ]
 
+# ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
+# A CORE `*_api.cpp` implementation is the store-backed side of the seam, so it
+# legitimately reaches stores (network/verify/compliance/device/dex `_api.cpp`
+# all include their family's stores). What it MUST NOT reach is the
+# PRESENTATION / transport layer: a route header (`*_routes.hpp`), a view-type
+# header (`*_view_types.hpp`), a renderer (`*_ui.hpp`), or `<httplib.h>`. The
+# core→presentation include inversion this rule prevents shipped once (dex_api.cpp
+# `#include "dex_routes.hpp"` for the window resolvers, which transitively pulled
+# httplib) and the store-only FORBIDDEN_HEADER_PATTERNS above could not catch it
+# — a route header is not a store header. `httplib.h` is EXTERNAL (resolves to
+# no in-tree path, so the closure walk never visits it as a Path); it is caught
+# by an include-SPELLING scan across the closure instead of the resolved-path
+# match the other patterns use.
+IMPL_FORBIDDEN_HEADER_PATTERNS = [
+    "*_routes.hpp",
+    "*_view_types.hpp",
+    "*_ui.hpp",
+]
+IMPL_TUS = [
+    "server/core/src/network_api.cpp",
+    "server/core/src/verify_api.cpp",
+    "server/core/src/compliance_api.cpp",
+    "server/core/src/device_api.cpp",
+    "server/core/src/dex_api.cpp",
+    # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
+    # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
+    # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
+    # dex_device_score → dex_read_builders.hpp). NOTE: this check is INCLUDE-purity
+    # (no presentation/httplib header in the TU's include closure), NOT link-purity
+    # — dex_read_model.cpp still CALLS symbols whose definitions live in the
+    # presentation dex_routes.cpp, a core→presentation LINK residual tracked in
+    # #4579 (only meaningful at the WS-B2 physical split; inert in today's monolith).
+    "server/core/src/dex_read_model.cpp",
+]
+# ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
+# The store-HEADER patterns above do NOT catch an abstract seam header that
+# NAMES a store type without INCLUDING its header — e.g. a forward-declared
+# `class GuaranteedStateStore;` plus a `build_dex_*(GuaranteedStateStore*,…)`
+# signature. dex_api.hpp shipped exactly that (10 GuaranteedStateStore mentions;
+# the four sibling abstract headers: 0), because dex_read_model.hpp bundled the
+# store-reaching builders with the pure model structs. This probe closes that
+# gap: for each family's ABSTRACT `*_api.hpp`, no file in its transitive include
+# closure may name a store type token in CODE (comments are stripped first).
+# A store-pointer-taking signature is caught for free — the type name appears.
+ABSTRACT_API_HEADERS = [
+    "server/core/src/network_api.hpp",
+    "server/core/src/verify_api.hpp",
+    "server/core/src/compliance_api.hpp",
+    "server/core/src/device_api.hpp",
+    "server/core/src/dex_api.hpp",
+]
+# Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
+# regex catches any of them used as a type. Store/infra type names that do NOT end
+# in "Store" are listed EXPLICITLY. Two kinds belong here:
+#   - store ROW/data types (defined in a `*_store.hpp`): `AppPerfDailyRow` (from
+#     app_perf_daily_store.hpp) — reachable from dex_api.hpp via the gap-#2
+#     serializer before PR #4582.
+#   - store/infra CLASS names the "Store" suffix misses: `AuthDB`, `AgentRegistry`,
+#     `ExecutionTracker`, `PgPool` — data/identity/registry/pool types that must
+#     never surface in an abstract seam header (some, e.g. auth_db.hpp /
+#     execution_tracker.hpp, are not even in FORBIDDEN_HEADER_PATTERNS, so this
+#     name probe is their only guard). Added per the #4582 Fable review; verified
+#     absent from all five abstract-header closures today (no false-fire).
+# This is a hand-maintained denylist (a new such type is a manual add) — the
+# `*_store.hpp` include check remains the backstop for any full-definition leak.
+# NOT listed: `AppPerfCohortRow`, a PURE comparison type in `app_perf_compare.hpp`
+# (the verify seam's own pure model) that legitimately appears in verify_api.hpp's
+# closure — it is NOT a store type, so listing it would be a false positive.
+STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
+EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AuthDB", "AgentRegistry",
+                           "ExecutionTracker", "PgPool"]
+
+# `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
+# `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
+# bus + `StreamBudget`) that includes `<httplib.h>` for `httplib::DataSink&`.
+# `network_api.cpp` and `device_api.cpp` reach it TRANSITIVELY through their own
+# stores (not through any presentation header) — a core→core dependency that
+# predates this seam and is NOT the presentation-inversion this rule targets.
+# Exempting it by name keeps the transitive-httplib ban meaningful for any NEW
+# path while not forcing an out-of-scope network/device refactor; the broader
+# "should a core *_api.cpp transitively touch httplib via a core SSE primitive"
+# question is a WS-B2 physical-split concern (core owns no httplib once extracted),
+# out of scope for this seam and tracked as #4579, not this round.
+# `dex_api.cpp` reaches NEITHER event_bus.hpp NOR httplib — its fix is fully clean.
+IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
+
 # ── Family definitions ────────────────────────────────────────────────────
-# Three families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
-# #4250, the SECOND family) and `compliance` (the THIRD). Each set covers the
+# Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
+# (the FOURTH, #4484) and `dex` (the FIFTH — the DEX signals seam). Each set
+# covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -221,6 +309,36 @@ FAMILIES = {
             "server/core/src/compliance_model.cpp",
             "server/core/src/compliance_api.hpp",
             "server/core/src/compliance_api_local.hpp",
+        ],
+    },
+    # `dex` (ADR-0031 WS-A4, the FIFTH family through the seam) — the DEX
+    # signals / experience-score surface (GuaranteedStateStore-backed
+    # `/api/v1/dex/*` reads). The enforced set is the four PURE seam headers:
+    # `dex_types.hpp` (the relocated DEX leaf PODs), `dex_read_model.hpp` (the
+    # pure model structs + model-only JSON serializers), and the abstract/local
+    # api pair. Their closures must contain NO store header AND name no store
+    # TYPE (the abstract-header probe below enforces the latter). `dex_types.hpp`
+    # was relocated out of the CATASTROPHIC `guaranteed_state_store.hpp` in slice
+    # 1a; the store-reaching `build_dex_*_model(GuaranteedStateStore*,…)` builders
+    # (and `dex_device_app_perf_json`, which names `AppPerfDailyRow`) were then
+    # split out of `dex_read_model.hpp` into the core-only `dex_read_builders.hpp`
+    # (PR #4582, FortitudeEtc review) — before that split `dex_api.hpp`
+    # transitively NAMED `GuaranteedStateStore` and was not store-type-free like
+    # its siblings. The IMPL TUs `dex_read_model.cpp`, `dex_api.cpp` and
+    # `dex_read_builders.hpp`'s other includers are OUTSIDE this set: they
+    # legitimately reach the store (core side of the seam), like every other
+    # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
+    # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
+    # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
+    # other families' twin-registration files. REST and MCP both route through
+    # `DexApi`; the dashboard fragments and the /fragments/device/dex lens are
+    # deferred (follow-up).
+    "dex": {
+        "tus": [
+            "server/core/src/dex_types.hpp",
+            "server/core/src/dex_read_model.hpp",
+            "server/core/src/dex_api.hpp",
+            "server/core/src/dex_api_local.hpp",
         ],
     },
 }
@@ -390,6 +508,124 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     return ok
 
 
+def _includes_httplib(path: Path) -> bool:
+    """True if `path` has a `#include` of httplib.h (angle or quote). Used to
+    detect the EXTERNAL header the closure walk never visits as a resolved
+    Path (see check_impl_purity)."""
+    for _is_angle, name in parse_includes(path):
+        if Path(name).name == "httplib.h":
+            return True
+    return False
+
+
+def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
+    """Every family's `*_api.cpp` impl TU must NOT reach a presentation /
+    transport header — `*_routes.hpp`, `*_view_types.hpp`, `*_ui.hpp`, or
+    `<httplib.h>` — anywhere in its transitive include closure. The impl is the
+    store-backed side of the seam (it legitimately reaches stores), so this is a
+    DIFFERENT forbidden set from the family rule; a route/view/ui header is not a
+    store header, which is exactly why the store-only patterns missed the
+    dex_api.cpp -> dex_routes.hpp -> httplib inversion. A missing declared TU is
+    a HARD ERROR (same posture as check_family)."""
+    ok = True
+    for rel in tus:
+        tu = (roots.root / rel).resolve()
+        if not tu.is_file():
+            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
+            ok = False
+            continue
+        visited, parent, _unresolved = closure(tu, roots)
+        # (a) presentation in-tree headers via resolved-path basename match.
+        for f in sorted(visited, key=str):
+            hit, pat = is_forbidden_header(f, roots.root, patterns=IMPL_FORBIDDEN_HEADER_PATTERNS)
+            if not hit:
+                continue
+            chain = chain_to(f, parent, tu)
+            chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
+            gh("error",
+               f"check-seam-closure: impl-purity: {rel} reaches presentation header "
+               f"{f.relative_to(roots.root)} (matches {pat!r}) via include chain: {chain_str}")
+            ok = False
+        # (b) <httplib.h> via include-SPELLING scan (external -> never a visited Path),
+        #     minus the IMPL_HTTPLIB_ALLOWED pre-existing core-SSE coupling.
+        for f in sorted({tu} | visited, key=str):
+            if str(f.relative_to(roots.root)).replace("\\", "/") in IMPL_HTTPLIB_ALLOWED:
+                continue
+            if _includes_httplib(f):
+                gh("error",
+                   f"check-seam-closure: impl-purity: {rel} reaches <httplib.h> via "
+                   f"{f.relative_to(roots.root)} — a core *_api.cpp must not depend on "
+                   f"the httplib transport layer")
+                ok = False
+    return ok
+
+
+def _strip_comments(text: str) -> str:
+    """Blank ordinary string/char literal CONTENTS first, then remove /* */
+    block comments and // line comments (covers /// doc comments too). Not a
+    full C++ lexer. Blanking literals before comment-stripping is load-bearing:
+    a `//` or `/*` INSIDE a string literal (e.g. `const char* u = "http://h";`)
+    would otherwise be treated as a comment and over-strip a real store-type
+    token that follows the literal on the same line — the exact bypass this
+    probe exists to prevent (#4582 review). After the literal-blank the pass is
+    sound in the direction that matters: it can under-strip (a leftover token
+    just produces an author-resolved false positive), and can no longer
+    over-strip via an ordinary literal. RESIDUAL: raw string literals
+    (`R"(...)"`) are not lexed, so a `//` inside one could still over-strip;
+    accepted because no abstract `*_api.hpp` closure contains a raw string (a
+    selftest case pins the ordinary-literal fix)."""
+    text = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', text)  # blank string literals
+    text = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", text)  # blank char literals
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
+def names_store_type(path: Path):
+    """Returns the first store-type token this file NAMES in code (comments
+    stripped), or None. Catches both `*Store` class names (regex) and the
+    non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
+    code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+    m = STORE_TYPE_TOKEN_RE.search(code)
+    if m:
+        return m.group(0)
+    for tok in EXTRA_STORE_TYPE_TOKENS:
+        if re.search(r"\b" + re.escape(tok) + r"\b", code):
+            return tok
+    return None
+
+
+def check_abstract_headers_store_type_free(headers: list[str],
+                                           roots: Roots = DEFAULT_ROOTS) -> bool:
+    """Each family's ABSTRACT `*_api.hpp` — and every header in its transitive
+    include closure — must NAME no store type in code (see the probe's block
+    comment above). A missing declared header is a HARD ERROR."""
+    ok = True
+    for rel in headers:
+        tu = (roots.root / rel).resolve()
+        if not tu.is_file():
+            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel}")
+            ok = False
+            continue
+        visited, parent, _unresolved = closure(tu, roots)
+        for f in sorted({tu} | visited, key=str):
+            tok = names_store_type(f)
+            if tok is None:
+                continue
+            if f == tu:
+                chain_str = str(f.relative_to(roots.root))
+            else:
+                chain = chain_to(f, parent, tu)
+                chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
+            gh("error",
+               f"check-seam-closure: abstract-header {rel} reaches a header that NAMES store "
+               f"type {tok!r}: {f.relative_to(roots.root)} — an abstract seam header's closure "
+               f"must be store-type-free (forward-decl / store-pointer signature included) via: "
+               f"{chain_str}")
+            ok = False
+    return ok
+
+
 def run_check() -> int:
     ok = True
     checked = 0
@@ -397,10 +633,20 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
+    impl_ok = check_impl_purity(IMPL_TUS)
+    if not impl_ok:
+        ok = False
+    abstract_ok = check_abstract_headers_store_type_free(ABSTRACT_API_HEADERS)
+    if not abstract_ok:
+        ok = False
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
-              f"{'y' if checked == 1 else 'ies'} checked, all closures free "
-              f"of store-layer and core-only `*_api_local.hpp` headers)")
+              f"{'y' if checked == 1 else 'ies'} header-closure checked + "
+              f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
+              f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
+              f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "
+              f"impls free of presentation/httplib headers, and abstract headers name no "
+              f"store type)")
     return 0 if ok else 1
 
 

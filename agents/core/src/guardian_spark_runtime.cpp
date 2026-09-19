@@ -1694,11 +1694,8 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 }
 
 GuardianSparkRuntime::ReceiptStatus
-GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
-    if (!receipt.claim)
-        return ReceiptStatus::Failed; // nothing to observe
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    switch (receipt.claim->end) {
+GuardianSparkRuntime::classify_claim_end(ClaimEnd end) noexcept {
+    switch (end) {
     case ClaimEnd::None:
         return ReceiptStatus::Pending;
     case ClaimEnd::Committed:
@@ -1730,8 +1727,37 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
     return ReceiptStatus::Failed;
 }
 
+GuardianSparkRuntime::ReceiptStatus
+GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return ReceiptStatus::Failed; // nothing to observe
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return classify_claim_end(receipt.claim->end);
+}
+
 bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
+}
+
+bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
+    const std::shared_ptr<KeyClaim>& claim) const noexcept {
+    if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
+        return false;
+    const auto eit = claims_.find(claim->key);
+    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+}
+
+GuardianSparkRuntime::WedgeAwareStatus
+GuardianSparkRuntime::receipt_status_wedge_aware(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return WedgeAwareStatus{}; // Failed, wedge_eligible=false - nothing to observe
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    WedgeAwareStatus out;
+    out.status = classify_claim_end(claim->end);
+    if (out.status == ReceiptStatus::Wedged)
+        out.wedge_eligible = is_wedge_k_eligible_locked(claim);
+    return out;
 }
 
 bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
@@ -1740,6 +1766,31 @@ bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto rit = rules_.find(receipt.claim->rule_id);
     return rit != rules_.end() && rit->second->generation == receipt.claim->generation;
+}
+
+bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return false;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return is_wedge_k_eligible_locked(receipt.claim);
+}
+
+GuardianSparkRuntime::RecoveryStatus
+GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return RecoveryStatus::Blocking;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    // Identical logic to receipt_recovered() + receipt_wedge_k_eligible(), inlined
+    // under this ONE lock acquisition rather than calling either standalone accessor
+    // - see this function's own doc comment for why the two-call sequence is unsafe
+    // for a caller that needs both answers about the same instant.
+    const auto rit = rules_.find(claim->rule_id);
+    if (rit != rules_.end() && rit->second->generation == claim->generation)
+        return RecoveryStatus::Recovered;
+    if (is_wedge_k_eligible_locked(claim))
+        return RecoveryStatus::WedgeEligible;
+    return RecoveryStatus::Blocking;
 }
 
 std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
@@ -3227,6 +3278,32 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                                      (now - scratch.last_unhealthy_emit) >=
                                          std::chrono::milliseconds(cfg_.errored_refresh_ms);
 
+            // M1 item (b), decided on the READ outcome (this pass observed Unknown),
+            // independent of the WIRE-side accept/reject check below (#2992). A
+            // rejected enqueue still consumed a read - a rule whose first edge is
+            // perpetually rejected at the outbox cap must still eventually leave the
+            // 5s priority lane, not retry the identical read forever - and the
+            // elapsed-time arm is a clock, not a sweep count, so it is checked on
+            // EVERY Unknown pass regardless of reason. Only the sweep COUNTER stays
+            // Convergence-only: an Event-reason eval (an OS-level change notification,
+            // not a poll) must not fast-demote a rule that is merely noisy.
+            if (out.status == EvalStatus::Unhealthy) {
+                const auto pit = pk->pending_initial.find(rg->assertion.rule_id);
+                if (pit != pk->pending_initial.end() && !pit->second.demoted) {
+                    if (reason == EvalReason::Convergence)
+                        ++pit->second.unknown_sweeps;
+                    const bool sweep_due = cfg_.pending_demote_sweeps > 0 &&
+                                          pit->second.unknown_sweeps >= cfg_.pending_demote_sweeps;
+                    const bool time_due = cfg_.pending_demote_ms > 0 &&
+                                          (now - pit->second.first_seen) >=
+                                              std::chrono::milliseconds(cfg_.pending_demote_ms);
+                    if (sweep_due || time_due) {
+                        pit->second.demoted = true;
+                        priority_demoted_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
             std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id, refresh_due);
             const bool had_entries = !entries.empty(); // captured BEFORE the move below
             bool accepted = true;
@@ -3235,7 +3312,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
             if (!accepted)
-                continue; // outbox full: eval stays pending (nothing committed), convergence retries
+                continue; // outbox full: RuleEvalState scratch stays uncommitted (nothing
+                          // written to rg->eval/last_unhealthy_emit), so eval retries the
+                          // identical read next pass. The M1 demotion bookkeeping above
+                          // already ran on this same read, unaffected by the rejection (#2992).
             if (had_entries)
                 enqueued_any = true;
 
@@ -3258,27 +3338,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                     unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
             }
             // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
-            // Unknown does not (it still owes a real verdict).
+            // Unknown does not (it still owes a real verdict). The demotion bookkeeping
+            // for the Unknown case already ran above, on the read outcome.
             if (out.status != EvalStatus::Unhealthy) {
                 pk->pending_initial.erase(rg->assertion.rule_id);
-            } else if (reason == EvalReason::Convergence) {
-                // M1 item (b): only a COMMITTED Convergence-reason Unknown advances the
-                // demotion clock - an Event-reason eval (an OS-level change notification,
-                // not a poll) must not fast-demote a rule that is merely noisy, and a
-                // rejected-enqueue pass (continue above) never reaches here at all.
-                const auto pit = pk->pending_initial.find(rg->assertion.rule_id);
-                if (pit != pk->pending_initial.end() && !pit->second.demoted) {
-                    ++pit->second.unknown_sweeps;
-                    const bool sweep_due = cfg_.pending_demote_sweeps > 0 &&
-                                          pit->second.unknown_sweeps >= cfg_.pending_demote_sweeps;
-                    const bool time_due = cfg_.pending_demote_ms > 0 &&
-                                          (now - pit->second.first_seen) >=
-                                              std::chrono::milliseconds(cfg_.pending_demote_ms);
-                    if (sweep_due || time_due) {
-                        pit->second.demoted = true;
-                        priority_demoted_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
             }
         }
         if (enqueued_any)

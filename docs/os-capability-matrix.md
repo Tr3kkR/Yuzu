@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(55).
+(57).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -91,7 +91,7 @@ duplicates.
 | **Certificate delete — verified / SIP-aware** (`certificates.delete`) | ✅ | ✅ | ✅ | Win: CryptoAPI store delete; Linux: `unlinkat` of the matching PEM entry on a held `/etc/ssl/certs` dirfd after a pre-unlink identity recheck (#3245). macOS: `security delete-certificate` on `System.keychain` then a re-enumeration that reports `deleted` only on a positively-proven absence (`classify_delete_verdict` in `agents/shared/macos_console_user.hpp`); `store=root` rejected (SystemRootCertificates.keychain is SIP-sealed) in `certificates_plugin.cpp` |
 | **━━ Network quality (`/network`) ━━** | | | | Measurement-first device/local-link health lens. `net_quality_sampler.cpp`; `docs/user-manual/network.md` "Platform coverage" |
 | **Network quality** (throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | 🟡 throughput only | Win `GetIfTable2` throughput + `GetTcpStatisticsEx` system-wide interval retransmit (**measurement-first, not loss-validated** — withheld from the fleet retransmit aggregate); RTT needs ESTATS (admin+overhead) → 🔜. Linux has all three. macOS `NET_RT_IFLIST2` throughput only (`read_net_counters()` sums non-loopback `if_data64` rx/tx, differenced per heartbeat); retransmit + RTT deferred — global `net.inet.tcp.stats` reads all-zero on modern macOS → 🔜 |
-| **━━ Agent plugins (55) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 41 fully cross-platform, 6 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`, `execution_artifacts`), 6 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented; `power_health` — Windows the only full leg; `wifi` — Windows full, Linux/macOS constrained; `filesystem_posture` — Linux constrained, Windows/macOS full), 2 macOS-constrained (`interaction` — GUI-less daemon; `app_usage` — macOS `usage` fold inherits TAR's process source's names-only constraint, ES entitlement absent -> poll granularity). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted). (Re-tallied 2026-09-17: the prior "3 uneven" count omitted power_health/wifi/filesystem_posture, which are not ✅✅✅ either — pre-existing drift, corrected here.) |
+| **━━ Agent plugins (57) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 42 fully cross-platform, 6 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`, `execution_artifacts`), 7 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented; `power_health` — Windows the only full leg; `wifi` — Windows full, Linux/macOS constrained; `filesystem_posture` — Linux constrained, Windows/macOS full; `peripherals` — macOS+Linux full, Windows leg planned/follow-up PR), 2 macOS-constrained (`interaction` — GUI-less daemon; `app_usage` — macOS `usage` fold inherits TAR's process source's names-only constraint, ES entitlement absent -> poll granularity). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted). (Re-tallied 2026-09-17: the prior "3 uneven" count omitted power_health/wifi/filesystem_posture, which are not ✅✅✅ either — pre-existing drift, corrected here.) |
 | agent_actions | ✅ | ✅ | ✅ | portable — no platform macros |
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
@@ -126,7 +126,9 @@ duplicates.
 | network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
+| peripherals | ⛔ | ✅ | ✅ | USB/PCI/Thunderbolt bus inventory. macOS + Linux full (IOKit / sysfs, both rung 1). Windows leg is `planned` — lands in a focused follow-up PR on top of this one, matching this plugin's own historical Wave-1-placeholder convention |
 | power_health | ✅ | 🟡 | 🟡 | Windows is the only full leg: battery via GetSystemPowerStatus + CallNtPowerInformation, thermal via PDH `\Thermal Zone Information(*)`, and power_plan/set_power_plan via PowrProf. macOS has battery (IOPS) and a thermal *pressure enum* (NSProcessInfo), never a temperature; power schemes are unsupported (no named schemes; IOPMSetPMPreferences is SPI, deliberately not adopted). Linux has battery and thermal via `/sys`; power schemes are planned (platform_profile) |
+| printing | ✅ | ✅ | ✅ | `printers`/`jobs` are read-only IPP over the CUPS Unix socket (cpp-httplib, no libcups) on macOS/Linux, winspool on Windows. A focused follow-up PR adds `clear_queue`, the plugin's only mutating action. See `agents/plugins/printing/README.md` |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
@@ -522,6 +524,15 @@ implementation is.
 | os_info | uptime | linux | supported | 1 | /proc/uptime | - |
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
+| peripherals | usb | linux | supported | 1 | /sys/bus/usb/devices sysfs attribute reads | - |
+| peripherals | usb | macos | supported | 1 | IOKit IOServiceMatching(IOUSBHostDevice) | - |
+| peripherals | usb | windows | planned | 1 | SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS | Windows leg lands in a focused follow-up PR on top of this one |
+| peripherals | pci | linux | supported | 1 | /sys/bus/pci/devices sysfs attribute reads | - |
+| peripherals | pci | macos | supported | 1 | IOKit IOServiceMatching(IOPCIDevice) | - |
+| peripherals | pci | windows | planned | 1 | SetupAPI (PCI enumerator) | Windows leg lands in a focused follow-up PR on top of this one |
+| peripherals | thunderbolt | linux | constrained | 1 | /sys/bus/thunderbolt/devices sysfs reads | walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run |
+| peripherals | thunderbolt | macos | supported | 1 | IOKit IOServiceMatching(IOThunderboltSwitch) | - |
+| peripherals | thunderbolt | windows | planned | 1 | SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | Windows leg lands in a focused follow-up PR on top of this one |
 | power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
 | power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
 | power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging |
@@ -534,6 +545,12 @@ implementation is.
 | power_health | set_power_plan | linux | planned | 1 | platform_profile | declared only; not implemented in this package |
 | power_health | set_power_plan | macos | unsupported | - | - | macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted |
 | power_health | set_power_plan | windows | supported | 1 | PowrProf PowerSetActiveScheme | - |
+| printing | printers | linux | supported | 1 | IPP CUPS-Get-Printers over the CUPS Unix socket (cpp-httplib) | localhost:631 fallback for reads when no socket is found |
+| printing | printers | macos | supported | 1 | IPP CUPS-Get-Printers over the CUPS Unix socket (cpp-httplib) | localhost:631 fallback for reads when no socket is found |
+| printing | printers | windows | supported | 1 | winspool EnumPrintersW level 2 | - |
+| printing | jobs | linux | supported | 1 | IPP Get-Jobs (which-jobs=not-completed) over the CUPS Unix socket | localhost:631 fallback for reads when no socket is found |
+| printing | jobs | macos | supported | 1 | IPP Get-Jobs (which-jobs=not-completed) over the CUPS Unix socket | localhost:631 fallback for reads when no socket is found |
+| printing | jobs | windows | supported | 1 | winspool EnumJobsW level 2 | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
