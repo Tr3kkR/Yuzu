@@ -3563,6 +3563,13 @@ private:
     // it through the current Subscribe stream. Shared by the GuardianEngine drift
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
+    // Returns Write()'s outcome so a caller can log it (#4606 criterion-10 T_wire) —
+    // deliberately instrumented ONLY at the drift-sink call site (set_event_sink's
+    // lambda), never here and never at the DEX observer's call site: DEX signal
+    // telemetry is a different kind of traffic than the Guardian-violation latency
+    // this benchmark measures, and instrumenting it here would flood the log at DEX
+    // observation volume. A new caller of this method should make the same choice
+    // deliberately rather than copy whichever pattern it happens to see first.
     bool emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
@@ -3605,10 +3612,15 @@ private:
         resp.set_action("event");
         resp.set_status(pb::CommandResponse::SUCCESS);
         resp.set_payload(guardian_outbox_entry_to_event(e, kHostPlatform).SerializeAsString());
-        std::lock_guard lock(stream_write_mu_);
-        if (!guardian_sink_stream_)
-            return SendResult::Retain; // link down between reconnects; keep + retry (A3)
-        const bool ok = guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+        bool ok;
+        {
+            std::lock_guard lock(stream_write_mu_);
+            if (!guardian_sink_stream_)
+                return SendResult::Retain; // link down between reconnects; keep + retry (A3)
+            ok = guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+        } // stream_write_mu_ released before any I/O below — a slow/blocked log write must never
+          // stall every other sender on this stream (heartbeats, command responses, the legacy
+          // Guardian drift-sink), matching evaluate_key's own unlock-before-I/O discipline.
         // #4606 criterion-10 T_wire: local Write() outcome only, NOT server receipt/commit (see
         // T_server, guardian_ingest.cpp). Best-effort, always-on info level (the shipped default
         // is what the benchmark must measure) — a log throw must never flip a real Sent into

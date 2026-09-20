@@ -21,6 +21,7 @@
 #include "guaranteed_state.pb.h"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -215,10 +216,9 @@ TEST_CASE("guardian ingest: event-store histogram splits by outcome status, skip
 TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on a non-observation "
           "Inserted event without disrupting ingest, and is skipped for observations",
           "[pg][guardian][ingest][diagnostics]") {
-    // No established, reliable spdlog-capture mechanism exists in this test file (see file
-    // banner) — this pins the block's REACHABILITY and its gate, not the log line's text.
-    // Proven indirectly: ingest still completes normally (no crash/throw escaping the
-    // try/catch onto the caller) and the store reflects every write.
+    // guardian_ingest.cpp is compiled directly into the server test binary (not a separate
+    // shared library), so LogCapture's cross-image caveat (test_log_capture.hpp's banner)
+    // does not apply here — it reliably observes this file's spdlog calls.
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -226,21 +226,32 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     // Ordinary rule violation, well-formed wire timestamp: rule_id != kObservationRuleId,
     // so the T_server block's try-block actually runs on this Inserted outcome (computes
     // recv_ns/committed_ns/store_ms and a valid agent_ns from ev.timestamp()).
+    yuzu::test::LogCapture cap1;
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
+    cap1.stop();
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
+    CHECK(cap1.text().find("Guardian T_server event_id=evt-r1") != std::string::npos);
+    CHECK(cap1.text().find("agent_ns=1718000000000000000") != std::string::npos);
 
     // Same, but with an out-of-range wire nanos field (untrusted agent input) — exercises
     // the bounds check that falls back to the agent_ns=-1 sentinel instead of computing a
     // value; must not crash/throw either.
+    yuzu::test::LogCapture cap2;
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-r2", "rule-1", 1718000000, -1),
                              nullptr, nullptr);
+    cap2.stop();
     CHECK(store.event_count() == 2);
+    CHECK(cap2.text().find("Guardian T_server event_id=evt-r2") != std::string::npos);
+    CHECK(cap2.text().find("agent_ns=-1") != std::string::npos);
 
     // A ruleless observation takes the OTHER arm of the gate (rule_id == kObservationRuleId
-    // -> block skipped entirely). Asserted here too so both arms of the gate are directly
-    // exercised in this file, alongside the DEX-observer coverage above.
+    // -> block skipped entirely) — no T_server line at all, proving the gate actually
+    // discriminates rather than always/never firing.
+    yuzu::test::LogCapture cap3;
     ingest_guardian_response(store, "agent-A", make_observation("__observation__-t-server", "svc.exe"),
                              nullptr, nullptr);
+    cap3.stop();
     CHECK(store.event_count() == 3);
+    CHECK(cap3.text().find("Guardian T_server") == std::string::npos);
 }
