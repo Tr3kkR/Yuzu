@@ -360,7 +360,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two; the degrade branch below matches this
+            // same route's own agents_opt degrade handling just underneath.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded, retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #1634 (Doomgoose review finding, important): fail closed on a
             // transient tracker degrade rather than silently treat it as
             // "zero agents" — see get_agent_statuses_checked's doc comment.
@@ -909,7 +927,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  auto exec_id = req.matches[1].str();
-                 auto exec_opt = execution_tracker->get_execution(exec_id);
+                 // Governance fix (#2146 A2-R1 Gate 8 re-review): was the
+                 // plain get_execution(), which collapses "row genuinely
+                 // absent" and "read degraded" (pool/query failure) to the
+                 // same nullopt -- a transient degrade here fell through to
+                 // the not-found + denial-audit branch below, producing a
+                 // FALSE 404 for a legitimate owner and a permanently wrong
+                 // CC7.2 audit trail for a non-owner. get_execution_checked's
+                 // outer std::expected distinguishes the two; the degrade
+                 // branch below matches this same route's own agents_opt
+                 // degrade handling a few lines down.
+                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                 if (!exec_r) {
+                     res.status = 503;
+                     res.set_content("live updates unavailable, tracker degraded, retry "
+                                    "shortly",
+                                    "text/plain; charset=utf-8");
+                     return;
+                 }
+                 const auto& exec_opt = *exec_r;
                  // #1634 perf (governance Gate 3 finding): only fetch/scan agent
                  // statuses when confined — an unrestricted subscriber is always
                  // visible regardless, so this indexed lookup would be pure
@@ -2297,12 +2333,40 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
+                // #2146 A2-R1 (gov docs-writer/cpp-expert fix round): definition_id/
+                // enabled_only query params. The legacy GET /api/schedules route
+                // treats ANY presence of enabled_only as true, regardless of value
+                // -- this v1 twin does NOT reproduce that quirk. It follows the
+                // #4034 precedent already set on this same REST v1 surface
+                // (compliance_routes.cpp's PolicyQuery enabled_only fix) and
+                // matches the MCP twin list_schedules, which already honors the
+                // boolean value: presence alone must not decide it, or
+                // enabled_only=false would silently behave like enabled_only=true
+                // (the caller asked to see disabled/all schedules and got the
+                // opposite). An unrecognized value 400s.
+                ScheduleQuery q;
+                if (req.has_param("definition_id"))
+                    q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only")) {
+                    auto v = req.get_param_value("enabled_only");
+                    if (v == "true" || v == "1") {
+                        q.enabled_only = true;
+                    } else if (v == "false" || v == "0") {
+                        q.enabled_only = false;
+                    } else {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                            "application/json");
+                        return;
+                    }
+                }
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked();
+                auto scheds_result = schedule_engine->query_schedules_checked(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,
