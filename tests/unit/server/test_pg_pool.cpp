@@ -175,12 +175,19 @@ TEST_CASE("PgPool::Options::saturated_fast_fail default stays at-or-above every 
     constexpr auto kNotificationCreateAcquireTimeout = 500ms;  // notification_store.cpp
     constexpr auto kGatewayRouteWriteTimeout = 500ms;          // gateway_route_store.cpp
     constexpr auto kContainmentReadSlotWait = 500ms;           // server.cpp
+    // kIngestAcquireTimeout is independently redefined at exactly 500ms in
+    // 6 stores (app_usage_store.cpp, software_licensing_store.cpp,
+    // software_inventory_store.cpp, inventory_store.cpp,
+    // app_perf_daily_store.cpp, device_inventory_store.cpp); one file cited
+    // here as the representative mirror since all 6 share the same value.
+    constexpr auto kIngestAcquireTimeout = 500ms;              // app_usage_store.cpp (one of 6)
 
     const auto fast_fail = PgPool::Options{}.saturated_fast_fail;
     CHECK(fast_fail >= kAuthDbAcquireRetryTimeout);
     CHECK(fast_fail >= kNotificationCreateAcquireTimeout);
     CHECK(fast_fail >= kGatewayRouteWriteTimeout);
     CHECK(fast_fail >= kContainmentReadSlotWait);
+    CHECK(fast_fail >= kIngestAcquireTimeout);
 }
 
 TEST_CASE("PgPool size 0 clamps to 1", "[pg][pool]") {
