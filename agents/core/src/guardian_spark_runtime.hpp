@@ -908,10 +908,13 @@ public:
     /// overwrite a newer one), so only assert on it after a call you know reached emission
     /// and that nothing else is evaluating. Test-only.
     [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
-    /// Test seam (#4606): make the timing staging in evaluate_key() fail as if an allocation
-    /// threw, to prove the bookkeeping is best-effort and can never drop the real enqueue.
-    void fail_timing_stage_for_test(bool on) noexcept {
-        fail_timing_stage_for_test_.store(on, std::memory_order_relaxed);
+    /// Test seam (#4606): make the timing staging in evaluate_key() throw as if an allocation
+    /// failed when it is about to stage the record at index `k` OF THE PASS (0 = the first
+    /// record, 1 = the second, ...; -1 = off, the default). Proves the bookkeeping is
+    /// best-effort: the real enqueue still happens, and only the failing rule's timing is
+    /// dropped (records staged for earlier rules in the same pass survive).
+    void fail_timing_stage_at_for_test(int k) noexcept {
+        fail_timing_stage_at_for_test_.store(k, std::memory_order_relaxed);
     }
     [[nodiscard]] bool stopping() const;
 
@@ -2220,7 +2223,7 @@ private:
     /// so writing this cross-key member under only the calling pass's eval_mu would race.
     mutable std::mutex last_eval_timings_mu_;
     std::vector<EvalTimingRecord> last_eval_timings_;
-    std::atomic<bool> fail_timing_stage_for_test_{false}; ///< test seam, see fail_timing_stage_for_test()
+    std::atomic<int> fail_timing_stage_at_for_test_{-1}; ///< test seam, see fail_timing_stage_at_for_test()
 };
 
 /// R5.7 (docs/spark-stage2-guardian-consumer-design.md): human-readable rendering

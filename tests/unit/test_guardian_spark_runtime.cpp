@@ -2229,7 +2229,7 @@ TEST_CASE("#4606 criterion-10: a failure while staging timing records never drop
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
 
-    rt->fail_timing_stage_for_test(true);
+    rt->fail_timing_stage_at_for_test(0); // fail on the very first record
     r->file = read_unknown<FileSnapshot>("io"); // errored -> one health entry
     REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
     CHECK(drain_all(*rt).size() == 1);                // the event was still enqueued
@@ -2237,11 +2237,54 @@ TEST_CASE("#4606 criterion-10: a failure while staging timing records never drop
 
     // With the seam off the same pass shape stages its timing again, so the empty result above
     // was the seam, not a broken accessor.
-    rt->fail_timing_stage_for_test(false);
+    rt->fail_timing_stage_at_for_test(-1);
     r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
     rt->evaluate_key(key, EvalReason::Event);
     CHECK(drain_all(*rt).size() == 2);
     CHECK(rt->last_eval_timings_for_test().size() == 2);
+}
+
+TEST_CASE("#4606 criterion-10: a failure part-way through a rule's batch drops that whole batch's "
+          "timing but never an event",
+          "[spark][runtime]") {
+    // One rule, two entries in one pass (recovery + drift). Failing on the SECOND record means the
+    // first was already staged when the handler runs, so this is the case where the handler's
+    // tail erase has something to erase: leaving the half-staged record would report a batch whose
+    // second entry has no timing.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io"); // errored
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    rt->fail_timing_stage_at_for_test(1);
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted -> 2 entries
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Event));
+    CHECK(drain_all(*rt).size() == 2);                // both events enqueued
+    CHECK(rt->last_eval_timings_for_test().empty());  // the half-staged record was erased too
+}
+
+TEST_CASE("#4606 criterion-10: a staging failure for one rule keeps an earlier rule's timing in the "
+          "same pass",
+          "[spark][runtime]") {
+    // Two rules on one key each emit one entry in one pass. Failing on the second record drops only
+    // the second rule's timing: the first rule's already-staged record survives and both events are
+    // still enqueued.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+
+    rt->fail_timing_stage_at_for_test(1);
+    r->file = read_unknown<FileSnapshot>("io"); // both rules edge -> two health entries
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 2);                  // both events enqueued
+    CHECK(rt->last_eval_timings_for_test().size() == 1); // only the second rule's timing was dropped
 }
 
 TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trigger sentinel "

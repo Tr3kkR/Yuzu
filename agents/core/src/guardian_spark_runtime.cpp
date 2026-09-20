@@ -3239,9 +3239,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             // enqueue_all below.
             const std::size_t staged_begin = staged.size();
             try {
-                if (fail_timing_stage_for_test_.load(std::memory_order_relaxed))
-                    throw std::bad_alloc{};
+                const int fail_at = fail_timing_stage_at_for_test_.load(std::memory_order_relaxed);
                 for (const OutboxEntry& e : entries) {
+                    if (fail_at >= 0 && staged.size() == static_cast<std::size_t>(fail_at))
+                        throw std::bad_alloc{}; // test seam: as if the copy below failed
                     EvalTimingRecord r;
                     r.event_id = e.event_id; // the only allocating copy: a throw here must not
                                              // prevent the enqueue below
@@ -3254,8 +3255,9 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                     staged.push_back(std::move(r));
                 }
             } catch (...) {
-                // Best-effort: drop this rule's timing, never its event. erase() of a tail range
-                // does not allocate, so this handler cannot itself throw.
+                // Best-effort: drop THIS rule's timing (including any of its entries already staged
+                // before the failure), never its event, and keep earlier rules' records. erase() of a
+                // tail range does not allocate, so this handler cannot itself throw.
                 staged.erase(staged.begin() + static_cast<std::ptrdiff_t>(staged_begin),
                              staged.end());
             }
