@@ -44,3 +44,15 @@ proven-wedge-only condition and the co-leaked state (satisfied in `eb5c05b35`). 
 authoring session, so independence is asserted, not verified. Why it is acceptable: the alternative is
 `~mech` -> `stop()` -> unbounded sweeper join on a sweeper wedged holding `mu_`, which hangs the whole test
 binary; the leak is failure-only, test-only, and harmless because every reachable object is co-leaked.
+
+## Addendum (ledger review): callback contexts stored in the test code
+
+Found by the compliance-officer ledger review; each is a stored callback context whose captured state must
+outlive the thread that calls it.
+
+| callback context | captured state | owner / lifetime |
+|---|---|---|
+| `EstLog::sink()` and `EstLog::fault_sink()` closures (`[this]`, test_spark_mechanism.cpp ~4658) | the `EstLog` (its mutex, entries, `throw_if`, `stall`) | the `EstLog` lives in the `Race` block (RF-17/FF-17, held by `shared_ptr` in every closure) or is declared BEFORE the mechanism in the other cases (round-1 tst-lifetime fix), so it outlives the sweeper/worker that calls it |
+| `Collector::handler()` (engine-level RF-2..RF-9 / FF-2..FF-9, ~line 58) | the `Collector` (pre-existing helper) | declared BEFORE `SparkEngine engine` after the round-2 hoist, so the engine joins its threads before the collector dies; the pre-existing baseline tests keep the old order (46 uses, follow-up) |
+| `sweep_hook = [&passes]` in RF-9 (~line 5193) | a local `std::atomic<std::size_t> passes` | declared before the engine/mechanism (round-2 hoist) |
+| `probe_hook` / `emit_bookkeeping_hook` closures installed via `set_*_test_controls_for_test` | the `Race` block (RF-17/FF-17) or gate objects declared before the mechanism | the controls REPLACE every hook on each call; the hook is a `shared_ptr` shared with detached probe jobs, which is the source of the known ProbeGate entry-window residual (finding `g8-probegate-entry-window`) |
