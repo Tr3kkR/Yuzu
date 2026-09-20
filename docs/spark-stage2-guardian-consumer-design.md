@@ -1260,9 +1260,9 @@ subscriptions, not read them as deaf.
 notification coverage (adoption and join excepted, above), not at the moment
 `report_established` is dispatched to a consumer. All three slow paths poll on a 50 ms
 cadence (`kServicePollCadence`, `kRegSweepCadence`, `kFileSweepCadence`): each is a wait CAP
-the mechanism's own wait clamps to whenever any probe is outstanding — not a fixed delay;
-commands, nudges and APCs wake it earlier. Dispatch of a report is bounded the same way on
-all three mechanisms.
+the mechanism's own wait clamps to whenever a probe is outstanding (Pending) — not a fixed
+delay; a nudge (Registry, File) or a command or APC (Service) wakes it earlier. Dispatch of a
+report is bounded the same way on all three mechanisms.
 **Windows live-registration-retry blind spot, carried forward for R5.7's own
 future use of this channel:** on a live-registration failure that occurs
 AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
