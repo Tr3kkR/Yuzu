@@ -7890,6 +7890,68 @@ TEST_CASE("MCP list_pending_approvals: happy path returns the widened field set"
     CHECK_FALSE(structured.contains("result_truncated_by_cap"));
 }
 
+TEST_CASE("MCP list_pending_approvals: status/submitted_by wrong JSON type is rejected -- "
+          "not silently dropped to the default (#2146 A2-R4 governance finding)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    SECTION("status wrong type") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"list_pending_approvals","arguments":{"status":42}}})");
+        REQUIRE(res);
+        // Pre-fix: param_str silently read this as absent, aq.status fell
+        // back to "pending", and the tool answered 200 with an unfiltered-
+        // by-caller-intent result instead of rejecting the malformed input.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("status must be a JSON string") !=
+              std::string::npos);
+    }
+
+    SECTION("submitted_by wrong type") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"list_pending_approvals","arguments":{"submitted_by":["bob"]}}})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(
+                  "submitted_by must be a JSON string") != std::string::npos);
+    }
+}
+
+TEST_CASE("MCP list_pending_approvals: status:\"expired\" is accepted, matching the REST v1 "
+          "twin's enum (#2146 A2-R4 governance finding)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals","arguments":{"status":"expired"}}})");
+    REQUIRE(res);
+    // Pre-fix: the tool's own declared schema enum omitted "expired" even
+    // though it is a real, store-written status the REST v1 twin's OpenAPI
+    // enum already listed -- a schema-validating client had no way to
+    // discover this value was accepted. The handler itself never validated
+    // against the schema (this call already worked pre-fix); this test
+    // pins the schema/handler agreement, not a behavior change.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+}
+
 TEST_CASE("MCP list_pending_approvals: RBAC denial (Approval:Read) blocks the call",
           "[mcp][approval]") {
     McpTestServer ts;

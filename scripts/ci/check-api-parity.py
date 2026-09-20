@@ -144,13 +144,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # hand-picked from either side's stale pre-merge number (212 vs 209).
 #
 # #2146 A2-R4 (this dev-catch-up merge, on top of dev's 208): approval-review
-# REST v1/MCP parity flips 2 other.json rows to "twinned" (get.api-approvals
-# -> GET /api/v1/approvals + list_pending_approvals; get.api-approvals-
-# pending-count -> GET /api/v1/approvals/pending/count +
-# get_pending_approval_count) -- value below reconciled post-merge against
-# the actual measured count, not hand-picked from either side's stale
-# pre-merge number (211 vs 208).
-BASELINE_UNTWINNED = 0  # PLACEHOLDER -- reconciled below after building and measuring
+# REST v1/MCP parity flips 2 other.json rows to "twinned" (GET /api/approvals
+# -> GET /api/v1/approvals + list_pending_approvals; GET
+# /api/approvals/pending/count -> GET /api/v1/approvals/pending/count +
+# get_pending_approval_count) -- measured post-build at 206 (208 - 2), not
+# hand-picked.
+BASELINE_UNTWINNED = 206
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

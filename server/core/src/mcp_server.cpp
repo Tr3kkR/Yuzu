@@ -1116,9 +1116,10 @@ static const ToolDef kTools[] = {
      "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
      "(shared builder approval_row_json). Gated on query_checked: a store/pool failure returns "
      "a retryable error rather than a false empty list. The underlying query is hard-capped at "
-     "100 rows with no limit/cursor parameter; a result hitting that cap sets "
-     "result_truncated_by_cap:true rather than presenting a partial list as complete.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
+     "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
+     "exactly 100 matching rows is a complete, non-truncated result.",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"]},"submitted_by":{"type":"string"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
 
     {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
@@ -12621,8 +12622,27 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 ApprovalQuery aq;
-                aq.status = param_str(args, "status", "pending");
-                aq.submitted_by = param_str(args, "submitted_by");
+                // Gate 2 governance finding (#2146 A2-R4, same defect class as
+                // #2970B/#2146 A2-R1/A2-R2's param_int_strict/param_bool_strict/
+                // param_string_strict family): a present-but-wrong-JSON-type
+                // status/submitted_by must not silently read as absent and
+                // default to "pending"/"" -- reject it instead.
+                auto status_opt = param_string_strict(args, "status", "pending");
+                if (!status_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "status must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                auto submitted_by_opt = param_string_strict(args, "submitted_by");
+                if (!submitted_by_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "submitted_by must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                aq.status = *status_opt;
+                aq.submitted_by = *submitted_by_opt;
                 // #2146 A2-R4 review finding: was the unchecked query(), which
                 // silently returned an empty list on pool exhaustion / a
                 // failed query, indistinguishable from a genuinely empty
