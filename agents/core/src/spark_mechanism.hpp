@@ -100,8 +100,10 @@ using SparkFaultFn =
 /// own timestamp taken at the point it committed the transition (source, never
 /// delivery — a queued/polled mechanism's dispatch latency must not leak into the
 /// recorded value). Optional: default `ISparkMechanism::set_established_sink`
-/// installs no sink, so a mechanism that never calls this (every one except the two
-/// Service platform classes, today) is unaffected. Called with the engine lock
+/// installs no sink, so a mechanism that never calls this is unaffected — as of
+/// #4340 every shipped event-driven mechanism (Registry, File, the two Service
+/// platform classes) overrides it; only a bare test fake still leaves it default.
+/// Called with the engine lock
 /// released, like emit()/fault() — MAY THROW under the same #2012/#3840 allocation
 /// posture as those two; a mechanism that owns one calls it from a context that can
 /// tolerate the throw (see spark_service.cpp's own containment at each call site).
@@ -244,10 +246,11 @@ public:
     [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
 
     /// Additive establishment-signal seam (rung 9c PR-6 item 1). Default forwards to
-    /// watch() so every existing mechanism (Registry, File, every test fake) compiles
-    /// and behaves unchanged — the engine ALWAYS calls THIS overload, never the plain
-    /// watch() above, so a mechanism that wants to correlate its establishment reports
-    /// (see SparkEstablishedFn) against a stable identity overrides this one instead.
+    /// watch() so a mechanism with no need to override it (a bare test fake) compiles
+    /// and behaves unchanged — as of #4340 every shipped event-driven mechanism
+    /// (Registry, File, Service) overrides this instead, to correlate its
+    /// establishment reports (see SparkEstablishedFn) against a stable identity. The
+    /// engine ALWAYS calls THIS overload, never the plain watch() above.
     /// A DISTINCT NAME, deliberately not an overload of watch(): an overload would be
     /// a change to the frozen watch()/unwatch() seam this class's own header comment
     /// documents as reviewed and settled; a new name is purely additive.
@@ -549,6 +552,7 @@ struct FileMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit
     std::uint64_t fault_failed{0};   ///< fault() threw on submit
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged on a later pass
+    std::uint64_t established_failed{0}; ///< established() threw on submit (rung 9c PR-6 item 1)
     std::size_t probe_workers_active{0};
     std::size_t live_dirs{0};
     std::size_t live_ancestors{0};
