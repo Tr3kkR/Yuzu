@@ -626,9 +626,10 @@ static const ToolDef kTools[] = {
 
     {"aggregate_responses",
      "Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. `op_column` picks "
-     "which column sum/avg/min/max operates on (ignored for count; defaults to \"id\" — a row-"
-     "count-equivalent — when omitted); must be one of \"timestamp\", \"status\", \"id\" (#2146 "
-     "A2-R2 — previously silently ignored, every aggregate operated on the store's default column "
+     "which column sum/avg/min/max operates on (ignored for count; defaults to \"id\" when omitted "
+     "— an arbitrary numeric column, NOT a row count; each group's `count` field already reports "
+     "the row count regardless of `op_column`); must be one of \"timestamp\", \"status\", \"id\" "
+     "(#2146 A2-R2 — previously silently ignored, every aggregate operated on the store's default column "
      "regardless of what a caller asked for). Confined by management group: "
      "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "

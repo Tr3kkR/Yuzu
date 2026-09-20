@@ -5418,7 +5418,12 @@ exactly: the result set orders by a non-unique, actively-growing timestamp while
 non-terminal, so offset-based paging would silently skip or duplicate rows; a caller-supplied
 `offset` is rejected with `400`, not silently ignored. Scope pushdown mirrors `query_responses`
 exactly: the caller's visible agent set is resolved and pushed into the store query before `limit`
-(ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`.
+(ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`. **Row shape
+does NOT mirror `query_responses`** — this route returns the narrower 5-field shape
+(`agent_id/execution_id/status/output/timestamp`); `query_responses` was widened to 10 fields by
+#2146 A2-R2 on both its `instruction_id` and `execution_id` paths, but this REST route was not
+retrofitted onto the wider shared builder (tracked as #4647). The "twin"/"mirrors" language above
+is about query-parameter and scope-pushdown semantics only.
 
 #### `GET /api/v1/executions/{id}/children` (#2146 A2-R1)
 
@@ -5497,11 +5502,22 @@ and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
   (`GET /api/responses/{id}/export`) only floors its own *default* at 10000 — a caller-supplied
   `?limit=` there has no ceiling at all and can attempt an unbounded fetch. Not fixed on the legacy
   route (out of scope for this PR); not propagated to `GET /api/v1/responses/{id}/export`.
-- `offset` is rejected with `400` on `GET /api/v1/responses/{id}` (the plain query route), matching
+- `offset` is rejected with `400` on `GET /api/v1/responses/{id}` and `GET
+  /api/v1/responses/{id}/export` (the two routes below with a row-level result set), matching
   `GET /api/v1/executions/{id}/responses` and MCP `query_responses` above: the result set orders by
   a non-unique, actively-growing `timestamp`, so offset-based paging can silently skip or duplicate
-  rows. The legacy route accepts (and silently mis-serves) `offset` today — a pre-existing gap this
-  PR does not fix on that route.
+  rows. The legacy routes accept (and silently mis-serve) `offset` today — a pre-existing gap this
+  PR does not fix on those routes.
+
+`status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame),
+same enum as the bundle-steps `status` field documented above.
+
+A caller cannot tell a complete result from a capped one from row count alone: `GET
+/api/v1/responses/{id}` and `GET /api/v1/responses/{id}/export` both set
+`pagination.result_truncated_by_cap: true` (a response header, `X-Result-Truncated-By-Cap: true`, on
+the export route's CSV format, which has no JSON envelope to carry the field in) when the served row
+count equals `limit` — matching MCP `query_responses`' own `hit_cap` convention. Page past a
+truncated result with `since`/`until`, not `offset` (rejected, see above).
 
 Audit posture: all three routes below emit a `response.read` audit event, **REST fail-closed** (503
 on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the legacy
@@ -5522,7 +5538,7 @@ filtered after the fact. The v1 twin of `GET /api/responses/{id}` above, MCP twi
 {
   "data": [
     { "id": 42, "instruction_id": "instr-1", "agent_id": "agent-A", "execution_id": "exec-1",
-      "status": 0, "output": "ok", "error_detail": "", "timestamp": 1735689600,
+      "status": 1, "output": "ok", "error_detail": "", "timestamp": 1735689600,
       "plugin": "shellexec", "received_at_ms": 1735689600123 }
   ],
   "pagination": { "total": 1, "start": 0, "page_size": 50 },
@@ -5560,13 +5576,18 @@ mapped to a `503` (a client typo must not read as store degradation).
 twin of `GET /api/responses/{id}/export` above (no MCP twin — export is a REST-only shape). `format`
 is `json` (default) or `csv` — an unrecognised value falls through to `json`, matching the legacy
 route's own behavior exactly (neither route rejects an unknown `format` with `400`); `limit` is
-clamped to `[1,10000]` on both bounds (see the correction above). Unlike the legacy export's
+clamped to `[1,10000]` on both bounds (see the correction above). Does not accept `offset` (see
+above) — rejected with `400`, same non-unique-timestamp-ordering rationale as `GET
+/api/v1/responses/{id}`. Unlike the legacy export's
 narrower 7-column CSV, both formats here carry the same field set as `GET /api/v1/responses/{id}`
 (`id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin,
 received_at_ms`) — this is a brand-new endpoint with no positional-column consumer to keep
 compatible. Both formats set `Content-Disposition: attachment`. The JSON format's envelope is the
 standard v1 `{data, pagination, meta}` shape (same as `GET /api/v1/responses/{id}` above) -
-distinct from the legacy export's bespoke `{instruction_id, count, responses}` body.
+distinct from the legacy export's bespoke `{instruction_id, count, responses}` body. A cap-hit
+(served rows == `limit`) is most consequential here since bulk export is this route's whole
+purpose — see `pagination.result_truncated_by_cap`/`X-Result-Truncated-By-Cap` above; there is no
+built-in way to page past 10,000 rows other than narrowing with `since`/`until`/`agent_id`/`status`.
 
 **Response** (`format=json`):
 

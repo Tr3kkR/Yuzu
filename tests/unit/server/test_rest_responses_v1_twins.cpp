@@ -245,6 +245,35 @@ TEST_CASE("GET /api/v1/responses/:id: limit is clamped on BOTH bounds",
     CHECK(body_zero["data"].size() == 1);
 }
 
+TEST_CASE("GET /api/v1/responses/:id: a cap-hit signals result_truncated_by_cap, an "
+          "under-cap result does not (governance finding, #2146 A2-R2)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(
+            mk_resp("instr-trunc-1", "agent-" + std::to_string(i), 0, "o", 100 + i));
+
+    // Served count == limit -> the cap may have dropped rows; signal it.
+    auto res_capped = h.sink.Get("/api/v1/responses/instr-trunc-1?limit=2");
+    REQUIRE(res_capped);
+    auto body_capped = nlohmann::json::parse(res_capped->body);
+    CHECK(body_capped["data"].size() == 2);
+    REQUIRE(body_capped["pagination"].contains("result_truncated_by_cap"));
+    CHECK(body_capped["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+
+    // Served count < limit -> genuinely complete; the field must be absent
+    // (never present-false, matching the codebase's own present-only-when-
+    // true convention for this field elsewhere).
+    auto res_complete = h.sink.Get("/api/v1/responses/instr-trunc-1?limit=100");
+    REQUIRE(res_complete);
+    auto body_complete = nlohmann::json::parse(res_complete->body);
+    CHECK(body_complete["data"].size() == 3);
+    CHECK_FALSE(body_complete["pagination"].contains("result_truncated_by_cap"));
+}
+
 TEST_CASE("GET /api/v1/responses/:id: management-group scope filters another operator's rows",
           "[pg][rest][responses][v1][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
@@ -383,6 +412,26 @@ TEST_CASE("GET /api/v1/responses/:id/export: csv format", "[pg][rest][responses]
     CHECK(res->body.find("hello") != std::string::npos);
 }
 
+TEST_CASE("GET /api/v1/responses/:id/export: CSV formula injection (CWE-1236) is neutralized, "
+          "not passed through raw (#2146 A2-R2 governance finding)",
+          "[pg][rest][responses][v1][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(
+        mk_resp("instr-exp-formula", "agent-A", 0, "=cmd|'/c calc'!A1", 100));
+
+    auto res = h.sink.Get("/api/v1/responses/instr-exp-formula/export?format=csv");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // Pre-fix: the raw "=cmd|..." byte sequence reached the CSV cell
+    // unneutralized -- opening the export in Excel/Sheets would execute it as
+    // a formula. Post-fix: a leading apostrophe forces Excel/Sheets to treat
+    // the cell as text.
+    CHECK(res->body.find("'=cmd") != std::string::npos);
+    CHECK(res->body.find(",=cmd") == std::string::npos);
+}
+
 TEST_CASE("GET /api/v1/responses/:id/export: a caller-supplied limit is clamped, "
           "not left unbounded (#2146 A2-R2 -- corrects the legacy route's own gap)",
           "[pg][rest][responses][v1]") {
@@ -396,6 +445,48 @@ TEST_CASE("GET /api/v1/responses/:id/export: a caller-supplied limit is clamped,
     CHECK(res->status == 200); // clamped, not an unbounded fetch attempt
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"].size() == 1);
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: offset is rejected with 400, not silently "
+          "ignored (unhappy-path governance finding, #2146 A2-R2)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+
+    auto res = h.sink.Get("/api/v1/responses/instr-exp-offset-1/export?offset=1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: a cap-hit signals result_truncated_by_cap on "
+          "JSON (pagination) and CSV (response header) (#2146 A2-R2 governance finding)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(
+            mk_resp("instr-exp-trunc-1", "agent-" + std::to_string(i), 0, "o", 100 + i));
+
+    auto res_json = h.sink.Get("/api/v1/responses/instr-exp-trunc-1/export?limit=2");
+    REQUIRE(res_json);
+    auto body_json = nlohmann::json::parse(res_json->body);
+    CHECK(body_json["data"].size() == 2);
+    REQUIRE(body_json["pagination"].contains("result_truncated_by_cap"));
+    CHECK(body_json["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+
+    auto res_csv = h.sink.Get("/api/v1/responses/instr-exp-trunc-1/export?limit=2&format=csv");
+    REQUIRE(res_csv);
+    CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+
+    // Under the cap: complete, no marker on either format.
+    auto res_complete = h.sink.Get("/api/v1/responses/instr-exp-trunc-1/export?limit=100");
+    REQUIRE(res_complete);
+    auto body_complete = nlohmann::json::parse(res_complete->body);
+    CHECK(body_complete["data"].size() == 3);
+    CHECK_FALSE(body_complete["pagination"].contains("result_truncated_by_cap"));
 }
 
 TEST_CASE("GET /api/v1/responses/:id/export: fleet_read_fn denial -> 403",

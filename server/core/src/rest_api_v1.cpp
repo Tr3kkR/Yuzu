@@ -240,8 +240,16 @@ std::string ok_json(std::string_view data_json) {
 // retry_after_ms per agentic-first §A4.
 
 std::string list_json(std::string_view data_json, int64_t total, int64_t start = 0,
-                      int64_t page_size = 50) {
-    auto pag = JObj().add("total", total).add("start", start).add("page_size", page_size).str();
+                      int64_t page_size = 50, bool result_truncated_by_cap = false) {
+    auto pag_obj = JObj().add("total", total).add("start", start).add("page_size", page_size);
+    // Present-only-when-true, matching list_schedules'/query_responses' own
+    // result_truncated_by_cap convention: `total` above is the count RETURNED,
+    // never asserted as the true total, and a caller must not read an absent
+    // key as "definitely complete" vs. "not applicable to this route" -- both
+    // read the same (absent), which is the existing convention's own limit.
+    if (result_truncated_by_cap)
+        pag_obj.add("result_truncated_by_cap", true);
+    auto pag = pag_obj.str();
     return JObj()
         .raw("data", data_json)
         .raw("pagination", pag)
@@ -1164,13 +1172,13 @@ const std::string& openapi_spec() {
         // the unsplit form.
         R"json(,
     "/responses/{id}": {
-      "get": {"summary": "Query command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id} and MCP query_responses' instruction_id path (shared builder response_query_row_json, response_query_model.hpp -- REST v1 and MCP cannot drift on row shape by construction; the legacy route is frozen reference code for this PR, not retrofitted onto the shared builder). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read) -- resolve-then-scope: the in-scope agent set is pushed into the store query BEFORE limit, never post-filtered. No offset parameter (unlike the legacy route): the result set orders by a non-unique, actively-growing timestamp, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400 (mirrors GET /executions/{id}/responses and MCP query_responses). limit is clamped to [1,1000] on BOTH bounds. Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row (CC7.2), and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows: id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin, received_at_ms", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Query command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id} and MCP query_responses' instruction_id path (shared builder response_query_row_json, response_query_model.hpp -- REST v1 and MCP cannot drift on row shape by construction; the legacy route is frozen reference code for this PR, not retrofitted onto the shared builder). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read) -- resolve-then-scope: the in-scope agent set is pushed into the store query BEFORE limit, never post-filtered. No offset parameter (unlike the legacy route): the result set orders by a non-unique, actively-growing timestamp, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400 (mirrors GET /executions/{id}/responses and MCP query_responses). limit is clamped to [1,1000] on BOTH bounds, default 100 when omitted; when the served row count equals limit, pagination.result_truncated_by_cap is set true (matching MCP query_responses' own hit_cap convention) so a caller cannot mistake a capped page for a complete result. Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row (CC7.2), and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows: id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin, received_at_ms. pagination.result_truncated_by_cap (bool, optional) present true when the limit cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/responses/{id}/aggregate": {
       "get": {"summary": "Aggregate command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/aggregate and MCP aggregate_responses (shared builder response_aggregate_row_json). group_by must be status or agent_id; op is one of count|sum|avg|min|max (default count); op_column (sum/avg/min/max only) must be one of timestamp|status|id, default id when omitted -- an invalid group_by/op_column is a 400, validated against ResponseStore's own allow-list before the query runs. Gated on Response:Read with the same resolve-then-scope confinement as the query route above (filter-before-aggregate, ADR-0017 INV-3). Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row, and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "group_by", "in": "query", "required": false, "schema": {"type": "string", "enum": ["status", "agent_id"], "default": "status"}}, {"name": "op", "in": "query", "required": false, "schema": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"], "default": "count"}}, {"name": "op_column", "in": "query", "required": false, "schema": {"type": "string", "enum": ["timestamp", "status", "id"], "default": "id"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}], "responses": {"200": {"description": "{instruction_id, groups: [{group_value, count, aggregate_value}], total_groups, total_rows}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid group_by, op_column, or numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/responses/{id}/export": {
-      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv -- an unrecognised value falls through to json, matching the legacy route's own behavior exactly (neither route rejects an unknown format with 400); both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds -- a real, pre-existing gap on the legacy route (an unbounded caller-supplied limit) that is not propagated here. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv -- an unrecognised value falls through to json, matching the legacy route's own behavior exactly (neither route rejects an unknown format with 400); both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds, default 10000 when omitted -- a real, pre-existing gap on the legacy route (an unbounded caller-supplied limit) that is not propagated here. No offset parameter, same non-unique-timestamp-ordering rationale as GET /responses/{id} above -- a caller-supplied offset is rejected with 400. When the served row count equals limit, a cap-hit is signalled: pagination.result_truncated_by_cap on the JSON format, an X-Result-Truncated-By-Cap: true response header on the CSV format (which has no JSON envelope to carry the field in) -- most consequential here since bulk export is this route's purpose and a truncated CSV would otherwise look byte-for-byte like a complete one. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}. pagination.result_truncated_by_cap (JSON) / X-Result-Truncated-By-Cap header (CSV) present true when the limit cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/workflows": {
       "get": {"summary": "List workflows (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows and MCP list_workflows (new). Requires Workflow:Read (RBAC seeding prerequisite fixed by #4030/#4032 — Workflow was gated but never seeded, so no role could hold this grant before this change). Shared builder workflow_row_json (workflow_model.hpp) — REST/MCP cannot drift on field set.", "parameters": [{"name": "name", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Workflow list"}, "400": {"description": "Invalid limit or numeric query parameter"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "503": {"description": "Workflow engine not available"}}}
@@ -8341,6 +8349,25 @@ void RestApiV1::register_routes(
             }
             auto instruction_id = req.matches[1].str();
 
+            // unhappy-path governance finding: this route restated the same
+            // unsafe-offset rationale as GET /api/v1/responses/{id}'s own
+            // guard (below) in its header comment but never applied the
+            // guard to itself — offset-based paging on a non-unique,
+            // actively-growing timestamp-ordered result set silently skips
+            // or duplicates rows, same reasoning as the plain-GET sibling.
+            if (req.has_param("offset")) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "offset is not supported on this route -- the result set "
+                                     "orders by a non-unique, actively-growing timestamp and "
+                                     "offset-based paging would silently skip or duplicate rows; "
+                                     "use the limit/since cursor shape instead, matching MCP "
+                                     "query_responses"),
+                    "application/json");
+                return;
+            }
+
             // #2146 A2-R2: this v1 twin clamps a CALLER-SUPPLIED limit too —
             // the legacy export route (response_routes.cpp) only floors its
             // own DEFAULT at kExportLimitCap; an explicit `?limit=` there has
@@ -8428,6 +8455,14 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // happy-path/enterprise-readiness governance finding: this route
+            // never signalled a cap-hit -- a caller with more than `limit`
+            // matching rows got exactly `limit` back with no marker that the
+            // export was cut, most consequential here since bulk export is
+            // this route's whole purpose. Mirrors MCP query_responses' own
+            // `hit_cap = results.size() == limit` convention (this PR's own
+            // MCP twin already computes this).
+            const bool hit_cap = results.size() == static_cast<std::size_t>(q.limit);
             auto format = req.get_param_value("format");
             if (format == "csv") {
                 std::string csv{kResponseExportCsvHeader};
@@ -8435,6 +8470,8 @@ void RestApiV1::register_routes(
                     csv += response_export_csv_row(r);
                 res.set_header("Content-Disposition",
                                "attachment; filename=\"responses-" + instruction_id + ".csv\"");
+                if (hit_cap)
+                    res.set_header("X-Result-Truncated-By-Cap", "true");
                 res.set_content(csv, "text/csv; charset=utf-8");
             } else {
                 JArr arr;
@@ -8442,7 +8479,8 @@ void RestApiV1::register_routes(
                     arr.add_raw(response_query_row_json(r).dump());
                 res.set_header("Content-Disposition",
                                "attachment; filename=\"responses-" + instruction_id + ".json\"");
-                res.set_content(list_json(arr.str(), arr.size()), "application/json; charset=utf-8");
+                res.set_content(list_json(arr.str(), arr.size(), 0, 50, hit_cap),
+                                "application/json; charset=utf-8");
             }
         });
 
@@ -8573,10 +8611,17 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // happy-path/enterprise-readiness governance finding: this route
+            // never signalled a cap-hit, unlike MCP query_responses (this
+            // PR's own twin) and the established list_schedules/executions-
+            // children REST pagination pattern (#2146 A2-R1 Gate 8). A caller
+            // whose matching rows equal `limit` cannot tell a complete result
+            // from a truncated one.
+            const bool hit_cap = results.size() == static_cast<std::size_t>(q.limit);
             JArr arr;
             for (const auto& r : results)
                 arr.add_raw(response_query_row_json(r).dump());
-            res.set_content(list_json(arr.str(), arr.size()), "application/json");
+            res.set_content(list_json(arr.str(), arr.size(), 0, 50, hit_cap), "application/json");
         });
 
     // ── GET /api/v1/executions/{id} — final-state lookup (#1088 UAT-found gap)

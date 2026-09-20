@@ -30,6 +30,12 @@
   legacy-route bug is deliberately NOT fixed by this PR (the legacy handlers are frozen reference
   code here) and is not propagated to the new v1/MCP surfaces; tracked separately as #4310 (broadened
   to also cover the plain legacy query route, which shares the same unbounded-limit shape).
-- The new export route's CSV output reuses the existing `data_export::csv_escape` helper unchanged
-  (no new escaping logic written) - inherits, but does not worsen, that helper's pre-existing lack
-  of CSV-formula-injection neutralization on agent-controlled fields; tracked as #4311.
+- **`data_export::csv_escape` now neutralizes CSV/formula injection (CWE-1236, #4311)** - a leading
+  `=`/`+`/`-`/`@`/tab/CR on an agent-controlled field (`output`, `error_detail`, `plugin`) is
+  prefixed with a literal `'` before RFC 4180 quoting, so Excel/Sheets renders it as text instead of
+  executing it as a formula. Promoted from `access_review_model.cpp`'s existing, tested
+  `neutralize_formula`/`is_formula_trigger` (the original precedent for this fix) into the shared
+  `data_export.hpp` chokepoint - fixes the new v1 export route, the legacy `GET
+  /api/responses/{id}/export` route, `access_review_model.cpp`'s own compliance export, and
+  `data_export::json_array_to_csv`'s dashboard-driven generic export all at once, and removes the
+  access-review file's local duplicate of the same logic.

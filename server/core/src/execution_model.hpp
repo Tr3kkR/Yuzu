@@ -110,7 +110,7 @@ nlohmann::json execution_child_row_json(const Execution& c);
 /// out of scope for A2-R2 (a different, already-shipped capability keyed on
 /// execution_id, not instruction_id). Retrofitting THIS route onto the
 /// wider builder, or removing this function in favor of it, is a separate,
-/// future decision, not something A2-R2 does.
+/// future decision, not something A2-R2 does -- tracked as #4647.
 nlohmann::json execution_response_row_json(const StoredResponse& r);
 
 } // namespace yuzu::server
