@@ -3317,23 +3317,27 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
         outbox_waker();
 
     // #4606 criterion-10: release eval_lk (this key's own serialisation) BEFORE any
-    // I/O below — a slow/blocked log write must never delay the next eval of this key.
-    // registry_mu_'s own block already closed above and outbox_waker() already fired;
-    // neither ordering changes. The waker deliberately does NOT wait for the T_detect
-    // emission below: delivery must never depend on log-sink health, so a T_wire line
-    // can reach the log before its own T_detect line - correlate by event_id and the
-    // embedded *_wall_ns fields, never file order (see guardian_spark_timing.hpp).
+    // I/O below, so a slow log write never delays the next eval of this key, and the
+    // waker above has already fired, so nothing below delays the ENQUEUE or the drain
+    // worker's wake. That is the whole extent of the decoupling: the T_detect line is
+    // written synchronously on THIS thread (the Spark consumer or the convergence
+    // thread) and the T_wire line on the single-flight send worker, so a log sink that
+    // blocks stalls whichever thread is writing (see guardian_spark_timing.hpp). The
+    // waker also means a T_wire line can reach the log before its own T_detect line -
+    // correlate by event_id and the embedded *_wall_ns fields, never file order.
     eval_lk.unlock();
-    {
-        std::lock_guard<std::mutex> lt{last_eval_timings_mu_};
-        last_eval_timings_ = staged; // test accessor; cheap copy, staged is usually 0-2 entries
-    }
     if (!staged.empty()) {
         try {
             for (const EvalTimingRecord& r : staged)
                 spdlog::info("{}", format_eval_timing_line(r));
         } catch (...) { // best-effort diagnostic; never propagate out of evaluate_key
         }
+    }
+    {
+        // Test accessor only. Assigned AFTER the emission so it adds no allocation between the
+        // waker and the log line; the move is noexcept and `staged` is not used again.
+        std::lock_guard<std::mutex> lt{last_eval_timings_mu_};
+        last_eval_timings_ = std::move(staged);
     }
 }
 

@@ -899,9 +899,13 @@ public:
     /// Test seam: rule_ids on `key` that have been demoted off the priority lane
     /// (M1 item (b)). A subset of pending_initial(key).
     [[nodiscard]] std::vector<std::string> pending_demoted_for_test(const std::string& key) const;
-    /// #4606 criterion-10: the EvalTimingRecord batch staged by the MOST RECENT
-    /// evaluate_key() call, for direct unit-test inspection (field order / two-entry /
-    /// accepted=false cases) without depending on log capture. Test-only.
+    /// #4606 criterion-10: the EvalTimingRecord batch staged by the most recent
+    /// evaluate_key() call that REACHED the emission step, for direct unit-test inspection
+    /// (field order / two-entry / accepted=false cases) without depending on log capture.
+    /// A call that returns early (stopping runtime, withdrawn key, nothing planned, a
+    /// non-event type) leaves the previous batch in place, and concurrent calls for
+    /// different keys are last-writer-wins, so only assert on it after a call you know
+    /// reached emission. Test-only.
     [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
     [[nodiscard]] bool stopping() const;
 

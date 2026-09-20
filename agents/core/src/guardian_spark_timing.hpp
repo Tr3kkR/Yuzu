@@ -3,8 +3,11 @@
 /**
  * guardian_spark_timing.hpp - #4606 criterion-10: plain-data timing record types +
  * their pure log-line formatters for the Spark detect->delivery latency benchmark
- * (T_ready -> T_mutation -> T_mechanism -> T_detect -> T_fire -> T_server ->
- * T_visible). Deliberately NOT part of GuardianSparkRuntime's class interface:
+ * (T_ready -> T_mutation -> T_mechanism -> T_detect -> T_fire -> T_wire -> T_server ->
+ * T_visible). T_ready and T_mutation are taken by the benchmark rig and T_visible is a
+ * dashboard observation; none of the three is logged here, and T_mechanism and the handler
+ * instant are fields of the T_detect line, not lines of their own. Deliberately NOT part of
+ * GuardianSparkRuntime's class interface:
  *   - so the two format_*_line() functions are directly unit-testable (pure, no
  *     I/O, no clock reads) without touching the runtime;
  *   - so the agent-side send-site logging (agent.cpp, T_wire) can use
@@ -26,14 +29,28 @@
  * CORRELATION CONTRACT (read before writing a correlator):
  *   - Join on the event id and the embedded wall-clock fields, NEVER on log-file line order.
  *     A T_wire line can precede its own T_detect line in the file: evaluate_key wakes the
- *     outbox drain worker BEFORE it emits the deferred T_detect line (the waker deliberately
- *     does not wait on the log sink - a stalled sink must never delay delivery), and two
- *     keys' deferred emissions can interleave. Treat the post-hoc join over the COMPLETE log
- *     as authoritative. A streaming correlator may buffer a T_wire for a grace window, but a
- *     stalled sink delays T_detect without bound, so expiry must file the sample in a "late"
- *     bucket and never drop it or count it as an orphan. In program order detect_wall_ns
- *     precedes wire_wall_ns for one event, but both are system_clock reads, so an NTP step
- *     can invert them; T_wire carries no *_mono_ns field.
+ *     outbox drain worker BEFORE it emits the deferred T_detect line, so the enqueue and the
+ *     wake never wait on the log sink, and two keys' deferred emissions can interleave. Treat
+ *     the post-hoc join over the COMPLETE log as authoritative. A streaming correlator may
+ *     buffer a T_wire for a grace window, but a stalled sink delays T_detect without bound,
+ *     so expiry must file the sample in a "late" bucket and never drop it or count it as an
+ *     orphan. In program order detect_wall_ns precedes wire_wall_ns for one event, but both
+ *     are system_clock reads, so an NTP step can invert them; T_wire carries no *_mono_ns
+ *     field.
+ *   - Ordering and clocks. On the agent the program order is mechanism <= handler <= detect
+ *     <= fire. fire <= wire and wire <= recv are NOT guaranteed: fire is stamped after the
+ *     outbox lock is released, so a drain that is already running can send and stamp wire
+ *     first, and wire is stamped after Write() returns, by which time the server may already
+ *     have logged receipt. Small negative deltas between those pairs are ordinary. Every
+ *     *_wall_ns and *_ns field is a wall-clock read, so any difference taken between two
+ *     hosts (agent_ns, the wire->recv hop and the gateway hop between them) includes their
+ *     clock skew; the *_mono_ns fields are for intervals within one process only.
+ *   - The lines are written synchronously: T_detect on the thread that ran the evaluation
+ *     (the Spark consumer thread or the convergence thread), T_wire on the single-flight send
+ *     worker (Spark path) or the guard worker (legacy path), T_server on the gRPC ingest
+ *     thread. A log sink that blocks therefore stalls whichever of those is writing: later
+ *     evaluations, the next send, or the next ingest. Removing the Spark-path coupling is a
+ *     flip precondition (docs/spark-flip-gate.md section 7).
  *   - The agent-side lines carry no agent field (each agent has its own log); join on
  *     (agent, event_id), taking the agent from the log's origin and from T_server's agent=.
  *   - Event id layout differs by path. Spark: `<agent>-<boot_nonce>-<rule>-<wall_ms>-<seq>`,
@@ -41,6 +58,16 @@
  *     never re-minted after it. Legacy (domain=legacy): `<rule>-<agent>-<wall_ms>-<seq>`,
  *     with NO boot_nonce and a per-process seq. An empty agent id (before registration) is
  *     a known degenerate case.
+ *   - The event id (and T_server's agent and rule ids) is untrusted text: it embeds the
+ *     operator-authored rule id. It is neutralised before it is written - a control byte,
+ *     DEL, space, '=' or ',' becomes '_' - and cut to 256 bytes, by ONE shared function
+ *     (yuzu::log_token, common/include/yuzu/log_token.hpp) on both sides, so an id with such
+ *     characters or longer than 256 bytes still joins. Two raw ids can share one logged token
+ *     only if they differ solely in those characters or beyond byte 256.
+ *   - Every T_* line is best-effort, so "no partner" is evidence, not proof: a line can be
+ *     missing because the log call failed (the error is swallowed), the level was raised
+ *     above info at run time, a file rotated, or the process stopped between the write and
+ *     the log call.
  *   - Reading a T_detect line that has no later lines:
  *       accepted=0 (fire_*_ns=-1)  the outbox rejected the batch; nothing was enqueued. The
  *                                  next eval pass mints a NEW event_id (and logs another
@@ -52,11 +79,17 @@
  *                                  (including behind a slow or blocked send), held back by a
  *                                  down stream (the Spark path logs no T_wire for that), or
  *                                  the agent stopped first. The T_* lines alone cannot tell
- *                                  the last four apart (other agent log lines, such as arm and
- *                                  lifecycle messages, can help). The Compliance/Health outbox is an
- *                                  in-memory buffer, NOT durable (guardian_outbox.hpp): after
- *                                  a restart the boot re-evaluation MAY mint a fresh id under
- *                                  a new boot_nonce (only if the re-evaluation emits).
+ *                                  the last four apart (other agent log lines, such as arm
+ *                                  and lifecycle messages, can help). The Compliance/Health
+ *                                  outbox is an in-memory buffer, NOT durable
+ *                                  (guardian_outbox.hpp): after a restart the boot
+ *                                  re-evaluation MAY mint a fresh id under a new boot_nonce
+ *                                  (only if the re-evaluation emits).
+ *   - trigger_present=1 means a detection event started the pass. The trigger fields
+ *     describe THAT event and are repeated on every entry the pass stages, including an entry
+ *     for a rule the event did not change (a refresh or a first verdict), so a trigger_present=1
+ *     line is not by itself a detection of its own rule. trigger_present=0 (a scheduled
+ *     re-evaluation) carries -1 in all four trigger fields.
  *   - Reading a T_wire line:
  *       Spark path (domain=compliance|health|lifecycle):
  *         sent=0  Write() returned false. The entry is retained and re-sent under the SAME
@@ -71,18 +104,22 @@
  *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
  *     disarmed and errored events - a subscription LOSS produces a lifecycle "errored"
  *     entry - and journal replays from this or an earlier process), domain=health raised by
- *     a subscription FAULT or its recovery rather than an evaluation pass, and domain=legacy. It can also
- *     mean the agent stopped between the waker and the deferred T_detect line.
+ *     a subscription FAULT or its recovery rather than an evaluation pass, and
+ *     domain=legacy. It can also mean the agent stopped between the waker and the deferred
+ *     T_detect line.
  *   - T_server (server log) fields: recv_ns and committed_ns are wall-clock instants on the
  *     SERVER; agent_ns is the event's own AGENT-side timestamp (on the Spark path the outbox
  *     entry's enqueue stamp; whole seconds on the legacy path), so arithmetic between
  *     agent_ns and the server's instants includes any agent/server clock skew; store_ms is
- *     an elapsed time; agent_ns=-1 marks an invalid wire timestamp. It is emitted for
- *     Inserted only. Redelivered is logged at debug, Conflict and Error at warn (the Conflict
- *     warning carries event_id; the Error warning and the parse-failure warning do not, so
- *     they cannot be joined), so at the default info level a replay and a loss look alike in
- *     the server log: T_wire sent=1 with no T_server means lost in flight OR classified
- *     Redelivered, Conflict or Error.
+ *     the elapsed time of the whole store call, including work after the commit, so it is
+ *     not committed_ns - recv_ns; agent_ns=-1 marks an ABSENT or invalid wire timestamp. It
+ *     is emitted for Inserted only. Redelivered is logged at debug, Conflict and Error at
+ *     warn (the Conflict warning carries event_id; the Error warning and the parse-failure
+ *     warning do not, so they cannot be joined), so at the default info level a replay and a
+ *     loss look alike in the server log: T_wire sent=1 with no T_server means lost in
+ *     flight, OR classified Redelivered, Conflict or Error, OR the server had no Guardian
+ *     store configured (it then skips the store silently). A T_server with no T_wire means
+ *     the agent's line was not written or not retained (see best-effort above).
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core shared-lib symbol visibility, -fvisibility=hidden)
@@ -104,7 +141,7 @@ struct EvalTrigger {
     std::int64_t mechanism_wall_ns{0}; ///< T_mechanism: SparkEvent::at, ns since Unix epoch
     std::int64_t handler_wall_ns{0};   ///< T_handler (diagnostic only): on_event() entry, wall ns
     std::int64_t handler_mono_ns{0};   ///< same instant, steady ns (for LOCAL interval math only)
-    std::uint64_t seq{0};              ///< SparkEvent::seq — correlates to the mechanism's own line
+    std::uint64_t seq{0};              ///< SparkEvent::seq, the mechanism's per-event sequence number
 };
 
 /// One outbox entry's timing, staged during evaluate_key()'s registry_mu_-held commit section

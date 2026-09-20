@@ -763,17 +763,32 @@ TEST_CASE("#4606 criterion-10: on_event(Fired) stages a timing record with trigg
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
     r->file = read_known(FileSnapshot{.exists = true}); // compliant
+    auto steady_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    const auto mono_before_ns = steady_ns();
     const auto before = std::chrono::system_clock::now();
     const SparkEvent ev{.key = key, .seq = 42, .at = std::chrono::system_clock::now(),
                         .kind = SparkEventKind::Fired};
     rt->on_event(ev);
     const auto after = std::chrono::system_clock::now();
+    const auto mono_after_ns = steady_ns();
     drain_all(*rt); // clears the buffered edge; not what this test asserts on
 
     auto timings = rt->last_eval_timings_for_test();
     REQUIRE(timings.size() == 1);
     REQUIRE(timings[0].trigger.has_value());
     CHECK(timings[0].trigger->seq == 42);
+    // The three *_mono_ns stamps must be REAL steady_clock reads: the runtime's injected clock
+    // (make_rt) is a small synthetic time_point, so a stamp taken from it would fall outside this
+    // bracket and fail, and the chain must be non-decreasing in program order.
+    REQUIRE(timings[0].accepted);
+    CHECK(timings[0].trigger->handler_mono_ns >= mono_before_ns);
+    CHECK(timings[0].trigger->handler_mono_ns <= timings[0].detect_mono_ns);
+    CHECK(timings[0].detect_mono_ns <= timings[0].fire_mono_ns);
+    CHECK(timings[0].fire_mono_ns <= mono_after_ns);
     CHECK(timings[0].trigger->mechanism_wall_ns ==
           std::chrono::duration_cast<std::chrono::nanoseconds>(ev.at.time_since_epoch()).count());
     const auto before_ns =
@@ -2166,11 +2181,24 @@ TEST_CASE("#4606 criterion-10: a two-entry build_entries pass stages two timing 
     REQUIRE(drain_all(*rt).size() == 1); // health(false)
 
     r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    const auto mono_before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
     rt->evaluate_key(key, EvalReason::Event);
+    const auto mono_after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
     REQUIRE(drain_all(*rt).size() == 2); // health(true) + the drift, landed atomically
 
     const auto timings = rt->last_eval_timings_for_test();
     REQUIRE(timings.size() == 2);
+    // Both stamps are REAL steady_clock reads (the injected make_rt clock is a small synthetic
+    // time_point that would fall outside this bracket), taken inside the evaluate_key call.
+    for (const auto& t : timings) {
+        CHECK(t.detect_mono_ns >= mono_before_ns);
+        CHECK(t.detect_mono_ns <= t.fire_mono_ns);
+        CHECK(t.fire_mono_ns <= mono_after_ns);
+    }
     CHECK(timings[0].detect_wall_ns == timings[1].detect_wall_ns);
     CHECK(timings[0].detect_mono_ns == timings[1].detect_mono_ns);
     CHECK(timings[0].detect_wall_ns != 0);
