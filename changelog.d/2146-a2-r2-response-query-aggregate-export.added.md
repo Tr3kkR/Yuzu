@@ -14,7 +14,10 @@
 - **`aggregate_responses` gained an `op_column` parameter** (`timestamp`/`status`/`id`, default
   `id`), validated against `ResponseStore::allowed_op_column()`. Previously `op_column` was never
   read from the tool's arguments at all, so a `sum`/`avg`/`min`/`max` aggregate silently operated
-  on the store's own default operand column regardless of what a caller requested.
+  on the store's own default operand column regardless of what a caller requested. A
+  present-but-wrong-JSON-type `op_column` (e.g. a number) is rejected with `kInvalidParams`
+  rather than silently read as absent and defaulted to `id` (same defect class as #2970B/#2146
+  A2-R1's `param_int_strict`/`param_bool_strict`/`param_string_strict` family).
 - `GET /api/v1/responses/{id}` and `GET /api/v1/responses/{id}/export` clamp a caller-supplied
   `limit` on **both** bounds (`[1,1000]` and `[1,10000]` respectively) - the legacy `GET
   /api/responses/{id}/export` route only floors its own *default* at 10000; an explicit

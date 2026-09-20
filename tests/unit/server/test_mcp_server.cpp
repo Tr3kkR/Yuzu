@@ -19609,6 +19609,42 @@ TEST_CASE("MCP aggregate_responses: an invalid op_column is rejected with kInval
     CHECK(body["error"]["message"].get<std::string>().find("op_column") != std::string::npos);
 }
 
+TEST_CASE("MCP aggregate_responses: op_column wrong JSON type is rejected -- not silently "
+          "dropped to the default (#2146 A2-R2)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["timestamp"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-badtype","group_by":"status","aggregate":"sum",)"
+        R"("op_column":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `effective_op_column`
+    // fell back to "id" (a valid allow-listed value), and the tool answered
+    // 200 with an aggregate over the wrong column instead of rejecting the
+    // caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
+}
+
 TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
           "[pg][mcp][integration][response][aggregate][scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

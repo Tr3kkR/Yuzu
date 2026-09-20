@@ -8727,9 +8727,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 // in (#2691 Doomgoose finding #2 precedent — same rationale as
                 // group_by just above: a typo'd op_column would otherwise read as
                 // store degradation for a healthy database).
-                auto op_column_param = param_str(args, "op_column");
+                //
+                // Use `param_string_strict`, not `param_str` (same defect class as
+                // #2970B/#2146 A2-R1, applied proactively here since this call site
+                // is new in this change): a present-but-wrong-type `op_column` (e.g.
+                // `{"op_column": 42}`) must not silently read as absent and default
+                // to "id" -- the caller asked to aggregate a specific column and
+                // typed it wrong, not asked for the default.
+                auto op_column_opt = param_string_strict(args, "op_column");
+                if (!op_column_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "op_column must be a JSON string"),
+                        "application/json");
+                    return;
+                }
                 const std::string effective_op_column =
-                    op_column_param.empty() ? "id" : op_column_param;
+                    op_column_opt->empty() ? "id" : *op_column_opt;
                 if (std::find(ResponseStore::allowed_op_column().begin(),
                               ResponseStore::allowed_op_column().end(),
                               effective_op_column) == ResponseStore::allowed_op_column().end()) {
@@ -8737,7 +8750,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                aq.op_column = op_column_param;
+                aq.op_column = *op_column_opt;
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
