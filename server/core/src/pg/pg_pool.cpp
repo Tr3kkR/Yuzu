@@ -127,9 +127,10 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     // bookkeeping. If a BOUNDED acquire (`deadline != nullptr`) observes the
     // pool already in that state, the caller's own timeout is very unlikely
     // to be honoured by an actual release in time -- clamp the wait to
-    // `saturated_fast_fail_` instead, so the calling thread (an httplib
-    // worker, for a route backed by this pool) is freed almost immediately
-    // rather than pinned for the full timeout. Measured from `t0` (taken
+    // `saturated_fast_fail_` instead, so the calling thread (often an
+    // httplib worker for a REST route, but any caller of a bounded acquire
+    // backed by this pool) is freed almost immediately rather than pinned
+    // for the full timeout. Measured from `t0` (taken
     // before the lock, above) rather than "now" here, so time already spent
     // waiting on `mu_` counts against the budget too -- the caller's thread
     // has been unavailable to its own caller since `t0`. Unbounded

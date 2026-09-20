@@ -139,9 +139,10 @@ public:
         /// acquire loop would otherwise block a caller), the wait is clamped
         /// to `min(caller's own timeout, this value)`, so a caller that
         /// arrives after saturation gets its degrade response back quickly
-        /// rather than pinning its thread (an httplib worker, for a REST
-        /// route) for the full timeout waiting on a connection that is very
-        /// unlikely to free up in time anyway. A caller that arrives BEFORE
+        /// rather than pinning its thread (often an httplib worker for a
+        /// REST route, but any caller of a bounded acquire) for the full
+        /// timeout waiting on a connection that is very unlikely to free up
+        /// in time anyway. A caller that arrives BEFORE
         /// saturation is unaffected -- this never shortens a wait that would
         /// otherwise have succeeded quickly.
         ///
