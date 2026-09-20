@@ -1216,7 +1216,11 @@ future use of this channel (and for any future criterion 10 built on it):** a
 fire-triggered re-arm on the SAME incarnation (Registry's ordinary fire path above)
 never re-stamps `established_at`, and `subscription_establishment()` is a pull query
 that is not guaranteed to observe the transient `None` mid-flap — Registry's `None`
-and the re-arm's `Notification` can land in the same sweep pass. A consumer that
+and the re-arm's `Notification` land on consecutive sweep passes when the re-arm
+probe resolves promptly (the sweep drains the `None` marker before it commits the
+re-arm, and the commit's own `Notification` marker is only picked up by the next
+pass, never the same one), and may then be too close together for a pull query to
+observe the transient `None`. A consumer that
 needs to observe "coverage was lost and regained across a re-arm cycle" must either
 disarm+arm (mints a fresh incarnation, and so a fresh `established_at`) or install a
 mechanism-direct `set_established_sink()` observer in its own harness — do not build
