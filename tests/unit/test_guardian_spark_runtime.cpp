@@ -752,6 +752,45 @@ TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spar
     REQUIRE(got[0].drift.detected_value == "<absent>");
 }
 
+TEST_CASE("#4606 criterion-10: on_event(Fired) stages a timing record with trigger present "
+          "(mechanism/handler/seq); a Convergence pass with no event stages trigger absent",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_known(FileSnapshot{.exists = true}); // compliant
+    const auto before = std::chrono::system_clock::now();
+    const SparkEvent ev{.key = key, .seq = 42, .at = std::chrono::system_clock::now(),
+                        .kind = SparkEventKind::Fired};
+    rt->on_event(ev);
+    const auto after = std::chrono::system_clock::now();
+    drain_all(*rt); // clears the buffered edge; not what this test asserts on
+
+    auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1);
+    REQUIRE(timings[0].trigger.has_value());
+    CHECK(timings[0].trigger->seq == 42);
+    CHECK(timings[0].trigger->mechanism_wall_ns ==
+          std::chrono::duration_cast<std::chrono::nanoseconds>(ev.at.time_since_epoch()).count());
+    const auto before_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(before.time_since_epoch()).count();
+    const auto after_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(after.time_since_epoch()).count();
+    CHECK(timings[0].trigger->handler_wall_ns >= before_ns);
+    CHECK(timings[0].trigger->handler_wall_ns <= after_ns);
+
+    // Convergence-reason pass, no event context. Flip the read so it actually produces a
+    // record (a no-op Convergence over unchanged compliant state stages nothing).
+    r->file = read_known(FileSnapshot{.exists = false}); // now drifted
+    rt->evaluate_key(key, EvalReason::Convergence);
+    timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1);
+    CHECK_FALSE(timings[0].trigger.has_value());
+}
+
 TEST_CASE("pending-initial holds until a Known verdict, kept on Unknown", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -943,6 +982,36 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
     REQUIRE(got.size() == 1);
     REQUIRE(got[0].rule_id == "r3");
     REQUIRE(rt->pending_initial(k3).empty());
+}
+
+TEST_CASE("#4606 criterion-10: a rejected enqueue at outbox cap stages accepted=false with "
+          "fire_wall_ns/fire_mono_ns left at zero, but detect_wall_ns still captured",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor; three drifting keys exceed it
+    auto rt = make_rt(r, b, cfg);
+    const auto k3 = spark_key(file_spec("/c"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true);
+    rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3", /*present=*/false), true);
+    r->file = read_known(FileSnapshot{.exists = true}); // present -> all rules drift (expect absent)
+
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // slot 1
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial); // slot 2 (full)
+    REQUIRE(rt->outbox_size() == 2);
+
+    rt->evaluate_key(k3, EvalReason::Initial); // rejected at cap
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1); // r3's one drift entry, rejected
+    CHECK_FALSE(timings[0].accepted);
+    CHECK(timings[0].fire_wall_ns == 0);
+    CHECK(timings[0].fire_mono_ns == 0);
+    CHECK(timings[0].detect_wall_ns != 0); // still captured even though the enqueue was rejected
+    CHECK(timings[0].detect_mono_ns != 0);
 }
 
 TEST_CASE("a configured capacity below two is floored so a recovery pair can never be lost",
@@ -2079,6 +2148,104 @@ TEST_CASE("recovery to a drifted state emits BOTH guard.healthy and the drift ve
     REQUIRE(g[0].healthy);
     REQUIRE(g[1].domain == OutboxDomain::Compliance);
     REQUIRE_FALSE(g[1].drift.compliant);
+}
+
+TEST_CASE("#4606 criterion-10: a two-entry build_entries pass stages two timing records "
+          "sharing one detect timestamp with distinct event_ids",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io"); // errored
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1); // health(false)
+
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).size() == 2); // health(true) + the drift, landed atomically
+
+    const auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 2);
+    CHECK(timings[0].detect_wall_ns == timings[1].detect_wall_ns);
+    CHECK(timings[0].detect_mono_ns == timings[1].detect_mono_ns);
+    CHECK(timings[0].detect_wall_ns != 0);
+    CHECK(timings[0].event_id != timings[1].event_id);
+    CHECK(timings[0].accepted);
+    CHECK(timings[1].accepted);
+    CHECK(timings[0].fire_wall_ns == timings[1].fire_wall_ns); // one backfill pass, same instant
+    CHECK_FALSE(timings[0].trigger.has_value()); // evaluate_key called directly, no trigger arg
+    CHECK_FALSE(timings[1].trigger.has_value());
+}
+
+TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trigger sentinel "
+          "contract (pure formatter, no runtime)",
+          "[spark][runtime]") {
+    EvalTimingRecord r;
+    r.event_id = "evt-1";
+    r.domain = OutboxDomain::Compliance;
+    r.detect_wall_ns = 100;
+    r.detect_mono_ns = 200;
+    r.accepted = true;
+    r.fire_wall_ns = 300;
+    r.fire_mono_ns = 400;
+    // trigger left absent (std::nullopt by default)
+
+    const auto line_absent = format_eval_timing_line(r);
+    CHECK(line_absent.find("event_id=evt-1") != std::string::npos);
+    CHECK(line_absent.find("domain=compliance") != std::string::npos);
+    CHECK(line_absent.find("detect_wall_ns=100") != std::string::npos);
+    CHECK(line_absent.find("detect_mono_ns=200") != std::string::npos);
+    CHECK(line_absent.find("accepted=1") != std::string::npos);
+    CHECK(line_absent.find("fire_wall_ns=300") != std::string::npos);
+    CHECK(line_absent.find("fire_mono_ns=400") != std::string::npos);
+    CHECK(line_absent.find("trigger_present=0") != std::string::npos);
+    CHECK(line_absent.find("mechanism_wall_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("handler_wall_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("handler_mono_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("seq=-1") != std::string::npos);
+    // "absent" must never render as a fabricated zero a benchmark parser could mistake
+    // for "observed, zero-latency".
+    CHECK(line_absent.find("mechanism_wall_ns=0") == std::string::npos);
+    CHECK(line_absent.find("handler_wall_ns=0") == std::string::npos);
+    CHECK(line_absent.find("handler_mono_ns=0") == std::string::npos);
+    CHECK(line_absent.find("seq=0") == std::string::npos);
+
+    EvalTrigger trig;
+    trig.mechanism_wall_ns = 10;
+    trig.handler_wall_ns = 20;
+    trig.handler_mono_ns = 30;
+    trig.seq = 7;
+    r.trigger = trig;
+    r.accepted = false;
+    r.fire_wall_ns = 0;
+    r.fire_mono_ns = 0;
+
+    const auto line_present = format_eval_timing_line(r);
+    CHECK(line_present.find("accepted=0") != std::string::npos);
+    CHECK(line_present.find("trigger_present=1") != std::string::npos);
+    CHECK(line_present.find("mechanism_wall_ns=10") != std::string::npos);
+    CHECK(line_present.find("handler_wall_ns=20") != std::string::npos);
+    CHECK(line_present.find("handler_mono_ns=30") != std::string::npos);
+    CHECK(line_present.find("seq=7") != std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatter)",
+          "[spark][runtime]") {
+    SendTimingRecord r;
+    r.event_id = "evt-9";
+    r.sent = true;
+    r.wire_wall_ns = 555;
+    const auto line = format_send_timing_line(r);
+    CHECK(line.find("event_id=evt-9") != std::string::npos);
+    CHECK(line.find("sent=1") != std::string::npos);
+    CHECK(line.find("wire_wall_ns=555") != std::string::npos);
+
+    r.sent = false;
+    const auto line2 = format_send_timing_line(r);
+    CHECK(line2.find("sent=0") != std::string::npos);
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {

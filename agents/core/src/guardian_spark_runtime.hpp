@@ -53,6 +53,10 @@
  * locks (e.g. outbox_size()) since outbox_mu_ is released across it, but it must NOT
  * re-enter drain() (drain_mu_ is non-recursive).
  *
+ * last_eval_timings_mu_ (#4606 criterion-10) is a LEAF: taken standalone, briefly, at the
+ * very end of evaluate_key() (after eval_lk and registry_mu_ have both already released)
+ * and in last_eval_timings_for_test(); never held while taking any lock above.
+ *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
  * evaluate_key is rung 4; the unified reconcile op (merge / full-sync / kill-
@@ -66,6 +70,7 @@
 #include "guardian_journal_format.hpp" // JournalRecord + caps (item 7 PR-Ag)
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
+#include "guardian_spark_timing.hpp" // #4606 criterion-10: EvalTrigger, EvalTimingRecord
 
 #include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
@@ -401,7 +406,12 @@ public:
     /// Evaluate every active rule on `key` against a single live re-read. The sole
     /// eval path for all reasons. Serialised per key; commits a verdict to the
     /// outbox (or a health event on Unknown). No-op if stopping or the key is gone.
-    void evaluate_key(const std::string& key, EvalReason reason);
+    /// `trigger` (#4606 criterion-10): the T_mechanism/T_handler context this pass was
+    /// invoked with, when it was invoked from on_event() for a real Fired SparkEvent;
+    /// absent for a Convergence-reason (or other no-event) pass. Purely diagnostic —
+    /// never consulted by any eval/dispatch/commit decision.
+    void evaluate_key(const std::string& key, EvalReason reason,
+                       std::optional<EvalTrigger> trigger = std::nullopt);
 
     /// #2818 poll backstop: scan every armed key and query the backend's
     /// subscription_health() for it, cheaply (no I/O). A Dead subscription is
@@ -889,6 +899,10 @@ public:
     /// Test seam: rule_ids on `key` that have been demoted off the priority lane
     /// (M1 item (b)). A subset of pending_initial(key).
     [[nodiscard]] std::vector<std::string> pending_demoted_for_test(const std::string& key) const;
+    /// #4606 criterion-10: the EvalTimingRecord batch staged by the MOST RECENT
+    /// evaluate_key() call, for direct unit-test inspection (field order / two-entry /
+    /// accepted=false cases) without depending on log capture. Test-only.
+    [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
     [[nodiscard]] bool stopping() const;
 
     /// A live status snapshot for one currently-attached rule, reflecting the
@@ -2188,6 +2202,14 @@ private:
     std::atomic<std::uint64_t> priority_demoted_{0};     ///< M1 item (b): rule_ids demoted off the 5s
                                                          ///< priority lane (pending_demote_sweeps /
                                                          ///< pending_demote_ms). Lock-free, same call site.
+
+    /// #4606 criterion-10: the most recent evaluate_key() call's staged EvalTimingRecord
+    /// batch, for last_eval_timings_for_test(). A LEAF lock, never held while taking any
+    /// other lock this class defines (registry_mu_, outbox_mu_, drain_mu_, a PerKey's
+    /// eval_mu) — needed because eval_mu is PER-KEY (sibling keys evaluate concurrently),
+    /// so writing this cross-key member under only the calling pass's eval_mu would race.
+    mutable std::mutex last_eval_timings_mu_;
+    std::vector<EvalTimingRecord> last_eval_timings_;
 };
 
 /// R5.7 (docs/spark-stage2-guardian-consumer-design.md): human-readable rendering
