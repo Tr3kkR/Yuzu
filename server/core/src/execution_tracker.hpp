@@ -327,6 +327,14 @@ public:
     std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
     get_agent_statuses_for_executions_checked(
         const std::vector<std::string>& execution_ids) const;
+    /// Best-effort convenience wrapper over `get_children_checked` with
+    /// `scope = nullopt` -- test-only production usage today (no confined
+    /// caller). Discards BOTH the degrade signal (a pool/query failure
+    /// collapses to the same empty vector a genuinely childless parent
+    /// returns) and `ExecutionChildrenResult::truncated` -- silently, since
+    /// no caller today reads past `kExecutionChildrenCap` rows to notice. A
+    /// future caller that needs either signal should call
+    /// `get_children_checked` directly rather than add it here.
     std::vector<Execution> get_children(const std::string& parent_id) const;
     /// #3789: degrade-distinguishable twin of `get_children`, for the
     /// migrated `/api/executions/{id}/children` route — `nullopt` on a

@@ -8007,6 +8007,45 @@ TEST_CASE("MCP list_schedules: enabled_only wrong JSON type is rejected, not sil
           std::string::npos);
 }
 
+// PR #4623 external review fix (#2146 A2-R1): the same defect class as
+// enabled_only's wrong-type test immediately above, but for definition_id --
+// the pre-fix `param_str` idiom silently treated a present-but-wrong-type
+// value (a JSON number) as absent, so the caller who thinks they narrowed to
+// one definition_id got every schedule back with no error.
+// param_string_strict (mcp_server.cpp, sibling of param_int_strict/
+// param_bool_strict) closes this the same way.
+TEST_CASE("MCP list_schedules: definition_id wrong JSON type is rejected -- not silently "
+          "dropped (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule sched;
+    sched.name = "sched-definition-id-strict";
+    sched.definition_id = "def-2146-mcp-strict-defid";
+    sched.frequency_type = "once";
+    sched.created_by = "admin";
+    auto sched_id = engine.create_schedule(sched);
+    REQUIRE(sched_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":773,"params":{"name":"list_schedules",)"
+        R"("arguments":{"definition_id":42}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    // Pre-fix: this was a `result` with `structuredContent.schedules`
+    // containing every schedule (the filter silently dropped) and no error.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
+}
+
 // #3290 Phase 2: query_installed_software's per-tool blanket
 // deny_fleet_wide_service_scoped call (the guardian-confinement-2298 Gate
 // 2/4/6 finding this test used to pin) is RETIRED — confinement is now

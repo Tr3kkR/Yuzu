@@ -935,25 +935,14 @@ TEST_CASE("ExecutionTracker: get_children_checked's cap boundary is the "
     }
 }
 
-// #2146 A2-R1 Gate 8 fix: get_children_checked's `WHERE parent_id = $1` query
-// had no supporting index. Asserts the migration actually created it, rather
-// than trusting the migration literal by inspection.
-TEST_CASE("ExecutionTracker: migration creates a supporting index on "
-          "executions(parent_id) (#2146 A2-R1 Gate 8 fix)",
-          "[pg][execution_tracker]") {
-    yuzu::test::ExecutionTrackerPg tracker_bundle;
-    REQUIRE(tracker_bundle->is_open()); // forces the migration ladder to run
-
-    pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
-    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-    pg::PgResult res =
-        pg::exec_params(conn.get(),
-                        "SELECT 1 FROM pg_indexes WHERE schemaname = 'execution_tracker' "
-                        "AND indexname = 'idx_executions_parent_id'",
-                        std::vector<std::string>{});
-    REQUIRE(res.status() == PGRES_TUPLES_OK);
-    CHECK(PQntuples(res.get()) == 1);
-}
+// #2146 A2-R1 Gate 8 review round: a migration adding a supporting index on
+// executions(parent_id) was authored and then removed before this PR merged
+// (adversarial review found it a docs/postgres-store-playbook.md
+// non-transactional-migration policy-floor violation on an already-non-empty
+// table -- see the comment above execution_tracker.cpp's kMigrations v5 entry
+// and #4624). get_children_checked's query is therefore a deliberate,
+// disclosed sequential scan today; the test below pins its statement_timeout
+// bound instead of an index-presence assertion.
 
 // #2146 A2-R1 Gate 8 fix: get_children_checked's query ran under the pool's
 // 30s default statement_timeout, vastly exceeding the ~1.5s acquire budget

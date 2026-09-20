@@ -297,6 +297,23 @@ std::optional<bool> param_bool_strict(const nlohmann::json& params, const char* 
     return params[key].get<bool>();
 }
 
+/// String sibling of `param_int_strict`/`param_bool_strict` above (same
+/// defect class -- PR #4623 external review, #2146 A2-R1): `param_str`
+/// silently treats a present-but-wrong-type value (e.g. `{"definition_id":
+/// 42}`) as ABSENT -- the filter is dropped rather than rejected, so a
+/// caller who thinks they narrowed the query gets the unfiltered result
+/// instead. Same nullopt-on-present-wrong-type contract as its siblings:
+/// present+string -> the value; present+wrong-type -> `nullopt` (caller
+/// answers `kInvalidParams`); absent -> `def` (omitted is not malformed).
+std::optional<std::string> param_string_strict(const nlohmann::json& params, const char* key,
+                                               const std::string& def = "") {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_string())
+        return std::nullopt;
+    return params[key].get<std::string>();
+}
+
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
@@ -10811,7 +10828,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 // /api/v1/schedules, workflow_routes.cpp) and the legacy
                 // GET /api/schedules route already populate.
                 ScheduleQuery sq;
-                sq.definition_id = param_str(args, "definition_id");
+                // PR #4623 external review fix (#2146 A2-R1): was the bare
+                // `param_str`, which silently treats a present-but-wrong-type
+                // `definition_id` (e.g. a JSON number) as absent -- the exact
+                // defect class param_bool_strict below was written to close
+                // for `enabled_only`, not originally extended to this filter.
+                const auto definition_id_opt =
+                    param_string_strict(args, "definition_id", sq.definition_id);
+                if (!definition_id_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "definition_id must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                sq.definition_id = *definition_id_opt;
                 // Governance fix (#2146 A2-R1): was the bare
                 // `args.contains(...) && args[...].is_boolean()` idiom, which
                 // silently treats a present-but-wrong-type value (e.g. the

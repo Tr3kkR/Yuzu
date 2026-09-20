@@ -50,14 +50,21 @@ constexpr std::chrono::milliseconds kWriteTimeout{2000};
 constexpr int kExecutionChildrenCap = 100;
 
 // #2146 A2-R1 Gate 8 fix: get_children_checked's `WHERE parent_id = $1`
-// query had no supporting index and ran under the pool's 30s default
-// statement_timeout_ms (pg_pool.hpp), vastly exceeding kReadTimeout's
-// ~1.5s acquire budget every other reader of this shared pool_ (including
-// rbac_store_, which shares one pg_pool_ singleton with this store) assumes
-// -- a slow unindexed scan here could stall connections other subsystems
-// need. SET LOCAL scopes a tighter timeout to this one statement inside its
-// own transaction, matching the shared idiom established by
-// software_licensing_store.cpp / app_usage_store.cpp / app_perf_rollup.cpp.
+// query has no supporting index (a plain CREATE INDEX migration for it was
+// authored and removed -- see the comment above kMigrations' v5 entry and
+// #4624 -- a policy-floor violation on an already-non-empty table, not a
+// deferred style choice) and would otherwise run under the pool's 30s
+// default statement_timeout_ms (pg_pool.hpp), vastly exceeding
+// kReadTimeout's ~1.5s acquire budget every other reader of this shared
+// pool_ (including rbac_store_, which shares one pg_pool_ singleton with
+// this store) assumes -- a slow sequential scan here could stall
+// connections other subsystems need. SET LOCAL scopes a tighter timeout to
+// this one statement inside its own transaction, matching the shared idiom
+// established by software_licensing_store.cpp / app_usage_store.cpp /
+// app_perf_rollup.cpp. This bound matters MORE without an index, not less
+// -- an unindexed scan is the slower case a timeout needs to catch -- so it
+// stays in place unconditionally on top of the row cap below, independent
+// of whether/when #4624's index ships.
 constexpr const char* kChildrenStatementTimeout = "1500ms";
 
 std::string generate_id() {
@@ -383,23 +390,31 @@ const std::vector<pg::PgMigration>& migrations() {
          "  DEFAULT pg_current_xact_id();"
          "ALTER TABLE event_outbox ADD COLUMN origin_replica TEXT NOT NULL DEFAULT '';"
          "CREATE INDEX idx_event_outbox_wxid ON event_outbox(w_xid, event_id);"},
-        // #2146 A2-R1 Gate 8 fix: supporting index for get_children_checked's
-        // `WHERE parent_id = $1` query, which previously ran as a full scan
-        // of `executions`. Plain (non-CONCURRENT) CREATE INDEX is this
-        // store's only option, not a style choice: every migration here runs
-        // inside PgMigrationRunner's own explicit BEGIN/COMMIT transaction
-        // (pg_migration_runner.cpp), and Postgres refuses `CREATE INDEX
-        // CONCURRENTLY` inside a transaction block -- see scim_store.cpp's
-        // identical precedent/rationale. Unlike this file's earlier
-        // additions (v1's indexes are born with their table; v3's
-        // idx_concurrency_claims_claimed_at was added while that table had
-        // zero production rows), `executions` can already be non-empty on an
-        // upgrading install, so this migration's plain CREATE INDEX takes a
-        // SHARE lock on it for the build (blocks concurrent writers, not
-        // readers, per Postgres's own CREATE INDEX locking rules) -- an
-        // accepted one-time operational cost, since a CONCURRENT build is
-        // not an option this migration mechanism can offer.
-        {6, "CREATE INDEX IF NOT EXISTS idx_executions_parent_id ON executions(parent_id);"},
+        // #2146 A2-R1 Gate 8 review round: a v6 migration adding a supporting
+        // index for get_children_checked's `WHERE parent_id = $1` query was
+        // authored here (a plain, non-CONCURRENT CREATE INDEX) and REMOVED
+        // before this PR merged -- adversarial review (Codex + Kimi-K3)
+        // correctly flagged it as a docs/postgres-store-playbook.md policy-
+        // floor violation: `executions` "can already be non-empty on an
+        // upgrading install" (this file's own admission at the time), and
+        // the playbook's "Non-transactional migrations (the deferred kind)"
+        // section is explicit that an index on an already-large table
+        // during a live rolling upgrade needs the non-transactional
+        // migration kind, which "must be built ... before such a migration
+        // ships. Do not weaken the transactional default to sneak one in" --
+        // that kind does not exist yet (tracked generally by #4432, for a
+        // different store). `get_children_checked` therefore stays an
+        // unindexed sequential scan today, bounded by kExecutionChildrenCap
+        // and kChildrenStatementTimeout (both above) -- a disclosed
+        // performance tradeoff, not a correctness gap. #4624 tracks adding
+        // `idx_executions_parent_id ON executions(parent_id)` here, through
+        // the non-transactional kind, once #4432 lands. Version 6 is
+        // deliberately NOT reserved for it -- this v6 never shipped (no
+        // release ever recorded it in schema_meta), and PgMigrationRunner
+        // only requires each store's own migrations() vector to be strictly
+        // increasing, not contiguous, so the next migration added here
+        // simply takes whatever the next free version number is at that
+        // time.
     };
     return kMigrations;
 }
