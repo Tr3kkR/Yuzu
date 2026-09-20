@@ -1187,30 +1187,42 @@ completes and is not a valid proxy for it. The diagnostic script's completeness 
 own log line from that count, since a no-op returns the same `rules_size()` figure
 without a single real arm occurring.
 
-**Rung 9c PR-6 item 1 — a positive-establishment channel now exists (Service-scoped),
-2026-09-18.** R5.7 above still needs its own T2 arm-confirmation timestamp from the
-runtime, but the raw fact it would need to read from is no longer entirely missing at
-the mechanism layer: `SparkEngine::subscription_establishment(id)` is a pull query
-returning `armed_at` / an optional `established_at` (first Notification-coverage report
-for the subscription's CURRENT incarnation, never re-stamped by a later recovery) /
+**Rung 9c PR-6 item 1 — a positive-establishment channel now exists (Service first;
+Registry and File followed under #4340), 2026-09-18.** R5.7 above still needs its own T2
+arm-confirmation timestamp from the runtime, but the raw fact it would need to read from is
+no longer entirely missing at the mechanism layer: `SparkEngine::subscription_establishment(id)`
+is a pull query returning `armed_at` / an optional `established_at` (first Notification-coverage
+report for the subscription's CURRENT incarnation, never re-stamped by a later recovery) /
 the mechanism's current tri-state `SparkCoverage` (`None`/`Notification`/`Poll`). Wired
-for the **Service** mechanism only, on both platforms (Linux sd-bus, Windows SCM) — a
-Service watch's `watch()` call returning success carries zero information about
-establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged` registration is
-what this channel actually observes), so it was the mechanism with the most acute gap.
-**Registry and File landed (#4340, 2026-09-20).** Both mechanisms now override
-`watch_incarnation()`/`set_established_sink()` the same way Service does above,
-mirroring its shape byte-for-byte (mark under mu_ at every coverage-transition site,
-stage at the sweep visit, dispatch in `run_off_lock()` with mu_ released,
-established-before-actions ordering). One asymmetry the two do NOT share with each
-other, load-bearing for any consumer comparing their `coverage` streams: Registry's
-`RegNotifyChangeKeyValue` is one-shot, so coverage genuinely FLAPS
-`Notification -> None -> Notification` on every consumed Target-mode fire (a real
-notify-then-rearm cycle, not a bug); File's `ReadDirectoryChangesW` reissue is
-synchronous on an ordinary fire, so its coverage stays `Notification` across it and
-only drops on a genuine backend failure, teardown, or parent-directory loss. A
-consumer that assumes the two mechanisms' `coverage` streams mean the same thing is
-wrong without accounting for this.
+first for Service (both platforms: Linux sd-bus, Windows SCM); Registry and File followed
+under #4340 (Windows only). A Service watch's `watch()` call returning success carries zero
+information about establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged`
+registration is what this channel actually observes), so it was the mechanism with the most
+acute gap.
+**Registry and File: implemented (#4340, 2026-09-20; not yet merged).** Both mechanisms
+override `watch_incarnation()`/`set_established_sink()` the way Service does. They follow
+Service's shape (seal the sink first in `start()`, mark coverage transitions under `mu_`, stage
+in the sweep visit, dispatch in `run_off_lock()` with `mu_` released, established reports
+before that pass's emits/faults) minus these differences: no `key_epoch` (the staged
+incarnation is the identity check); no `Poll` state (Service only); no worker-death
+invalidation (Service invalidates every key to `None` when its worker throws; the Registry
+sweeper and the File worker survive an exception); a per-call try/catch plus an
+`established_failed` counter around the sink (Service has no per-call catch, so a throwing
+sink there reaches its `run()` catch); no Service-style `fired` guard on adoption (Registry
+re-reports the watch's raw coverage, so an adoption landing between the OS signal and
+`on_fire()` taking `mu_` can briefly report `Notification` for a watch that has already
+fired, with `None` following); and File keeps a per-KEY incarnation over per-DIRECTORY
+coverage.
+One asymmetry the two do NOT share with each other, load-bearing for any consumer comparing
+their `coverage` streams: Registry's `RegNotifyChangeKeyValue` is one-shot, so coverage
+genuinely FLAPS `Notification -> None -> Notification` on every consumed Target-mode fire (a
+real notify-then-rearm cycle, not a bug); a deletion fire ends at `None` (Target -> Ancestor,
+no `Notification` until the key reappears). File's `ReadDirectoryChangesW` reissue is
+synchronous on an ordinary fire, so its coverage stays `Notification` across it and only
+drops on a genuine backend failure (a failed read completion, reissue or re-probe) or loss of
+the watched (parent) directory; never on `unwatch()` or an orderly `stop()`, which are
+deliberately unreported (see R4). A consumer that assumes the two mechanisms' `coverage`
+streams mean the same thing is wrong without accounting for this.
 **established_at is per-INCARNATION, not per-key, carried forward for R5.7's own
 future use of this channel (and for any future criterion 10 built on it):** a
 fire-triggered re-arm on the SAME incarnation (Registry's ordinary fire path above)
@@ -1220,19 +1232,37 @@ and the re-arm's `Notification` land on consecutive sweep passes when the re-arm
 probe resolves promptly (the sweep drains the `None` marker before it commits the
 re-arm, and the commit's own `Notification` marker is only picked up by the next
 pass, never the same one), and may then be too close together for a pull query to
-observe the transient `None`. A consumer that
-needs to observe "coverage was lost and regained across a re-arm cycle" must either
-disarm+arm (mints a fresh incarnation, and so a fresh `established_at`) or install a
-mechanism-direct `set_established_sink()` observer in its own harness — do not build
-that on polling `subscription_establishment()` for the re-arm half.
+observe the transient `None`. A consumer that needs to observe "coverage was lost and
+regained across a re-arm cycle" must install a mechanism-direct `set_established_sink()`
+observer in its own harness — do not build that on polling `subscription_establishment()`
+for the re-arm half. Do not build it on disarm+arm either: a disarm of the LAST subscriber
+followed by an arm mints a fresh incarnation (a dedup arm onto an already-armed key shares
+the existing one), and when a concurrent re-arm lands before the engine's `unwatch()` the
+engine skips it and the mechanism ADOPTS the live watch under the new incarnation,
+re-reporting its CURRENT coverage stamped `now()` — a re-baseline, not an observation of
+loss and regain.
+**Timestamp semantics:** `established_at` is the mechanism's commit time, EXCEPT adoption
+and join reports (Registry adoption; File join or coalesce), which are stamped `now()` so a
+first-wins `established_at` cannot predate its own incarnation's `armed_at`; an adopted key's
+or joined sibling's `established_at` can therefore be up to one sweep pass later than the true
+establishment. This matters for any latency measurement.
+**Ordering:** within ONE dispatch pass the establishment reports are delivered before that
+pass's own emits/faults. That is all it guarantees. A commit stages its synthetic Emit in the
+same visit but re-marks its `Notification` after that visit's drain, so the `Notification` is
+staged one pass AFTER the Emit; Registry's immediate emit from `on_fire()` is not covered
+either. It is not a general "the report is visible before any event" guarantee.
+**Ancestor mode:** the watch is on the nearest existing ancestor (the target is absent) and
+WILL detect the target's appearance, yet `coverage` is `None` — a stable NON-loss. An absent
+target's `established_at` therefore stays unset; a latency criterion must censor such
+subscriptions, not read them as deaf.
 **Latency caveat, carried forward for R5.7's own future use of this channel:**
 `established_at` is stamped by the MECHANISM at the point it commits successful
-notification coverage, not at the moment `report_established` is dispatched to a
-consumer, and Windows's own Service dispatch is bounded by `kServicePollCadence` (a
-50ms wait CAP the mechanism's alertable wait clamps to whenever any probe is
-outstanding — not a fixed delay; commands/APCs can wake the thread earlier). Do not
-compare Service's poll-mediated establishment timestamp against Registry's or File's
-own caller-wait-bounded path (both landed, #4340) as if they measured the same thing.
+notification coverage (adoption and join excepted, above), not at the moment
+`report_established` is dispatched to a consumer. All three slow paths poll on a 50 ms
+cadence (`kServicePollCadence`, `kRegSweepCadence`, `kFileSweepCadence`): each is a wait CAP
+the mechanism's own wait clamps to whenever any probe is outstanding — not a fixed delay;
+commands, nudges and APCs wake it earlier. Dispatch of a report is bounded the same way on
+all three mechanisms.
 **Windows live-registration-retry blind spot, carried forward for R5.7's own
 future use of this channel:** on a live-registration failure that occurs
 AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
@@ -1249,7 +1279,7 @@ invisible). A future R5.7 consumer treating Windows's `None` in this
 specific window as "confirmed absent" rather than "not yet re-confirmed"
 would be wrong; do not conflate the two without a discriminating signal
 Spark does not currently have (see also the `SparkCoverage::None` ambiguity
-note for Registry/File, landed as #4340 — Registry's `None` is very often a
+note for Registry/File, implemented under #4340 — Registry's `None` is very often a
 genuine one-shot-notify-consumed flap rather than a Service-style "not yet
 re-confirmed" gap; a consumer must not conflate the two without checking
 which mechanism produced the report, per the asymmetry noted above).
@@ -1259,6 +1289,23 @@ subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A
 R5.7 consumer that cares whether the engine is still live checks `is_running()` itself
 (the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
 post-stop `established_at`/`coverage` pair as current live coverage.
+
+**Consumer preconditions and known residuals (Registry and File, #4340).** (a) `coverage` is
+the LAST DELIVERED value, not an authoritative live state. (b) It can go stale in two known
+ways: a dropped report (the sink threw; the production engine sink takes only the engine lock
+and cannot realistically throw) and a Registry sweeper in persistent failure before it flips
+`inert` (about three consecutive failed passes). A consumer must AND
+`subscription_health() == Healthy` with `!stats_by_type()[type].inert` (both on `SparkEngine`)
+before trusting a `Notification`. (c) `Notification` means the mechanism holds the watch and
+issued the read (Registry: the key exists and the notify is armed; File: the parent directory
+handle is watched, even when the file itself is absent). It is a probe result, NOT an
+end-to-end detection guarantee; whether File's handle-based watch reports the rename of the
+watched directory as a loss is not verified. (d) `coverage == None` with `established_at`
+unset means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily
+deaf); with `established_at` set it means a loss or, for Registry, the one-shot flap. (e) The
+first production consumer (flip-gate criterion 10 / #4606) must re-derive the stale-cache
+severity and cover these residuals. (f) There is no operator surface: a dropped report is
+counted in the `established_failed` debug counter (a test seam).
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
 calls for is built and run. T2 is a new runtime-side log line at the LAST statement of

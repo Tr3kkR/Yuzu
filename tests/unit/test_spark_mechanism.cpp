@@ -4604,10 +4604,9 @@ std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind ki
 // ── #4340 (rung 9c PR-6 item 1): Registry establishment-signal ───────────────
 //
 // Mirrors spark_service.cpp's shipped M3 shape (#3840 PR-B3). Every case here
-// is DGRHP-only (the real mechanism is Windows-only); see the delivery plan
-// (~/.claude/plans/spark-4340-registry-file-establishment-signal-DELIVERY-PLAN.md
-// §5) for the RF-1..RF-10 catalogue and the mutation checklist this section's
-// commit body records results for.
+// only runs on Windows (the real mechanism is Windows-only). RF-1..RF-11 are
+// the Registry establishment-signal cases; the FF- cases below are the File
+// twins.
 
 TEST_CASE("Registry mechanism (Windows, direct): set_established_sink seals at start(), still "
           "sealed after stop() (#4340 RF-1)",
@@ -4672,7 +4671,7 @@ TEST_CASE("Registry spark (real mechanism): an absent target watches its ancesto
     REQUIRE(sub.has_value());
     // Ancestor-mode establishment settles quickly too (the parent exists),
     // but it must NEVER report Notification for the absent target - only
-    // None, unconditionally, per the mode gate (MF1).
+    // None, unconditionally, per the mode gate.
     std::this_thread::sleep_for(300ms);
     auto est = engine.subscription_establishment(*sub);
     REQUIRE(est.has_value());
@@ -4721,10 +4720,11 @@ TEST_CASE("Registry spark (real mechanism): an ordinary fire re-arms without mov
     REQUIRE(est->established_at.has_value());
     const auto stamped = *est->established_at;
 
-    // RegNotifyChangeKeyValue is one-shot (correction C): the write consumes
+    // RegNotifyChangeKeyValue is one-shot: the write consumes
     // it, flapping coverage None -> Notification across the re-arm - a genuine
     // transition the pull query below is not guaranteed to observe mid-flight
-    // (hand-off note §10), so this asserts only the settled before/after
+    // (the None and the re-arm's Notification land on consecutive sweep
+    // passes), so this asserts only the settled before/after
     // states, not the transient None.
     const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
     a.write(1);
@@ -4764,7 +4764,7 @@ TEST_CASE("Registry spark (real mechanism): a parked initial probe leaves covera
 
     const auto spec = registry_spec("HKCU", a.sub);
     auto sub = engine.arm(*c, spec);
-    REQUIRE(sub.has_value()); // success-with-pending (correction A: the local
+    REQUIRE(sub.has_value()); // success-with-pending (the call's local
                               // discards is never dispatched - only the mark on
                               // `w` itself, which survives, carries the report)
     REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
@@ -4895,7 +4895,7 @@ TEST_CASE("Registry spark (real mechanism): a disarm racing a re-arm (adoption) 
     auto est = engine.subscription_establishment(*sub2);
     REQUIRE(est.has_value());
     REQUIRE(est->established_at.has_value());
-    CHECK(*est->established_at >= est->armed_at); // MF4: never predates the adopting arm
+    CHECK(*est->established_at >= est->armed_at); // never predates the adopting arm
     CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
 
     engine.disarm(*sub2);
@@ -4938,7 +4938,7 @@ TEST_CASE("Registry spark (real mechanism): a failed re-arm reports None until t
         ctl.backend_retry_base = 150ms;
         REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
     }
-    a.write(1); // consumes the notify: on_fire marks None (R6); the re-arm probe throws
+    a.write(1); // consumes the notify: on_fire marks None; the re-arm probe throws
     REQUIRE(eventually(
         [&] {
             auto e = engine.subscription_establishment(*sub);
@@ -4994,7 +4994,7 @@ TEST_CASE("Registry spark (real mechanism): a present key establishes fast enoug
     REQUIRE(est->established_at.has_value());
     // The fast-commit path (watch_incarnation's own bounded wait resolves the
     // probe before the caller budget expires) nudges the sweeper immediately
-    // (correction B) rather than leaving the report for next_wake_locked()'s
+    // rather than leaving the report for next_wake_locked()'s
     // otherwise-applicable 1h idle ceiling. Bounded generously against CI
     // scheduling noise - the point is "not an hour", not a tight bound.
     const auto latency = *est->established_at - est->armed_at;
@@ -5012,7 +5012,7 @@ TEST_CASE("Registry mechanism (Windows, direct): the establishment sink reports 
     // Direct (no engine) so a real SparkIncarnation token can be supplied and
     // every report's identity checked - the engine-level pull query
     // (subscription_establishment) cannot reliably observe a transient None
-    // mid-flap (hand-off note §10), and it never exposes dispatch ORDER at
+    // mid-flap, and it never exposes dispatch ORDER at
     // all. Ordering against the SYNTHETIC (resync) emit specifically - not
     // the immediate on_fire emit, which races the sweeper's own wake on a
     // different thread and is not deterministically orderable - is proven by
@@ -5066,7 +5066,7 @@ TEST_CASE("Registry mechanism (Windows, direct): the establishment sink reports 
     ctl.probe_hook = gate.hook_for(a.sub);
     REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
 
-    a.write(1); // consumes the one-shot notify: on_fire marks None (R6) and
+    a.write(1); // consumes the one-shot notify: on_fire marks None and
                 // fires the immediate emit; the re-arm probe launches and parks.
     REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
     REQUIRE(eventually(
@@ -5114,7 +5114,7 @@ TEST_CASE("Registry mechanism (Windows, direct): an establishment report and an 
     // RF-10 above pins ordering ACROSS sweep passes only (it parks the re-arm
     // probe precisely so the None report and the synthetic emit land in
     // different passes) - a swap of run_off_lock()'s two dispatch loops would
-    // still pass it (adversarial-review finding on #4340). This case forces
+    // still pass it. This case forces
     // both into ONE pass, deterministically and without any sleep:
     //  * the initial probe is parked, so watch_incarnation() returns
     //    success-with-pending and, in ONE mu_ hold, publishes w->call, marks
@@ -5129,7 +5129,7 @@ TEST_CASE("Registry mechanism (Windows, direct): an establishment report and an 
     //    call is a no-op (no grace check, nothing due).
     // Both entries therefore belong to the same run_off_lock() call, and one
     // shared, mutex-guarded log records the real dispatch order. A Fault
-    // stands in for the Emit the finding names because an Emit is only ever
+    // stands in for an Emit because an Emit is only ever
     // staged by a commit, which re-marks Notification due strictly AFTER the
     // drain (never the same visit) - and Fault and Emit share the one
     // work.actions loop, so this pins the identical established-before-
@@ -6356,12 +6356,12 @@ TEST_CASE("File spark (real mechanism): a shared-ancestor storm keeps concurrent
 
 // ── #4340 (rung 9c PR-6 item 1): File establishment-signal ───────────────────
 //
-// Mirrors the Registry RF-1..RF-10 catalogue above (§4602) and spark_service.
-// cpp's shipped M3 shape. Every case here is DGRHP-only. Correction C (File
-// does NOT lose coverage on an ordinary fire - the reissue is synchronous,
-// unlike Registry's one-shot RegNotifyChangeKeyValue) means FF-4/FF-10 use a
-// parent-delete+recreate cycle / a forced notify_fail_hook loss respectively,
-// never a plain write, to exercise a genuine coverage transition.
+// Mirrors the Registry RF- cases above and spark_service.cpp's shipped M3
+// shape. Every case here only runs on Windows. File does NOT lose coverage on
+// an ordinary fire (the reissue is synchronous, unlike Registry's one-shot
+// RegNotifyChangeKeyValue), so FF-4/FF-10 use a parent-delete+recreate cycle /
+// a forced notify_fail_hook loss respectively, never a plain write, to
+// exercise a genuine coverage transition.
 
 TEST_CASE("File mechanism (Windows, direct): set_established_sink seals at start(), still "
           "sealed after stop() (#4340 FF-1)",
@@ -6431,7 +6431,7 @@ TEST_CASE("File spark (real mechanism): an absent parent dir watches its ancesto
 
     // Ancestor-mode establishment settles quickly too (root exists), but it
     // must NEVER report Notification for the absent target - only None,
-    // unconditionally, per the mode gate (MF1).
+    // unconditionally, per the mode gate.
     std::this_thread::sleep_for(300ms);
     auto est = engine.subscription_establishment(*sub);
     REQUIRE(est.has_value());
@@ -6574,9 +6574,9 @@ TEST_CASE("File mechanism (Windows, direct): a published-pending initial probe r
           "[spark][established][windows]") {
     // FF-5 above reads only SparkEngine::subscription_establishment(), whose
     // armed-entry cache DEFAULTS to None: it stays green if the mechanism
-    // never reports the published-pending None at all (adversarial-review
-    // finding on #4340: the File branch once omitted mark_coverage_locked()
-    // where Registry's identical branch has it). Only a direct sink observer,
+    // never reports the published-pending None at all (the File branch once
+    // omitted mark_coverage_locked() where Registry's identical branch has
+    // it). Only a direct sink observer,
     // as RF-10/FF-10 use, can tell an explicit report from an absent one.
     ScratchDir a("est_direct_pending");
     FileProbeGate gate; // declared BEFORE mech: outlives every worker that touches it
@@ -6668,8 +6668,8 @@ TEST_CASE("File spark (real mechanism): a deterministic completion failure repor
     REQUIRE(est->established_at.has_value());
     const auto stamped = *est->established_at;
 
-    // Force the NEXT real completion for this dir to be reported !ok
-    // (F6): a genuine coverage loss distinct from an ordinary fire.
+    // Force the NEXT real completion for this dir to be reported !ok: a
+    // genuine coverage loss distinct from an ordinary fire.
     std::atomic<bool> armed{true};
     {
         FileMechanismTestControls ctl;
@@ -6754,7 +6754,7 @@ TEST_CASE("File spark (real mechanism): a disarm racing a re-arm (adoption) stil
     auto est = engine.subscription_establishment(*sub2);
     REQUIRE(est.has_value());
     REQUIRE(est->established_at.has_value());
-    CHECK(*est->established_at >= est->armed_at); // MF4: never predates the adopting arm
+    CHECK(*est->established_at >= est->armed_at); // never predates the adopting arm
     CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
 
     engine.disarm(*sub2);
@@ -6880,7 +6880,7 @@ TEST_CASE("File mechanism (Windows, direct): the establishment sink reports the 
     // Direct (no engine) so a real SparkIncarnation token can be supplied and
     // every report's identity checked. Unlike Registry's RF-10 (which parks
     // the RE-ARM probe to prove ordering), File's ordinary fire never even
-    // launches a probe (correction C: the reissue is synchronous) - the
+    // launches a probe (the reissue is synchronous) - the
     // deterministic loss here comes from notify_fail_hook, mirroring FF-6.
     ScratchDir a("est_direct_seq");
     auto mech = make_file_mechanism();
@@ -6920,17 +6920,17 @@ TEST_CASE("File mechanism (Windows, direct): the establishment sink reports the 
     }
     CHECK(emits.load() == 0);
 
-    // An ORDINARY write (correction C): the reissue is synchronous, so this
+    // An ORDINARY write: the reissue is synchronous, so this
     // must produce an emit but NO additional established report.
     a.write("ordinary change");
     REQUIRE(eventually([&] { return emits.load(std::memory_order_acquire) >= 1; }, 8000ms));
     std::this_thread::sleep_for(200ms);
     {
         std::lock_guard lk(mu);
-        REQUIRE(est_seq.size() == 1); // still just the initial commit - F7x
+        REQUIRE(est_seq.size() == 1); // still just the initial commit
     }
 
-    // Force the NEXT completion for this dir to be reported !ok (F6): a
+    // Force the NEXT completion for this dir to be reported !ok: a
     // genuine, deterministic coverage loss.
     std::atomic<bool> armed{true};
     {
@@ -6987,8 +6987,8 @@ TEST_CASE("File mechanism (Windows, direct): an establishment report and an acti
     // so ONE visit stages both the drained None report (stage_established_
     // locked, ahead of the switch) and, from grace_check_locked, a Fault
     // notice into work.notices. Fault and Emit share that one notices loop,
-    // so this pins the same established-before-notices property the finding
-    // names for Emit (an Emit needs a commit, whose re-marked Notification is
+    // so this pins the same established-before-notices property for an Emit
+    // (an Emit needs a commit, whose re-marked Notification is
     // never drained in the same visit - see RF-11).
     ScratchDir a("est_same_pass");
     FileProbeGate gate; // declared BEFORE mech: outlives every worker that touches it
