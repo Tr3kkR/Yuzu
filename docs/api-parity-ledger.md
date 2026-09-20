@@ -123,12 +123,14 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
-| other | 74 | 10 | 64 |
-| **Total** | **284** | **78** | **206** |
+| other | 74 | 11 | 63 |
+| **Total** | **284** | **79** | **205** |
 
-Registered `/api/vN/*` routes: 234. OpenAPI `paths` entries: 233. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 179.
+Registered `/api/vN/*` routes: 235. OpenAPI `paths` entries: 234. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 178.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 206.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 205.
+
+<!-- PLACEHOLDER: dev's post-A2-R2 snapshot, carried forward pending this merge's own --render-doc pass after build (adds A2-R4's approval-review REST v1/MCP twins). -->
 
 <!-- END GENERATED -->
 

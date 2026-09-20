@@ -489,9 +489,9 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
         registry.register_agent(info_b);
     }
     for (const auto& id : {"dev-A", "dev-B"})
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-plugin-presence-cmd");

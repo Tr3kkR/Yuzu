@@ -419,15 +419,16 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
     }
 }
 
-void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& node,
+bool AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& session_id,
+                                      const std::string& node,
                                       std::vector<std::string> capabilities,
                                       std::string stream_home_id) {
     std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
         auto it = agents_.find(agent_id);
-        if (it == agents_.end())
-            return;
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return false;
         session = it->second;
     }
     // M1 (review finding): `gateway_node` and `gateway_wire_capabilities` used
@@ -451,6 +452,7 @@ void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     session->gateway_wire_capabilities =
         std::unordered_set<std::string>(capabilities.begin(), capabilities.end());
     session->gateway_stream_home_id = std::move(stream_home_id);
+    return true;
 }
 
 std::optional<std::string>

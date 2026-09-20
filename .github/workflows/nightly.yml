@@ -279,6 +279,10 @@ jobs:
     # 60->75: see the sanitize-asan job's identical comment above (#4018 hardening).
     timeout-minutes: 75
     env:
+      # TSan suppressions are COMPILED INTO the test binaries
+      # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+      # there is deliberately no `suppressions=` file here. Read that comment
+      # before adding one.
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
       # Shared 4-runner Big Tam host: harmless gateway-eunit default-cookie
       # defence (matches ci.yml's linux leg).
@@ -438,6 +442,10 @@ jobs:
         if: (failure() || cancelled()) && (steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled')
         env:
           LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
+          # TSan suppressions are COMPILED INTO the test binaries
+          # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+          # there is deliberately no `suppressions=` file here. Read that comment
+          # before adding one.
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
           # Not interpolated into the shell directly: keeps the expression out of
           # the script body (zizmor template-injection hygiene, and it is the

@@ -1307,6 +1307,7 @@ if build_server
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_rest_executions_v1_twins.cpp',
+      'unit/server/test_rest_responses_v1_twins.cpp', # #2146 A2-R2: GET /api/v1/responses{,/aggregate,/export}
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*
@@ -2522,6 +2523,17 @@ test('split interlock tripwire',
 test('split interlock tripwire selftest',
   _python3_test,
   args: [files('test_split_interlock_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
+# only while no first-party code references the conn-less libpq escape APIs
+# PQescapeString/PQescapeBytea (libpq's sole readers of the suppressed globals).
+# Also runs in .github/workflows/docs-lint.yml on every PR.
+test('no conn-less libpq escape references',
+  _python3_test,
+  args: [files('test_no_connless_pq_escape.py')],
   suite: 'docs',
   timeout: 30,
 )
