@@ -393,6 +393,41 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
+        # #4471 quarantine-ref contract. ci.yml's trusted_inputs step is covered
+        # behaviourally by tests/shell/test_trusted_inputs_validate.sh, and
+        # fork-dynamic-review.yml's own quarantine guard by
+        # tests/shell/test_fork_dynamic_review_validate.sh (both extraction
+        # harnesses) -- this string pin is a cheap structural backstop, not
+        # the only net. The wrapper's purge job is the sole actions:write
+        # holder, checks nothing out, and must never hand that grant to the
+        # reusable gate.
+        quarantine = "^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$"
+        review = (ROOT / ".github" / "workflows" / "fork-dynamic-review.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(quarantine, review)
+        self.assertIn(quarantine, self.job("ci.yml", "trusted_inputs"))
+        purge = self.job("trusted-fork-ci.yml", "purge-quarantine-cache")
+        self.assertIn("actions: write", purge)
+        self.assertEqual(wrapper.count("actions: write"), 1)
+        self.assertNotIn("actions/checkout", purge)
+        self.assertIn("if: always()", purge)
+        self.assertIn("needs: [trusted-gate]", purge)
+        # The purge job's own scope guard is a separate spelling (no PR number
+        # in scope there); pin it so it cannot drift or vanish unnoticed.
+        self.assertIn("^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$", purge)
+
+    def test_codeql_query_filters_are_exactly_the_documented_two(self) -> None:
+        """#4471: the poisonable-step exclusion is the trade-off that stops
+        alert #5177 re-firing on every preflight step; a query-id rename or an
+        accidental broadening would silently reopen or over-suppress it."""
+        config = (ROOT / ".github" / "codeql" / "codeql-config.yml").read_text(encoding="utf-8")
+        ids = re.findall(r"(?m)^\s*-\s*exclude:\n\s*id:\s*(\S+)\s*$", config)
+        self.assertEqual(
+            ids,
+            ["cpp/poorly-documented-function", "actions/cache-poisoning/poisonable-step"],
+        )
+
         # linux + windows carry the full boundary: conditional clean:false
         # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
         # the trusted-fork cache-isolation trio.
@@ -406,6 +441,55 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
                 self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
                 self.assertIn("Purge trusted-fork workspace", job)
+
+    def test_pr_derived_checkout_refs_stay_in_the_quarantined_workflows(self) -> None:
+        """#4471: CodeQL's actions/cache-poisoning/poisonable-step is excluded in
+        .github/codeql/codeql-config.yml because its model cannot see the
+        trusted-fork/pr-<N> quarantine. This sweep is the in-repo replacement:
+        a workflow that checks out a PR-derived ref must be one of the two that
+        carry the quarantine assertion. Extending the allowlist is a security
+        decision, not a routine edit. Any dispatch input or job output used as a
+        checkout ref counts (deliberately broad). Only `with:` blocks written
+        after the `uses:` line are inspected — every checkout in this repo is
+        written that way."""
+        allowed = {"ci.yml", "fork-dynamic-review.yml"}
+        pr_derived = re.compile(
+            r"refs/pull/|github\.event\.pull_request\.head|inputs\.|needs\.[A-Za-z0-9_-]+\.outputs\."
+        )
+        offenders = []
+        # GitHub loads BOTH extensions ("must have either a .yml or .yaml file
+        # extension" — Workflow syntax docs); adversarial-review (CDX-4471-02 /
+        # kimi P2) mutation-proved that globbing only *.yml lets an offending
+        # *.yaml workflow pass unseen. zizmor.yml's own grep already covers
+        # both (`--include='*.yml' --include='*.yaml'`) — match that pattern.
+        for path in sorted(
+            p for ext in ("*.yml", "*.yaml") for p in (ROOT / ".github" / "workflows").glob(ext)
+        ):
+            text = path.read_text(encoding="utf-8")
+            # A checkout step's `with:` block: the indented lines after the
+            # `uses:` line (either `- uses:` or `- name:` + `uses:` form) up to
+            # the next `- ` step.
+            for step in re.finditer(
+                r"(?m)^[ \t]*(?:- )?uses: actions/checkout@[^\n]*\n((?:(?![ \t]*- )[ \t]+[^\n]*\n)*)",
+                text,
+            ):
+                ref = re.search(r"(?m)^[ \t]*ref:[ \t]*(.+)$", step.group(1))
+                if ref and pr_derived.search(ref.group(1)) and path.name not in allowed:
+                    offenders.append(f"{path.name}: ref: {ref.group(1).strip()}")
+        self.assertEqual(offenders, [])
+
+    def test_fork_review_guard_precedes_checkout(self) -> None:
+        """#4471 (adversarial-review CDX-4471-03 / kimi K3): the extraction
+        test keys on step NAME only, so a future reorder that moves the
+        checkout above the quarantine-ref guard would keep every existing
+        assertion green while checking out unreviewed fork code first. Pin
+        the ORDER, not just the presence, of the two steps."""
+        review = self.job("fork-dynamic-review.yml", "linux")
+        validate_at = review.find("- name: Validate immutable inputs")
+        checkout_at = review.find("- name: Check out exact PR revision")
+        self.assertNotEqual(validate_at, -1)
+        self.assertNotEqual(checkout_at, -1)
+        self.assertLess(validate_at, checkout_at)
 
         # macOS deliberately keeps actions/checkout's default clean:true (a
         # fresh workspace every run is a *stronger* fork-isolation boundary; the

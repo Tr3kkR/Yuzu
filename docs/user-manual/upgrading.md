@@ -3025,6 +3025,12 @@ Start-Service yuzu-server  # or start manually
 > distribution cookie. `.deb`/`.rpm` installs auto-generate `/etc/yuzu/gateway.env`;
 > for tarball/manual installs create it once (see "Gateway distribution cookie now
 > required" under *Upgrade notes by release* below) before the restart step.
+>
+> **Breaking (`#4555`):** the cookie must additionally be **32+ characters**
+> (every documented generation path already clears this), and the gateway's
+> Erlang node short name changed from `yuzu_gw1` to a shared `yuzu_gw` — update
+> any external tooling hardcoding the old full node name. See "Gateway
+> distribution-cookie length floor + shared node identity" below.
 
 ```bash
 sudo systemctl stop yuzu-gateway
@@ -3480,6 +3486,41 @@ overridden.
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
 > guard and restores the unauthenticated-RPC surface. It exists only for
 > ephemeral dev/CI stacks.
+
+### Gateway distribution-cookie length floor + shared node identity (HA WS-4 `#4555`) — **BREAKING**
+
+Extends the `#659` cookie requirement above with two further changes, both
+shipped together as part of gateway multi-node cluster formation:
+
+- **Cookie length floor.** The gateway now additionally refuses to boot with
+  a distribution cookie **shorter than 32 characters**, even a genuinely
+  custom (non-default) one. DNS-based cluster discovery means a node now
+  dials addresses it did not choose by hand, and the distribution
+  handshake's INITIATOR sends the cookie hash first — a short cookie is
+  brute-forceable offline from a legitimately-dialing node. **Every
+  documented cookie-generation path already clears this floor with room to
+  spare** (`openssl rand -hex 32` produces 64 characters) — no action
+  needed if you followed the `#659` guidance above verbatim. Only an
+  operator who hand-picked a short custom cookie is affected; the same
+  `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
+  bypasses this check too.
+- **Node identity change.** The Erlang node short name changed from a
+  hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
+  cluster now advertises the SAME short name, distinguished only by an
+  address resolved at boot (`YUZU_GW_ADVERTISE_ADDR`, auto-detected by
+  default), so that identical replicas can boot from one image/env (a
+  prerequisite for `docker compose up --scale gateway=N`). A single-node
+  deployment boots identically otherwise (the address defaults to
+  `127.0.0.1`, matching the old hardcoded value) — but any external
+  tooling that hardcodes the OLD full node name (`yuzu_gw1@127.0.0.1`) in a
+  `erl -remsh`/`recon` script, a health check, or a monitoring probe will
+  silently stop matching after upgrade. Update any such tooling to match
+  `yuzu_gw@` (a prefix, since the address suffix may vary).
+
+**Recovery** for the cookie-length case uses the same diagnostic path as
+`#659` above (`journalctl -t yuzu-gateway | grep -i cookie` / stdout /
+`gateway.log`) — the log line names the specific failure (`shorter than 32
+characters`) separately from the known-default rejection.
 
 ### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
 

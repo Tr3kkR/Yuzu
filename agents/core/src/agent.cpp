@@ -391,8 +391,9 @@ private:
 // single local RAII variable, never copied or moved out of its declaring
 // scope, so the double-fire the deletion would guard against cannot
 // occur. Same reasoning, and the same corrected justification, apply to
-// the byte-identical sibling in `server/core/src/api_token_store.cpp`;
-// keep both aggregate, not just this one.
+// the byte-identical siblings in `server/core/src/api_token_store.cpp`
+// and `agents/core/src/spark_engine.cpp` (#2050) — keep all three
+// aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }

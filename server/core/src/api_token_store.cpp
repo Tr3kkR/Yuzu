@@ -545,7 +545,8 @@ bool constant_time_hex_equal(const std::string& a, const std::string& b) {
 // already-scrubbed/empty string is a no-op) — so the theoretical
 // double-fire hazard has no live path, and there is no defect this
 // guard needs deleted copy/move to close. Same reasoning applies to the
-// byte-identical sibling in `agents/core/src/agent.cpp`; keep both
+// byte-identical siblings in `agents/core/src/agent.cpp` and
+// `agents/core/src/spark_engine.cpp` (#2050) — keep all three
 // aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;

@@ -692,75 +692,72 @@ two genuinely separate mechanisms, matching the two concerns ruling 14(b) folds
 together in prose but which do not share one signal in code:
 
 - **Adoption (does the late arm's subscription get committed).**
-  `GuardianSparkRuntime::on_arm_complete()` decides this per claim, not per
-  ledger. A retained-wedge head (`is_retained_wedge()`: dispatched, waiter-
-  abandoned, `ClaimEnd::WaiterTimedOutDispatched`) whose `RuleGeneration::active`
-  is still true is adopted exactly like an ordinary live claim's commit - one
-  watcher, live and enforcing - EXCEPT the claim's own `end`/`outcome` are left
-  untouched: the sticky-Wedged receipt (§R5.2, pinned by test) is a fact about
-  the ORIGINAL episode's timeout, not a live status of the rule, and adoption
-  never revises history. `rg->active` is the desired-state signal: it starts
-  true at attach and is flipped false ONLY by a withdrawal that can actually
-  reach the claim - `detach_rule_locked()`'s ordinary Case 0 FIFO scan
-  deliberately EXCLUDES a `waiter_abandoned` claim (it was already unreachable
-  through `index_`/`rules_` at abandonment time), so a dedicated locator,
-  `wedged_by_rule_` (rule_id -> the currently-wedged claim, populated the
-  instant a claim wedges, non-stopping only), is what lets
-  `detach_rule_locked()`/`detach_all()` find and deactivate it. The map has two
-  writers - `abandon_claim_locked()` (a claim just timed out) and
-  `attach_core()`'s Reobserved-restore branch (a still-wedged claim is
-  re-observed) - and both guard against a cross-key collision (the SAME
-  rule_id wedged on two different keys at once, an ordinary flip-flop
-  redeploy) in OPPOSITE directions, because the claim each is about to insert
-  carries opposite provenance; and `detach_rule_locked()`'s own deactivation
-  of this map's entry runs UNCONDITIONALLY, FIRST, before its Case 0 FIFO scan
-  even starts, rather than only when Case 0 falls through unmatched - the 5th
-  occurrence of this same fail-open class on this branch (rung 9c PR-5d, found
-  by this governance run's own Gate 4 unhappy-path pass) was Case 0's own
-  mid-loop `return nullptr;` skipping this cleanup whenever it matched a
-  DIFFERENT, still-live claim for the same rule_id on another key first. See
-  `wedged_by_rule_`'s own doc comment in `guardian_spark_runtime.hpp` and
-  `detach_rule_locked()`'s own header comment for the full mechanics, guard
-  proofs, and reachable interleavings - both are canonical here; this
-  paragraph is a summary, not a substitute. A genuine
-  reobservation (the SAME rule_id + spec re-attaching onto its own still-wedged
-  head) is hoisted to run BEFORE `detach_rule_locked(rule_id)`'s own
-  unconditional call in `attach_core()` - without that ordering, every
-  reobservation would transit the withdrawal lookup and deactivate its own
-  claim's `rg->active`, since `detach_rule_locked(rule_id)` runs on every
-  `attach_core()` call regardless of what the call turns out to be. **As
-  implemented after governance Gate 7 (rung 9c PR-5d /governance run, round
-  2):** an intervening `detach_all()` (a routine full-sync retry's own
-  teardown) deactivates `rg->active` and clears the `wedged_by_rule_` locator
-  for every currently-wedged claim UNCONDITIONALLY, including one whose rule
-  is still present in the replacement desired set - the hoisted Reobserved
-  branch is what restores candidacy for exactly that case, since reaching
-  Reobserved is itself proof the rule is still desired right now. The restore
-  writes the fallible, node-allocating `wedged_by_rule_.insert_or_assign()`
-  call BEFORE the (then-noexcept) `rg->active = true` write - matching the
-  file's own commit-or-rollback discipline (never an irreversible mutation
-  ahead of a fallible one) - so a throw there leaves `rg->active` untouched
-  and the NEXT reobservation retries, rather than permanently disabling
-  adoption for that rule (the shape governance Gate 2-4 found and Gate 7
-  closed). `on_arm_complete`'s own adoption branch additionally verifies,
-  rather than merely trusts, that nothing else has taken ownership of the
-  rule_id in the meantime: it refuses adoption outright (falling through to
-  the ordinary disarm path, counted via `wedge_adopt_stale_refused()` and
-  logged at INFO) if `rules_` already holds ANY entry for that rule_id. This
-  is NOT purely defense-in-depth against the fault-injection fix above -
-  governance Gate 8 found (and a regression test now pins) that this branch
-  is independently reachable via entirely ordinary desired-state churn, no
-  fault injection needed: rule R wedges on key A; R is redeployed to key B
-  (commits normally); R is redeployed BACK to key A while the ORIGINAL key-A
-  arm is still in flight - `is_retained_wedge()` never consults `rg->active`,
-  so the Reobserved-restore branch above legitimately reactivates the
-  still-outstanding key-A claim's candidacy even though `rules_[R]` is
-  correctly live on key B throughout. The guard handles both this common
-  churn case and the rarer true invariant-violation case identically and
-  safely (refuse, disarm the stale success, never touch the live generation)
-  - `wedge_adopt_stale_refused()`'s own doc comment states what a SUSTAINED,
-  climbing rate is worth investigating for, since an occasional nonzero count
-  is expected operational noise, not a bug signal.
+  `claims_` is the sole source of pending wedge adoption candidacy (#4508).
+  `is_wedge_candidate_locked(c)` means `is_retained_wedge(c) && c.rg &&
+  c.rg->active && !generation_committed_locked(c)`. `is_retained_wedge`, defined
+  in `guardian_spark_runtime.cpp`, accepts both Dispatching and Dispatched Arm
+  claims with `waiter_abandoned` and `end == WaiterTimedOutDispatched`.
+  Receipt history stays sticky-Wedged even after recovery: it records the
+  original timeout, not current desired state or current enforcement.
+
+  **W0 (ownership):** no candidacy writer changes `active` on a generation
+  owned by `rules_`. Adoption commits `rg` by shared ownership, so a retained,
+  unpublished claim can alias the live generation during publication failure.
+  `generation_committed_locked` compares the exact generation in `rules_`;
+  all four publication, receipt-recovery, recovery-status and fallback-outcome
+  sites share it. No independent adopted bit or completion locator is needed.
+  Ordinary commitment moves `rg` into a by-value parameter: a null claim `rg`
+  means commit was attempted, whether it succeeded or threw, and leaves no
+  generation eligible for adoption on that claim.
+
+  **W1 (uniqueness):** at most one candidate per rule_id, the most recently
+  attached or re-observed. Three allocation-free writer sites preserve it:
+  withdrawal sweeps matching candidates; hoisted Reobserved restore sweeps
+  other candidates before setting its own desire; abandonment deactivates its
+  incoming uncommitted generation if another candidate already exists. That
+  other candidate became desired after the incoming claim was created. A
+  timeout itself provides no fresh desired-state signal. Re-observation is
+  decided before ordinary attach withdrawal, and a committed generation is
+  excluded even when its retained claim is re-observed.
+
+  `detach_rule_locked` constructs its debug postcondition guard first, sweeps
+  candidates second, then calls `withdraw_rule_after_wedge_sweep_locked`.
+  Thus Case 0's early return and every throwing withdrawal path follow the
+  sweep. `detach_all` constructs the global guard and sweeps once immediately
+  after locking, then calls the same pre-swept helper in both its claimed-rule
+  and committed-rule loops. The postcondition checks absence of candidates,
+  including during unwind. The helper cannot create candidacy under that lock.
+
+  Completion ends candidacy through commitment or removal from `claims_`.
+  A receipt can retain a popped, refused claim with all candidate fields still
+  set, so its test accessor checks FIFO-front identity membership as well as
+  the predicate. The existing late-adoption policy remains: the runtime must
+  not be stopping, the claim must be desired, no live follower may take the
+  subscription, and `rules_` must not already contain that rule_id. Refusal
+  increments `wedge_adopt_stale_refused` and compensates the stale subscription
+  without touching the live generation. A re-observation after another key
+  commits can reach this refusal during ordinary desired-state churn.
+
+  **Cost:** let N be the total FIFO population, C the rule_ids with claims,
+  R the committed rules, f the largest FIFO, and R_idx/K_idx the ordered
+  index's rule/key counts. Each added global candidacy walk is linear in N,
+  with average O(1) hash work for relevant retained wedges. `detach_rule_locked`
+  adds one sweep and one debug walk; A attaches add O(A*N) work. Abandonment
+  adds O(N) per expiring wedge, on top of maintenance's existing O(N) collection.
+  `detach_all` adds two global walks, retaining the existing withdrawal cost:
+  O(N) + (C+R)*(f + log R_idx) + existing confirmed-path work. Case 0 scans a
+  key's FIFO for committed rules too; the (C+R)*f term is pre-existing.
+  `index_` uses ordered maps: rule lookups cost O(log R_idx), key lookups
+  O(log K_idx), and inner set lookups O(log S_k), where S_k is the number of
+  rules sharing the key. Under the index invariant those latter terms are
+  absorbed by O(log R_idx). Runtime maps use average O(1) hash lookups.
+  Retained-wedge heads satisfy W <= 10 + D, where D counts retained-wedge
+  heads awaiting compensation reservation, including heads in collected refill
+  batches. D has no bound supplied by the permit pool, executor quota, or
+  concurrent caller count. Executor quota is released before completion drain;
+  the ten compensation permits persist through it. Neither pool bounds N:
+  same-key followers and retained Disarm heads can accumulate. This trades
+  constant-time locator reads for linear candidacy walks without another cache.
 - **Arm-recovery telemetry (does the CURRENT application's `arm_failed`
   clear).** `GuardianArmAckLedger` retains the `ArmReceipt` for any receipt
   `drain_locked()` resolves to `Wedged` specifically (`Application::
@@ -1237,6 +1234,32 @@ subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A
 R5.7 consumer that cares whether the engine is still live checks `is_running()` itself
 (the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
 post-stop `established_at`/`coverage` pair as current live coverage.
+
+**R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
+calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
+`GuardianSparkRuntime::commit_new_generation_locked()` - never
+`subscription_establishment()` (that channel still has zero production callers) and never
+`SparkEngine`'s own "armed" log (fires before the OS watch call even runs, exactly as this
+section already says not to use it). Membership across repeated `#3990` diagnostic full_syncs
+is decided by an explicit APPLICATION FENCE, not by timestamp order: `detach_all()` stamps a
+monotonic `detach_epoch_` (bumped first, before any of its own mutation) and logs it in a new
+`Guardian spark: detach_all complete (epoch=, incarnation_floor=, ...)` line as its LAST
+statement; every T2 line then carries that epoch, so a stale in-flight commit from a PREVIOUS
+full_sync (which can land between the new `full_sync cleared` line and `detach_all()`, since
+both run under `registry_mu_`, not the engine's own `mtx_`) is rejected by epoch identity
+rather than by an insufficient timestamp check - a real gap an Astra adversarial review found
+in this item's own first design round, before implementation. `--spark-disable` never
+constructs `spark_runtime_` at all (`wire_spark_engine()`'s `spark_disabled_by_config` branch
+returns before that point) - legacy needs no fence in the first place, since its arms are
+synchronous on the same thread as T0/T1. Result: Phase B (baseline re-deploy) reached a
+pre-registered PASS on the current NonWaiting attach model; Phase B2 (bare rule-create,
+`#3990`'s own literal shape) is FAIL-RELIABILITY - a genuine spark arm failure on repeat 3
+(`applied=61, failed=1`, one rule) was initially misclassified as an instrument-invalid void by
+a driver bug (`/adversarial-review` found and fixed same-session; see the run doc's own
+"Correction" note under its Phase B2 section) and, once corrected, breaks the reliability gate
+outright regardless of the separate 2/3 floor miss. Full detail: `docs/spark-rebuild-baselines/
+3990-fullsync-blackout-run.md`'s own "R5.7 T2 re-run results" section; `docs/spark-flip-gate.md`'s
+`#3990` entry for the flip-gate framing.
 
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 

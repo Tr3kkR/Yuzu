@@ -637,3 +637,262 @@ not assumed. Agent stopped and relaunched on **spark** (no `--spark-disable`, un
 `detection backend = spark` boot line present (PID 21788). `run_agent_legacy.ps1` (new this
 round, adds `--spark-disable` to the existing script) left on-box, not committed. Server and
 Postgres tunnel untouched throughout this session.
+
+## R5.7 T2 re-measurement - pre-registration (2026-09-19, rung 9c PR-6 item 2)
+
+Everything above this section describes the **clean-v2 PASS** measured on the WAITING attach
+model (`origin/dev@65f2938156a19` + the flip one-liner, pre-dating rung 9c PR-2). That result
+stands as recorded - it is not edited or retroactively reinterpreted here. This section
+pre-registers a SEPARATE re-measurement under the current NonWaiting attach model
+(`reconcile_rule_locked()` -> `attach_rule(GuardianSparkRuntime::NonWaiting{}, ...)`), per
+`docs/spark-stage2-guardian-consumer-design.md` "R5.7 - Re-measurement methodology" and its
+"Rung 9c PR-6 item 1" follow-on paragraph. Committed BEFORE any rig time, per this diagnostic's
+own established discipline: define the measurand and pass/fail criterion first, never relax
+an unmet precondition after the fact.
+
+**Why a re-measurement is needed at all**: on current `origin/dev`, `apply_rules ok` gained a
+`pending=` field (rung 9c PR-2), which alone breaks the existing driver's `T1_RE`. More
+substantively, T1 no longer waits for every rule's arm to commit under the NonWaiting model, so
+Window B (`T1 - T0`) no longer brackets synchronous arm completion the way it did for the
+waiting-model clean-v2 result. A runtime-side confirmation independent of `apply_rules`'s own
+return is required - see `docs/spark-stage2-guardian-consumer-design.md`'s R5.7 section for the
+full reasoning this implements.
+
+**Estimand.** Time from the existing `full_sync cleared` marker (T0) to confirmation of the
+current application's expected runtime commits - spark: the 62 epoch-member T2 lines
+(`Guardian spark: arm committed for rule ...`, epoch-identity-filtered against that
+application's own `detach_all()` teardown); legacy: the 62 `guard armed for rule` lines after
+that same teardown's `Guardian spark: detach_all complete (...)` marker (T0d - logged on both
+backends, since `spark_runtime_` is wired unconditionally regardless of which backend is
+selected for arming). This is a **commit-latency proxy on both backends**, not a claim of
+end-to-end detection blackout or notification-establishment coverage: for spark, `arm()`
+returning success does not itself prove the OS watch/subscription is established for any of the
+three cohort mechanism types (file/registry/service - see the design doc's establishment-limit
+discussion), and for legacy `FileGuard::start()` similarly returns before its watch exists. The
+comparison is not claimed to be conservative in either direction.
+
+**Primary measurand: C = T2_last - T0** (spark) / legacy's equivalent last-arm-line - T0. This
+is the HEADLINE number this re-run decides on.
+
+**Continuity measurand: B = T1 - T0**, reported alongside C, NOT decision-bearing. Under the
+NonWaiting model B no longer brackets synchronous arm completion, so a drop in B relative to
+clean-v2's 127-140ms spark figures is a MODEL CHANGE, not a speed improvement, and must be
+reported as such rather than as evidence of anything getting faster.
+
+**Hypotheses, recorded before running (none of these bears on the pass/fail verdict - each is
+reported confirmed or refuted after the run):**
+  (i) spark B on the NonWaiting binary lands below clean-v2's 127-140ms figures;
+  (ii) spark `t1_to_t2_last_ms > 0` on most repeats, with T2 lines observed in all three
+      positions relative to T1 (before/tie/after) across the sample;
+  (iii) spark C falls in the 100-200ms range, legacy C within ~3ms of its own B;
+  (iv) `n_reobserved_adopt == 0` and the `repush_confound` void rate stays under 5%.
+
+**Cohort, triggers, order.** Unchanged cohort composition from clean-v2: 60 cohort rules (20
+file + 20 registry + 20 service, `BLACKOUT_SVC_OVERRIDE` unchanged) + the trigger rule + the
+pre-existing protected rule = 62 expected rule_ids per full_sync. Phase B = baseline re-deploy
+trigger; Phase B2 = bare rule-create trigger (`run_id`-scoped ids this round, closing the
+existing trigger-ID-reuse trap documented above). Pre-registered invocation order: **legacy B,
+spark B, spark B2, legacy B2** - alternating at the invocation level (not full ABBA within a
+phase; each phase's two backend cells still run once each, in this fixed order). One binary per
+backend switch (`--spark-disable` selects at relaunch); the run-order confound this introduces
+(backend is not randomized against phase) is not eliminated, only stated.
+
+**Sample floor.** K = 5 counted repeats per cell for Phase B, K = 3 for Phase B2, within the
+driver's existing attempt cap (2K, minimum 10). A cell that does not reach its floor is
+INCONCLUSIVE for that cell - never relaxed after the fact, per this diagnostic's own prior
+rounds' hard-learned lesson (Sol's round-3 catch, see the retraction above).
+
+**A repeat counts (is "valid") iff ALL of:** `failed == 0`; `total == 62`
+(`cohort_composition` void otherwise); `detached_rules == 62` on spark / `== 0` on legacy
+(`teardown_size_mismatch` void otherwise); `applied == total`; every one of the 62 expected
+rule_ids has an eligible epoch-member confirmation line found within the 240s visibility
+deadline, with no intervening next-application `T0d` (`t2_incomplete` / `double_full_sync`
+void otherwise, `t2_incomplete` rows get one further look via the post-invocation sweep before
+their final classification); `fence_violation == 0`; the existing push-counter deltas match;
+functional validity (`guard.compliant` observed for all 60 cohort rules within `max(2C, 30s)`
+of T0, polled with a 60s ingestion grace). `pending > 0` at T1 and any nonzero
+`n_reobserved_adopt` / `repush_confound` are RECORDED on the row, never voids by themselves
+(`repush_confound` from an in-window push command IS its own void reason, separate from these).
+
+**Verdict per phase - a ONE-RIG EMPIRICAL ACCEPTANCE GATE, explicitly NOT a statistical
+non-inferiority demonstration** (no uncertainty criterion, small K, the order confound noted
+above):
+1. *Latency gate*: spark median C <= legacy median C + max(1000ms, legacy median C), computed
+   on counted (valid) repeats only. The 1000ms floor on the margin is carried unchanged from
+   clean-v2's own acceptance choice (see "Decision rule and outcome" above) - permissive
+   relative to the historical numbers, not derived from any SLO.
+2. *Reliability gate*: zero genuine-failure attempts (`failed_gt_0`, `arm_never_confirmed`,
+   `functional_invalid`, `fence_violation`) across BOTH backend cells of the phase, counting
+   EVERY attempt, not just counted repeats. Any genuine failure fails the phase regardless of
+   what the latency gate would otherwise say, and is filed as its own product finding separate
+   from this diagnostic. Instrument-invalid voids never fail a phase on their own; if they
+   exceed 50% of a cell's attempts that cell is INCONCLUSIVE instead.
+
+PASS requires both gates to hold, at floor, in both cells of the phase. FAIL-LATENCY /
+FAIL-RELIABILITY name which gate failed. INCONCLUSIVE otherwise (floor not reached, or void
+rate too high to interpret). Every attempt - valid or voided - is reported in the raw JSONL and
+in `report`'s per-cell breakdown; nothing is silently dropped.
+
+**Build under measurement.** One `origin/dev`-merged branch SHA (`feat/3990-r57-t2-remeasure`)
+plus the single `agent.cpp:853` flip one-liner for the spark half only
+(`/*prefer_spark=*/!cfg_.spark_disable`); `git diff` against that branch tip must show nothing
+else. `yuzu-agent --version` and the `detection backend = <x>` boot line recorded per relaunch.
+
+**Fields to fill in before/during the actual run** (literal placeholders below, replaced when
+the rig run happens - Commit 1's C++ instrumentation must land and be built into the agent
+binary first):
+- Build SHA under measurement: `TBD-before-run`
+- DGRHP heartbeat interval / rig settings (H12 in the delivery plan): `TBD-before-run`
+- Actual invocation order executed (confirm matches the pre-registered order above):
+  `TBD-before-run`
+- `comparison_id` used to group the four invocations: `TBD-before-run`
+
+This section's own commit hash is the pre-registration timestamp; results are appended as a new
+section below it once the run completes, never edited into this section.
+
+## R5.7 T2 re-run results (2026-09-19) - Phase B PASS, Phase B2 FAIL-RELIABILITY
+
+**Read this first: the headline changes for Phase B; Phase B2 is FAIL-RELIABILITY - a genuine
+spark arm failure (`failed_gt_0`, repeat 3) was initially misclassified as an instrument-invalid
+void by a driver bug found via `/adversarial-review` and fixed same-session (see the "Correction"
+note under Phase B2 below); the corrected verdict is worse than what this section first
+reported, not better.** All numbers below are recomputed directly from the committed
+`fullsync-blackout-results.jsonl` (rows appended this round, `label="t2-v1"`), not from any
+executing agent's own printout.
+
+**Build under measurement**: branch `feat/3990-r57-t2-remeasure` @ `0a4a605d6f159c2e30fd70a5fd4e5b3913d29d79`
+(origin/dev merged through `f0f07d4d8`) + the single `agents/core/src/agent.cpp:853` one-liner
+(`/*prefer_spark=*/!cfg_.spark_disable`) for the spark leg; `git diff` on devrig2 showed only
+that one line throughout. Confirmed via `yuzu-agent --version`: `0.13.1+9739 (0a4a605d6f)`, both
+legs (one binary, backend chosen by `--spark-disable` at relaunch). Server built from the same
+tree, same SHA. `--heartbeat` not overridden - default 30s (confirmed live: "Heartbeat thread
+started (interval=30s)" both legs). DGRHP devrig2, server `C:\rigA`, Postgres
+`postgresql://yuzu:yuzu@127.0.0.1:15436/yuzu_rigc`.
+
+**Two real driver bugs surfaced live during this run and were fixed same-session** (commit
+`5a833f4ff`, see that commit message and the branch's own CHANGELOG fragment for the full
+account): (1) legacy never gets a T0d line at all (`--spark-disable` short-circuits
+`wire_spark_engine()` before `spark_runtime_` is even constructed) - the driver was changed to
+synthesize `t0d = t0` for legacy rather than wait on a line that can never appear; (2)
+`build_verdict_lines()` was pairing legacy/spark on `run_id`, which differs by construction
+between the two backends' separate `cmd_run()` invocations - every verdict silently read
+INCONCLUSIVE regardless of the underlying data until this was fixed to pair on
+`(comparison_id, label, phase)` only. Both were caught by generating a real report against live
+data (Phase B was 5/5 valid on both backends and still showed INCONCLUSIVE), not by inspection.
+
+**A rig-environment fact unrelated to any code change**: DGRHP's Hyper-V/WSL2 stack had
+reserved TCP ports `50000-50369` as excluded ranges (`netsh int ipv4 show excludedportrange`)
+since the last time this branch's own diagnostic ran on this rig - the rig's `run_server.ps1` /
+`run_agent2.ps1` / `run_agent_legacy.ps1` scripts (previously `127.0.0.1:50081` for the agent
+gRPC listener, default `0.0.0.0:50052` for management) were updated in place to
+`127.0.0.1:50400`/`127.0.0.1:50410`, both confirmed outside every excluded range. This is a
+rig-ops fact, not a driver or runtime defect; recorded here so a future round on this same rig
+doesn't re-diagnose it from scratch.
+
+### Phase B - baseline re-deploy trigger
+
+| Backend | Attempted | Valid | Floor | B median (ms) | C median (ms) | Void breakdown |
+|---|---|---|---|---|---|---|
+| legacy | 5 | 5 | Y | 75.0 | 74.0 | - |
+| spark | 5 | 5 | Y | 97.0 | 98.0 | - |
+
+Legacy C values: 74.0, 65.0, 68.0, 75.0, 96.0 ms. Spark C values: 92.0, 99.0, 91.0, 106.0, 98.0 ms.
+Zero voids on either backend - all 10 attempts valid, zero genuine-failure rows.
+
+**Verdict: PASS.** Latency gate: spark median C (98.0) <= legacy median C (74.0) + max(1000,
+74.0) = 1074.0 - holds comfortably. Reliability gate: zero genuine-failure attempts on either
+backend across all attempts - holds. Both gates satisfied at floor in both cells.
+
+### Phase B2 - bare rule-create trigger (#3990's literal shape)
+
+**Correction (2026-09-19, post-`/adversarial-review`).** This section originally reported
+INCONCLUSIVE with "zero genuine-failure rows" on spark. Both independent reviewers (Kimi K3,
+Codex Sol) found, and cross-examination confirmed, that the driver checked a collection-stage
+void `reason` (here, `double_full_sync`) BEFORE the T1-reported `failed>0` check, so a real
+arm failure recorded on spark B2 repeat 3 (`applied=61, failed=1`, committed data unchanged)
+was laundered into an instrument-invalid void instead of counting against the reliability gate.
+Driver fixed (`genuine_t1_failure()`, hoisted ahead of the collection-stage check); the one
+affected row's `void_class`/`void_reason` corrected from `instrument`/`double_full_sync` to
+`genuine`/`failed_gt_0` in `fullsync-blackout-results.jsonl` (every other field on that row,
+including its 61 committed `t2_selected` entries, is unchanged - only the derived classification
+was wrong). The table, verdict, and analysis below reflect the corrected classification.
+
+| Backend | Attempted | Valid | Floor | B median (ms) | C median (ms) | Void breakdown |
+|---|---|---|---|---|---|---|
+| legacy | 3 | 3 | Y | 67.0 | 66.0 | - |
+| spark | 10 | 2 | N | 89.0 | 90.0 | `failed_gt_0`=1 (genuine), `t1_not_found`=7 |
+
+Legacy C values: 66.0, 82.0, 65.0 ms - clean, no voids, matches Phase B's legacy figures
+closely. Spark reached its 10-attempt cap with only 2 valid repeats (C = 92.0, 88.0 ms, both
+consistent with Phase B's spark C figures where they did land). Of the other 8 attempts: 7
+(`t1_not_found`, governance `sre` finding, this run: the same known `--log-file` flush-lag
+mechanism documented above for the earlier 2026-09-06/07 round, not a new cause - worth finally
+filing that deferred product issue given it has now cost two separate measurement rounds real
+rig time) never reached T1 and carry no T2 evidence either way; the 8th (repeat 3)
+**did** reach T1 and **did** commit 61 of its 62 expected arms (`t2_selected` has 61 entries),
+but `apply_rules()` itself reported `failed=1` for the one remaining rule, `blackout-file-03` -
+a genuine, backend-self-reported arm failure, not an absence of evidence.
+
+**Temporal note, not a full root cause.** Repeat 3's T1 fired 86ms after its T0
+(04:23:40.529 -> 04:23:40.615), reporting `failed=1` already at that point. The event that
+produced this row's `double_full_sync` void classification pre-fix - an unrelated
+`__guard__`-reconcile push (`push_cmd_lines_in_window`) - landed at 04:24:11.326, **~30.7
+seconds later**. The confound cannot be the cause of a failure already reported 30+ seconds
+earlier; they are temporally and causally independent events that happened to fall in the same
+observation window. Why `blackout-file-03`'s arm itself failed is NOT established here - the
+DGRHP rig was unreachable by the time this was found (SSH session had already ended), so the
+raw `agent.log` line for that specific failure (which would name the underlying error) could
+not be pulled. Recorded as an open, unresolved product-level finding per the pre-registered
+rule ("any genuine failure... is filed as its own product finding separate from this
+diagnostic") - not root-caused, not dismissed as instrumentation. **Filed as
+[#4607](https://github.com/Tr3kkR/Yuzu/issues/4607).** **Observability gap,
+noted here for whoever picks this up (governance `sre` finding, this run)**: `yuzu.guardian_arm_failed`
+(`yuzu_fleet_guardian_arm_failed`) is an existing production metric that would have counted
+exactly this failure, but no alert rule exists on it in `docs/prometheus/yuzu-alerts.yml` today -
+worth adding one alongside the root-cause investigation, since the plumbing already exists.
+
+**Verdict: FAIL-RELIABILITY.** The reliability gate is "zero genuine-failure attempts... counting
+EVERY attempt" (not just counted repeats); repeat 3's `failed_gt_0` breaks it outright, and per
+the pre-registered rule this holds "regardless of what the latency gate would otherwise say."
+The floor-miss (2/3 valid) and the >50% instrument-invalid rate among the remaining 7 attempts
+are both still true but are no longer the controlling fact - reliability fails before either is
+reached. Not relaxed, and not inflated: the corrected verdict is worse than what was first
+reported, stated exactly as the pre-registered rule requires.
+
+### Hypotheses (i)-(iv), stated in the pre-registration - each resolved against the data
+
+- **(i) "spark B on the NonWaiting binary lands below clean-v2's 127-140ms figures"**:
+  **CONFIRMED.** Spark Phase B's own B (`T1-T0`) median is 97.0 ms, well below the waiting-model
+  clean-v2 figures (127-140 ms). This is a model-change effect (T1 no longer waits for every
+  arm), not a speed improvement - stated in those words, per the pre-registration.
+- **(ii) "spark `t1_to_t2_last_ms > 0` on most repeats, with T2 lines observed in all three
+  positions relative to T1"**: **PARTIALLY REFUTED.** `t1_to_t2_last_ms` was positive on all 5
+  Phase B spark repeats (+1 ms each), so the first half holds. The second half does not: per
+  repeat, 61 of the 62 T2 commits landed BEFORE T1 and exactly 1 landed after (the one that
+  produces the +1 ms figure); zero ties were observed. The real behavior is "T1 fires after
+  nearly all arms have already committed, with the single straggler landing a millisecond
+  later" - not an even spread across before/tie/after as the hypothesis anticipated.
+- **(iii) "spark C in 100-200ms range, legacy C within ~3ms of its own B"**: **legacy part
+  CONFIRMED** (every legacy Phase B repeat's C sits exactly 1 ms below its own B, well within
+  3 ms). **spark part narrowly REFUTED**: spark Phase B's C median is 98.0 ms, just under the
+  predicted 100-200 ms floor (individual repeats ranged 91.0-106.0 ms, mostly below 100).
+- **(iv) "`n_reobserved_adopt == 0` and `repush_confound` rate < 5%"**: **CONFIRMED.** Zero
+  reobserved-adopt commits and zero `repush_confound` voids across every counted repeat in both
+  phases.
+
+### What this does and does not establish
+
+Confirms the round-2 plan's central redesign point: C (the epoch-fenced runtime-commit
+measurand) is measurable and well-behaved on current `origin/dev`, and spark's Phase B
+non-inferiority holds under the pre-registered rule on this rig. Does NOT establish
+non-inferiority for the bare rule-create trigger shape (#3990's own literal reproduction) -
+that cell FAILS the reliability gate outright on a genuine, unroot-caused spark arm failure
+(`blackout-file-03`, repeat 3) and needs both a follow-up investigation into that failure and a
+re-run before any verdict can be reached for this trigger shape. Does NOT reopen or restate the
+clean-v2 waiting-model result above, which stands as its own record for that build.
+
+This section's own commit is the results record; see the driver-fix commits (`5a833f4ff`,
+`2dbb9c7d1`), the T2 instrumentation commit (`0a4a605d6`), and this section's own correction
+commit (`a8d37feac`) for the code and the classification fix these results depend on -
+`5a833f4ff` alone still reproduces the retracted INCONCLUSIVE verdict (`2dbb9c7d1` is what fixes
+the precedence bug that caused it).
