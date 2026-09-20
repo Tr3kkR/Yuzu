@@ -281,6 +281,13 @@ TEST_CASE("PgPool concurrent acquire and teardown", "[pg][pool]") {
     constexpr int kWorkers = 2;
     auto pool = std::make_optional<PgPool>(PgPool::Options{.conninfo = db.dsn(), .size = kWorkers});
     REQUIRE(pool->valid());
+    // Workers use a raw pointer captured BEFORE they start, never the
+    // optional: pool.reset() clears the optional's engaged flag BEFORE
+    // ~PgPool() runs (libstdc++ _Optional_payload_base::_M_destroy), and
+    // operator-> reads that flag under _GLIBCXX_ASSERTIONS (Meson injects it
+    // for buildtype=debug) - an unsynchronised write/read pair TSan reports
+    // even though PgPool's own teardown is race-free (#1611).
+    PgPool* const raw = &*pool;
 
     // Catch2 assertion macros are not thread-safe — workers only count via
     // atomics; all CHECKs happen on the main thread after join.
@@ -291,15 +298,15 @@ TEST_CASE("PgPool concurrent acquire and teardown", "[pg][pool]") {
     std::vector<std::thread> workers;
     workers.reserve(kWorkers);
     for (int i = 0; i < kWorkers; ++i) {
-        workers.emplace_back([&] {
-            auto held = pool->acquire();
+        workers.emplace_back([&, raw] {
+            auto held = raw->acquire();
             if (!held) {
                 ++holding; // keep the main thread's wait loop live
                 return;
             }
             ++got_lease;
             ++holding;
-            auto denied = pool->acquire(); // pool exhausted -> blocks here
+            auto denied = raw->acquire(); // pool exhausted -> blocks here
             if (!denied)
                 ++woken_empty; // woken by shutdown, not by capacity
             held.reset();      // now the destructor may finish
