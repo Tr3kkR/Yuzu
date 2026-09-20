@@ -9,11 +9,15 @@ libpq's only readers are the conn-less PQescapeString / PQescapeBytea. A new
 caller would turn a benign write-write race into a real, now-silenced
 read-write race, so this test fails on the first such reference — not just a
 call with an immediately-following '(', but any bare identifier reference
-(covers function pointers / aliasing too), with one deliberate exception (see
-EXCLUDE_PATHS below). The Conn-suffixed variants (PQescapeStringConn,
-PQescapeByteaConn, PQescapeLiteral, PQescapeIdentifier) take a PGconn and are
-NOT matched. Wired into tests/meson.build (suite 'docs') and docs-lint.yml
-(merge ref).
+(covers function pointers / aliasing too). A `//`-comment line (e.g. this
+file's own docstring-adjacent prose in tests/unit/test_runner_main.cpp,
+which quotes libpq's comment naming both functions to explain the
+suppression) is skipped everywhere, uniformly — not via a per-file
+exclusion list, so a REAL call later added to that same file still trips
+this the moment it isn't itself inside a `//` comment. The Conn-suffixed
+variants (PQescapeStringConn, PQescapeByteaConn, PQescapeLiteral,
+PQescapeIdentifier) take a PGconn and are NOT matched. Wired into
+tests/meson.build (suite 'docs') and docs-lint.yml (merge ref).
 """
 import re
 import subprocess
@@ -22,30 +26,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROOTS = ["server", "common", "agents", "sdk", "gateway", "tests", "tools"]
-EXTS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".mm", ".m")
+EXTS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".mm", ".m", ".ipp")
 PATTERN = re.compile(r"\bPQescapeString\b|\bPQescapeBytea\b")
 SELF = Path(__file__).resolve()
-
-# Deliberate, narrow exclusion (mirrors test_split_interlock_tripwire.py's
-# `excluded` mechanism: a recorded rationale, never a silent skip). Keyed on
-# the repo-relative path exactly as `git ls-files` reports it, so the
-# exclusion holds in both the worktree and a CI checkout.
-#
-# tests/unit/test_runner_main.cpp is the file that DOCUMENTS this suppression
-# (it quotes libpq's own comment naming PQescapeString/PQescapeBytea to
-# explain what the __tsan_default_suppressions hook silences and why that's
-# safe). It #includes no libpq header and calls neither function - the hits
-# there are prose, not a call site. Excluding it by name, rather than
-# rewording the comment to dodge this pattern or stripping comments before
-# matching (which adds its own failure surface, e.g. '//' inside a string
-# literal), keeps the explanatory comment intact and the check itself simple.
-# A rename moves the comment's path out of this set and the wire fires again
-# until the entry is updated - fail-loud in the direction that matters.
-EXCLUDE_PATHS = {
-    "tests/unit/test_runner_main.cpp": (
-        "documents the #1611 TSan suppression by name; no libpq include, no call"
-    ),
-}
 
 
 def _selfcheck() -> None:
@@ -54,7 +37,7 @@ def _selfcheck() -> None:
         "x = PQescapeString(to, from, n);",
         "PQescapeBytea (b, n, &m)",
         "auto fp = &PQescapeString;",  # bare identifier, no paren adjacent
-        "/* PQescapeString */ foo();",
+        "/* PQescapeString */ foo();",  # block comment, NOT skipped (only // lines are)
     ]
     must_not = [
         "PQescapeStringConn(conn, to, from, n, &e)",
@@ -68,6 +51,21 @@ def _selfcheck() -> None:
     for s in must_not:
         if PATTERN.search(s):
             raise SystemExit(f"selfcheck: pattern wrongly matched {s!r}")
+    # Comment-line skip: only a line whose STRIPPED form starts with `//` is
+    # exempt — this is what replaces the old per-file EXCLUDE_PATHS list.
+    comment_lines_skipped = [
+        "// PQescapeString and PQescapeBytea can behave somewhat sanely",
+        "  // calls PQescapeBytea internally, see the header comment",
+    ]
+    code_lines_not_skipped = [
+        "auto fp = &PQescapeString;  // trailing comment doesn't exempt code",
+    ]
+    for s in comment_lines_skipped:
+        if not s.lstrip().startswith("//"):
+            raise SystemExit(f"selfcheck: fixture {s!r} isn't actually a // line")
+    for s in code_lines_not_skipped:
+        if s.lstrip().startswith("//"):
+            raise SystemExit(f"selfcheck: fixture {s!r} unexpectedly a // line")
 
 
 def main() -> int:
@@ -80,13 +78,13 @@ def main() -> int:
     for rel in out.splitlines():
         if not rel.endswith(EXTS):
             continue
-        if rel in EXCLUDE_PATHS:
-            continue
         p = REPO_ROOT / rel
         if p == SELF or not p.is_file():
             continue
         text = p.read_text(encoding="utf-8", errors="replace")
         for n, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("//"):
+                continue
             if PATTERN.search(line):
                 hits.append(f"{rel}:{n}: {line.strip()}")
     if hits:
