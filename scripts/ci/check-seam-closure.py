@@ -185,6 +185,7 @@ IMPL_TUS = [
     "server/core/src/compliance_api.cpp",
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
+    "server/core/src/dex_perf_api.cpp",
     # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
     # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
@@ -194,6 +195,12 @@ IMPL_TUS = [
     # presentation dex_routes.cpp, a core→presentation LINK residual tracked in
     # #4579 (only meaningful at the WS-B2 physical split; inert in today's monolith).
     "server/core/src/dex_read_model.cpp",
+    # dex_app_perf_model.cpp backs the same LocalDexPerfApi (it defines
+    # app_perf_fleet_trend/app_perf_group_trend/app_perf_device_summaries +
+    # dex_device_app_perf_json, ADR-0031 WS-A4 DexPerfApi seam) and was already
+    # httplib/routes-free from its first commit (unlike dex_read_model.cpp, it
+    # never had the DEX-signals-seam's presentation include to drop).
+    "server/core/src/dex_app_perf_model.cpp",
 ]
 # ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
 # The store-HEADER patterns above do NOT catch an abstract seam header that
@@ -211,10 +218,11 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/compliance_api.hpp",
     "server/core/src/device_api.hpp",
     "server/core/src/dex_api.hpp",
+    "server/core/src/dex_perf_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
-# in "Store" are listed EXPLICITLY. Two kinds belong here:
+# in "Store" are listed EXPLICITLY. Three kinds belong here:
 #   - store ROW/data types (defined in a `*_store.hpp`): `AppPerfDailyRow` (from
 #     app_perf_daily_store.hpp) — reachable from dex_api.hpp via the gap-#2
 #     serializer before PR #4582.
@@ -224,14 +232,26 @@ ABSTRACT_API_HEADERS = [
 #     execution_tracker.hpp, are not even in FORBIDDEN_HEADER_PATTERNS, so this
 #     name probe is their only guard). Added per the #4582 Fable review; verified
 #     absent from all five abstract-header closures today (no false-fire).
+#   - `AppPerfFleetRow` (from app_perf_fleet_store.hpp) — the DexPerfApi seam's own
+#     raw B2 store row. It carries per-`(version,day)` histogram arrays the
+#     `kDexCohortFloor` suppression must apply to BEFORE anything crosses the
+#     seam, so `dex_perf_api.hpp` exposes only the floor-applied `AppPerfTrendPoint`
+#     (a pure type, see `dex_app_perf_model.hpp`), never this raw type. Two SIBLING row types
+#     — `AppPerfVersionDeviceRow` (app_perf_daily_store.hpp) and `AppPerfAppSummary`
+#     (app_perf_fleet_store.hpp) — were RELOCATED into the pure `app_perf_types.hpp`
+#     instead of denylisted, because the version-devices drill and the app picker
+#     are floor-FREE / no-suppression-needed resources that legitimately return
+#     those rows verbatim across the seam (see their own doc comments). Only
+#     `AppPerfDailyRow` and `AppPerfFleetRow` — the two row types a floor/audit
+#     gate must interpose on BEFORE crossing — stay store-side and denylisted.
 # This is a hand-maintained denylist (a new such type is a manual add) — the
 # `*_store.hpp` include check remains the backstop for any full-definition leak.
 # NOT listed: `AppPerfCohortRow`, a PURE comparison type in `app_perf_compare.hpp`
 # (the verify seam's own pure model) that legitimately appears in verify_api.hpp's
 # closure — it is NOT a store type, so listing it would be a false positive.
 STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
-EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AuthDB", "AgentRegistry",
-                           "ExecutionTracker", "PgPool"]
+EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
+                           "AgentRegistry", "ExecutionTracker", "PgPool"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -339,6 +359,23 @@ FAMILIES = {
             "server/core/src/dex_read_model.hpp",
             "server/core/src/dex_api.hpp",
             "server/core/src/dex_api_local.hpp",
+        ],
+    },
+    # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
+    # sequel to `dex` (DEX signals). REST and MCP ARE rewired through this
+    # seam (zero remaining direct AppPerfProviders/DexPerfFn calls in
+    # rest_api_v1.cpp/mcp_server.cpp) — same header-only posture as `dex` for
+    # a DIFFERENT reason: those two consumer TUs are multi-family and stay
+    # inspected-not-enforced (same as every family), not because the rewire is
+    # outstanding. Only the dashboard (dex_app_perf_ui.*, dex_perf_ui.cpp) is
+    # unrewired, tracked #4626 (mirroring `dex`'s #4576).
+    "dex_perf": {
+        "tus": [
+            "server/core/src/app_perf_types.hpp",
+            "server/core/src/dex_app_perf_pure.hpp",
+            "server/core/src/dex_perf_model.hpp",
+            "server/core/src/dex_perf_api.hpp",
+            "server/core/src/dex_perf_api_local.hpp",
         ],
     },
 }

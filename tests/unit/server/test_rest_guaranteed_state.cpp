@@ -32,6 +32,7 @@
 #include "response_store.hpp"
 #include "dex_api_local.hpp" // ADR-0031 WS-A4: wire the real DexApi seam so the DEX REST cases exercise it
 #include "rest_api_v1.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 #include "test_verify_api_double.hpp"
@@ -527,6 +528,17 @@ struct RestGsHarness {
             dex_api_local = yuzu::server::make_local_dex_api(
                 store.get(), [this]() { return dex_fleet_override_; });
 
+        // ADR-0031 WS-A4 (sixth family): the REAL DexPerfApi seam wrapping
+        // this harness's existing dex_perf_fn_/app_perf_providers_ function
+        // doubles (FnDexPerfApi — mirrors FnVerifyApi's own "wrap the
+        // pre-seam fn-shaped test double" pattern) — always wired, since
+        // dex_perf_fn_ is always present-but-empty here (see its own doc
+        // comment) and every over-time method individually degrades to
+        // nullopt when its own app_perf_providers_ field is unset, exactly
+        // matching this file's pre-rewire per-route provider-absent checks.
+        auto dex_perf_api_local =
+            std::make_shared<yuzu::server::test::FnDexPerfApi>(dex_perf_fn_, app_perf_providers_);
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -600,7 +612,7 @@ struct RestGsHarness {
                             verify_api_,
                             // ADR-0031 WS-A4: device_api unused by this harness;
                             // dex_api_local is the real DEX signals seam (above).
-                            /*device_api=*/nullptr, dex_api_local);
+                            /*device_api=*/nullptr, dex_api_local, dex_perf_api_local);
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs

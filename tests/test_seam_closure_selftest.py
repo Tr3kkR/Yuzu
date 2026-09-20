@@ -99,6 +99,15 @@ EXPECTED_FAMILIES = {
             "server/core/src/dex_api_local.hpp",
         ],
     },
+    "dex_perf": {
+        "tus": [
+            "server/core/src/app_perf_types.hpp",
+            "server/core/src/dex_app_perf_pure.hpp",
+            "server/core/src/dex_perf_model.hpp",
+            "server/core/src/dex_perf_api.hpp",
+            "server/core/src/dex_perf_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
@@ -126,7 +135,9 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/compliance_api.cpp",
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
+    "server/core/src/dex_perf_api.cpp",
     "server/core/src/dex_read_model.cpp",
+    "server/core/src/dex_app_perf_model.cpp",
 ]
 EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
 # Abstract-header store-type probe (PR #4582 FIX 3).
@@ -136,9 +147,10 @@ EXPECTED_ABSTRACT_API_HEADERS = [
     "server/core/src/compliance_api.hpp",
     "server/core/src/device_api.hpp",
     "server/core/src/dex_api.hpp",
+    "server/core/src/dex_perf_api.hpp",
 ]
-EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AuthDB", "AgentRegistry",
-                                    "ExecutionTracker", "PgPool"]
+EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
+                                    "AgentRegistry", "ExecutionTracker", "PgPool"]
 
 
 def _fail(msg: str, failures: list) -> None:
