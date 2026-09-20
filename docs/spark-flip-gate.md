@@ -1664,21 +1664,28 @@ trust it over the aggregate for Linux Service until #4252 is fixed). Fleet-agnos
 pilot-only: any fleet with Linux Service rules and no prior drift history gets this as a FIRST
 exposure at the flip, not a widening (§8's tenth-round paragraph). If #4252 is fixed before
 PR-5 ships, this deliverable is moot and can be dropped. **A fourth deliverable (sre and
-chaos-injector, `/governance` on the #4606 criterion-10 instrumentation):** that change adds
+chaos-injector, `/governance` on the #4606 benchmark instrumentation), owned by the PR-5 author:** that change adds
 always-on `info`-level `Guardian T_detect` / `Guardian T_wire` / `Guardian T_server` log lines.
 The server-side `T_server` line and the agent's legacy drift-sink `T_wire` line are live today;
 `T_detect` and the Spark-outbox `T_wire` line stay dormant until `prefer_spark`. They are
 benchmark diagnostics and have no kill switch other than `--log-level`. The trigger is #4606 closing (the
-criterion-10 evidence campaign concluding): at that point, or at PR-5 if that comes first, they must
+benchmark campaign concluding): at that point, or at PR-5 if that comes first, they must
 be retired or gated behind a runtime flag - left unrecorded they ship into the flip as permanent
 unconditional log volume. As of this writing no separate issue exists for the retirement, so this paragraph is
-its only record.
-Two fault-injection scenarios designed at that governance run are also unowned and not yet run,
-both inert until `prefer_spark` gives the Spark drain worker a live caller: a slow or blocked log
-sink with Spark live, and orphan attribution under outbox rejection or an agent crash between
+its only record. **A flip precondition that comes with it:** the lines are written synchronously, `T_detect` on
+the Spark consumer thread and the convergence thread and the Spark-outbox `T_wire` on the single-flight send
+worker, so once `prefer_spark` is true a blocked log sink stalls whichever of those threads is writing. The
+Gate 8 review of #4606 traced consequences that include a full consumer queue dropping `SparkEvent`s and
+delayed subscription recovery (read from the code, not reproduced). Before the flip the lines must therefore be
+retired (the default) or their emission moved behind a bounded non-blocking hand-off. The same synchronous
+exposure already exists on the live legacy path (`T_wire` on the guard worker, `T_server` on the ingest
+thread), where it is not new: other `info` lines are already written on those threads.
+Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a slow or
+blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark` gives the Spark drain
+worker a live caller), and orphan attribution under outbox rejection or an agent crash between
 enqueue and send. The related findings are ledgered in
-`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (`4606-up1` through `4606-up6` and
-`4606-sre-no-removal-plan`).
+`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (`4606-up1` through `4606-up6`,
+`4606-sre-no-removal-plan` and the Gate 8 findings `g8-*`).
 
 1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruled 2026-09-02 per
    §3 row 8). Runs
