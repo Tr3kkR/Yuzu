@@ -4601,6 +4601,512 @@ std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind ki
 
 } // namespace
 
+// ── #4340 (rung 9c PR-6 item 1): Registry establishment-signal ───────────────
+//
+// Mirrors spark_service.cpp's shipped M3 shape (#3840 PR-B3). Every case here
+// is DGRHP-only (the real mechanism is Windows-only); see the delivery plan
+// (~/.claude/plans/spark-4340-registry-file-establishment-signal-DELIVERY-PLAN.md
+// §5) for the RF-1..RF-10 catalogue and the mutation checklist this section's
+// commit body records results for.
+
+TEST_CASE("Registry mechanism (Windows, direct): set_established_sink seals at start(), still "
+          "sealed after stop() (#4340 RF-1)",
+          "[spark][established][windows]") {
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
+}
+
+TEST_CASE("Registry spark (real mechanism): an existing target key reaches Notification "
+          "coverage with a stamped established_at (#4340 RF-2)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_target");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an absent target watches its ancestor with None "
+          "coverage until the key is created (#4340 RF-3, DoD 1)",
+          "[spark][established][windows]") {
+    ScratchRegKey parent("est_absent_parent");
+    const std::string target = parent.sub + "\\Missing"; // absent at arm time
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", target);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    // Ancestor-mode establishment settles quickly too (the parent exists),
+    // but it must NEVER report Notification for the absent target - only
+    // None, unconditionally, per the mode gate (MF1).
+    std::this_thread::sleep_for(300ms);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Create the target key - NO value write. The parent's NAME notification
+    // fires; the re-arm resolves to Target and must stamp established_at.
+    OwnedRegKey created(target, KEY_READ); // deleted on scope exit
+    REQUIRE(created.h != nullptr);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an ordinary fire re-arms without moving "
+          "established_at (#4340 RF-4, DoD 2)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_rearm");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // RegNotifyChangeKeyValue is one-shot (correction C): the write consumes
+    // it, flapping coverage None -> Notification across the re-arm - a genuine
+    // transition the pull query below is not guaranteed to observe mid-flight
+    // (hand-off note §10), so this asserts only the settled before/after
+    // states, not the transient None.
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    a.write(1);
+    REQUIRE(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; }, 8000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == stamped); // first-wins: the ordinary re-arm never re-stamps
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a parked initial probe leaves coverage None until "
+          "release, then stamps established_at (#4340 RF-5)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_late");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    ProbeGate gate;
+    RegistryMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.sub);
+    REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value()); // success-with-pending (correction A: the local
+                              // discards is never dispatched - only the mark on
+                              // `w` itself, which survives, carries the report)
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    std::this_thread::sleep_for(200ms); // well past the 50 ms caller budget/sweep cadence
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    const auto t_release = std::chrono::steady_clock::now();
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= t_release);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): deleting the target loses coverage without "
+          "re-stamping, recreate restores Notification (#4340 RF-6)",
+          "[spark][established][windows]") {
+    const std::string sub = "Software\\Yuzu\\SparkEst4340_" + std::to_string(::GetCurrentProcessId()) +
+                            "_" + std::to_string(yuzu::test::process_random_salt() % 1000000000);
+    HKEY h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                              &h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(h);
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = registry_spec("HKCU", sub);
+    auto s = engine.arm(*c, spec);
+    REQUIRE(s.has_value());
+    engine.start();
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*s);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*s);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // loss of coverage never un-stamps established_at
+
+    HKEY h2 = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                              &h2, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(h2);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*s);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins - recovery never re-stamps
+
+    engine.disarm(*s);
+    engine.stop();
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+}
+
+TEST_CASE("Registry spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (#4340 RF-7)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_adopt");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, spec); // dedup: same key -> the engine renews the
+                                           // existing armed_ entry, skipping unwatch()
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub2);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at); // MF4: never predates the adopting arm
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a failed re-arm reports None until the retry "
+          "recovers, established_at unchanged (#4340 RF-8)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_backend_fail");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // Every re-arm probe of `a` now throws inside the worker (WorkerThrew -> a
+    // backend failure), on a shortened retry schedule - the initial probe
+    // above already succeeded, so only the SECOND (re-arm) probe is affected.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = [sub_key = a.sub](std::string_view s) {
+            if (s == sub_key)
+                throw std::runtime_error("simulated re-arm failure");
+        };
+        ctl.backend_retry_base = 150ms;
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    a.write(1); // consumes the notify: on_fire marks None (R6); the re-arm probe throws
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    REQUIRE(eventually([&] { return engine.stats().armed_faulted == 1; }, 5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // a fault never un-stamps established_at
+
+    // Clear the hook: the next scheduled retry recovers the watch.
+    {
+        RegistryMechanismTestControls ctl; // null hook clears it; timings unchanged
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    REQUIRE(eventually([&] { return engine.stats().armed_faulted == 0; }, 10000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a present key establishes fast enough that "
+          "established_at trails armed_at by well under an idle sweep's ceiling (#4340 RF-9, "
+          "correction B)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_fast");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    // The fast-commit path (watch_incarnation's own bounded wait resolves the
+    // probe before the caller budget expires) nudges the sweeper immediately
+    // (correction B) rather than leaving the report for next_wake_locked()'s
+    // otherwise-applicable 1h idle ceiling. Bounded generously against CI
+    // scheduling noise - the point is "not an hour", not a tight bound.
+    const auto latency = *est->established_at - est->armed_at;
+    CHECK(latency < 500ms);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): the establishment sink reports the ordered "
+          "coverage sequence [Notification, None, Notification] against a fixed incarnation, "
+          "and the fire-consumed None is dispatched strictly before the synthetic emit that "
+          "closes the gap (#4340 RF-10)",
+          "[spark][established][windows]") {
+    // Direct (no engine) so a real SparkIncarnation token can be supplied and
+    // every report's identity checked - the engine-level pull query
+    // (subscription_establishment) cannot reliably observe a transient None
+    // mid-flap (hand-off note §10), and it never exposes dispatch ORDER at
+    // all. Ordering against the SYNTHETIC (resync) emit specifically - not
+    // the immediate on_fire emit, which races the sweeper's own wake on a
+    // different thread and is not deterministically orderable - is proven by
+    // construction here: the ProbeGate below holds the re-arm probe parked,
+    // so commit_locked (the ONLY place that stages the synthetic emit) cannot
+    // have run until AFTER release(), by which point the None report has
+    // already been observed.
+    ScratchRegKey a("est_direct_seq");
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+
+    struct EstEntry {
+        SparkIncarnation incarnation;
+        SparkCoverage coverage;
+    };
+    std::mutex mu;
+    std::vector<EstEntry> est_seq;
+    std::atomic<int> emits{0};
+
+    REQUIRE(mech->set_established_sink(
+        [&](const std::string&, SparkIncarnation inc, std::chrono::steady_clock::time_point,
+           SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            est_seq.push_back({inc, cov});
+        }));
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+
+    // Initial establishment: Notification, token 42, no emit yet ("an initial
+    // establishment never emits" - matches the existing appearance test).
+    REQUIRE(eventually([&] {
+        std::lock_guard lk(mu);
+        return !est_seq.empty();
+    }));
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 1);
+        CHECK(est_seq[0].incarnation == kToken);
+        CHECK(est_seq[0].coverage == SparkCoverage::Notification);
+    }
+    CHECK(emits.load() == 0);
+
+    // Park every FUTURE probe of `a` - the re-arm only (the initial one
+    // already resolved above without this hook installed).
+    ProbeGate gate;
+    RegistryMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.sub);
+    REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+
+    a.write(1); // consumes the one-shot notify: on_fire marks None (R6) and
+                // fires the immediate emit; the re-arm probe launches and parks.
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return est_seq.size() >= 2;
+        },
+        8000ms));
+    {
+        std::lock_guard lk(mu);
+        CHECK(est_seq[1].incarnation == kToken);
+        CHECK(est_seq[1].coverage == SparkCoverage::None);
+    }
+    const int emits_while_parked = emits.load(std::memory_order_acquire);
+    CHECK(emits_while_parked >= 1); // the immediate fire, unaffected by the re-arm park
+
+    // The synthetic (resync) emit cannot land while the re-arm stays parked:
+    // established(None) above is therefore dispatched strictly before it.
+    std::this_thread::sleep_for(200ms);
+    CHECK(emits.load(std::memory_order_acquire) == emits_while_parked);
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] { return emits.load(std::memory_order_acquire) > emits_while_parked; }, 5000ms));
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return est_seq.size() >= 3;
+        },
+        8000ms));
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 3);
+        CHECK(est_seq[2].incarnation == kToken);
+        CHECK(est_seq[2].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+}
+
 // ── File walkoff (#2012/#3840 PR-B2) ────────────────────────────────────────
 namespace {
 
