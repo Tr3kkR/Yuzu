@@ -58,6 +58,8 @@
 /// A2-discoverable (openapi.json + tools/list), behind `GuaranteedState:Read` with
 /// per-device audit via `rest_audit.hpp` (fail-closed 503).
 
+#include "app_perf_types.hpp" // AppPerfVersionDeviceRow (ADR-0031 WS-A4 DexPerfApi split)
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -106,13 +108,9 @@ struct AppPerfDailyRow {
 /// fan-out read across devices, not a per-agent one — same reason
 /// `AppPerfCohortRow` (app_perf_compare.hpp) is a distinct shape from
 /// `AppPerfDailyRow` rather than a reuse.
-struct AppPerfVersionDeviceRow {
-    std::string agent_id;
-    std::int64_t last_day{0}; ///< most recent day this device reported this (app,version)
-    std::int64_t samples{0};
-    double cpu_avg{0.0};       ///< that day's share-of-capacity CPU%
-    std::int64_t ws_avg_bytes{0};
-};
+// AppPerfVersionDeviceRow relocated to app_perf_types.hpp (ADR-0031 WS-A4
+// DexPerfApi split, PR #4582-review) — re-exported transitively via the
+// #include above, so every existing caller of this header is unaffected.
 
 class AppPerfDailyStore {
 public:

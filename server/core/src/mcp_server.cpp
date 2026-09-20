@@ -52,7 +52,6 @@
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
-#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
 #include "dex_read_model.hpp"    // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
@@ -13792,7 +13791,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return; // the gate wrote its own 401/403
-                if (!app_perf_providers.device) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         a4_error(kInternalError, "service unavailable", "retry the request",
                                  /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
@@ -13807,8 +13806,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     "device app-perf-over-time drill (B1 retained) via MCP "
                     "get_dex_device_app_perf");
                 const auto app_filter = param_str(args, "app", "");
-                auto rows = app_perf_providers.device(agent_id);
-                if (!rows) {
+                auto body = dex_perf_api_->device_app_perf_json(agent_id, app_filter, audit_ok);
+                if (!body) {
                     // Authoritative read degrade — an ERROR, never success+[] (matches
                     // every other app-perf provider-degrade branch in this file).
                     mcp_audit("failure", "app-perf store read degraded; agent=" + agent_id);
@@ -13820,9 +13819,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 mcp_audit("success", agent_id);
                 res.set_content(
-                    success_response(id, tool_result(dex_device_app_perf_json(agent_id, app_filter,
-                                                                               *rows, audit_ok),
-                                                      kObjectOutputSchema)),
+                    success_response(id, tool_result(*body, kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -14248,7 +14245,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!dex_perf_fn) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Fleet perf provider unavailable",
                                        a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the fleet-perf "
@@ -14273,7 +14270,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // are aggregates and stay on the generic mcp.<tool> audit.
                 bool device_list_audit_ok = true;
                 if (tool_name == "get_dex_perf_fleet") {
-                    const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                    const auto now = dex_perf_fleet_now(dex_perf_api_->fleet_snapshot(std::string{}));
                     payload = JObj()
                                   .raw("cpu_pct", stat_json(now.cpu))
                                   .raw("commit_pct", stat_json(now.commit))
@@ -14296,7 +14293,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    const auto snap = dex_perf_fn(key);
+                    const auto snap = dex_perf_api_->fleet_snapshot(key);
                     JArr rows;
                     for (const auto& c : dex_perf_cohorts(snap)) {
                         JObj o;
@@ -14350,7 +14347,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                    const auto d = dex_perf_cohort_diff(dex_perf_api_->fleet_snapshot(key), a, b);
                     auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                         if (!found)
                             return "null";
@@ -14427,7 +14424,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn, req, "dex.perf.device.view", "success", "GuaranteedState", "",
                         "fleet-wide DEX perf device list via MCP list_dex_perf_devices");
                     JArr arr;
-                    for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
+                    for (const auto& r : dex_perf_device_list(dex_perf_api_->fleet_snapshot(cohort_key), metric,
                                                               not_reporting, cohort_filter,
                                                               limit)) {
                         JObj o;
@@ -14505,7 +14502,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 };
                 std::string payload;
                 if (tool_name == "list_dex_perf_apps") {
-                    if (!app_perf_providers.apps) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14514,7 +14511,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     bool truncated = false;
-                    auto apps = app_perf_providers.apps(truncated);
+                    auto apps = dex_perf_api_->apps(truncated);
                     if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
@@ -14531,7 +14528,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     .add("last_day", a.last_day));
                     payload = JObj().raw("apps", arr.str()).add("truncated", truncated).str();
                 } else if (tool_name == "get_dex_app_perf") {
-                    if (!app_perf_providers.fleet) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14564,8 +14561,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.fleet(app, version);
-                    if (!rows) { // AUTHORITATIVE read degrade
+                    auto trend = dex_perf_api_->app_fleet_trend(app, version);
+                    if (!trend) { // AUTHORITATIVE read degrade
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14574,7 +14571,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                    for (const auto& pt : *trend) {
                         // Fleet floors now too — emit suppressed + gate stats, same
                         // shape as get_dex_group_app_perf (a suppressed point must not
                         // read as "N devices @ 0% CPU").
@@ -14617,7 +14614,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (redundant-but-reachable, not dead) and is deliberately
                     // NOT touched here — see
                     // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
-                    if (!app_perf_providers.group) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14667,8 +14664,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.group(group_id, app, version);
-                    if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                    auto trend = dex_perf_api_->group_trend(group_id, app, version);
+                    if (!trend) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                         res.set_content(
                             error_response(id, kInternalError, "app-perf group read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14677,7 +14674,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                    for (const auto& pt : *trend) {
                         JObj o;
                         o.add("version", pt.version)
                             .add("day", pt.day)
@@ -14714,7 +14711,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // gives: perm_fn above already denies every service-scoped
                     // token outright for (GuaranteedState, Read) before any
                     // tool-specific branch is reached.
-                    if (!app_perf_providers.tag_cohort) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14790,8 +14787,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.tag_cohort(key, value, app, version);
-                    if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+                    auto trend = dex_perf_api_->tag_trend(key, value, app, version);
+                    if (!trend) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
                         res.set_content(
                             error_response(id, kInternalError, "app-perf tag cohort read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14800,7 +14797,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                    for (const auto& pt : *trend) {
                         JObj o;
                         o.add("version", pt.version)
                             .add("day", pt.day)
@@ -14900,7 +14897,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // the gate already wrote its own JSON-RPC error body
-                if (!app_perf_providers.version_devices) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         a4_error(kInternalError, "service unavailable", "retry the request",
                                  /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
@@ -14912,7 +14909,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
                 bool truncated = false;
                 auto rows =
-                    app_perf_providers.version_devices(app, version, visible_ids, truncated);
+                    dex_perf_api_->app_version_devices(app, version, visible_ids, truncated);
                 if (!rows) { // AUTHORITATIVE read degrade
                     // Dedicated verb on the degrade path too, matching the REST/dashboard
                     // siblings (set-and-proceed — MCP has no Sec-Audit-Failed equivalent).

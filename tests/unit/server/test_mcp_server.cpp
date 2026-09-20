@@ -56,6 +56,7 @@
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
 #include "test_device_api_double.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
@@ -1472,6 +1473,26 @@ private:
         if (guaranteed_state_store_for_test)
             mcp.set_dex_api(yuzu::server::make_local_dex_api(
                 guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
+
+        // ADR-0031 WS-A4 (sixth family): wrap this file's plain dex_perf_fn_for_test
+        // (heartbeat-now) + app_perf_providers_for_test (over-time) fn-shaped test
+        // doubles in the DexPerfApi seam (FnDexPerfApi — mirrors FnVerifyApi's own
+        // "wrap the pre-seam fn-shaped test double" pattern above). Conditional,
+        // NOT unconditional like the DexApi wiring above: several existing tests
+        // (e.g. "tools report unavailable when no provider is wired") rely on
+        // dex_perf_fn_for_test staying entirely empty by default -> dex_perf_api_
+        // stays null -> the MCP tools' own `!dex_perf_api_` guard answers 503,
+        // exactly like the pre-seam `!dex_perf_fn` check it replaces. A test that
+        // wires ANY ONE field still gets a non-null seam whose OTHER methods
+        // individually degrade to nullopt for their own unset provider, exactly
+        // matching this file's pre-rewire per-tool provider-absent checks.
+        if (dex_perf_fn_for_test || app_perf_providers_for_test.fleet ||
+            app_perf_providers_for_test.apps || app_perf_providers_for_test.device ||
+            app_perf_providers_for_test.group || app_perf_providers_for_test.tag_cohort ||
+            app_perf_providers_for_test.tag_values ||
+            app_perf_providers_for_test.version_devices)
+            mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
+                dex_perf_fn_for_test, app_perf_providers_for_test));
 
         // #4035 hardening (governance): same setter idiom, reads
         // dex_visible_for_test LIVE at request time (see that field's doc

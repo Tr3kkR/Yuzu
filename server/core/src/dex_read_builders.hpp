@@ -3,9 +3,8 @@
 /// @file dex_read_builders.hpp
 /// CORE-ONLY. The store-reaching half of the DEX read-model layer: the nine
 /// `build_dex_*_model(GuaranteedStateStore* store, ...)` builders that read a
-/// store into a pure model struct, plus `dex_device_app_perf_json` (which names
-/// the `AppPerfDailyRow` store-row type). Split out of `dex_read_model.hpp`
-/// (ADR-0031 WS-A4, FortitudeEtc review on PR #4582) so the PURE half —
+/// store into a pure model struct. Split out of `dex_read_model.hpp` (ADR-0031
+/// WS-A4, FortitudeEtc review on PR #4582) so the PURE half —
 /// `dex_read_model.hpp` (the model structs + the model-only JSON serializers) —
 /// carries NO store-type token and can sit behind the ABSTRACT `dex_api.hpp`
 /// seam with a genuinely store-type-free include closure, exactly like the four
@@ -13,12 +12,10 @@
 ///
 /// This header forward-declares the store types it needs (never includes a
 /// store header) and is included ONLY by store-reaching TUs: the seam impl
-/// (`dex_api.cpp`), the definitions TU (`dex_read_model.cpp`), the parity test
-/// (`test_dex_api.cpp`), and the app-perf-drill serializer's callers
-/// (`rest_api_v1.cpp` / `mcp_server.cpp`). It is NEVER included by
-/// `dex_api.hpp` or any presentation TU — that is what keeps the abstract seam
-/// header store-type-free (enforced by check-seam-closure.py's abstract-header
-/// probe).
+/// (`dex_api.cpp`), the definitions TU (`dex_read_model.cpp`), and the parity
+/// test (`test_dex_api.cpp`). It is NEVER included by `dex_api.hpp` or any
+/// presentation TU — that is what keeps the abstract seam header store-type-free
+/// (enforced by check-seam-closure.py's abstract-header probe).
 ///
 /// LINK RESIDUAL (WS-B2, tracked #4579): "CORE-ONLY" here means include-only —
 /// the nine builders are DEFINED in `dex_read_model.cpp` (core), but the
@@ -36,7 +33,6 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
-struct AppPerfDailyRow; // app_perf_daily_store.hpp -- fwd decl only (Seam 2 device app-perf drill); full def in dex_read_model.cpp
 
 // ── Store-reaching builders (each reads `store` into a pure model struct) ──
 // `store` may be null in every builder (degrades to an empty/`-1` model, never
@@ -90,15 +86,5 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
                                           const std::string& window, int window_days,
                                           const std::string& since,
                                           const std::set<std::string>* visible);
-
-// ── Seam-2 (app-perf drill) serializer — names the AppPerfDailyRow store-row
-//    type, so it lives here (NOT in the pure dex_read_model.hpp). Callers:
-//    rest_api_v1.cpp + mcp_server.cpp's GET /dex/devices/{id}/app-perf handler.
-/// Shared JSON serializer for the per-device B1 app-perf drill. `rows` is
-/// whatever `AppPerfProviders::device(agent_id)` returned; empty `app_filter`
-/// means "every app". `audit_persisted` per `dex_device_score_json`.
-std::string dex_device_app_perf_json(const std::string& agent_id, const std::string& app_filter,
-                                     const std::vector<AppPerfDailyRow>& rows,
-                                     bool audit_persisted = true);
 
 } // namespace yuzu::server
