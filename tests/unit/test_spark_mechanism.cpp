@@ -5107,6 +5107,104 @@ TEST_CASE("Registry mechanism (Windows, direct): the establishment sink reports 
     mech->stop();
 }
 
+TEST_CASE("Registry mechanism (Windows, direct): an establishment report and an action staged "
+          "in the SAME sweep visit dispatch in established-before-action order (#4340 RF-11, "
+          "delivery plan §1.8)",
+          "[spark][established][windows]") {
+    // RF-10 above pins ordering ACROSS sweep passes only (it parks the re-arm
+    // probe precisely so the None report and the synthetic emit land in
+    // different passes) - a swap of run_off_lock()'s two dispatch loops would
+    // still pass it (adversarial-review finding on #4340). This case forces
+    // both into ONE pass, deterministically and without any sleep:
+    //  * the initial probe is parked, so watch_incarnation() returns
+    //    success-with-pending and, in ONE mu_ hold, publishes w->call, marks
+    //    None due and nudges the sweeper;
+    //  * health_grace is 1 ms (far below the 50 ms caller budget already spent
+    //    by then), so the FIRST sweep visit that can see the published call
+    //    finds the grace already blown: within that single visit sweep_locked()
+    //    drains the None marker into work.established (before the switch) and
+    //    then, in the same visit, grace_check_locked()'s faulted_now flip
+    //    stages a Fault action into work.actions;
+    //  * an earlier visit cannot interfere: a Pending watch with no published
+    //    call is a no-op (no grace check, nothing due).
+    // Both entries therefore belong to the same run_off_lock() call, and one
+    // shared, mutex-guarded log records the real dispatch order. A Fault
+    // stands in for the Emit the finding names because an Emit is only ever
+    // staged by a commit, which re-marks Notification due strictly AFTER the
+    // drain (never the same visit) - and Fault and Emit share the one
+    // work.actions loop, so this pins the identical established-before-
+    // actions property.
+    ScratchRegKey a("est_same_pass");
+    ProbeGate gate; // declared BEFORE mech: outlives every worker that touches it
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+
+    struct LogEntry {
+        enum class Kind { Established, Fault } kind;
+        SparkIncarnation incarnation;
+        SparkCoverage coverage;
+        bool faulted;
+    };
+    std::mutex mu;
+    std::vector<LogEntry> log;
+
+    REQUIRE(mech->set_established_sink(
+        [&](const std::string&, SparkIncarnation inc, std::chrono::steady_clock::time_point,
+           SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            log.push_back({LogEntry::Kind::Established, inc, cov, false});
+        }));
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.sub);
+        ctl.health_grace = 1ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+               [&](const std::string&, bool faulted, std::string_view) {
+                   std::lock_guard lk(mu);
+                   log.push_back({LogEntry::Kind::Fault, kNoSparkIncarnation, SparkCoverage::None,
+                                  faulted});
+               });
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return log.size() >= 2;
+        },
+        8000ms));
+    {
+        std::lock_guard lk(mu);
+        CHECK(log[0].kind == LogEntry::Kind::Established); // established FIRST...
+        CHECK(log[0].incarnation == kToken);
+        CHECK(log[0].coverage == SparkCoverage::None);
+        CHECK(log[1].kind == LogEntry::Kind::Fault); // ...then the same-visit action
+        CHECK(log[1].faulted);
+    }
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            for (const auto& e : log)
+                if (e.kind == LogEntry::Kind::Established &&
+                    e.coverage == SparkCoverage::Notification)
+                    return true;
+            return false;
+        },
+        8000ms));
+
+    mech->stop();
+    CHECK(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+        5000ms));
+}
+
 // ── File walkoff (#2012/#3840 PR-B2) ────────────────────────────────────────
 namespace {
 
@@ -6876,6 +6974,90 @@ TEST_CASE("File mechanism (Windows, direct): the establishment sink reports the 
     }
 
     mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): an establishment report and an action staged in "
+          "the SAME sweep visit dispatch in established-before-action order (#4340 FF-11, "
+          "delivery plan §1.8)",
+          "[spark][established][windows]") {
+    // The File twin of Registry's RF-11 (see its rationale): FF-10 above
+    // pins ordering across passes only. Here the first sweep visit that sees
+    // the published-pending call (published in the same mu_ hold that marks
+    // None due - the mark FF-5b pins) finds health_grace (1 ms) long blown,
+    // so ONE visit stages both the drained None report (stage_established_
+    // locked, ahead of the switch) and, from grace_check_locked, a Fault
+    // notice into work.notices. Fault and Emit share that one notices loop,
+    // so this pins the same established-before-notices property the finding
+    // names for Emit (an Emit needs a commit, whose re-marked Notification is
+    // never drained in the same visit - see RF-11).
+    ScratchDir a("est_same_pass");
+    FileProbeGate gate; // declared BEFORE mech: outlives every worker that touches it
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    struct LogEntry {
+        enum class Kind { Established, Fault } kind;
+        SparkIncarnation incarnation;
+        SparkCoverage coverage;
+        bool faulted;
+    };
+    std::mutex mu;
+    std::vector<LogEntry> log;
+
+    REQUIRE(mech->set_established_sink(
+        [&](const std::string&, SparkIncarnation inc, std::chrono::steady_clock::time_point,
+           SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            log.push_back({LogEntry::Kind::Established, inc, cov, false});
+        }));
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        ctl.health_grace = 1ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+               [&](const std::string&, bool faulted, std::string_view) {
+                   std::lock_guard lk(mu);
+                   log.push_back({LogEntry::Kind::Fault, kNoSparkIncarnation, SparkCoverage::None,
+                                  faulted});
+               });
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return log.size() >= 2;
+        },
+        8000ms));
+    {
+        std::lock_guard lk(mu);
+        CHECK(log[0].kind == LogEntry::Kind::Established); // established FIRST...
+        CHECK(log[0].incarnation == kToken);
+        CHECK(log[0].coverage == SparkCoverage::None);
+        CHECK(log[1].kind == LogEntry::Kind::Fault); // ...then the same-visit action
+        CHECK(log[1].faulted);
+    }
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            for (const auto& e : log)
+                if (e.kind == LogEntry::Kind::Established &&
+                    e.coverage == SparkCoverage::Notification)
+                    return true;
+            return false;
+        },
+        8000ms));
+
+    mech->stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
 }
 
 // ── File T6-analogue (#2012 PR-B2, criterion #15, reentrancy half) ──────────
