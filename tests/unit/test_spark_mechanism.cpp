@@ -6448,6 +6448,9 @@ TEST_CASE("File spark (real mechanism): a parked initial discovery probe leaves 
     std::this_thread::sleep_for(200ms); // well past the 50 ms caller budget/sweep cadence
     auto est = engine.subscription_establishment(*sub);
     REQUIRE(est.has_value());
+    // NB: the engine's armed-entry cache defaults to None, so this cannot tell
+    // an explicit mechanism-side None report from none at all - FF-5b below
+    // observes the mechanism's sink directly for exactly that.
     CHECK(est->coverage == SparkCoverage::None);
     CHECK_FALSE(est->established_at.has_value());
 
@@ -6466,6 +6469,81 @@ TEST_CASE("File spark (real mechanism): a parked initial discovery probe leaves 
 
     engine.disarm(*sub);
     engine.stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): a published-pending initial probe reports an "
+          "explicit None to the establishment sink before any Notification (#4340 FF-5b)",
+          "[spark][established][windows]") {
+    // FF-5 above reads only SparkEngine::subscription_establishment(), whose
+    // armed-entry cache DEFAULTS to None: it stays green if the mechanism
+    // never reports the published-pending None at all (adversarial-review
+    // finding on #4340: the File branch once omitted mark_coverage_locked()
+    // where Registry's identical branch has it). Only a direct sink observer,
+    // as RF-10/FF-10 use, can tell an explicit report from an absent one.
+    ScratchDir a("est_direct_pending");
+    FileProbeGate gate; // declared BEFORE mech: outlives every worker that touches it
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    struct EstEntry {
+        SparkIncarnation incarnation;
+        SparkCoverage coverage;
+    };
+    std::mutex mu;
+    std::vector<EstEntry> est_seq;
+
+    REQUIRE(mech->set_established_sink(
+        [&](const std::string&, SparkIncarnation inc, std::chrono::steady_clock::time_point,
+           SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            est_seq.push_back({inc, cov});
+        }));
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    // Success-with-pending: returns after the caller budget with the probe
+    // still parked on the worker.
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // The None must arrive while the probe is STILL parked - no Notification
+    // can exist yet, so this entry is the explicit published-pending report.
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return !est_seq.empty();
+        },
+        5000ms));
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 1);
+        CHECK(est_seq[0].incarnation == kToken);
+        CHECK(est_seq[0].coverage == SparkCoverage::None);
+    }
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return est_seq.size() >= 2;
+        },
+        5000ms));
+    {
+        std::lock_guard lk(mu);
+        CHECK(est_seq[1].incarnation == kToken);
+        CHECK(est_seq[1].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
 }
 
 TEST_CASE("File spark (real mechanism): a deterministic completion failure reports None until "

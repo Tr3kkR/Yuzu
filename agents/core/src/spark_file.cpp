@@ -971,6 +971,19 @@ public:
                 // synthetic fire the sweep emits on commit (#2012/#3840
                 // gap-2 trigger: published-pending establishment; mirrors
                 // spark_registry.cpp watch()'s identical site).
+                //
+                // Establishment signal (delivery plan §3 row F5, "Marks N"):
+                // this obligation is accepted but not yet watching, so it has
+                // NO coverage yet — report None explicitly, exactly as
+                // spark_registry.cpp's identical branch does. The engine's
+                // armed-entry cache already defaults to None, so the pull
+                // query alone cannot tell this mark from its absence; a
+                // direct mechanism-level sink observer can. Under mu_, so the
+                // mark lands in the same lock hold that publishes w->call: the
+                // first sweep visit that sees the pending call also sees the
+                // due marker. The shared nudge_locked() below (this branch is
+                // `live`) wakes the sweeper — no second nudge here.
+                mark_coverage_locked(*w, SparkCoverage::None);
                 w->call = std::move(call);
                 w->needs_resync = true;
                 w->resync_epoch = ++resync_epoch_;
