@@ -1216,8 +1216,10 @@ coverage.
 One asymmetry the two do NOT share with each other, load-bearing for any consumer comparing
 their `coverage` streams: Registry's `RegNotifyChangeKeyValue` is one-shot, so coverage
 genuinely FLAPS `Notification -> None -> Notification` on every consumed Target-mode fire (a
-real notify-then-rearm cycle, not a bug); a deletion fire ends at `None` (Target -> Ancestor,
-no `Notification` until the key reappears). File's `ReadDirectoryChangesW` reissue is
+real notify-then-rearm cycle, not a bug; Target mode means the watch sits on the requested key
+itself, Ancestor mode means the key is absent so the watch sits on its nearest existing
+ancestor until the key appears); a deletion fire ends at `None` (Target -> Ancestor, no
+`Notification` until the key reappears). File's `ReadDirectoryChangesW` reissue is
 synchronous on an ordinary fire, so its coverage stays `Notification` across it and only
 drops on a genuine backend failure (a failed read completion, reissue or re-probe) or loss of
 the watched (parent) directory; never on `unwatch()` or an orderly `stop()`, which are
@@ -1297,7 +1299,8 @@ post-stop `established_at`/`coverage` pair as current live coverage.
 LAST DELIVERED value, not an authoritative live state. (b) It can go stale with no signal a
 consumer can read. A dropped report (the sink threw; the production engine sink takes only the
 engine lock and cannot realistically throw) is not detectable by a consumer at all:
-`subscription_health()` reads `armed_.faulted`, which only a mechanism's Fault callback sets, so
+`subscription_health()` reads `armed_.faulted`, which only a Fault report sets (a mechanism's
+Fault callback, or the engine's own pre-start replay failure), so
 once a deleted target's re-arm has resolved to the ancestor the watch is Healthy, `inert` is
 false, and the cache can still read `Notification` if the `None` report was dropped (the
 Registry test that characterises exactly this drops every `None` and deletes the target). A
@@ -1319,7 +1322,9 @@ reissue or re-probe on File; a failed re-arm on Registry). The discriminators th
 `subscription_health() == Faulted`, the age of `armed_at` (which bounds how long the
 subscription has existed; there is no last-transition timestamp, so telling a brief flap from a
 stable `None` means sampling `coverage` over time), and `nullopt` from
-`subscription_establishment()`, which means the subscription is dead or torn down. (e) The first
+`subscription_establishment()`, which means an unknown or already-disarmed subscription id (not
+an engine `stop()`: after `stop()` the query keeps returning last-known values, see R4 above).
+(e) The first
 production consumer, the detect-latency measurement tracked in #4606, must re-derive the
 stale-cache severity and cover these residuals itself: the check in (b) narrows only one
 Registry case and (g) has no such check, so there is no complete guard to copy. (f) There is no
@@ -1327,7 +1332,7 @@ operator surface: a dropped report is counted in the `established_failed` debug 
 seam) and logged once (the first drop only). (g) File has no equivalent of (b)'s Registry
 narrowing: its `inert_` is written only in `start()` (spark_file.cpp) and never flips at
 runtime, and a File worker that keeps failing passes (its per-pass catch in `run()` unwinds and
-carries on, with no backoff, counter or log; a tracked follow-up) is invisible to both
+carries on, with no backoff, counter or log; a known gap, not yet fixed) is invisible to both
 `subscription_health()` and `inert`, so both guards pass on a deaf File watch.
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
