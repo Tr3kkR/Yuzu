@@ -1309,6 +1309,12 @@ struct RestApprovalsHarness {
     bool perm_grant{true};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
+    // compliance-officer governance finding (#2146 A2-R4): captures each
+    // audit_fn call's (action, result, detail) so a test can assert content,
+    // not just that a 200 came back -- a future refactor deleting the
+    // audit_fn(...) call on a handler would otherwise pass every existing
+    // test silently.
+    std::vector<std::tuple<std::string, std::string, std::string>> audit_calls;
 
     explicit RestApprovalsHarness(bool with_manager = true) {
         if (with_manager)
@@ -1335,8 +1341,10 @@ struct RestApprovalsHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string&, const std::string& detail) -> bool {
+            audit_calls.emplace_back(action, result, detail);
             return true;
         };
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -1468,6 +1476,68 @@ TEST_CASE("GET /api/v1/approvals: status and submitted_by filters, matching the 
     auto by_submitter = h.sink.Get("/api/v1/approvals?submitted_by=operator1");
     REQUIRE(by_submitter);
     CHECK(nlohmann::json::parse(by_submitter->body)["data"].size() == 2); // def-a + def-c
+}
+
+TEST_CASE("GET /api/v1/approvals: status AND submitted_by combined filter (happy-path "
+          "governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction);
+    auto to_approve1 =
+        h->submit("def-b", "operator1", "scope-b", "", ApprovalOrigin::kInstruction);
+    auto to_approve2 =
+        h->submit("def-c", "operator2", "scope-c", "", ApprovalOrigin::kInstruction);
+    REQUIRE(to_approve1.has_value());
+    REQUIRE(to_approve2.has_value());
+    REQUIRE(h->approve(*to_approve1, "reviewer1", "").has_value());
+    REQUIRE(h->approve(*to_approve2, "reviewer1", "").has_value());
+
+    // Two rows are status=approved; only one of those is also
+    // submitted_by=operator1 -- proves the two filters AND-compose rather
+    // than one silently overriding the other or an off-by-one in the SQL
+    // placeholder indexing when both are present.
+    auto res = h.sink.Get("/api/v1/approvals?status=approved&submitted_by=operator1");
+    REQUIRE(res);
+    auto data = nlohmann::json::parse(res->body)["data"];
+    REQUIRE(data.size() == 1);
+    CHECK(data[0]["definition_id"] == "def-b");
+}
+
+TEST_CASE("GET /api/v1/approvals: an out-of-enum status is rejected with 400, not silently "
+          "producing a false-empty result (unhappy-path governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    // Pre-fix: this silently produced data:[] -- indistinguishable from a
+    // genuinely empty match -- instead of rejecting the malformed input.
+    auto res = h.sink.Get("/api/v1/approvals?status=aproved");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/v1/approvals: audits a success read with surface/count detail "
+          "(compliance-officer governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A future refactor that deletes the audit_fn(...) call on this handler
+    // would otherwise pass every other test in this file silently.
+    bool found = false;
+    for (const auto& [action, result, detail] : h.audit_calls) {
+        if (action == "approval.read" && result == "success") {
+            found = true;
+            CHECK(detail.find("surface=list") != std::string::npos);
+            CHECK(detail.find("count=1") != std::string::npos);
+        }
+    }
+    CHECK(found);
 }
 
 TEST_CASE("GET /api/v1/approvals: result_truncated_by_cap appears when more than 100 "

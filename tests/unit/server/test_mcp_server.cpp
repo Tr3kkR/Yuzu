@@ -35,6 +35,7 @@
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
+#include "approval_model.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
@@ -7888,6 +7889,82 @@ TEST_CASE("MCP list_pending_approvals: happy path returns the widened field set"
     CHECK(row["review_comment"] == "looks good");
     CHECK(row.contains("reviewed_at"));
     CHECK_FALSE(structured.contains("result_truncated_by_cap"));
+    // compliance-officer governance finding (#2146 A2-R4): a future refactor
+    // deleting the mcp_audit("success", ...) call on this handler would
+    // otherwise pass this test silently.
+    bool found_audit = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("surface=list") != std::string::npos) {
+            found_audit = true;
+            CHECK(d.find("count=1") != std::string::npos);
+        }
+    }
+    CHECK(found_audit);
+}
+
+TEST_CASE("MCP list_pending_approvals: row is byte-identical to approval_row_json directly "
+          "(Rule 1 regression test, consistency-auditor governance finding, #2146 A2-R4)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto id =
+        appr.submit("def-rule1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(appr.approve(*id, "reviewer1", "looks good").has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"list_pending_approvals","arguments":{"status":"approved"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured["approvals"].size() == 1);
+
+    // Fetch the same row directly and compare against the SAME shared
+    // builder both surfaces call -- this is the actual regression test for
+    // "cannot drift by construction" (docs/api-twin-recipe.md's Rule 1),
+    // not just an independent assertion on individually-picked fields that
+    // would stay green if a call site swapped onto a near-identical but
+    // not-actually-shared builder.
+    auto direct = appr.get(*id);
+    REQUIRE(direct.has_value());
+    CHECK(structured["approvals"][0] == yuzu::server::approval_row_json(*direct));
+}
+
+TEST_CASE("MCP list_pending_approvals: an out-of-enum status is rejected with kInvalidParams "
+          "(unhappy-path governance finding, #2146 A2-R4)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    SECTION("typo'd value") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"list_pending_approvals","arguments":{"status":"aproved"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+
+    SECTION("explicit empty string -- must not silently mean ALL statuses") {
+        // Pre-fix: query_checked's own filter-building treats "" as "no
+        // filter", so this silently returned every status instead of
+        // rejecting the caller's malformed input or honoring the tool's own
+        // documented pending-on-omission default.
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"list_pending_approvals","arguments":{"status":""}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
 }
 
 TEST_CASE("MCP list_pending_approvals: status/submitted_by wrong JSON type is rejected -- "

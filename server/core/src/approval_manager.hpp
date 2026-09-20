@@ -426,6 +426,16 @@ public:
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
+    /// unhappy-path governance finding (#2146 A2-R4): neither GET
+    /// /api/v1/approvals nor MCP list_pending_approvals validated `status`
+    /// against this closed set before this fix -- an unrecognized value
+    /// (a typo, a case mismatch, or MCP's explicit `""`) flowed straight
+    /// into a SQL equality filter and silently produced a false-empty (or,
+    /// for `""`, a false-ALL-statuses) result instead of rejecting the
+    /// caller's malformed input. Mirrors ResponseStore::allowed_op_column()
+    /// and ScheduleEngine's group_by allow-list convention.
+    static const std::vector<std::string>& allowed_status();
+
     /// query() with the store failure kept apart from a genuinely empty
     /// result — the same rationale as get_checked (see its doc comment):
     /// query() collapses "not open" / "pool exhausted" / "query failed"

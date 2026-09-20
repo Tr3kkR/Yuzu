@@ -478,6 +478,11 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 // Query
 // ---------------------------------------------------------------------------
 
+const std::vector<std::string>& ApprovalManager::allowed_status() {
+    static const std::vector<std::string> v = {"pending", "approved", "rejected", "expired"};
+    return v;
+}
+
 std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     std::vector<Approval> results;
     if (!open_)
@@ -499,7 +504,12 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
         sql += " AND submitted_by = $" + std::to_string(idx++);
         params.push_back(q.submitted_by);
     }
-    sql += " ORDER BY submitted_at DESC LIMIT 100";
+    // `id DESC` tiebreaker (unhappy-path governance finding, #2146 A2-R4):
+    // submitted_at has no uniqueness constraint, so a tie straddling the
+    // LIMIT boundary was non-deterministic across identical calls -- id is
+    // TEXT PRIMARY KEY, always unique, so appending it makes the result
+    // order fully deterministic.
+    sql += " ORDER BY submitted_at DESC, id DESC LIMIT 100";
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
@@ -559,8 +569,8 @@ ApprovalManager::query_checked(const ApprovalQuery& q) const {
     // heuristic false-positives on that boundary (matches
     // ScheduleEngine::query_schedules_checked's identical technique,
     // schedule_engine.cpp). The sentinel row is trimmed back off below, never
-    // returned to the caller.
-    sql += " ORDER BY submitted_at DESC LIMIT " + std::to_string(kApprovalListCap + 1);
+    // returned to the caller. `id DESC` tiebreaker: see query() above.
+    sql += " ORDER BY submitted_at DESC, id DESC LIMIT " + std::to_string(kApprovalListCap + 1);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {

@@ -1119,7 +1119,7 @@ static const ToolDef kTools[] = {
      "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
      "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
      "exactly 100 matching rows is a complete, non-truncated result.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"]},"submitted_by":{"type":"string"}}})",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
 
     {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
@@ -12634,6 +12634,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // unhappy-path governance finding (#2146 A2-R4): a well-typed
+                // but out-of-enum status -- a typo, a case mismatch, or an
+                // explicit "" (which query_checked's filter-building treats
+                // as "no filter", silently returning EVERY status instead of
+                // the documented pending-on-omission default) -- must be
+                // rejected, not silently misinterpreted.
+                if (std::find(ApprovalManager::allowed_status().begin(),
+                              ApprovalManager::allowed_status().end(),
+                              *status_opt) == ApprovalManager::allowed_status().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid status"),
+                                    "application/json");
+                    return;
+                }
                 auto submitted_by_opt = param_string_strict(args, "submitted_by");
                 if (!submitted_by_opt) {
                     res.set_content(
@@ -12664,7 +12677,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr arr;
                 for (const auto& a : list_result->approvals)
                     arr.add_raw(approval_row_json(a).dump());
-                mcp_audit("success");
+                // compliance-officer governance finding (#2146 A2-R4):
+                // detail content, matching the REST twin's audit posture
+                // (surface=list count=N) rather than an empty detail string.
+                mcp_audit("success", "surface=list count=" + std::to_string(arr.size()));
                 // result_truncated_by_cap (declared in the output schema
                 // above, precedent: list_schedules): the underlying query is
                 // hard-capped at 100 rows with no limit/cursor parameter on
@@ -12715,7 +12731,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                mcp_audit("success");
+                // compliance-officer governance finding (#2146 A2-R4): detail
+                // content, matching the REST twin's audit posture.
+                mcp_audit("success", "surface=count count=" + std::to_string(*count_result));
                 res.set_content(
                     success_response(
                         id, tool_result(JObj().add("count", *count_result).str(),
