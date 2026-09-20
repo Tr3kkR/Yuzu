@@ -2582,9 +2582,9 @@ private:
                     // itself must never throw out of this handler.
                     if (established_failed_.fetch_add(1, std::memory_order_relaxed) == 0) {
                         try {
-                            spdlog::warn("spark_file: an establishment report was dropped "
-                                         "(sink threw); further drops are counted only "
-                                         "(established_failed)");
+                            spdlog::warn("spark_file: an establishment report for '{}' was "
+                                         "dropped (sink threw); further drops are not logged",
+                                         e.key);
                         } catch (...) {
                         }
                     }
