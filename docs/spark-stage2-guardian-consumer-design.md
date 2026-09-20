@@ -1305,7 +1305,8 @@ unset means never confirmed (an absent target, a pending arm or a failed arm; NO
 deaf); with `established_at` set it means a loss or, for Registry, the one-shot flap. (e) The
 first production consumer (flip-gate criterion 10 / #4606) must re-derive the stale-cache
 severity and cover these residuals. (f) There is no operator surface: a dropped report is
-counted in the `established_failed` debug counter (a test seam).
+counted in the `established_failed` debug counter (a test seam) and logged once (the first drop
+only).
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
 calls for is built and run. T2 is a new runtime-side log line at the LAST statement of

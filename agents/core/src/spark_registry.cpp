@@ -1610,10 +1610,11 @@ private:
         // reference, no copy, no mu_ - the write happens-before this thread
         // exists (set_established_sink(), pre-seal, under mu_) and the only
         // later write is stop()'s null-out, after this thread has been
-        // joined. A throw on one report is counted (established_failed_) and
-        // the report is dropped, NOT re-staged: the engine's cache keeps the
-        // last delivered value until the next transition of that key, and a
-        // persistent throw would otherwise spin the sweeper.
+        // joined. A throw on one report is counted (established_failed_; the
+        // first one is also logged) and the report is dropped, NOT re-staged:
+        // the engine's cache keeps the last delivered value until the next
+        // transition of that key, and a persistent throw would otherwise spin
+        // the sweeper.
         // This DIVERGES from spark_service.cpp by design: Service has no
         // per-call catch, so a throw there reaches its run() catch, which
         // invalidates every key to None; here the sweeper never exits on an
@@ -1627,7 +1628,16 @@ private:
                 try {
                     established_(e.key, e.incarnation, e.at, e.coverage);
                 } catch (...) {
-                    established_failed_.fetch_add(1, std::memory_order_relaxed);
+                    // Log only the FIRST drop; the rest are counted. The log
+                    // itself must never throw out of this handler.
+                    if (established_failed_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        try {
+                            spdlog::warn("spark_registry: an establishment report was dropped "
+                                         "(sink threw); further drops are counted only "
+                                         "(established_failed)");
+                        } catch (...) {
+                        }
+                    }
                 }
             }
         }
