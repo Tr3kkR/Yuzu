@@ -52,6 +52,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
+#include "guardian_spark_timing.hpp" // #4606 criterion-10 T_wire: SendTimingRecord/format_send_timing_line
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
@@ -2068,8 +2069,22 @@ public:
                         std::lock_guard lock(stream_write_mu_);
                         guardian_sink_stream_ = stream;
                     }
-                    guardian_->set_event_sink(
-                        [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
+                    guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
+                        const bool sent = emit_guardian_event(ev);
+                        // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
+                        // DEX observer's call to this same method stays uninstrumented, see
+                        // emit_guardian_event's own comment).
+                        try {
+                            SendTimingRecord r;
+                            r.event_id = ev.event_id();
+                            r.sent = sent;
+                            r.wire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::system_clock::now().time_since_epoch())
+                                                 .count();
+                            spdlog::info("{}", format_send_timing_line(r));
+                        } catch (...) { // best-effort diagnostic; never propagate
+                        }
+                    });
                     // Replay the durable lifecycle journal into the send window now that the
                     // sink is live on the new stream (item 7 PR-Ag). The drain worker sends the
                     // paged backlog on its next pass. Inert unless prefer_spark.
@@ -3548,15 +3563,16 @@ private:
     // it through the current Subscribe stream. Shared by the GuardianEngine drift
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
-    void emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+    bool emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
         resp.set_status(pb::CommandResponse::SUCCESS);
         resp.set_payload(ev.SerializeAsString());
         std::lock_guard lock(stream_write_mu_);
-        if (guardian_sink_stream_)
-            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+        if (!guardian_sink_stream_)
+            return false;
+        return guardian_sink_stream_->Write(resp, grpc::WriteOptions());
     }
 
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
@@ -3592,8 +3608,22 @@ private:
         std::lock_guard lock(stream_write_mu_);
         if (!guardian_sink_stream_)
             return SendResult::Retain; // link down between reconnects; keep + retry (A3)
-        return guardian_sink_stream_->Write(resp, grpc::WriteOptions()) ? SendResult::Sent
-                                                                        : SendResult::Retain;
+        const bool ok = guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+        // #4606 criterion-10 T_wire: local Write() outcome only, NOT server receipt/commit (see
+        // T_server, guardian_ingest.cpp). Best-effort, always-on info level (the shipped default
+        // is what the benchmark must measure) — a log throw must never flip a real Sent into
+        // Retain, so this stays strictly after `ok` is captured and before the return.
+        try {
+            SendTimingRecord r;
+            r.event_id = e.event_id;
+            r.sent = ok;
+            r.wire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            spdlog::info("{}", format_send_timing_line(r));
+        } catch (...) { // best-effort diagnostic; never propagate
+        }
+        return ok ? SendResult::Sent : SendResult::Retain;
     }
 
     // Per-command dispatch task (#2037): runs one CommandRequest through its
