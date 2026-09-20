@@ -138,8 +138,9 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     // Options::saturated_fast_fail's doc comment for why its default is
     // 500ms rather than a smaller "near-zero" value -- several existing
     // callers already pick a deliberately short timeout for reasons
-    // unrelated to this finding, and 500ms is chosen to sit above every one
-    // of them.
+    // unrelated to this finding, and 500ms is chosen to sit AT OR ABOVE every
+    // one of them (a few tie at exactly 500ms; see the doc comment for the
+    // full survey).
     std::chrono::steady_clock::time_point fast_fail_deadline;
     if (deadline && idle_.empty() && open_ + connecting_ >= size_) {
         fast_fail_deadline = std::min(*deadline, t0 + saturated_fast_fail_);
