@@ -111,7 +111,10 @@ using SparkFaultFn =
 /// only a bare test fake leaves it default. Called with the engine lock released,
 /// like emit()/fault() — MAY THROW under the same #2012/#3840 allocation posture as
 /// those two; a mechanism that owns one calls it from a context that can tolerate the
-/// throw (see spark_service.cpp's own containment at each call site).
+/// throw. Registry and File wrap each call in their own try/catch and count the dropped
+/// report (`established_failed`); Service has no per-call catch, so a throw there reaches
+/// its run() catch, which invalidates every tracked key's coverage to `None` and stops the
+/// mechanism accepting new watches (spark_service.cpp).
 using SparkEstablishedFn = std::function<void(const std::string& key, SparkIncarnation incarnation,
                                               std::chrono::steady_clock::time_point at,
                                               SparkCoverage coverage)>;

@@ -4745,9 +4745,9 @@ bool stable_for(Read read, std::chrono::milliseconds quiet, std::chrono::millise
 // ── #4340 (rung 9c PR-6 item 1): Registry establishment-signal ───────────────
 //
 // Mirrors spark_service.cpp's shipped M3 shape (#3840 PR-B3). Every case here
-// only runs on Windows (the real mechanism is Windows-only). RF-1..RF-11 are
-// the Registry establishment-signal cases; the FF- cases below are the File
-// twins.
+// only runs on Windows (the real mechanism is Windows-only). RF-1..RF-17 are
+// the Registry establishment-signal cases; the FF- cases further below are the
+// File counterparts (the File section header lists which ones pair up).
 //
 // What the assertions here do and do not pin. The `established_at == stamped`
 // CHECKs in RF-4/6/8 and FF-4/6/8 restate the ENGINE's first-wins latch
@@ -5369,7 +5369,7 @@ TEST_CASE("Registry mechanism (Windows, direct): an establishment report and an 
         5000ms));
 }
 
-// ── #4340 governance fix round: failure and race coverage (Registry) ──────────
+// ── #4340 establishment signal: failure and race coverage (Registry) ─────────
 //
 // The cases below aim faults at the establishment-report path using only
 // existing seams. Two seam traps apply to every one of them:
@@ -5559,8 +5559,9 @@ TEST_CASE("Registry mechanism (Windows, direct): a dropped None is never re-sent
     // again - so it bites only when no later mark comes: here the target is deleted, the
     // re-arm resolves to the ancestor (a stable None) and every None is dropped, so the last
     // delivered value stays Notification although the true coverage is None. The production
-    // engine sink takes only the engine lock and cannot realistically throw; a first consumer
-    // must ignore a Notification whose subscription is not Healthy (see the design doc).
+    // engine sink takes only the engine lock and cannot realistically throw. A dropped report
+    // raises no Fault and sets no inert flag, so a consumer's health checks cannot detect it
+    // (see the design doc's consumer preconditions).
     ScratchRegKey k("est_thr_resid");
     EstLog log;
     log.throw_if = [](std::size_t, const EstLog::Entry& e) {
@@ -7636,9 +7637,12 @@ TEST_CASE("File mechanism (Windows, direct): an establishment report and an acti
                      5000ms));
 }
 
-// ── #4340 governance fix round: failure and race coverage (File) ────────────────
+// ── #4340 establishment signal: failure and race coverage (File) ─────────────
 //
-// The File twins of RF-12..RF-17. The same two seam traps apply (all hooks in ONE
+// The File counterparts of the Registry cases above: FF-12 pairs with RF-12, FF-14
+// with RF-13, FF-15 with RF-15, FF-16 with RF-16 and FF-17 with RF-17. FF-13 (a
+// failed synchronous reissue) has no Registry twin and RF-14 (a dropped None) has
+// no File twin. The same two seam traps apply (all hooks in ONE
 // controls struct per call; captured state declared before `mech`), and the same
 // one-slot-lane recipe lines a staged report and a probe launch up in one pass
 // (see the Registry section comment). File differences: the sweeping thread is the
