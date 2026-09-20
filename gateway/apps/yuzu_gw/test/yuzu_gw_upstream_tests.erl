@@ -142,10 +142,20 @@ proxy_register_ok() ->
     ?assertMatch({ok, #{session_id := <<"new-sess">>}}, Result).
 
 proxy_register_error() ->
+    %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error return for a
+    %% genuine (non-transport) grpc status is a 3-ELEMENT tuple — `error`,
+    %% the `{Status, Message}` pair, and the trailers map
+    %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) — not the
+    %% OLD mocked shape here (`{error, {Status, Message, Trailers}}`, a
+    %% 2-element tuple whose 2nd element was itself a 3-tuple), which this
+    %% test previously used and do_rpc's matching clause mirrored. That
+    %% shape does not match ANYTHING grpcbox actually returns, so do_rpc's
+    %% corresponding clause could never fire against the real dependency —
+    %% both were wrong together. Fixed to the real shape.
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _       -> {error, {14, <<"UNAVAILABLE">>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),

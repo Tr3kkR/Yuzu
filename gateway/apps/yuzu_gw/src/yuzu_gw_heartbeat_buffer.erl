@@ -175,7 +175,17 @@ do_flush(BatchReq, BufLen) ->
                               #{rpc_name => <<"batch_heartbeat">>}),
             logger:debug("Flushed ~b heartbeats", [BufLen]),
             ok;
-        {error, {Status, Message, _Trailers}} ->
+        {error, {Status, Message}, _Trailers} ->
+            %% HA WS-4 4.4 review fix (F3, mirrors yuzu_gw_upstream:do_rpc/4's
+            %% identical bug): grpcbox_client:unary/5's REAL error shape for a
+            %% genuine (non-transport) grpc status is a 3-ELEMENT tuple —
+            %% `error`, the `{Status, Message}` pair, and the trailers map —
+            %% not the 2-element `{error, {Status, Message, Trailers}}` this
+            %% clause used to match, which grpcbox never actually returns. A
+            %% real grpc-status error on BatchHeartbeat (e.g. RESOURCE_EXHAUSTED
+            %% on an oversized batch) previously matched NEITHER this clause
+            %% nor the transport-level `{error, Reason}` one below, crashing
+            %% this process with a case_clause exception.
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => <<"batch_heartbeat">>,

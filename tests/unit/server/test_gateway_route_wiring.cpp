@@ -161,6 +161,16 @@ struct LiveGatewayWiringHarness {
     /// exercise the re-announce/unknown-session branches — see file header).
     apb::RegisterResponse register_agent(const std::string& agent_id,
                                          const std::string& presented_session = {}) {
+        auto [status, resp] = register_agent_status(agent_id, presented_session);
+        REQUIRE(status.ok());
+        return resp;
+    }
+
+    /// Like register_agent, but for a call expected to be REFUSED (HA WS-4
+    /// 4.4's stale/zombie-replay FAILED_PRECONDITION path) — returns the raw
+    /// status instead of REQUIRE-asserting it ok.
+    std::pair<grpc::Status, apb::RegisterResponse>
+    register_agent_status(const std::string& agent_id, const std::string& presented_session = {}) {
         auto req = make_gw_register(auth_mgr, agent_id);
         grpc::ClientContext ctx;
         ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
@@ -168,8 +178,7 @@ struct LiveGatewayWiringHarness {
             ctx.AddMetadata(std::string(AgentServiceImpl::kSessionMetadataKey), presented_session);
         apb::RegisterResponse resp;
         auto status = stub_->ProxyRegister(&ctx, req, &resp);
-        REQUIRE(status.ok());
-        return resp;
+        return {status, resp};
     }
 };
 
@@ -263,18 +272,18 @@ TEST_CASE("ProxyRegister: presenting a KNOWN x-yuzu-session-id re-announces (ren
     REQUIRE((*row2)->lease_until_ms.has_value());
 }
 
-TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id renews the PRESENTED session "
-          "in the directory — NEVER register_fresh — so no row is minted for a first-ever "
-          "registration",
+TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id with NO existing row RECLAIMS "
+          "it — the row is created under the PRESENTED session, never a fresh mint (HA WS-4 "
+          "4.4, `#4246` #6)",
           "[pg][gateway_route_wiring][grpc]") {
-    // 4.2a #2 (mechanism c): before this slice, an unknown-locally presented
-    // session fell through to the SAME "fresh" branch as no-metadata-at-all,
-    // which would mint a fresh epoch via register_fresh and unconditionally
-    // win — able to clobber a live newer connection's route on a stale
-    // replay. Now it renews the PRESENTED session only; since this agent has
-    // never registered before, that presented session matches no row, so the
-    // directory gets NO row at all (register_fresh never runs on this
-    // branch) and the shortfall is counted as a desync signal.
+    // Pre-4.4 behavior (now fixed): an unknown-locally presented session fell
+    // through to minting a throwaway fresh session S' that the directory
+    // never learned about, while the caller's own replay logic went on
+    // believing it still held the ORIGINAL presented session S — a
+    // server/gateway desync (`#4246` #6). Now the server ADOPTS S outright:
+    // since no row exists yet for this agent at all, reclaim_tombstoned_session
+    // treats that exactly like a tombstone (nothing to protect) and creates
+    // one under S, seeded at epoch 0.
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayRouteStore store{pool};
@@ -287,24 +296,170 @@ TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id renews the PRES
     // above.
     auto resp = h.register_agent("agent-unknown-session", "gw-session-forged-not-real");
     REQUIRE(resp.accepted());
-    // Deferred S'-vs-S in-memory desync (#6/4.4, explicitly out of scope for
-    // this slice): the response still mints a fresh session_id, unchanged
-    // from the pre-4.2a behavior — only the DIRECTORY write changed.
-    CHECK(resp.session_id() != "gw-session-forged-not-real");
+    // The response now ADOPTS the presented session — no more S'-vs-S gap.
+    CHECK(resp.session_id() == "gw-session-forged-not-real");
 
     auto row = store.lookup_route("agent-unknown-session");
     REQUIRE(row.has_value());
-    CHECK_FALSE(row->has_value()); // NO row minted — register_fresh never ran
+    REQUIRE(row->has_value()); // a row WAS created — reclaimed, not skipped
+    CHECK((*row)->session_id == "gw-session-forged-not-real");
+    CHECK((*row)->connection_epoch == 0); // seeded below anything register_fresh can mint
+    REQUIRE((*row)->lease_until_ms.has_value()); // reclaim seeds a fresh lease
 
+    // No desync signal for a clean reclaim — this is the intended, successful
+    // path, not a guard rejection.
     CHECK(h.metrics
               .counter("yuzu_server_gateway_route_desync_total",
-                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
-              .value() == 1);
+                       {{"op", "proxy_register"}, {"outcome", "session_superseded"}})
+              .value() == 0);
+}
+
+TEST_CASE("ProxyRegister: presenting a TOMBSTONED session (the agent disconnected, then a "
+          "delayed circuit-recovery replay arrives) RE-ARMS the row under the same session — "
+          "the core-restart/post-DISCONNECT-eviction case `#4246` #6 names",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Register + connect, then deregister (tombstones the row: session_id/
+    // lease_until/cluster_id/gateway_node -> NULL, connection_epoch retained).
+    const std::string session_id = "gw-session-tombstone-replay";
+    REQUIRE(store.register_fresh("agent-tombstone-replay", session_id).has_value());
+    REQUIRE(store.announce_connected("agent-tombstone-replay", session_id, "zone-a", "node-a", 90)
+                .has_value());
+    REQUIRE(store.deregister("agent-tombstone-replay", session_id).has_value());
+
+    auto tombstoned = store.lookup_route("agent-tombstone-replay");
+    REQUIRE(tombstoned.has_value());
+    REQUIRE(tombstoned->has_value());
+    CHECK_FALSE((*tombstoned)->session_id.has_value()); // confirmed tombstoned
+
+    // A fresh replica (this replica's gateway_sessions_ never learned this
+    // session) now receives a delayed replay presenting the SAME, now-
+    // tombstoned session — must be reclaimed, not refused.
+    LiveGatewayWiringHarness h(store);
+    auto resp = h.register_agent("agent-tombstone-replay", session_id);
+    REQUIRE(resp.accepted());
+    CHECK(resp.session_id() == session_id); // adopted, not a fresh mint
+
+    auto row = store.lookup_route("agent-tombstone-replay");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    REQUIRE((*row)->lease_until_ms.has_value()); // re-armed with a fresh lease
+}
+
+TEST_CASE("ProxyRegister: the STORE governs even when the session is KNOWN IN MEMORY — a "
+          "tombstoned-out-from-under-it row still gets reclaimed (HA WS-4 4.4 round-2 review "
+          "fix F1: a >270s gateway-uplink partition, core itself never restarted)",
+          "[pg][gateway_route_wiring][grpc]") {
+    // F1 (round-2 Fable review, BLOCKING): the FIRST cut of this decision
+    // ADOPTED a presented session outright whenever this replica's
+    // in-memory gateway_sessions_ already knew it, WITHOUT ever consulting
+    // the store. gateway_sessions_ is erased ONLY by a DISCONNECTED
+    // (NotifyStreamStatus) — so a session this replica installed can stay
+    // "known in memory" long after GatewayRouteStore::reap_stale_routes
+    // has tombstoned (and would eventually hard-delete) its row, e.g. a
+    // gateway<->core network partition outlasting the 270s reap grace
+    // window while core itself never restarts. Adopting on memory alone in
+    // that window installed a fresh AgentSession (wiping placement) and
+    // then had announce_connected's fallback INSERT no-op against the
+    // still-tombstoned row (ON CONFLICT DO NOTHING) — the route never
+    // recovered. This test reproduces exactly that: the SAME harness
+    // (so gateway_sessions_ still knows the session) whose STORE row is
+    // separately tombstoned out-of-band (simulating the reaper), and
+    // asserts the replay still reclaims it instead of silently adopting.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto resp1 = h.register_agent("agent-mem-vs-store-tombstone");
+    REQUIRE(resp1.accepted());
+    const std::string session_id = resp1.session_id();
+
+    // Simulate the reaper tombstoning the row out from under a replica
+    // that still believes (via gateway_sessions_) it owns this session —
+    // a direct store call, bypassing NotifyStreamStatus entirely, so the
+    // harness's in-memory session map is untouched.
+    REQUIRE(store.deregister("agent-mem-vs-store-tombstone", session_id).has_value());
+    auto tombstoned = store.lookup_route("agent-mem-vs-store-tombstone");
+    REQUIRE(tombstoned.has_value());
+    REQUIRE(tombstoned->has_value());
+    CHECK_FALSE((*tombstoned)->session_id.has_value());
+
+    // The SAME harness (session_id still "known in memory") replays.
+    auto resp2 = h.register_agent("agent-mem-vs-store-tombstone", session_id);
+    REQUIRE(resp2.accepted());
+    CHECK(resp2.session_id() == session_id); // adopted via reclaim, not silently via memory
+
+    auto row = store.lookup_route("agent-mem-vs-store-tombstone");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id); // RE-ARMED — the bug left this tombstoned forever
+    REQUIRE((*row)->lease_until_ms.has_value());
+}
+
+TEST_CASE("ProxyRegister: the STORE governs even when the session is KNOWN IN MEMORY — a row "
+          "LIVE under a DIFFERENT session REFUSES the replay instead of zombie-overwriting it "
+          "(HA WS-4 4.4 round-2 review fix F1: cross-node zombie session)",
+          "[pg][gateway_route_wiring][grpc]") {
+    // F1's second half: an agent that reconnected to a DIFFERENT gateway
+    // node under a NEW session S2 (installing a correct, live directory
+    // row) while THIS replica's stale local gateway_sessions_ entry for
+    // the OLD session S1 was still intact used to ADOPT S1 on memory
+    // alone and overwrite S2's live placement. The store already knows
+    // the right answer (REFUSE) and must be asked.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto resp1 = h.register_agent("agent-mem-vs-store-zombie");
+    REQUIRE(resp1.accepted());
+    const std::string s1 = resp1.session_id();
+
+    // Simulate the agent reconnecting to a DIFFERENT gateway node: a
+    // direct store call installs a NEW, live session S2 for the same
+    // agent — bypassing this harness's ProxyRegister/gateway_sessions_
+    // entirely, so THIS replica's map still (incorrectly) believes S1 is
+    // current.
+    const std::string s2 = "gw-session-zombie-winner";
+    auto fresh = store.register_fresh("agent-mem-vs-store-zombie", s2);
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    REQUIRE(store.announce_connected("agent-mem-vs-store-zombie", s2, "zone-b", "node-b", 90)
+                .has_value());
+
+    // The SAME harness (s1 still "known in memory") replays presenting
+    // the now-superseded s1.
+    auto [status, resp2] = h.register_agent_status("agent-mem-vs-store-zombie", s1);
+    CHECK_FALSE(status.ok());
+    CHECK(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
+
+    auto row = store.lookup_route("agent-mem-vs-store-zombie");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == s2); // S2's live placement survives untouched
+    CHECK((*row)->cluster_id == "zone-b");
+    CHECK((*row)->gateway_node == "node-b");
 }
 
 TEST_CASE("ProxyRegister: a ZOMBIE unknown presented session (the agent's row belongs to a "
-          "DIFFERENT, current session) renews zero rows and leaves the live row untouched",
+          "DIFFERENT, LIVE current session) is REFUSED outright (FAILED_PRECONDITION) and "
+          "leaves the live row untouched — HA WS-4 4.4 (`#4246` #6)",
           "[pg][gateway_route_wiring][grpc]") {
+    // Pre-4.4 behavior (now fixed): this case fell through to minting a
+    // throwaway fresh session and returning grpc::Status::OK, so the gateway
+    // had no signal that its replay was stale — it just kept using an
+    // orphaned session forever. Now the server refuses the RPC outright
+    // (FAILED_PRECONDITION), which the gateway-side fix (HA WS-4 4.4,
+    // yuzu_gw_upstream.erl) uses to force the agent to reconnect fresh,
+    // and installs NOTHING (no register_agent, no store write) on this path.
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayRouteStore store{pool};
@@ -325,10 +480,12 @@ TEST_CASE("ProxyRegister: a ZOMBIE unknown presented session (the agent's row be
 
     // Present a DIFFERENT, forged session — never seen by this replica's
     // gateway_sessions_ (case 3: unknown locally) AND not the row's current
-    // session either (the "zombie" shape) — renew_leases({forged}) must
-    // match zero rows and leave the live row alone.
-    auto resp2 = h.register_agent("agent-zombie-1", "gw-session-zombie-not-current");
-    REQUIRE(resp2.accepted());
+    // LIVE session either (the "zombie" shape) — reclaim_tombstoned_session's
+    // guard (`session_id IS NULL`) can never win against it.
+    auto [status, resp2] =
+        h.register_agent_status("agent-zombie-1", "gw-session-zombie-not-current");
+    CHECK_FALSE(status.ok());
+    CHECK(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
 
     auto row_after = store.lookup_route("agent-zombie-1");
     REQUIRE(row_after.has_value());
@@ -338,7 +495,7 @@ TEST_CASE("ProxyRegister: a ZOMBIE unknown presented session (the agent's row be
 
     CHECK(h.metrics
               .counter("yuzu_server_gateway_route_desync_total",
-                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
+                       {{"op", "proxy_register"}, {"outcome", "session_superseded"}})
               .value() == 1);
 }
 

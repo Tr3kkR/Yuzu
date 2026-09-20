@@ -178,11 +178,18 @@
 /// `DISCONNECTED(S_old, home1)` interleaved at every point of
 /// `register_agent(S_new)`/`map_session`/`CONNECTED(S_new, home2)` leaves
 /// `S_new` live in registry, store, and `gateway_sessions_`. `4.4`'s `#4246`
-/// #6 fix (session writeback) must follow the same rule: mechanism (c) must
-/// ADOPT the presented session into `gateway_sessions_`/registry only if the
-/// directory `renew_leases` call matched >= 1 row (a store-side CAS proving
-/// the row still belongs to that session) — NEVER write back a
-/// server-minted session to a gateway whose agent still holds the original.
+/// #6 fix (SHIPPED) follows this rule: `ProxyRegister` ADOPTS a presented
+/// session into `gateway_sessions_`/registry only if the directory
+/// `renew_leases` call matched >= 1 row (a store-side CAS proving the row
+/// still belongs to that session) OR the new guarded CAS
+/// `reclaim_tombstoned_session` re-arms a row this session's row was
+/// TOMBSTONED under (never a row a DIFFERENT, live session holds) —
+/// NEVER writing back a server-minted session to a gateway whose agent
+/// still holds the original. An ADOPT is followed by the gateway's own
+/// still-live `yuzu_gw_agent` process re-sending its OWN, already-stamped
+/// CONNECTED (`yuzu_gw_agent:reannounce/2`) — a SAME-session, SAME-home
+/// re-publish, never a `CONNECTED(S, home2)` for a different home, so this
+/// does not reopen the tripwire above.
 ///
 /// WOULD REOPEN THIS: a 4.3 design where the logical home (the
 /// `yuzu_gw_agent` process / `stream_home_id`) moves or is re-spawned
@@ -484,6 +491,39 @@ public:
     [[nodiscard]] std::expected<DeregisterResult, GatewayRouteStoreError>
     deregister(std::string_view agent_id, std::string_view session_id,
               std::string_view stream_home_id = {});
+
+    /// HA WS-4 4.4 (`#4246` #6, gateway-side session-writeback fix): re-arm a
+    /// TOMBSTONED (or entirely absent) row under `session_id`, for a gateway
+    /// circuit-recovery replay whose presented session this replica no longer
+    /// recognizes in memory (a core restart / replica failover / post-
+    /// DISCONNECT eviction) but which was never superseded by a genuinely
+    /// newer connection. Returns `true` (won) iff the row was tombstoned
+    /// (`session_id IS NULL`) or absent; `false` (lost) iff a DIFFERENT,
+    /// LIVE (non-NULL) session already holds the row — that is a genuine
+    /// stale/zombie replay and the caller MUST NOT install anything.
+    ///
+    /// Deliberately does NOT mint a fresh `connection_epoch` (unlike
+    /// `register_fresh`): this is not a new connection racing for the row,
+    /// it is the exact same session being resurrected, so there is no
+    /// concurrent-fresh-registration ordering to fence. `connection_epoch`
+    /// is `0` on a brand-new row (no prior row existed at all); on a
+    /// re-armed EXISTING tombstone it is left UNTOUCHED (retains whatever
+    /// `register_fresh` last minted for that row) — either way it is safe:
+    /// `register_fresh`'s `nextval` sequence starts above `0` and is
+    /// strictly monotonic, so it always exceeds a brand-new row's `0`, and
+    /// a tombstone's retained epoch is exactly what `register_fresh`
+    /// already tolerated overwriting before this method existed. ANY later
+    /// genuine `register_fresh` for this agent still wins the guarded
+    /// upsert regardless of ordering, exactly as if this reclaim had never
+    /// run. `cluster_id`/`gateway_node`/`stream_home_id` are left NULL (they
+    /// are already NULL on a tombstone, and a never-existed row has nothing
+    /// to carry forward) — `announce_connected` remains the sole writer of
+    /// placement; this slice's gateway-side fix (re-sending the process's
+    /// own CONNECTED after a successful reclaim) is what converges them,
+    /// not this call.
+    [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
+    reclaim_tombstoned_session(std::string_view agent_id, std::string_view session_id,
+                               int lease_ttl_secs);
 
     /// Batched lease renewal: bumps `lease_until` for every row whose
     /// `(agent_id, session_id)` matches a pair in the two PARALLEL arrays

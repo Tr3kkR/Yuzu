@@ -369,6 +369,53 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     return AnnounceResult{.matched = false};
 }
 
+std::expected<bool, GatewayRouteStoreError>
+GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
+                                              std::string_view session_id,
+                                              int lease_ttl_secs) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::reclaim_tombstoned_session: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // Same ON-CONFLICT-DO-UPDATE-WHERE idiom as register_fresh's guarded
+    // upsert, but the guard is `session_id IS NULL` (tombstoned or a fresh
+    // The INSERT branch supplies the real session_id directly, so the
+    // `session_id IS NULL` guard only ever matters on the UPDATE/conflict
+    // branch — this is a resurrection of the SAME session, not a new one
+    // racing for the row, so the guard is on session identity, not an
+    // epoch comparison. connection_epoch is 0 on a brand-new row (INSERT)
+    // and UNTOUCHED on a re-armed existing tombstone (UPDATE never sets
+    // it) — either way a genuine concurrent or later register_fresh still
+    // always wins regardless of commit order (file header "THE FENCE"):
+    // its nextval mint exceeds a fresh row's 0, and a tombstone's retained
+    // epoch is exactly what register_fresh already tolerated overwriting.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO gateway_route_store.agent_routes "
+        "  (agent_id, connection_epoch, session_id, lease_until, updated_at) "
+        "VALUES ($1, 0, $2, now() + ($3 || ' seconds')::interval, now()) "
+        "ON CONFLICT (agent_id) DO UPDATE SET "
+        "  session_id = EXCLUDED.session_id, "
+        "  lease_until = EXCLUDED.lease_until, "
+        "  updated_at = now() "
+        "WHERE agent_routes.session_id IS NULL "
+        "RETURNING agent_id",
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::to_string(lease_ttl_secs)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::reclaim_tombstoned_session: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    // Zero rows: the ON CONFLICT branch's WHERE guard rejected the update
+    // because the row belongs to a DIFFERENT, LIVE (non-NULL) session — a
+    // genuine stale/zombie replay. The caller must refuse it outright.
+    return PQntuples(res.get()) == 1;
+}
+
 std::expected<DeregisterResult, GatewayRouteStoreError>
 GatewayRouteStore::deregister(std::string_view agent_id, std::string_view session_id,
                               std::string_view stream_home_id) {

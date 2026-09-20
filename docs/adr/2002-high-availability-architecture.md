@@ -342,8 +342,10 @@ cluster unit; intra-zone scale is more nodes.
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
-fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done
-— see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
+`#4324` per-home stream-generation fence done; 4.3a (intra-cluster routing) done; `#4555` (gateway
+multi-node cluster formation) done; 4.4 (`gateway_node` convergence + `#4246` #6 session writeback,
+§7c) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
 gateway-upstream connect/disconnect/heartbeat paths. **The directory is no longer literally INERT** —
 Task C wired `GatewayRouteStore::lookup_routes` into confined dispatch as a FALLBACK-ONLY consult
@@ -454,9 +456,20 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   delivered `DISCONNECTED(S)` tombstones it, and a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops
   (circuit-open, or the `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease
   reaper — and nothing resurrects a newer placement because none exists under a reused `S`. So there is
-  AT MOST ONE `CONNECTED(S)` and one `DISCONNECTED(S)` per session (an untrappable process/node kill or a
-  dropped notification only shrinks that count); the only reorder is item #5, which IS closed. The
-  invariant to hold: **`session_id` ≡ exactly one gateway stream placement.** The per-home generation fence
+  AT MOST ONE `CONNECTED(S)` and one `DISCONNECTED(S)` per session **from the ORIGINAL wording** (an
+  untrappable process/node kill or a dropped notification only shrinks that count); the only reorder is
+  item #5, which IS closed. **Retired by 4.4 (`#4246` #6), narrowly, not reopened:** a replay-ADOPTED
+  `ProxyRegister` (the server's `register_agent` unconditionally installs a brand-new `AgentSession`,
+  wiping `gateway_node`/`wire_capabilities`/`stream_home_id` even on an adopt — see 4.4's status
+  paragraph below) is followed by the gateway's OWN still-live `yuzu_gw_agent` process re-sending its
+  OWN, ALREADY-STAMPED `CONNECTED(S, home)` — the SAME `home` that session's process minted at its own
+  `init/1`, never a new one, and only when that process still holds session `S` (a superseded/dead
+  process ignores the cast). This is a second `CONNECTED` for a session that already sent one, but it is
+  **same-session, same-home** — the tripwire this invariant protects against is `CONNECTED(S, home2)`
+  for a DIFFERENT home, which the fence (`stream_home_id`-stamped, exact-match on tombstone) still
+  refuses exactly as before. The invariant to hold, precisely: **`session_id` ≡ exactly one gateway
+  stream placement, converged via zero or more same-home `CONNECTED(S, home)`s, never a
+  `CONNECTED(S, home2)`.** The per-home generation fence
   (a token stamped on both `CONNECTED`/`DISCONNECTED` — a `NotifyStreamStatus` protocol change, spanning
   the legacy in-memory teardown path too, NOT a store-only change) is deferred to the first slice that
   introduces a same-session re-CONNECT (4.3 intra-cluster re-home / 4.4 convergence / #6 replay-response
@@ -504,13 +517,37 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   `deregister` tombstone change above: the fallback INSERT is `ON CONFLICT (agent_id) DO NOTHING`, and
   against an EXISTING tombstoned row it now no-ops instead of reviving a dead route.
 - **The gateway discards the replay `ProxyRegister` response, so a server-minted fresh session desyncs
-  silently** (#4246 #6 — **DEFERRED to 4.4**). When the presented session is unknown (core restart /
-  replica failover / post-DISCONNECT eviction) the server mints a NEW session and returns it, but the
-  gateway's replay path ignores the response and keeps stamping the OLD session id on every
-  notify/heartbeat → `renew`/`announce`/`deregister` all miss, the route is stale and wrong-sessioned
-  until the agent reconnects or the 4.4 reconcile runs. 4.2a's mechanism (c) (see above) renews the
-  *presented* session server-side rather than clobbering it, which narrows the blast radius, but the
-  gateway-side session-id writeback itself remains 4.4's fix.
+  silently** (#4246 #6 — **CLOSED, 4.4**). Pre-4.4: when the presented session was unknown (core restart
+  / replica failover / post-DISCONNECT eviction) the server minted a NEW session S' and returned it, but
+  the gateway's replay path ignored the response and kept stamping the OLD session id S on every
+  notify/heartbeat → `renew`/`announce`/`deregister` all missed, the route stayed stale and
+  wrong-sessioned until the agent reconnected. **4.4's fix is server-side, not gateway-side writeback of
+  S'**: the design review (below) found that adopting a server-minted S' on the gateway would violate
+  `gateway_route_store.hpp`'s FORWARD NOTE and, separately, could never actually work — the AGENT's own
+  heartbeats are stamped with the AGENT's session id, which the gateway forwards verbatim and cannot
+  rewrite, so a gateway-side S' adoption would leave heartbeats permanently mismatched regardless.
+  Instead, `GatewayUpstreamServiceImpl::ProxyRegister` now decides ADOPT-vs-REFUSE *before* installing
+  anything: whenever `GatewayRouteStore` is configured, the STORE governs the decision, never the
+  in-memory `gateway_sessions_` map on its own — a presented session S is ADOPTED (the response always
+  carries S, never a fresh mint) if `GatewayRouteStore::renew_leases` finds a live row still owned by
+  S, or the NEW `GatewayRouteStore::reclaim_tombstoned_session` guarded CAS re-arms a TOMBSTONED (or
+  entirely absent) row under S (`connection_epoch` is `0` on a brand-new row, or left UNTOUCHED on a
+  re-armed existing tombstone — either way strictly no higher than anything `register_fresh`'s
+  `nextval` sequence can mint, so a genuine later fresh connection still always wins). A REVIEW FIX
+  (round 2, F1) removed an earlier "adopt if `gateway_sessions_` already knows it" short-circuit that
+  bypassed this store check entirely — see the round-2 review note below for why that was a real,
+  reachable bug, not a theoretical one. If neither store check holds — the row is LIVE under a
+  DIFFERENT session — the RPC is REFUSED outright (`FAILED_PRECONDITION`, nothing installed), and the
+  gateway (`yuzu_gw_upstream.erl`)
+  treats that as an authoritative answer (feeds its circuit breaker a SUCCESS, not a failure) and calls
+  `yuzu_gw_agent:disconnect/1` to force the AGENT-driven reconnect that is the only sanctioned recovery.
+  On an ADOPT, the gateway's replay handler tells the still-live `yuzu_gw_agent` process
+  (`yuzu_gw_agent:reannounce/2`) to re-send its own CONNECTED — converging `gateway_node`/
+  `wire_capabilities`/`stream_home_id` (wiped by `register_agent`'s unconditional fresh-`AgentSession`
+  install, a pre-existing, previously-unfixed bug this design review surfaced — see the 4.4 status
+  paragraph) via the ordinary, already-tested `NotifyStreamStatus` → `set_gateway_route` path, rather
+  than a new server-side carry-over mechanism. This is the SAME-SESSION-SAME-HOME `CONNECTED` exception
+  to the "at most one `CONNECTED(S)`" wording above.
 - **Guard-rejection no-ops are unobserved** (#4246 #8 — **counter half CLOSED, 4.2a; alert-rule half
   PARTIALLY CLOSED, 4.2b**). The 4.1 fail-open counter covers only Postgres WRITE FAILURES; a systemic
   guard-rejection desync (e.g. every `renew` matching 0 rows, every `announce` no-opping) moved neither
@@ -585,10 +622,10 @@ change to validate (see the WS-9 note on `docs/ha-delivery-matrix.md`'s WS-4 row
 for this reader has nothing to exercise until it becomes behaviorally live). Remaining WS-4 sub-work: 4.3
 (net-new distributed intra-cluster agent→node routing, multi-cluster fanout — today one
 `gw_mgmt_stub_`; 4.3 also owns the pre-CONNECT-race ordering gap #4324 deliberately left open, see its
-status paragraph below), the durable cross-replica session lookup (#4246 #3, re-homed to WS-5 — this is
-also what makes the reader behaviorally live, since only then can a directory row outlive the writing
-replica's own in-memory registry), and 4.4 (`gateway_node` convergence reconcile, replay-response
-writeback). The #4324 per-home stream-generation fence itself is now CLOSED — see below.
+status paragraph below), and the durable cross-replica session lookup (#4246 #3, re-homed to WS-5 — this
+is also what makes the reader behaviorally live, since only then can a directory row outlive the writing
+replica's own in-memory registry). The #4324 per-home stream-generation fence and 4.4 (`gateway_node`
+convergence reconcile + the `#4246` #6 replay-session writeback) are both now CLOSED — see below.
 
 **4.3a update (2026-09-18): the intra-cluster half of 4.3 is DONE** — per-agent `pg`-group agent→node
 lookup within one Erlang gateway cluster (`yuzu_gw_registry.erl`'s `lookup/1`/`lookup_remote/1`), the
@@ -597,8 +634,10 @@ lookup within one Erlang gateway cluster (`yuzu_gw_registry.erl`'s `lookup/1`/`l
 formation, entirely unimplemented in production). The pre-CONNECT-race ordering gap is **NOT**
 "deliberately left open" as this paragraph previously stated — it is RESOLVED as unreachable BY
 INVARIANT (see the #4324 status paragraph's PR-review-fix note below for the full resolution).
-Remaining WS-4 work is the REST of 4.3 (cross-cluster gateway fan-out — today one `gw_mgmt_stub_` —
-**and** `#4555` cluster formation itself, not fan-out logic alone) and 4.4.
+Remaining WS-4 work (as of `#4555`, 2026-09-18) was the REST of 4.3 (cross-cluster gateway fan-out —
+today one `gw_mgmt_stub_` — **and** `#4555` cluster formation itself, not fan-out logic alone) and 4.4.
+`#4555` merged 2026-09-19; 4.4 is now CLOSED too — see its own status paragraph below. Remaining WS-4
+gate items: the REST of 4.3 (cross-cluster fan-out) and WS-5's durable cross-replica session lookup.
 
 **Status (#4324, MERGED to `origin/dev` — PR #4492, `c37306113`, 2026-09-17T22:05:58Z): the per-home
 stream-generation fence is CLOSED end-to-end**, three tasks: task 1 (`46f1e72b6`) adds
@@ -832,6 +871,117 @@ seed name, or a genuinely single-node deployment, which is not itself an error).
 `docs/observability-conventions.md`, same as every other alert-rule change) — closing the same
 fail-open-means-silent-by-design gap the original single-gauge decision identified, but with enough
 resolution for an operator to tell which runbook applies.
+
+### 7c. `gateway_node` convergence + session writeback (WS-4 4.4, `#4246` #6, 2026-09-20)
+
+**Status: CLOSED.** Finding 6b (§7's "`gateway_node` convergence is a first-class requirement") and
+`#4246` #6 (the discarded-replay-response desync) were named together as WS-4 4.4's scope in
+`docs/ha-delivery-matrix.md`. Closed as one slice because a pre-implementation Fable adversarial design
+review found they share a root cause and rejected the originally-proposed two-mechanism design outright.
+
+**The originally-proposed design (REJECTED).** (A) a periodic `ReplicaSafe` background pass that
+read-repairs `AgentRegistry`'s in-memory `gateway_node`/`cluster_id` from the durable
+`GatewayRouteStore` row on an exact session-id match; (B) a gateway-side writeback that adopts a
+server-minted replacement session id from the replay `ProxyRegister` response into `yuzu_gw_registry`
+and the live `yuzu_gw_agent` process.
+
+**Why it was rejected.** (A) would publish a directory-sourced route with an EMPTY capability set — the
+directory does not carry `wire_capabilities`, and dispatch DENIES any command to an agent with no
+advertised capability for it (`gateway_capability_missing`, `agent_registry.cpp`), so the "converged"
+route would be a LOUD deny, not a working one. (B) is explicitly prohibited by
+`gateway_route_store.hpp`'s own FORWARD NOTE ("NEVER write back a server-minted session to a gateway
+whose agent still holds the original") and would not have worked regardless: an agent's own heartbeats
+are stamped with the AGENT's session id and forwarded verbatim by the gateway
+(`yuzu_gw_heartbeat_buffer.erl`) — the gateway cannot retroactively make heartbeats agree with a
+different, server-chosen id.
+
+**The real root cause the review surfaced (not previously named anywhere in this ADR or the matrix):**
+`GatewayUpstreamServiceImpl::ProxyRegister` called `AgentRegistry::register_agent` — which ALWAYS
+allocates a brand-new `AgentSession` and installs it over any prior one — UNCONDITIONALLY, before
+deciding whether the call was a fresh registration or a re-announce of an already-known session. Every
+circuit-recovery replay, even the ordinary same-replica "known session" case with no core restart
+involved, therefore wiped `gateway_node`/`wire_capabilities`/`stream_home_id` in memory — live,
+reachable, single-replica, no active-active needed. This is finding 6b's actual dominant cause, not the
+one-lost-`NotifyStreamStatus`-call framing the original finding described.
+
+**The shipped fix.** `ProxyRegister` now decides ADOPT-vs-REFUSE for a presented session BEFORE calling
+`register_agent` at all: whenever `GatewayRouteStore` is configured, the store's own verdict governs —
+`gateway_sessions_` is consulted only when no store exists (nothing else to fence with). ADOPT (the
+response always carries the presented session, never a fresh mint) when `GatewayRouteStore::renew_leases`
+proves the durable row still belongs to it, or the new guarded CAS `GatewayRouteStore::reclaim_tombstoned_session`
+re-arms a TOMBSTONED (or entirely absent) row under it (`0` on a brand-new row, untouched on a re-armed
+tombstone — either way no higher than anything `register_fresh`'s `nextval` mints, so a genuine
+concurrent or later `register_fresh` always still wins regardless of commit order); REFUSE
+(`FAILED_PRECONDITION`, nothing installed, no `register_agent` call)
+when the row is LIVE under a DIFFERENT session — a genuine stale/zombie replay. `register_agent` still
+runs after an ADOPT and still wipes the placement trio (fixing that in place was rejected too — see
+below) — convergence instead comes from the gateway: on a successful ADOPT, `yuzu_gw_upstream.erl`'s
+replay handler tells the still-verified-live `yuzu_gw_agent` process (`reannounce/2`) to re-send its OWN
+already-known CONNECTED (same session, same `stream_home_id`, same node/cluster/capabilities) through
+the ordinary, already-tested `NotifyStreamStatus` → `set_gateway_route` path. On a REFUSE, the gateway
+feeds its circuit breaker a SUCCESS (the server answered authoritatively; this is not an outage) and
+calls `yuzu_gw_agent:disconnect/1` to force the agent-driven reconnect that is the only sanctioned
+recovery for a superseded session (per the FORWARD NOTE). A pre-existing, latent bug in
+`yuzu_gw_upstream.erl`'s `do_rpc` was fixed as part of shipping this: its error-clause pattern matched a
+shape (`{error, {Status, Message, Trailers}}`, a 2-tuple whose 2nd element is a 3-tuple) that
+`grpcbox_client:unary/5` has never actually returned (the real shape is a 3-element tuple, `error` +
+`{Status, Message}` + a trailers map) — unreachable before 4.4 because no prior caller on this RPC path
+ever received a real non-OK, non-transport grpc status; 4.4's `FAILED_PRECONDITION` is the first.
+
+**Deliberately scoped OUT of 4.4:** after an outage longer than the reap grace window (270s: 90s TTL +
+180s grace), `GatewayRouteStore::reap_stale_routes` tombstones rows faster than the registration-replay
+drip (paced at `replay_spacing_ms`, ~20ms/agent) can reach every agent at fleet scale — every agent the
+drip reaches after its row is tombstoned hits the reclaim path correctly (this is exactly what
+`reclaim_tombstoned_session` is for), but a large fleet recovering from a long outage will see a
+transient wave of `session_superseded`-adjacent reclaim activity rather than instant convergence. Filed
+as a follow-up issue alongside this slice's PR.
+
+**Round-2 review (post-implementation Fable pass) found three real bugs and one narrow gap in the
+first cut, all fixed before push:**
+- **F1 (BLOCKING, the most severe):** the FIRST version of the adopt decision let an in-memory
+  `gateway_sessions_` hit ADOPT a session WITHOUT consulting the store at all. `gateway_sessions_` is
+  erased ONLY by a DISCONNECTED — so a gateway-uplink partition longer than 270s, with core itself
+  still UP (no restart), left a session "known in memory" long after its row was tombstoned and then
+  hard-deleted: the in-memory ADOPT still fired, `register_agent` still wiped placement, and the
+  reannounce's `announce_connected` UPDATE missed (session already NULL) with its fallback INSERT
+  no-oping against the tombstone (`ON CONFLICT DO NOTHING`) — the route never recovered, contradicting
+  this section's own "CLOSED" claim for exactly the partition case deferral #2 (now the sole remaining
+  deferral, above) describes. The SAME short-circuit also let a genuine ZOMBIE through: an agent that
+  reconnected to a DIFFERENT gateway node under a new session S2 (installing a correct, live directory
+  row) while THIS node's stale local ETS entry for the old session S1 was still intact would ADOPT S1
+  on memory alone and overwrite S2's live placement — the store already knew the right answer (REFUSE)
+  and was never asked. **Fixed:** whenever `GatewayRouteStore` is configured, the decision now ALWAYS
+  runs `renew_leases` then (if needed) `reclaim_tombstoned_session` — memory is consulted only when no
+  store exists at all. No added DB round trip (the renew this replaced was already happening,
+  differently gated, in the pre-fix code).
+- **F2 (BLOCKING):** `yuzu_gw_upstream.erl`'s `?MAX_NOTIFY_INFLIGHT` (10) cap dropped a CONNECTED/
+  DISCONNECTED notify with only a debug log, no telemetry — invisible, and this slice's own reannounce
+  mechanism turns that into a burst (one CONNECTED per replayed agent at ~20ms) exactly when the
+  server is also absorbing the replay wave, an I6a false-assurance shape: an ADOPTED, "reannounced"
+  agent whose notify got silently dropped looks fully converged from the outside (it renews heartbeats
+  fine) while `gateway_node` stays empty and every dispatch to it 404s via `send_to`'s null-stream
+  branch. **Fixed:** both drop reasons now emit `[yuzu, gw, upstream, notify_dropped]` telemetry
+  (`reason` = `circuit_open` | `at_capacity`, mirroring the Guardian-forward path's existing
+  `forward_dropped` counter); the replay drip additionally backs off (retries the SAME queue head,
+  not advancing it) whenever `notify_pids` is already at the cap, so a reannounce is never queued into a
+  notify budget already known to be full.
+- **F3 (BLOCKING, same class as the `do_rpc` fix above):** `yuzu_gw_heartbeat_buffer.erl` had the
+  IDENTICAL impossible error-clause shape — a real grpc status on `BatchHeartbeat` (e.g.
+  `RESOURCE_EXHAUSTED` on an oversized batch, reachable today) would crash the heartbeat-buffer
+  process with a `case_clause` exception. Fixed the same way, with a regression test asserting the
+  process survives and the buffer is retained.
+- **N1 (non-blocking, fixed anyway):** the `connecting`-state `upstream_reannounced` handler
+  originally no-op'd on the (incorrect) assumption that `stream_ready`'s transition to `streaming`
+  re-sends CONNECTED — it does not; `init/1` sends this process's ONLY CONNECTED before the state
+  machine ever reaches `connecting`. An ADOPT landing in that narrow pre-Subscribe window left
+  placement unrecovered until the session's next full disconnect/reconnect. Fixed to re-announce from
+  `connecting` too, using the same `Data` fields `streaming`'s clause already reads.
+
+**The `yuzu_gw_cluster` gen_server** (adjacency/health/CPU/latency-based rebalancing gossip, named as
+"remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
+WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
+peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
+not a WS-4 gate item.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:

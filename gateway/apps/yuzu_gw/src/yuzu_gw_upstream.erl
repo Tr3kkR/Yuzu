@@ -202,11 +202,22 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHo
     case CbState of
         open ->
             logger:debug("Dropping stream status notification for ~s (circuit open)", [AgentId]),
+            %% HA WS-4 4.4 review fix (F2): this drop was previously
+            %% invisible — no telemetry, only a debug log line, matching
+            %% the guardian-forward path's own forward_dropped counter
+            %% (yuzu_gw_guardian_forward_tests.erl). A dropped CONNECTED for
+            %% an ADOPTED replay session (the reannounce mechanism this
+            %% slice added) means the server's placement stays wiped with
+            %% NO observable signal — an I6a false-assurance risk.
+            telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                              #{count => 1}, #{reason => <<"circuit_open">>}),
             {noreply, State};
         _ ->
             case map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT of
                 true ->
                     logger:debug("Dropping stream status notification for ~s (at capacity)", [AgentId]),
+                    telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                                      #{count => 1}, #{reason => <<"at_capacity">>}),
                     {noreply, State};
                 false ->
                     Notification = #{
@@ -334,54 +345,69 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 logger:warning("Registration replay aborted: circuit open "
                                "(~b agent(s) not yet re-proxied)", [length(Rest) + 1]),
                 State1#state{replay_queue = []};
+            {allow, #state{notify_pids = Pids} = State1}
+                    when map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT ->
+                %% HA WS-4 4.4 review fix (F2): a replay-ADOPTED session
+                %% triggers a reannounce-driven CONNECTED
+                %% (yuzu_gw_agent:reannounce/2 -> notify_stream_status),
+                %% which shares the SAME ?MAX_NOTIFY_INFLIGHT budget as
+                %% every other stream-status notify. Driving the drip at a
+                %% fixed spacing regardless of that budget risks the
+                %% notify being silently DROPPED at capacity (see
+                %% handle_cast({notify_stream_status,...}) above) right
+                %% when 4.4's convergence mechanism needs it most — a
+                %% fleet-scale recovery replay is exactly when
+                %% notify_pids is busiest. Retry the SAME head entry
+                %% later (replay_queue is NOT advanced) rather than
+                %% popping it and risking a dropped reannounce. replay_queue
+                %% is untouched (still `[{AgentId, SessionId, RegisterReq} |
+                %% Rest]`), so the same head retries on the next tick.
+                schedule_replay_next(State1#state.replay_queue, Spacing),
+                State1;
             {allow, State1} ->
-                case map_size(RegisterReq) of
-                    0 ->
-                        %% Agent registered without a stashed request
-                        %% (older caller / test). Nothing to send — skip
-                        %% it without disturbing the breaker.
-                        logger:debug("Registration replay: skipping ~s (no stored request)",
-                                     [AgentId]),
-                        schedule_replay_next(Rest, Spacing),
-                        State1#state{replay_queue = Rest};
-                    _ ->
-                        %% HA WS-4 4.1 — carry the agent's EXISTING session
-                        %% id as `x-yuzu-session-id` outgoing metadata (the
-                        %% same header key Subscribe reads,
-                        %% yuzu_gw_agent_service.erl) on the replay
-                        %% ProxyRegister ONLY. This is a re-proxy of an
-                        %% agent connection the gateway already holds, not a
-                        %% new agent — the metadata lets the server treat it
-                        %% as a re-announce of the existing session rather
-                        %% than minting a new one on every upstream
-                        %% reconnect (which would otherwise let a zombie
-                        %% replay clobber a live agent's route once the
-                        %% routing directory is dispatch-authoritative,
-                        %% WS-4 4.2). No SessionId (register_agent/5
-                        %% back-compat path) sends the request as before.
-                        Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
-                        case Result of
-                            {ok, _} ->
-                                logger:debug("Registration replay: re-proxied ~s", [AgentId]);
-                            {error, Reason} ->
-                                logger:warning("Registration replay: ~s failed: ~p",
-                                               [AgentId, Reason])
-                        end,
-                        %% Feed the result through the breaker so a
-                        %% mid-replay failure trips/advances it normally —
-                        %% but record_result_no_replay so a successful
-                        %% replay RPC can't kick off a nested replay.
-                        State3 = record_result_no_replay(Result, State1),
-                        %% Gate 7 sre OBS-4 — registration-replay
-                        %% observability. `replayed` counts this re-proxy;
-                        %% `queue_depth` lets an operator alert on a drip
-                        %% that never drains (UP-5 storm).
-                        telemetry:execute([yuzu, gw, upstream, registration_replay],
-                                          #{replayed => 1, queue_depth => length(Rest)},
-                                          #{}),
-                        schedule_replay_next(Rest, Spacing),
-                        State3#state{replay_queue = Rest}
-                end
+                NextState =
+                    case map_size(RegisterReq) of
+                        0 ->
+                            %% Agent registered without a stashed request
+                            %% (older caller / test). Nothing to send — skip
+                            %% it without disturbing the breaker.
+                            logger:debug("Registration replay: skipping ~s (no stored request)",
+                                        [AgentId]),
+                            State1;
+                        _ ->
+                            %% HA WS-4 4.4 (`#4246` #6): re-verify liveness
+                            %% right before replaying — the drip is
+                            %% self-paced (replay_spacing_ms apart), so by
+                            %% the time this queued entry's turn comes up
+                            %% the agent may have disconnected, or
+                            %% reconnected under a BRAND-NEW session
+                            %% (register_agent/6 overwrites its ETS row
+                            %% wholesale). Replaying a stale snapshot's
+                            %% session in either case would present an
+                            %% orphaned session id the server should not
+                            %% (and, post-4.4, will not) adopt — skip it
+                            %% without touching the breaker, same as the
+                            %% empty-RegisterReq case above. Re-using the
+                            %% already-bound `SessionId` (the QUEUED value,
+                            %% from this function's head) as the match
+                            %% pattern here means the `{ok, {Pid, SessionId}}`
+                            %% clause only fires when the CURRENT local
+                            %% session still equals it — a mismatch (or no
+                            %% row at all) falls to the catch-all.
+                            case yuzu_gw_registry:lookup_local_session(AgentId) of
+                                {ok, {Pid, SessionId}} ->
+                                    do_replay_one(AgentId, Pid, SessionId, RegisterReq,
+                                                 length(Rest), State1);
+                                _ ->
+                                    logger:debug(
+                                        "Registration replay: skipping ~s (no longer live "
+                                        "locally, or reconnected under a different session, "
+                                        "since this drip was queued)", [AgentId]),
+                                    State1
+                            end
+                    end,
+                schedule_replay_next(Rest, Spacing),
+                NextState#state{replay_queue = Rest}
         end,
     {noreply, State2};
 
@@ -401,6 +427,72 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason},
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% @doc Fire one registration-replay ProxyRegister and classify the result.
+%% Split out of handle_info(replay_next, ...) for the three-way branch HA
+%% WS-4 4.4 (`#4246` #6) added: an ordinary adopt-success, the NEW
+%% stale/zombie-replay refusal, and every other (transport-level) failure.
+do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
+    %% HA WS-4 4.1 — carry the agent's EXISTING session id as
+    %% `x-yuzu-session-id` outgoing metadata (the same header key Subscribe
+    %% reads, yuzu_gw_agent_service.erl) on the replay ProxyRegister ONLY.
+    %% This is a re-proxy of an agent connection the gateway already holds,
+    %% not a new agent — the metadata lets the server treat it as a
+    %% re-announce of the existing session rather than minting a new one on
+    %% every upstream reconnect (which would otherwise let a zombie replay
+    %% clobber a live agent's route once the routing directory is
+    %% dispatch-authoritative, WS-4 4.2).
+    Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
+    NewState =
+        case Result of
+            {ok, Response} ->
+                %% HA WS-4 4.4: the server now ALWAYS adopts the presented
+                %% session on success (never a throwaway fresh mint, see
+                %% gateway_route_store.hpp's FORWARD NOTE) — so
+                %% AdoptedSession is expected to equal SessionId, but read
+                %% it from the response rather than assume, mirroring
+                %% yuzu_gw_agent_service:register/2's own defensive
+                %% atom-or-binary-key lookup.
+                AdoptedSession = maps:get(session_id, Response,
+                                          maps:get(<<"session_id">>, Response, SessionId)),
+                logger:debug("Registration replay: re-proxied ~s (adopted session ~s)",
+                            [AgentId, AdoptedSession]),
+                %% Tell the process (confirmed live and holding SessionId by
+                %% the caller's lookup_local_session/1 check) to re-send its
+                %% own CONNECTED — this is what converges the server's
+                %% freshly-installed AgentSession's gateway_node/
+                %% wire_capabilities/stream_home_id (register_agent always
+                %% wipes that trio, see gateway_service_impl.cpp's
+                %% ProxyRegister), rather than leaving this agent
+                %% dispatch-unreachable until its next real reconnect.
+                yuzu_gw_agent:reannounce(Pid, AdoptedSession),
+                record_result_no_replay({ok, Response}, State);
+            {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
+                %% The presented session was superseded by a DIFFERENT, LIVE
+                %% session server-side — a genuine stale/zombie replay, not
+                %% an outage. The server answered authoritatively, so this
+                %% is fed to the breaker as a SUCCESS (record_result_no_replay
+                %% on a bare {error, _} would count it as a failure and could
+                %% spuriously trip the breaker on a run of legitimately-stale
+                %% replays after a fleet-wide reconnect storm). The sanctioned
+                %% recovery is an AGENT-DRIVEN reconnect
+                %% (gateway_route_store.hpp's FORWARD NOTE) — force it by
+                %% tearing down this process's stream; the agent's own
+                %% subsequent fresh Register carries no stale metadata.
+                logger:warning("Registration replay: ~s's presented session was superseded — "
+                              "forcing a fresh reconnect", [AgentId]),
+                yuzu_gw_agent:disconnect(Pid),
+                record_result_no_replay({ok, superseded}, State);
+            {error, Reason} ->
+                logger:warning("Registration replay: ~s failed: ~p", [AgentId, Reason]),
+                record_result_no_replay(Result, State)
+        end,
+    %% Gate 7 sre OBS-4 — registration-replay observability. `replayed`
+    %% counts this re-proxy attempt (any outcome); `queue_depth` lets an
+    %% operator alert on a drip that never drains (UP-5 storm).
+    telemetry:execute([yuzu, gw, upstream, registration_replay],
+                      #{replayed => 1, queue_depth => QueueDepth}, #{}),
+    NewState.
 
 terminate(_Reason, _State) ->
     ok.
@@ -579,7 +671,26 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{duration_ms => Duration},
                               #{rpc_name => atom_to_binary(Tag, utf8)}),
             {ok, Response};
-        {error, {Status, Message, _Trailers}} ->
+        {error, {Status, Message}, _Trailers} ->
+            %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error shape for
+            %% a genuine (non-transport) grpc status is a 3-element tuple —
+            %% `error`, the `{Status, Message}` pair, and the trailers map
+            %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) —
+            %% not the 2-element `{error, {Status, Message, Trailers}}` this
+            %% clause used to match. That mismatch meant this clause could
+            %% NEVER fire: any real upstream grpc-status error (anything
+            %% other than a transport-level `{error, Reason}`) fell through
+            %% to neither clause and crashed this gen_server with a
+            %% case_clause exception. Unreachable before this slice — every
+            %% pre-4.4 ProxyRegister/NotifyStreamStatus/etc. failure the
+            %% gateway could receive was either OK or a transport-level
+            %% error (connection refused, TLS failure, timeout) — but HA
+            %% WS-4 4.4 is the first caller to make the server return a
+            %% real, deliberate non-OK grpc status (FAILED_PRECONDITION) on
+            %% this RPC, so this had to be fixed to ship that feature at
+            %% all. `Status` is the raw `grpc-status` trailer value, a
+            %% binary digit string (`?GRPC_STATUS_*` in grpcbox.hrl), e.g.
+            %% `<<"9">>` for FAILED_PRECONDITION — never an atom.
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
