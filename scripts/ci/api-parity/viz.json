@@ -7,7 +7,7 @@
       "method": "GET",
       "path": "/api/v1/viz/fleet/topology"
     },
-    "mcp_twin": null,
+    "mcp_twin": "get_fleet_topology",
     "status": "twinned"
   },
   {
@@ -18,7 +18,7 @@
       "method": "GET",
       "path": "/api/v1/viz/host/{param}/topology"
     },
-    "mcp_twin": null,
+    "mcp_twin": "get_host_topology",
     "status": "twinned"
   }
 ]

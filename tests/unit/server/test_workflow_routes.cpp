@@ -24,6 +24,7 @@
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -186,6 +187,9 @@ struct ExecHarness {
     /// test can exercise each of the 4-way 503 split's branches instead of
     /// only the generic catch-all every prior test here left at defaults.
     bool dispatch_containment_unreadable_override{false};
+    // WS-4 4.2b Task D: mirrors dispatch_containment_unreadable_override --
+    // the exact sibling (a degraded gateway routing-directory read).
+    bool dispatch_route_unreadable_override{false};
     std::size_t dispatch_denied_quarantined_count_override{0};
     std::size_t dispatch_unknown_plugin_count_override{0};
     /// PR #3939 review fix round: exercises the new scope_parse_error ->
@@ -380,7 +384,8 @@ struct ExecHarness {
                    .denied_quarantined_count = dispatch_denied_quarantined_count_override,
                    .command_id = dispatch_cmd_override,
                    .containment_unreadable = dispatch_containment_unreadable_override,
-                   .unknown_plugin_count = dispatch_unknown_plugin_count_override};
+                   .unknown_plugin_count = dispatch_unknown_plugin_count_override,
+                   .route_unreadable = dispatch_route_unreadable_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
@@ -1518,6 +1523,23 @@ TEST_CASE("instruction execute: a fail-closed containment gate reports "
     CHECK(body["error"]["retry_after_ms"] == 5000);
 }
 
+TEST_CASE("instruction execute: a degraded gateway routing-directory read reports "
+          "reason=route_unreadable, retryable after 5000ms (WS-4 4.2b Task D — the exact "
+          "sibling of containment_unreadable)",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-RU", "RU");
+    h.dispatch_route_unreadable_override = true;
+    auto res = h.sink.Post("/api/instructions/def-RU/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "route_unreadable");
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+}
+
 TEST_CASE("instruction execute: every target quarantined reports "
           "reason=quarantined, non-retryable",
           "[pg][workflow][executions][execute][3424][3511]") {
@@ -2162,6 +2184,31 @@ TEST_CASE("#2500 — numeric agent_ids entries are refused DELIBERATELY, with a 
             denied_audit = true;
     }
     CHECK(denied_audit);
+}
+
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. This body is an otherwise-VALID, otherwise-ACCEPTED
+// request (a real single target) with one extra deeply-nested field inside
+// "params" - the exact field this handler's params-building loop calls
+// .dump() on for non-string values - so on unguarded code the request
+// proceeds all the way to dispatch, and only the new depth check tells
+// fixed and unfixed code apart. depth 40 is trivially safe to build/dump
+// directly in this test process; the real attack depth this guard exists
+// for is many orders of magnitude higher (~100,000 levels).
+TEST_CASE("POST /api/instructions/:id/execute: a body nested past the depth limit is "
+          "rejected before dispatch",
+          "[pg][workflow][executions][execute][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-DEPTH", "DEPTH");
+
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body = R"({"agent_ids":["agent-1"],"params":{"deep":)" + deep_array + "}}";
+    auto res = h.sink.Post("/api/instructions/def-DEPTH/execute", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
 }
 
 TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broadness guard)",
@@ -3457,6 +3504,59 @@ TEST_CASE("GET /api/workflow-executions/:id (legacy): malformed result_json "
     REQUIRE(parsed["steps"].is_array());
     REQUIRE(parsed["steps"].size() == 1);
     CHECK(parsed["steps"][0]["result"].is_null());
+}
+
+TEST_CASE("GET /api/workflow-executions/:id: a stored result_json nested past the depth guard "
+          "is excluded, never dumped raw (#2437-class)",
+          "[pg][workflow][legacy][security]") {
+    // Same setup as the malformed-JSON corruption test above, but the row is
+    // STRUCTURALLY VALID JSON that nests past kMcpMaxJsonDepth - not what
+    // json::parse(..., false) rejects, but what nlohmann::json::dump() would
+    // SIGSEGV on. WorkflowEngine's own write-side guard (workflow_engine.cpp)
+    // closes the live dispatch path; this proves the matching read-side guard
+    // in confined_workflow_step_result_json closes the row-predates-the-fix /
+    // direct-DB-write case too.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-DEPTHWFXM", "depthwfxm");
+    auto wf_id = h.make_workflow("legacy-exec-workflow-depth-poisoned", "def-DEPTHWFXM");
+    h.dispatch_cmd_override = "cmd-depthwfxm";
+    h.dispatch_sent_override = 1;
+
+    auto exec_res = h.sink.Post("/api/workflows/" + wf_id + "/execute",
+                                R"({"agent_ids":["agent-A"]})");
+    REQUIRE(exec_res);
+    REQUIRE(exec_res->status == 202);
+    auto exec_body = nlohmann::json::parse(exec_res->body);
+    auto exec_id = exec_body["execution_id"].get<std::string>();
+
+    // Reachability-proxy depth (35 > kMcpMaxJsonDepth's 32) - never the real
+    // ~100,000-level attack depth in a test.
+    const std::string poisoned = std::string(35, '[') + std::string(35, ']');
+    REQUIRE_FALSE(yuzu::server::mcp::json_exceeds_depth(poisoned, 40)); // sanity: valid JSON
+    REQUIRE(yuzu::server::mcp::json_exceeds_depth(poisoned, yuzu::server::mcp::kMcpMaxJsonDepth));
+    {
+        PgConn saboteur{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        std::string sql = "UPDATE workflow_engine.workflow_step_results SET result_json = '" +
+                          poisoned + "' WHERE execution_id = '" + exec_id + "'";
+        PgResult upd{PQexec(saboteur.get(), sql.c_str())};
+        REQUIRE(upd.ok());
+    }
+
+    auto res = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(res); // no crash
+    CHECK(res->status == 200);
+    auto parsed = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    CHECK_FALSE(parsed.is_discarded());
+    REQUIRE(parsed.contains("steps"));
+    REQUIRE(parsed["steps"].is_array());
+    REQUIRE(parsed["steps"].size() == 1);
+    // Excluded as the fixed safe placeholder, never the poisoned tree itself.
+    CHECK(parsed["steps"][0]["result"]["error"] ==
+          "stored result exceeded maximum JSON nesting depth");
 }
 
 TEST_CASE("GET /api/v1/workflow-executions/:id: 403 when fleet_read_fn denies",

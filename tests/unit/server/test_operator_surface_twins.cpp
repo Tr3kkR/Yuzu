@@ -499,6 +499,68 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_guardian_events", "GuaranteedState", "Read", true},
     {"get_guardian_rule_status", "GuaranteedState", "Read", true},
     {"get_guardian_device_guards", "GuaranteedState", "Read", true},
+    // #2146 Batch B2 — result-set MCP twins, pinned against rest_api_v1.cpp's
+    // 12-operation REST v1 result-set API (docs/scope-walking-design.md).
+    // The three async dispatch producers + reevaluate share
+    // execute_instruction's own Execution:Execute pair; the rest are owner-
+    // scoped, no RBAC gate in the handler (Infrastructure:Read/Write/Delete
+    // drive MCP tier classification only, matching validate_scope's own
+    // precedent of a registered pair with no backing perm_fn call).
+    //
+    // create_result_set_from_inventory_query is DELIBERATELY NOT listed here:
+    // its real RBAC gate is a genuine perm_fn(Inventory, Read) call (matching
+    // the REST twin exactly — see that tool's own permission-denied test),
+    // but its kToolSecurityRows/kWriteTools registration is Inventory:WRITE,
+    // because the tool genuinely creates a new result set (a write) and
+    // readOnlyHint/kWriteTools classification must stay truthful regardless
+    // of which permission happens to gate the read half of the work. This
+    // array's contract ("REST and MCP gate on the SAME securable/operation")
+    // does not hold for this one tool by design, so pinning it here would
+    // assert something false in one direction or fail in the other.
+    {"list_result_sets", "Infrastructure", "Read", true},
+    {"create_result_set", "Infrastructure", "Write", false},
+    {"create_result_set_from_tar_query", "Execution", "Execute", false},
+    {"create_result_set_from_instruction_result", "Execution", "Execute", false},
+    {"reevaluate_result_set", "Execution", "Execute", false},
+    {"get_result_set", "Infrastructure", "Read", true},
+    {"get_result_set_members", "Infrastructure", "Read", true},
+    {"get_result_set_lineage", "Infrastructure", "Read", true},
+    {"pin_result_set", "Infrastructure", "Write", false},
+    {"unpin_result_set", "Infrastructure", "Write", false},
+    {"delete_result_set", "Infrastructure", "Delete", false},
+    // #2146 Batch B3 (api-parity programme) — execution/fleet statistics +
+    // fleet visualization read twins. Pinned against rest_api_v1.cpp's
+    // GET /api/v1/execution-statistics{,/agents,/definitions} + GET
+    // /api/v1/statistics, and viz_routes.cpp's GET /api/v1/viz/fleet/topology
+    // + GET /api/v1/viz/host/{id}/topology — the SAME (securable, operation)
+    // each REST twin gates on.
+    {"get_execution_statistics", "Execution", "Read", true},
+    {"get_execution_statistics_by_agent", "Execution", "Read", true},
+    {"get_execution_statistics_by_definition", "Execution", "Read", true},
+    {"get_fleet_statistics", "Infrastructure", "Read", true},
+    {"get_fleet_topology", "Response", "Read", true},
+    {"get_host_topology", "Response", "Read", true},
+    // #2146 Batch B5 - offload targets, CA root-CSR export/subordinate-chain
+    // import, platform license, and software deployments. Pinned against
+    // offload_routes.cpp / ca_routes.cpp / rest_api_v1.cpp's own gates.
+    {"list_offload_targets", "Infrastructure", "Read", true},
+    {"create_offload_target", "Infrastructure", "Write", false},
+    {"get_offload_target", "Infrastructure", "Read", true},
+    {"delete_offload_target", "Infrastructure", "Write", false},
+    {"list_offload_target_deliveries", "Infrastructure", "Read", true},
+    {"export_ca_root_csr", "Security", "Read", true},
+    {"import_ca_chain", "Security", "Write", false},
+    {"get_platform_license", "License", "Read", true},
+    {"activate_platform_license", "License", "Write", false},
+    {"list_license_alerts", "License", "Read", true},
+    {"list_software_deployments", "SoftwareDeployment", "Read", true},
+    {"create_software_deployment", "SoftwareDeployment", "Execute", false},
+    {"rollback_software_deployment", "SoftwareDeployment", "Execute", false},
+    {"cancel_software_deployment", "SoftwareDeployment", "Execute", false},
+    // Wave 7 PR7.2 — app-usage read surface. Pinned against
+    // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
+    // app-usage), same (securable, operation) the MCP twin enforces.
+    {"get_agent_app_usage", "Forensics", "Read", true},
 };
 
 } // namespace

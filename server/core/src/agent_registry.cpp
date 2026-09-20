@@ -12,6 +12,8 @@
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
+#include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
+#include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -43,7 +45,8 @@ void AgentRegistry::set_register_agent_interleave_hook_for_test(std::function<vo
     register_agent_interleave_hook_for_test_ = std::move(hook);
 }
 
-std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentInfo& info) {
+std::expected<std::shared_ptr<AgentSession>, std::string>
+AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
     session->agent_id = info.agent_id();
     session->hostname = info.hostname();
@@ -192,7 +195,7 @@ std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentIn
     bus_.publish("agent-online", info.agent_id());
     spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
                  info.hostname(), info.plugins_size());
-    return {};
+    return session;
 }
 
 void AgentRegistry::set_stream(
@@ -371,6 +374,27 @@ void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
     spdlog::info("Agent removed: id={} (session={})", agent_id, session_id);
 }
 
+void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
+                                         const std::shared_ptr<AgentSession>& installed) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second != installed) {
+            // Superseded (a concurrent register_agent already installed a different session) or
+            // gone (already torn down some other way) — nothing of OURS to clean up; do not touch
+            // whatever is (or isn't) there now.
+            spdlog::debug("Rollback cleanup skipped: superseded/gone for agent {}", agent_id);
+            return;
+        }
+        if (!it->second->session_id.empty())
+            session_to_agent_.erase(it->second->session_id);
+        agents_.erase(it);
+    }
+    metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
+    bus_.publish("agent-offline", agent_id);
+    spdlog::info("Agent registration rolled back: id={}", agent_id);
+}
+
 void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
                                             const std::string& session_id) {
     std::shared_ptr<AgentSession> session;
@@ -396,7 +420,8 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
 }
 
 void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& node,
-                                      std::vector<std::string> capabilities) {
+                                      std::vector<std::string> capabilities,
+                                      std::string stream_home_id) {
     std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
@@ -414,6 +439,10 @@ void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     // deny). Both fields are published together, under the SAME lock
     // `send_to`/`send_to_all` already read them under, so there is exactly
     // one lock domain and no publish step in between for a reader to land in.
+    // HA WS-4 #4324: `stream_home_id` joins the same atomic publish for the
+    // same reason — folding it into a second lock acquisition would
+    // reintroduce exactly the M1 hazard this comment describes, one field
+    // later.
     std::lock_guard slock(session->stream_mu);
     session->gateway_node = node;
     // PLAN item 5: a full REPLACE, never a merge — a reconnect behind an
@@ -421,6 +450,22 @@ void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     // capabilities a prior connection advertised but this one does not.
     session->gateway_wire_capabilities =
         std::unordered_set<std::string>(capabilities.begin(), capabilities.end());
+    session->gateway_stream_home_id = std::move(stream_home_id);
+}
+
+std::optional<std::string>
+AgentRegistry::gateway_stream_home_id(const std::string& agent_id,
+                                      const std::string& session_id) const {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return std::nullopt;
+        session = it->second;
+    }
+    std::lock_guard slock(session->stream_mu);
+    return session->gateway_stream_home_id;
 }
 
 void AgentRegistry::clear_gateway_wire_capabilities(const std::string& agent_id) {
@@ -681,6 +726,18 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
     return count;
 }
 
+bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                                       const std::string& cluster_id) {
+    // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
+    // this path has no session to have already validated anything, so it is
+    // the ONLY check this method makes before queuing.
+    if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
+        return false;
+    std::lock_guard glock(gw_pending_mu_);
+    gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
+    return true;
+}
+
 std::vector<AgentRegistry::GatewayPendingCmd> AgentRegistry::drain_gateway_pending() {
     std::lock_guard lock(gw_pending_mu_);
     auto result = std::move(gw_pending_);
@@ -885,7 +942,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"msi_packages.product_codes",
          "Compact list of installed package identifiers (Windows MSI GUIDs / macOS pkgutil "
          "reverse-domain IDs)"},
+        // windows_optional_features
+        {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
+        {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
         // sccm
+        // peripherals
+        {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
+        {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
+        {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // storage
@@ -1761,6 +1825,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // a fabricated 0.
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
+    // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
+    // zero rule: on a fleet where no agent is running spark (prefer_spark_ off
+    // fleet-wide, today's default), the writer never emits either family at all,
+    // so both must go fully ABSENT here, never a fabricated 0 that would read as
+    // "spark arming, healthy".
+    for (const auto& m : kGuardianArmMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    for (const auto& m : kGuardianIoCeilingMetrics)
+        metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1776,6 +1850,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // three metrics — the same reports_any definition DexPerfFleetNow uses,
     // so the gauge and the Performance tab's Reporting card agree.
     int perf_reporting = 0;
+    // C1: the SAME samples, additionally bucketed by normalize_os so
+    // recompute_perf_os_gauges can export per-OS families — parallel maps,
+    // not a restructure of the flat vectors above (the existing four
+    // yuzu_fleet_perf_* families stay on their original, untouched path).
+    std::unordered_map<std::string, std::vector<double>> perf_cpu_os, perf_commit_os,
+        perf_disk_lat_os;
+    std::unordered_map<std::string, int> perf_reporting_os;
     // Network heartbeat facts (slice 3) — same shared validators as the
     // /network read model (per-device parity); the dashboard is OS-blended while
     // these gauges are per-OS, so a mixed-fleet aggregate differs by design.
@@ -1897,6 +1978,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // separately from the sum for the same non-conforming-explicit-"0" reason.
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
+    // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
+    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // despite being RE-STATABLE gauges rather than monotonic counters on the
+    // agent side: this reader only ever sees one CURRENT value per agent per
+    // sweep either way, so "sum the current values" is correct regardless of
+    // whether the agent-side field is cumulative or re-statable.
+    std::array<double, kNGuardianArmMetrics> ga_sum{};
+    std::array<bool, kNGuardianArmMetrics> ga_reported{};
+    int ga_reporting = 0;
+    int ga_tag_rejected = 0;
+    static const std::array<std::string, kNGuardianArmMetrics> ga_keys = [] {
+        std::array<std::string, kNGuardianArmMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i)
+            keys[i] = kGuardianArmMetrics[i].tag;
+        return keys;
+    }();
+    // rung 9c PR-3 (Decision 3, Option B): the io-ceiling monitor-only counter.
+    // Genuinely cumulative on the agent side, same SUM shape as the journal
+    // family mechanically AND semantically.
+    std::array<double, kNGuardianIoCeilingMetrics> gioc_sum{};
+    std::array<bool, kNGuardianIoCeilingMetrics> gioc_reported{};
+    int gioc_reporting = 0;
+    int gioc_tag_rejected = 0;
+    static const std::array<std::string, kNGuardianIoCeilingMetrics> gioc_keys = [] {
+        std::array<std::string, kNGuardianIoCeilingMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i)
+            keys[i] = kGuardianIoCeilingMetrics[i].tag;
+        return keys;
+    }();
     int gh_reporting = 0;
     int gh_tag_rejected = 0;
     // Same static-destruction-safety rationale as gj_keys above.
@@ -2011,21 +2121,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // A4 perf tags — validation rules live in dex_perf_rules.hpp, SHARED
         // with the F2a /dex Performance read model so the Prometheus gauges
         // and the in-product view can never disagree on the same sample.
+        // C1: each sample also feeds the *_os twin (same normalize_os the net
+        // families use) for recompute_perf_os_gauges — one parse, two pushes.
+        const std::string perf_os = normalize_os(os_val);
         bool perf_reported_any = false;
         if (auto v = parse_perf_cpu_pct(get(kPerfTagCpuPct))) {
             perf_cpu.push_back(*v);
+            perf_cpu_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
         if (auto v = parse_perf_commit_pct(get(kPerfTagCommitPct))) {
             perf_commit.push_back(*v);
+            perf_commit_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
         if (auto v = parse_perf_disk_lat_ms(get(kPerfTagDiskLatMs))) {
             perf_disk_lat.push_back(*v);
+            perf_disk_lat_os[perf_os].push_back(*v);
             perf_reported_any = true;
         }
-        if (perf_reported_any)
+        if (perf_reported_any) {
             ++perf_reporting;
+            ++perf_reporting_os[perf_os];
+        }
 
         // Network facts — validators shared with network_perf_model.cpp; bucketed
         // by the agent's OS so the rollup stays per-OS (never a cross-OS blend).
@@ -2223,6 +2341,43 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+
+        // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
+        // split as every family above - an empty view means this agent did not
+        // report (dormant/non-spark, per the writer's own Check A gate), never a
+        // rejection.
+        bool arm_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i) {
+            const auto raw = get_view(ga_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_arm_count(raw)) {
+                ga_sum[i] += *v;
+                ga_reported[i] = true;
+                arm_reported_any = true;
+            } else {
+                ++ga_tag_rejected;
+            }
+        }
+        if (arm_reported_any)
+            ++ga_reporting;
+
+        // rung 9c PR-3 (Decision 3, Option B): io-ceiling counter.
+        bool io_ceiling_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i) {
+            const auto raw = get_view(gioc_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_io_ceiling_count(raw)) {
+                gioc_sum[i] += *v;
+                gioc_reported[i] = true;
+                io_ceiling_reported_any = true;
+            } else {
+                ++gioc_tag_rejected;
+            }
+        }
+        if (io_ceiling_reported_any)
+            ++gioc_reporting;
     }
 
     // OTA signature refusals (#416/#3807). Counts AGENTS currently reporting a
@@ -2274,6 +2429,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_stats("yuzu_fleet_perf_cpu_pct", perf_cpu);
     set_stats("yuzu_fleet_perf_commit_pct", perf_commit);
     set_stats("yuzu_fleet_perf_disk_lat_ms", perf_disk_lat);
+    recompute_perf_os_gauges(metrics, perf_reporting_os, perf_cpu_os, perf_commit_os,
+                             perf_disk_lat_os);
 
     // Network rollup: per-OS {stat,os} distributions + per-OS reporting
     // denominators — never a cross-OS blend (gov sre/consistency/UP-2). Families
@@ -2370,6 +2527,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianJournalTagRejectedGauge)
         .set(static_cast<double>(gj_tag_rejected));
 
+    // rung 9c PR-3: arm-ledger pair (Decision 1) + io-ceiling counter (Decision 3,
+    // Option B). Same absent-when-unreported rule as every family above - on a
+    // fleet where nothing is running spark this cycle, both stay ABSENT entirely,
+    // and the two "reporting" meta-signals below read 0 honestly rather than
+    // fabricating a healthy zero for the gauges themselves.
+    for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i)
+        if (ga_reported[i])
+            metrics.gauge(kGuardianArmMetrics[i].gauge).set(ga_sum[i]);
+    metrics.gauge(kGuardianArmReportingGauge).set(static_cast<double>(ga_reporting));
+    metrics.gauge(kGuardianArmTagRejectedGauge).set(static_cast<double>(ga_tag_rejected));
+    for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i)
+        if (gioc_reported[i])
+            metrics.gauge(kGuardianIoCeilingMetrics[i].gauge).set(gioc_sum[i]);
+    metrics.gauge(kGuardianIoCeilingReportingGauge).set(static_cast<double>(gioc_reporting));
+    metrics.gauge(kGuardianIoCeilingTagRejectedGauge)
+        .set(static_cast<double>(gioc_tag_rejected));
+
     // Guardian M1 health-stream rollup (#2298 gate 3, item 6d). Same absent-not-zero
     // rule as the journal family: cleared at the top, so a signal nobody reported this
     // cycle stays ABSENT.
@@ -2379,6 +2553,41 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));
+}
+
+void AgentHealthStore::recompute_perf_os_gauges(
+    yuzu::MetricsRegistry& metrics, std::unordered_map<std::string, int>& reporting_os,
+    std::unordered_map<std::string, std::vector<double>>& cpu_os,
+    std::unordered_map<std::string, std::vector<double>>& commit_os,
+    std::unordered_map<std::string, std::vector<double>>& disk_lat_os) {
+    // Absent-not-zero: clear every sweep so an OS that stops reporting leaves
+    // no stale series, mirroring the yuzu_fleet_net_*{os} precedent.
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_reporting");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_cpu_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_commit_pct");
+    metrics.clear_gauge_family("yuzu_fleet_perf_os_disk_lat_ms");
+    for (auto& [os, n] : reporting_os)
+        metrics.gauge("yuzu_fleet_perf_os_reporting", {{"os", os}}).set(static_cast<double>(n));
+    auto set_stats_os = [&](const char* family, const std::string& os,
+                            std::vector<double>& vals) {
+        if (vals.empty())
+            return;
+        std::sort(vals.begin(), vals.end());
+        double sum = 0.0;
+        for (double v : vals)
+            sum += v;
+        metrics.gauge(family, {{"stat", "avg"}, {"os", os}})
+            .set(sum / static_cast<double>(vals.size()));
+        metrics.gauge(family, {{"stat", "p50"}, {"os", os}}).set(nearest_rank(vals, 0.50));
+        metrics.gauge(family, {{"stat", "p90"}, {"os", os}}).set(nearest_rank(vals, 0.90));
+        metrics.gauge(family, {{"stat", "max"}, {"os", os}}).set(vals.back());
+    };
+    for (auto& [os, vals] : cpu_os)
+        set_stats_os("yuzu_fleet_perf_os_cpu_pct", os, vals);
+    for (auto& [os, vals] : commit_os)
+        set_stats_os("yuzu_fleet_perf_os_commit_pct", os, vals);
+    for (auto& [os, vals] : disk_lat_os)
+        set_stats_os("yuzu_fleet_perf_os_disk_lat_ms", os, vals);
 }
 
 } // namespace yuzu::server::detail

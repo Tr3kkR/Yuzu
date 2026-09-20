@@ -110,7 +110,7 @@ TEST_CASE("antivirus plugin: products/status/av_exclusions execute via "
           "[antivirus][windows][local_dispatcher]") {
     auto plugin_path = find_antivirus_plugin();
     if (plugin_path.empty()) {
-        WARN("antivirus.dll not found (build_examples=false?) -- skipping "
+        WARN("antivirus.dll not found (build_agent=false?) -- skipping "
              "LocalDispatcher execute-path test");
         return;
     }

@@ -22,6 +22,9 @@
 #   deploy/docker/docker-compose.demo.yml            server/gateway-chisel: /bin/busybox wget
 #   deploy/docker/docker-compose.reference.yml       server: bash /dev/tcp (connect-only)
 #   deploy/docker/docker-compose.reference-gateway.yml  server: bash /dev/tcp
+#   deploy/docker/docker-compose.reference-gateway-cluster.yml  gateway: wget --spider
+#     (same shape/probe as docker-compose.uat.yml's gateway row above — no new
+#     probe branch needed, HA WS-4 #4555)
 #   deploy/docker/docker-compose.viz-uat.yml         server: bash /dev/tcp + head + grep
 #   scripts/test/docker-compose.upgrade-test.yml     server: bash /dev/tcp + grep
 #   .github/workflows/pre-release.yml (3 heredocs)   server: bash /dev/tcp

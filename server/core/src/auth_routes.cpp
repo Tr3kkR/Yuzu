@@ -17,6 +17,7 @@
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
+#include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
@@ -868,7 +869,16 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // so an admin's MCP token passes the floor here and a non-admin's does
     // not. That is intended, not a gap to "fix".
     const bool floored = topology_floor_applies(securable_type, operation);
-    if ((operation != "Read" || floored) && auth::effective_role(*session) != auth::Role::admin) {
+    // #2963: a pair on the legacy self-service allowlist (currently just
+    // ApiToken:Rotate) skips the admin-role requirement here — never the
+    // floor, which stays checked unconditionally above/independently of
+    // this. See legacy_self_service_allow.hpp for why this is safe (the
+    // downstream store enforces ownership; this gate only decides "may
+    // attempt").
+    const bool self_service_exempt =
+        !floored && legacy_self_service_allow(securable_type, operation);
+    if ((operation != "Read" || floored) && !self_service_exempt &&
+        auth::effective_role(*session) != auth::Role::admin) {
         const std::string reason =
             (floored ? std::string("topology floor: non-admin role denied ")
                      : std::string("non-admin role denied ")) +
@@ -1136,14 +1146,25 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
     // — defense-in-depth; the is_elevated short-circuit above already returned for
     // elevated sessions).
-    // #2376 topology floor: mirrors require_permission's floor above. No
-    // floored (securable, operation) pair reaches this scoped variant today,
-    // but it is floored anyway so a FUTURE scoped topology read cannot
-    // silently bypass the floor — flooring only one of the two structurally
-    // identical legacy branches is the "second copy" defect this repo keeps
-    // re-learning. See authz_topology_floor.hpp for the rationale.
+    // #2376 topology floor: mirrors require_permission's floor above. Wave 7
+    // PR7b (app_usage) is the first floored (securable, operation) pair to
+    // reach this scoped variant — `Forensics:Read`, routed here via
+    // `app_usage_routes.cpp`'s scoped gate (see the `{"Forensics", "Read"}`
+    // entry in authz_topology_floor.hpp). It was floored defensively before
+    // that, so a FUTURE scoped topology read cannot silently bypass the
+    // floor — flooring only one of the two structurally identical legacy
+    // branches is the "second copy" defect this repo keeps re-learning. See
+    // authz_topology_floor.hpp for the rationale.
     const bool floored = topology_floor_applies(securable_type, operation);
-    if ((operation != "Read" || floored) && auth::effective_role(*session) != auth::Role::admin) {
+    // #2963: mirrors require_permission's exemption above — no floored
+    // (securable, operation) pair reaches this scoped variant today, but
+    // it is checked anyway so a future scoped self-service op cannot
+    // silently fall on the wrong side of this (same "second copy" lesson
+    // as the topology floor comment above).
+    const bool self_service_exempt =
+        !floored && legacy_self_service_allow(securable_type, operation);
+    if ((operation != "Read" || floored) && !self_service_exempt &&
+        auth::effective_role(*session) != auth::Role::admin) {
         const std::string reason =
             (floored ? std::string("topology floor: non-admin role denied ")
                      : std::string("non-admin role denied ")) +

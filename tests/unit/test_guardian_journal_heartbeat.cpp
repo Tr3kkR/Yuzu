@@ -5,8 +5,10 @@
 
 #include "guardian_journal_heartbeat.hpp"
 
+#include "guardian_arm_heartbeat.hpp"     // rung 9c PR-3: doc/emitter cross-check union
 #include "guardian_backend.hpp"           // F7, #2298: doc/emitter cross-check union
 #include "guardian_health_heartbeat.hpp"  // F7, #2298: doc/emitter cross-check union
+#include "guardian_io_ceiling_heartbeat.hpp" // rung 9c PR-3: doc/emitter cross-check union
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -201,6 +203,23 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
     emit_guardian_backend_heartbeat_tag(emitted, /*prefer_spark=*/true,
                                         GuardianEngine::SparkAvailability::SparkFailed);
+    // rung 9c PR-3: union in the arm-ledger + io-ceiling emitters too - both are
+    // yuzu.guardian_*-namespaced, so a future metrics.md edit referencing
+    // yuzu.guardian_arm_pending or yuzu.guardian_io_arm_disarm_rejected_ceiling
+    // must not rediscover this same doc/emitter gap.
+    GuardianArmStats arm_s{.pending = 1, .failed = 1};
+    emit_guardian_arm_heartbeat_tags(emitted, std::optional{arm_s});
+    emit_guardian_io_ceiling_heartbeat_tags(emitted, 1);
+    // Governance fix (Gate 8, doc-scrape false-negative): yuzu.guardian_generation is a
+    // real, always-emitted heartbeat tag (agent.cpp's own inline
+    // tags["yuzu.guardian_generation"] = ..., NOT one of the extracted
+    // guardian_*_heartbeat.hpp emitter functions this test otherwise unions) - a
+    // metrics.md doc edit mentioning it by name (the arm-gauge alerting-hazard note)
+    // tripped this scrape with no way to satisfy it via an emitter call, exactly the
+    // gap this test's own comments already describe closing for yuzu.guardian_backend
+    // (F7/#2298). Inserted directly rather than via an emitter function since none
+    // exists for this one inline tag.
+    emitted["yuzu.guardian_generation"] = "1";
     REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);

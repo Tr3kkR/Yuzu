@@ -435,9 +435,12 @@
     "method": "POST",
     "path": "/api/scope/validate",
     "capability_id": "post.api-scope-validate",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/scope/validate"
+    },
+    "mcp_twin": "validate_scope",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -547,48 +550,66 @@
     "method": "POST",
     "path": "/fragments/result-sets/create",
     "capability_id": "post.fragments-result-sets-create",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets"
+    },
+    "mcp_twin": "create_result_set",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/result-sets/sidebar",
     "capability_id": "get.fragments-result-sets-sidebar",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets"
+    },
+    "mcp_twin": "list_result_sets",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/fragments/result-sets/{param}/delete",
     "capability_id": "post.fragments-result-sets-param-delete",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/result-sets/{param}"
+    },
+    "mcp_twin": "delete_result_set",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/result-sets/{param}/detail",
     "capability_id": "get.fragments-result-sets-param-detail",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets/{param}"
+    },
+    "mcp_twin": "get_result_set",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/fragments/result-sets/{param}/pin",
     "capability_id": "post.fragments-result-sets-param-pin",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets/{param}/pin"
+    },
+    "mcp_twin": "pin_result_set",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/fragments/result-sets/{param}/unpin",
     "capability_id": "post.fragments-result-sets-param-unpin",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets/{param}/unpin"
+    },
+    "mcp_twin": "unpin_result_set",
+    "status": "twinned"
   }
 ]

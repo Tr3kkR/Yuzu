@@ -709,8 +709,8 @@ void warn_on_san_drift(const fs::path& representative_leaf,
         out.ca_fingerprint_sha256 = *fp;
         out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
         out.freshly_generated = false;
-        spdlog::info("default_certs: existing default cert set is intact (CA {})",
-                     out.ca_fingerprint_sha256);
+        spdlog::info("default_certs: existing default cert set is intact (CA {}, dir {})",
+                     out.ca_fingerprint_sha256, dir.string());
         // Tell the operator if --cert-san now asks for names the existing
         // certs don't carry (we never auto-rotate).
         warn_on_san_drift(out.gateway_cert, extra_sans);

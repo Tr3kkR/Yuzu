@@ -73,18 +73,83 @@ struct Collector {
 
 /// A cross-platform stand-in for the Windows watch mechanisms. Records the
 /// engine's watch/unwatch/start/stop calls and lets a test drive a fire.
+/// A one-shot park for the #2815 teardown-barrier cases (and, since rung 9c
+/// PR-6 item 1, FakeMechanism's own watch()/unwatch() park seam below): an
+/// engine test hook — or a mechanism call — enters, announces it, and blocks
+/// until the test releases it.
+///
+/// DELIBERATELY NOT OWNED BY THE ENGINE for the #2815 door-test use below.
+/// Scenario B destroys the engine while a caller is parked in here, so the
+/// gate must outlive it — it lives on the TEST's stack and the hook captures
+/// a bare pointer to it. The hook lambda's own closure storage belongs to the
+/// engine's std::function member and dies with the engine, so the capture is
+/// read ONCE at hook entry (into a stack local) and never again after the
+/// park begins; otherwise ASan reports the closure rather than the engine
+/// member the case is about. (FakeMechanism's own use owns its ParkGate as a
+/// plain member — its lifetime is the mechanism's own, no such hazard.)
+struct ParkGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+    void park() {
+        std::unique_lock lk(mu);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [this] { return released; });
+    }
+    [[nodiscard]] bool wait_entered(std::chrono::milliseconds timeout = 5000ms) {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, timeout, [this] { return entered; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
 class FakeMechanism final : public ISparkMechanism {
 public:
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1), mirroring the real mechanisms:
+        // start() being CALLED seals the establishment sink, whether or not
+        // this call does anything else.
+        sink_sealed_ = true;
         emit_ = std::move(emit);
         fault_ = std::move(fault);
         started_ = true;
         ++start_calls_;
     }
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
+        // One-shot park (rung 9c PR-6 item 1, E14/E15): gate at the TOP,
+        // before any state mutation — models a mechanism whose watch() blocks
+        // on OS handle setup while the caller still holds this type's
+        // mech-ops lock. Shares one ParkGate with unwatch() below — a given
+        // test scenario parks at most one of the two at a time.
+        bool should_park = false;
+        {
+            std::lock_guard lk(mu_);
+            if (park_next_watch_) {
+                park_next_watch_ = false;
+                should_park = true;
+            }
+        }
+        if (should_park)
+            park_gate_.park(); // blocks until release_park()
         std::lock_guard lk(mu_);
         ++watch_calls_;
+        // Checked after the gate, consumed (rung 9c PR-6 item 1): a NEW
+        // one-shot failure independent of the pre-existing fail_watch_/
+        // throw_watch_* below, which stay level-triggered (set-then-use, not
+        // consumed) for the tests that already depend on that.
+        if (fail_next_watch_) {
+            fail_next_watch_ = false;
+            return std::unexpected("forced watch failure (one-shot, rung 9c PR-6 item 1)");
+        }
         if (throw_watch_nonstd_)
             throw 42; // non-std throw → exercises watch_guarded()'s catch(...) arm
         if (throw_watch_)
@@ -94,7 +159,39 @@ public:
         watched_.insert(key);
         return {};
     }
+    // The engine always calls this overload in production. Records the
+    // incarnation token BEFORE delegating to watch() above, so every existing
+    // fail/throw/park behavior on watch() (and every pre-existing test that
+    // exercises it via the engine) is unaffected — this is purely additive.
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
+        {
+            std::lock_guard lk(mu_);
+            tokens_[key].push_back(incarnation);
+        }
+        return watch(key, params);
+    }
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_sink_ = std::move(sink);
+        return true;
+    }
     void unwatch(const std::string& key) override {
+        // One-shot park (rung 9c PR-6 item 1, E14/E15) — see watch()'s own
+        // comment; same shared ParkGate.
+        bool should_park = false;
+        {
+            std::lock_guard lk(mu_);
+            if (park_next_unwatch_) {
+                park_next_unwatch_ = false;
+                should_park = true;
+            }
+        }
+        if (should_park)
+            park_gate_.park();
         std::lock_guard lk(mu_);
         ++unwatch_calls_;
         // #2815: did this unwatch arrive AFTER the engine had already torn this
@@ -137,6 +234,25 @@ public:
         }
         if (f)
             f(key, faulted, reason);
+    }
+    // Drive the establishment channel as a real mechanism would (lock released,
+    // rung 9c PR-6 item 1).
+    void fire_established(const std::string& key, SparkIncarnation inc,
+                          std::chrono::steady_clock::time_point at, SparkCoverage cov) {
+        SparkEstablishedFn f;
+        {
+            std::lock_guard lk(mu_);
+            f = established_sink_;
+        }
+        if (f)
+            f(key, inc, at, cov);
+    }
+    /// Every incarnation token watch_incarnation() has recorded for `key`, in
+    /// call order (rung 9c PR-6 item 1, H1 tests).
+    std::vector<SparkIncarnation> tokens(const std::string& key) {
+        std::lock_guard lk(mu_);
+        auto it = tokens_.find(key);
+        return it == tokens_.end() ? std::vector<SparkIncarnation>{} : it->second;
     }
     bool is_watching(const std::string& key) {
         std::lock_guard lk(mu_);
@@ -189,11 +305,41 @@ public:
         std::lock_guard lk(mu_);
         throw_unwatch_ = b;
     }
+    // ── rung 9c PR-6 item 1 test seams ──
+    void set_park_next_watch(bool b) {
+        std::lock_guard lk(mu_);
+        park_next_watch_ = b;
+    }
+    void set_park_next_unwatch(bool b) {
+        std::lock_guard lk(mu_);
+        park_next_unwatch_ = b;
+    }
+    void set_fail_next_watch(bool b) {
+        std::lock_guard lk(mu_);
+        fail_next_watch_ = b;
+    }
+    /// True once a parked watch()/unwatch() has actually entered its park —
+    /// the observable half of the park seam (E14/E15).
+    [[nodiscard]] bool wait_parked(std::chrono::milliseconds timeout = 5000ms) {
+        return park_gate_.wait_entered(timeout);
+    }
+    void release_park() { park_gate_.release(); }
+    /// Exposes the internal ParkGate by reference so a test can hand it to
+    /// ThreadJoinGuard directly, matching the #2815 door tests' own backstop
+    /// pattern (release-then-join on early REQUIRE failure, so an unwind
+    /// never destroys a still-joinable thread parked forever with no other
+    /// caller left to release it).
+    ParkGate& park_gate_for_test() { return park_gate_; }
 
 private:
     std::mutex mu_;
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) — installed by
+    /// set_established_sink(), sealed at start(), read (lock released) by
+    /// fire_established().
+    SparkEstablishedFn established_sink_;
+    bool sink_sealed_{false};
     std::set<std::string> watched_;
     bool started_{false};
     bool fail_watch_{false};
@@ -207,39 +353,15 @@ private:
     int unwatch_calls_after_stop_{0};
     int stop_calls_{0};
     int start_calls_{0};
-};
-
-/// A one-shot park for the #2815 teardown-barrier cases: an engine test hook enters,
-/// announces it, and blocks until the test releases it.
-///
-/// DELIBERATELY NOT OWNED BY THE ENGINE. Scenario B destroys the engine while a caller
-/// is parked in here, so the gate must outlive it — it lives on the TEST's stack and the
-/// hook captures a bare pointer to it. The hook lambda's own closure storage belongs to
-/// the engine's std::function member and dies with the engine, so the capture is read
-/// ONCE at hook entry (into a stack local) and never again after the park begins;
-/// otherwise ASan reports the closure rather than the engine member the case is about.
-struct ParkGate {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool entered{false};
-    bool released{false};
-    void park() {
-        std::unique_lock lk(mu);
-        entered = true;
-        cv.notify_all();
-        cv.wait(lk, [this] { return released; });
-    }
-    [[nodiscard]] bool wait_entered(std::chrono::milliseconds timeout = 5000ms) {
-        std::unique_lock lk(mu);
-        return cv.wait_for(lk, timeout, [this] { return entered; });
-    }
-    void release() {
-        {
-            std::lock_guard lk(mu);
-            released = true;
-        }
-        cv.notify_all();
-    }
+    /// spark key -> every incarnation token watch_incarnation() has recorded
+    /// for it, in call order (rung 9c PR-6 item 1, H1 tests).
+    std::map<std::string, std::vector<SparkIncarnation>> tokens_;
+    bool park_next_watch_{false};
+    bool park_next_unwatch_{false};
+    bool fail_next_watch_{false};
+    /// Shared by watch()/unwatch() — a given test scenario parks at most one
+    /// of the two calls at a time, so one gate suffices.
+    ParkGate park_gate_;
 };
 
 /// RAII safety net for the #2815/#2833/#2818 door tests below (cpp-safety Gate 3
@@ -2327,6 +2449,629 @@ TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][me
 #endif
 }
 
+// ── rung 9c PR-6 item 1: the establishment signal (SparkIncarnation /
+//    SparkCoverage / SubscriptionEstablishment), engine-level plumbing.
+//    Cross-platform (FakeMechanism); the real-mechanism M1-M6 cases live
+//    further down, alongside the existing Linux/Windows smoke sections they
+//    extend. ──────────────────────────────────────────────────────────────
+
+TEST_CASE("Establishment: a fresh arm mints a real incarnation; dedup shares it, no second "
+          "watch call (E1)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    auto est1 = engine.subscription_establishment(*sub1);
+    REQUIRE(est1.has_value());
+    CHECK(est1->coverage == SparkCoverage::None); // nothing reported yet
+    CHECK_FALSE(est1->established_at.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+
+    // Dedup: a second subscriber to the SAME spec shares the existing
+    // watcher — no second watch_incarnation() call, same incarnation.
+    auto sub2 = engine.arm(*c2, spec);
+    REQUIRE(sub2.has_value());
+    CHECK(fake->tokens(key).size() == 1); // still just one — no second watch call
+    auto est2 = engine.subscription_establishment(*sub2);
+    REQUIRE(est2.has_value());
+    CHECK(est2->armed_at == est1->armed_at); // same Armed entry
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: report_established assigns coverage unconditionally and stamps "
+          "established_at first-wins (E2, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation inc = fake->tokens(key).front();
+
+    // Poll: coverage assigned, established_at stays unset (never stamped by
+    // anything but Notification).
+    fake->fire_established(key, inc, std::chrono::steady_clock::now(), SparkCoverage::Poll);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Poll);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Notification: coverage assigned, established_at stamps for the first time.
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+
+    // A second, LATER Notification does NOT move established_at (first-wins).
+    const auto t2 = t1 + std::chrono::milliseconds(50);
+    fake->fire_established(key, inc, t2, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == t1); // unchanged
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: subscription_establishment is nullopt for an unknown or "
+          "torn-down id (E3)",
+          "[spark][established]") {
+    SparkEngine engine;
+    wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, service_spec("svc1"));
+    REQUIRE(sub.has_value());
+    // Mirrors subscription_health()'s own "unknown id" pin.
+    CHECK_FALSE(engine.subscription_establishment(*sub + 1'000'000).has_value());
+    engine.disarm(*sub);
+    CHECK_FALSE(engine.subscription_establishment(*sub).has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a report against a superseded incarnation is dropped by IDENTITY, "
+          "not by timestamp ordering (E4, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation old_inc = fake->tokens(key)[0];
+
+    engine.disarm(*sub1);
+    auto sub2 = engine.arm(*c1, spec); // fully torn down + re-armed -> fresh incarnation
+    REQUIRE(sub2.has_value());
+    REQUIRE(fake->tokens(key).size() == 2);
+    const SparkIncarnation new_inc = fake->tokens(key)[1];
+    CHECK(new_inc != old_inc);
+
+    // Stale report, timestamped an hour in the FUTURE — a time-ordering check
+    // would accept this over anything already recorded; an identity check
+    // must reject it regardless of its timestamp.
+    const auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    fake->fire_established(key, old_inc, future, SparkCoverage::Notification);
+
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None); // untouched by the stale report
+    CHECK_FALSE(est->established_at.has_value());
+
+    // A report against the CURRENT incarnation still works normally.
+    fake->fire_established(key, new_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    CHECK(est->established_at.has_value());
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a dedup arm shares the existing key's incarnation and armed_at "
+          "(E5)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    auto sub2 = engine.arm(*c2, spec);
+    REQUIRE(sub2.has_value());
+    REQUIRE(fake->tokens(key).size() == 1); // one watch_incarnation() call for both
+
+    const SparkIncarnation inc = fake->tokens(key).front();
+    fake->fire_established(key, inc, std::chrono::steady_clock::now(), SparkCoverage::Notification);
+    auto est1 = engine.subscription_establishment(*sub1);
+    auto est2 = engine.subscription_establishment(*sub2);
+    REQUIRE(est1.has_value());
+    REQUIRE(est2.has_value());
+    CHECK(est1->armed_at == est2->armed_at);
+    CHECK(est1->coverage == est2->coverage);
+    CHECK(est1->established_at == est2->established_at);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: armed_at is stamped at ARM time, even for a pre-start arm (E6/H14)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    // Deliberately NOT started yet.
+    const auto before = std::chrono::steady_clock::now();
+    auto sub = engine.arm(*c1, service_spec("svc1"));
+    const auto after = std::chrono::steady_clock::now();
+    REQUIRE(sub.has_value());
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->armed_at >= before);
+    CHECK(est->armed_at <= after);
+    CHECK(fake->watch_calls() == 0); // not started yet — no live watch call
+    engine.start(); // replay runs now
+    CHECK(fake->watch_calls() == 1);
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a fault-then-recovery cycle does not move established_at (E7)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+
+    // Coverage drops to None (a fault/teardown) then RECOVERS to Notification
+    // — spark.hpp's SubscriptionEstablishment doc comment: established_at is
+    // a historical fact, not a live status.
+    fake->fire_established(key, inc, t1 + std::chrono::milliseconds(10), SparkCoverage::None);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK(*est->established_at == t1); // still the original stamp
+
+    const auto t2 = t1 + std::chrono::milliseconds(20);
+    fake->fire_established(key, inc, t2, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    CHECK(*est->established_at == t1); // STILL the original — recovery does not re-stamp
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a timer-driven spark's coverage/established_at stay at their "
+          "defaults forever — the field is inert off the event-driven path (E8)",
+          "[spark][established]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(1); // ms — let the interval fire quickly
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, interval_spec(5));
+    REQUIRE(sub.has_value());
+    std::this_thread::sleep_for(50ms); // let it fire a few times
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: after stop(), the query returns last-known values, like "
+          "subscription_health (E9/R4)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    {
+        auto pre = engine.subscription_establishment(*sub);
+        REQUIRE(pre.has_value());
+        REQUIRE(pre->coverage == SparkCoverage::Notification);
+    }
+
+    engine.stop();
+    CHECK_FALSE(engine.is_running());
+    // R4: stop() never erases armed_ — the query still returns the last
+    // thing any mechanism reported, exactly like subscription_health().
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+}
+
+TEST_CASE("Establishment: adoption — a disarm racing a re-arm skips the stale unwatch, and "
+          "the mechanism sees a fresh token it can report against (E10)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation old_inc = fake->tokens(key)[0];
+
+    // Fires inside disarm()'s teardown, after the key is dropped from
+    // armed_/sub_keys_ under mu_ but BEFORE the (M2-staleness-rechecked)
+    // unwatch() call — a fresh equal-spec arm() lands in that exact window.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c1, spec);
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+    // M2: the stale unwatch was skipped entirely.
+    CHECK(fake->unwatch_calls() == 0);
+    // The mechanism DID see a second watch_incarnation() call, with a
+    // different token — "adoption" from the mechanism's perspective: the
+    // same live watch object, a new engine-side identity.
+    REQUIRE(fake->tokens(key).size() == 2);
+    const SparkIncarnation new_inc = fake->tokens(key)[1];
+    CHECK(new_inc != old_inc);
+
+    // A report against the now-superseded OLD incarnation must not reach the
+    // NEW subscription.
+    fake->fire_established(key, old_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+
+    // A report against the CURRENT (new) incarnation lands correctly.
+    fake->fire_established(key, new_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: [tsan] established_at is never before armed_at under concurrent "
+          "arm/report/read (locking discipline, not disarm/re-arm identity — see E4/E10 "
+          "for that) (E11)",
+          "[spark][established][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false}; // set by the checker; asserted after join
+    std::vector<SparkEngine::SubscriptionId> subs;
+    std::mutex subs_mu;
+
+    std::thread armer([&] {
+        int i = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            auto sub = engine.arm(*c1, service_spec("svc" + std::to_string(i++ % 8)));
+            if (sub.has_value()) {
+                std::lock_guard lk(subs_mu);
+                subs.push_back(*sub);
+                if (subs.size() > 32)
+                    subs.erase(subs.begin());
+            }
+        }
+    });
+    std::thread reporter([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            for (int i = 0; i < 8; ++i) {
+                const std::string key = spark_key(service_spec("svc" + std::to_string(i)));
+                auto toks = fake->tokens(key);
+                if (!toks.empty())
+                    fake->fire_established(key, toks.back(), std::chrono::steady_clock::now(),
+                                           SparkCoverage::Notification);
+            }
+        }
+    });
+    std::thread checker([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            std::vector<SparkEngine::SubscriptionId> snapshot;
+            {
+                std::lock_guard lk(subs_mu);
+                snapshot = subs;
+            }
+            for (auto id : snapshot) {
+                if (auto est = engine.subscription_establishment(id)) {
+                    if (est->established_at && *est->established_at < est->armed_at)
+                        violation.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+    std::this_thread::sleep_for(200ms);
+    stop.store(true, std::memory_order_release);
+    armer.join();
+    reporter.join();
+    checker.join();
+    engine.stop();
+
+    CHECK_FALSE(violation.load(std::memory_order_relaxed));
+}
+
+TEST_CASE("Establishment: set_established_sink seals at start() — a repeat call after "
+          "start() (or stop()) returns false, one-way (E12/H3)",
+          "[spark][established]") {
+    FakeMechanism fake;
+    CHECK(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    fake.start([](const std::string&, SparkData) {},
+              [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    fake.stop();
+    // One-way: still sealed after stop() too — never re-opens.
+    CHECK_FALSE(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+}
+
+TEST_CASE("Establishment: start()'s replay skips a key superseded during on_start_hook_ by "
+          "IDENTITY, not containment (E13, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    // I1: pre-start arm — deferred, no watch_incarnation() call yet.
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    CHECK(fake->tokens(key).empty());
+
+    // Fires between "every mechanism started + sink installed" and "the
+    // pre-start replay loop runs" — no locks held. Disarms sub1 (I1) and
+    // re-arms the same key LIVE (running_ is already true) — I2's
+    // watch_incarnation() call happens synchronously, right here.
+    engine.set_on_start_hook_for_test([&] {
+        engine.disarm(*sub1);
+        auto sub2 = engine.arm(*c1, spec);
+        REQUIRE(sub2.has_value());
+    });
+    engine.start();
+    engine.set_on_start_hook_for_test(nullptr);
+
+    // The stale I1 replay must be skipped — only I2's live call reaches the
+    // mechanism. Mutation (replay gate reverted to bare armed_.contains())
+    // lets the stale replay through too: tokens(K) becomes [I2, I1].
+    auto toks = fake->tokens(key);
+    REQUIRE(toks.size() == 1);
+    CHECK(fake->watch_calls() == 1);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: the failed-watch cleanup only touches the entry if it's still "
+          "OURS — a successor's fresh arm survives untouched (E14, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    std::atomic<bool> c2_got_lost{false};
+    auto c2 = engine.register_consumer("c2", [&](const SparkEvent& ev) {
+        if (ev.kind == SparkEventKind::Lost)
+            c2_got_lost.store(true, std::memory_order_relaxed);
+    });
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    // Declared BEFORE the guard and tracked immediately (ThreadJoinGuard's
+    // own doc comment: C++ destroys locals in reverse order, so a thread
+    // must be declared before the guard protecting it, or an early REQUIRE
+    // failure below destroys a still-joinable thread -> terminate). Real
+    // bodies are move-assigned in below as each phase becomes ready.
+    std::thread t1, t2, t3;
+    ThreadJoinGuard guard{&fake->park_gate_for_test(), {}};
+    guard.track(t1);
+    guard.track(t2);
+    guard.track(t3);
+
+    // T1: arm(c1, K) — the fake parks INSIDE watch() (after recording I1's
+    // token in watch_incarnation()), holding `ops` for the whole park —
+    // arm_impl calls watch_guarded() while holding this type's mech-ops lock.
+    fake->set_park_next_watch(true);
+    t1 = std::thread([&] {
+        auto sub = engine.arm(*c1, spec);
+        (void)sub; // T1's own result is not the assertion target — T3's is
+    });
+    REQUIRE(fake->wait_parked());
+
+    // T2: unregister_consumer(c1) — erases sub1 + the Armed(I1) entry under
+    // mu_ alone (no `ops` needed for the bookkeeping), then blocks trying to
+    // take `ops` for its own (about-to-be-stale) unwatch call.
+    t2 = std::thread([&] { engine.unregister_consumer(*c1); });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 0; }));
+
+    // T3: arm(c2, K) — commits a fresh Armed(I2) under mu_, then blocks at
+    // the live gate trying to take the SAME `ops` T1 still holds. The result
+    // is captured, NOT asserted here — a Catch2 assertion macro failing
+    // inside a spawned std::thread's own function throws across the thread
+    // boundary, which terminates the process rather than failing cleanly;
+    // every assertion on T3's outcome happens on the main thread after join.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    t3 = std::thread([&] {
+        auto sub = engine.arm(*c2, spec);
+        if (sub.has_value())
+            sub2 = *sub;
+    });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; }));
+
+    // Release T1's park with a forced watch failure queued.
+    fake->set_fail_next_watch(true);
+    fake->release_park();
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    REQUIRE(sub2.has_value());
+    // c2 never sees Lost — the cleanup found I2 != I1 and left its entry alone.
+    CHECK_FALSE(c2_got_lost.load(std::memory_order_relaxed));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+    // Both watch_incarnation() calls reached the mechanism, in order: I1
+    // (T1, later failed) then I2 (T3, succeeded once `ops` was released).
+    auto toks = fake->tokens(key);
+    REQUIRE(toks.size() == 2);
+    CHECK(toks[0] != toks[1]);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: the live watch gate rejects a key superseded while queued behind "
+          "`ops` — by IDENTITY, not containment (E15, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+
+    const auto spec0 = service_spec("svc0"); // sibling key — holds `ops` via a parked unwatch
+    const auto spec = service_spec("svc1");  // the key under test
+    const std::string key = spark_key(spec);
+
+    auto sub0 = engine.arm(*c1, spec0);
+    REQUIRE(sub0.has_value());
+
+    // Declared BEFORE the guard and tracked immediately — see E14's own
+    // comment for why.
+    std::thread t0, t1, t2, t3;
+    ThreadJoinGuard guard{&fake->park_gate_for_test(), {}};
+    guard.track(t0);
+    guard.track(t1);
+    guard.track(t2);
+    guard.track(t3);
+
+    fake->set_park_next_unwatch(true);
+    t0 = std::thread([&] { engine.disarm(*sub0); });
+    REQUIRE(fake->wait_parked());
+    // disarm()'s own mu_-held block (including armed_.erase for svc0) runs
+    // and completes BEFORE it ever calls mech->unwatch() — where the park
+    // above is — so by the time wait_parked() returns, svc0's bookkeeping
+    // is already gone: armed_sparks is 0 here, not 1 (nothing else is armed
+    // yet). Confirmed, not polled: this is a deterministic fact once T0 has
+    // provably entered its park.
+    REQUIRE(engine.stats().armed_sparks == 0);
+
+    std::atomic<bool> t1_failed_as_expected{false};
+    t1 = std::thread([&] {
+        auto sub = engine.arm(*c1, spec);
+        if (!sub.has_value() && sub.error().find("disarmed") != std::string::npos)
+            t1_failed_as_expected.store(true, std::memory_order_relaxed);
+    });
+    // K(I1) committed under mu_ (T1 then blocks trying to take the same
+    // `ops` T0 holds) — starting from the just-confirmed 0 above, this can
+    // only be the 0->1 transition, never a stale reading.
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; }));
+
+    t2 = std::thread([&] { engine.unregister_consumer(*c1); });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 0; }));
+
+    // Captured, not asserted here — see E14's own comment on why a Catch2
+    // assertion macro must never fail inside a spawned thread's function.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    t3 = std::thread([&] {
+        auto sub = engine.arm(*c2, spec);
+        if (sub.has_value())
+            sub2 = *sub;
+    });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; })); // K(I2) only
+
+    fake->release_park();
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+
+    CHECK(t1_failed_as_expected.load(std::memory_order_relaxed));
+    REQUIRE(sub2.has_value());
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+    // T1's own token was NEVER recorded — the live gate rejected it before
+    // watch_incarnation() was ever called. Only T3's (I2) reaches the fake.
+    auto toks = fake->tokens(key);
+    CHECK(toks.size() == 1);
+
+    engine.stop();
+}
+
 // ── Linux-only smoke: drive the REAL sd-bus mechanism against absent units and
 //    (env-gated) a live unit transition. The cross-platform cases above prove
 //    the engine plumbing via the fake; these prove the actual Linux body fires
@@ -2398,6 +3143,25 @@ TEST_CASE("Service spark (real mechanism): an absent unit gets an initial Stoppe
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Stopped);
+    // M1 (rung 9c PR-6 item 1): the mechanism must reach SOME real coverage
+    // classification, never stay at the default None forever. EMPIRICALLY
+    // VERIFIED against a real system bus (a standalone sd-bus probe, not
+    // assumed from the D-Bus API docs): systemd's LoadUnit succeeds for ANY
+    // syntactically valid unit name — it lazily creates a stub unit object
+    // with LoadState=not-found rather than erroring — so an absent unit
+    // takes the SAME Resolved -> match -> read path as a present one
+    // (arm_unit's NotFound branch, mapping to Poll, is reserved for the
+    // rarer case where LoadUnit itself fails outright) and typically also
+    // reaches Notification here. Accept either — the property under test is
+    // "no coverage started at None forever, and if Notification, it stamps",
+    // not a specific tri-state value this absence path does not control.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->established_at.has_value() == (est->coverage == SparkCoverage::Notification));
     engine.disarm(*sub);
     engine.stop();
 }
@@ -2439,6 +3203,18 @@ TEST_CASE("Service spark (real mechanism): two spark keys coalescing onto one un
     CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
           ServiceRunState::Stopped); // ...same (absent) unit, same resolved state
 
+    // M1 (rung 9c PR-6 item 1): the F4 unified branch reports establishment
+    // for the SECOND (coalescing) key unconditionally — it must NOT be
+    // gated behind the same `uw.last` check the emit above is (a key
+    // coalescing onto an already-resolved unit whose state HASN'T changed
+    // still needs its own establishment report; the emit is edge-gated, the
+    // establishment report is not). See the "absent unit" test above for why
+    // this accepts any non-None coverage rather than a specific value.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*second);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+
     engine.disarm(*first);
     engine.disarm(*second);
     engine.stop();
@@ -2466,8 +3242,93 @@ TEST_CASE("Service spark (real mechanism): a real active unit resolves to Runnin
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+    // M1 (rung 9c PR-6 item 1), STRICT: a real, present, resolvable unit MUST
+    // reach Notification coverage, never settle for Poll — Poll here would
+    // mean the mechanism-wide Subscribe() call failed (H7), which on a normal
+    // systemd host is a real finding (a Subscribe-denied host), not an
+    // acceptable degraded mode this test should silently tolerate.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
     engine.disarm(*sub);
     engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (M1)",
+          "[spark][mechanism][linux]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub1 = engine.arm(*c, service_spec("systemd-journald.service"));
+    if (!sub1.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    // Race a re-arm of the SAME key into disarm()'s teardown window — the M2
+    // staleness recheck skips the stale unwatch, so the real mechanism's
+    // UnitWatch survives untouched ("adoption": same live sd-bus match, a
+    // new engine-side incarnation).
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, service_spec("systemd-journald.service"));
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    // The adopted key still reaches Notification under its NEW incarnation
+    // — the F4 unconditional coalesce/adoption report, exercised against the
+    // real mechanism rather than the fake.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub2);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Service mechanism (Linux, direct): set_established_sink seals at start(), same "
+          "one-way contract as the fake (M2)",
+          "[spark][mechanism][linux]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
 }
 
 TEST_CASE("Service spark (real mechanism): fd/thread collapse holds across N absent watches",
@@ -6175,9 +7036,109 @@ TEST_CASE("Service spark (real mechanism): two spark keys folding onto one servi
     CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
           ServiceRunState::Running); // ...same service, same resolved state
 
+    // M3 (rung 9c PR-6 item 1): the F4 unified branch reports establishment
+    // for the SECOND (coalescing) key unconditionally, mirroring Linux's M1
+    // coalescing coverage.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*second);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
     engine.disarm(*first);
     engine.disarm(*second);
     engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): Winmgmt reaches Notification coverage with a "
+          "stamped established_at (M3)",
+          "[spark][mechanism][windows]") {
+    // Winmgmt is always present and running on any Windows host, read-only
+    // here (never stopped/started) — the Windows twin of Linux's M1
+    // systemd-journald.service case, STRICT for the same reason (H7): a real
+    // resolvable, subscribable service must reach Notification, not settle
+    // for Poll.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (M3)",
+          "[spark][mechanism][windows]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub1 = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, service_spec("Winmgmt"));
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub2);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Service mechanism (Windows, direct): set_established_sink seals at start(), same "
+          "one-way contract as the fake (M3)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
 }
 
 TEST_CASE("Service spark (real mechanism): thread count settles to 1 persistent worker (plus "
@@ -6388,6 +7349,11 @@ struct ServiceEmitCollector {
     std::mutex mu;
     std::vector<std::pair<std::string, ServiceRunState>> emits;
     std::vector<std::tuple<std::string, bool, std::string>> faults; // key, faulted, reason
+    /// rung 9c PR-6 item 1: key, incarnation, coverage — every established
+    /// report the mechanism has made, in order. Installed via
+    /// set_established_sink() BEFORE start() (an addition to this
+    /// test-owned collector, not an existing helper — M4/M3's own seam).
+    std::vector<std::tuple<std::string, SparkIncarnation, SparkCoverage>> established;
     SparkEmitFn emit_fn() {
         return [this](const std::string& key, SparkData data) {
             std::lock_guard lk(mu);
@@ -6401,13 +7367,197 @@ struct ServiceEmitCollector {
             faults.emplace_back(key, faulted, std::string(reason));
         };
     }
+    SparkEstablishedFn established_fn() {
+        return [this](const std::string& key, SparkIncarnation inc,
+                     std::chrono::steady_clock::time_point, SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            established.emplace_back(key, inc, cov);
+        };
+    }
     std::size_t emit_count() {
         std::lock_guard lk(mu);
         return emits.size();
     }
+    std::size_t established_count() {
+        std::lock_guard lk(mu);
+        return established.size();
+    }
+    /// Count of Notification reports for `key` — M3's live-transition
+    /// re-report observer counts THIS, not emit_count(), since an engine
+    /// query holding first-wins state cannot show a re-report at all.
+    std::size_t notification_count_for(const std::string& key) {
+        std::lock_guard lk(mu);
+        return static_cast<std::size_t>(std::count_if(
+            established.begin(), established.end(), [&](const auto& e) {
+                return std::get<0>(e) == key && std::get<2>(e) == SparkCoverage::Notification;
+            }));
+    }
 };
 
 } // namespace
+
+// Live transition, direct-mechanism variant — env-gated (YUZU_SPARK_LIVE_SERVICE),
+// mirrors the engine-level live test above but installs a test-local sink
+// directly via set_established_sink() before start(), so it can observe every
+// Notification RE-REPORT the fired-scan's `:1919`-shape re-arm produces —
+// something an engine query (first-wins on established_at) structurally
+// cannot show (M3).
+TEST_CASE("Service mechanism (direct): a live service transition re-reports Notification on "
+          "every fired-scan re-arm, not just the first (M3)",
+          "[spark][mechanism][windows][live]") {
+    const char* env = std::getenv("YUZU_SPARK_LIVE_SERVICE");
+    if (!env || !*env) {
+        SUCCEED("YUZU_SPARK_LIVE_SERVICE unset — skipping live service integration test");
+        return;
+    }
+    const std::string name(env);
+    const auto spec = service_spec(name);
+    const std::string key = spark_key(spec);
+
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+
+    // Toggle externally while this waits for at least 3 observed terminal
+    // transitions (the emit channel) — mirrors the engine-level live test's
+    // own wait shape.
+    REQUIRE(eventually([&] { return got.emit_count() >= 3; }, 60000ms));
+
+    // Oracle: every report's token == 1 (this mechanism instance only ever
+    // watched this key once, at incarnation 1); the count of Notification
+    // reports for `key` is >= the count of terminal transitions observed —
+    // the fired-scan's `:1919` re-arm re-reports Notification each time,
+    // which the emit channel alone (edge-dedup baseline) would never reveal.
+    {
+        std::lock_guard lk(got.mu);
+        for (const auto& [k, inc, cov] : got.established) {
+            if (k == key)
+                CHECK(inc == 1);
+        }
+    }
+    CHECK(got.notification_count_for(key) >= got.emit_count());
+
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): a parked probe's None-on-teardown report lands "
+          "immediately, before the probe even resolves; release delivers a Notification "
+          "report carrying the watch's token (M4a)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec = service_spec("Winmgmt");
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    // begin_probe()'s own unconditional None stage (right after
+    // teardown_watch, BEFORE probe_lane_.launch()) lands synchronously on the
+    // Add — it does not wait for the probe to resolve. By the time the probe
+    // has provably parked, exactly the initial None report already exists.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.established.size() >= 1);
+        CHECK(std::get<0>(got.established[0]) == key);
+        CHECK(std::get<1>(got.established[0]) == 1);
+        CHECK(std::get<2>(got.established[0]) == SparkCoverage::None);
+    }
+
+    gate.release();
+    REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
+
+    // Oracle (deliberately loose per the plan: "no exact count" — the
+    // immediate-callback re-arm on a real, live-changing Winmgmt can add
+    // further positive reports beyond the first): every report for this key
+    // carries token 1 (the only incarnation this mechanism instance ever
+    // watched it under) — the initial None (asserted above) included.
+    {
+        std::lock_guard lk(got.mu);
+        for (const auto& [k, inc, cov] : got.established) {
+            if (k != key)
+                continue;
+            CHECK(inc == 1);
+            (void)cov;
+        }
+    }
+
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): a probe parked for a retired watch's token never "
+          "resolves — a re-watch under a NEW token gets its own clean reports (M4b)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec = service_spec("Winmgmt");
+    const std::string key = spark_key(spec);
+
+    // Token 1's probe parks and is left parked — this watch is about to be
+    // RETIRED, never resolved.
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    // begin_probe()'s own unconditional None stage lands for token 1 too,
+    // before its probe even resolves — snapshot how many reports exist so
+    // the oracle below only checks reports produced AFTER the retirement,
+    // not this legitimate token-1 report.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    std::size_t baseline = 0;
+    {
+        std::lock_guard lk(got.mu);
+        baseline = got.established.size();
+    }
+
+    mech->unwatch(key);
+    // Re-watch under a NEW token while the OLD probe is STILL parked — the
+    // retired SvcWatch's eventual probe result is never resolve_probe()'d
+    // against the new one (a fresh SvcWatch object, a fresh begin_probe()).
+    REQUIRE(mech->watch_incarnation(key, spec.params, 2).has_value());
+
+    gate.release(); // frees BOTH the stale parked probe (discarded on
+                    // retirement) and lets token 2's own probe proceed
+    REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
+
+    // Every report for this key produced AFTER the retirement carries the
+    // NEW token — the retired watch's result is silently discarded, never
+    // misattributed.
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.established.size() > baseline);
+        for (std::size_t i = baseline; i < got.established.size(); ++i) {
+            const auto& [k, inc, cov] = got.established[i];
+            if (k != key)
+                continue;
+            CHECK(inc == 2);
+            (void)cov;
+        }
+    }
+
+    mech->stop();
+}
 
 TEST_CASE("Service mechanism (direct): a parked establishment probe for one service does not "
           "stall a sibling's establishment (#2012/#3840 PR-B3)",
@@ -6533,10 +7683,12 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
         REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
     }
     ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn())); // H15, rung 9c PR-6 item 1
     mech->start(got.emit_fn(), got.fault_fn());
 
     const auto spec_a = service_spec("Winmgmt");
-    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    const std::string key = spark_key(spec_a);
+    REQUIRE(mech->watch_incarnation(key, spec_a.params, 7).has_value());
 
     // Contained: the throw is a genuine backend failure (never WorkerThrew
     // silently discarded), and dispatches a fault — proving the mechanism's
@@ -6556,7 +7708,7 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     {
         std::lock_guard lk(got.mu);
         REQUIRE_FALSE(got.faults.empty());
-        CHECK(std::get<0>(got.faults.back()) == spark_key(spec_a));
+        CHECK(std::get<0>(got.faults.back()) == key);
         CHECK(std::get<1>(got.faults.back())); // faulted == true
     }
     {
@@ -6564,6 +7716,41 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
         REQUIRE(d.has_value());
         CHECK(d->probe_backend_failed > 0);
     }
+    // H15 (rung 9c PR-6 item 1): the SAME WorkerThrew outcome that faults the
+    // key also stages None coverage for it — the established channel must
+    // not stay silent (or stuck at a stale positive) just because the
+    // backend failure classification is "never a false Stopped", which is a
+    // statement about the RUN-STATE emit channel, not about coverage.
+    //
+    // Counted, not baselined (adversarial-review finding, post-synthesis
+    // correction of an earlier baseline-snapshot draft of this test): TWO
+    // distinct None reports for (key, incarnation 7) must land within this
+    // window — begin_probe()'s own unconditional pre-throw stage (:1601)
+    // PLUS resolve_probe()'s WorkerThrew-branch stage (:1759, the row this
+    // test actually exists to pin). A baseline snapshot taken after
+    // confirming only the first has two independent failure modes a count
+    // does not: the probe lane's injected throw resolves near-instantly, so
+    // a snapshot read a few instructions after the first None is confirmed
+    // can race past the second one too and produce a false RED on correct
+    // code; and the window must stay short enough that :1759's OWN 30s
+    // retry cadence (kAbsentRetryMs) cannot contribute a masking THIRD
+    // None via a fresh begin_probe() call if :1759 is genuinely missing —
+    // 3s is comfortably inside that margin. Falsifier: removing ONLY
+    // resolve_probe's `stage_coverage(w, SparkCoverage::None, established)`
+    // call at spark_service.cpp:1759 must drop this count to exactly 1
+    // within the same 3s window (mutation-verified on DGRHP).
+    CHECK(eventually(
+        [&] {
+            std::lock_guard lk(got.mu);
+            std::size_t none_count = 0;
+            for (const auto& e : got.established) {
+                if (std::get<0>(e) == key && std::get<1>(e) == 7 &&
+                    std::get<2>(e) == SparkCoverage::None)
+                    ++none_count;
+            }
+            return none_count >= 2;
+        },
+        3000ms));
     mech->stop();
 }
 

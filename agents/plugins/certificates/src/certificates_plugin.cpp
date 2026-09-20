@@ -14,9 +14,10 @@
  *   Windows — CryptoAPI (CertOpenStore, CertEnumCertificatesInStore, etc.)
  *   Linux   — PEM files in /etc/ssl/certs/ parsed in-process via libcrypto
  *             (certificates_x509.hpp) -- no subprocess.
- *   macOS   — System.keychain / SystemRootCertificates.keychain read
- *             in-process via SecItemCopyMatching (certificates_x509.hpp's
- *             DER parse backs the result); the login keychain still reads
+ *   macOS   — System.keychain / SystemRootCertificates.keychain read via a
+ *             bounded, in-process SecItem query in agent-core
+ *             (yuzu/agent/keychain_read.hpp; certificates_x509.hpp's DER
+ *             parse backs the result); the login keychain still reads
  *             via a `security find-certificate` subprocess routed through
  *             the per-user launchd/Aqua session, as a pre-split argv
  *             through the bounded runner (rung 2, #3406 -- see
@@ -32,8 +33,10 @@
 
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <format>
@@ -70,14 +73,12 @@
 // `yuzu::` lookup in this file -- e.g. `yuzu::TempFile` below would then
 // fail to resolve, since the nested `(anonymous namespace)::yuzu` has no
 // TempFile member.
+#include <sys/stat.h>
 #include <unistd.h>
+#include <yuzu/agent/keychain_read.hpp>     // yuzu::agent::read_keychain_bounded -- agent-core bounded SecItem seam (#3246, #2318a)
 #include <yuzu/agent/passwd_lookup.hpp>    // bounded passwd resolution -- replaces the shell's `~username` expansion (#3406)
 #include <macos_console_user.hpp>          // shared console-user + store/keychain mapping (#2277)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
-#if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
-#include <Security/Security.h>          // SecKeychainOpen/SecItemCopyMatching (WP-B rung-1 System/root read)
-#include <yuzu/agent/scoped_cfref.hpp>  // yuzu::agent::ScopedCFRef<T> (RAII for the CF objects above)
-#endif
 #endif
 
 // NOTE: the Linux leg deliberately includes NO subprocess header. WP-B removed
@@ -86,6 +87,24 @@
 // `#ifdef __linux__ #include <yuzu/agent/subprocess_runner.hpp>` block is gone
 // with the mechanism it served. Every remaining spawn site in this file is
 // inside the __APPLE__ region.
+
+#ifdef __linux__
+// certificates_linux_store.hpp declares `namespace yuzu::certificates_linux`
+// and pulls in confined_fs.hpp (`namespace yuzu::agent::confined_fs`) and
+// scoped_fd.hpp (`namespace yuzu::agent`) itself -- included here, at global
+// scope, before the anonymous namespace below opens, for the exact reason
+// the __APPLE__ block above this one documents in full: including it inside
+// `namespace { ... }` would nest `yuzu::agent`/`yuzu::certificates_linux`
+// under `(anonymous namespace)::yuzu`, shadowing the global `::yuzu`
+// namespace (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::`
+// lookup in this file, and would give `capture_identity`'s call sites below
+// a declaration in a different, TU-local namespace than the one agent-core
+// actually exports the symbol from (confirmed via a real compile: GCC 13
+// and Clang both reject or mis-resolve the resulting ambiguous/orphaned
+// `yuzu::agent::confined_fs::capture_identity` reference).
+#include "certificates_linux_store.hpp"
+using namespace yuzu::certificates_linux;
+#endif
 
 #if defined(__linux__) || defined(__APPLE__)
 // yuzu::certificates_x509 -- in-process libcrypto PEM/DER parsing (WP-B).
@@ -152,27 +171,6 @@ struct CertRecord {
     }
 };
 
-#if defined(__linux__) || defined(__APPLE__)
-// Adopt a certificates_x509::CertFields (the pure libcrypto parse result)
-// into this file's own CertRecord shape, setting `store` from the caller --
-// certificates_x509.hpp never knows which keychain/directory a certificate
-// came from, only the plugin's platform-specific read sites do. Shared by
-// the Linux PEM-file path (read_linux_cert_record) and the macOS SecItem
-// System/root path (list/details_cert_macos) so both adopt CertFields into
-// CertRecord identically.
-CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std::string store) {
-    CertRecord rec;
-    rec.store = std::move(store);
-    rec.subject = fields.subject;
-    rec.issuer = fields.issuer;
-    rec.not_before = fields.not_before;
-    rec.not_after = fields.not_after;
-    rec.serial = fields.serial;
-    rec.thumbprint = fields.thumbprint;
-    rec.key_usage = fields.key_usage;
-    return rec;
-}
-
 /// Report a partial certificate read through the ABI4 typed result seam
 /// (`yuzu_ctx_set_result_status`, sdk/include/yuzu/plugin.hpp) in addition to
 /// the operator-visible `not_available|<reason>` row the caller writes.
@@ -204,6 +202,10 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
 /// line. That is the one case where the agent log has to distinguish them --
 /// the result row reaches the operator, but an on-call engineer reading only
 /// the log needs to know a wedged Directory Service is the cause.
+///
+/// Defined outside every platform guard: the Windows CryptoAPI store-open
+/// path (enumerate_store) needs it too, so it can no longer live only under
+/// `#if defined(__linux__) || defined(__APPLE__)`.
 void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance,
                          std::string_view reason = {}) {
     if (reason.empty())
@@ -214,22 +216,25 @@ void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance,
                           provenance);
 }
 
-/**
- * Canonicalize a thumbprint to uppercase hex so every downstream comparison
- * against a parsed value (certificates_x509::extract_thumbprint always emits
- * uppercase) is a plain `==`. The `thumbprint` request parameter is
- * documented as case-insensitive (content/definitions/certificates.yaml) but
- * was compared as-is on both the macOS and Linux paths, so a lowercase
- * caller-supplied value silently failed to match. `s` is assumed already
- * hex-validated by is_valid_thumbprint(); this only changes case, never
- * rejects input. Shared (not macOS-only) because details_cert_linux and
- * delete_cert_linux need the identical fold.
- */
-std::string canonical_thumbprint(std::string_view s) {
-    std::string out{s};
-    for (auto& c : out)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return out;
+#if defined(__linux__) || defined(__APPLE__)
+// Adopt a certificates_x509::CertFields (the pure libcrypto parse result)
+// into this file's own CertRecord shape, setting `store` from the caller --
+// certificates_x509.hpp never knows which keychain/directory a certificate
+// came from, only the plugin's platform-specific read sites do. Shared by
+// the Linux PEM-file path (read_linux_cert_record) and the macOS SecItem
+// System/root path (list/details_cert_macos) so both adopt CertFields into
+// CertRecord identically.
+CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std::string store) {
+    CertRecord rec;
+    rec.store = std::move(store);
+    rec.subject = fields.subject;
+    rec.issuer = fields.issuer;
+    rec.not_before = fields.not_before;
+    rec.not_after = fields.not_after;
+    rec.serial = fields.serial;
+    rec.thumbprint = fields.thumbprint;
+    rec.key_usage = fields.key_usage;
+    return rec;
 }
 #endif
 
@@ -322,23 +327,50 @@ std::string get_key_usage(PCCERT_CONTEXT cert) {
     return result;
 }
 
-std::vector<CertRecord> enumerate_store(const char* store_name) {
+enum class StoreLocation { kLocalMachine, kCurrentUser };
+enum class StoreReadFailure { kNone, kOpen, kEnumeration };
+
+struct StoreEnumeration {
+    StoreReadFailure failure = StoreReadFailure::kNone;
+    StoreLocation location = StoreLocation::kLocalMachine;
     std::vector<CertRecord> records;
+};
+
+StoreEnumeration enumerate_store(const char* store_name) {
+    StoreEnumeration result;
 
     HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
                                       CERT_SYSTEM_STORE_LOCAL_MACHINE |
                                           CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
                                       store_name);
 
-    if (!hStore) {
-        // Fall back to current user store
+    if (!hStore &&
+        yuzu::certificates_macos::win_store_fallback_allowed(
+            yuzu::certificates_macos::WinStoreAction::kRead)) {
+        // Disclosed fallback (#4377): a READ may consult CurrentUser when
+        // LocalMachine could not be opened -- callers are told which
+        // location actually served the data via `result.location`, and mark
+        // the result CONSTRAINED/PARTIAL with cryptoapi:store-fallback
+        // provenance rather than silently presenting CurrentUser rows as if
+        // they came from LocalMachine.
         hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
                                CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG |
                                    CERT_STORE_READONLY_FLAG,
                                store_name);
+        if (hStore)
+            result.location = StoreLocation::kCurrentUser;
     }
-    if (!hStore)
-        return records;
+    if (!hStore) {
+        // Both opens failed (or fallback is not allowed for this action) --
+        // an honest typed failure, never a silent empty vector
+        // indistinguishable from "store opened, found nothing"
+        // (consistency-auditor Gate-4 BLOCKING finding, same shape as the
+        // macOS/Linux honesty fixes elsewhere in this file).
+        spdlog::warn("certificates: CryptoAPI store '{}' could not be opened (GetLastError={})",
+                    store_name, GetLastError());
+        result.failure = StoreReadFailure::kOpen;
+        return result;
+    }
 
     PCCERT_CONTEXT cert = nullptr;
     while ((cert = CertEnumCertificatesInStore(hStore, cert)) != nullptr) {
@@ -351,11 +383,30 @@ std::vector<CertRecord> enumerate_store(const char* store_name) {
         rec.serial = get_cert_serial(cert);
         rec.store = store_name;
         rec.key_usage = get_key_usage(cert);
-        records.push_back(std::move(rec));
+        result.records.push_back(std::move(rec));
+    }
+    // CertEnumCertificatesInStore returns NULL both at genuine end-of-store
+    // (CRYPT_E_NOT_FOUND, per Microsoft Learn) and on a real mid-enumeration
+    // error -- treating every NULL as "fully scanned" would let a transient
+    // CryptoAPI failure look like a clean, complete, possibly-empty result
+    // (adversarial-review CDX-003). Fold anything else into a typed
+    // kEnumeration failure, discarding the partial records the same way the
+    // open-failure path above never invents any: this function's callers
+    // already treat a non-kNone failure as "cannot trust this store's
+    // results, mark PARTIAL, never report a definitive not_found".
+    DWORD enum_err = GetLastError();
+    if (enum_err != CRYPT_E_NOT_FOUND) {
+        spdlog::warn("certificates: CryptoAPI enumeration of store '{}' ended abnormally "
+                    "(GetLastError={}), scan incomplete",
+                    store_name, enum_err);
+        CertCloseStore(hStore, 0);
+        result.failure = StoreReadFailure::kEnumeration;
+        result.records.clear();
+        return result;
     }
 
     CertCloseStore(hStore, 0);
-    return records;
+    return result;
 }
 
 void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, int expiring_days) {
@@ -367,8 +418,38 @@ void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, in
         if (store_filter != "all" && store_filter != store_name)
             continue;
 
-        auto records = enumerate_store(store_name);
-        for (const auto& rec : records) {
+        auto enumeration = enumerate_store(store_name);
+        if (enumeration.failure == StoreReadFailure::kOpen) {
+            // Every open attempt for this store failed -- say so
+            // (operator-visible row + ABI4 typed status) and keep scanning
+            // the remaining stores rather than silently reporting them as
+            // empty (consistency-auditor Gate-4 BLOCKING finding).
+            auto reason = std::format("not_available|{} store could not be opened", store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-open", reason);
+            continue;
+        }
+        if (enumeration.failure == StoreReadFailure::kEnumeration) {
+            auto reason =
+                std::format("not_available|{} store enumeration incomplete", store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-enum", reason);
+            continue;
+        }
+        if (enumeration.location == StoreLocation::kCurrentUser) {
+            // Disclosed fallback (#4377): rows below actually came from
+            // CurrentUser, not the LocalMachine hive this store name
+            // normally means -- say so before the rows themselves, and mark
+            // the result CONSTRAINED/PARTIAL rather than presenting them as
+            // an ordinary LocalMachine read.
+            auto reason = std::format(
+                "not_available|{} store (LocalMachine) could not be opened; rows read from "
+                "CurrentUser",
+                store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-fallback", reason);
+        }
+        for (const auto& rec : enumeration.records) {
             if (expires_within_days(rec.not_after, expiring_days)) {
                 ctx.write_output(rec.to_row());
             }
@@ -381,38 +462,169 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
 
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
+    auto needle = canonical_thumbprint(thumbprint);
+    // Tracks whether every selected store was actually opened AND fully
+    // enumerated AND (if fallback-served) that fallback was disclosed. Any
+    // one of those failing leaves this loop free to keep scanning the rest,
+    // but the eventual "not found" verdict must not be reported as
+    // definitive if any store was skipped, incompletely scanned, or served
+    // from a hive its name doesn't normally mean -- mirrors
+    // details_cert_linux's scan_complete flag.
+    bool scan_complete = true;
+    std::string unopened;
+    std::string incomplete;
+    std::string fallback;
+    auto append_store = [](std::string& list, const char* store_name) {
+        if (!list.empty())
+            list += ", ";
+        list += store_name;
+    };
     for (const auto* store_name : kStores) {
-        auto records = enumerate_store(store_name);
-        for (const auto& rec : records) {
-            if (rec.thumbprint == thumbprint) {
+        auto enumeration = enumerate_store(store_name);
+        if (enumeration.failure == StoreReadFailure::kOpen) {
+            scan_complete = false;
+            append_store(unopened, store_name);
+            mark_result_partial(ctx, "cryptoapi:store-open");
+            continue;
+        }
+        if (enumeration.failure == StoreReadFailure::kEnumeration) {
+            scan_complete = false;
+            append_store(incomplete, store_name);
+            mark_result_partial(ctx, "cryptoapi:store-enum");
+            continue;
+        }
+        // Snapshot every per-store degradation accumulated from EARLIER
+        // iterations, before this store's own (possible) append below -- if
+        // a match turns up in this store, any name in here never got its
+        // row-level disclosure because the loop moved on without a return
+        // (the "scan incomplete" summary below is skipped entirely on an
+        // early match-and-return, silently dropping it; CDX-P1-001 fixed
+        // this for the fallback case only -- governance Gate 2 found the
+        // identical gap for unopened/incomplete and it's fixed here too).
+        std::string prior_unopened = unopened;
+        std::string prior_incomplete = incomplete;
+        std::string prior_fallback = fallback;
+        bool is_fallback = enumeration.location == StoreLocation::kCurrentUser;
+        if (is_fallback) {
+            append_store(fallback, store_name);
+            mark_result_partial(ctx, "cryptoapi:store-fallback");
+        }
+        for (const auto& rec : enumeration.records) {
+            if (rec.thumbprint == needle) {
+                if (!prior_unopened.empty()) {
+                    ctx.write_output(
+                        std::format("not_available|{} store(s) could not be opened",
+                                    prior_unopened));
+                }
+                if (!prior_incomplete.empty()) {
+                    ctx.write_output(
+                        std::format("not_available|{} store(s) enumeration incomplete",
+                                    prior_incomplete));
+                }
+                if (!prior_fallback.empty()) {
+                    // An earlier store in this scan fell back to CurrentUser
+                    // and didn't match -- its own row-level disclosure was
+                    // never written because the loop moved on without a
+                    // return. Disclose it now, alongside (not instead of)
+                    // the current store's own disclosure below, or the scan
+                    // silently omits a fallback #4377 requires surfaced.
+                    ctx.write_output(std::format(
+                        "not_available|{} store(s) (LocalMachine) could not be opened; rows read "
+                        "from CurrentUser",
+                        prior_fallback));
+                }
+                if (is_fallback) {
+                    // Disclosed fallback (#4377), same wording and ordering
+                    // as list_certs_win's matching branch: the row about to
+                    // be written came from CurrentUser, not the LocalMachine
+                    // hive this store name normally means -- say so
+                    // immediately before it. README.md and this issue's own
+                    // changelog fragment promise this row for both list and
+                    // details; returning the match without it (as this
+                    // branch previously did) left a caller with no
+                    // output-level signal, only the
+                    // CONSTRAINED/PARTIAL/cryptoapi:store-fallback status
+                    // metadata. Scoped to the matched store only -- the
+                    // no-match path below already has its own combined
+                    // "N store(s) read from CurrentUser" summary line, and
+                    // duplicating a per-store row there would be redundant.
+                    ctx.write_output(std::format(
+                        "not_available|{} store (LocalMachine) could not be opened; rows read "
+                        "from CurrentUser",
+                        store_name));
+                }
                 ctx.write_output(rec.to_row());
                 return;
             }
         }
     }
-    ctx.write_output("status|not_found");
+    if (scan_complete && fallback.empty()) {
+        ctx.write_output("status|not_found");
+    } else {
+        // At least one store was unopened, incompletely enumerated, or
+        // fallback-served, so "not found" was never established -- mirrors
+        // details_cert_linux's "scan incomplete" convention.
+        std::vector<std::string> parts;
+        if (!unopened.empty())
+            parts.push_back(std::format("{} store(s) could not be opened", unopened));
+        if (!incomplete.empty())
+            parts.push_back(std::format("{} store(s) enumeration incomplete", incomplete));
+        if (!fallback.empty())
+            parts.push_back(std::format(
+                "{} store(s) read from CurrentUser (LocalMachine could not be opened)",
+                fallback));
+        std::string joined;
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0)
+                joined += "; ";
+            joined += parts[i];
+        }
+        ctx.write_output(std::format("not_available|{}; scan incomplete", joined));
+    }
 }
 
-void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
+bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
                      std::string_view store_name) {
-    HCERTSTORE hStore =
-        CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                      std::string{store_name}.c_str());
+    // store_name is caller-supplied free text (execute() passes
+    // params.get("store", "MY") straight through, unvalidated) -- escape it
+    // (K-7/BR-07) so a hostile value containing '|' or embedded CR/LF can
+    // never inject an extra pipe-delimited column or newline-delimited row
+    // into this output, same rule the cert-derived fields already follow in
+    // CertRecord::to_row().
+    auto safe_store = yuzu::util::safe_output_field(store_name);
+
+    // CERT_STORE_OPEN_EXISTING_FLAG: without it, opening the store silently
+    // CREATES a missing store and this function then reports the
+    // certificate "not_found" in a store that was never actually opened --
+    // an unopenable store must be reported honestly, not masked as a
+    // definitive negative (consistency-auditor Gate-4 BLOCKING finding).
+    //
+    // LOCAL_MACHINE only, no CURRENT_USER retry: unlike the read path
+    // (enumerate_store), a destructive delete must never target a store the
+    // caller did not name (#4377). If the caller-named store can't be
+    // opened under LocalMachine, this fails closed and reports the failure
+    // rather than silently falling back to a different hive and deleting
+    // from a store the caller never asked about.
+    HCERTSTORE hStore = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_A, 0, 0,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG,
+        std::string{store_name}.c_str());
 
     if (!hStore) {
-        hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0, CERT_SYSTEM_STORE_CURRENT_USER,
-                               std::string{store_name}.c_str());
-    }
-    if (!hStore) {
-        ctx.write_output("status|not_found");
-        return;
+        auto reason =
+            std::format("error|{} store could not be opened; nothing removed", safe_store);
+        ctx.write_output(reason);
+        mark_result_partial(ctx, "cryptoapi:store-open", reason);
+        return false;
     }
 
+    auto needle = canonical_thumbprint(thumbprint);
     PCCERT_CONTEXT cert = nullptr;
     bool found = false;
+    bool ok = true;
     while ((cert = CertEnumCertificatesInStore(hStore, cert)) != nullptr) {
         auto fp = get_cert_thumbprint(cert);
-        if (fp == thumbprint) {
+        if (fp == needle) {
             // Duplicate the context because CertDeleteCertificateFromStore
             // frees the context and invalidates the enumeration
             PCCERT_CONTEXT dup = CertDuplicateCertificateContext(cert);
@@ -420,6 +632,7 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 ctx.write_output("status|deleted");
             } else {
                 ctx.write_output("status|delete_failed");
+                ok = false;
             }
             found = true;
             break;
@@ -427,10 +640,28 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (!found) {
+        // CertEnumCertificatesInStore returns NULL both at genuine
+        // end-of-store (CRYPT_E_NOT_FOUND) and on a real mid-enumeration
+        // error (adversarial-review CDX-003, same fix as enumerate_store
+        // above) -- a "not found" verdict on a destructive delete must not
+        // be reported unless the scan genuinely completed.
+        DWORD enum_err = GetLastError();
+        if (enum_err != CRYPT_E_NOT_FOUND) {
+            auto reason = std::format(
+                "error|{} store enumeration ended abnormally; nothing removed", safe_store);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-enum", reason);
+            CertCloseStore(hStore, 0);
+            return false;
+        }
+        // A definitive negative: the store opened and was fully scanned,
+        // so "not found" is a successful idempotent no-op, matching
+        // delete_cert_macos's pre-delete presence check.
         ctx.write_output("status|not_found");
     }
 
     CertCloseStore(hStore, 0);
+    return ok;
 }
 
 #endif // _WIN32
@@ -439,58 +670,62 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
 #ifdef __linux__
 
+// Every Linux-only include this file needs (dirent.h/fcntl.h/sys/stat.h/
+// unistd.h/climits, confined_fs.hpp, scoped_fd.hpp) is at global scope
+// above, before the anonymous namespace opens -- see the comment there for
+// why confined_fs.hpp/scoped_fd.hpp specifically cannot live inside it.
+
 // parity: `openssl x509 -in <file>` -- the subprocess call this file used to
 // shell out to for every field, replaced below by
 // yuzu::certificates_x509::parse_pem_certs -- reads ONLY the first PEM block
 // in a file. parse_pem_certs can return every certificate a multi-cert
 // bundle contains, so BOTH callers that need "the certificate this file
 // represents" (read_linux_cert_record below and delete_cert_linux further
-// down) go through this ONE helper and consume only certs.front() -- never
-// anything past index 0. Widening either caller to consider a 2nd-or-later
-// certificate would make MANY MORE thumbprints match a bundle file, and since
-// `delete` removes the whole FILE (`std::filesystem::remove`, the only
-// mechanism available for a PEM-directory store), every extra match is
-// another way to reach a bulk trust-anchor removal. Note carefully what this
-// guard does and does NOT buy: matching only certs.front() is a strict
-// REDUCTION in the number of requests that can trigger a bundle-wide delete,
-// and it is byte-parity with the replaced subprocess -- but it does not make
-// the delete granular. A request naming a bundle's FIRST certificate still
-// removes the entire bundle, exactly as the pre-migration code did. That
-// pre-existing coarseness is out of WP-B's scope (a granular delete means
-// rewriting the file, a different and mutating design); do not read this
-// comment as a claim that bundle files are safe from bulk removal.
-// Returns std::nullopt for a file that cannot be
-// opened OR that yields zero parseable certificates (empty, garbage, a
-// truncated PEM block) -- both are "no certificate available from this
-// path" as far as every caller here is concerned.
-std::optional<yuzu::certificates_x509::CertFields> first_cert_of_file(
-    const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
-        return std::nullopt;
-    std::ostringstream contents;
-    contents << in.rdbuf();
-    auto certs = yuzu::certificates_x509::parse_pem_certs(contents.str());
-    if (certs.empty())
-        return std::nullopt;
-    return std::move(certs.front());
-}
+// down) go through this ONE helper (read_cert_entry) and consume only
+// certs.front() -- never anything past index 0. Widening either caller to
+// consider a 2nd-or-later certificate would make MANY MORE thumbprints
+// match a bundle file, and since `delete` removes the whole ENTRY
+// (`::unlinkat`, the only mechanism available for a PEM-directory store),
+// every extra match is another way to reach a bulk trust-anchor removal.
+// Note carefully what this guard does and does NOT buy: matching only
+// certs.front() is a strict REDUCTION in the number of requests that can
+// trigger a bundle-wide delete, and it is byte-parity with the replaced
+// subprocess -- but it does not make the delete granular. A request naming
+// a bundle's FIRST certificate still removes the entire bundle, exactly as
+// the pre-migration code did. That pre-existing coarseness is out of WP-B's
+// scope (a granular delete means rewriting the file, a different and
+// mutating design); do not read this comment as a claim that bundle files
+// are safe from bulk removal.
 
-CertRecord read_linux_cert_record(yuzu::CommandContext& ctx,
-                                  const std::filesystem::path& pem_path,
+// CertDir/open_cert_dir/ScopedDir/for_each_cert_entry/CertEntryRead/
+// read_cert_entry/StoreSyscalls/DeleteScan/delete_matching_cert now live in
+// certificates_linux_store.hpp (yuzu::certificates_linux), pulled into scope
+// above via `using namespace yuzu::certificates_linux;` -- moved there so
+// tests/unit/test_certificates_linux_store.cpp can drive a real delete
+// against a TempDir on macOS and Linux alike.
+
+CertRecord read_linux_cert_record(yuzu::CommandContext& ctx, int dirfd, const std::string& name,
                                   const std::string& store_name) {
-    auto cert = first_cert_of_file(pem_path);
-    if (!cert) {
+    auto read = read_cert_entry(dirfd, name);
+    if (read.state == CertEntryOpen::kVanished) {
+        // Entry vanished mid-scan, or turned out not to be a regular file/
+        // target -- callers skip this record silently, exactly like a
+        // concurrently-removed file.
+        CertRecord rec;
+        rec.thumbprint = "(vanished)";
+        return rec;
+    }
+    if (read.state == CertEntryOpen::kUnreadable || !read.cert) {
         // The deleted is_safe_path() rejected a path containing shell
         // metacharacters before this file ever shelled out to
-        // `openssl x509 -in <path>` -- native std::ifstream I/O never
-        // interpolates the path into a shell command, so that specific risk
+        // `openssl x509 -in <path>` -- native openat/read I/O never
+        // interpolates the name into a shell command, so that specific risk
         // is gone, and with it the only condition "(unsafe path)" ever
         // described. What reaches this branch now is a DIFFERENT condition:
-        // a file this code genuinely cannot turn into a certificate record
-        // (missing, permission denied, empty, garbage, or a truncated PEM
-        // block). Reporting that as "(unsafe path)" would name a cause that
-        // cannot occur, so the sentinel says what actually happened.
+        // an entry this code genuinely cannot turn into a certificate record
+        // (permission denied, empty, garbage, or a truncated PEM block).
+        // Reporting that as "(unsafe path)" would name a cause that cannot
+        // occur, so the sentinel says what actually happened.
         //
         // This is a deliberate, narrow divergence from the pre-migration
         // output, and NOT the one the deleted code's own comment claimed:
@@ -516,42 +751,52 @@ CertRecord read_linux_cert_record(yuzu::CommandContext& ctx,
         rec.thumbprint = "(skipped)";
         return rec;
     }
-    return to_cert_record(*cert, store_name);
+    return to_cert_record(*read.cert, store_name);
 }
 
 void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter*/,
                       int expiring_days) {
-    const std::filesystem::path cert_dir{"/etc/ssl/certs"};
-
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    std::error_code ec;
-    if (!std::filesystem::exists(cert_dir, ec)) {
+    auto dir = open_cert_dir(kDefaultCertDir);
+    if (dir.state == CertDirOpen::kAbsent) {
+        return;
+    }
+    if (dir.state == CertDirOpen::kUnreadable) {
+        ctx.write_output("not_available|/etc/ssl/certs could not be opened");
+        mark_result_partial(ctx, "posix:cert-dir", std::strerror(dir.err));
         return;
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(cert_dir, ec)) {
-        if (!entry.is_regular_file(ec))
-            continue;
-        auto ext = entry.path().extension().string();
-        if (ext != ".pem" && ext != ".crt")
-            continue;
-
-        auto rec = read_linux_cert_record(ctx, entry.path(), "/etc/ssl/certs");
-        if (expires_within_days(rec.not_after, expiring_days)) {
-            ctx.write_output(rec.to_row());
-        }
+    int enum_err = 0;
+    bool dir_complete = for_each_cert_entry(
+        dir.fd.get(),
+        [&](const std::string& name) {
+            auto rec = read_linux_cert_record(ctx, dir.fd.get(), name, "/etc/ssl/certs");
+            if (rec.thumbprint == "(vanished)")
+                return;
+            if (expires_within_days(rec.not_after, expiring_days)) {
+                ctx.write_output(rec.to_row());
+            }
+        },
+        &enum_err);
+    if (!dir_complete) {
+        ctx.write_output("not_available|/etc/ssl/certs enumeration incomplete");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
     }
 }
 
 void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) {
-    const std::filesystem::path cert_dir{"/etc/ssl/certs"};
-
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    std::error_code ec;
-    if (!std::filesystem::exists(cert_dir, ec)) {
+    auto dir = open_cert_dir(kDefaultCertDir);
+    if (dir.state == CertDirOpen::kAbsent) {
         ctx.write_output("status|not_found");
+        return;
+    }
+    if (dir.state == CertDirOpen::kUnreadable) {
+        ctx.write_output("not_available|/etc/ssl/certs could not be opened");
+        mark_result_partial(ctx, "posix:cert-dir", std::strerror(dir.err));
         return;
     }
 
@@ -560,31 +805,58 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
     // this compared as-is, unlike the macOS path fixed for the same gap
     // earlier in this same PR).
     auto needle = canonical_thumbprint(thumbprint);
-    // Tracks whether every candidate file in this directory was actually
-    // readable. A file read_linux_cert_record couldn't parse reports its
-    // degradation via mark_result_partial (the ABI4 result-status channel)
-    // but still leaves this LOCAL loop free to keep scanning -- so without
-    // this flag, an unreadable file that happened to be the real target
-    // would fall all the way through to "status|not_found" below, an
-    // incomplete scan silently presenting as a definitive negative
-    // (consistency-auditor Gate-4 BLOCKING finding).
+    bool found = false;
+    // Tracks whether every candidate ENTRY was actually readable -- distinct
+    // from `dir_complete` below (which tracks whether the readdir(3) scan
+    // itself ran to completion). A file read_linux_cert_record couldn't
+    // parse reports its own degradation via mark_result_partial (the ABI4
+    // result-status channel) but still leaves this loop free to keep
+    // scanning -- so without this flag, an unreadable entry that happened to
+    // be the real target would fall all the way through to
+    // "status|not_found" below, an incomplete scan silently presenting as a
+    // definitive negative (consistency-auditor Gate-4 BLOCKING finding).
     bool scan_complete = true;
-    for (const auto& entry : std::filesystem::directory_iterator(cert_dir, ec)) {
-        if (!entry.is_regular_file(ec))
-            continue;
-        auto ext = entry.path().extension().string();
-        if (ext != ".pem" && ext != ".crt")
-            continue;
-
-        auto rec = read_linux_cert_record(ctx, entry.path(), "/etc/ssl/certs");
-        if (rec.thumbprint == "(skipped)") {
-            scan_complete = false;
-            continue;
-        }
-        if (canonical_thumbprint(rec.thumbprint) == needle) {
-            ctx.write_output(rec.to_row());
-            return;
-        }
+    int enum_err = 0;
+    bool dir_complete = for_each_cert_entry(
+        dir.fd.get(),
+        [&](const std::string& name) {
+            if (found)
+                return;
+            auto rec = read_linux_cert_record(ctx, dir.fd.get(), name, "/etc/ssl/certs");
+            if (rec.thumbprint == "(vanished)")
+                return;
+            if (rec.thumbprint == "(skipped)") {
+                scan_complete = false;
+                return;
+            }
+            if (canonical_thumbprint(rec.thumbprint) == needle) {
+                ctx.write_output(rec.to_row());
+                found = true;
+            }
+        },
+        &enum_err);
+    // A match already fully answers the query: whatever happened to the
+    // readdir(3) scan on entries past the match (including a mid-scan
+    // failure, dir_complete=false) cannot retroactively make this result
+    // wrong, so the row already written above stands unconditionally. But
+    // an incomplete scan is still worth surfacing -- the caller asked about
+    // ONE thumbprint and got a real answer, yet other entries in the store
+    // went unexamined, so mark the result PARTIAL without touching the row
+    // already written (reviewer A3-02: silently dropping this would make a
+    // real enumeration failure invisible whenever it happened to fall after
+    // the match).
+    if (found) {
+        if (!dir_complete)
+            mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
+        return;
+    }
+    if (!dir_complete) {
+        // Mirrors the directory-open failure row: an errno-bearing readdir
+        // failure mid-scan is exactly as inconclusive as never having opened
+        // the directory at all.
+        ctx.write_output("not_available|/etc/ssl/certs enumeration incomplete");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
+        return;
     }
     if (scan_complete) {
         ctx.write_output("status|not_found");
@@ -596,57 +868,107 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
     }
 }
 
-void delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
+/// Deletes the certificate matching `thumbprint` from /etc/ssl/certs. Returns
+/// true iff the request reached a definitive outcome (deleted, or a proven
+/// not_found); false on every failure path, so execute() can map "nothing
+/// was removed" to a non-zero rc.
+///
+/// A symlinked entry: the LINK is removed (untrusted), never the target --
+/// unlinkat(dirfd, name, 0) always acts on the entry's own name, and this
+/// code never opens or resolves the target for anything other than parsing.
+/// The identity that must match binds the link's own inode, the target
+/// TEXT, and the target's resolved INODE (capture_identity of the parse fd),
+/// so a link retargeted to a different path, or rename-over-replaced at the
+/// SAME path text, is refused by classify_delete_recheck (kChanged). An
+/// in-place rewrite of the same target inode (open+truncate+write, no
+/// rename) is NOT detectable this way -- the decision is identity-bound, not
+/// content-bound, and that is a deliberate, documented limit, not a gap.
+///
+/// The residual fstatat-then-unlinkat window (POSIX has no unlink-by-fd) is
+/// narrowed to the identity-verified microseconds between the two calls, but
+/// not closed. confined_fs_posix.cpp:348-366 documents a STRONGER mitigation
+/// for its own (different) delete-with-byte-cap problem -- capture-then-
+/// measure: renameat the entry to an unpredictable name, then measure and
+/// unlink THAT name -- and that comment is explicit that even THAT only
+/// narrows the window further, it does not close it either. This function
+/// deliberately does NOT adopt that rename step: /etc/ssl/certs is the
+/// host's live trust store, and renaming an entry there before unlinking it
+/// has its own hazards a staging/quarantine directory doesn't -- a renamed
+/// entry keeping its .pem/.crt suffix would still be trusted under the new
+/// name, one without the suffix would be silently untrusted before this
+/// function ever verifies it, a crash between rename and unlink would leave
+/// renamed residue sitting in a security-relevant directory, and a rename-
+/// back on a failed recheck is itself just as racy as the original problem.
+/// fstatat-then-unlinkat with full identity verification is the WEAKER but
+/// side-effect-free sequence, and is chosen here for exactly that reason.
+bool delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view /*store*/) {
-    const std::filesystem::path cert_dir{"/etc/ssl/certs"};
-
-    std::error_code ec;
-    if (!std::filesystem::exists(cert_dir, ec)) {
+    auto dir = open_cert_dir(kDefaultCertDir);
+    if (dir.state == CertDirOpen::kAbsent) {
         ctx.write_output("status|not_found");
-        return;
+        return true;
+    }
+    if (dir.state == CertDirOpen::kUnreadable) {
+        ctx.write_output("error|/etc/ssl/certs could not be opened; nothing removed");
+        mark_result_partial(ctx, "posix:cert-dir", std::strerror(dir.err));
+        return false;
     }
 
-    auto needle = canonical_thumbprint(thumbprint);
-    // See details_cert_linux's identical flag -- a delete request must never
-    // report "not_found" (which idempotent "ensure-absent" remediation
-    // depends on being a definitive negative) when a candidate file couldn't
-    // actually be inspected.
-    bool scan_complete = true;
-    for (const auto& entry : std::filesystem::directory_iterator(cert_dir, ec)) {
-        if (!entry.is_regular_file(ec))
-            continue;
-        auto ext = entry.path().extension().string();
-        if (ext != ".pem" && ext != ".crt")
-            continue;
-
-        // parity: only the file's FIRST certificate is a delete target --
-        // see first_cert_of_file's own comment.
-        auto cert = first_cert_of_file(entry.path());
-        if (!cert) {
-            // Same degraded-read signal read_linux_cert_record gives list/
-            // details -- an unreadable file here means this scan cannot
-            // prove the target is absent (consistency-auditor Gate-4
-            // BLOCKING finding).
-            mark_result_partial(ctx, "libcrypto:unreadable-file");
-            scan_complete = false;
-            continue;
-        }
-        if (canonical_thumbprint(cert->thumbprint) == needle) {
-            if (std::filesystem::remove(entry.path(), ec)) {
-                ctx.write_output("status|deleted");
-            } else {
-                ctx.write_output("status|delete_failed");
-            }
-            return;
-        }
+    auto scan = delete_matching_cert(dir.fd.get(), canonical_thumbprint(thumbprint));
+    if (scan.unreadable_entries > 0) {
+        // Same degraded-read signal read_linux_cert_record gives list/
+        // details -- an unreadable entry here means this scan cannot prove
+        // the target is absent/complete (consistency-auditor Gate-4
+        // BLOCKING finding).
+        mark_result_partial(ctx, "libcrypto:unreadable-file");
     }
-    if (scan_complete) {
-        ctx.write_output("status|not_found");
-    } else {
+
+    bool ok = true;
+    switch (scan.kind) {
+    case DeleteScanKind::kDeleted:
+        ctx.write_output("status|deleted");
+        break;
+    case DeleteScanKind::kUnlinkFailed:
+        spdlog::warn("certificates: unlinkat('{}') failed (errno={}): {}", scan.entry,
+                    scan.unlink_err, std::strerror(scan.unlink_err));
+        ctx.write_output("status|delete_failed");
+        ok = false;
+        break;
+    case DeleteScanKind::kChanged:
+        ctx.write_output("error|certificate file changed during delete; nothing removed");
+        mark_result_partial(ctx, "posix:delete-recheck",
+                            "identity at unlink time differs from identity at match time");
+        ok = false;
+        break;
+    case DeleteScanKind::kUnverifiable:
+        ctx.write_output(
+            "error|certificate file could not be re-verified before delete; nothing removed");
+        mark_result_partial(ctx, "posix:delete-recheck",
+                            "identity could not be re-derived immediately before unlink");
+        ok = false;
+        break;
+    case DeleteScanKind::kEnumerationFailed:
+        ctx.write_output("error|/etc/ssl/certs enumeration incomplete; nothing removed");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(scan.enum_err));
+        return false;
+    case DeleteScanKind::kUnreadableEntries:
         ctx.write_output(
             "error|unreadable file(s) in /etc/ssl/certs prevented a complete scan; "
             "cannot confirm the certificate is absent");
+        return false;
+    case DeleteScanKind::kNotFound:
+        ctx.write_output("status|not_found");
+        return true;
     }
+
+    // A match already decided the row/rc above -- a readdir failure on
+    // entries scanned AFTER that match cannot undo a mutation (or a
+    // definitive non-mutation) that already happened, so this is surfaced
+    // as PARTIAL rather than reversing `ok` (reviewer A3-02: this must be a
+    // real signal, not a reason to reverse the rc).
+    if (scan.enumeration_failed)
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(scan.enum_err));
+    return ok;
 }
 
 #endif // __linux__
@@ -697,6 +1019,16 @@ constexpr std::chrono::milliseconds kCertParseDeadline{5000};     // one openssl
 // WAN-latent AD lookup is the case that would justify raising THIS one.
 constexpr std::chrono::milliseconds kPasswdLookupDeadline{5000};
 constexpr std::chrono::milliseconds kKeychainReadDeadline{15000}; // one `security find-certificate` keychain read (incl. the login-keychain launchctl/sudo hop)
+// One bounded, in-process SecItem keychain read of System.keychain or
+// SystemRootCertificates.keychain (agents/core/include/yuzu/agent/
+// keychain_read.hpp's read_keychain_bounded). Its own constant rather than
+// reusing kKeychainReadDeadline: that one bounds a CHILD PROCESS the runner
+// can SIGKILL at the deadline, whereas this bounds a detached in-process
+// thread against a wedged securityd that can only be ABANDONED, never
+// killed -- a wall-clock-equal but mechanically different bound, and the
+// two must be able to move independently. Costs a process-global
+// bounded_call slot (see keychain_read.hpp's own comment on the ceiling).
+constexpr std::chrono::milliseconds kSecItemReadDeadline{15000};
 constexpr std::chrono::seconds kCertActionBudget{60};             // whole list/details/delete-verify action, across every keychain it reads
 constexpr std::size_t kMaxCertsPerKeychain = 2000;                // per-keychain parsed-certificate cap
 
@@ -722,217 +1054,135 @@ struct CheckedCommandResult {
     // -1 when the child could not be spawned or did not exit normally
     // (signaled, killed at the deadline/cancel).
     int exit_code = -1;
+    // Human-readable reason the capture was not usable (is_usable_capture's
+    // negative case, via capture_failure_detail) -- empty iff `ok`. Lets a
+    // caller fold the runner's own diagnosis into its `not_available|<...>`
+    // row instead of a bare "read failed" that drops the "why".
+    std::string failure_detail;
 };
+
+/// TerminationReason -> the stable text name capture_failure_detail and the
+/// WARN log line below key on (subprocess_runner.hpp:61-72). A plain switch
+/// rather than reusing any enum-to-string elsewhere in the tree, since this
+/// name set (exited/signaled/deadline/cancelled/line_limit/spawn_error) is
+/// TerminationReason's own and nothing else's.
+const char* termination_reason_name(yuzu::agent::TerminationReason reason) {
+    switch (reason) {
+    case yuzu::agent::TerminationReason::exited:
+        return "exited";
+    case yuzu::agent::TerminationReason::signaled:
+        return "signaled";
+    case yuzu::agent::TerminationReason::deadline:
+        return "deadline";
+    case yuzu::agent::TerminationReason::cancelled:
+        return "cancelled";
+    case yuzu::agent::TerminationReason::line_limit:
+        return "line_limit";
+    case yuzu::agent::TerminationReason::spawn_error:
+        return "spawn_error";
+    }
+    return "unknown"; // unreachable -- exhaustive switch above
+}
 
 CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
                                          const yuzu::agent::SubprocessOptions& opts,
                                          std::string_view operation) {
     auto result = yuzu::agent::run_bounded_subprocess(argv, opts);
-    // SRE S1 observability: a deadline kill or capture-cap truncation still
-    // produces an honest sentinel row + rc downstream, but that is only
-    // visible by parsing the emitted output -- a degraded keychain read/parse
-    // would otherwise be silent in the agent log. Surface it, matching
-    // event_logs_plugin.cpp's `log show` WARN pattern.
-    if (result.timed_out || result.output_truncated) {
-        spdlog::warn("certificates: {} {} (timed_out={}, output_truncated={})", operation,
-                     result.timed_out ? "timed out" : "output truncated", result.timed_out,
-                     result.output_truncated);
-    }
     CheckedCommandResult out;
     out.output = std::move(result.output);
     if (result.tool_ran)
         out.exit_code = result.exit_code;
     out.ok = is_usable_capture(result.tool_ran, result.timed_out, result.output_truncated,
                                result.exit_code);
+    // SRE S1 observability: ANY non-ok result -- a deadline kill, capture-cap
+    // truncation, a nonzero exit, a spawn failure, ... -- still produces an
+    // honest sentinel row + rc downstream, but that is only visible by
+    // parsing the emitted output. Surface it, matching
+    // event_logs_plugin.cpp's `log show` WARN pattern; termination_reason
+    // (ADR-3002) is what lets an on-call engineer reading only the log tell
+    // "killed at deadline" (escalate) from "spawn error" (never retry) from
+    // a plain nonzero exit.
+    if (!out.ok) {
+        const char* name = termination_reason_name(result.termination_reason);
+        out.failure_detail = capture_failure_detail(
+            result.tool_ran, result.timed_out, result.output_truncated, result.exit_code, name);
+        spdlog::warn("certificates: {} failed: {} (termination_reason={}, exit_code={})",
+                     operation, out.failure_detail, name, result.exit_code);
+    }
     return out;
 }
 
-// ── System/root keychain read: rung-1 SecItem (WP-B) ────────────────────────
+// Test-only fault-injection seam (#4374): lets a test prove a login-keychain
+// read spawn site was REACHED or SUPPRESSED without spawning anything and
+// without reading the host's real login keychain. Read per call (never
+// cached) so one test process can point successive dispatches at different
+// fixtures. When YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE is set
+// and non-empty, returns a failed CheckedCommandResult carrying the env
+// value (truncated to 200 bytes) as failure_detail; otherwise nullopt, and
+// the caller spawns exactly as today.
+std::optional<CheckedCommandResult> injected_login_keychain_read_failure() {
+    const char* override_detail =
+        std::getenv("YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE");
+    if (override_detail == nullptr || override_detail[0] == '\0')
+        return std::nullopt;
+    CheckedCommandResult injected;
+    injected.ok = false;
+    injected.failure_detail = std::string(override_detail).substr(0, 200);
+    return injected;
+}
+
+// ── System/root keychain read: bounded SecItem via agent-core (#3246, #2318a) ──
 //
 // System.keychain and SystemRootCertificates.keychain ONLY -- the login
 // keychain stays on the `security find-certificate` subprocess path via
 // build_login_keychain_read_argv() below (rung-2 pre-split argv since
 // #3406, registered as sink `certificates/list_certs_macos#1` +
 // `certificates/details_cert_macos#1` in docs/agent-spawn-sink-manifest.md).
-// Gated on YUZU_HAVE_SECURITY_FRAMEWORK
-// (meson.build, required:false + -D flag -- same shape as
-// agents/plugins/users/meson.build's YUZU_HAVE_SYSTEMCONFIGURATION gate) so
-// a box without the Security framework still builds; the #else fallback
-// below compiles to an honest "could not read" result rather than reviving
-// a subprocess call, so zero-raw-spawn holds either way.
-#if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
+// The actual bounded SecItem query and its bounded-call wrapping live in
+// agent-core (yuzu::agent::read_keychain_bounded,
+// agents/core/include/yuzu/agent/keychain_read.hpp), not here: bounding a
+// synchronous Security-framework call against a wedged securityd needs
+// bounded_call's detached-thread-plus-abandon pattern, and a plugin
+// .dylib/.so can be dlclose()'d while that detached thread is still
+// executing inside it -- see that header's own comment for the full
+// argument, which mirrors passwd_lookup.hpp's identical constraint.
 
 struct SecItemKeychainResult {
     std::vector<yuzu::certificates_x509::CertFields> certs;
-    bool ok = false;       // false: the keychain itself could not be opened/queried.
-    bool complete = false; // false: kMaxCertsPerKeychain capped the result --
-                            // there were MORE certificates than were parsed.
+    yuzu::agent::KeychainReadStatus status = yuzu::agent::KeychainReadStatus::OpenFailed;
 };
 
+static_assert(kMaxCertsPerKeychain == yuzu::agent::kMaxKeychainReadCerts);
+
 /**
- * Enumerate every certificate in the ONE keychain at `keychain_path` via
- * SecItemCopyMatching (kSecMatchSearchList restricted to just that keychain
- * via SecKeychainOpen, kSecMatchLimitAll, kSecReturnRef) and hand each
- * result's DER encoding (SecCertificateCopyData) to
- * yuzu::certificates_x509::parse_der_cert. test_certificates_x509.cpp is a
- * fixture-only unit suite and cannot exercise this function directly (it
- * needs a real keychain), so the mechanism's equivalence to the
- * `security find-certificate -a -p` subprocess it replaces was established
- * empirically instead, and the check is REPRODUCIBLE rather than anecdotal:
- * enumerate each keychain through this function's query and compare the
- * resulting uppercase SHA-1 thumbprint SET to the set obtained by piping
- * `security find-certificate -a -p <keychain>` through
- * `openssl x509 -noout -fingerprint -sha1` per PEM block. Measured
- * 2026-08-17 on macOS 26.5.2 arm64: System.keychain 3/3 and
- * SystemRootCertificates.keychain 158/158 thumbprints, both sets IDENTICAL
- * (zero diff either way). Re-run that comparison, not a re-read of this
- * comment, when changing the query below.
+ * Adapt agent-core's bounded raw-DER read into this file's own CertFields
+ * shape (to_cert_record/expires_within_days downstream expect
+ * certificates_x509::CertFields, not raw DER bytes). `budget` is the
+ * caller's clamp_to_action_budget(action_deadline, kSecItemReadDeadline)
+ * result -- this function never computes its own deadline.
  *
- * Every CoreFoundation object here is ScopedCFRef-owned (scoped_cfref.hpp)
- * -- read that header's reset()/same-identity contract before touching this
- * function. Every value handed to a ScopedCFRef below is a fresh
- * Create/Copy-rule +1 reference; `CFArrayGetValueAtIndex` results are
- * borrowed (Get-rule) references owned by the array and are never
- * ScopedCFRef-wrapped themselves, only passed to SecCertificateCopyData
- * (which DOES return an owned +1 CFDataRef, and IS wrapped).
- *
- * SecKeychainOpen/SecItemCopyMatching are synchronous CoreFoundation/
- * Security calls with no deadline or cancellation primitive of their own --
- * unlike the bounded subprocess runner they replace, there is no child
- * process here to SIGKILL against a wall clock. `action_deadline` is
- * therefore only ever consulted by the CALLER before invoking this function
- * (skip the call entirely once the action budget is already exhausted),
- * never during the call itself. kMaxCertsPerKeychain still caps how many
- * results are parsed from a single keychain (SecItemKeychainResult::complete
- * reports whether the cap was hit), same discipline as the PEM-block loop
- * (emit_keychain_rows_macos) this replaces for System/root.
- *
- * SecKeychainOpen is deprecated (macOS 10.10+) but remains the API this
- * package's spec calls for and is fully functional on every supported
- * host; the pragma below silences just that one, already-triaged warning.
+ * A DER blob Security.framework accepted but libcrypto's parse_der_cert
+ * rejects downgrades an otherwise-Completed read to Truncated: the read
+ * itself finished, but the result is no longer exhaustive (mirrors the
+ * per-item conversion-failure fold the previous in-plugin implementation
+ * performed at this same seam).
  */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-SecItemKeychainResult read_keychain_secitem(const char* keychain_path) {
+SecItemKeychainResult read_keychain_secitem(const std::string& keychain_path,
+                                            std::chrono::milliseconds budget) {
+    auto raw = yuzu::agent::read_keychain_bounded(keychain_path, budget);
     SecItemKeychainResult out;
-
-    SecKeychainRef raw_keychain = nullptr;
-    if (SecKeychainOpen(keychain_path, &raw_keychain) != errSecSuccess || !raw_keychain)
-        return out;
-    yuzu::agent::ScopedCFRef<SecKeychainRef> keychain(raw_keychain);
-
-    // SecKeychainOpen DOES NOT VALIDATE THE PATH -- it returns errSecSuccess
-    // and a live SecKeychainRef for a path that does not exist, and for a
-    // file that is not a keychain at all. SecItemCopyMatching over such a
-    // reference then returns errSecItemNotFound, which is indistinguishable
-    // from a genuinely empty keychain -- so without this check a missing,
-    // deleted or corrupt System.keychain would be reported as "read fine,
-    // zero certificates" rather than as a read failure, silently dropping
-    // the entire trust store from a certificate inventory. That is exactly
-    // the class of silent failure the subprocess path's PLAN-12 checked-read
-    // discipline exists to prevent, and `security find-certificate -a -p`
-    // (the call this replaces) DID fail non-zero on both inputs.
-    //
-    // SecKeychainGetStatus is the cheap discriminator (measured on macOS
-    // 26.5.2, arm64): errSecSuccess for a real keychain,
-    // errSecNoSuchKeychain (-25294) for a non-existent path,
-    // errSecInvalidKeychain (-25295) for an existing non-keychain file.
-    SecKeychainStatus keychain_status = 0;
-    if (SecKeychainGetStatus(keychain.get(), &keychain_status) != errSecSuccess)
-        return out; // ok stays false -> the caller emits its read-failed sentinel
-
-    const void* keychain_values[] = {keychain.get()};
-    yuzu::agent::ScopedCFRef<CFArrayRef> search_list(
-        CFArrayCreate(nullptr, keychain_values, 1, &kCFTypeArrayCallBacks));
-    if (!search_list)
-        return out;
-
-    yuzu::agent::ScopedCFRef<CFMutableDictionaryRef> query(CFDictionaryCreateMutable(
-        nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
-    if (!query)
-        return out;
-    CFDictionarySetValue(query.get(), kSecClass, kSecClassCertificate);
-    CFDictionarySetValue(query.get(), kSecMatchSearchList, search_list.get());
-    CFDictionarySetValue(query.get(), kSecMatchLimit, kSecMatchLimitAll);
-    CFDictionarySetValue(query.get(), kSecReturnRef, kCFBooleanTrue);
-
-    CFTypeRef raw_result = nullptr;
-    OSStatus status = SecItemCopyMatching(query.get(), &raw_result);
-    if (status == errSecItemNotFound) {
-        // An empty keychain is a legitimate, successful result: zero
-        // certificates, not a failure.
-        out.ok = true;
-        out.complete = true;
-        return out;
-    }
-    if (status != errSecSuccess || !raw_result)
-        return out;
-    yuzu::agent::ScopedCFRef<CFTypeRef> result(raw_result);
-
-    // kSecMatchLimitAll documents a CFArrayRef result; defensively also
-    // accept a bare (non-array) single-item result, in case a future SDK's
-    // behaviour for a one-item match ever differs from what this header was
-    // verified against.
-    std::vector<CFTypeRef> items;
-    if (CFGetTypeID(result.get()) == CFArrayGetTypeID()) {
-        auto array = static_cast<CFArrayRef>(const_cast<void*>(result.get()));
-        CFIndex count = CFArrayGetCount(array);
-        for (CFIndex i = 0; i < count; ++i)
-            items.push_back(CFArrayGetValueAtIndex(array, i));
-    } else {
-        items.push_back(result.get());
-    }
-
-    out.ok = true;
-    out.complete = items.size() <= kMaxCertsPerKeychain;
-    std::size_t attempted = 0;
-    for (CFTypeRef item : items) {
-        if (attempted >= kMaxCertsPerKeychain)
-            break;
-        ++attempted;
-        auto cert_ref = static_cast<SecCertificateRef>(const_cast<void*>(item));
-        yuzu::agent::ScopedCFRef<CFDataRef> der(SecCertificateCopyData(cert_ref));
-        if (!der) {
-            out.complete = false; // conversion failure -- result is no longer exhaustive
-            continue;
-        }
-        const auto* bytes = CFDataGetBytePtr(der.get());
-        auto len = CFDataGetLength(der.get());
-        if (!bytes || len <= 0) {
-            out.complete = false;
-            continue;
-        }
+    out.status = raw.status;
+    for (const auto& der : raw.certs_der) {
         auto parsed = yuzu::certificates_x509::parse_der_cert(
-            std::span<const unsigned char>(bytes, static_cast<std::size_t>(len)));
+            std::span<const unsigned char>(der.data(), der.size()));
         if (parsed) {
             out.certs.push_back(std::move(*parsed));
-        } else {
-            out.complete = false; // libcrypto rejected a cert Security.framework accepted
+        } else if (out.status == yuzu::agent::KeychainReadStatus::Completed) {
+            out.status = yuzu::agent::KeychainReadStatus::Truncated;
         }
     }
     return out;
 }
-#pragma clang diagnostic pop
-
-#else // !YUZU_HAVE_SECURITY_FRAMEWORK
-
-struct SecItemKeychainResult {
-    std::vector<yuzu::certificates_x509::CertFields> certs;
-    bool ok = false;
-    bool complete = false;
-};
-
-// Honest no-op fallback for a box built without the Security framework --
-// same "genuinely-absent primitive" shape as macos_console_user.hpp's own
-// console_user() fallback. Never falls back to a subprocess call: the
-// caller reports SecItemKeychainResult::ok == false as the same
-// "not_available|<keychain> read failed" sentinel a real SecItem failure
-// would produce.
-SecItemKeychainResult read_keychain_secitem(const char* /*keychain_path*/) {
-    return {};
-}
-
-#endif // YUZU_HAVE_SECURITY_FRAMEWORK
 
 // clamp_to_action_budget, parse_openssl_native_date and strip_leading_blank
 // moved to certificates_macos_parsers.hpp (shared with the unit test).
@@ -1111,21 +1361,31 @@ ConsoleUserResolution resolve_console_user(
         out.degrade_reason = "console-user lookup skipped: action deadline exceeded";
         return out;
     }
-    // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
-    // SystemConfiguration IS linkable here, deliberately not used (device-
-    // vs session-owner semantics), see manifest
-    auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
-                                           yuzu::agent::SubprocessOptions{
-                                               .deadline = stat_deadline},
-                                           "console-user stat /dev/console");
-    if (!stat_result.ok) {
-        // The `stat` spawn itself failed/timed out -- we do not KNOW whether
-        // anyone is at the console, so we must not answer as though we do.
-        out.outcome = ConsoleUserOutcome::kDegraded;
-        out.degrade_reason = "console-user lookup failed (stat /dev/console)";
-        return out;
+    std::string username;
+    // Test-only seam (#4374): a substitute for the `stat` spawn's OUTPUT
+    // only, never a bypass of the validation below -- read per call (never
+    // cached), so a single test process can point successive dispatches at
+    // different fixtures.
+    if (const char* override_user = std::getenv("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE");
+        override_user != nullptr && override_user[0] != '\0') {
+        username = override_user;
+    } else {
+        // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
+        // SystemConfiguration IS linkable here, deliberately not used (device-
+        // vs session-owner semantics), see manifest
+        auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
+                                               yuzu::agent::SubprocessOptions{
+                                                   .deadline = stat_deadline},
+                                               "console-user stat /dev/console");
+        if (!stat_result.ok) {
+            // The `stat` spawn itself failed/timed out -- we do not KNOW whether
+            // anyone is at the console, so we must not answer as though we do.
+            out.outcome = ConsoleUserOutcome::kDegraded;
+            out.degrade_reason = "console-user lookup failed (stat /dev/console)";
+            return out;
+        }
+        username = yuzu::macos::parse_console_user_output(stat_result.output);
     }
-    auto username = yuzu::macos::parse_console_user_output(stat_result.output);
     if (yuzu::macos::is_no_console_user(username)) {
         out.outcome = ConsoleUserOutcome::kNoSession; // a real, definite answer
         return out;
@@ -1197,7 +1457,8 @@ ConsoleUserResolution resolve_console_user(
     return out;
 }
 
-// canonical_thumbprint() moved to the shared __linux__/__APPLE__ block above
+// canonical_thumbprint() lives in certificates_macos_parsers.hpp (resolved
+// unqualified via `using namespace yuzu::certificates_macos;` above)
 // -- details_cert_linux/delete_cert_linux need the identical fold.
 
 // BlockIdentityOutcome / classify_block_identity moved to
@@ -1231,6 +1492,44 @@ bool emit_keychain_rows_macos(yuzu::CommandContext& ctx, const std::string& pem,
         }
     }
     return true;
+}
+
+// #2318b: re-confirm the console session owner immediately before a
+// login-keychain spawn -- resolve_console_user() above ran a Directory
+// Services lookup that can itself take seconds; this in-process
+// ::stat("/dev/console") needs none, so the window between "who is logged
+// in" and "whose keychain are we about to read" -- a fast-user-switch could
+// change it in between -- shrinks from tens of seconds to microseconds. Not
+// eliminated: see classify_console_owner_recheck's own comment. No new spawn
+// is added by this check, so it adds no sink-manifest row. The single
+// ::stat("/dev/console") site for both list_certs_macos and
+// details_cert_macos.
+struct ConsoleOwnerSnapshot {
+    bool ok = false;
+    unsigned long long uid = 0;
+};
+
+ConsoleOwnerSnapshot snapshot_console_owner() {
+    // Test-only seam (#4374), read per call (never cached): a substitute for
+    // the ::stat() OUTPUT only. The whole value must be digits and fully
+    // consumed by std::from_chars -- any parse failure yields ok=false, the
+    // same "unknown" answer a failed ::stat produces.
+    if (const char* override_uid =
+            std::getenv("YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE");
+        override_uid != nullptr && override_uid[0] != '\0') {
+        ConsoleOwnerSnapshot out;
+        std::string_view value(override_uid);
+        auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), out.uid);
+        out.ok = (ec == std::errc{} && ptr == value.data() + value.size());
+        if (!out.ok)
+            out.uid = 0;
+        return out;
+    }
+    struct stat console_st {};
+    ConsoleOwnerSnapshot out;
+    out.ok = ::stat("/dev/console", &console_st) == 0;
+    out.uid = static_cast<unsigned long long>(console_st.st_uid);
+    return out;
 }
 
 void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
@@ -1277,63 +1576,45 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         return;
     }
 
-    // System.keychain / SystemRootCertificates.keychain: rung-1 SecItem read
-    // (WP-B) via read_keychain_secitem -- no bounded-subprocess deadline
-    // applies to the call itself (see that function's own comment); the
-    // action_deadline check below only decides whether to even ATTEMPT it.
-    // A checked failure emits an honest sentinel row instead of silently
+    // System.keychain / SystemRootCertificates.keychain: bounded SecItem read
+    // via read_keychain_secitem (agent-core seam, #3246/#2318a) -- budget is
+    // whatever remains of the whole-action budget, clamped to
+    // kSecItemReadDeadline, exactly like the subprocess reads below. A
+    // checked failure emits an honest sentinel row instead of silently
     // contributing zero rows, same discipline PLAN-12 established for the
-    // subprocess path this replaces.
-    if (plan.want_system) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            ctx.write_output("not_available|System.keychain action deadline exceeded");
-            mark_result_partial(ctx, "secitem:System.keychain");
-        } else {
-            auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
-            if (sys_result.ok) {
-                for (const auto& cert : sys_result.certs) {
-                    auto rec = to_cert_record(cert, "System.keychain");
-                    if (expires_within_days(rec.not_after, expiring_days)) {
-                        ctx.write_output(rec.to_row());
-                    }
+    // subprocess path SecItem itself replaced.
+    auto emit_secitem_keychain = [&](std::string_view label, const std::string& path) {
+        auto budget = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
+        if (budget <= std::chrono::milliseconds::zero()) {
+            ctx.write_output(std::format("not_available|{} action deadline exceeded", label));
+            mark_result_partial(ctx, secitem_provenance(label));
+            return;
+        }
+        auto r = read_keychain_secitem(path, budget);
+        if (r.status == yuzu::agent::KeychainReadStatus::Completed ||
+            r.status == yuzu::agent::KeychainReadStatus::Truncated) {
+            for (const auto& cert : r.certs) {
+                auto rec = to_cert_record(cert, std::string(label));
+                if (expires_within_days(rec.not_after, expiring_days)) {
+                    ctx.write_output(rec.to_row());
                 }
-                if (!sys_result.complete) {
-                    ctx.write_output("not_available|System.keychain scan incomplete");
-                    mark_result_partial(ctx, "secitem:System.keychain");
-                }
-            } else {
-                ctx.write_output("not_available|System.keychain read failed");
-                mark_result_partial(ctx, "secitem:System.keychain");
             }
         }
+        if (r.status == yuzu::agent::KeychainReadStatus::TimedOut) {
+            spdlog::warn("certificates: {} secitem read timed out", label);
+        }
+        if (auto reason = secitem_failure_reason(r.status, label)) {
+            ctx.write_output(std::format("not_available|{}", *reason));
+            mark_result_partial(ctx, secitem_provenance(label), *reason);
+        }
+    };
+
+    if (plan.want_system) {
+        emit_secitem_keychain("System.keychain", yuzu::macos::system_keychain_path());
     }
 
     if (plan.want_root) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            ctx.write_output(
-                "not_available|SystemRootCertificates.keychain action deadline exceeded");
-            mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-        } else {
-            auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
-            if (root_result.ok) {
-                for (const auto& cert : root_result.certs) {
-                    auto rec = to_cert_record(cert, "SystemRootCertificates.keychain");
-                    if (expires_within_days(rec.not_after, expiring_days)) {
-                        ctx.write_output(rec.to_row());
-                    }
-                }
-                if (!root_result.complete) {
-                    ctx.write_output(
-                        "not_available|SystemRootCertificates.keychain scan incomplete");
-                    mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-                }
-            } else {
-                ctx.write_output("not_available|SystemRootCertificates.keychain read failed");
-                mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-            }
-        }
+        emit_secitem_keychain("SystemRootCertificates.keychain", yuzu::macos::root_keychain_path());
     }
 
     if (plan.want_login) {
@@ -1347,54 +1628,80 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         // uid/username resolve_console_user() had already validated: defensive
         // only, and a genuinely different (internal) fault. Reporting both as
         // "command construction failed" told the operator the wrong thing.
-        auto argv = console_user->home_dir.empty()
-                        ? std::vector<std::string>{}
-                        : yuzu::macos::build_login_keychain_read_argv(
-                              console_user->uid, console_user->username,
-                              console_user->home_dir, caller_is_root());
-        if (console_user->home_dir.empty()) {
-            ctx.write_output(
-                "not_available|login keychain home directory unresolved for console user");
-            mark_result_partial(ctx, "login-keychain");
-        } else if (argv.empty()) {
-            ctx.write_output("not_available|login keychain command construction failed");
-            mark_result_partial(ctx, "login-keychain");
-        } else {
-            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
-            if (read_deadline <= std::chrono::milliseconds::zero()) {
-                ctx.write_output("not_available|login keychain action deadline exceeded");
+        // #2318b: re-confirm the console session owner -- see
+        // snapshot_console_owner's own comment for the full rationale.
+        auto owner = snapshot_console_owner();
+        switch (classify_console_owner_recheck(owner.ok, owner.uid, console_user->uid)) {
+        case ConsoleOwnerRecheck::kChanged:
+            ctx.write_output("not_available|console user changed");
+            mark_result_partial(ctx, "login-keychain", "console user changed");
+            break;
+        case ConsoleOwnerRecheck::kUnknown:
+            ctx.write_output("not_available|console user recheck failed");
+            mark_result_partial(ctx, "login-keychain", "console user recheck failed");
+            break;
+        case ConsoleOwnerRecheck::kUnchanged: {
+            spdlog::info("certificates: login keychain read for console user {} (uid {})",
+                        console_user->username, console_user->uid);
+            auto argv = console_user->home_dir.empty()
+                            ? std::vector<std::string>{}
+                            : yuzu::macos::build_login_keychain_read_argv(
+                                  console_user->uid, console_user->username,
+                                  console_user->home_dir, caller_is_root());
+            if (console_user->home_dir.empty()) {
+                ctx.write_output(
+                    "not_available|login keychain home directory unresolved for console user");
+                mark_result_partial(ctx, "login-keychain");
+            } else if (argv.empty()) {
+                ctx.write_output("not_available|login keychain command construction failed");
                 mark_result_partial(ctx, "login-keychain");
             } else {
-                // Pre-split argv through the bounded runner -- no shell
-                // (#3406, rung 2). The former "/bin/sh -c" hop existed for
-                // exactly two shell features, both now provided without
-                // one: `~username` tilde expansion (resolve_passwd_entry's
-                // bounded passwd lookup above -- the same lookup the shell
-                // performed) and a `2>/dev/null` redirect (the runner's
-                // merge_stderr=false default already discards child
-                // stderr). The launchctl/sudo/security session hop itself
-                // never needed a shell -- it execs fine as plain argv.
-                // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                auto login_result = run_bounded_checked(
-                    argv,
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                    "login keychain read");
-                if (login_result.ok) {
-                    if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
-                                                  expiring_days, action_deadline)) {
-                        ctx.write_output("not_available|login keychain scan incomplete");
-                        mark_result_partial(ctx, "login-keychain");
-                    }
-                } else {
-                    // A missing sudoers grant, a launchctl/sudo failure, or an
-                    // inaccessible keychain path all land here. Report it
-                    // honestly instead of emitting zero rows, which would be
-                    // indistinguishable from "this keychain is genuinely
-                    // empty".
-                    ctx.write_output("not_available|login keychain read failed");
+                auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+                if (read_deadline <= std::chrono::milliseconds::zero()) {
+                    ctx.write_output("not_available|login keychain action deadline exceeded");
                     mark_result_partial(ctx, "login-keychain");
+                } else {
+                    // Pre-split argv through the bounded runner -- no shell
+                    // (#3406, rung 2). The former "/bin/sh -c" hop existed for
+                    // exactly two shell features, both now provided without
+                    // one: `~username` tilde expansion (resolve_passwd_entry's
+                    // bounded passwd lookup above -- the same lookup the shell
+                    // performed) and a `2>/dev/null` redirect (the runner's
+                    // merge_stderr=false default already discards child
+                    // stderr). The launchctl/sudo/security session hop itself
+                    // never needed a shell -- it execs fine as plain argv.
+                    // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
+                    auto injected = injected_login_keychain_read_failure();
+                    auto login_result = injected ? std::move(*injected)
+                                                  : run_bounded_checked(
+                                                        argv,
+                                                        yuzu::agent::SubprocessOptions{
+                                                            .deadline = read_deadline},
+                                                        "login keychain read");
+                    if (login_result.ok) {
+                        if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
+                                                      expiring_days, action_deadline)) {
+                            ctx.write_output("not_available|login keychain scan incomplete");
+                            mark_result_partial(ctx, "login-keychain");
+                        }
+                    } else {
+                        // A missing sudoers grant, a launchctl/sudo failure, or an
+                        // inaccessible keychain path all land here. Report it
+                        // honestly instead of emitting zero rows, which would be
+                        // indistinguishable from "this keychain is genuinely
+                        // empty". Names the termination reason (post
+                        // code-review CXR-03: this used to drop
+                        // login_result.failure_detail entirely, unlike
+                        // details_cert_macos's equivalent branch, contrary to
+                        // what the #2318 changelog fragment already claimed).
+                        ctx.write_output(std::format("not_available|login keychain read failed ({})",
+                                                     login_result.failure_detail));
+                        mark_result_partial(ctx, "login-keychain", login_result.failure_detail);
+                    }
                 }
             }
+            break;
+        }
         }
     }
 }
@@ -1479,9 +1786,10 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // (System/root, WP-B rung-1) instead of raw PEM blocks -- reuses the
     // SAME classify_block_identity decision `check` above uses, so the two
     // scans can never drift on what counts as a match/no-match/inconclusive
-    // identity. `result.complete == false` (kMaxCertsPerKeychain capped the
-    // read) folds into kIncomplete exactly like `check`'s own cap/deadline
-    // check does.
+    // identity. `result.status != Completed` (Truncated: kMaxCertsPerKeychain
+    // capped the read, or a DER blob failed to parse; anything worse never
+    // reaches here -- see scan_secitem_store) folds into kIncomplete exactly
+    // like `check`'s own cap/deadline check does.
     auto check_secitem = [&](const SecItemKeychainResult& result,
                              const std::string& store) -> ScanOutcome {
         for (const auto& cert : result.certs) {
@@ -1495,7 +1803,9 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 break;
             }
         }
-        return result.complete ? ScanOutcome::kNotFound : ScanOutcome::kIncomplete;
+        return result.status == yuzu::agent::KeychainReadStatus::Completed
+                   ? ScanOutcome::kNotFound
+                   : ScanOutcome::kIncomplete;
     };
 
     // A checked read failure, an exhausted action budget, or an incomplete
@@ -1506,138 +1816,155 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // successfully is still reported normally, even if an earlier store
     // had already failed.
     bool read_failed = console_user_degraded;
-    std::string_view failure_reason = console_user_degraded ? cu.degrade_reason : std::string_view{};
+    // std::string rather than std::string_view (fix-round shape, B3): unlike
+    // the previous file-local literals, System/root failure text is now
+    // COMPUTED by secitem_failure_reason and would dangle as a view into a
+    // temporary.
+    std::string failure_reason =
+        console_user_degraded ? std::string(cu.degrade_reason) : std::string{};
     // Which half of the hybrid read failed, for the ABI4 result seam below --
     // set together with failure_reason at every site (first failure wins), so
     // the machine-visible provenance can never name a different keychain from
     // the operator-visible reason.
-    std::string_view failure_provenance = console_user_degraded ? "login-keychain" : std::string_view{};
+    std::string failure_provenance = console_user_degraded ? "login-keychain" : std::string{};
 
-    if (plan.want_system) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
+    // System.keychain / SystemRootCertificates.keychain: bounded SecItem read
+    // (agent-core seam, #3246/#2318a) -- same budget discipline and failure
+    // vocabulary as list_certs_macos's emit_secitem_keychain.
+    auto scan_secitem_store = [&](std::string_view label, const std::string& path) {
+        auto budget = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
+        if (budget <= std::chrono::milliseconds::zero()) {
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = "System.keychain action deadline exceeded";
-                failure_provenance = "secitem:System.keychain";
+                failure_reason = std::format("{} action deadline exceeded", label);
+                failure_provenance = secitem_provenance(label);
             }
-        } else {
-            auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
-            if (!sys_result.ok) {
-                if (!read_failed) {
-                    read_failed = true;
-                    failure_reason = "System.keychain read failed";
-                    failure_provenance = "secitem:System.keychain";
-                }
-            } else {
-                switch (check_secitem(sys_result, "System.keychain")) {
-                case ScanOutcome::kFound:
-                    return;
-                case ScanOutcome::kIncomplete:
-                    if (!read_failed) {
-                        read_failed = true;
-                        failure_reason = "System.keychain scan incomplete";
-                        failure_provenance = "secitem:System.keychain";
-                    }
-                    break;
-                case ScanOutcome::kNotFound:
-                    break;
-                }
-            }
+            return false; // not found -- caller should not return early
         }
+        auto result = read_keychain_secitem(path, budget);
+        const bool ok = result.status == yuzu::agent::KeychainReadStatus::Completed ||
+                        result.status == yuzu::agent::KeychainReadStatus::Truncated;
+        if (!ok) {
+            if (!read_failed) {
+                read_failed = true;
+                failure_reason = *secitem_failure_reason(result.status, label);
+                failure_provenance = secitem_provenance(label);
+            }
+            return false;
+        }
+        switch (check_secitem(result, std::string(label))) {
+        case ScanOutcome::kFound:
+            return true;
+        case ScanOutcome::kIncomplete:
+            if (!read_failed) {
+                read_failed = true;
+                auto reason = secitem_failure_reason(result.status, label);
+                failure_reason = reason ? *reason : std::format("{} scan incomplete", label);
+                failure_provenance = secitem_provenance(label);
+            }
+            return false;
+        case ScanOutcome::kNotFound:
+            return false;
+        }
+        return false; // unreachable -- exhaustive switch above
+    };
+
+    if (plan.want_system) {
+        if (scan_secitem_store("System.keychain", yuzu::macos::system_keychain_path()))
+            return;
     }
 
     if (plan.want_root) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            if (!read_failed) {
-                read_failed = true;
-                failure_reason = "SystemRootCertificates.keychain action deadline exceeded";
-                failure_provenance = "secitem:SystemRootCertificates.keychain";
-            }
-        } else {
-            auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
-            if (!root_result.ok) {
-                if (!read_failed) {
-                    read_failed = true;
-                    failure_reason = "SystemRootCertificates.keychain read failed";
-                    failure_provenance = "secitem:SystemRootCertificates.keychain";
-                }
-            } else {
-                switch (check_secitem(root_result, "SystemRootCertificates.keychain")) {
-                case ScanOutcome::kFound:
-                    return;
-                case ScanOutcome::kIncomplete:
-                    if (!read_failed) {
-                        read_failed = true;
-                        failure_reason = "SystemRootCertificates.keychain scan incomplete";
-                        failure_provenance = "secitem:SystemRootCertificates.keychain";
-                    }
-                    break;
-                case ScanOutcome::kNotFound:
-                    break;
-                }
-            }
-        }
+        if (scan_secitem_store("SystemRootCertificates.keychain", yuzu::macos::root_keychain_path()))
+            return;
     }
 
     if (plan.want_login) {
-        // See list_certs_macos's matching comment: home-resolution failure and
-        // a defensive argv-construction failure are distinct faults and are
-        // reported as such.
-        auto argv = console_user->home_dir.empty()
-                        ? std::vector<std::string>{}
-                        : yuzu::macos::build_login_keychain_read_argv(
-                              console_user->uid, console_user->username,
-                              console_user->home_dir, caller_is_root());
-        if (argv.empty()) {
+        // #2318b: re-confirm the console session owner -- see
+        // snapshot_console_owner's own comment for the full rationale.
+        auto owner = snapshot_console_owner();
+        switch (classify_console_owner_recheck(owner.ok, owner.uid, console_user->uid)) {
+        case ConsoleOwnerRecheck::kChanged:
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = console_user->home_dir.empty()
-                                     ? "login keychain home directory unresolved for console user"
-                                     : "login keychain command construction failed";
+                failure_reason = "console user changed";
                 failure_provenance = "login-keychain";
             }
-        } else {
-            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
-            if (read_deadline <= std::chrono::milliseconds::zero()) {
+            break;
+        case ConsoleOwnerRecheck::kUnknown:
+            if (!read_failed) {
+                read_failed = true;
+                failure_reason = "console user recheck failed";
+                failure_provenance = "login-keychain";
+            }
+            break;
+        case ConsoleOwnerRecheck::kUnchanged: {
+            spdlog::info("certificates: login keychain read for console user {} (uid {})",
+                        console_user->username, console_user->uid);
+            // See list_certs_macos's matching comment: home-resolution failure
+            // and a defensive argv-construction failure are distinct faults
+            // and are reported as such.
+            auto argv = console_user->home_dir.empty()
+                            ? std::vector<std::string>{}
+                            : yuzu::macos::build_login_keychain_read_argv(
+                                  console_user->uid, console_user->username,
+                                  console_user->home_dir, caller_is_root());
+            if (argv.empty()) {
                 if (!read_failed) {
                     read_failed = true;
-                    failure_reason = "login keychain action deadline exceeded";
+                    failure_reason =
+                        console_user->home_dir.empty()
+                            ? "login keychain home directory unresolved for console user"
+                            : "login keychain command construction failed";
                     failure_provenance = "login-keychain";
                 }
             } else {
-                // See list_certs_macos's matching comment: pre-split argv
-                // through the bounded runner, no shell (#3406, rung 2) --
-                // tilde expansion is replaced by
-                // resolve_passwd_entry's bounded passwd lookup above.
-                // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                auto login_result = run_bounded_checked(
-                    argv,
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                    "login keychain read");
-                if (!login_result.ok) {
+                auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+                if (read_deadline <= std::chrono::milliseconds::zero()) {
                     if (!read_failed) {
                         read_failed = true;
-                        failure_reason = "login keychain read failed";
+                        failure_reason = "login keychain action deadline exceeded";
                         failure_provenance = "login-keychain";
                     }
                 } else {
-                    switch (check(login_result.output, "login.keychain-db")) {
-                    case ScanOutcome::kFound:
-                        return;
-                    case ScanOutcome::kIncomplete:
+                    // See list_certs_macos's matching comment: pre-split argv
+                    // through the bounded runner, no shell (#3406, rung 2) --
+                    // tilde expansion is replaced by
+                    // resolve_passwd_entry's bounded passwd lookup above.
+                    // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
+                    auto injected = injected_login_keychain_read_failure();
+                    auto login_result = injected ? std::move(*injected)
+                                                  : run_bounded_checked(
+                                                        argv,
+                                                        yuzu::agent::SubprocessOptions{
+                                                            .deadline = read_deadline},
+                                                        "login keychain read");
+                    if (!login_result.ok) {
                         if (!read_failed) {
                             read_failed = true;
-                            failure_reason = "login keychain scan incomplete";
+                            failure_reason = std::format("login keychain read failed ({})",
+                                                        login_result.failure_detail);
                             failure_provenance = "login-keychain";
                         }
-                        break;
-                    case ScanOutcome::kNotFound:
-                        break;
+                    } else {
+                        switch (check(login_result.output, "login.keychain-db")) {
+                        case ScanOutcome::kFound:
+                            return;
+                        case ScanOutcome::kIncomplete:
+                            if (!read_failed) {
+                                read_failed = true;
+                                failure_reason = "login keychain scan incomplete";
+                                failure_provenance = "login-keychain";
+                            }
+                            break;
+                        case ScanOutcome::kNotFound:
+                            break;
+                        }
                     }
                 }
             }
+            break;
+        }
         }
     }
 
@@ -1665,74 +1992,75 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
  * (ACL/SIP quirks, an unexpected keychain state), and reporting "deleted"
  * in that case would be exactly the false-success this package exists to
  * prevent. Returns std::nullopt when the keychain itself could not be read
- * (locked, missing, permission denied, a `security` failure, ...) --
+ * (locked, missing, permission denied, a read failure, ...) --
  * delete_cert_macos() treats that as the unreadable-keychain verdict,
  * never "absent": a verification read that could not run proves nothing
- * about the outcome. An UNRELATED unparseable block (parse_pem_block_macos
- * falls back to the literal "(unknown)" on a per-record openssl/temp-file
- * failure -- classify_block_identity reports kInconclusive) does NOT abort
- * the proof (UP-5): openssl could not turn it into a cert, so it can never be
- * a positive match for the needle, and aborting on it made a genuinely
- * successful delete report failure (kVerifyUnreadable) whenever the keychain
- * also held any unrelated malformed cert. Such blocks are skipped and the
- * scan continues; only a definitive match returns `true`, and a keychain that
- * was fully read AND fully scanned within budget with no match returns
- * `false` (provably absent). The fail-safe is preserved for the cases that
- * genuinely prove nothing -- a `security` read failure, or a cap/deadline-
- * truncated scan -- which still return std::nullopt (see fold_presence_scan),
- * so an unread/partly-read keychain is never reported as a clean "deleted".
- * Reuses run_bounded_checked + the same PEM-enumeration path as list/details
- * rather than adding a second certificate-reading mechanism.
+ * about the outcome.
+ *
+ * MECHANISM (post code-review F1, #2318a): this used to shell out to
+ * `/usr/bin/security find-certificate -a -p <keychain_path>` and trust a
+ * zero exit status plus empty stdout as proof the keychain is genuinely
+ * empty. That is exactly the #2318a UP-4 defect the issue named this
+ * function by, and it is NOT hypothetical: empirically verified on real
+ * macOS 26.6.2 (`security find-certificate -a -p` against a chmod-000,
+ * genuinely permission-denied copy of a populated System.keychain) --
+ * `security` exits 0 with EMPTY stdout and no diagnostic, indistinguishable
+ * from a truly empty keychain. (A merely LOCKED-but-otherwise-readable
+ * keychain does NOT trigger this: certificates are non-secret keychain
+ * items and both `security` and `SecItemCopyMatching` correctly enumerate
+ * them regardless of lock state -- also empirically verified. The
+ * reproducible failure mode is a file-permission/ACL denial, not a lock.)
+ * delete_cert_macos() only ever resolves `keychain_path` to System.keychain
+ * (see resolve_delete_keychain_path -- "root" is rejected earlier as
+ * SIP-sealed, "login" is rejected outright, nothing else is recognized), so
+ * this now reuses the SAME bounded, in-process SecItem seam
+ * (read_keychain_secitem / agents/core/include/yuzu/agent/keychain_read.hpp,
+ * #3246) that list_certs_macos/details_cert_macos already use for
+ * System.keychain -- eliminating the second, honesty-blind reading
+ * mechanism entirely rather than teaching it a new special case.
+ * KeychainReadStatus::NotReadable/OpenFailed/TimedOut/Rejected all map to
+ * std::nullopt (never "absent"); only Completed with no match, or Truncated
+ * with no match found before truncation, is a real "not present" answer --
+ * and Truncated can only narrow future certainty, never manufacture it, so
+ * it takes the same nullopt-if-inconclusive path as the old scan-incomplete
+ * case did.
  *
  * `action_deadline` is the CALLER's whole-action budget (fix-round finding
  * FP-CERTS-R3: this used to start its own fresh kCertActionBudget window
  * regardless of how much of delete_cert_macos()'s own budget the preceding
  * `security delete-certificate` call had already spent, letting the pair
- * run to roughly 75s worst case). The keychain read AND every per-block
- * parse below now clamp to this same shared deadline via
- * clamp_to_action_budget, same as list/details_cert_macos. If the budget is
- * already exhausted before the read can even be attempted, this returns
- * std::nullopt without issuing a doomed call -- classify_delete_verdict
- * already treats std::nullopt as kVerifyUnreadable (an honest "action
- * deadline exceeded" outcome), never kDeleted.
+ * run to roughly 75s worst case). The keychain read below clamps to this
+ * same shared deadline via clamp_to_action_budget, same as
+ * list/details_cert_macos. If the budget is already exhausted before the
+ * read can even be attempted, this returns std::nullopt without issuing a
+ * doomed call -- classify_delete_verdict already treats std::nullopt as
+ * kVerifyUnreadable (an honest "action deadline exceeded" outcome), never
+ * kDeleted.
  */
+// Deliberately does not call secitem_failure_reason/mark_result_partial the
+// way list_certs_macos/details_cert_macos do on a non-Completed read: this
+// helper's std::nullopt already reaches delete_cert_macos's own
+// classify_delete_verdict, which turns it into a hard `error|...` result and
+// a non-zero rc -- a stronger signal than CONSTRAINED/PARTIAL, and the one a
+// destructive action's caller actually needs. Naming the specific
+// KeychainReadStatus in that error text (rather than a generic "could not be
+// re-read to verify") would be a nice-to-have, not a correctness gap.
 std::optional<bool> keychain_contains_thumbprint(
     const std::string& keychain_path, const std::string& canonical_needle,
     std::chrono::steady_clock::time_point action_deadline) {
-    auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+    auto read_deadline = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
     if (read_deadline <= std::chrono::milliseconds::zero()) {
         return std::nullopt;
     }
-    // sink: certificates/keychain_contains_thumbprint#1 — rung-2 runner argv,
-    // fixed literal keychain path, see manifest
-    auto result = run_bounded_checked(
-        {"/usr/bin/security", "find-certificate", "-a", "-p", keychain_path},
-        yuzu::agent::SubprocessOptions{.deadline = read_deadline}, "keychain verify read");
-    if (!result.ok)
-        return std::nullopt;
-
-    // Accumulate each block's identity outcome and hand the final verdict to
-    // the shared, unit-tested fold_presence_scan. A definitive match
-    // short-circuits (no need to parse the rest); an unrelated unparseable
-    // block (kInconclusive) is collected and skipped rather than aborting the
-    // proof (UP-5, see the function comment). A cap/deadline-truncated scan
-    // is passed as scan_complete=false so fold_presence_scan yields the honest
-    // std::nullopt -- an incomplete scan can never positively prove absence.
-    std::vector<BlockIdentityOutcome> outcomes;
-    std::size_t parsed = 0;
-    for (const auto& block : split_pem_blocks(result.output)) {
-        auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
-        if (parsed >= kMaxCertsPerKeychain || parse_deadline <= std::chrono::milliseconds::zero()) {
-            return fold_presence_scan(outcomes, /*scan_complete=*/false);
+    auto result = read_keychain_secitem(keychain_path, read_deadline);
+    bool matched = false;
+    for (const auto& cert : result.certs) {
+        if (cert.thumbprint == canonical_needle) {
+            matched = true;
+            break;
         }
-        ++parsed;
-        auto rec = parse_pem_block_macos(block, "", parse_deadline);
-        auto outcome = classify_block_identity(rec.thumbprint, canonical_needle);
-        if (outcome == BlockIdentityOutcome::kMatch)
-            return true;
-        outcomes.push_back(outcome);
     }
-    return fold_presence_scan(outcomes, /*scan_complete=*/true);
+    return fold_secitem_presence(result.status, matched);
 }
 
 // is_provably_absent_macos moved to certificates_macos_parsers.hpp (shared
@@ -1957,7 +2285,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "delete",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "libcrypto X509 lookup + filesystem remove", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "libcrypto X509 match + held-dirfd openat/fstatat/unlinkat with pre-unlink identity "
+         "recheck",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "security delete-certificate via subprocess runner",
          "SystemRootCertificates.keychain is sealed under SIP and rejected outright; only "
@@ -2056,9 +2387,23 @@ public:
             }
 
 #ifdef _WIN32
-            delete_cert_win(ctx, thumbprint, store);
+            // delete_cert_win() returns false only when nothing was
+            // actually removed (the store couldn't be opened, or the
+            // delete call itself failed) -- propagate that as a non-zero rc
+            // so orchestration can't mistake "nothing was deleted" for a
+            // successful no-op, same rc/typed-status coherence as macOS.
+            if (!delete_cert_win(ctx, thumbprint, store))
+                return 1;
 #elif defined(__linux__)
-            delete_cert_linux(ctx, thumbprint, store);
+            // delete_cert_linux() returns false only when nothing was
+            // actually removed (the store couldn't be opened, an
+            // incomplete scan couldn't prove absence, or the pre-unlink
+            // identity recheck refused the delete) -- propagate that as a
+            // non-zero rc so orchestration can't mistake "nothing was
+            // deleted" for a successful no-op, same rc/typed-status
+            // coherence as Windows/macOS.
+            if (!delete_cert_linux(ctx, thumbprint, store))
+                return 1;
 #elif defined(__APPLE__)
             // delete_cert_macos() returns false only for a request REJECTED
             // outright (sealed root / unsupported store) or a delete that
