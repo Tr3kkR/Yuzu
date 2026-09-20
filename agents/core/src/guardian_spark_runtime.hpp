@@ -908,6 +908,11 @@ public:
     /// overwrite a newer one), so only assert on it after a call you know reached emission
     /// and that nothing else is evaluating. Test-only.
     [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
+    /// Test seam (#4606): make the timing staging in evaluate_key() fail as if an allocation
+    /// threw, to prove the bookkeeping is best-effort and can never drop the real enqueue.
+    void fail_timing_stage_for_test(bool on) noexcept {
+        fail_timing_stage_for_test_.store(on, std::memory_order_relaxed);
+    }
     [[nodiscard]] bool stopping() const;
 
     /// A live status snapshot for one currently-attached rule, reflecting the
@@ -2215,6 +2220,7 @@ private:
     /// so writing this cross-key member under only the calling pass's eval_mu would race.
     mutable std::mutex last_eval_timings_mu_;
     std::vector<EvalTimingRecord> last_eval_timings_;
+    std::atomic<bool> fail_timing_stage_for_test_{false}; ///< test seam, see fail_timing_stage_for_test()
 };
 
 /// R5.7 (docs/spark-stage2-guardian-consumer-design.md): human-readable rendering

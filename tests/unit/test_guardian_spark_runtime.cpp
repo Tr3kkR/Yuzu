@@ -2218,6 +2218,32 @@ TEST_CASE("#4606 criterion-10: a two-entry build_entries pass stages two timing 
     CHECK_FALSE(timings[1].trigger.has_value());
 }
 
+TEST_CASE("#4606 criterion-10: a failure while staging timing records never drops the event",
+          "[spark][runtime]") {
+    // The timing bookkeeping runs BEFORE the real enqueue inside evaluate_key. It must be
+    // best-effort: if it cannot allocate, the pass loses its timing lines, never its outbox entry
+    // (and never throws out of evaluate_key, which would also skip the drain-worker wake).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    rt->fail_timing_stage_for_test(true);
+    r->file = read_unknown<FileSnapshot>("io"); // errored -> one health entry
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 1);                // the event was still enqueued
+    CHECK(rt->last_eval_timings_for_test().empty());  // only the timing was dropped
+
+    // With the seam off the same pass shape stages its timing again, so the empty result above
+    // was the seam, not a broken accessor.
+    rt->fail_timing_stage_for_test(false);
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(drain_all(*rt).size() == 2);
+    CHECK(rt->last_eval_timings_for_test().size() == 2);
+}
+
 TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trigger sentinel "
           "contract (pure formatter, no runtime)",
           "[spark][runtime]") {

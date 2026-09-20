@@ -3133,9 +3133,14 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     // #4606 criterion-10: T_detect/T_fire staging for this pass, emitted as a
     // best-effort deferred log line after both registry_mu_ and eval_lk release
     // (see the end of this function). Purely diagnostic — read by nothing else here.
+    // BEST-EFFORT means it may never change what is enqueued: every allocation this
+    // bookkeeping does is inside a try, and a failure drops the timing, not the event.
     std::vector<EvalTimingRecord> staged;
-    staged.reserve(planned.size() * 2); // most rules produce 0-1 entries; recovery+compliance
-                                         // pairs produce 2 sharing one detect stamp
+    try {
+        staged.reserve(planned.size() * 2); // most rules produce 0-1 entries; recovery+compliance
+                                             // pairs produce 2 sharing one detect stamp
+    } catch (...) { // diagnostic only; the staging loop below re-guards its own allocations
+    }
 
     // Snapshot the debounce clock BEFORE the blocking read too, so neither the clock
     // nor the agent-id provider is invoked on the detached-post-read path (a provider
@@ -3233,16 +3238,26 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             // already final, minted by build_entries above) BEFORE entries moves into
             // enqueue_all below.
             const std::size_t staged_begin = staged.size();
-            for (const OutboxEntry& e : entries) {
-                EvalTimingRecord r;
-                r.event_id = e.event_id;
-                r.domain = e.domain;
-                r.detect_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       detect_wall.time_since_epoch()).count();
-                r.detect_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       detect_mono.time_since_epoch()).count();
-                r.trigger = trigger; // copied as-is; absent stays absent
-                staged.push_back(std::move(r));
+            try {
+                if (fail_timing_stage_for_test_.load(std::memory_order_relaxed))
+                    throw std::bad_alloc{};
+                for (const OutboxEntry& e : entries) {
+                    EvalTimingRecord r;
+                    r.event_id = e.event_id; // the only allocating copy: a throw here must not
+                                             // prevent the enqueue below
+                    r.domain = e.domain;
+                    r.detect_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_wall.time_since_epoch()).count();
+                    r.detect_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_mono.time_since_epoch()).count();
+                    r.trigger = trigger; // copied as-is; absent stays absent
+                    staged.push_back(std::move(r));
+                }
+            } catch (...) {
+                // Best-effort: drop this rule's timing, never its event. erase() of a tail range
+                // does not allocate, so this handler cannot itself throw.
+                staged.erase(staged.begin() + static_cast<std::ptrdiff_t>(staged_begin),
+                             staged.end());
             }
 
             bool accepted = true;
