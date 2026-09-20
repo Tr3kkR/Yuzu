@@ -237,8 +237,9 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     CHECK(cap1.text().find("Guardian T_server event_id=evt-r1 agent=agent-A rule=rule-1 ") !=
           std::string::npos);
     CHECK(cap1.text().find("agent_ns=1718000000000000000") != std::string::npos);
-    // The two server instants and the elapsed store time must be real and ordered: a swapped or
-    // mis-wired recv/committed pair (or a zeroed store_ms) would still print the prefix above.
+    // The two server instants must be real and ordered: a swapped or mis-wired recv/committed
+    // pair would still print the prefix above. store_ms is only checked non-negative (a sub-ms
+    // insert legitimately reads 0, so a stricter bound would flake).
     auto field = [](const std::string& text, const std::string& key) -> std::int64_t {
         const auto p = text.find(key);
         REQUIRE(p != std::string::npos);
@@ -278,6 +279,9 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     ingest_guardian_response(store, "agent-B", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
     cap4.stop();
     CHECK(store.event_count() == 3); // neither was stored
+    // ...and each really reached its own store outcome (rather than both failing earlier).
+    CHECK(store.events_redelivered_total() == 1);
+    CHECK(store.events_dropped_total() == 1);
     CHECK(cap4.text().find("Guardian T_server") == std::string::npos);
 
     // An ABSENT wire timestamp reads as seconds()==0; it must report the -1 sentinel, not a
@@ -306,11 +310,12 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
         return n;
     };
 
-    // event_id and rule_id are free text (a rule id is operator-authored; an event id embeds it):
-    // spaces and '=' would forge tokens, the newline would forge a whole second line.
+    // event_id, rule_id and agent_id are all free text on the wire (a rule id is operator-authored
+    // and an event id embeds it): spaces and '=' would forge tokens, the newline would forge a
+    // whole second line, and agent_id is only length-checked at registration.
     yuzu::test::LogCapture cap;
     ingest_guardian_response(
-        store, "agent-A",
+        store, "agent A=1",
         make_rule_event("evt x=1 agent=victim\nGuardian T_server event_id=z", "rule 2 recv_ns=9"),
         nullptr, nullptr);
     cap.stop();
@@ -321,7 +326,7 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
     REQUIRE(at != std::string::npos);
     const auto eol = text.find('\n', at);
     const std::string line = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
-    CHECK(line.find("event_id=evt_x_1_agent_victim_Guardian_T_server_event_id_z agent=agent-A "
+    CHECK(line.find("event_id=evt_x_1_agent_victim_Guardian_T_server_event_id_z agent=agent_A_1 "
                     "rule=rule_2_recv_ns_9 recv_ns=") != std::string::npos);
     // Exactly one of each key, and the record is one physical line (nothing followed the id).
     CHECK(count(line, "event_id=") == 1);
@@ -330,14 +335,36 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
     CHECK(count(line, " recv_ns=") == 1);
     CHECK(count(text, "Guardian T_server ") == 1);
 
-    // An id longer than the shared cap truncates to the SAME prefix the agent's T_wire/T_detect
-    // lines emit, so it still joins.
+    // The Conflict warning is the line the alert text sends operators to for the event_id, so it
+    // must read the SAME token (this event id again, from a different agent, is a mismatched
+    // collision) and be just as un-forgeable.
+    yuzu::test::LogCapture cap_conflict;
+    ingest_guardian_response(
+        store, "agent B=2",
+        make_rule_event("evt x=1 agent=victim\nGuardian T_server event_id=z", "rule 2 recv_ns=9"),
+        nullptr, nullptr);
+    cap_conflict.stop();
+    CHECK(store.event_count() == 1);
+    const std::string ctext = cap_conflict.text();
+    const auto cat = ctext.find("event_id collision with MISMATCHED fields");
+    REQUIRE(cat != std::string::npos);
+    const auto ceol = ctext.find('\n', cat);
+    const std::string cline = ctext.substr(cat, ceol == std::string::npos ? std::string::npos : ceol - cat);
+    CHECK(cline.find("event_id=evt_x_1_agent_victim_Guardian_T_server_event_id_z agent=agent_B_2 "
+                     "rule=rule_2_recv_ns_9") != std::string::npos);
+    CHECK(count(cline, " agent=") == 1);
+    CHECK(count(ctext, "event_id collision") == 1);
+
+    // An id longer than the shared length is shortened by the SAME function the agent's
+    // T_wire/T_detect lines use (head, '~', last 24 bytes), so it still joins.
     const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'q');
+    const std::string shortened =
+        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'q') + "~" +
+        std::string(yuzu::kGuardianLogIdTailBytes, 'q');
     yuzu::test::LogCapture cap_long;
     ingest_guardian_response(store, "agent-A", make_rule_event(longid, "rule-1"), nullptr, nullptr);
     cap_long.stop();
-    CHECK(cap_long.text().find("Guardian T_server event_id=" +
-                               std::string(yuzu::kGuardianLogIdMaxBytes, 'q') + " agent=") !=
+    CHECK(cap_long.text().find("Guardian T_server event_id=" + shortened + " agent=") !=
           std::string::npos);
     CHECK(cap_long.text().find(std::string(yuzu::kGuardianLogIdMaxBytes + 1, 'q')) ==
           std::string::npos);

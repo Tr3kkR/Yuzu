@@ -4,8 +4,6 @@
 /// Pure utility functions for the Yuzu web server layer.
 /// Extracted here for testability.
 
-#include <yuzu/log_token.hpp>
-
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -19,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server {
 
@@ -197,8 +197,10 @@ inline std::string html_escape(const std::string& s) {
 /// replaces every control byte and structural delimiter (space, '=', ',') with
 /// '_'; the identity is preserved verbatim in its own audit columns
 /// (principal/target_id) and rendered safely elsewhere (DB-parameterised,
-/// html-escaped, json-escaped). Canonical home for the neutralizer so the rule
-/// can't drift between call sites (server.cpp CA audits, tar_tree_routes.cpp).
+/// html-escaped, json-escaped). The mapping itself is yuzu::log_token in
+/// common/include/yuzu/log_token.hpp, shared with the agent so the rule can't drift; this
+/// name stays as the audit-detail spelling for its call sites (server.cpp CA audits,
+/// tar_tree_routes.cpp).
 [[nodiscard]] inline std::string audit_token(std::string_view s) {
     return ::yuzu::log_token(s); // shared mapping: common/include/yuzu/log_token.hpp
 }

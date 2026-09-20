@@ -107,7 +107,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
-            spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
+            spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}",
+                         log_id_token(agent_id));
             return; // a malformed frame never reaches the store - not a timed ingest
         }
         // #4606 criterion-10 T_server waypoint: server receipt, captured before
@@ -139,8 +140,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // CRLF-forging exposure.
             spdlog::warn("Guardian: dropping oversized detail_json ({} bytes) from agent {} "
                          "event {} (cap {})",
-                         ev_row.detail_json.size(), sanitize_label(agent_id),
-                         sanitize_label(ev_row.event_id), kMaxDetailJson);
+                         ev_row.detail_json.size(), log_id_token(agent_id),
+                         log_id_token(ev_row.event_id), kMaxDetailJson);
             ev_row.detail_json.clear();
         }
 
@@ -194,28 +195,30 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         case EventInsertOutcome::Inserted:
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
-            // Agent-controlled identifiers are sanitize_label'd before they reach any log
-            // line: the NUL guard strips \0 but not CR/LF, and the tightened
-            // YuzuGuardianEventsDropped alert directs operators to trust these logs, so a
-            // raw event_id could otherwise forge log lines (sec-M1). Same chokepoint the
-            // observer path uses. res.error is dropped on Conflict — it only repeats the
-            // (now-sanitized) event_id.
+            // Agent-controlled identifiers are neutralised before they reach any key=value
+            // log line: the NUL guard strips \0 but not CR/LF, a space or '=' forges extra
+            // tokens, and the tightened YuzuGuardianEventsDropped alert directs operators to
+            // trust these logs (sec-M1). log_id_token is the same neutraliser and cap the
+            // T_server line and the agent's T_wire/T_detect lines use, so an id reads
+            // identically on every line an operator joins across. (sanitize_label above stays
+            // for the alert-sink labels, whose content is not a key=value line.) res.error
+            // is dropped on Conflict — it only repeats the (now-neutralised) event_id.
             spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
                           "event_id={} agent={} rule={}",
-                          sanitize_label(ev_row.event_id), sanitize_label(agent_id),
-                          sanitize_label(ev_row.rule_id));
+                          log_id_token(ev_row.event_id), log_id_token(agent_id),
+                          log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Conflict:
             spdlog::warn("Guardian: event_id collision with MISMATCHED fields (possible "
                          "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}",
-                         sanitize_label(ev_row.event_id), sanitize_label(agent_id),
-                         sanitize_label(ev_row.rule_id));
+                         log_id_token(ev_row.event_id), log_id_token(agent_id),
+                         log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Error:
             // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
-            // input — but the identifiers still get sanitized.
+            // input — but the identifiers still get neutralised.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
-                         sanitize_label(agent_id), sanitize_label(ev_row.rule_id), res.error);
+                         log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);
             return;
         }
         if (ev_row.rule_id != kObservationRuleId) {
@@ -239,15 +242,15 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                     secs <= (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
                     agent_ns = secs * kNsPerSec + nanos;
                 // The three ids are agent- or operator-supplied text embedded in a space-delimited
-                // key=value line, so each goes through the SAME neutraliser and cap the agent's
-                // T_wire/T_detect lines use (yuzu/log_token.hpp): a space or '=' would otherwise
-                // forge extra tokens, and a per-side cap would break the event_id join.
+                // key=value line, so each goes through the SAME neutraliser and shortening the
+                // agent's T_wire/T_detect lines use (yuzu/log_token.hpp, log_id_token): a space or
+                // '=' would otherwise forge extra tokens, and a per-side rule would break the
+                // event_id join.
                 spdlog::info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
                              "committed_ns={} agent_ns={} store_ms={}",
-                             log_token(ev_row.event_id, kGuardianLogIdMaxBytes),
-                             log_token(agent_id, kGuardianLogIdMaxBytes),
-                             log_token(ev_row.rule_id, kGuardianLogIdMaxBytes), recv_wall_ns,
-                             res.committed_wall_ns, agent_ns, store_ms);
+                             log_id_token(ev_row.event_id), log_id_token(agent_id),
+                             log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
+                             agent_ns, store_ms);
             } catch (...) { // best-effort diagnostic; never propagate onto the ingest thread
             }
         }

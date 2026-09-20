@@ -5,9 +5,9 @@
  * their pure log-line formatters for the Spark detect->delivery latency benchmark
  * (T_ready -> T_mutation -> T_mechanism -> T_detect -> T_fire -> T_wire -> T_server ->
  * T_visible). T_ready and T_mutation are taken by the benchmark rig and T_visible is a
- * dashboard observation; none of the three is logged here, and T_mechanism and the handler
- * instant are fields of the T_detect line, not lines of their own. Deliberately NOT part of
- * GuardianSparkRuntime's class interface:
+ * dashboard observation; none of the three is logged here, and T_mechanism, the handler
+ * instant and T_fire are fields of the T_detect line, not lines of their own. Deliberately NOT
+ * part of GuardianSparkRuntime's class interface:
  *   - so the two format_*_line() functions are directly unit-testable (pure, no
  *     I/O, no clock reads) without touching the runtime;
  *   - so the agent-side send-site logging (agent.cpp, T_wire) can use
@@ -42,15 +42,20 @@
  *     outbox lock is released, so a drain that is already running can send and stamp wire
  *     first, and wire is stamped after Write() returns, by which time the server may already
  *     have logged receipt. Small negative deltas between those pairs are ordinary. Every
- *     *_wall_ns and *_ns field is a wall-clock read, so any difference taken between two
- *     hosts (agent_ns, the wire->recv hop and the gateway hop between them) includes their
- *     clock skew; the *_mono_ns fields are for intervals within one process only.
- *   - The lines are written synchronously: T_detect on the thread that ran the evaluation
- *     (the Spark consumer thread or the convergence thread), T_wire on the single-flight send
- *     worker (Spark path) or the guard worker (legacy path), T_server on the gRPC ingest
- *     thread. A log sink that blocks therefore stalls whichever of those is writing: later
- *     evaluations, the next send, or the next ingest. Removing the Spark-path coupling is a
- *     flip precondition (docs/spark-flip-gate.md section 7).
+ *     *_wall_ns field, and recv_ns, committed_ns and agent_ns, is a wall-clock read, so any
+ *     difference taken between two hosts (agent_ns, the wire->recv hop and the gateway hop
+ *     between them) includes their clock skew; the *_mono_ns fields are for intervals within
+ *     one process only.
+ *   - The lines are written synchronously. T_detect: on the thread that ran the evaluation
+ *     (the Spark consumer thread for an Event pass; a convergence lane or the priority thread
+ *     otherwise). T_wire: on the detached send worker of its lane (Spark path: the lifecycle
+ *     lane and the compliance+health lane each have a single-flight executor) or on the guard
+ *     worker (legacy path). T_server: on the thread that reads the agent's Subscribe stream
+ *     (direct path, where it is the whole read loop, so a stall also delays that agent's
+ *     other responses) or on the gateway's forward handler. A log sink that blocks therefore
+ *     stalls whichever of those is writing: Event evaluations queued behind it, a convergence
+ *     sweep, the next send on that lane, or the next ingest. Removing the Spark-path coupling
+ *     is a flip precondition (docs/spark-flip-gate.md section 7).
  *   - The agent-side lines carry no agent field (each agent has its own log); join on
  *     (agent, event_id), taking the agent from the log's origin and from T_server's agent=.
  *   - Event id layout differs by path. Spark: `<agent>-<boot_nonce>-<rule>-<wall_ms>-<seq>`,
@@ -59,11 +64,14 @@
  *     with NO boot_nonce and a per-process seq. An empty agent id (before registration) is
  *     a known degenerate case.
  *   - The event id (and T_server's agent and rule ids) is untrusted text: it embeds the
- *     operator-authored rule id. It is neutralised before it is written - a control byte,
- *     DEL, space, '=' or ',' becomes '_' - and cut to 256 bytes, by ONE shared function
- *     (yuzu::log_token, common/include/yuzu/log_token.hpp) on both sides, so an id with such
- *     characters or longer than 256 bytes still joins. Two raw ids can share one logged token
- *     only if they differ solely in those characters or beyond byte 256.
+ *     operator-authored rule id. It goes through ONE shared function (yuzu::log_id_token,
+ *     common/include/yuzu/log_token.hpp) on both sides: every byte outside printable ASCII,
+ *     and space, '=' and ',', becomes '_', and an id longer than 256 bytes is shortened to
+ *     exactly 256 as <head> '~' <last 24 bytes>, which keeps the `<wall_ms>-<seq>` tail that
+ *     tells two events of one rule apart. So an id with such characters, or of any length,
+ *     still joins. Two raw ids can share one logged token only if they differ solely in
+ *     neutralised characters, or are over-long and share both their head and their last 24
+ *     bytes. The server's Redelivered, Conflict and Error lines use the same function.
  *   - Every T_* line is best-effort, so "no partner" is evidence, not proof: a line can be
  *     missing because the log call failed (the error is swallowed), the level was raised
  *     above info at run time, a file rotated, or the process stopped between the write and
@@ -118,7 +126,8 @@
  *     warning do not, so they cannot be joined), so at the default info level a replay and a
  *     loss look alike in the server log: T_wire sent=1 with no T_server means lost in
  *     flight, OR classified Redelivered, Conflict or Error, OR the server had no Guardian
- *     store configured (it then skips the store silently). A T_server with no T_wire means
+ *     store configured (on the direct path it then skips the store without any line; the
+ *     gateway path logs a warning that carries no event_id). A T_server with no T_wire means
  *     the agent's line was not written or not retained (see best-effort above).
  */
 
@@ -138,10 +147,12 @@ namespace yuzu::agent {
 /// stay absent in every derived timing record, never defaulted to a fabricated zero that a
 /// benchmark parser could mistake for "observed but zero-latency".
 struct EvalTrigger {
-    std::int64_t mechanism_wall_ns{0}; ///< T_mechanism: SparkEvent::at, ns since Unix epoch
+    std::int64_t mechanism_wall_ns{0}; ///< T_mechanism: SparkEvent::at, stamped when the engine
+                                       ///< receives the mechanism's report (SparkEngine::emit_event),
+                                       ///< ns since Unix epoch
     std::int64_t handler_wall_ns{0};   ///< T_handler (diagnostic only): on_event() entry, wall ns
     std::int64_t handler_mono_ns{0};   ///< same instant, steady ns (for LOCAL interval math only)
-    std::uint64_t seq{0};              ///< SparkEvent::seq, the mechanism's per-event sequence number
+    std::uint64_t seq{0};              ///< SparkEvent::seq, the engine's per-armed-spark counter
 };
 
 /// One outbox entry's timing, staged during evaluate_key()'s registry_mu_-held commit section

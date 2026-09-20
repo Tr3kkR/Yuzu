@@ -3316,15 +3316,17 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     if (outbox_waker)
         outbox_waker();
 
-    // #4606 criterion-10: release eval_lk (this key's own serialisation) BEFORE any
-    // I/O below, so a slow log write never delays the next eval of this key, and the
-    // waker above has already fired, so nothing below delays the ENQUEUE or the drain
-    // worker's wake. That is the whole extent of the decoupling: the T_detect line is
-    // written synchronously on THIS thread (the Spark consumer or the convergence
-    // thread) and the T_wire line on the single-flight send worker, so a log sink that
-    // blocks stalls whichever thread is writing (see guardian_spark_timing.hpp). The
-    // waker also means a T_wire line can reach the log before its own T_detect line -
-    // correlate by event_id and the embedded *_wall_ns fields, never file order.
+    // #4606 criterion-10: release eval_lk (this key's serialisation) BEFORE any I/O
+    // below, so a slow log write does not extend the window in which OTHER threads wait
+    // on this key, and the waker above has already fired, so nothing below delays the
+    // ENQUEUE or the drain worker's wake. That is the whole extent of the decoupling:
+    // the T_detect line is written synchronously on THIS thread (the Spark consumer
+    // thread for an Event pass, a convergence lane or the priority thread otherwise) and
+    // the T_wire line on a send worker, so a log sink that blocks stalls whichever thread
+    // is writing, including the next Event evaluation queued behind it on the consumer
+    // thread (see guardian_spark_timing.hpp). The waker also means a T_wire line can
+    // reach the log before its own T_detect line - correlate by event_id and the
+    // embedded *_wall_ns fields, never file order.
     eval_lk.unlock();
     if (!staged.empty()) {
         try {

@@ -903,9 +903,10 @@ public:
     /// evaluate_key() call that REACHED the emission step, for direct unit-test inspection
     /// (field order / two-entry / accepted=false cases) without depending on log capture.
     /// A call that returns early (stopping runtime, withdrawn key, nothing planned, a
-    /// non-event type) leaves the previous batch in place, and concurrent calls for
-    /// different keys are last-writer-wins, so only assert on it after a call you know
-    /// reached emission. Test-only.
+    /// non-event type) leaves the previous batch in place, and concurrent calls are
+    /// last-writer-wins (the batch is assigned after the log I/O, so a slow older pass can
+    /// overwrite a newer one), so only assert on it after a call you know reached emission
+    /// and that nothing else is evaluating. Test-only.
     [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
     [[nodiscard]] bool stopping() const;
 

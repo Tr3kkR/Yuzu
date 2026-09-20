@@ -1,18 +1,19 @@
 #include "guardian_spark_timing.hpp"
 
-#include <yuzu/log_token.hpp>
-
 #include <format>
+
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::agent {
 
 namespace {
 
-/// The event id embeds the operator-authored rule id, so it is neutralised and capped exactly
-/// as the server's T_server line does (yuzu/log_token.hpp): a space, '=' or newline would
-/// otherwise forge tokens or whole lines, and a different cap on either side breaks the join.
+/// The event id embeds the operator-authored rule id, so it is neutralised and shortened exactly
+/// as the server's T_server line does (yuzu/log_token.hpp, log_id_token): a space, '=' or
+/// newline would otherwise forge tokens or whole lines, and a different rule on either side
+/// breaks the join.
 std::string id_token(const std::string& id) {
-    return ::yuzu::log_token(id, ::yuzu::kGuardianLogIdMaxBytes);
+    return ::yuzu::log_id_token(id);
 }
 
 /// -1 sentinel for every trigger sub-field when a pass has no attributable Spark event

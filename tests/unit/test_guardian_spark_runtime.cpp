@@ -2386,14 +2386,33 @@ TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a l
     CHECK(count(wire, "event_id=") == 1);
     CHECK(count(wire, "Guardian T_") == 1);
 
-    // Both lines cap the id at the SAME constant the server's T_server line uses, so an over-long
-    // id still joins (both sides truncate to the identical prefix).
+    // Both lines shorten an over-long id with the SAME function the server's T_server line uses
+    // (head, '~', last 24 bytes), so it still joins.
     const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'a');
     e.event_id = longid;
     w.event_id = longid;
-    const std::string capped(yuzu::kGuardianLogIdMaxBytes, 'a');
-    CHECK(format_eval_timing_line(e).rfind("Guardian T_detect event_id=" + capped + " ", 0) == 0);
-    CHECK(format_send_timing_line(w).rfind("Guardian T_wire event_id=" + capped + " ", 0) == 0);
+    const std::string shortened =
+        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'a') + "~" +
+        std::string(yuzu::kGuardianLogIdTailBytes, 'a');
+    CHECK(shortened.size() == yuzu::kGuardianLogIdMaxBytes);
+    CHECK(format_eval_timing_line(e).rfind("Guardian T_detect event_id=" + shortened + " ", 0) == 0);
+    CHECK(format_send_timing_line(w).rfind("Guardian T_wire event_id=" + shortened + " ", 0) == 0);
+
+    // The tail (`<wall_ms>-<seq>`) survives, so two events of one very long rule id stay distinct.
+    const std::string rule(300, 'r');
+    e.event_id = rule + "-1789930557755-101";
+    const auto first = format_eval_timing_line(e);
+    e.event_id = rule + "-1789930557755-102";
+    CHECK(format_eval_timing_line(e) != first);
+
+    // A multi-byte character (here U+2028 LINE SEPARATOR, and one that straddles the cut) never
+    // reaches the line: every byte outside printable ASCII becomes '_', so the output is ASCII
+    // and cannot be split by a Unicode-aware consumer or made invalid UTF-8 by the cut.
+    e.event_id = "a\xE2\x80\xA8" "b" + std::string(300, '\xC3');
+    for (const char c : format_eval_timing_line(e))
+        CHECK(static_cast<unsigned char>(c) < 0x80);
+    w.event_id = "a\xE2\x80\xA8" "b";
+    CHECK(format_send_timing_line(w) == "Guardian T_wire event_id=a___b domain=health sent=1 wire_wall_ns=9");
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {
@@ -2524,6 +2543,15 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
     threads.emplace_back([&] {
         while (!go.load()) {}
         for (int i = 0; i < kIters; ++i) drain_all(*rt);
+    });
+    // Reader: the #4606 test accessor copies the last staged batch under its leaf mutex while the
+    // evaluators move-assign into it, so a reader running concurrently with those writers is
+    // covered (writer-vs-writer was already exercised by the evaluators themselves).
+    threads.emplace_back([&] {
+        while (!go.load()) {}
+        std::size_t seen = 0;
+        for (int i = 0; i < kIters; ++i) seen += rt->last_eval_timings_for_test().size();
+        (void)seen;
     });
 
     go.store(true);

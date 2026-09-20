@@ -3625,8 +3625,9 @@ private:
         // T_server, guardian_ingest.cpp). Best-effort, always-on info level (the shipped default
         // is what the benchmark must measure) — a log throw must never flip a real Sent into
         // Retain, so this stays strictly after `ok` is captured and before the return. It is
-        // still a synchronous write on the single-flight send worker, so a log sink that blocks
-        // delays the NEXT entry's send (see guardian_spark_timing.hpp).
+        // still a synchronous write on the detached send worker of its lane (each lane's
+        // executor is single-flight), so a log sink that blocks delays the NEXT entry's send
+        // on that lane (see guardian_spark_timing.hpp).
         try {
             const auto r = make_outbox_send_timing(
                 e, ok,
