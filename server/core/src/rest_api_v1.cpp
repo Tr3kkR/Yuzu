@@ -10,7 +10,6 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
-#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
@@ -1151,6 +1150,9 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}/responses": {
       "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}/children": {
+      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible limit/cursor). #2146 A2-R1 Gate 8 fix: the cap is now pushed down TOGETHER WITH the caller's own visibility scope, before LIMIT -- a confined caller's cap applies to their OWN visible children, not the fleet-wide raw row set, so an invisible sibling can no longer displace a visible child out of the capped window. result_truncated_by_cap:true means that scoped row set exceeded the cap; a truncated:false confined response means every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -1168,7 +1170,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fetch one workflow execution (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflow-executions/{id} and MCP get_workflow_execution (new) — WorkflowEngine's own per-step execution record, a DIFFERENT data model from ExecutionTracker's fan-out Execution (GET /executions/{id}). Both this route and the legacy twin gate on fleet_read_fn (Workflow:Read) with record-level confinement (#4030 Gate 8 fix): a caller with no agent visible in agent_ids_json 404s identically to a nonexistent execution, never a narrower-but-present record; an admitted confined caller's agent_ids is narrowed to their visible agents and each step's result.agents_reached is stripped. Audited as workflow_execution.detail.fetch (set-and-proceed) on both the success path and the confinement-denied path — a genuinely nonexistent id writes no audit row (the denied row alone therefore distinguishes 'exists, out of scope' from 'never existed' for a caller who also holds AuditLog:Read; tracked open). Shared builder workflow_execution_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow execution detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Execution not found"}, "503": {"description": "Workflow engine not available"}}}
     },
     "/schedules": {
-      "get": {"summary": "List schedules (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the dashboard GET /fragments/schedules fragment and the widened MCP list_schedules tool (now includes execution_count). NOT the separate legacy unversioned GET /api/schedules (a distinct, untouched capability). Same two-stage gate as the fragment: a service-scoped token is denied the fleet-wide list outright, then Schedule:Read. Shared builder schedule_row_json. Gated on query_schedules_checked (#4030 review finding): a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when the fleet has more schedules than that, `pagination.result_truncated_by_cap: true` is added so `pagination.total` is never presented as the fleet's true count.", "responses": {"200": {"description": "Schedule list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows."}, "403": {"description": "Insufficient permission (Schedule:Read), or a service-scoped token denied the fleet-wide list"}, "503": {"description": "Schedule engine not available, or the store query itself failed (retry_after_ms in the A4 envelope)"}}}
+      "get": {"summary": "List schedules (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the dashboard GET /fragments/schedules fragment and the widened MCP list_schedules tool (now includes execution_count). NOT the separate legacy unversioned GET /api/schedules (a distinct, untouched capability). Same two-stage gate as the fragment: a service-scoped token is denied the fleet-wide list outright, then Schedule:Read. Shared builder schedule_row_json. Gated on query_schedules_checked (#4030 review finding): a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when the fleet has more schedules than that, `pagination.result_truncated_by_cap: true` is added so `pagination.total` is never presented as the fleet's true count. definition_id/enabled_only filters (#2146 A2-R1): enabled_only is a real boolean (matching the #4034 fix on GET /api/v1/policies, unlike the legacy GET /api/schedules route's presence-only quirk) -- an unrecognized value 400s.", "parameters": [{"name": "definition_id", "in": "query", "schema": {"type": "string"}}, {"name": "enabled_only", "in": "query", "schema": {"type": "boolean"}}], "responses": {"200": {"description": "Schedule list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows."}, "400": {"description": "Invalid boolean value for enabled_only"}, "403": {"description": "Insufficient permission (Schedule:Read), or a service-scoped token denied the fleet-wide list"}, "503": {"description": "Schedule engine not available, or the store query itself failed (retry_after_ms in the A4 envelope)"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
         R"json(,
@@ -1798,7 +1800,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1816,7 +1818,7 @@ void RestApiV1::register_routes(
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
                     std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
-                    std::move(dex_api));
+                    std::move(dex_api), std::move(dex_perf_api));
 }
 
 void RestApiV1::register_routes(
@@ -1842,7 +1844,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -8131,7 +8133,27 @@ void RestApiV1::register_routes(
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two, matching this same route's own
+            // GET .../children twin below; the degrade branch MUST run
+            // BEFORE any denial audit is recorded.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "execution tracker degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; the execution read failed transiently"),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #4030: optional per-agent status/duration expansion --
             // `?include=agents` adds a per-agent array + KPI summary to this
             // SAME route (the issue's query-param decision, not a distinct
@@ -8311,6 +8333,186 @@ void RestApiV1::register_routes(
                 }
             }
             res.set_content(ok_json(data_obj.str()), "application/json");
+        });
+
+    // ── GET /api/v1/executions/{id}/children (#2146 A2-R1) ──────────────
+    //
+    // REST v1 twin of the legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) -- same gate (fleet_read_fn, Execution:Read),
+    // same confinement rules (execution_scope_rules.hpp's execution_visible,
+    // applied to the parent AND independently to each child -- a visible
+    // parent does not by itself disclose a child dispatched by, or
+    // targeting, someone else, #3789), and the SAME execution_child_row_json
+    // shared builder (execution_model.hpp) the legacy route now also calls
+    // (docs/api-twin-recipe.md Rule 1). Batched per-child status lookup
+    // under confinement (get_agent_statuses_for_executions_checked), never
+    // N+1 (ADR-0017 INV-10).
+    //
+    // Auth: Execution:Read via fleet_read_fn. Audit: mirrors the legacy
+    // route's own posture exactly -- "execution.read"/"denied" ONLY under an
+    // engaged scope when the parent is invisible/nonexistent; no audit call
+    // on a successful read (metadata about executions, not itself the
+    // per-agent behavioural PII the detail route's `?include=agents`
+    // expansion carries) and no audit call for an unconfined caller's
+    // genuinely-nonexistent id (ordinary 404, not a confinement decision).
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/children)",
+        [fleet_read_fn, auth_fn, audit_fn, execution_tracker](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions/{{id}}/children: fleet_read_fn unwired; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+
+            auto exec_id = req.matches[1].str();
+            std::string username;
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
+            if (gate.scope) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                username = session->username;
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after the fleet gate already
+                // admitted the request -- fail closed rather than silently
+                // fall through to agent-only visibility (matches the bare
+                // detail/list routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "unable to resolve caller identity for a confined read",
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-visible-
+                // agent admission predicate into get_children_checked's SQL
+                // below (this file's own LIST handler precedent) -- closes
+                // the cap-before-scope defect where an invisible sibling
+                // could displace this caller's own visible children out of
+                // the capped window.
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
+            }
+
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> parent_statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                parent_statuses = std::move(*statuses_opt);
+            }
+
+            const bool parent_visible =
+                exec_opt.has_value() &&
+                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            if (!exec_opt || !parent_visible) {
+                // #3789: audit ONLY under an engaged scope -- matches the
+                // legacy route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_fn(req, "execution.read", "denied", "Execution", exec_id,
+                                   "not found or outside caller's fleet-read scope "
+                                   "surface=children cid=" +
+                                       cid);
+                }
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "execution not found", cid),
+                                "application/json");
+                return;
+            }
+
+            auto children_opt = execution_tracker->get_children_checked(exec_id, scope_arg);
+            if (!children_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            if (gate.scope) {
+                // #3789 (Sol/gpt-5.6-sol adversarial review, mirrored from
+                // the legacy route): parent visibility does NOT authorize
+                // enumerating every child -- each independently passes
+                // execution_visible. One batched statuses call, not N+1.
+                std::vector<std::string> child_ids;
+                child_ids.reserve(children_opt->children.size());
+                for (const auto& c : children_opt->children)
+                    child_ids.push_back(c.id);
+                auto child_statuses_opt =
+                    execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
+                if (!child_statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& c : children_opt->children) {
+                    auto it = child_statuses_opt->find(c.id);
+                    const auto& c_statuses =
+                        it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                        continue;
+                    arr.add_raw(execution_child_row_json(c).dump());
+                }
+            } else {
+                for (const auto& c : children_opt->children)
+                    arr.add_raw(execution_child_row_json(c).dump());
+            }
+            // #2146 A2-R1 (governance re-review, blocking): get_children_checked
+            // is now hard-capped (kExecutionChildrenCap, execution_tracker.cpp)
+            // -- previously unbounded. Present-only-when-true, matching MCP
+            // list_schedules/query_responses' result_truncated_by_cap
+            // convention -- top-level next to `children` since this route
+            // has no `pagination` envelope to nest it under (unlike GET
+            // /api/v1/schedules). #2146 A2-R1 Gate 8 fix: scope_arg above is
+            // now pushed into the SQL BEFORE the cap (ExecutionChildrenResult's
+            // doc comment), so for a confined caller this reports THEIR OWN
+            // visible row set exceeding the cap, not the fleet-wide one --
+            // the per-child confinement filter above is now
+            // redundant-but-safe defense in depth over an already-scoped
+            // result, never the primary admission decision.
+            JObj result_obj;
+            result_obj.raw("children", arr.str());
+            if (children_opt->truncated)
+                result_obj.add("result_truncated_by_cap", true);
+            res.set_content(ok_json(result_obj.str()), "application/json");
         });
 
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──
@@ -12138,7 +12340,7 @@ void RestApiV1::register_routes(
     // concept.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/app-perf)",
-        [scoped_perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [scoped_perm_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
@@ -12151,7 +12353,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
-            if (!app_perf_providers.device) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12175,8 +12377,12 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            auto rows = app_perf_providers.device(agent_id);
-            if (!rows) { // AUTHORITATIVE read degrade
+            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
+            // #4035: shared seam (dex_perf_api.hpp) -- the MCP twin
+            // get_dex_device_app_perf calls the SAME seam so the two response
+            // shapes cannot drift (Rule 1).
+            auto body = dex_perf_api->device_app_perf_json(agent_id, app_filter);
+            if (!body) { // AUTHORITATIVE read degrade
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -12185,12 +12391,7 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
-            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
-            // get_dex_device_app_perf calls the SAME provider + serializer so
-            // the two response shapes cannot drift (Rule 1).
-            res.set_content(ok_json(dex_device_app_perf_json(agent_id, app_filter, *rows)),
-                            "application/json");
+            res.set_content(ok_json(*body), "application/json");
         });
 
     if (metrics_registry) {
@@ -12608,7 +12809,7 @@ void RestApiV1::register_routes(
     // GET /dex/perf/fleet — the now-stats per metric + the honest denominators
     // (the same numbers the yuzu_fleet_perf_* Prometheus gauges export).
     sink.Get("/api/v1/dex/perf/fleet",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
@@ -12616,7 +12817,7 @@ void RestApiV1::register_routes(
                  // id on every response + the A4 error envelope on failures.
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12626,7 +12827,7 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                 const auto now = dex_perf_fleet_now(dex_perf_api->fleet_snapshot(std::string{}));
                  res.set_content(ok_json(JObj()
                                              .raw("cpu_pct", perf_stat_json(now.cpu))
                                              .raw("commit_pct", perf_stat_json(now.commit))
@@ -12650,14 +12851,14 @@ void RestApiV1::register_routes(
     // carry suppressed=true with their population and no stats; the untagged
     // residual is the cohort=="" row.
     sink.Get("/api/v1/dex/perf/cohorts",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12675,7 +12876,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto snap = dex_perf_fn(key);
+                 const auto snap = dex_perf_api->fleet_snapshot(key);
                  JArr rows;
                  for (const auto& c : dex_perf_cohorts(snap)) {
                      JObj o;
@@ -12710,13 +12911,13 @@ void RestApiV1::register_routes(
     // half of the BRD F2c residual, row 100, is deferred: per-app data is
     // device-drill-only, not fleet render-time — see dex_perf_model.hpp.)
     sink.Get("/api/v1/dex/perf/cohort-diff",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12758,7 +12959,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                 const auto d = dex_perf_cohort_diff(dex_perf_api->fleet_snapshot(key), a, b);
                  auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                      if (!found)
                          return "null";
@@ -12807,7 +13008,7 @@ void RestApiV1::register_routes(
     // (default), the not-reporting complement (filter=not_reporting), or a
     // cohort's members (cohort_key + cohort_value; empty value = untagged).
     sink.Get("/api/v1/dex/perf/devices",
-             [perm_fn, audit_fn, dex_perf_fn, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, dex_perf_api, deny_fleet_wide_service_scoped](
                  const httplib::Request& req, httplib::Response& res) {
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
@@ -12827,7 +13028,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12893,8 +13094,8 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.perf.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const auto rows = dex_perf_device_list(dex_perf_fn(cohort_key), metric,
-                                                        not_reporting, cohort_filter, limit);
+                 const auto rows = dex_perf_device_list(dex_perf_api->fleet_snapshot(cohort_key),
+                                                        metric, not_reporting, cohort_filter, limit);
                  JArr arr;
                  for (const auto& r : rows) {
                      JObj o;
@@ -12941,12 +13142,12 @@ void RestApiV1::register_routes(
     // data, so a worker discovers which `app=` values are answerable (A2).
     sink.Get(
         "/api/v1/dex/perf/apps",
-        [perm_fn, app_perf_providers](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, dex_perf_api](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.apps) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12956,7 +13157,7 @@ void RestApiV1::register_routes(
                 return;
             }
             bool truncated = false;
-            auto apps = app_perf_providers.apps(truncated);
+            auto apps = dex_perf_api->apps(truncated);
             if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                 res.status = 503;
                 res.set_content(
@@ -12981,13 +13182,13 @@ void RestApiV1::register_routes(
     // (version omitted = every version, interleaved, each point tagged with its
     // canonicalized version). Exact fleet mean/max + bucket-resolution p50/p95.
     sink.Get("/api/v1/dex/perf/app",
-             [perm_fn, app_perf_providers, app_pct_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, app_pct_json](const httplib::Request& req,
                                                          httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!app_perf_providers.fleet) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(
                                          503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13023,8 +13224,8 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto rows = app_perf_providers.fleet(app, version);
-                 if (!rows) { // AUTHORITATIVE read degrade
+                 auto trend = dex_perf_api->app_fleet_trend(app, version);
+                 if (!trend) { // AUTHORITATIVE read degrade
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -13034,7 +13235,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  JArr points;
-                 for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                 for (const auto& pt : *trend) {
                      // The fleet path floors too now, so a sub-floor point carries
                      // suppressed=true with device_count only — same shape as the
                      // group endpoint; without the flag a suppressed point would read
@@ -13099,7 +13300,7 @@ void RestApiV1::register_routes(
     // honest instead of generic).
     sink.Get(
         "/api/v1/dex/perf/app/devices",
-        [fleet_read_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -13154,7 +13355,7 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
             if (!gate.admitted)
                 return;
-            if (!app_perf_providers.version_devices) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13167,7 +13368,7 @@ void RestApiV1::register_routes(
             if (gate.scope)
                 visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
             bool truncated = false;
-            auto rows = app_perf_providers.version_devices(app, version, visible_ids, truncated);
+            auto rows = dex_perf_api->app_version_devices(app, version, visible_ids, truncated);
             if (!rows) { // AUTHORITATIVE read degrade
                 (void)detail::try_persist_audit(
                     audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
@@ -13249,7 +13450,7 @@ void RestApiV1::register_routes(
     // adjacent fleet/cohort aggregates, which are likewise unaudited.
     sink.Get(
         "/api/v1/dex/perf/group",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.group.view", "GuaranteedState",
@@ -13260,7 +13461,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.group) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13311,8 +13512,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.group(group_id, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+            auto trend = dex_perf_api->group_trend(group_id, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf group read degraded", cid,
@@ -13322,7 +13523,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)
@@ -13361,7 +13562,7 @@ void RestApiV1::register_routes(
     // cohort is equally a "named set of specific devices".
     sink.Get(
         "/api/v1/dex/perf/tag",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.tag.view", "GuaranteedState",
@@ -13372,7 +13573,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.tag_cohort) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13432,8 +13633,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.tag_cohort(key, value, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+            auto trend = dex_perf_api->tag_trend(key, value, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf tag cohort read degraded", cid,
@@ -13443,7 +13644,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)
@@ -14960,7 +15161,27 @@ void RestApiV1::register_routes(
             return;
         }
 
-        auto exec_opt = execution_tracker->get_execution(exec_id);
+        // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+        // get_execution(), which collapses "row genuinely absent" and "read
+        // degraded" (pool/query failure) to the same nullopt -- a transient
+        // degrade here fell through to the not-found + denial-audit branch
+        // below, producing a FALSE 404 for a legitimate owner and a
+        // permanently wrong CC7.2 audit trail for a non-owner.
+        // get_execution_checked's outer std::expected distinguishes the two;
+        // the degrade branch below matches this same route's own agents_opt
+        // degrade handling a few lines down.
+        auto exec_r = execution_tracker->get_execution_checked(exec_id);
+        if (!exec_r) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503, "execution tracker degraded", cid,
+                                      /*retry_after_ms=*/5000,
+                                      "retry shortly; the execution read failed "
+                                      "transiently"),
+                "application/json");
+            return;
+        }
+        const auto& exec_opt = *exec_r;
         // #1634 perf (governance Gate 3 finding): only fetch/scan agent
         // statuses when confined — an unrestricted subscriber is always
         // visible regardless, so this indexed lookup would be pure waste on

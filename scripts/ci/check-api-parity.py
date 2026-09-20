@@ -136,7 +136,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # class as the pre-existing device-live/run and device-live/result rows they
 # sit alongside; inventory-software-devices -- a fleet-wide software search
 # fragment with no REST twin proposed yet) -- net +3 untwinned, 206 -> 209.
-BASELINE_UNTWINNED = 209
+#
+# #2146 A2-R1 (merged into dev's 209 by the #4581-region dev-catch-up merge):
+# get.api-executions-param-children flipped planned:#2146 -> twinned (GET
+# /api/v1/executions/{id}/children + MCP get_execution_children) -- value
+# below reconciled post-merge against the actual measured count (208), not
+# hand-picked from either side's stale pre-merge number (212 vs 209).
+BASELINE_UNTWINNED = 208
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

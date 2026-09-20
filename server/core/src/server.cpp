@@ -190,6 +190,7 @@
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -15860,6 +15861,18 @@ private:
         // ready, degrading every `compare()` call to the AUTHORITATIVE nullopt.
         auto verify_api =
             make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
+        // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API seam —
+        // ONE instance backing the 9 GET /api/v1/dex/perf/* resources (minus
+        // /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/app-perf.
+        // Wired with the SAME `dex_perf_fn` closure (below) DexRoutes/the
+        // fragments already share, so the heartbeat-now denominator can never
+        // diverge between the seam and the fragments — mirrors DexApi's own
+        // FleetFn threading (dex_api, below). ADDITIONAL to app_perf_providers
+        // above (not a replacement): other consumers (the dashboard fragments)
+        // still read app_perf_providers directly until they migrate too.
+        auto dex_perf_api = make_local_dex_perf_api(
+            dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
+            app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -18306,7 +18319,14 @@ private:
             // null (constructed above iff the store is present, so `!dex_api`
             // is the exact readiness signal the old `!guaranteed_state_store`
             // guard was).
-            dex_api);
+            dex_api,
+            // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API
+            // seam — the 9 GET /api/v1/dex/perf/* handlers + the per-device
+            // drill require this and answer 503 when it is null, the exact
+            // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+            // guards produced (app_perf_providers stays wired above too — this
+            // is additive until every consumer migrates).
+            dex_perf_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18508,6 +18528,20 @@ private:
             // disagree. nullptr when the store is absent → the tools' !dex_api_
             // readiness guard answers "store unavailable" (byte-identical).
             mcp_server_->set_dex_api(dex_api);
+            // ADR-0031 WS-A4 (sixth family): the SAME DexPerfApi seam instance
+            // the REST /api/v1/dex/perf/* handlers use (constructed above,
+            // additive alongside app_perf_providers), so the 9 MCP DEX
+            // app-perf tool twins + get_dex_device_app_perf never disagree
+            // with REST. Unlike dex_api above, dex_perf_api is constructed
+            // UNCONDITIONALLY — never nullptr — because each backing store
+            // pointer is checked individually INSIDE the impl (dex_perf_api.cpp),
+            // exactly matching the old per-lambda null-checks in
+            // app_perf_providers; the tools' !dex_perf_api_ guard therefore
+            // never fires in practice (dex_perf_api_local.hpp's own banner
+            // states this), but stays as defense-in-depth against a future
+            // wiring change, and every server's stores fail closed at boot
+            // regardless — behaviourally identical to the old direct calls.
+            mcp_server_->set_dex_perf_api(dex_perf_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see

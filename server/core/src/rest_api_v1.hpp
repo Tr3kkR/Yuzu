@@ -19,6 +19,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -499,7 +500,20 @@ public:
         // use). The DEX signal handlers REQUIRE it: nullptr → those routes
         // answer 503, equivalent to the old `!guaranteed_state_store` readiness
         // guard (server.cpp wires this iff the store is present).
-        std::shared_ptr<const DexApi> dex_api = nullptr);
+        std::shared_ptr<const DexApi> dex_api = nullptr,
+        // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-
+        // over-time API seam — backs the 9 GET /api/v1/dex/perf/* resources
+        // (minus /compare, VerifyApi's) + GET /api/v1/dex/devices/{id}/app-perf
+        // (the SAME instance the MCP DEX perf tools use). REQUIRED: nullptr →
+        // those routes answer 503, equivalent to the old
+        // `!dex_perf_fn`/`!app_perf_providers.<member>` readiness guards.
+        // Unlike dex_api above, server.cpp constructs this UNCONDITIONALLY
+        // (never null) — each backing store pointer is checked individually
+        // inside the impl, matching the old per-lambda null-checks, so the
+        // route guard is defense-in-depth, never expected to fire.
+        // `app_perf_providers`/`dex_perf_fn` above stay wired too — this is an
+        // ADDITIONAL seam, not a replacement, until every consumer migrates.
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -591,7 +605,10 @@ public:
         std::shared_ptr<const DeviceApi> device_api = nullptr,
         // ADR-0031 WS-A4 (fifth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const DexApi> dex_api = nullptr);
+        std::shared_ptr<const DexApi> dex_api = nullptr,
+        // ADR-0031 WS-A4 (sixth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
