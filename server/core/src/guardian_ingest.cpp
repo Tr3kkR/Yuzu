@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <limits>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -108,6 +109,11 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
             return; // a malformed frame never reaches the store - not a timed ingest
         }
+        // #4606 criterion-10 T_server waypoint: server receipt, captured before
+        // store.insert_event_classified so store latency is not folded in.
+        const std::int64_t recv_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
         ev_row.rule_id = ev.rule_id();
@@ -210,6 +216,32 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
                          sanitize_label(agent_id), sanitize_label(ev_row.rule_id), res.error);
             return;
+        }
+        if (ev_row.rule_id != kObservationRuleId) {
+            // #4606 criterion-10 T_server: benchmark-diagnostic latency waypoint, always-on at
+            // info level (the shipped default is what the benchmark must measure). Best-effort —
+            // formatting/logging must never escape onto the gRPC ingest thread (same posture as
+            // the metrics try/catch above and the blast-radius try/catch below).
+            try {
+                const std::int64_t store_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                   std::chrono::steady_clock::now() - store_t0)
+                                                   .count();
+                // Agent-supplied wire timestamp, checked before use (untrusted protobuf input):
+                // nanos must be in [0, 1e9) and seconds must not overflow an int64 once scaled.
+                std::int64_t agent_ns = -1; // sentinel: invalid/unavailable
+                const std::int64_t secs = ev.timestamp().seconds();
+                const std::int32_t nanos = ev.timestamp().nanos();
+                constexpr std::int64_t kNsPerSec = 1'000'000'000;
+                if (nanos >= 0 && nanos < kNsPerSec && secs >= 0 &&
+                    secs <= (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
+                    agent_ns = secs * kNsPerSec + nanos;
+                spdlog::info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
+                             "committed_ns={} agent_ns={} store_ms={}",
+                             sanitize_label(ev_row.event_id), sanitize_label(agent_id),
+                             sanitize_label(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
+                             agent_ns, store_ms);
+            } catch (...) { // best-effort diagnostic; never propagate onto the ingest thread
+            }
         }
         // Fleet-wide incident detection — RULELESS observations only, and only
         // AFTER the event committed (a rolled-back duplicate must never count a

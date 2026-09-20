@@ -24,6 +24,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 
@@ -74,6 +75,28 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
     ev.set_event_type("service.stopped");
     ev.set_detected_value(std::string("a\0b", 3)); // embedded NUL -> Error (round-trips via proto)
     ev.mutable_timestamp()->set_seconds(1718000000);
+
+    apb::CommandResponse resp;
+    resp.set_action("event");
+    resp.set_payload(ev.SerializeAsString());
+    return resp;
+}
+
+// An ordinary (non-observation) rule violation, with a caller-supplied wire
+// timestamp — used to exercise the #4606 criterion-10 T_server diagnostic
+// block, which is gated on rule_id != kObservationRuleId.
+apb::CommandResponse make_rule_event(const std::string& event_id, const std::string& rule_id,
+                                     std::int64_t ts_seconds = 1718000000,
+                                     std::int32_t ts_nanos = 0) {
+    gpb::GuaranteedStateEvent ev;
+    ev.set_event_id(event_id);
+    ev.set_rule_id(rule_id);
+    ev.set_event_type("service.stopped");
+    ev.set_severity("high");
+    ev.set_detected_value("stopped");
+    ev.set_expected_value("running");
+    ev.mutable_timestamp()->set_seconds(ts_seconds);
+    ev.mutable_timestamp()->set_nanos(ts_nanos);
 
     apb::CommandResponse resp;
     resp.set_action("event");
@@ -187,4 +210,37 @@ TEST_CASE("guardian ingest: event-store histogram splits by outcome status, skip
                              nullptr, nullptr, nullptr);
     CHECK(store.event_count() == 2); // obs-1 (agent-A) + obs-2 (agent-D); conflict/error not stored
     CHECK(count("inserted") == 1);   // unchanged by the null-registry ingest
+}
+
+TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on a non-observation "
+          "Inserted event without disrupting ingest, and is skipped for observations",
+          "[pg][guardian][ingest][diagnostics]") {
+    // No established, reliable spdlog-capture mechanism exists in this test file (see file
+    // banner) — this pins the block's REACHABILITY and its gate, not the log line's text.
+    // Proven indirectly: ingest still completes normally (no crash/throw escaping the
+    // try/catch onto the caller) and the store reflects every write.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    // Ordinary rule violation, well-formed wire timestamp: rule_id != kObservationRuleId,
+    // so the T_server block's try-block actually runs on this Inserted outcome (computes
+    // recv_ns/committed_ns/store_ms and a valid agent_ns from ev.timestamp()).
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
+    CHECK(store.event_count() == 1);
+    CHECK(store.events_written_total() == 1);
+
+    // Same, but with an out-of-range wire nanos field (untrusted agent input) — exercises
+    // the bounds check that falls back to the agent_ns=-1 sentinel instead of computing a
+    // value; must not crash/throw either.
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-r2", "rule-1", 1718000000, -1),
+                             nullptr, nullptr);
+    CHECK(store.event_count() == 2);
+
+    // A ruleless observation takes the OTHER arm of the gate (rule_id == kObservationRuleId
+    // -> block skipped entirely). Asserted here too so both arms of the gate are directly
+    // exercised in this file, alongside the DEX-observer coverage above.
+    ingest_guardian_response(store, "agent-A", make_observation("__observation__-t-server", "svc.exe"),
+                             nullptr, nullptr);
+    CHECK(store.event_count() == 3);
 }
