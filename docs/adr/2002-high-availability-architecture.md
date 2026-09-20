@@ -933,8 +933,13 @@ ever received a real non-OK, non-transport grpc status; 4.4's `FAILED_PRECONDITI
 drip (paced at `replay_spacing_ms`, ~20ms/agent) can reach every agent at fleet scale — every agent the
 drip reaches after its row is tombstoned hits the reclaim path correctly (this is exactly what
 `reclaim_tombstoned_session` is for), but a large fleet recovering from a long outage will see a
-transient wave of `session_superseded`-adjacent reclaim activity rather than instant convergence. Filed
-as a follow-up issue alongside this slice's PR.
+transient wave of `session_superseded`-adjacent reclaim activity rather than instant convergence.
+Filed as `#4627`. Related hardening filed alongside it: `#4628` (`reclaim_tombstoned_session`
+absent-row/deregister-race/cross-txn edge cases), `#4629` (a defensive session-match guard on the
+REFUSE path's `disconnect/1` call), `#4630` (backpressure/alerting for a caller stuck REFUSE-looping),
+`#4631` (a concurrency test for the `register_fresh`-vs-`reclaim_tombstoned_session` epoch-ordering
+argument), `#4632` (`?MAX_NOTIFY_INFLIGHT` sizing/observability, now on this mechanism's critical
+path).
 
 **Round-2 review (post-implementation Fable pass) found three real bugs and one narrow gap in the
 first cut, all fixed before push:**
@@ -976,6 +981,55 @@ first cut, all fixed before push:**
   machine ever reaches `connecting`. An ADOPT landing in that narrow pre-Subscribe window left
   placement unrecovered until the session's next full disconnect/reconnect. Fixed to re-announce from
   `connecting` too, using the same `Data` fields `streaming`'s clause already reads.
+
+**Round 3 (full `/governance` pipeline, post-round-2) found three more BLOCKING clusters — all fixed
+before push, none deferred:**
+- **sec-H1 (BLOCKING):** round 2's reannounce fix converges placement only when its ONE-SHOT
+  `notify_stream_status` cast is actually delivered — a drop at `?MAX_NOTIFY_INFLIGHT` capacity or
+  during a circuit-open window (exactly the condition a fleet-wide reconnect storm produces) left the
+  row's `cluster_id` permanently NULL, and — this is the part round 2 missed — BatchHeartbeat's own
+  `renew_leases` call kept extending `lease_until` on that same row FOREVER, on every heartbeat,
+  regardless of whether `cluster_id` had ever converged. The agent stays fully connected and
+  heartbeating; the route stays permanently non-`routable`; nothing ever re-tombstones the row for a
+  later `reclaim_tombstoned_session` to fix. Fixed at the root: `renew_leases`'s `SET lease_until=...`
+  is now a `CASE` that LEAVES `lease_until` untouched when `cluster_id IS NULL` — heartbeat renewals
+  become a no-op for an unconverged row instead of an indefinite lease extension, so it now reaches its
+  OWN ordinary TTL+grace expiry and gets tombstoned by the existing, UNMODIFIED
+  `reap_stale_routes()` sweep (no reaper changes needed — that sweep already keys purely off
+  `lease_until`), giving the next replay (or the agent's own natural reconnect) another reclaim
+  attempt. A CONVERGED row is completely unaffected: `announce_connected` is the sole writer of
+  `cluster_id` and always grants a full, uncapped fresh lease on every genuine CONNECTED, independent
+  of anything `renew_leases` did beforehand.
+- **NEW-1/NEW-2 (BLOCKING, a truth-contradiction, not just a code gap):** round 2's own claim
+  ("both drop reasons now emit... telemetry ... mirroring the Guardian-forward path's existing
+  `forward_dropped` counter") was FALSE as shipped — `[yuzu, gw, upstream, notify_dropped]` was
+  emitted by `yuzu_gw_upstream.erl` but never added to `yuzu_gw_telemetry.erl`'s `?EVENTS` list,
+  `handle_event/4` clauses, or `declare_metrics/0`, so `telemetry:execute/3` on it was a pure no-op —
+  the drop was exactly as invisible as before round 2's "fix". Two independent Gate 6 reviewers
+  (compliance-officer, enterprise-readiness), in the same parallel wave, each independently read the
+  ADR prose and flagged the same false claim without being told to look for it — the strongest kind of
+  convergence this pipeline produces. Fixed: `notify_dropped` is now a real `?EVENTS` entry with a
+  `handle_event/4` clause and a `yuzu_gw_upstream_notify_dropped_total{reason}` counter, mirroring
+  `forward_dropped` exactly, plus a NEW test file (`yuzu_gw_telemetry_tests.erl`) that fires the event
+  through the REAL attached handler (no `telemetry` mock) and asserts the Prometheus counter moves —
+  closing a blind spot every OTHER producer module's own tests share (they all mock `telemetry:execute`
+  itself, which can prove the emission call happened but can never catch a consumption-side wiring gap
+  like this one).
+- **UP-4/COMP-6 (BLOCKING):** the replay-ADOPT decision's `renew_leases`/`reclaim_tombstoned_session`
+  calls were fail-OPEN on a degraded Postgres read (`adopt = true`), converting every replay in that
+  window into an unconditional, uncheckable ADOPT — bypassing the ENTIRE stale/zombie-refusal mechanism
+  this slice exists to add, at exactly the moment (a fleet-wide reconnect storm also stressing Postgres)
+  a genuine zombie replay is most likely. This is a materially different risk than this file's other
+  fail-open sites tolerate (a degraded `renew_leases`/`announce_connected` elsewhere just yields
+  premature lease-staleness — bounded, low-consequence); a wrong ADOPT here actively installs a
+  placement that may belong to a genuine zombie session, overwriting a healthy replica's correct one.
+  Fixed to fail-CLOSED (`UNAVAILABLE`), mirroring `register_fresh`'s own established precedent for
+  exactly this class of decision — a wrong answer worse than a refusal.
+- Also fixed, cheaply, in the same pass: a fourth real `grpcbox_client:unary/5` return shape
+  (`{http_error, {Status, Message}, Trailers}`, a non-grpc-layer HTTP error) was left uncovered by
+  round 2's `do_rpc` fix in BOTH `yuzu_gw_upstream.erl` and `yuzu_gw_heartbeat_buffer.erl` — same
+  crash class, closed the same way, each with its own regression test (consistency-auditor c-1 /
+  chaos-injector CH-2, which explicitly recommended fixing this now rather than deferring it).
 
 **The `yuzu_gw_cluster` gen_server** (adjacency/health/CPU/latency-based rebalancing gossip, named as
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the

@@ -257,6 +257,13 @@ TEST_CASE("ProxyRegister: presenting a KNOWN x-yuzu-session-id re-announces (ren
     // register_fresh never sets a lease (only announce_connected/renew_leases do).
     CHECK_FALSE((*row1)->lease_until_ms.has_value());
 
+    // Simulate the agent's own CONNECTED landing (HA WS-4 4.4 round-2 review
+    // fix, sec-H1: renew_leases now leaves lease_until untouched for a
+    // cluster_id-IS-NULL row, so a converged placement is required here for
+    // the renewal assertion below to mean what it says).
+    REQUIRE(store.announce_connected("agent-reannounce-1", session1, "zone-a", "node-a", 90)
+                .has_value());
+
     // Re-announce: present the SAME session id via x-yuzu-session-id metadata.
     auto resp2 = h.register_agent("agent-reannounce-1", session1);
     REQUIRE(resp2.accepted());
@@ -270,6 +277,57 @@ TEST_CASE("ProxyRegister: presenting a KNOWN x-yuzu-session-id re-announces (ren
     CHECK((*row2)->session_id == session1);
     // renew_leases fired instead of register_fresh.
     REQUIRE((*row2)->lease_until_ms.has_value());
+}
+
+TEST_CASE("ProxyRegister: renew_leases does NOT extend the lease for a row still lacking a "
+          "converged cluster_id — HA WS-4 4.4 round-2 review fix (sec-H1): an ADOPTED-but-"
+          "never-converged row must be able to EXPIRE via the ordinary reaper, not be kept "
+          "artificially alive forever by renewals",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto resp1 = h.register_agent("agent-unconverged-renew");
+    REQUIRE(resp1.accepted());
+    const std::string session1 = resp1.session_id();
+
+    // No announce_connected call — cluster_id stays NULL, exactly the state
+    // a replay-ADOPTED session sits in when its reannounce/2-triggered
+    // CONNECTED was dropped (MAX_NOTIFY_INFLIGHT capacity / circuit-open).
+    auto row_before = store.lookup_route("agent-unconverged-renew");
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->has_value());
+    CHECK_FALSE((*row_before)->cluster_id.has_value());
+    CHECK_FALSE((*row_before)->lease_until_ms.has_value());
+
+    // A replay re-announce (the same session, still known in-memory) is the
+    // ordinary BatchHeartbeat-equivalent renewal path for this row.
+    auto resp2 = h.register_agent("agent-unconverged-renew", session1);
+    REQUIRE(resp2.accepted());
+
+    auto row_after = store.lookup_route("agent-unconverged-renew");
+    REQUIRE(row_after.has_value());
+    REQUIRE(row_after->has_value());
+    CHECK_FALSE((*row_after)->cluster_id.has_value()); // still unconverged
+    // The core fix: no lease was granted just because the session was
+    // renewed — a stuck row must be able to reach its OWN natural
+    // lease-expiry (never having had one extended) so reap_stale_routes can
+    // eventually tombstone it and give a later reclaim another chance.
+    CHECK_FALSE((*row_after)->lease_until_ms.has_value());
+
+    // Once the SAME session's CONNECTED actually lands, convergence and
+    // leasing resume completely normally — the fix has no lasting effect on
+    // a session that eventually does confirm placement.
+    REQUIRE(store.announce_connected("agent-unconverged-renew", session1, "zone-c", "node-c", 90)
+                .has_value());
+    auto row_converged = store.lookup_route("agent-unconverged-renew");
+    REQUIRE(row_converged.has_value());
+    REQUIRE(row_converged->has_value());
+    CHECK((*row_converged)->cluster_id == "zone-c");
+    REQUIRE((*row_converged)->lease_until_ms.has_value());
 }
 
 TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id with NO existing row RECLAIMS "
@@ -1203,6 +1261,13 @@ TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in
     CHECK_FALSE((*row_before)->lease_until_ms.has_value()); // register_fresh sets no lease
     const auto epoch_before = (*row_before)->connection_epoch;
 
+    // HA WS-4 4.4 round-2 review fix (sec-H1): renew_leases now leaves
+    // lease_until untouched for a cluster_id-IS-NULL row, so this agent's
+    // CONNECTED must land (converging placement) before BatchHeartbeat's
+    // renewal below is expected to actually grant a lease.
+    REQUIRE(store.announce_connected("agent-hb-1", session_id, "zone-hb", "node-hb", 90)
+                .has_value());
+
     gw::BatchHeartbeatRequest batch;
     batch.set_gateway_node("node-hb");
     auto* hb = batch.add_heartbeats();
@@ -1240,6 +1305,11 @@ TEST_CASE("BatchHeartbeat: a duplicate session id in one batch and a lost-epoch-
     apb::RegisterResponse resp_live;
     REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_live, &resp_live).ok());
     const std::string live_session = resp_live.session_id();
+    // HA WS-4 4.4 round-2 review fix (sec-H1): converge placement so the
+    // renewal assertion below (a converged row IS granted a lease) is
+    // meaningful under the new cluster_id-gated renew_leases semantics.
+    REQUIRE(store.announce_connected("agent-hb-dup-1", live_session, "zone-dup", "node-dup", 90)
+                .has_value());
 
     // A session that LOSES its register_fresh epoch race — deterministic
     // single-threaded stand-in via raw_bump_epoch, mirrors the existing
@@ -1316,6 +1386,12 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
     apb::RegisterResponse resp_live;
     REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_live, &resp_live).ok());
     const std::string live_session = resp_live.session_id();
+    // HA WS-4 4.4 round-2 review fix (sec-H1): converge placement so the
+    // "still renews normally" assertion below is meaningful under the new
+    // cluster_id-gated renew_leases semantics.
+    REQUIRE(store.announce_connected("agent-hb-unknown-1", live_session, "zone-unk", "node-unk",
+                                     90)
+                .has_value());
 
     gw::BatchHeartbeatRequest batch;
     batch.set_gateway_node("node-hb-unknown");
@@ -1405,6 +1481,46 @@ TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAIL
     CHECK(events[1] == "agent-offline:agent-failclosed-1");
 
     bus.unsubscribe(sub);
+}
+
+TEST_CASE("ProxyRegister: a degraded GatewayRouteStore during the replay-ADOPT decision "
+          "REFUSES the RPC (fail-CLOSED) rather than trusting an unverified session — HA WS-4 "
+          "4.4 round-2 review fix (UP-4/COMP-6)",
+          "[gateway_route_wiring][grpc]") {
+    // UP-4 (round-2 Fable review, BLOCKING): the first cut of the ADOPT
+    // decision fail-OPENED on a degraded renew_leases/reclaim_tombstoned_session
+    // call (adopt=true), converting every replay in a degraded-store window
+    // into an unconditional, uncheckable ADOPT — bypassing the entire
+    // stale/zombie-refusal mechanism this slice exists to add, at exactly
+    // the moment (fleet-wide reconnect storm stressing Postgres) a genuine
+    // zombie replay is most likely. Fixed to fail-CLOSED, mirroring
+    // register_fresh's own established precedent for a decision whose wrong
+    // answer is more dangerous than a refusal (the row-CREATING write is
+    // fail-closed for exactly the same reason).
+    //
+    // Same broken-pool technique as the register_fresh fail-closed test
+    // above: an unparseable conninfo makes the store permanently
+    // `!open_` with no network I/O, so `renew_leases`/
+    // `reclaim_tombstoned_session` degrade immediately and deterministically.
+    PgPool broken_pool{{.conninfo = "not a valid conninfo string ===", .size = 1}};
+    GatewayRouteStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+    // A real grpc::Server + stub is required here (unlike the register_fresh
+    // test above) because reaching the replay-ADOPT branch at all needs a
+    // REAL x-yuzu-session-id client_metadata() value — context=nullptr
+    // always takes the fresh-registration branch (file header note).
+    LiveGatewayWiringHarness h(broken_store);
+
+    auto [status, resp] =
+        h.register_agent_status("agent-degraded-store-replay", "gw-session-presented-but-unverifiable");
+    CHECK_FALSE(status.ok()); // fail-CLOSED: the decision could not be verified
+    CHECK(status.error_code() == grpc::StatusCode::UNAVAILABLE);
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_write_failed_total",
+                       {{"op", "renew_leases"}, {"reason", "store_unavailable"}})
+              .value() == 1);
+    // Nothing was installed: no ghost session, no root-group membership.
+    CHECK(h.registry.get_session("agent-degraded-store-replay") == nullptr);
 }
 
 TEST_CASE("AgentRegistry::remove_agent_if_same: pointer identity, not session_id, is the "

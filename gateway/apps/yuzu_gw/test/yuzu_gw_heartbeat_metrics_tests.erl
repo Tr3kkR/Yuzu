@@ -26,6 +26,8 @@ heartbeat_metrics_test_() ->
       {"status_tags survive buffer retention on failure", fun tags_survive_failure/0},
       {"HA WS-4 4.4 (F3): a real grpc-status error does not crash the buffer",
        fun real_grpc_status_error_does_not_crash/0},
+      {"HA WS-4 4.4 (c-1/CH-2): an http_error shape does not crash",
+       fun http_error_shape_does_not_crash/0},
       {"empty status_tags heartbeat is valid", fun empty_tags_valid/0},
       {"status_tags are maps not lists", fun tags_are_maps/0}
      ]}.
@@ -252,6 +254,40 @@ real_grpc_status_error_does_not_crash() ->
     ?assertEqual(1, length(HBs)),
     [Sent] = HBs,
     ?assertEqual(<<"grpc-status-fail">>, maps:get(session_id, Sent)).
+
+http_error_shape_does_not_crash() ->
+    %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
+    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
+    %% `{http_error, {Status, Message}, Trailers}`, was left uncovered by the
+    %% F3 fix above despite sharing its root cause.
+    drain_buffer(),
+
+    HB = make_heartbeat(<<"http-error-fail">>, #{<<"yuzu.os">> => <<"linux">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
+    timer:sleep(20),
+
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {http_error, {502, <<>>}, #{}}
+    end),
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
+    timer:sleep(100),
+
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    ?assert(is_pid(Pid)),
+    ?assert(is_process_alive(Pid)),
+
+    meck:reset(grpcbox_client),
+    mock_batch_success(),
+    Pid ! flush,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(1, length(HBs)),
+    [Sent] = HBs,
+    ?assertEqual(<<"http-error-fail">>, maps:get(session_id, Sent)).
 
 empty_tags_valid() ->
     drain_buffer(),

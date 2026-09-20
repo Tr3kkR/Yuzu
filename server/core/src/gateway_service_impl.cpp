@@ -80,22 +80,35 @@ constexpr std::size_t kMaxStreamHomeIdLen = 64;
 // is PER-SITE, not uniform (Task B's per-site fail-closed contract): as of
 // 4.2b Task C the directory IS read for dispatch (fallback-only, on a local
 // registry miss), so the reader's trust predicate — not the write posture —
-// is the integrity backstop. Only the write whose LOSS is otherwise
-// unrecoverable is worth refusing the RPC over:
-//   - register_fresh (the ProxyRegister fresh-registration branch) is the
-//     ONE fail-CLOSED site — it CREATES the row, and a missed create persists
-//     until reconnect/4.4 with no other write on the path able to fill in a
-//     first row, so its caller returns UNAVAILABLE right after this call
-//     (mirrors the existing #3401 register_agent-failure precedent).
+// is the integrity backstop for most sites. Only a write whose LOSS is
+// otherwise unrecoverable, OR a READ whose wrong answer is more dangerous
+// than a refusal, is worth refusing the RPC over:
+//   - register_fresh (the ProxyRegister fresh-registration branch) — it
+//     CREATES the row, and a missed create persists until reconnect with no
+//     other write on the path able to fill in a first row, so its caller
+//     returns UNAVAILABLE right after this call (mirrors the existing #3401
+//     register_agent-failure precedent).
+//   - HA WS-4 4.4 round-2 review fix (UP-4/COMP-6): the replay-ADOPT
+//     decision's OWN renew_leases and reclaim_tombstoned_session calls (in
+//     ProxyRegister's presented-session branch, BEFORE register_agent runs)
+//     are ALSO fail-CLOSED — a degraded read here can't tell "still valid,
+//     adopt" from "superseded, refuse" any better than we can, and a wrong
+//     ADOPT installs a placement that may belong to a genuine zombie
+//     session, unconditionally overwriting a healthy replica's correct one.
+//     This is a stronger failure mode than register_fresh's own (a missed
+//     CREATE is merely absent; a wrong ADOPT actively clobbers), so it gets
+//     the same fail-closed treatment.
 //   - Every OTHER site stays fail-OPEN and proceeds — see each call site's
 //     own comment for why that site specifically tolerates a degraded write:
 //     announce_connected (the CONNECTED notify is a droppable gen_server:cast
 //     and set_gateway_route already published in-memory — failing it would
-//     split memory/directory state and risk a black hole), the two
-//     ProxyRegister renew branches and BatchHeartbeat's renew (a renew
-//     failure only yields premature lease-staleness, which the reader's
-//     `routable` predicate already treats as not-routable), and deregister
-//     (bounded by the 90s lease TTL regardless).
+//     split memory/directory state and risk a black hole), BatchHeartbeat's
+//     OWN renew_leases call (a renew failure only yields premature
+//     lease-staleness, which the reader's `routable` predicate already
+//     treats as not-routable — a fundamentally different risk than the
+//     decision-phase renew above, which decides ADOPT vs REFUSE rather than
+//     merely extending an already-adopted lease), and deregister (bounded by
+//     the 90s lease TTL regardless).
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
@@ -155,14 +168,17 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
     if (metrics_) {
         metrics_->describe(
             "yuzu_server_gateway_route_write_failed_total",
-            "HA WS-4: GatewayRouteStore directory writes (register_fresh/"
-            "announce_connected/deregister/renew_leases) that degraded instead of "
-            "succeeding, by op and reason. PER-SITE posture (4.2b): register_fresh "
-            "is fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); the other "
-            "writers stay fail-OPEN (the RPC proceeds, integrity living at the "
-            "fallback-only dispatch reader's trust predicate) - so for the fail-open "
-            "writers this counter is the only signal a systemic write failure would "
-            "otherwise leave invisible.",
+            "HA WS-4: GatewayRouteStore directory writes/reads (register_fresh/"
+            "announce_connected/deregister/renew_leases/reclaim_tombstoned_session) "
+            "that degraded instead of succeeding, by op and reason. PER-SITE posture "
+            "(4.2b, extended 4.4 round-2 review UP-4/COMP-6): register_fresh, and the "
+            "replay-ADOPT decision's own renew_leases/reclaim_tombstoned_session calls, "
+            "are fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); every other "
+            "writer (announce_connected, BatchHeartbeat's own renew_leases, deregister) "
+            "stays fail-OPEN (the RPC proceeds, integrity living at the fallback-only "
+            "dispatch reader's trust predicate) - so for the fail-open writers this "
+            "counter is the only signal a systemic write failure would otherwise leave "
+            "invisible.",
             "counter");
         // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
         // pre-seed every (op,reason) combo this counter can ACTUALLY emit (record_route_store_failure
@@ -590,13 +606,19 @@ gw_enrolled:
     // installed, instead of installing then rolling back.
     //
     // gateway_route_store.hpp's FORWARD NOTE states the binding rule this
-    // block implements: "mechanism (c) must ADOPT the presented session into
+    // block implements (docs-writer Gate 2 finding doc-S1: keep this quote
+    // in sync with that comment rather than restating an earlier draft of
+    // it — the reclaim_tombstoned_session clause below is NOT an
+    // undocumented deviation from the rule, it's the rule's second ADOPT
+    // path): "mechanism (c) must ADOPT the presented session into
     // gateway_sessions_/registry only if the directory renew_leases call
     // matched >= 1 row (a store-side CAS proving the row still belongs to
-    // that session) — NEVER write back a server-minted session to a gateway
-    // whose agent still holds the original." register_fresh must NEVER run
-    // for an adopted session: it mints a fresh epoch and unconditionally
-    // wins the guarded upsert, which would clobber a route a NEWER
+    // that session) OR the guarded CAS reclaim_tombstoned_session re-arms a
+    // row this session's row was TOMBSTONED under — NEVER write back a
+    // server-minted session to a gateway whose agent still holds the
+    // original." register_fresh must NEVER run for an adopted session: it
+    // mints a fresh epoch and unconditionally wins the guarded upsert,
+    // which would clobber a route a NEWER
     // connection already holds.
     std::string presented_session;
     if (context) {
@@ -635,11 +657,32 @@ gw_enrolled:
             auto renew_res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
                                                                  kGatewayRouteLeaseTtlSecs);
             if (!renew_res) {
-                // Fail-open (per-site contract, record_route_store_failure's
-                // header comment): a degraded read must not turn an
-                // otherwise-legitimate replay into a hard refusal.
+                // HA WS-4 4.4 review fix (round-2, UP-4/COMP-6): FAIL-CLOSED,
+                // deliberately breaking with this file's usual per-site
+                // fail-open convention (record_route_store_failure's header
+                // comment). Every OTHER fail-open site in this file degrades
+                // to "the lease looks slightly staler than it is" — bounded,
+                // low-consequence. THIS decision is different in kind: a
+                // wrong ADOPT here doesn't just accept a redundant write, it
+                // INSTALLS a placement that may belong to a genuine zombie
+                // session, unconditionally overwriting whatever a healthy
+                // replica correctly holds — the exact failure register_fresh
+                // is already fail-closed to prevent for a fresh registration.
+                // A degraded store can't distinguish "still valid, adopt" from
+                // "superseded, refuse" any better than we can, so refuse
+                // rather than gamble on the more dangerous of the two wrong
+                // answers. UNAVAILABLE (not FAILED_PRECONDITION): this is "we
+                // can't tell right now", not "we checked and it's stale" — the
+                // gateway's do_rpc/do_rpc_replay treats it as an ordinary
+                // transport-shaped failure (record_result_no_replay counts it
+                // against the breaker), not the FAILED_PRECONDITION-specific
+                // disconnect-and-force-reconnect path.
                 record_route_store_failure(metrics_, "renew_leases", renew_res.error());
-                adopt = true;
+                spdlog::warn("[gateway] ProxyRegister: degraded renew_leases during replay-adopt "
+                            "decision for agent {} — refusing (fail-closed) rather than adopting "
+                            "an unverified session", info.agent_id());
+                return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                    "routing directory unavailable");
             } else if (*renew_res >= 1) {
                 // The durable directory still owns this session for this
                 // agent (this replica's in-memory map may or may not have
@@ -655,9 +698,16 @@ gw_enrolled:
                 auto reclaim_res = gateway_route_store_->reclaim_tombstoned_session(
                     info.agent_id(), presented_session, kGatewayRouteLeaseTtlSecs);
                 if (!reclaim_res) {
+                    // Same fail-CLOSED rationale as the renew_leases degraded
+                    // branch above — see that comment.
                     record_route_store_failure(metrics_, "reclaim_tombstoned_session",
                                                reclaim_res.error());
-                    adopt = true; // fail-open, same rationale as above
+                    spdlog::warn("[gateway] ProxyRegister: degraded reclaim_tombstoned_session "
+                                "during replay-adopt decision for agent {} — refusing "
+                                "(fail-closed) rather than adopting an unverified session",
+                                info.agent_id());
+                    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                        "routing directory unavailable");
                 } else if (*reclaim_res) {
                     adopt = true;
                     store_confirmed_adopt = true;

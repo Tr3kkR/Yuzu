@@ -554,10 +554,33 @@ GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
     session_views.reserve(session_ids.size());
     for (const std::string& s : session_ids)
         session_views.emplace_back(s);
+    // HA WS-4 4.4 round-2 review fix (sec-H1, BLOCKING): a row that was
+    // ADOPTED or RECLAIMED (session_id set) but never received its own
+    // confirming CONNECTED (cluster_id/gateway_node still NULL — e.g. the
+    // reannounce/2 notification that would have confirmed it was dropped
+    // at ?MAX_NOTIFY_INFLIGHT capacity or during a circuit-open window)
+    // must NOT have its lease extended indefinitely by ordinary
+    // BatchHeartbeat renewals — the agent keeps heartbeating (so nothing
+    // else ever notices), while the row stays PERMANENTLY unroutable
+    // (`routable` requires `cluster_id IS NOT NULL`) with no path back to
+    // `reclaim_tombstoned_session` ever running again. `LEAST(...)` caps a
+    // cluster_id-IS-NULL row's lease at whatever it already was — heartbeat
+    // renewals become a no-op for it instead of pushing it forward forever
+    // — so it lets the EXISTING expired-lease sweep in
+    // `reap_stale_routes()` tombstone it after the ordinary TTL+grace
+    // window (no reaper change needed: that sweep already keys purely off
+    // `lease_until`), giving the NEXT circuit-recovery replay (or the
+    // agent's own natural reconnect) another reclaim attempt. A CONVERGED
+    // row (cluster_id set) is completely unaffected — `announce_connected`
+    // is the sole writer of `cluster_id`, and it always grants a full,
+    // uncapped fresh lease on every genuine CONNECTED, independent of
+    // whatever this function did beforehand.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes AS r SET "
-        "  lease_until = now() + ($3 || ' seconds')::interval, updated_at = now() "
+        "  lease_until = CASE WHEN r.cluster_id IS NULL THEN r.lease_until "
+        "                     ELSE now() + ($3 || ' seconds')::interval END, "
+        "  updated_at = now() "
         "FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
         "WHERE r.agent_id = t.agent_id AND r.session_id = t.session_id "
         "RETURNING r.agent_id",

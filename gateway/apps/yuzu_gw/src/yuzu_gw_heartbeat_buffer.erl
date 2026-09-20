@@ -193,6 +193,19 @@ do_flush(BatchReq, BufLen) ->
             logger:warning("BatchHeartbeat failed (~b buffered): ~p ~s",
                            [BufLen, Status, Message]),
             {error, {Status, Message}};
+        {http_error, {Status, _}, _Trailers} ->
+            %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
+            %% chaos-injector CH-2), mirrors yuzu_gw_upstream:do_rpc/4's
+            %% identical fix — see that clause's comment for the full
+            %% rationale (a fourth real grpcbox_client:unary/5 return shape
+            %% this file's classifier didn't cover either).
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => <<"batch_heartbeat">>,
+                                code => Status}),
+            logger:warning("BatchHeartbeat failed (~b buffered) with HTTP-level error: ~p",
+                           [BufLen, Status]),
+            {error, {internal, iolist_to_binary(io_lib:format("http_error ~p", [Status]))}};
         {error, Reason} ->
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},

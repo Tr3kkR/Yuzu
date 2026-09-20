@@ -275,9 +275,30 @@ WS-8-readyz.**
 > `?MAX_NOTIFY_INFLIGHT` with everything else and dropped silently at
 > capacity (I6a); fixed with drop telemetry + drip backpressure. F3
 > (BLOCKING) — `yuzu_gw_heartbeat_buffer.erl` had the SAME impossible
-> `do_rpc`-shaped error clause; fixed identically. Deliberately deferred as
-> the one remaining follow-up, not WS-4-gate-blocking: the
-> reap-vs-replay-drip race after a >270s outage at fleet scale. The
+> `do_rpc`-shaped error clause; fixed identically. **A full `/governance`
+> pass (round 3) then found 3 MORE blocking issues round 2 itself
+> introduced or missed**: sec-H1 — round 2's reannounce fix converges
+> placement only if its notify is actually delivered, and a dropped one left
+> `cluster_id` permanently NULL while BatchHeartbeat's `renew_leases` kept
+> extending the row's lease forever regardless — fixed by making
+> `renew_leases` leave `lease_until` untouched for a `cluster_id`-NULL row,
+> so it reaches its own ordinary TTL+grace expiry and the EXISTING,
+> unmodified reaper tombstones it, giving the next replay another reclaim
+> shot (no reaper changes needed). NEW-1/NEW-2 — round 2's own claim that
+> both drop reasons "now emit telemetry" was FALSE as shipped: the event was
+> never wired into `yuzu_gw_telemetry.erl`'s `?EVENTS`/`handle_event`/
+> `declare_metrics`, so it was a pure no-op — two Gate-6 reviewers
+> independently caught the same false ADR claim in the same wave; fixed by
+> wiring it for real, with a new test file that fires the REAL event through
+> the real handler (every other module's tests mock `telemetry` itself,
+> which can't catch this class of gap). UP-4/COMP-6 — the decision's own
+> `renew_leases`/`reclaim_tombstoned_session` calls were fail-OPEN on a
+> degraded Postgres read, so a degraded-store window bypassed the entire
+> stale/zombie-refusal mechanism outright; fixed to fail-CLOSED, mirroring
+> `register_fresh`'s own precedent for exactly this class of decision.
+> Deliberately deferred as the one remaining follow-up, not WS-4-gate-blocking: the
+> reap-vs-replay-drip race after a >270s outage at fleet scale — filed as
+> `#4627`, with related hardening filed alongside it (`#4628`-`#4632`). The
 > `yuzu_gw_cluster` gossip/adjacency gen_server `#4555`'s design notes
 > named as "remaining 4.4 scope" is judged OUT of WS-4 entirely
 > (capacity/rebalancing, not reachability — the WS-4 gate exists because

@@ -697,6 +697,24 @@ do_rpc(Method, Request, Tag, Ctx) ->
                                 code => Status}),
             logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, Message]),
             {error, {Status, Message}};
+        {http_error, {Status, _}, _Trailers} ->
+            %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
+            %% chaos-injector CH-2): a FOURTH real grpcbox_client:unary/5
+            %% return shape (unary_handler's `{http_error, Status, Headers}`
+            %% branch, grpcbox_client.erl) for a non-grpc-layer HTTP error
+            %% (e.g. a stripped/mangled response from something in front of
+            %% the actual gRPC service) — same crash-class gap as the
+            %% `{error, {Status, Message}, Trailers}` fix above, and left
+            %% unclosed by that fix despite sharing its root cause. Never
+            %% observed in practice (the gateway talks to the C++ server
+            %% directly, no intermediary), but cheap to close now rather
+            %% than chase a `case_clause` crash in production later.
+            telemetry:execute([yuzu, gw, upstream, rpc_error],
+                              #{count => 1},
+                              #{rpc_name => atom_to_binary(Tag, utf8),
+                                code => Status}),
+            logger:warning("Upstream RPC ~s failed with HTTP-level error: ~p", [Method, Status]),
+            {error, {internal, iolist_to_binary(io_lib:format("http_error ~p", [Status]))}};
         {error, Reason} ->
             %% R-3 (#1243): emit a DISTINCT metric for a TLS handshake failure
             %% (cert expiry / CA rotation / wrong-SAN / unreadable cert) so it is
