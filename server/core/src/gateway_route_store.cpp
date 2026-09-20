@@ -381,12 +381,17 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
     // Same ON-CONFLICT-DO-UPDATE-WHERE idiom as register_fresh's guarded
-    // upsert, but the guard is `session_id IS NULL` (tombstoned or a fresh
-    // The INSERT branch supplies the real session_id directly, so the
-    // `session_id IS NULL` guard only ever matters on the UPDATE/conflict
-    // branch — this is a resurrection of the SAME session, not a new one
-    // racing for the row, so the guard is on session identity, not an
-    // epoch comparison. connection_epoch is 0 on a brand-new row (INSERT)
+    // upsert, but the guard is `session_id IS NULL` — a genuinely
+    // TOMBSTONED row (deregister sets session_id=NULL, never a
+    // register_fresh row, whose session_id is set immediately on creation).
+    // The INSERT branch (no existing row at all) supplies the real
+    // session_id directly, so this `session_id IS NULL` guard only ever
+    // matters on the UPDATE/conflict branch — this is a resurrection of the
+    // SAME session under a tombstone, not a new one racing for the row, so
+    // the guard is on session identity, not an epoch comparison.
+    // (HA WS-4 4.4 post-build review, PR #4636 FortitudeEtc minor finding:
+    // this comment was previously truncated mid-sentence — corrected here,
+    // no code change.) connection_epoch is 0 on a brand-new row (INSERT)
     // and UNTOUCHED on a re-armed existing tombstone (UPDATE never sets
     // it) — either way a genuine concurrent or later register_fresh still
     // always wins regardless of commit order (file header "THE FENCE"):

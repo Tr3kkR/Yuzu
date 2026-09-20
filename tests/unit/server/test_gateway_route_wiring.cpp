@@ -48,11 +48,13 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
@@ -594,7 +596,11 @@ TEST_CASE("ProxyRegister: a ZOMBIE unknown presented session (the agent's row be
 // ── #8 desync counters: announce_connected / deregister mismatch ───────────
 
 TEST_CASE("NotifyStreamStatus: a STALE CONNECTED for a session already superseded by a genuine "
-          "newer registration reports matched=false and bumps the desync counter",
+          "newer registration is REJECTED outright and never reaches announce_connected — HA "
+          "WS-4 4.4 post-build review fix (PR #4636 FortitudeEtc BLOCKER 2): "
+          "AgentRegistry::set_gateway_route is now session-checked, so a delayed reannounce for "
+          "a superseded session can no longer clobber the CURRENT session's in-memory "
+          "gateway_node/capabilities/stream_home_id",
           "[pg][gateway_route_wiring]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -623,28 +629,67 @@ TEST_CASE("NotifyStreamStatus: a STALE CONNECTED for a session already supersede
     const std::string session2 = resp2.session_id();
     REQUIRE(session2 != session1);
 
-    // A stale CONNECTED for the now-superseded session1.
+    // session2's OWN legitimate CONNECTED — establishes a known-good baseline
+    // in the in-memory registry to assert against below.
+    gw::StreamStatusNotification good_notif;
+    good_notif.set_agent_id("agent-mismatch-1");
+    good_notif.set_session_id(session2);
+    good_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    good_notif.set_cluster_id("cluster-2");
+    good_notif.set_gateway_node("node-2");
+    good_notif.add_wire_capabilities("cap-real");
+    good_notif.set_stream_home_id("home-2");
+    gw::StreamStatusAck good_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &good_notif, &good_ack).ok());
+    REQUIRE(good_ack.acknowledged());
+
+    // A stale, DELAYED CONNECTED for the now-superseded session1 — still a
+    // live entry in gateway_sessions_ (passes that check), but no longer the
+    // CURRENT session for this agent.
     gw::StreamStatusNotification notif;
     notif.set_agent_id("agent-mismatch-1");
     notif.set_session_id(session1);
     notif.set_event(gw::StreamStatusNotification::CONNECTED);
     notif.set_cluster_id("cluster-stale");
     notif.set_gateway_node("node-stale");
+    notif.add_wire_capabilities("should-not-apply");
+    notif.set_stream_home_id("home-stale");
     gw::StreamStatusAck ack;
     REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
-    CHECK(ack.acknowledged()); // the in-memory gateway_sessions_ guard still passes
+    // The core fix: rejected outright, not silently accepted.
+    CHECK_FALSE(ack.acknowledged());
 
-    // The store's session-guarded UPDATE did NOT match — session2 owns the row.
+    // Rejected BEFORE reaching announce_connected at all — the store's row
+    // stays exactly as session2's own legitimate CONNECTED left it.
     auto row = store.lookup_route("agent-mismatch-1");
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     CHECK((*row)->session_id == session2);
-    CHECK_FALSE((*row)->cluster_id.has_value()); // stale CONNECTED did not write through
+    CHECK((*row)->cluster_id == "cluster-2"); // session2's write, untouched by the stale attempt
+
+    // The registry-level assertion this finding's own regression test was
+    // missing: session2's in-memory gateway_node/capabilities/stream_home_id
+    // are UNCHANGED by the stale CONNECTED, not merely the store row.
+    CHECK(registry.gateway_has_wire_capability("agent-mismatch-1", "cap-real"));
+    CHECK_FALSE(registry.gateway_has_wire_capability("agent-mismatch-1", "should-not-apply"));
+    auto home2 = registry.gateway_stream_home_id("agent-mismatch-1", session2);
+    REQUIRE(home2.has_value());
+    CHECK(*home2 == "home-2");
+    // session1 is no longer the installed session at all, so this accessor's
+    // own session guard returns nullopt for it — a second, independent proof
+    // the stale CONNECTED never became "current" in the registry either.
+    CHECK_FALSE(registry.gateway_stream_home_id("agent-mismatch-1", session1).has_value());
 
     CHECK(metrics
               .counter("yuzu_server_gateway_route_desync_total",
-                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+                       {{"op", "notify_stream_status"}, {"outcome", "stale_connected_session"}})
               .value() == 1);
+    // Never reached announce_connected, so the old outcome this test used to
+    // pin never fires for this scenario anymore.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+              .value() == 0);
 }
 
 TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race does NOT bump the "
@@ -1698,4 +1743,85 @@ TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore announce_connected w
               .counter("yuzu_server_gateway_route_write_failed_total",
                        {{"op", "announce_connected"}, {"reason", "store_unavailable"}})
               .value() == 1);
+}
+
+TEST_CASE("ProxyRegister: a concurrent FRESH registration completing between a REPLAY's "
+          "decide-phase and its own install cannot be clobbered — HA WS-4 4.4 post-build review "
+          "fix (PR #4636 FortitudeEtc BLOCKER 1): registration_lock_for serializes "
+          "decide->install per agent_id, so the two can never interleave in memory and the "
+          "durable store the way the finding described",
+          "[pg][gateway_route_wiring][grpc]") {
+    // NOTE: no Catch2 assertion macro (REQUIRE/CHECK) may run on any thread
+    // other than this test's own — Catch2's assertion machinery is not
+    // thread-safe. Every value the interleave hook and the spawned thread
+    // below observe is captured into a plain/atomic variable and asserted
+    // on ONLY after both the replay's own gRPC call (this thread, blocking
+    // on the stub as usual) and t_b (joined below) have returned.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto resp_old = h.register_agent("agent-concurrent-race");
+    const std::string session_old = resp_old.session_id();
+
+    std::atomic<bool> b_finished{false};
+    std::atomic<bool> b_finished_during_hook_window{false};
+    std::string session_new;
+    std::thread t_b;
+
+    h.svc.set_proxy_register_interleave_hook_for_test([&] {
+        // Fires INSIDE the replay's (session_old's) critical section — after
+        // its decide-phase confirmed adopt via renew_leases, before
+        // register_agent installs anything (the exact window BLOCKER 1
+        // described). Spawn a competing FRESH registration for the SAME
+        // agent_id: pre-fix, this thread would very likely install AND
+        // register_fresh well within the sleep below, since nothing blocked
+        // it; post-fix, it must block trying to acquire the SAME per-agent
+        // mutex this call already holds, and cannot possibly finish before
+        // this call's own critical section ends.
+        t_b = std::thread([&] {
+            auto result = h.register_agent_status("agent-concurrent-race");
+            if (result.first.ok()) session_new = result.second.session_id();
+            b_finished.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        b_finished_during_hook_window.store(b_finished.load(std::memory_order_acquire),
+                                            std::memory_order_release);
+    });
+
+    auto [replay_status, replay_resp] =
+        h.register_agent_status("agent-concurrent-race", session_old);
+    REQUIRE(replay_status.ok());
+    CHECK(replay_resp.session_id() == session_old); // adopted, not re-minted
+
+    REQUIRE(t_b.joinable());
+    t_b.join();
+
+    // The deterministic proof: t_b could NOT complete during the 200ms the
+    // replay's own critical section held the per-agent lock (its own hook's
+    // sleep, executed WHILE still holding that lock).
+    CHECK_FALSE(b_finished_during_hook_window.load());
+    REQUIRE(b_finished.load());
+    REQUIRE_FALSE(session_new.empty());
+    REQUIRE(session_new != session_old);
+
+    // Because the lock fully serializes the two calls, the fresh
+    // registration's install (which necessarily ran SECOND, after the
+    // replay's own install completed and released the lock) is never
+    // clobbered by anything running afterward — there is nothing left to
+    // interleave with. Both the in-memory registry AND the durable store
+    // agree on session_new as current; pre-fix, the finding's own
+    // interleaving could leave these disagreeing (store on the fresh
+    // session, registry on the stale replay).
+    auto home_new = h.registry.gateway_stream_home_id("agent-concurrent-race", session_new);
+    CHECK(home_new.has_value());
+    CHECK_FALSE(
+        h.registry.gateway_stream_home_id("agent-concurrent-race", session_old).has_value());
+
+    auto row = store.lookup_route("agent-concurrent-race");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_new);
 }

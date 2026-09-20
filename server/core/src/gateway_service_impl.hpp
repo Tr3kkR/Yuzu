@@ -64,6 +64,11 @@ public:
     /// disables the writes — every write site below is fail-OPEN and tolerates
     /// a null store the same way it tolerates a degraded write.
     void set_gateway_route_store(GatewayRouteStore* store) { gateway_route_store_ = store; }
+    /// Test-only, see ProxyRegister's `proxy_register_interleave_hook_for_test_`
+    /// firing-point comment in gateway_service_impl.cpp.
+    void set_proxy_register_interleave_hook_for_test(std::function<void()> hook) {
+        proxy_register_interleave_hook_for_test_ = std::move(hook);
+    }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -199,6 +204,45 @@ private:
     // at ProxyRegister time and removed together with gateway_sessions_'s
     // entry on DISCONNECTED.
     std::unordered_set<std::string> lost_race_sessions_;
+
+    // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    // BLOCKER 1): a per-agent striped lock serializing ProxyRegister's own
+    // decide (renew_leases/reclaim_tombstoned_session) -> install
+    // (AgentRegistry::register_agent/GatewayRouteStore::register_fresh ->
+    // map_session -> gateway_sessions_) sequence for one agent_id at a time.
+    // Without it, two concurrent ProxyRegister calls for the SAME agent_id
+    // (an ordinary reconnect-storm timing, no partition required) can
+    // interleave: a stale replay's decide-phase confirms its presented
+    // session still owns the durable row, then — before that replay calls
+    // register_agent — an entirely separate FRESH registration for the same
+    // agent completes in full (both its own register_agent install AND its
+    // register_fresh, which unconditionally wins the row). The replay then
+    // proceeds to call register_agent: AgentRegistry::register_agent's own
+    // two-phase guard (agent_registry.cpp) only catches a second call that
+    // STARTS during THIS call's revoke window, not one that already
+    // completed entirely beforehand — so the replay's install silently
+    // overwrites the fresh registration's in-memory AgentSession, leaving
+    // the durable store correctly on the fresh session while the in-memory
+    // registry (what `send_to` actually dispatches through) points at the
+    // stale one. Striped (one mutex per agent_id, not a single global lock)
+    // so unrelated agents' registrations never contend; the map itself is
+    // never pruned, matching `AgentRegistry::agents_`'s own never-erase-the-
+    // key lifetime (bounded by the number of DISTINCT agents ever seen, not
+    // by connection churn).
+    std::mutex registration_locks_mu_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> registration_locks_;
+
+    /// Returns the (lazily-created) per-agent registration mutex for
+    /// `agent_id`. The returned shared_ptr keeps the mutex alive for the
+    /// caller's lock_guard even if another thread races to look up the same
+    /// agent_id concurrently (the map itself is only touched under
+    /// `registration_locks_mu_`, released before the returned mutex is ever
+    /// locked).
+    std::shared_ptr<std::mutex> registration_lock_for(const std::string& agent_id);
+
+    /// Test-only, see the setter above and ProxyRegister's firing-point
+    /// comment. nullptr (default) in production.
+    std::function<void()> proxy_register_interleave_hook_for_test_;
 };
 
 // -- ManagementServiceImpl (placeholder) --------------------------------------

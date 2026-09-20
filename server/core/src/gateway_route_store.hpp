@@ -34,9 +34,26 @@
 /// guarded by `session_id`, not by epoch — they only touch the row if it still
 /// belongs to THIS session. A stale CONNECTED/DISCONNECTED from a DIFFERENT,
 /// already-superseded session therefore cannot overwrite or tear down a
-/// newer re-home: `announce_connected` no-ops (falls through to an
-/// `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
+/// newer re-home IN THIS STORE: `announce_connected` no-ops (falls through to
+/// an `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
 /// `deregister` tombstones zero rows.
+///
+/// This guarantee was DURABLE-STORE-ONLY through HA WS-4 4.4's initial push
+/// (PR #4636 FortitudeEtc post-build review, BLOCKER 2): the IN-MEMORY
+/// `AgentRegistry::set_gateway_route` (agent_registry.cpp) had NO session
+/// check at all — a delayed CONNECTED for a session already superseded by a
+/// genuine newer registration could still clobber the newer session's
+/// `gateway_node`/capabilities/`stream_home_id` in memory even though this
+/// store's own row stayed correct, a real end-to-end gap this file's own
+/// prose read as already closed. Fixed in the same PR:
+/// `AgentRegistry::set_gateway_route` now takes and checks `session_id`
+/// against the currently-installed session (mirroring
+/// `gateway_stream_home_id`'s own pre-existing guard) and returns `false`
+/// (nothing written) on a mismatch; `NotifyStreamStatus`'s CONNECTED handler
+/// rejects the RPC outright on `false` rather than falling through to this
+/// store's own (already-correct) `announce_connected` write. The claim below
+/// is therefore now genuinely end-to-end — memory AND store both refuse a
+/// stale session — not store-only as it was when first written.
 /// LIMIT (as of 4.2a) — a SAME-session late notification was NOT fenced by
 /// `session_id` alone: the re-announce path deliberately REUSES the session
 /// id, so `session_id` equality cannot distinguish an old home's teardown

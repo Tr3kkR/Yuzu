@@ -241,6 +241,16 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "deregister"}, {"outcome", "malformed_home_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
+        // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+        // BLOCKER 2): a CONNECTED whose session_id is a live entry in
+        // gateway_sessions_ (passes the check above) but is no longer the
+        // CURRENTLY-installed session for this agent in the in-memory
+        // registry — a delayed/superseded reannounce arriving after a
+        // genuine newer registration has already installed. Rejected by
+        // AgentRegistry::set_gateway_route's own session check rather than
+        // clobbering the newer session's placement.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "notify_stream_status"}, {"outcome", "stale_connected_session"}});
         // HA WS-4 4.4 (`#4246` #6): a replay's presented session belonged to
         // a DIFFERENT, LIVE session by the time reclaim_tombstoned_session
         // ran — a genuine stale/zombie replay, refused outright (see
@@ -248,6 +258,14 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_superseded"}});
     }
+}
+
+std::shared_ptr<std::mutex>
+GatewayUpstreamServiceImpl::registration_lock_for(const std::string& agent_id) {
+    std::lock_guard lock(registration_locks_mu_);
+    auto& slot = registration_locks_[agent_id];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    return slot;
 }
 
 // -- ProxyRegister ------------------------------------------------------------
@@ -620,6 +638,16 @@ gw_enrolled:
     // mints a fresh epoch and unconditionally wins the guarded upsert,
     // which would clobber a route a NEWER
     // connection already holds.
+    // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    // BLOCKER 1): held for the ENTIRE remainder of this function — every
+    // return path from here on releases it via RAII. See
+    // registration_locks_'s header comment for the exact interleaving this
+    // closes (a concurrent fresh registration for this SAME agent_id
+    // completing its own decide+install between THIS call's decide and its
+    // own register_agent/register_fresh/map_session install).
+    auto reg_lock_ptr = registration_lock_for(info.agent_id());
+    std::lock_guard<std::mutex> reg_lock(*reg_lock_ptr);
+
     std::string presented_session;
     if (context) {
         presented_session = AgentServiceImpl::client_metadata_value(
@@ -740,6 +768,22 @@ gw_enrolled:
                                 "session superseded; reconnect");
         }
         session_id = presented_session;
+    }
+
+    // Test-only interleave seam (HA WS-4 4.4 post-build review, PR #4636
+    // FortitudeEtc BLOCKER 1 regression test): fires once, synchronously,
+    // in the EXACT window the finding cited — after the decide-phase above,
+    // before register_agent installs anything. A test callback that itself
+    // dispatches a competing ProxyRegister for the SAME agent_id from here
+    // deterministically proves registration_lock_for's serialization (that
+    // competing call blocks on the same per-agent mutex this call already
+    // holds, rather than racing to install ahead of it). No-op (nullptr) in
+    // production. Mirrors AgentRegistry::register_agent's own
+    // register_agent_interleave_hook_for_test_ seam (Gate 5 CH-1a).
+    if (proxy_register_interleave_hook_for_test_) {
+        auto hook = std::move(proxy_register_interleave_hook_for_test_);
+        proxy_register_interleave_hook_for_test_ = nullptr;
+        hook();
     }
 
     // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
@@ -1354,8 +1398,28 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             record_directory_desync(metrics_, "announce_connected", "malformed_home_id");
             stream_home_id.clear();
         }
-        registry_.set_gateway_route(agent_id, request->gateway_node(),
-                                    std::move(wire_capabilities), stream_home_id);
+        // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+        // BLOCKER 2): the session check just above (gateway_sessions_) only
+        // proves `session_id` is SOME live entry for this agent — multiple
+        // sessions can coexist there until each is individually torn down by
+        // its own DISCONNECTED — not that it is the CURRENT one. Without this
+        // check, set_gateway_route would publish a delayed/superseded
+        // session's placement over a genuinely newer registration's, ahead of
+        // the durable store even getting a chance to reject the corresponding
+        // announce_connected write below. A `false` return means a different,
+        // now-current session is installed for this agent — reject this
+        // CONNECTED outright rather than publishing a stale route or
+        // continuing to the (now-meaningless) announce_connected write.
+        if (!registry_.set_gateway_route(agent_id, session_id, request->gateway_node(),
+                                         std::move(wire_capabilities), stream_home_id)) {
+            spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) is "
+                        "no longer the currently-installed session — rejecting the publish "
+                        "rather than clobbering a newer registration's placement",
+                        session_id, agent_id);
+            record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
+            response->set_acknowledged(false);
+            return grpc::Status::OK;
+        }
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a

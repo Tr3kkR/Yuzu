@@ -280,11 +280,16 @@ WS-8-readyz.**
 > introduced or missed**: sec-H1 — round 2's reannounce fix converges
 > placement only if its notify is actually delivered, and a dropped one left
 > `cluster_id` permanently NULL while BatchHeartbeat's `renew_leases` kept
-> extending the row's lease forever regardless — fixed by making
-> `renew_leases` leave `lease_until` untouched for a `cluster_id`-NULL row,
-> so it reaches its own ordinary TTL+grace expiry and the EXISTING,
-> unmodified reaper tombstones it, giving the next replay another reclaim
-> shot (no reaper changes needed). NEW-1/NEW-2 — round 2's own claim that
+> extending the row's lease AND `updated_at` forever regardless — fixed by
+> making `renew_leases` freeze BOTH `lease_until` AND `updated_at` for a
+> `cluster_id`-NULL row (freezing `lease_until` alone, the round-3 fix as
+> first shipped, does nothing for a `register_fresh` row whose `lease_until`
+> is already NULL from creation — only the `updated_at`-keyed tombstone/
+> never-announced purge sweep can ever reach it; caught by a targeted
+> post-build Fable review before push), so it reaches its own ordinary
+> TTL+grace/purge age and gets deleted, giving the next replay another
+> reclaim shot — not an instant self-heal, since convergence still needs
+> that next replay or reconnect. NEW-1/NEW-2 — round 2's own claim that
 > both drop reasons "now emit telemetry" was FALSE as shipped: the event was
 > never wired into `yuzu_gw_telemetry.erl`'s `?EVENTS`/`handle_event`/
 > `declare_metrics`, so it was a pure no-op — two Gate-6 reviewers

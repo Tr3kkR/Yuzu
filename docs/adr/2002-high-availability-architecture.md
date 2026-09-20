@@ -1056,6 +1056,62 @@ further, deliberately-deferred limitation:
   offered alternative (a bounded re-queue-at-tail retry is more invasive than this slice's remaining
   budget justifies).
 
+**Post-build review (PR #4636, FortitudeEtc — an independent Kimi+Codex empirical panel, cross-examined
+and adjudicated) found and fixed 2 more real, HIGH, BLOCKING bugs before merge — both downstream of the
+durable store's own (already-correct) fencing, in code the internal `/governance` pass on this PR did
+not cover:**
+- **BLOCKER 1 — a concurrent fresh registration could be silently overwritten in memory by a stale
+  replay's later install.** `ProxyRegister`'s decide phase (`renew_leases`/`reclaim_tombstoned_session`,
+  proving a presented session still owns the row) and its own install
+  (`register_agent`/`register_fresh`/`map_session`/`gateway_sessions_`) had no lock spanning the two.
+  `AgentRegistry::register_agent`'s own two-phase guard only catches a second `register_agent` call that
+  STARTS during THIS call's device-token-revoke window — not one that already ran to completion
+  beforehand — so if an entirely separate, fresh `ProxyRegister` for the SAME agent (session S2)
+  completed in full between a replay's (session S1) decide phase and its own `register_agent` call
+  (ordinary reconnect-storm timing, no partition required), the replay's install would silently
+  overwrite S2's in-memory `AgentSession` — wiping its `gateway_node`/capabilities — while the durable
+  store stayed correctly on S2 (the replay's own adopt path issues no store write of its own). End state:
+  store = S2 (correct), in-memory registry = S1 (stale); `send_to` dispatches via the registry, so
+  commands to the live S2 agent misroute or drop, with nothing self-healing via heartbeats
+  (`BatchHeartbeat` validates against `gateway_sessions_`, which still has S2 acked). Fixed with a
+  per-agent striped lock (`GatewayUpstreamServiceImpl::registration_lock_for`, one `std::mutex` per
+  `agent_id`, never a single global lock) held across the ENTIRE decide→install span — unrelated agents'
+  registrations never contend, and the two calls for one agent can no longer interleave at all.
+- **BLOCKER 2 — `NotifyStreamStatus`'s CONNECTED publish was session-blind, contradicting this ADR's own
+  claim.** The RPC's session check (`gateway_sessions_`) only confirms the presented `session_id` is SOME
+  live entry for this `agent_id` — not that it is the agent's CURRENT session (multiple sessions coexist
+  there until each is individually torn down by its own DISCONNECTED). It then called
+  `AgentRegistry::set_gateway_route`, which took NO session parameter at all and unconditionally
+  overwrote `agents_[agent_id]`'s node/capabilities/`stream_home_id` — its sibling
+  `gateway_stream_home_id` accessor, two functions below it in the same file, already had exactly this
+  session guard; `set_gateway_route` simply never adopted it. A delayed CONNECTED for a session already
+  superseded by a genuine newer registration could therefore clobber the live session's route in memory
+  before the durable store even got a chance to reject the matching `announce_connected` write. The
+  PRE-EXISTING regression test for this exact scenario asserted only the store row, never the registry
+  object, so it stayed green while the registry was silently corrupted — and this ADR's own §7c prose
+  (the SESSION GUARDS description this bullet corrects) read as an end-to-end guarantee that was, until
+  this fix, store-only. Fixed by making `set_gateway_route` take and check `session_id` against the
+  currently-installed session (mirroring `gateway_stream_home_id`'s guard exactly), returning `false` on
+  a mismatch; `NotifyStreamStatus` now rejects the RPC outright (`acknowledged=false`, a new
+  `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="stale_connected_session"}`
+  counter) rather than falling through to a now-meaningless store write.
+
+Both fixes carry new regression tests in `tests/unit/server/test_gateway_route_wiring.cpp`: a
+deterministic concurrency test for BLOCKER 1 (a new `proxy_register_interleave_hook_for_test_` seam
+mirroring `AgentRegistry`'s own Gate-5 interleave-hook pattern — spawns a competing fresh registration
+from inside the replay's own critical section and proves it cannot complete until the lock releases,
+with every cross-thread observation routed through plain atomics rather than Catch2 assertions, which
+are not thread-safe) and an extended registry-level assertion on the existing stale-CONNECTED test for
+BLOCKER 2 (checks `gateway_has_wire_capability`/`gateway_stream_home_id` against the CURRENT session,
+not just the store row). Full targeted suite green after both (506 test cases, 9876 assertions). Also
+corrected in the same pass: the SESSION GUARDS section in `gateway_route_store.hpp` and this file's own
+"cannot overwrite or tear down a newer re-home" claim were STORE-ONLY when first written, not the
+end-to-end guarantee they read as — now genuinely end-to-end after BLOCKER 2; and a truncated
+mid-sentence comment at `gateway_route_store.cpp:383` that the original governance ledger had
+incorrectly recorded as already fixed (a corrective ledger row was appended — ledgers are append-only,
+so a wrong disposition is never edited in place, only superseded by a later row for the same
+`finding_id`).
+
 **The `yuzu_gw_cluster` gen_server** (adjacency/health/CPU/latency-based rebalancing gossip, named as
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
