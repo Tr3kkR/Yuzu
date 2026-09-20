@@ -1,10 +1,19 @@
 #include "guardian_spark_timing.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <format>
 
 namespace yuzu::agent {
 
 namespace {
+
+/// The event id embeds the operator-authored rule id, so it is neutralised and capped exactly
+/// as the server's T_server line does (yuzu/log_token.hpp): a space, '=' or newline would
+/// otherwise forge tokens or whole lines, and a different cap on either side breaks the join.
+std::string id_token(const std::string& id) {
+    return ::yuzu::log_token(id, ::yuzu::kGuardianLogIdMaxBytes);
+}
 
 /// -1 sentinel for every trigger sub-field when a pass has no attributable Spark event
 /// (Convergence reason). Kept as a single named constant so every sentinel write agrees.
@@ -28,7 +37,7 @@ std::string format_eval_timing_line(const EvalTimingRecord& r) {
     std::string line = std::format(
         "Guardian T_detect event_id={} domain={} detect_wall_ns={} detect_mono_ns={} "
         "accepted={} fire_wall_ns={} fire_mono_ns={} trigger_present={}",
-        r.event_id, domain_name(r.domain), r.detect_wall_ns, r.detect_mono_ns,
+        id_token(r.event_id), domain_name(r.domain), r.detect_wall_ns, r.detect_mono_ns,
         r.accepted ? 1 : 0, r.fire_wall_ns, r.fire_mono_ns, r.trigger.has_value() ? 1 : 0);
     if (r.trigger) {
         line += std::format(
@@ -55,9 +64,9 @@ SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool sent,
 }
 
 std::string format_send_timing_line(const SendTimingRecord& r) {
-    return std::format("Guardian T_wire event_id={} domain={} sent={} wire_wall_ns={}", r.event_id,
-                        r.domain ? domain_name(*r.domain) : "legacy", r.sent ? 1 : 0,
-                        r.wire_wall_ns);
+    return std::format("Guardian T_wire event_id={} domain={} sent={} wire_wall_ns={}",
+                        id_token(r.event_id), r.domain ? domain_name(*r.domain) : "legacy",
+                        r.sent ? 1 : 0, r.wire_wall_ns);
 }
 
 } // namespace yuzu::agent

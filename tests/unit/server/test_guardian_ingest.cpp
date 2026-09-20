@@ -12,6 +12,7 @@
 
 #include "guardian_ingest.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include "dex_alert_router.hpp"
@@ -88,7 +89,7 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
 // block, which is gated on rule_id != kObservationRuleId.
 apb::CommandResponse make_rule_event(const std::string& event_id, const std::string& rule_id,
                                      std::int64_t ts_seconds = 1718000000,
-                                     std::int32_t ts_nanos = 0) {
+                                     std::int32_t ts_nanos = 0, bool with_timestamp = true) {
     gpb::GuaranteedStateEvent ev;
     ev.set_event_id(event_id);
     ev.set_rule_id(rule_id);
@@ -96,8 +97,10 @@ apb::CommandResponse make_rule_event(const std::string& event_id, const std::str
     ev.set_severity("high");
     ev.set_detected_value("stopped");
     ev.set_expected_value("running");
-    ev.mutable_timestamp()->set_seconds(ts_seconds);
-    ev.mutable_timestamp()->set_nanos(ts_nanos);
+    if (with_timestamp) {
+        ev.mutable_timestamp()->set_seconds(ts_seconds);
+        ev.mutable_timestamp()->set_nanos(ts_nanos);
+    }
 
     apb::CommandResponse resp;
     resp.set_action("event");
@@ -231,8 +234,21 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     cap1.stop();
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
-    CHECK(cap1.text().find("Guardian T_server event_id=evt-r1") != std::string::npos);
+    CHECK(cap1.text().find("Guardian T_server event_id=evt-r1 agent=agent-A rule=rule-1 ") !=
+          std::string::npos);
     CHECK(cap1.text().find("agent_ns=1718000000000000000") != std::string::npos);
+    // The two server instants and the elapsed store time must be real and ordered: a swapped or
+    // mis-wired recv/committed pair (or a zeroed store_ms) would still print the prefix above.
+    auto field = [](const std::string& text, const std::string& key) -> std::int64_t {
+        const auto p = text.find(key);
+        REQUIRE(p != std::string::npos);
+        return std::stoll(text.substr(p + key.size()));
+    };
+    const std::int64_t recv_ns = field(cap1.text(), "recv_ns=");
+    const std::int64_t committed_ns = field(cap1.text(), "committed_ns=");
+    CHECK(recv_ns > 0);
+    CHECK(committed_ns >= recv_ns); // COMMIT happens strictly after the receive stamp
+    CHECK(field(cap1.text(), "store_ms=") >= 0);
 
     // Same, but with an out-of-range wire nanos field (untrusted agent input) — exercises
     // the bounds check that falls back to the agent_ns=-1 sentinel instead of computing a
@@ -254,4 +270,75 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     cap3.stop();
     CHECK(store.event_count() == 3);
     CHECK(cap3.text().find("Guardian T_server") == std::string::npos);
+
+    // T_server is Inserted-only: an exact redelivery and a same-id/other-agent Conflict both reach
+    // the store and neither may emit the line (a replay or a rejected event is not a fresh commit).
+    yuzu::test::LogCapture cap4;
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
+    ingest_guardian_response(store, "agent-B", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
+    cap4.stop();
+    CHECK(store.event_count() == 3); // neither was stored
+    CHECK(cap4.text().find("Guardian T_server") == std::string::npos);
+
+    // An ABSENT wire timestamp reads as seconds()==0; it must report the -1 sentinel, not a
+    // fabricated epoch-0 instant (agent_ns=0).
+    yuzu::test::LogCapture cap5;
+    ingest_guardian_response(store, "agent-A",
+                             make_rule_event("evt-r5", "rule-1", 0, 0, /*with_timestamp=*/false),
+                             nullptr, nullptr);
+    cap5.stop();
+    CHECK(store.event_count() == 4);
+    CHECK(cap5.text().find("Guardian T_server event_id=evt-r5") != std::string::npos);
+    CHECK(cap5.text().find("agent_ns=-1") != std::string::npos);
+    CHECK(cap5.text().find("agent_ns=0") == std::string::npos);
+}
+
+TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-supplied ids so a hostile "
+          "value cannot forge a token or a line",
+          "[pg][guardian][ingest][diagnostics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    // event_id and rule_id are free text (a rule id is operator-authored; an event id embeds it):
+    // spaces and '=' would forge tokens, the newline would forge a whole second line.
+    yuzu::test::LogCapture cap;
+    ingest_guardian_response(
+        store, "agent-A",
+        make_rule_event("evt x=1 agent=victim\nGuardian T_server event_id=z", "rule 2 recv_ns=9"),
+        nullptr, nullptr);
+    cap.stop();
+    REQUIRE(store.event_count() == 1);
+
+    const std::string text = cap.text();
+    const auto at = text.find("Guardian T_server ");
+    REQUIRE(at != std::string::npos);
+    const auto eol = text.find('\n', at);
+    const std::string line = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    CHECK(line.find("event_id=evt_x_1_agent_victim_Guardian_T_server_event_id_z agent=agent-A "
+                    "rule=rule_2_recv_ns_9 recv_ns=") != std::string::npos);
+    // Exactly one of each key, and the record is one physical line (nothing followed the id).
+    CHECK(count(line, "event_id=") == 1);
+    CHECK(count(line, " agent=") == 1);
+    CHECK(count(line, " rule=") == 1);
+    CHECK(count(line, " recv_ns=") == 1);
+    CHECK(count(text, "Guardian T_server ") == 1);
+
+    // An id longer than the shared cap truncates to the SAME prefix the agent's T_wire/T_detect
+    // lines emit, so it still joins.
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'q');
+    yuzu::test::LogCapture cap_long;
+    ingest_guardian_response(store, "agent-A", make_rule_event(longid, "rule-1"), nullptr, nullptr);
+    cap_long.stop();
+    CHECK(cap_long.text().find("Guardian T_server event_id=" +
+                               std::string(yuzu::kGuardianLogIdMaxBytes, 'q') + " agent=") !=
+          std::string::npos);
+    CHECK(cap_long.text().find(std::string(yuzu::kGuardianLogIdMaxBytes + 1, 'q')) ==
+          std::string::npos);
 }

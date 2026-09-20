@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include "dex_alert_router.hpp"
@@ -227,19 +228,26 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                                                    std::chrono::steady_clock::now() - store_t0)
                                                    .count();
                 // Agent-supplied wire timestamp, checked before use (untrusted protobuf input):
-                // nanos must be in [0, 1e9) and seconds must not overflow an int64 once scaled.
+                // the field must be present, nanos must be in [0, 1e9) and seconds must not
+                // overflow an int64 once scaled. An ABSENT timestamp reads as seconds()==0, which
+                // must not be reported as a real epoch-0 instant, so it takes the sentinel too.
                 std::int64_t agent_ns = -1; // sentinel: invalid/unavailable
                 const std::int64_t secs = ev.timestamp().seconds();
                 const std::int32_t nanos = ev.timestamp().nanos();
                 constexpr std::int64_t kNsPerSec = 1'000'000'000;
-                if (nanos >= 0 && nanos < kNsPerSec && secs >= 0 &&
+                if (ev.has_timestamp() && nanos >= 0 && nanos < kNsPerSec && secs >= 0 &&
                     secs <= (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
                     agent_ns = secs * kNsPerSec + nanos;
+                // The three ids are agent- or operator-supplied text embedded in a space-delimited
+                // key=value line, so each goes through the SAME neutraliser and cap the agent's
+                // T_wire/T_detect lines use (yuzu/log_token.hpp): a space or '=' would otherwise
+                // forge extra tokens, and a per-side cap would break the event_id join.
                 spdlog::info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
                              "committed_ns={} agent_ns={} store_ms={}",
-                             sanitize_label(ev_row.event_id), sanitize_label(agent_id),
-                             sanitize_label(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
-                             agent_ns, store_ms);
+                             log_token(ev_row.event_id, kGuardianLogIdMaxBytes),
+                             log_token(agent_id, kGuardianLogIdMaxBytes),
+                             log_token(ev_row.rule_id, kGuardianLogIdMaxBytes), recv_wall_ns,
+                             res.committed_wall_ns, agent_ns, store_ms);
             } catch (...) { // best-effort diagnostic; never propagate onto the ingest thread
             }
         }

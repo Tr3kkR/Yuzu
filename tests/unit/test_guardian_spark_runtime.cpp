@@ -14,6 +14,7 @@
 
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
+#include <yuzu/log_token.hpp>
 
 #include "fake_journal_store.hpp" // FakeJournalStore (#4153)
 #include "test_helpers.hpp"
@@ -2317,6 +2318,54 @@ TEST_CASE("#4606 criterion-10: make_outbox_send_timing carries the entry's event
     CHECK_FALSE(rec2.sent);
     // A Spark-path record never renders as the legacy marker.
     CHECK(format_send_timing_line(rec2).find("domain=legacy") == std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a line in the "
+          "agent T_detect/T_wire output",
+          "[spark][runtime]") {
+    // The event id embeds the operator-authored rule id (any non-empty string is accepted at rule
+    // creation), so it reaches these lines unvalidated. A newline would forge a whole physical
+    // line and a space or '=' would forge extra key=value tokens that a first-match parser reads.
+    const std::string hostile =
+        "agent-1-r x=9\nGuardian T_wire event_id=victim domain=health sent=1 wire_wall_ns=1";
+    const std::string neutral =
+        "agent-1-r_x_9_Guardian_T_wire_event_id_victim_domain_health_sent_1_wire_wall_ns_1";
+    auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    EvalTimingRecord e;
+    e.event_id = hostile;
+    e.domain = OutboxDomain::Compliance;
+    const auto detect = format_eval_timing_line(e);
+    CHECK(detect.find('\n') == std::string::npos);
+    CHECK(detect.rfind("Guardian T_detect event_id=" + neutral + " domain=compliance ", 0) == 0);
+    CHECK(count(detect, "event_id=") == 1);
+    CHECK(count(detect, " domain=") == 1);
+    CHECK(count(detect, "Guardian T_") == 1);
+
+    SendTimingRecord w;
+    w.event_id = hostile;
+    w.domain = OutboxDomain::Health;
+    w.sent = true;
+    w.wire_wall_ns = 9;
+    const auto wire = format_send_timing_line(w);
+    CHECK(wire == "Guardian T_wire event_id=" + neutral + " domain=health sent=1 wire_wall_ns=9");
+    CHECK(wire.find('\n') == std::string::npos);
+    CHECK(count(wire, "event_id=") == 1);
+    CHECK(count(wire, "Guardian T_") == 1);
+
+    // Both lines cap the id at the SAME constant the server's T_server line uses, so an over-long
+    // id still joins (both sides truncate to the identical prefix).
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'a');
+    e.event_id = longid;
+    w.event_id = longid;
+    const std::string capped(yuzu::kGuardianLogIdMaxBytes, 'a');
+    CHECK(format_eval_timing_line(e).rfind("Guardian T_detect event_id=" + capped + " ", 0) == 0);
+    CHECK(format_send_timing_line(w).rfind("Guardian T_wire event_id=" + capped + " ", 0) == 0);
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {
