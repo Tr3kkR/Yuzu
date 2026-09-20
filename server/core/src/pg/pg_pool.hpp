@@ -154,14 +154,31 @@ public:
         /// is sized to be >= its retry backoff SPECIFICALLY so a retry has
         /// time to catch a just-freed connection, after a prior review
         /// (Gate 4 UP-3) rejected a narrower window for causing false
-        /// `StoreBusy` under mere contention. 500ms sits above every
+        /// `StoreBusy` under mere contention. 500ms sits AT OR ABOVE every
         /// deliberately-short acquire/retry timeout already in this codebase
         /// at the time of writing (audited: the largest is
         /// `kCreateAcquireTimeout`/`kIngestAcquireTimeout`/gateway_route_
-        /// store's `kWriteTimeout`, all 500ms) so this fix only compresses
-        /// the LONG budgets (kReadTimeout/kWriteTimeout-class, 1500ms+) the
-        /// finding is actually about, never an already-tuned short one. It
-        /// mirrors `kContainmentReadSlotWait` (server.cpp)'s own reasoning
+        /// store's `kWriteTimeout`, all exactly 500ms -- a tie, not a gap) so
+        /// this fix only compresses the LONG budgets the finding is actually
+        /// about, never an already-tuned short one. Those long budgets span a
+        /// wider range than the `kReadTimeout`/`kWriteTimeout` shorthand
+        /// above suggests: several stores' own `with_txn_for`/`try_acquire_
+        /// for` call sites reach `AuditStore::kReapTimeout{8000}` (the
+        /// retention reaper), `LicenseStore::kValidateTimeout{10000}`,
+        /// `AppPerfRollup::kRollAcquireTimeout{5000}`, and
+        /// `AnalyticsEventStore::kDrainClaimTimeout{5000}` -- up to a 20x
+        /// compression at the extreme, not merely 3-8x (#2146 A2-R1 Gate 8
+        /// round 4, architect). This clamp is a SHARED chokepoint with no
+        /// read/write distinction: it applies identically to security- and
+        /// audit-critical WRITE paths sharing this pool (RbacStore, AuditStore,
+        /// QuarantineStore, SessionStore, EnginePrincipalStore among them, all
+        /// with `kWriteTimeout` well above 500ms) -- a deliberate, uniform
+        /// chokepoint-level policy rather than a read-only-scoped one, reviewed
+        /// and accepted in Gate 8 round 4 on the basis that a failed
+        /// `with_txn_for` already means "transaction never began" either way
+        /// (no partial-mutation risk is introduced), the only change being the
+        /// RATE of that pre-existing failure mode under sustained saturation.
+        /// It mirrors `kContainmentReadSlotWait` (server.cpp)'s own reasoning
         /// for the same number: a healthy store's read is milliseconds, so
         /// 500ms is unobservable there, while a stalled one is rejected
         /// quickly instead of pinning a worker.

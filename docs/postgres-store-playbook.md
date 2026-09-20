@@ -174,7 +174,8 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    ceiling, not a guarantee of how long a saturated pool will hold you: `try_acquire_for` itself
    clamps the wait once it observes the pool already saturated at entry (`Options::
    saturated_fast_fail`, ADR-0012's 2026-09-20 Update), so a caller arriving after saturation has
-   its httplib worker freed quickly rather than pinned for your deadline's full length.
+   its calling thread (often an httplib worker for a REST route, but any caller of a bounded
+   acquire) freed quickly rather than pinned for your deadline's full length.
 
    *Caching an authoritative read?* Do not invent the rules — **ADR-0012 §4** ("Read caching on
    an authoritative store") encodes the five that this seam demands: positive-only, invalidate

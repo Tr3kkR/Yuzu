@@ -3914,9 +3914,17 @@ cleared.
 
 To keep a momentary blip from becoming a console lockout, the **login-decision
 reads** `mfa_status` and `load_mfa_row` retry the acquire within a small bounded
-budget (`acquire_with_retry` in `auth_db.cpp`: the first acquire keeps its full
-`kReadTimeout` budget, then up to `kAcquireRetries` short retries — worst-case
-≈600 ms extra). `mfa_status` is the exact call #2396 names as denying **all**
+budget (`acquire_with_retry` in `auth_db.cpp`: the first acquire is attempted with
+`kReadTimeout` (1500 ms), then up to `kAcquireRetries` short retries; worst-case
+≈600 ms extra on top of the first attempt). **Since #2146 A2-R1 Gate 8's
+fast-fail-on-saturation clamp landed at the shared `PgPool` chokepoint
+(`pg_pool.hpp`'s `Options::saturated_fast_fail`, ADR-0012's 2026-09-20 Update),
+the first acquire no longer necessarily gets its full `kReadTimeout` budget: if
+the pool is already saturated at that instant, the wait is clamped to `min(1500
+ms, 500 ms)` = 500 ms instead. This makes the worst case FASTER under
+saturation (≈1100 ms total instead of ≈2100 ms), not slower; the `150 ms`
+`kAcquireRetryTimeout` retry leg was already below the 500 ms clamp and stays
+unaffected.** `mfa_status` is the exact call #2396 names as denying **all**
 logins: it `503`s a legitimate, correct-password login on a blip. This **never
 weakens fail-closed**: only the *acquire* is retried (a query that ran and
 errored is not retried — it will not self-heal in milliseconds), and on budget
