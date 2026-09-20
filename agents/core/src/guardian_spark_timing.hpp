@@ -51,8 +51,9 @@
  *                                  superseded, or the rule was dropped), still queued
  *                                  (including behind a slow or blocked send), held back by a
  *                                  down stream (the Spark path logs no T_wire for that), or
- *                                  the agent stopped first. The log alone cannot tell the
- *                                  last four apart. The Compliance/Health outbox is an
+ *                                  the agent stopped first. The T_* lines alone cannot tell
+ *                                  the last four apart (other agent log lines, such as arm and
+ *                                  lifecycle messages, can help). The Compliance/Health outbox is an
  *                                  in-memory buffer, NOT durable (guardian_outbox.hpp): after
  *                                  a restart the boot re-evaluation MAY mint a fresh id under
  *                                  a new boot_nonce (only if the re-evaluation emits).
@@ -70,17 +71,18 @@
  *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
  *     disarmed and errored events - a subscription LOSS produces a lifecycle "errored"
  *     entry - and journal replays from this or an earlier process), domain=health raised by
- *     a subscription FAULT rather than an evaluation pass, and domain=legacy. It can also
+ *     a subscription FAULT or its recovery rather than an evaluation pass, and domain=legacy. It can also
  *     mean the agent stopped between the waker and the deferred T_detect line.
  *   - T_server (server log) fields: recv_ns and committed_ns are wall-clock instants on the
  *     SERVER; agent_ns is the event's own AGENT-side timestamp (on the Spark path the outbox
  *     entry's enqueue stamp; whole seconds on the legacy path), so arithmetic between
  *     agent_ns and the server's instants includes any agent/server clock skew; store_ms is
- *     an elapsed time. It is emitted for Inserted only. Redelivered is logged at debug,
- *     Conflict and Error at warn (those warnings, and the parse-failure one, carry no
- *     event_id and cannot be joined), so at the default info level a replay and a loss look
- *     alike in the server log: T_wire sent=1 with no T_server means lost in flight OR
- *     classified Redelivered, Conflict or Error.
+ *     an elapsed time; agent_ns=-1 marks an invalid wire timestamp. It is emitted for
+ *     Inserted only. Redelivered is logged at debug, Conflict and Error at warn (the Conflict
+ *     warning carries event_id; the Error warning and the parse-failure warning do not, so
+ *     they cannot be joined), so at the default info level a replay and a loss look alike in
+ *     the server log: T_wire sent=1 with no T_server means lost in flight OR classified
+ *     Redelivered, Conflict or Error.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core shared-lib symbol visibility, -fvisibility=hidden)

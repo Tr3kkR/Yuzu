@@ -328,9 +328,10 @@ The full set of agent command-line flags:
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
 | `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
-| `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
-| `--log-max-size` | Size in bytes at which the `--log-file` file rotates; ignored without `--log-file` (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
-| `--log-max-files` | Number of rotated `--log-file` files kept; ignored without `--log-file` (env `YUZU_LOG_MAX_FILES`) | `5` |
+| `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; an unrecognised value is treated as `off`). The `agent_actions` plugin's `set_log_level` action changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
+| `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
+| `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
+| `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
 
 ### Per-agent mTLS auto-provisioning (PKI)
 
