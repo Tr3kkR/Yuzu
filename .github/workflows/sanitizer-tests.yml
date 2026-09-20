@@ -21,14 +21,13 @@ name: Sanitizer tests
 # file must be committed and pushed before /test --full can dispatch
 # against a new commit.
 #
-# TODO(#1611): this workflow provisions no Postgres service and sets no
+# TODO(#4637): this workflow provisions no Postgres service and sets no
 # YUZU_TEST_POSTGRES_DSN. Every Postgres-touching test SKIPs silently via
 # YUZU_REQUIRE_PG_DB when that DSN is unset (tests/unit/test_helpers.hpp), so
 # today this workflow cannot be trusted as evidence that a PG-touching
-# sanitizer issue (this one included) is actually exercised. Real fix is a
-# separate, larger CI change (adding a Postgres service + ensure-postgres.sh
-# wiring, mirroring ci.yml's server legs); out of scope here, tracked for
-# follow-up.
+# sanitizer issue is actually exercised. Real fix is a separate, larger CI
+# change (adding a Postgres service + ensure-postgres.sh wiring, mirroring
+# ci.yml's server legs); out of scope here, tracked at #4637.
 
 on:
   workflow_dispatch:
