@@ -44,6 +44,16 @@ std::string format_eval_timing_line(const EvalTimingRecord& r) {
     return line;
 }
 
+SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool sent,
+                                         std::int64_t wire_wall_ns) {
+    SendTimingRecord r;
+    r.event_id = e.event_id;
+    r.domain = e.domain;
+    r.sent = sent;
+    r.wire_wall_ns = wire_wall_ns;
+    return r;
+}
+
 std::string format_send_timing_line(const SendTimingRecord& r) {
     return std::format("Guardian T_wire event_id={} domain={} sent={} wire_wall_ns={}", r.event_id,
                         r.domain ? domain_name(*r.domain) : "legacy", r.sent ? 1 : 0,

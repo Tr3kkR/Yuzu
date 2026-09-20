@@ -3626,13 +3626,11 @@ private:
         // is what the benchmark must measure) — a log throw must never flip a real Sent into
         // Retain, so this stays strictly after `ok` is captured and before the return.
         try {
-            SendTimingRecord r;
-            r.event_id = e.event_id;
-            r.domain = e.domain;
-            r.sent = ok;
-            r.wire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
+            const auto r = make_outbox_send_timing(
+                e, ok,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
             spdlog::info("{}", format_send_timing_line(r));
         } catch (...) { // best-effort diagnostic; never propagate
         }

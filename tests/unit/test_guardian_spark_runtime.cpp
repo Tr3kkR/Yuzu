@@ -2177,6 +2177,14 @@ TEST_CASE("#4606 criterion-10: a two-entry build_entries pass stages two timing 
     CHECK(timings[0].accepted);
     CHECK(timings[1].accepted);
     CHECK(timings[0].fire_wall_ns == timings[1].fire_wall_ns); // one backfill pass, same instant
+    // T_fire is the measurement itself: an ACCEPTED record's fire_* must actually be populated
+    // (not left at the -1 "never fired" sentinel) and must not precede its own detect stamp.
+    // The mono pair uses steady_clock so the ordering check is immune to a wall-clock step.
+    CHECK(timings[0].fire_wall_ns != -1);
+    CHECK(timings[0].fire_mono_ns != -1);
+    CHECK(timings[1].fire_mono_ns != -1);
+    CHECK(timings[0].fire_mono_ns >= timings[0].detect_mono_ns);
+    CHECK(timings[1].fire_mono_ns >= timings[1].detect_mono_ns);
     CHECK_FALSE(timings[0].trigger.has_value()); // evaluate_key called directly, no trigger arg
     CHECK_FALSE(timings[1].trigger.has_value());
 }
@@ -2195,6 +2203,12 @@ TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trig
     // trigger left absent (std::nullopt by default)
 
     const auto line_absent = format_eval_timing_line(r);
+    // The exact line pins FIELD ORDER, which the substring checks below cannot: the header calls
+    // it the parseable-log-line contract the benchmark tooling regexes against.
+    CHECK(line_absent ==
+          "Guardian T_detect event_id=evt-1 domain=compliance detect_wall_ns=100 "
+          "detect_mono_ns=200 accepted=1 fire_wall_ns=300 fire_mono_ns=400 trigger_present=0 "
+          "mechanism_wall_ns=-1 handler_wall_ns=-1 handler_mono_ns=-1 seq=-1");
     CHECK(line_absent.find("event_id=evt-1") != std::string::npos);
     CHECK(line_absent.find("domain=compliance") != std::string::npos);
     CHECK(line_absent.find("detect_wall_ns=100") != std::string::npos);
@@ -2225,6 +2239,10 @@ TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trig
     r.fire_mono_ns = -1;
 
     const auto line_present = format_eval_timing_line(r);
+    CHECK(line_present ==
+          "Guardian T_detect event_id=evt-1 domain=compliance detect_wall_ns=100 "
+          "detect_mono_ns=200 accepted=0 fire_wall_ns=-1 fire_mono_ns=-1 trigger_present=1 "
+          "mechanism_wall_ns=10 handler_wall_ns=20 handler_mono_ns=30 seq=7");
     CHECK(line_present.find("accepted=0") != std::string::npos);
     CHECK(line_present.find("fire_wall_ns=-1") != std::string::npos);
     CHECK(line_present.find("fire_mono_ns=-1") != std::string::npos);
@@ -2251,8 +2269,10 @@ TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatt
     CHECK(line.find("domain=legacy") != std::string::npos);
     CHECK(line.find("sent=1") != std::string::npos);
     CHECK(line.find("wire_wall_ns=555") != std::string::npos);
-    // event_id stays the first field after the line-name token (correlator parse invariant).
+    // event_id stays the first field after the line-name token (correlator parse invariant),
+    // and the exact line pins the full field order.
     CHECK(line.find("Guardian T_wire event_id=evt-9") == 0);
+    CHECK(line == "Guardian T_wire event_id=evt-9 domain=legacy sent=1 wire_wall_ns=555");
 
     r.sent = false;
     const auto line2 = format_send_timing_line(r);
@@ -2268,6 +2288,34 @@ TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatt
     r.domain = OutboxDomain::Health;
     CHECK(format_send_timing_line(r).find("domain=health") != std::string::npos);
     CHECK(format_send_timing_line(r).find("domain=legacy") == std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: make_outbox_send_timing carries the entry's event_id and domain",
+          "[spark][runtime]") {
+    // send_guardian_outbox_entry (agent.cpp) builds its T_wire record through this function, and
+    // AgentImpl is unreachable from a unit test, so this is what proves the domain is actually
+    // wired through rather than silently rendering as domain=legacy on every Spark-path line.
+    OutboxEntry lifecycle;
+    lifecycle.domain = OutboxDomain::Lifecycle;
+    lifecycle.event_id = "evt-life";
+    const auto rec = make_outbox_send_timing(lifecycle, /*sent=*/true, 777);
+    CHECK(rec.event_id == "evt-life");
+    REQUIRE(rec.domain.has_value());
+    CHECK(*rec.domain == OutboxDomain::Lifecycle);
+    CHECK(rec.sent);
+    CHECK(rec.wire_wall_ns == 777);
+    CHECK(format_send_timing_line(rec) ==
+          "Guardian T_wire event_id=evt-life domain=lifecycle sent=1 wire_wall_ns=777");
+
+    OutboxEntry health;
+    health.domain = OutboxDomain::Health;
+    health.event_id = "evt-health";
+    const auto rec2 = make_outbox_send_timing(health, /*sent=*/false, 5);
+    REQUIRE(rec2.domain.has_value());
+    CHECK(*rec2.domain == OutboxDomain::Health);
+    CHECK_FALSE(rec2.sent);
+    // A Spark-path record never renders as the legacy marker.
+    CHECK(format_send_timing_line(rec2).find("domain=legacy") == std::string::npos);
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {

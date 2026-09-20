@@ -24,29 +24,46 @@
  * T0/T2 / the #3990 diagnostic) - keep it stable.
  *
  * CORRELATION CONTRACT (read before writing a correlator):
- *   - Correlate by `event_id` and the embedded *_wall_ns fields, NEVER by log-file line
- *     order. A T_wire line can precede its own T_detect line in the file: evaluate_key
- *     wakes the outbox drain worker BEFORE it emits the deferred T_detect line (the
- *     waker deliberately does not wait on the log sink - a stalled sink must never delay
- *     delivery), and two keys' deferred emissions can interleave. detect_wall_ns always
- *     precedes wire_wall_ns for one event_id by construction.
- *   - A T_detect line with no matching later lines is not necessarily a loss. Read its
- *     own fields to attribute the orphan:
- *       accepted=0 (fire_*_ns=-1)  the outbox rejected the batch; nothing was enqueued,
- *                                  and the next eval pass mints a NEW event_id.
- *       accepted=1, no T_wire      enqueued but never sent: coalesced away (latest-wins
- *                                  per rule+domain), purged (generation superseded),
- *                                  still queued, or the agent stopped first - the
- *                                  Compliance/Health outbox is an in-memory buffer, NOT
- *                                  durable (guardian_outbox.hpp), and a restart
- *                                  re-evaluates under a fresh event_id.
- *       T_wire sent=0              local Write() failed or the stream was down; the
- *                                  entry is retained and re-sent under the SAME event_id.
- *       T_wire sent=1, no T_server lost in flight, OR the server classified it Redelivered
- *                                  (a Lifecycle journal replay - see `domain=`), Conflict
- *                                  or Error: the server logs T_server for Inserted only.
- *   - `domain=legacy` on a T_wire line marks the non-Spark drift-sink path, which has no
- *     outbox and therefore no OutboxDomain.
+ *   - Join on `event_id` and the embedded *_wall_ns fields, NEVER on log-file line order.
+ *     A T_wire line can precede its own T_detect line in the file: evaluate_key wakes the
+ *     outbox drain worker BEFORE it emits the deferred T_detect line (the waker deliberately
+ *     does not wait on the log sink - a stalled sink must never delay delivery), and two
+ *     keys' deferred emissions can interleave. A streaming correlator should buffer a T_wire
+ *     for a grace window rather than pair it with the next T_detect it sees. In program order
+ *     detect_wall_ns precedes wire_wall_ns for one event_id, but both are system_clock reads,
+ *     so an NTP step can invert them; T_wire carries no *_mono_ns field.
+ *   - event_id is `<agent>-<boot_nonce>-<rule>-<wall_ms>-<seq>`. A new agent process gets a
+ *     new boot_nonce, so an id minted before a restart is never re-minted after it.
+ *   - Reading a T_detect line that has no later lines:
+ *       accepted=0 (fire_*_ns=-1)  the outbox rejected the batch; nothing was enqueued. The
+ *                                  next eval pass mints a NEW event_id (and logs another
+ *                                  accepted=0 line for as long as the outbox stays full).
+ *       accepted=1, no T_wire      enqueued but never sent: coalesced away (a later
+ *                                  observation for the same rule+domain replaced it under a
+ *                                  newer event_id, same boot_nonce), purged (generation
+ *                                  superseded, or the rule was dropped), still queued, held
+ *                                  back by a down stream (the Spark path logs no T_wire for
+ *                                  that), or the agent stopped first. The Compliance/Health
+ *                                  outbox is an in-memory buffer, NOT durable
+ *                                  (guardian_outbox.hpp): after a restart the boot
+ *                                  re-evaluation mints a fresh id under a new boot_nonce.
+ *   - Reading a T_wire line:
+ *       Spark path (domain=compliance|health|lifecycle):
+ *         sent=0  Write() returned false. The entry is retained and re-sent under the SAME
+ *                 event_id unless it is coalesced or dropped in the meantime, in which case
+ *                 that id never gets a sent=1. A DOWN stream logs no T_wire line at all.
+ *         sent=1  the local write succeeded, which is NOT receipt. A retried send produces
+ *                 several T_wire lines for one event_id.
+ *       domain=legacy (the non-Spark drift-sink path: no outbox, no T_detect):
+ *         sent=0  the event was DROPPED (link down or Write() failed). There is no retry.
+ *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
+ *     disarmed and errored events, and journal replays from this or an earlier process),
+ *     domain=health raised by a subscription fault or loss rather than an evaluation pass,
+ *     domain=legacy, or an agent stopped between the waker and the deferred T_detect line.
+ *   - T_wire sent=1 with no T_server: lost in flight, or the server classified the event
+ *     Redelivered (for example a Lifecycle journal replay), Conflict or Error. The server
+ *     emits T_server for Inserted only, and logs Redelivered at debug (Conflict and Error at
+ *     warn), so at the default info level a replay and a loss look alike in the server log.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core shared-lib symbol visibility, -fvisibility=hidden)
@@ -108,5 +125,12 @@ struct SendTimingRecord {
     std::int64_t wire_wall_ns{0};
 };
 YUZU_EXPORT std::string format_send_timing_line(const SendTimingRecord& r);
+
+/// Builds the T_wire record for one Spark-outbox send attempt: the entry's event_id and
+/// domain, the local Write() outcome, and the wire timestamp. A free function rather than
+/// inline in agent.cpp (whose AgentImpl is file-local and unreachable from a unit test) so
+/// that carrying `domain` through - the point of the field - is covered by a test.
+YUZU_EXPORT SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool sent,
+                                                     std::int64_t wire_wall_ns);
 
 } // namespace yuzu::agent
