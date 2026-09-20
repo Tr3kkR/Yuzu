@@ -86,16 +86,77 @@ deregister_agent(AgentId) ->
     gen_server:cast(?SERVER, {deregister, AgentId}).
 
 %% @doc Lookup an agent by ID. Returns {ok, Pid} or error.
+%%
+%% HA WS-4 4.3a (intra-cluster routing, ADR-2002 §7): node-local ETS is tried
+%% first (the common case — same node, zero cross-node cost) and remains the
+%% AUTHORITATIVE source for a pid on THIS node. On a local miss, falls back
+%% to the per-agent `pg' group (`{agent, AgentId}', joined/left alongside the
+%% existing `all_agents'/`{plugin, X}' groups below) — `pg' replicates group
+%% membership across every CONNECTED distributed-Erlang node in this
+%% cluster, giving cross-node location transparency `pg' broadcast groups
+%% alone do not provide (see ADR-2002 §7's "per-agent `pg' group, a global
+%% registry, or fan-and-filter" mechanism list — this is the first of the
+%% three). Deliberately NOT a consistent hash ring: `hash_ring_vnodes'
+%% (`gateway/config/sys.config') is for DNS-based connection placement and
+%% rebalancing only (`docs/erlang-gateway-blueprint.md`), explicitly NOT
+%% command routing — see #4556.
+%%
+%% SINGLE-MEMBER DISPATCH RULE (load-bearing): `pg' membership is eventually
+%% consistent, so during a re-home the OLD node's pid and the NEW node's pid
+%% can both be members of `{agent, AgentId}' until the old stream process
+%% actually exits. Dispatching to EVERY member would let one command yield
+%% TWO responses (a real one plus an `agent_disconnected' from the dead
+%% pid) for a single fanout target. Never happens today (agent reconnect is
+%% the only re-home path, ADR-2002 §7 — a physical stream move is always
+%% agent-reconnect-shaped, so at most one live member should exist at
+%% steady state), but the rule holds regardless: pick exactly ONE —
+%% preferring a LOCAL member if any (so `is_process_alive/1`'s liveness
+%% check still applies) — never dispatch to more than one.
 -spec lookup(binary()) -> {ok, pid()} | error.
 lookup(AgentId) ->
     case ets:lookup(?TABLE, AgentId) of
         [{_, Pid, _, _, _, _, _, _}] ->
             case is_process_alive(Pid) of
                 true  -> {ok, Pid};
-                false -> error
+                false -> lookup_remote(AgentId)
             end;
         [] ->
-            error
+            lookup_remote(AgentId)
+    end.
+
+%% @doc Cross-node fallback for lookup/1 — see that function's doc comment
+%% for the group-membership and single-member-dispatch rationale.
+%%
+%% `pg' membership removal on a monitored process's death is ASYNCHRONOUS
+%% relative to any other observer's own death detection (confirmed
+%% empirically: `yuzu_gw_registry_tests:lookup_dead_process/0' — which
+%% waits on its OWN separate monitor's DOWN before asserting — intermittently
+%% still found the dead pid as a live `{agent, AgentId}' pg member here,
+%% because `pg''s internal cleanup hadn't run yet). A LOCAL member is one
+%% this node CAN verify with `is_process_alive/1', so it must be — a dead
+%% local member is filtered out rather than returned. A REMOTE member's
+%% liveness is NOT locally verifiable; it is trusted to `pg''s own
+%% monitoring on ITS node (the same trust boundary the rest of this
+%% fallback already rests on).
+-spec lookup_remote(binary()) -> {ok, pid()} | error.
+lookup_remote(AgentId) ->
+    case pg:get_members(?PG_SCOPE, {agent, AgentId}) of
+        [] ->
+            error;
+        Members ->
+            Self = node(),
+            Live = lists:filter(fun(P) ->
+                node(P) =/= Self orelse is_process_alive(P)
+            end, Members),
+            case lists:filter(fun(P) -> node(P) =:= Self end, Live) of
+                [Local | _] ->
+                    {ok, Local};
+                [] ->
+                    case Live of
+                        [Remote | _] -> {ok, Remote};
+                        []           -> error
+                    end
+            end
     end.
 
 %% @doc Return all agent IDs.
@@ -211,13 +272,30 @@ store_pending(SessionId, Info) ->
     ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:system_time(millisecond)}),
     ok.
 
-%% @doc Atomically retrieve and delete pending registration info.
-%% Returns the info map or undefined if not found / expired.
+%% @doc Atomically retrieve-and-delete pending registration info.
+%% Returns the info map, or undefined if not found or already taken (by a
+%% concurrent consumer). NOTE: TTL expiry is enforced by the periodic
+%% `sweep_pending' handler, NOT here — this call does not inspect the stored
+%% timestamp, so an entry within up to one sweep interval past its TTL may still
+%% be returned. That admission leniency is deliberate and benign (the pending
+%% row is session-id-bound; a late Register→Subscribe handshake simply completes).
+%%
+%% Uses `ets:take/2' — a SINGLE atomic retrieve-and-delete BIF — NOT a
+%% lookup-then-delete pair. `?PENDING_TABLE' is `public', and this is called
+%% directly from `yuzu_gw_agent_service:subscribe/2', which grpcbox runs as an
+%% independent process per incoming stream, so two concurrent `Subscribe's
+%% presenting the SAME session id race here with zero serialization. A
+%% lookup-then-delete let BOTH win — each spawning an agent process and each
+%% emitting its own `CONNECTED(S)', which is exactly the "more than one
+%% CONNECTED(S) per session" producer that would break the HA WS-4 routing
+%% directory's once-per-session invariant (see ADR-2002 §7 #4246 #4 / #4324).
+%% `ets:take/2' guarantees exactly one concurrent caller receives the object
+%% for a given key (all others get `[]'); the once-per-session property is
+%% pinned by the concurrent-barrier test in yuzu_gw_registry_tests.erl.
 -spec take_pending(binary()) -> map() | undefined.
 take_pending(SessionId) ->
-    case ets:lookup(?PENDING_TABLE, SessionId) of
+    case ets:take(?PENDING_TABLE, SessionId) of
         [{_, Info, _}] ->
-            ets:delete(?PENDING_TABLE, SessionId),
             Info;
         [] ->
             undefined
@@ -244,8 +322,11 @@ handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq},
     ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
                         Hostname, RegisterReq}),
 
-    %% Join pg groups.
+    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
+    %% location-transparency group `lookup/1`'s fallback reads — see that
+    %% function's doc comment.
     pg:join(?PG_SCOPE, all_agents, Pid),
+    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
     lists:foreach(fun(Plugin) ->
         pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
     end, Plugins),
@@ -277,6 +358,17 @@ handle_info({'DOWN', MonRef, process, _Pid, _Reason},
     end;
 
 handle_info(sweep_pending, State) ->
+    %% PRE-EXISTING narrow race (NOT introduced by the take_pending atomicity
+    %% fix; tracked as #4326): this collects expired keys then deletes each
+    %% by key in a separate pass, without re-checking the timestamp at delete
+    %% time. `store_pending/2' is a bare `ets:insert' from the (concurrent)
+    %% stream process, so a re-store of the SAME session id landing between the
+    %% foldl scan and the per-key delete would be swept. It is benign today —
+    %% the stock agent never re-Registers the same session id (reconnect mints a
+    %% fresh S', ADR-2002 §7), the window is the scan→delete gap, and the effect
+    %% is one recoverable NOT_FOUND that triggers a re-Register. A tighter delete
+    %% (ets:select_delete with a StoredAt guard) is the fix if a same-session
+    %% re-Register path is ever added.
     Now = erlang:system_time(millisecond),
     Expired = ets:foldl(fun({SessionId, _, StoredAt}, Acc) ->
         case Now - StoredAt > ?PENDING_TTL_MS of
@@ -311,6 +403,7 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes on process exit, but leave explicitly for clarity.
             catch pg:leave(?PG_SCOPE, all_agents, Pid),
+            catch pg:leave(?PG_SCOPE, {agent, AgentId}, Pid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
             end, Plugins),
@@ -326,6 +419,7 @@ maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
         [{_, OldPid, _, _, OldPlugins, _, _, _}] ->
             catch pg:leave(?PG_SCOPE, all_agents, OldPid),
+            catch pg:leave(?PG_SCOPE, {agent, AgentId}, OldPid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)
             end, OldPlugins),

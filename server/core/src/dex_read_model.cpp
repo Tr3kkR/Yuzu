@@ -1,6 +1,8 @@
+#include "dex_read_builders.hpp" // the store-reaching build_dex_*_model_* (defined here); dex_device_app_perf_json has since moved to dex_app_perf_model.cpp
 #include "dex_read_model.hpp"
 
-#include "dex_routes.hpp" // dex_device_score -- full DexFleet/DexSignalGroup defs live here too
+#include "dex_window.hpp" // dex_normalize_os_filter (PURE) -- replaces the dropped dex_routes.hpp
+#include "guaranteed_state_store.hpp" // GuaranteedStateStore methods -- no longer transitive via dex_read_model.hpp
 
 #include <nlohmann/json.hpp>
 
@@ -45,31 +47,10 @@ std::string dex_device_score_json(const DexDeviceScoreModel& model, bool audit_p
     return out.dump();
 }
 
-// ── MCP-only gap #2: per-device app-perf drill ───────────────────────────────
-
-std::string dex_device_app_perf_json(const std::string& agent_id, const std::string& app_filter,
-                                     const std::vector<AppPerfDailyRow>& rows,
-                                     bool audit_persisted) {
-    json arr = json::array();
-    for (const auto& r : rows) {
-        if (!app_filter.empty() && r.app_name != app_filter)
-            continue;
-        arr.push_back({{"app_name", r.app_name},
-                       {"version", r.version},
-                       {"day", r.day},
-                       {"samples", r.samples},
-                       {"instances_max", r.instances_max},
-                       {"cpu_avg", r.cpu_avg},
-                       {"cpu_max", r.cpu_max},
-                       {"ws_avg_bytes", r.ws_avg_bytes},
-                       {"ws_max_bytes", r.ws_max_bytes}});
-    }
-    json out{{"agent_id", agent_id}, {"app", app_filter}};
-    out["rows"] = std::move(arr);
-    if (!audit_persisted)
-        out["audit_persisted"] = false;
-    return out.dump();
-}
+// dex_device_app_perf_json (the MCP-only gap #2 per-device app-perf drill
+// serializer) relocated to dex_app_perf_model.cpp (ADR-0031 WS-A4 DexPerfApi
+// seam, PR #4582 review — Seam 2's own home, absorbed from this seam's
+// temporary parking spot per its own header comment).
 
 // ── New twin #1: app blast-radius ────────────────────────────────────────────
 

@@ -153,6 +153,16 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/instructions/yaml",                  3149824u,           false, "instruction_yaml"},
     {"POST",   "/api/instructions/validate-yaml",          3149824u,           false, "instruction_yaml"},
     {"POST",   "/fragments/instructions/yaml-preview",    3149824u,           false, "instruction_yaml"},
+    // body_cap_policy.hpp hardware row — the Hardware CI list/record/sync REST
+    // v1 twin (hardware_routes.cpp). Only POST .../sync carries a body (one
+    // short "source" enum token); requires_measurable=true closes the same
+    // pre-auth-buffering gap the upload_session row above does (governance
+    // Gate 2). ANY method — the bodyless GET list/record routes on the same
+    // prefix are unaffected but share the class rather than falling to the
+    // (looser) catch-all.
+    {"GET",    "/api/v1/hardware",                        4u * 1024,          true,  "hardware"},
+    {"GET",    "/api/v1/hardware/agent-1",                4u * 1024,          true,  "hardware"},
+    {"POST",   "/api/v1/hardware/agent-1/sync",           4u * 1024,          true,  "hardware"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -185,6 +195,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "product_pack_yaml",
     "instruction_import",
     "instruction_yaml",
+    "hardware",
     "default",
 };
 
@@ -323,8 +334,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
     // instruction_yaml(3: save/validate/preview) + upload_session(1: the
     // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
-    // secret plane) + default(1).
-    CHECK(std::size(kBodyCapTable) == 28);
+    // secret plane) + hardware(1: the Hardware CI list/record/sync REST v1
+    // twin, governance Gate 2) + default(1).
+    CHECK(std::size(kBodyCapTable) == 29);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -334,13 +346,15 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
 // rest-api.md carried the identical stale claim (both fixed together). A
 // regression on the upload_session opt-in would have shipped with this
 // test green.
-TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session, OFF "
-         "for every other named class",
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session, and "
+         "hardware, OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/hardware/agent-1/sync").requires_measurable);
+    CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all

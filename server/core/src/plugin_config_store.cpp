@@ -472,6 +472,29 @@ PluginConfigStore::set_kill_switch(std::string_view plugin, std::string_view act
     return kill_switch_row(res.get(), 0);
 }
 
+bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
+                                                      std::string_view reason) {
+    if (!open_)
+        return false;
+    auto scope = plugin_config::parse_kill_switch_scope(plugin, "");
+    if (!scope || !plugin_config::is_valid_reason(reason) ||
+        !plugin_config::is_valid_actor("system"))
+        return false;
+    const std::string scope_key = plugin_config::kill_switch_scope_key(*scope);
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO plugin_config_store.kill_switches "
+        "  (scope_key, plugin, action, enabled, reason, set_by) "
+        "VALUES ($1, $2, $3, FALSE, $4, 'system') "
+        "ON CONFLICT (scope_key) DO NOTHING",
+        std::vector<std::string>{scope_key, scope->plugin, scope->action, std::string(reason)});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
 bool PluginConfigStore::action_allowed(std::string_view plugin, std::string_view action) const {
     if (!open_)
         return false; // degraded/unopened — fail closed, never "enabled"

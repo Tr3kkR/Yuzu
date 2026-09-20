@@ -45,7 +45,7 @@
 -export([start_link/0,
          proxy_register/1,
          proxy_inventory/1,
-         notify_stream_status/4,
+         notify_stream_status/5,
          forward_guardian_message/2,
          circuit_state/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
@@ -115,9 +115,11 @@ proxy_inventory(InventoryReport) ->
     gen_server:call(?SERVER, {proxy_inventory, InventoryReport}, 30000).
 
 %% @doc Notify C++ server about agent stream connect/disconnect.
--spec notify_stream_status(binary(), binary() | undefined, connected | disconnected, binary()) -> ok.
-notify_stream_status(AgentId, SessionId, Event, PeerAddr) ->
-    gen_server:cast(?SERVER, {notify_stream_status, AgentId, SessionId, Event, PeerAddr}).
+-spec notify_stream_status(binary(), binary() | undefined, connected | disconnected, binary(),
+                            binary()) -> ok.
+notify_stream_status(AgentId, SessionId, Event, PeerAddr, StreamHomeId) ->
+    gen_server:cast(?SERVER, {notify_stream_status, AgentId, SessionId, Event, PeerAddr,
+                               StreamHomeId}).
 
 %% @doc Forward an unsolicited Guardian side-channel CommandResponse
 %% (plugin="__guard__") upstream to the C++ control plane via the
@@ -194,7 +196,7 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
-handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
+handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHomeId},
             #state{notify_pids = Pids, cb_state = CbState, cluster_id = ClusterId} = State) ->
     %% Don't spawn notifications if circuit is open
     case CbState of
@@ -222,7 +224,14 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
                         %% disconnect alike) — the server only needs to observe
                         %% it once per gateway build, and sending it unconditionally
                         %% avoids a connect-only special case here.
-                        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1]
+                        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1],
+                        %% HA WS-4 (#4324) — opaque id minted once per
+                        %% yuzu_gw_agent process instance and passed through
+                        %% verbatim here on both CONNECTED and DISCONNECTED,
+                        %% so the server can fence a stale DISCONNECTED from
+                        %% tearing down a newer re-home under the same
+                        %% reused session id.
+                        stream_home_id => StreamHomeId
                     },
                     {Pid, _MonRef} = spawn_monitor(fun() ->
                         case do_rpc('NotifyStreamStatus', Notification, notify_stream) of

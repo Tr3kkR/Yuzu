@@ -49,12 +49,33 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
         return;
 
     if (outcome.containment_unreadable) {
-        // The gate itself failed closed — nothing in `claimed` was
-        // individually evaluated against quarantine/plugin-presence, so
-        // there is no per-device fact to act on, only a systemic one. Undo
-        // the claim entirely rather than fail it: a fail-closed gate
-        // typically recovers within seconds (matching the retry_after_ms:
-        // 5000 every other zero-reach cascade in this PR already promises).
+        // The gate itself failed closed: EVERY id was withheld by the
+        // `contained()` lambda BEFORE its `send_to`, so `sent == 0` and none
+        // of them appear in `sent`, `not_sent`, or the named-permanent sets --
+        // they are counted only in `denied_quarantined_count`. There is no
+        // per-device fact to act on, only a systemic one, and the per-id
+        // accounting below cannot see these ids at all. Undo the claim
+        // entirely rather than fail it: a fail-closed gate typically recovers
+        // within seconds (matching the retry_after_ms: 5000 every other
+        // zero-reach cascade in this PR already promises).
+        //
+        // `route_unreadable` is DELIBERATELY NOT handled here, though WS-4 4.2b
+        // Task D's first cut lumped it in with `containment_unreadable`. The
+        // two are NOT interchangeable for an all-or-nothing revert (see
+        // `ConfinedDispatchOutcome::route_unreadable`'s doc comment): a degraded
+        // GatewayRouteStore read does NOT force `sent == 0`. The arm walk still
+        // ran, so a locally-connected device in this batch was genuinely sent
+        // the command (and, for the execute step, is RUNNING the installer)
+        // while a directory-only device merely landed in `not_sent`. Reverting
+        // the WHOLE batch would send that already-executed device back to
+        // `revert_step`, and a later tick's candidate scan would reclaim and
+        // re-dispatch it under a FRESH command_id -- which the agent's
+        // command_id dedup (WS-0) does NOT absorb, because it is a different
+        // command. That is a double-execution of a destructive installer, the
+        // exact execute-once violation the deployment routed concern calls
+        // catastrophic. Instead, route-degraded devices flow to `not_sent` and
+        // REVERT INDIVIDUALLY below, identical to any offline device, while
+        // genuinely-sent devices are left to await their agent response.
         std::vector<DeviceTransition> revert;
         revert.reserve(claimed.size());
         for (const auto& aid : claimed)

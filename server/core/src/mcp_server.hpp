@@ -5,6 +5,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "agent_registry.hpp" // #3687: DispatchDenial / DispatchDenialReason — AuthorizeDispatchFn's error type
+#include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
@@ -28,9 +29,15 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
-#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
+#include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
+#include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
+#include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
+#include "offline_endpoint_store.hpp" // #2146 Batch B3: OfflineEndpoint -- see set_viz_deps below
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
@@ -41,6 +48,7 @@
 // MCP twin (list_upload_grants) cannot drift — same reuse discipline as
 // kek_routes.hpp above.
 #include "file_retrieval_routes.hpp"
+#include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
 #include "management_group_store.hpp"
 #include "mcp_retry.hpp"  // named retry_after_ms floors + poll counter name (#3344)
 #include "mcp_session.hpp"
@@ -49,6 +57,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -61,6 +70,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -77,6 +87,7 @@ namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
 // (assign_engine_role/unassign_engine_role/list_engine_roles) AND the PR 4.3
 // engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
@@ -100,6 +111,11 @@ class PluginConfigStore;
 // handler, which is the same shape). Forward-declared (pointer-only in the
 // setter below); the .cpp includes preflight_run_store.hpp for the definition.
 class PreflightRunStore;
+// #2146 Batch B1 — backs get_guardian_device_compliance (the SAME BaselineStore
+// GET /guaranteed-state/device-compliance already reads). Forward-declared
+// (pointer-only in the setter below); the .cpp includes baseline_store.hpp for
+// the full definition.
+class BaselineStore;
 // #4029 — backs list_product_packs/get_product_pack. Forward-declared
 // (pointer-only in build_handler/register_routes); the .cpp includes
 // product_pack_model.hpp, which pulls in product_pack_store.hpp.
@@ -108,6 +124,25 @@ class ProductPackStore;
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
+// #2146 Batch B2 — backs the 12 result-set MCP twins (scope-walking,
+// docs/scope-walking-design.md). Forward-declared (pointer-only in
+// build_handler/register_routes); the .cpp includes result_set_store.hpp for
+// the full definition.
+class ResultSetStore;
+// B5 (api-parity programme #2146) — backs the offload-target / platform-
+// license / software-deployment MCP twins (list/create/get/delete_offload_
+// target, list_offload_target_deliveries, get/activate_platform_license,
+// list_license_alerts, list/create/rollback/cancel_software_deployment).
+// Forward-declared (pointer-only in build_handler/register_routes); the .cpp
+// includes each store's own header for the full definition. LicenseStore and
+// SoftwareDeploymentStore are DELIBERATELY DORMANT on `dev` (ADR-0048/0051 —
+// nothing in server.cpp constructs them, mirroring rest_api_v1_'s own
+// nullptr wiring for both) — their MCP twins answer "unavailable" in
+// production today, same posture as their REST siblings, until a future PR
+// re-wires construction (out of scope here).
+class OffloadTargetStore;
+class LicenseStore;
+class SoftwareDeploymentStore;
 }
 
 namespace yuzu::server::detail {
@@ -482,6 +517,46 @@ public:
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
+    /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
+    /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
+    /// Same setter idiom as `set_preflight_run_store` above. Unset
+    /// (`nullptr`, the default) ⇒ every result-set tool answers
+    /// "unavailable" rather than crashing. Owner-scoped, not RBAC-gated
+    /// (matches the REST twins' `deny_fleet_wide_service_scoped`-only
+    /// posture — `ResultSet` is not a seeded RBAC securable, see
+    /// `rest_api_v1.cpp`'s result-set routes doc comment) — the three
+    /// dispatch-producer tools are the exception, gated on
+    /// `Execution:Execute` exactly like their REST twins.
+    void set_result_set_store(ResultSetStore* store) { result_set_store_ = store; }
+
+    /// #2146 Batch B1 — backs `get_guardian_device_compliance`'s Baseline lookup
+    /// (`get_baseline_by_name` / `deployed_member_rule_ids`), the SAME store
+    /// `GET /api/v1/guaranteed-state/device-compliance` reads. Same setter idiom
+    /// as `set_preflight_run_store` above (a persistent raw pointer owned by
+    /// `ServerImpl`, outliving the web server). Nullable; the tool answers a
+    /// clean "unavailable" 503 when unset, matching every other borrowed-store
+    /// seam in this class.
+    void set_baseline_store(BaselineStore* store) { baseline_store_ = store; }
+
+    /// #2146 Batch B3 — the fleet-visualization store trio backing
+    /// `get_fleet_topology`/`get_host_topology` (mirrors GET
+    /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
+    /// may be null (offline hosts are then not stale-flagged, matching
+    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// may be null (then the viz kill switch is never consulted on the MCP
+    /// path — production MUST wire the same `--viz-disable` /
+    /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
+    /// disabling the feature would silently leave the MCP twins reachable).
+    /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
+    /// answer "unavailable" rather than crashing.
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+                      const std::atomic<bool>* kill_switch) {
+        fleet_topology_store_ = fleet_topology_store;
+        offline_endpoint_store_ = offline_store;
+        viz_kill_switch_ = kill_switch;
+    }
+
     /// #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
     /// real per-agent/service confinement (see `authz::FleetReadGate`'s doc
@@ -525,6 +600,20 @@ public:
                                                   const std::string& securable_type,
                                                   const std::string& operation)>;
     void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
+
+    /// #2146 Batch B1 — the injected-callback twin of `RestApiV1::GuardianPushFn`
+    /// (rest_api_v1.hpp), backing `push_guardian_rules`. Same shape (scope +
+    /// full_sync in, agents-reached count out, with -1 = unparseable scope and
+    /// -2 = ADR-0038 degraded-store sentinel), reused verbatim so the REST
+    /// `POST /api/v1/guaranteed-state/push` route and this MCP twin fan out
+    /// through the IDENTICAL closure (server.cpp wires the SAME
+    /// `guardian_push_fn_` member into both surfaces) — they cannot drift on
+    /// what gets pushed or to whom. Unset (default-constructed) mirrors REST's
+    /// own null-callback contract: `push_guardian_rules` degrades to ack-only
+    /// with `agents:0` rather than failing (dispatch isn't wired — production
+    /// always wires this; the unwired path is a test-only affordance).
+    using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
+    void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
@@ -572,16 +661,26 @@ public:
         response_visible_set_fn_ = std::move(fn);
     }
 
-    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
-    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
-    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
-    /// twin can never read a different fleet snapshot for the same request.
-    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
-    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
-    /// to their "no reporting agents" suppressed shape — never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
-    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
+    /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
+    /// the REST `/api/v1/dex/*` handlers use — server.cpp wires the IDENTICAL
+    /// instance so the MCP DEX signal tools can never disagree with REST on the
+    /// signal/experience model. The DEX signal tools REQUIRE it: their
+    /// harmonized `if (!dex_api_)` readiness guard returns the "Guaranteed State
+    /// store unavailable" error when it is null — server.cpp wires it iff the
+    /// store is present, so null ⟺ store absent, mirroring verify_api's
+    /// null→error contract.
+    void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (sixth family): the SAME in-process DEX app-perf-over-time
+    /// API seam the REST `/api/v1/dex/perf/*` handlers use (server.cpp wires the
+    /// IDENTICAL instance) — backs the 9 MCP DEX perf tool twins +
+    /// get_dex_device_app_perf. server.cpp constructs it UNCONDITIONALLY
+    /// (never null) — each backing store pointer is checked individually
+    /// inside the impl, matching the old per-lambda null-checks; the tools'
+    /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
+    /// fire. Additive alongside `app_perf_providers` (still wired, still used
+    /// by the dashboard fragments) until every consumer migrates.
+    void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
     /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
@@ -598,6 +697,17 @@ public:
     using DexVisibleFn =
         std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+
+    /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
+    /// so the MCP `unlock_account` tool clears an account's lockout counter
+    /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
+    /// without pulling in rest_api_v1.hpp for one nested type (same mirror-not-
+    /// reuse discipline as `PublishCrlFn` below, which mirrors `CaRoutes::
+    /// PublishCrlFn`). Wraps `AuthDB::clear_failed_logins`. Returns true when
+    /// the underlying auth store write succeeded. Empty/unset callback = the
+    /// tool answers "lockout subsystem unavailable" (503-equivalent), matching
+    /// the REST route's degrade when `lockout_clear_fn` is unwired.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
 
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
@@ -736,7 +846,67 @@ public:
                             // disagree. Trailing optional dep; nullptr leaves the tool
                             // answering an internal-error JSON-RPC response, same degrade
                             // as the retired cohort provider.
-                            std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                            std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                            // B4 (#2146 API-parity): backs the `unlock_account` tool
+                            // (MCP twin of POST /api/v1/users/{name}/unlock). Trailing
+                            // optional dep; unset leaves the tool answering "lockout
+                            // subsystem unavailable", the same degrade the REST route
+                            // takes when its own lockout_clear_fn is unwired.
+                            LockoutClearFn lockout_clear_fn = {},
+                            // B5 (api-parity #2146) — backs the 5 offload-target MCP
+                            // twins. The SAME `offload_target_store_` instance
+                            // OffloadRoutes::register_routes wires (server.cpp) — a real,
+                            // non-dormant store. Trailing optional dep; nullptr leaves
+                            // every offload-target tool answering "unavailable".
+                            OffloadTargetStore* offload_target_store = nullptr,
+                            // B5 — backs get/activate_platform_license + list_license_alerts.
+                            // DELIBERATELY nullptr in production today (ADR-0048: LicenseStore
+                            // is dormant, matching RestApiV1's own `/*license_store=*/nullptr`
+                            // wiring) — see this header's forward-declaration comment above.
+                            LicenseStore* license_store = nullptr,
+                            // B5 — backs list/create/rollback/cancel_software_deployment.
+                            // DELIBERATELY nullptr in production today (ADR-0051:
+                            // SoftwareDeploymentStore is dormant, matching RestApiV1's own
+                            // `/*sw_deploy_store=*/nullptr` wiring).
+                            SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                            // B5 — backs export_ca_root_csr, the MCP twin of GET
+                            // /api/v1/ca/root-csr. Reuses `CaRoutes::ExportCsrFn` verbatim
+                            // (ca_routes.hpp, already included above for IssueCodeSigningFn)
+                            // rather than redeclaring it, so the REST route and this twin
+                            // call the identical ServerImpl seam (export_ca_csr()). Trailing
+                            // optional dep; unset leaves the tool answering "CA not
+                            // available", the same degradation ca_store == nullptr produces
+                            // for the other CA tools above.
+                            CaRoutes::ExportCsrFn export_csr_fn = {},
+                            // B5 — backs import_ca_chain, the MCP twin of POST
+                            // /api/v1/ca/import-chain. Reuses `CaRoutes::ImportChainFn`
+                            // verbatim; the CRL-republish half reuses the EXISTING
+                            // `publish_crl_fn` param above (identical signature to
+                            // `CaRoutes::PublishCrlFn`, already wired for
+                            // revoke_certificate) rather than adding a second one.
+                            // Trailing optional dep; unset leaves the tool answering
+                            // "CA not available".
+                            CaRoutes::ImportChainFn import_chain_fn = {},
+                            // ADR-0031 WS-A4: the public in-process compliance/policy
+                            // API seam (replaces direct PolicyStore access for the six
+                            // twinned read tools) — the SAME instance the /compliance
+                            // dashboard fragments and REST /api/v1/compliance*, /api/v1/
+                            // polic* routes use, so all three surfaces can never
+                            // disagree. Trailing optional dep; nullptr leaves those
+                            // tools on the pre-seam "Policy store unavailable" degrade.
+                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                            // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API
+                            // seam — backs `list_agents`/`get_agent_details`. The SAME
+                            // instance `DeviceRoutes`/REST GET /api/v1/devices[/{id}]
+                            // use, so all three surfaces can never disagree. Trailing
+                            // optional dep; nullptr leaves both tools on the pre-seam
+                            // "internal error"/unwired degrade.
+                            std::shared_ptr<const DeviceApi> device_api = nullptr,
+                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                            // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                            // (kept last across the device_api merge) so adding it can never shift a
+                            // later positional caller's arguments.
+                            AppUsageStore* app_usage_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -836,7 +1006,26 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B4 (#2146 API-parity): see build_handler's doc comment above —
+                         // forwarded to it for the `unlock_account` tool.
+                         LockoutClearFn lockout_clear_fn = {},
+                         // B5 (api-parity #2146) — forwarded to build_handler; see its doc
+                         // comments above for each param's contract.
+                         OffloadTargetStore* offload_target_store = nullptr,
+                         LicenseStore* license_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         CaRoutes::ExportCsrFn export_csr_fn = {},
+                         CaRoutes::ImportChainFn import_chain_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -885,7 +1074,26 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B4 (#2146 API-parity): see build_handler's doc comment above —
+                         // forwarded to it for the `unlock_account` tool.
+                         LockoutClearFn lockout_clear_fn = {},
+                         // B5 (api-parity #2146) — forwarded to build_handler; see its doc
+                         // comments above for each param's contract.
+                         OffloadTargetStore* offload_target_store = nullptr,
+                         LicenseStore* license_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         CaRoutes::ExportCsrFn export_csr_fn = {},
+                         CaRoutes::ImportChainFn import_chain_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
@@ -923,13 +1131,24 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    // #2146 Batch B2 — see set_result_set_store above.
+    ResultSetStore* result_set_store_{nullptr};
+    // #2146 Batch B1 — see set_baseline_store above.
+    BaselineStore* baseline_store_{nullptr};
+    // #2146 Batch B1 — see set_guardian_push_fn above.
+    GuardianPushFn guardian_push_fn_;
+    // #2146 Batch B3 — see set_viz_deps above.
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
     // #4033 — see set_response_visible_set_fn above.
     ResponseVisibleSetFn response_visible_set_fn_;
-    // #4035 — see set_dex_fleet_fn above.
-    DexFleetFn dex_fleet_fn_;
+    // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
+    std::shared_ptr<const DexApi> dex_api_;
+    std::shared_ptr<const DexPerfApi> dex_perf_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
 };

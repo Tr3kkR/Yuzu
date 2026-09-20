@@ -338,10 +338,16 @@ if $REUSE_STACK; then
     # assertions.
     SERVER_PID=$(pgrep -f 'yuzu-server.*--listen' | head -1 || true)
     # Gateway can run as either the prod release (`yuzu_gw/bin/yuzu_gw`
-    # wrapper → erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
-    # `-name yuzu_gw1@127.0.0.1` flag is the stable fingerprint across
-    # both; it's present on the cmdline either way.
-    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw1@127.0.0.1' | head -1 || true)
+    # wrapper -> erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
+    # `-name yuzu_gw@<addr>` flag is the stable fingerprint across both;
+    # it's present on the cmdline either way. HA WS-4 #4555 changed the
+    # node short name from the old hardcoded `yuzu_gw1` to a shared
+    # `yuzu_gw` (every replica now advertises the SAME short name,
+    # distinguished only by address, to support `docker compose --scale`)
+    # -- match the `yuzu_gw@` PREFIX, not a fixed full name, since the
+    # address suffix varies with YUZU_GW_ADVERTISE_ADDR (default
+    # 127.0.0.1, unchanged for a single-node/Phase-4 rig).
+    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw@' | head -1 || true)
     AGENT_PIDS=($(pgrep -f 'yuzu-agent.*--data-dir /tmp/yuzu-uat' || true))
     if [[ -z "$SERVER_PID" ]]; then
         echo "FAIL: Phase 4 reuse — could not find yuzu-server pid via pgrep" >&2

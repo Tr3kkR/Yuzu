@@ -101,9 +101,9 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 10 | 7 | 3 |
-| inventory | 6 | 1 | 5 |
-| dex | 25 | 17 | 8 |
+| devices | 14 | 9 | 5 |
+| inventory | 7 | 1 | 6 |
+| dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
@@ -123,14 +123,17 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
-| other | 74 | 2 | 72 |
-| **Total** | **278** | **67** | **211** |
+| other | 74 | 8 | 66 |
+| **Total** | **284** | **76** | **208** |
 
-Registered `/api/vN/*` routes: 224. OpenAPI `paths` entries: 223. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 125.
+Registered `/api/vN/*` routes: 232. OpenAPI `paths` entries: 231. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 178.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 211.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 208.
+
+<!-- PLACEHOLDER: dev's current snapshot, carried forward pending this merge's own --render-doc pass after build (adds A2-R4's approval-review REST v1/MCP twins). -->
 
 <!-- END GENERATED -->
+
 
 ## See also
 

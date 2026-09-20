@@ -45,7 +45,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
 | `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
 | `--no-default-certs` | off | Do **not** auto-generate built-in default certificates on first boot. Restores the legacy refuse-to-start: the server will not start unless `--cert`/`--key` (and `--https-cert`/`--https-key` when HTTPS is enabled) are supplied. Use where operator- or HSM-provided certs are mandatory policy. (Defaults emit a startup banner, the audit actions `server.default_certs_generated` + `server.default_certs_in_use`, and the Prometheus gauge `yuzu_server_default_certs_active`.) Env: `YUZU_NO_DEFAULT_CERTS`. |
-| `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux/macOS), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
+| `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux; macOS running as root — matches the packaged-install convention), `~/Library/Application Support/Yuzu/certs` (macOS running as a non-root user — e.g. a native `scripts/start-UAT.sh` dev run, since `/etc/yuzu` is root-owned and macOS has no packaged server installer), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
 | `--cert-san` | *(none)* | **Repeatable.** Extra Subject Alternative Name to add to *every* auto-generated default leaf (dashboard HTTPS, agent/management gRPC, and gateway), on top of the base `localhost` / `127.0.0.1` / `::1` / `<hostname>`. Forms: `dns:<name>`, `ip:<addr>`, or a bare value (auto-classified as IP vs DNS by shape); a single value may be comma-separated. Use this so the built-in certs validate for a name a client actually dials — e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service name passes TLS hostname verification, or `--cert-san dns:yuzu.corp.example --cert-san ip:10.0.0.5` for a load-balancer name / VIP. An `ip:` value that is not an IP literal is ignored with a warning. **Ignored** when operator certs are supplied or `--no-default-certs` is set; **changing it does not rotate an existing cert set** — clear `--ca-dir` (or replace the certs) for new SANs to take effect (in a container the cert dir lives in the image layer unless a volume is mounted there, so *recreate* the container — a restart alone won't regenerate). Env: `YUZU_CERT_SAN`. |
 | `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
 | `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
@@ -207,6 +207,35 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, `POST /api/v1/tokens/{id}/rotate`/`.../confirm` (and the
+MCP twins `rotate_api_token`/`confirm_api_token_rotation`) composed the
+shipped RBAC-off default with the store's self-service-only ownership check
+into something reachable by nobody but an admin out of the box — a plain
+non-admin owner of a token got `403` trying to rotate their own credential.
+Separately, a dashboard/cookie session could never rotate or confirm its own
+MCP-tiered or service-scoped token — only that exact token's own credential
+could, which was backwards precisely when the token's secret is under
+suspicion.
+
+**What changes:** any authenticated, non-admin owner of a token can now
+self-rotate it under the default configuration, and a plain interactive
+session can now rotate/confirm any of its own tokens regardless of that
+token's own tier/scope. Nothing that previously succeeded now fails — this
+only widens which previously-403/400'd callers now get `200`. The minted
+successor still always inherits the token's own tier/scope and expiry
+verbatim; no caller can mint a credential broader than the one it replaces.
+A token within 24 hours of its own expiry still cannot be rotated (mint a
+new one instead) — unchanged, by design.
+
+See `docs/user-manual/authentication.md` "Rotating a Token" for the full
+operator-facing detail, and
+`docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
+for the decision record.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
@@ -1053,10 +1082,65 @@ After upgrading, refusals are counted by
 `absent()` stays meaningful) and audited as `command.dispatch|denied`
 (`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
 (`detail=reason=<reason>`) or `result_set.create|denied`
-(`detail=reason=<reason> source_kind=<kind>`). The
+(`detail=reason=<reason> source_kind=<kind>`). The same action's `failure` result (#4496 + follow-up, the
+`POST /api/v1/result-sets/from-inventory-query` producer and its MCP twin) carries
+`detail=reason=store_degraded|query_truncated|poison_excluded|parse_error_excluded source_kind=inventory_query` - only
+the latter three of those four are counted on `yuzu_server_dispatch_target_rejected_total`
+(`route="result_set_inventory_query"`); `store_degraded` is a store-availability failure, not a
+targeting-shape refusal, so it is not on this series. The
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
+
+**`query_truncated`'s failure mode is structural, not a per-record near-miss - plan its runbook
+step separately from `poison_excluded`/`parse_error_excluded`.** `poison_excluded` and
+`parse_error_excluded` are both per-record and self-heal once the offending record is fixed or
+excluded - they are DIFFERENT causes (over-nested `data_json` vs. `data_json` that fails to parse
+as JSON at all), each with its own reason so an operator can tell which guard excluded a record,
+but the same "per-record, self-healing" runbook shape applies to both. `query_truncated` fires
+whenever the generic-inventory read backing both producer routes exceeds the hard-coded 5,000-row
+cap or the 8 MiB aggregate payload cap - there is no pagination on this path today. On a fleet
+whose inventory has grown past either cap, EVERY subsequent call to
+`POST /api/v1/result-sets/from-inventory-query` or its MCP twin refuses with `query_truncated`,
+and the alert never clears on its own. If you need to silence `YuzuDispatchTargetRejected` on such
+a fleet before the fix lands, scope the Alertmanager silence to `reason="query_truncated"` AND
+`route="result_set_inventory_query"` specifically - never the bare alertname, which would also
+hide `poison_excluded`/`parse_error_excluded`, genuine near-miss signals that must stay visible.
+Tracked fix: **#2633** (`InventoryStore::query` row cap (5000): keyset pagination +
+`limit+1` truncation probe).
+
+### vNEXT - result-set `instruction_id`/`params` fields are now bound-checked (#4373) (intentional compatibility break, no supported flow affected)
+
+**What changed.** `POST /api/v1/result-sets/from-instruction-result` and `POST
+/api/v1/result-sets/{id}/re-eval` had no bound on the `instruction_id` or `params` fields feeding
+an InstructionDefinition dispatch: an over-keyed/oversized `params` object could reach fleet-wide
+dispatch, and an oversized `instruction_id` could reach an unbounded `instruction_store` lookup
+(a real registered instruction id is capped at 128 characters, so an oversized id could never
+match one and dispatch - it reached the not-found fallback instead). Both routes now enforce the
+same caps MCP's `create_result_set_from_instruction_result`/`reevaluate_result_set` tools enforce:
+`instruction_id` at 256 bytes, `params` at 32 keys / 256-byte keys / 64 KiB values.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/v1/result-sets/from-instruction-result` | `instruction_id` over 256 bytes | reached an unbounded store lookup, then 404 | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
+| `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched (params) or reached an unbounded store lookup then 400 (instruction_id) | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
+| `POST /api/v1/result-sets/from-tar-query` | `sql` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `instruction_id` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-tar-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets`, `from-tar-query`, `from-instruction-result`, or `from-inventory-query` | `name` over 256 bytes, or (generic create route only) `source_kind` over 64 bytes | persisted/dispatched unbounded | `400` |
+| `POST /api/v1/result-sets` (the generic/synchronous create route) | `name` or `source_kind` present but not a JSON string | uncaught exception, bare `500` | `400` |
+
+**Who this affects.** Callers sending a field past a numeric/count bound (`instruction_id`,
+`params` count/key-length/value-length, both at the same values MCP's equivalent tools enforce -
+MCP's handler-side bounds landed within days of this fix, in the same unreleased cycle, not a
+long-standing MCP/REST gap), AND separately callers sending a wrong-typed `params`, `name`, or
+`source_kind` (not a numeric bound at all - a shape/type mismatch, always rejected regardless of
+size). No supported flow constructs any of these fields anywhere near the numeric limits or with
+the wrong JSON type, so no compliant client is affected either way.
 
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
 
@@ -1566,6 +1650,34 @@ Three things are visible after upgrading agents:
    the text, delete `security.firewall.state` and re-import it via
    `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
+
+### vNEXT — Linux firewall `state` may now read `unknown` more often for ufw/iptables hosts (correctness fix)
+
+The `firewall` plugin's Linux ufw/iptables legs previously reported a parsed
+`active`/`inactive` `state` as soon as the underlying subprocess exited `0`
+— even if the read had actually timed out or been truncated before
+finishing, which could report a stale or simply wrong verdict with full
+confidence. `state|` is now gated on the same completeness check `ruleset|`
+already used (`tool_ran && exit_code==0 && !timed_out && !output_truncated`),
+matching the nftables leg's own honest-degrade behavior added alongside it.
+
+1. **Hosts whose `ufw status`/`iptables -S` reads were marginal** (slow,
+   near-timeout, or hitting the output cap) will now read `state|unknown`
+   more often post-upgrade, for the SAME underlying firewall state as
+   before. This is the fix working as intended — a previously
+   false-confident `active`/`inactive` becomes an honest "couldn't tell" —
+   not a detection regression. `ruleset|unknown` already had this behavior;
+   `state|` now matches it.
+2. **No row shape changed.** `unknown` was already a valid `state` value on
+   every backend (it is the nftables leg's own honest-degrade outcome); this
+   only changes which reads reach it. Integrations already handling
+   `state|unknown` need no changes.
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep the
+   prior completeness posture for ufw/iptables; a wider spread of
+   `state|unknown` across the fleet for these backends specifically
+   identifies upgraded agents whose reads were genuinely marginal, not a
+   server-side fault.
+
 ### vNEXT — KEK rotation is now durably rate-limited (#2530) (breaking)
 
 Before this release, `POST /api/v1/secrets/kek/rotate` was rate-limited only by a 5-minute
@@ -2023,6 +2135,32 @@ A nonzero result means that host's `installed_count` will report a higher number
 **Deprecation window (per `docs/api-versioning-policy.md`).** Announced 2026-09-08. `GET /api/v1/agent/plugin-policy` keeps working for at least 90 days **and** at least one intervening feature release, whichever is longer (so no earlier than 2026-12-07, and not before the next feature release ships) — removal will carry its own `CHANGELOG.md` **Breaking/Removed** entry per the cycle's Step 3, never a silent drop.
 
 **Who this affects, and what to do.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Point it at `/api/v2/agent/plugin-policy` and read `response["data"]["trust_bundle_pem"]` (was `response["trust_bundle_pem"]`) — no CLI flag or configuration change is needed, this is a URL and response-shape change only. No action is required before the removal window closes, but migrating now also picks up the TOCTOU integrity fix.
+
+### vNEXT - a poisoned inventory record now makes two result-set producer routes refuse instead of silently narrowing (#4496) (breaking)
+
+**What changed.** `POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool now refuse (`503`/`kInternalError`) when a candidate inventory record's stored `data_json` nests past the JSON depth guard (the #2437-class poisoned/over-nested record). Previously the poisoned record was silently skipped with no signal at all, and the call succeeded, materialising a result set that had quietly excluded that agent.
+
+**Who this affects.** Any deployment with an existing stored inventory record (`inventory_store.inventory_data`) whose `data_json` nests deeper than the JSON depth guard allows - most likely a row predating the #2437-class write-side guard. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set.
+
+**How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source. Restart the affected agent to force a full resync; if the same WARN line (or a subsequent `poison_excluded` refusal) recurs afterward, the source data itself genuinely exceeds the depth guard and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
+
+### vNEXT - a malformed (unparseable) inventory record ALSO now makes the same two result-set producer routes refuse (#4496 follow-up) (breaking)
+
+**What changed.** Same two routes as the entry above (`POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool), a DIFFERENT trigger: a candidate inventory record whose stored `data_json` fails to parse as JSON at all (a syntax defect, not over-nesting) now also refuses (`503`/`kInternalError`, `reason=parse_error_excluded`) rather than being silently skipped. Kept as a separate, distinctly-named cause from `poison_excluded` above so an operator can tell WHICH guard excluded a record.
+
+**Who this affects.** Any deployment with an existing stored inventory record whose `data_json` is not valid JSON - the write-side depth guard (`gateway_service_impl.cpp`'s `json_exceeds_depth`) checks nesting depth only, not general JSON validity, so a malformed-but-shallow blob has always been able to reach storage. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set. The read-only `POST /api/v1/inventory/evaluate` route instead surfaces this as a `results_excluded_by_parse_error` count field alongside `results_excluded_by_poison` (present only when non-zero), the same posture as the depth-guard entry above. `POST /api/inventory/query` is UNAFFECTED by this specific change: it never calls `evaluate_inventory()` (it lists records by agent/plugin/time metadata, not by evaluating conditions against parsed JSON) and already degrades gracefully on a parse failure, returning the record with its `data` field as a raw string rather than dropping it - there is no narrowed-match-set hazard on that route for this cause.
+
+**How to identify the affected record(s).** Same mechanism as the entry above: a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json failed to parse (malformed JSON)`, emitted once per excluded record. Watch the server log for this line following a `503` (`reason=parse_error_excluded`) from either producer route to identify which agent/plugin's record needs re-collection at the source. Same remediation ladder as the entry above: restart the affected agent to force a full resync; if the same WARN line (or a subsequent `parse_error_excluded` refusal) recurs afterward, the source data itself is genuinely malformed and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
+
+---
+
+### vNEXT — `certificates` `delete` on Windows fails closed instead of silently switching stores (#4377) (breaking)
+
+**What changed.** The `security.certificates.delete` action on Windows opened the named store under the `LOCAL_MACHINE` hive; if that open failed, it silently retried under `CURRENT_USER` and deleted there if a same-named store existed and matched. `delete` now opens `LOCAL_MACHINE` only — a failure to open there reports `error|<store> store could not be opened; nothing removed` (non-zero exit, `status|not_found` never returned in this case) and removes nothing, rather than falling back. `list`/`details` are unaffected in kind — they keep the `CURRENT_USER` read fallback, and now disclose it more completely (an explicit output row and a `CONSTRAINED`/`PARTIAL` result whenever a store fell back, an earlier store couldn't be opened, or its enumeration was incomplete, not only when the final match itself came from the fallback).
+
+**Who this affects.** Any deployment where a `delete` automation's target `LOCAL_MACHINE` store can become unopenable (a permissions misconfiguration, a corrupted store) **and** a same-named `CURRENT_USER` store exists on the same host. Before this fix, that combination made `delete` silently remove a certificate from a store the caller never named — which is the bug this closes, not a regression. Automation that only checked for a non-zero exit code was already correctly informed on every OTHER failure path; this is the one combination where the old behavior masked a wrong-target delete with an apparent success.
+
+**Before upgrading, check whether this affects you.** If your `delete` automation for Windows hosts does not already treat a non-zero exit / an `error|...` result as a hard failure requiring investigation, add that check now. There is no way to pre-check for the specific `LOCAL_MACHINE`-unopenable-with-a-`CURRENT_USER`-fallback condition from outside the action itself; the fix is unconditional and has no opt-out.
 
 ---
 
@@ -3030,6 +3168,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
+**Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
+
 Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
 
 **Bootstrap-time floor (default-cert generation, ADR-0053).** First-boot (or self-heal) default-cert generation takes the `yuzu:default_certs_bootstrap` Postgres advisory lock for the duration of its critical section, holding one pool lease for that whole window while the CA-store writes it performs inside the lock each draw their own nested per-call lease from the SAME pool — an N-way race at this one boot-time code path needs roughly N+1 simultaneous connections. At the allowed minimum `--postgres-pool-size=1` this is not merely "can self-contend under a race" — it fails **every** boot that needs to generate certs, deterministically, zero racers required, since the outer lease alone exhausts a pool of size 1. It fails closed and loudly (a nested-acquire timeout surfaces as an ordinary `record_issued` failure → refuse to start), never a hang or silent corruption, but a pool sized at the bare minimum for steady-state heartbeat/SSE traffic above can still be too small for this one-time bootstrap path — size for at least 2 even on the smallest deployments.
@@ -3103,7 +3243,7 @@ Schedule the dump alongside the existing SQLite/cert-dir backups; verify restore
 
 ### Key management (secrets KEK)
 
-Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
+Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux and on macOS running as root, `~/Library/Application Support/Yuzu/certs` on macOS running non-root, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
 
 > Three of the four gated stores now write secret columns through this machinery: `auth` (TOTP secrets, since 2026-07-16), `webhooks` (the outbound HMAC signing secret, ADR-0057), and `runtime_config_store` (the OIDC client secret, ADR-0060). `offload_targets` adopts it once it migrates to Postgres (ADR-0059). Set your backup procedure up for the pairing below **now** — every additional migration widens the blast radius of a KEK/DB backup mismatch, never narrows it.
 
@@ -3111,7 +3251,7 @@ Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): eac
 
 | Startup error prefix | Meaning | Recovery |
 |---|---|---|
-| `kek_unresolvable` | A registered KEK version has no key file. Causes: keys dir older than the DB (backup skew), wrong keys directory, or a second server instance pointed at the same database (unsupported — one KEK per database). | Restore the keys directory from the backup *paired* with this database. |
+| `kek_unresolvable` | A registered KEK version has no key file. Causes: keys dir older than the DB (backup skew), wrong keys directory, a second server instance pointed at the same database (unsupported — one KEK per database), **or, on macOS, a database registered by a server run as root (`/etc/yuzu/certs`) later opened by the same binary run non-root, or vice versa (`~/Library/Application Support/Yuzu/certs`)** — the two euid-dependent defaults do not share key material. | Restore the keys directory from the backup *paired* with this database, or pass `--ca-dir` pointing at whichever directory the original KEK actually lives in. |
 | `kek_corrupt` | The key file exists but does not match its registered fingerprint (torn/corrupt file or foreign key material — **not** row tamper). | Same: restore the paired keys directory. |
 | `provider_failure` | CSPRNG or key-storage failure during KEK generation or check-value computation (first boot / rotation). | Check the keys directory is writable and system entropy is healthy; if a prior first boot crashed, the message names the torn file to delete. |
 | `db_error` | Postgres connection/transaction failure during the `secrets` schema migration or `kek_meta` read/write. | Check the DSN and Postgres service health — triage as "DB down", not key loss. |

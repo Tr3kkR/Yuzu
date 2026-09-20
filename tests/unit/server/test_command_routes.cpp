@@ -150,6 +150,10 @@ struct CommandHarness {
     int send_all_calls = 0;
     bool sink_throws = false;
     bool force_zero_sends = false;
+    // WS-4 4.2b Task D: mirrors force_zero_sends -- makes the sink's
+    // `prepare_route_fallback` report a degraded gateway routing-directory
+    // read, the exact sibling of `containment_fail_closed` above.
+    bool force_route_unreadable = false;
 
     // -- send-time discard --
     bool discard_send_time_called = false;
@@ -264,7 +268,10 @@ struct CommandHarness {
                         return 0;
                     return 2;
                 },
-                [this]() -> std::vector<std::string> { return registry.all_ids(); }};
+                [this]() -> std::vector<std::string> { return registry.all_ids(); },
+                [this](const std::vector<std::string>&) -> bool {
+                    return force_route_unreadable;
+                }};
         };
         deps.discard_send_time_fn = [this](const std::string& command_id) -> bool {
             discard_send_time_called = true;
@@ -393,6 +400,22 @@ TEST_CASE("/api/command: send-time is discarded when every send returns false (s
     CHECK(res->status == 503);
     CHECK(h.record_send_time_called);
     CHECK(h.discard_send_time_called);
+}
+
+TEST_CASE("/api/command: a degraded gateway routing-directory read reports "
+          "reason=route_unreadable, retryable (WS-4 4.2b Task D — the exact sibling of "
+          "containment_unreadable)",
+          "[command_routes]") {
+    CommandHarness h;
+    h.force_zero_sends = true;
+    h.force_route_unreadable = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "route_unreadable");
+    CHECK(j["error"]["retry_after_ms"] == 5000);
 }
 
 TEST_CASE("/api/command: send-time is discarded when the confined-dispatch sink throws "
@@ -822,4 +845,32 @@ TEST_CASE("/api/command: a Forensics action's single target falling outside the 
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(h.send_to_ids_called.empty());
+}
+
+// ─────────────── json-dump-depth-guard fix (#2437-class) ────────────────────
+//
+// nlohmann::json::dump() is unboundedly recursive. This body is an
+// otherwise-VALID, otherwise-ACCEPTED request (plugin/action/agent_ids all
+// well-formed) with one extra deeply-nested field inside "params" - the
+// exact field extract_json_string_map's non-string coercion calls .dump()
+// on - so on unguarded code the request proceeds all the way to dispatch,
+// and only the new depth check tells fixed and unfixed code apart. depth 40
+// is trivially safe to build/dump directly in this test process; the real
+// attack depth this guard exists for is many orders of magnitude higher
+// (~100,000 levels).
+
+TEST_CASE("/api/command: a body nested past the depth limit is rejected before dispatch",
+          "[command_routes][security][depth]") {
+    CommandHarness h;
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body =
+        R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"params":{"deep":)" +
+        deep_array + "}}";
+    auto res = h.sink.Post("/api/command", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("nests too deeply") != std::string::npos);
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.send_all_calls == 0);
 }

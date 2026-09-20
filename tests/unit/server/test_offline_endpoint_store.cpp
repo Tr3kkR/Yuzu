@@ -100,6 +100,44 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         auto rows = store.query_stale_within(std::chrono::hours(1));
         CHECK(find(rows, "") == nullptr);
     }
+
+    // Round-3 v2 columns (Devices-page merge, item 1): agent_version/arch.
+    SECTION("v2 round-trip: agent_version and arch persist") {
+        REQUIRE(store.upsert("agent-v2", "host-v2", "windows", t, 0, "1.4.2", "x86_64"));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-v2");
+        REQUIRE(v != nullptr);
+        CHECK(v->agent_version == "1.4.2");
+        CHECK(v->arch == "x86_64");
+    }
+
+    SECTION("v2 blank-preserve: a blank agent_version/arch does not clobber a known value") {
+        REQUIRE(store.upsert("agent-v2b", "host-v2b", "linux", t - 1000, 0, "2.0.0", "arm64"));
+        // A later heartbeat that raced the session lookup supplies blanks —
+        // hostname/os still update unconditionally, but the last-known
+        // version/arch must survive (see upsert()'s CASE WHEN doc comment).
+        REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "linux", t, 0, "", ""));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-v2b");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname == "host-v2b-renamed"); // unconditional field still updates
+        CHECK(v->agent_version == "2.0.0");       // preserved, not blanked
+        CHECK(v->arch == "arm64");                // preserved, not blanked
+    }
+
+    SECTION("v2 pre-migration rows read back as empty version/arch") {
+        // No explicit pre-v1-only fixture is practical here (the template
+        // always migrates through the latest version) — this asserts the
+        // DEFAULT '' on a row that never supplied them, which is the same
+        // observable shape a genuinely pre-v2 row would have after the
+        // ADD COLUMN migration runs.
+        REQUIRE(store.upsert("agent-noversion", "h", "linux", t, 0));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-noversion");
+        REQUIRE(v != nullptr);
+        CHECK(v->agent_version.empty());
+        CHECK(v->arch.empty());
+    }
 }
 
 // gov fjarvis B1: a reachable database whose schema migration FAILS must leave

@@ -36,6 +36,7 @@
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_api_v1.hpp"
 #include "test_approval_manager_pg_helper.hpp"
@@ -48,6 +49,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h>
 
 #include <atomic>
 #include <chrono>
@@ -65,6 +67,19 @@ namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
+
+// Fault-injection helper for the #2146 A2-R1 Gate 8 degrade test below: runs
+// a raw statement over a fresh side connection (never the harness's own
+// pool, so the tracker's `open_`/pool state stays otherwise healthy -- only
+// the ONE targeted query fails). Mirrors test_rest_executions_v1_twins.cpp's
+// identical `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
 
 struct AuditCall {
     std::string action, result, target_type, target_id, detail;
@@ -519,6 +534,44 @@ TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notf
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "api.v1.events.subscribe");
     CHECK(h.audit_log[0].result == "denied");
+}
+
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("GET /api/v1/events: a transient tracker degrade is 503 (not a false 404) "
+          "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][events][notfound]") {
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running");
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing tracker-unavailable/pool-exhaustion
+    // branch above and mask this specific defect).
+    exec_sql(h.tracker_bundle->dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146b");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    exec_sql(h.tracker_bundle->dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146b RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    REQUIRE(res->body.find("execution tracker degraded") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // api.v1.events.subscribe/denied here.
+    for (const auto& c : h.audit_log)
+        CHECK(c.target_id != exec_id);
 }
 
 TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[pg][events][terminal]") {
