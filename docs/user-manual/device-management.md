@@ -329,6 +329,8 @@ The full set of agent command-line flags:
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
 | `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `--log-max-size` | Size in bytes at which the `--log-file` file rotates; ignored without `--log-file` (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
+| `--log-max-files` | Number of rotated `--log-file` files kept; ignored without `--log-file` (env `YUZU_LOG_MAX_FILES`) | `5` |
 
 ### Per-agent mTLS auto-provisioning (PKI)
 

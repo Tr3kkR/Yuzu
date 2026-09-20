@@ -1671,7 +1671,7 @@ The server-side `T_server` line and the agent's legacy drift-sink `T_wire` line 
 benchmark diagnostics and have no kill switch other than `--log-level`. The trigger is #4606 closing (the
 criterion-10 evidence campaign concluding): at that point, or at PR-5 if that comes first, they must
 be retired or gated behind a runtime flag - left unrecorded they ship into the flip as permanent
-unconditional log volume. No separate issue exists for the retirement yet, so this paragraph is
+unconditional log volume. As of this writing no separate issue exists for the retirement, so this paragraph is
 its only record.
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run,
 both inert until `prefer_spark` gives the Spark drain worker a live caller: a slow or blocked log

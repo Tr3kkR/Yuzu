@@ -7,10 +7,10 @@
  * T_visible). Deliberately NOT part of GuardianSparkRuntime's class interface:
  *   - so the two format_*_line() functions are directly unit-testable (pure, no
  *     I/O, no clock reads) without touching the runtime;
- *   - so a later commit's agent-side send-site logging (agent.cpp, T_wire) can
- *     reuse SendTimingRecord/format_send_timing_line without depending on
- *     guardian_spark_runtime.hpp (agent.cpp lives in this same directory and
- *     already avoids pulling that header in for an unrelated reason).
+ *   - so the agent-side send-site logging (agent.cpp, T_wire) can use
+ *     SendTimingRecord/make_outbox_send_timing/format_send_timing_line without
+ *     depending on guardian_spark_runtime.hpp (agent.cpp lives in this same
+ *     directory and already avoids pulling that header in for an unrelated reason).
  *
  * Placed in agents/core/src/ (not agents/core/include/yuzu/agent/) so its
  * `#include "guardian_outbox.hpp"` (for OutboxDomain) resolves via ordinary
@@ -24,16 +24,23 @@
  * T0/T2 / the #3990 diagnostic) - keep it stable.
  *
  * CORRELATION CONTRACT (read before writing a correlator):
- *   - Join on `event_id` and the embedded *_wall_ns fields, NEVER on log-file line order.
+ *   - Join on the event id and the embedded wall-clock fields, NEVER on log-file line order.
  *     A T_wire line can precede its own T_detect line in the file: evaluate_key wakes the
  *     outbox drain worker BEFORE it emits the deferred T_detect line (the waker deliberately
  *     does not wait on the log sink - a stalled sink must never delay delivery), and two
- *     keys' deferred emissions can interleave. A streaming correlator should buffer a T_wire
- *     for a grace window rather than pair it with the next T_detect it sees. In program order
- *     detect_wall_ns precedes wire_wall_ns for one event_id, but both are system_clock reads,
- *     so an NTP step can invert them; T_wire carries no *_mono_ns field.
- *   - event_id is `<agent>-<boot_nonce>-<rule>-<wall_ms>-<seq>`. A new agent process gets a
- *     new boot_nonce, so an id minted before a restart is never re-minted after it.
+ *     keys' deferred emissions can interleave. Treat the post-hoc join over the COMPLETE log
+ *     as authoritative. A streaming correlator may buffer a T_wire for a grace window, but a
+ *     stalled sink delays T_detect without bound, so expiry must file the sample in a "late"
+ *     bucket and never drop it or count it as an orphan. In program order detect_wall_ns
+ *     precedes wire_wall_ns for one event, but both are system_clock reads, so an NTP step
+ *     can invert them; T_wire carries no *_mono_ns field.
+ *   - The agent-side lines carry no agent field (each agent has its own log); join on
+ *     (agent, event_id), taking the agent from the log's origin and from T_server's agent=.
+ *   - Event id layout differs by path. Spark: `<agent>-<boot_nonce>-<rule>-<wall_ms>-<seq>`,
+ *     where a new agent process gets a new boot_nonce, so an id minted before a restart is
+ *     never re-minted after it. Legacy (domain=legacy): `<rule>-<agent>-<wall_ms>-<seq>`,
+ *     with NO boot_nonce and a per-process seq. An empty agent id (before registration) is
+ *     a known degenerate case.
  *   - Reading a T_detect line that has no later lines:
  *       accepted=0 (fire_*_ns=-1)  the outbox rejected the batch; nothing was enqueued. The
  *                                  next eval pass mints a NEW event_id (and logs another
@@ -41,12 +48,14 @@
  *       accepted=1, no T_wire      enqueued but never sent: coalesced away (a later
  *                                  observation for the same rule+domain replaced it under a
  *                                  newer event_id, same boot_nonce), purged (generation
- *                                  superseded, or the rule was dropped), still queued, held
- *                                  back by a down stream (the Spark path logs no T_wire for
- *                                  that), or the agent stopped first. The Compliance/Health
- *                                  outbox is an in-memory buffer, NOT durable
- *                                  (guardian_outbox.hpp): after a restart the boot
- *                                  re-evaluation mints a fresh id under a new boot_nonce.
+ *                                  superseded, or the rule was dropped), still queued
+ *                                  (including behind a slow or blocked send), held back by a
+ *                                  down stream (the Spark path logs no T_wire for that), or
+ *                                  the agent stopped first. The log alone cannot tell the
+ *                                  last four apart. The Compliance/Health outbox is an
+ *                                  in-memory buffer, NOT durable (guardian_outbox.hpp): after
+ *                                  a restart the boot re-evaluation MAY mint a fresh id under
+ *                                  a new boot_nonce (only if the re-evaluation emits).
  *   - Reading a T_wire line:
  *       Spark path (domain=compliance|health|lifecycle):
  *         sent=0  Write() returned false. The entry is retained and re-sent under the SAME
@@ -56,14 +65,22 @@
  *                 several T_wire lines for one event_id.
  *       domain=legacy (the non-Spark drift-sink path: no outbox, no T_detect):
  *         sent=0  the event was DROPPED (link down or Write() failed). There is no retry.
+ *                 A legacy detection made before the sink is wired is dropped with NO line
+ *                 at all, so the absence of a legacy T_wire does not prove nothing fired.
  *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
- *     disarmed and errored events, and journal replays from this or an earlier process),
- *     domain=health raised by a subscription fault or loss rather than an evaluation pass,
- *     domain=legacy, or an agent stopped between the waker and the deferred T_detect line.
- *   - T_wire sent=1 with no T_server: lost in flight, or the server classified the event
- *     Redelivered (for example a Lifecycle journal replay), Conflict or Error. The server
- *     emits T_server for Inserted only, and logs Redelivered at debug (Conflict and Error at
- *     warn), so at the default info level a replay and a loss look alike in the server log.
+ *     disarmed and errored events - a subscription LOSS produces a lifecycle "errored"
+ *     entry - and journal replays from this or an earlier process), domain=health raised by
+ *     a subscription FAULT rather than an evaluation pass, and domain=legacy. It can also
+ *     mean the agent stopped between the waker and the deferred T_detect line.
+ *   - T_server (server log) fields: recv_ns and committed_ns are wall-clock instants on the
+ *     SERVER; agent_ns is the event's own AGENT-side timestamp (on the Spark path the outbox
+ *     entry's enqueue stamp; whole seconds on the legacy path), so arithmetic between
+ *     agent_ns and the server's instants includes any agent/server clock skew; store_ms is
+ *     an elapsed time. It is emitted for Inserted only. Redelivered is logged at debug,
+ *     Conflict and Error at warn (those warnings, and the parse-failure one, carry no
+ *     event_id and cannot be joined), so at the default info level a replay and a loss look
+ *     alike in the server log: T_wire sent=1 with no T_server means lost in flight OR
+ *     classified Redelivered, Conflict or Error.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core shared-lib symbol visibility, -fvisibility=hidden)

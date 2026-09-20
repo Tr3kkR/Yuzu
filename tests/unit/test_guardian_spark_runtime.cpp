@@ -2292,9 +2292,10 @@ TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatt
 
 TEST_CASE("#4606 criterion-10: make_outbox_send_timing carries the entry's event_id and domain",
           "[spark][runtime]") {
-    // send_guardian_outbox_entry (agent.cpp) builds its T_wire record through this function, and
-    // AgentImpl is unreachable from a unit test, so this is what proves the domain is actually
-    // wired through rather than silently rendering as domain=legacy on every Spark-path line.
+    // send_guardian_outbox_entry (agent.cpp) builds its T_wire record through this function.
+    // AgentImpl is unreachable from a unit test, so this proves the HELPER carries event_id and
+    // domain (a hard-coded or dropped domain fails here); that agent.cpp calls it, with the right
+    // entry and outcome, is a single call site checked by reading it, not by a test.
     OutboxEntry lifecycle;
     lifecycle.domain = OutboxDomain::Lifecycle;
     lifecycle.event_id = "evt-life";
