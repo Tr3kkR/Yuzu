@@ -45,8 +45,9 @@ std::string format_eval_timing_line(const EvalTimingRecord& r) {
 }
 
 std::string format_send_timing_line(const SendTimingRecord& r) {
-    return std::format("Guardian T_wire event_id={} sent={} wire_wall_ns={}", r.event_id,
-                        r.sent ? 1 : 0, r.wire_wall_ns);
+    return std::format("Guardian T_wire event_id={} domain={} sent={} wire_wall_ns={}", r.event_id,
+                        r.domain ? domain_name(*r.domain) : "legacy", r.sent ? 1 : 0,
+                        r.wire_wall_ns);
 }
 
 } // namespace yuzu::agent

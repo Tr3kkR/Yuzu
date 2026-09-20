@@ -985,7 +985,7 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
 }
 
 TEST_CASE("#4606 criterion-10: a rejected enqueue at outbox cap stages accepted=false with "
-          "fire_wall_ns/fire_mono_ns left at zero, but detect_wall_ns still captured",
+          "fire_wall_ns/fire_mono_ns at the -1 sentinel while detect_wall_ns is still captured",
           "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -1008,8 +1008,9 @@ TEST_CASE("#4606 criterion-10: a rejected enqueue at outbox cap stages accepted=
     const auto timings = rt->last_eval_timings_for_test();
     REQUIRE(timings.size() == 1); // r3's one drift entry, rejected
     CHECK_FALSE(timings[0].accepted);
-    CHECK(timings[0].fire_wall_ns == 0);
-    CHECK(timings[0].fire_mono_ns == 0);
+    // -1 "never fired" sentinel, never a fabricated 0 a parser could read as "fired at the epoch".
+    CHECK(timings[0].fire_wall_ns == -1);
+    CHECK(timings[0].fire_mono_ns == -1);
     CHECK(timings[0].detect_wall_ns != 0); // still captured even though the enqueue was rejected
     CHECK(timings[0].detect_mono_ns != 0);
 }
@@ -2220,11 +2221,17 @@ TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trig
     trig.seq = 7;
     r.trigger = trig;
     r.accepted = false;
-    r.fire_wall_ns = 0;
-    r.fire_mono_ns = 0;
+    r.fire_wall_ns = -1;
+    r.fire_mono_ns = -1;
 
     const auto line_present = format_eval_timing_line(r);
     CHECK(line_present.find("accepted=0") != std::string::npos);
+    CHECK(line_present.find("fire_wall_ns=-1") != std::string::npos);
+    CHECK(line_present.find("fire_mono_ns=-1") != std::string::npos);
+    // A record never touched by the backfill (rejected enqueue) must default to the
+    // sentinel, not to a fabricated 0.
+    CHECK(EvalTimingRecord{}.fire_wall_ns == -1);
+    CHECK(EvalTimingRecord{}.fire_mono_ns == -1);
     CHECK(line_present.find("trigger_present=1") != std::string::npos);
     CHECK(line_present.find("mechanism_wall_ns=10") != std::string::npos);
     CHECK(line_present.find("handler_wall_ns=20") != std::string::npos);
@@ -2238,14 +2245,29 @@ TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatt
     r.event_id = "evt-9";
     r.sent = true;
     r.wire_wall_ns = 555;
+    // domain left absent: the legacy drift-sink path has no outbox and so no OutboxDomain.
     const auto line = format_send_timing_line(r);
     CHECK(line.find("event_id=evt-9") != std::string::npos);
+    CHECK(line.find("domain=legacy") != std::string::npos);
     CHECK(line.find("sent=1") != std::string::npos);
     CHECK(line.find("wire_wall_ns=555") != std::string::npos);
+    // event_id stays the first field after the line-name token (correlator parse invariant).
+    CHECK(line.find("Guardian T_wire event_id=evt-9") == 0);
 
     r.sent = false;
     const auto line2 = format_send_timing_line(r);
     CHECK(line2.find("sent=0") != std::string::npos);
+
+    // Every Spark-outbox domain renders by name, so a Lifecycle journal replay (server answers
+    // Redelivered, legitimately no T_server) is distinguishable from a lost Compliance/Health
+    // event in the log alone.
+    r.domain = OutboxDomain::Lifecycle;
+    CHECK(format_send_timing_line(r).find("domain=lifecycle") != std::string::npos);
+    r.domain = OutboxDomain::Compliance;
+    CHECK(format_send_timing_line(r).find("domain=compliance") != std::string::npos);
+    r.domain = OutboxDomain::Health;
+    CHECK(format_send_timing_line(r).find("domain=health") != std::string::npos);
+    CHECK(format_send_timing_line(r).find("domain=legacy") == std::string::npos);
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {

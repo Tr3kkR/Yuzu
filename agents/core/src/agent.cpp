@@ -3628,6 +3628,7 @@ private:
         try {
             SendTimingRecord r;
             r.event_id = e.event_id;
+            r.domain = e.domain;
             r.sent = ok;
             r.wire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::system_clock::now().time_since_epoch())

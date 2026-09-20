@@ -3254,8 +3254,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             // #4606 criterion-10: backfill T_fire (or accepted=false) into the records
             // just staged for this rule. MUST run regardless of `accepted` — placed
             // before the `continue` below so a rejected batch's records still get
-            // accepted=false written, not silently left at their struct defaults.
-            // noexcept field writes only; nothing here may throw.
+            // accepted=false written, not silently left at their struct defaults. On a
+            // rejection fire_wall_ns/fire_mono_ns are deliberately left at their -1
+            // "never fired" sentinel defaults (guardian_spark_timing.hpp), never a
+            // fabricated 0. noexcept field writes only; nothing here may throw.
             {
                 const auto fire_wall = accepted ? std::chrono::system_clock::now()
                                                  : std::chrono::system_clock::time_point{};
@@ -3317,7 +3319,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     // #4606 criterion-10: release eval_lk (this key's own serialisation) BEFORE any
     // I/O below — a slow/blocked log write must never delay the next eval of this key.
     // registry_mu_'s own block already closed above and outbox_waker() already fired;
-    // neither ordering changes.
+    // neither ordering changes. The waker deliberately does NOT wait for the T_detect
+    // emission below: delivery must never depend on log-sink health, so a T_wire line
+    // can reach the log before its own T_detect line - correlate by event_id and the
+    // embedded *_wall_ns fields, never file order (see guardian_spark_timing.hpp).
     eval_lk.unlock();
     {
         std::lock_guard<std::mutex> lt{last_eval_timings_mu_};

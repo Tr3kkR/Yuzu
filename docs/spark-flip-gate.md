@@ -1663,7 +1663,20 @@ status row - and the workaround (the per-device drill-down is unaffected and sta
 trust it over the aggregate for Linux Service until #4252 is fixed). Fleet-agnostic wording, not
 pilot-only: any fleet with Linux Service rules and no prior drift history gets this as a FIRST
 exposure at the flip, not a widening (§8's tenth-round paragraph). If #4252 is fixed before
-PR-5 ships, this deliverable is moot and can be dropped.
+PR-5 ships, this deliverable is moot and can be dropped. **A fourth deliverable (sre and
+chaos-injector, `/governance` on the #4606 criterion-10 instrumentation):** that change adds
+always-on `info`-level `Guardian T_detect` / `Guardian T_wire` / `Guardian T_server` log lines.
+The server-side `T_server` line and the agent's legacy drift-sink `T_wire` line are live today;
+`T_detect` and the Spark-outbox `T_wire` line stay dormant until `prefer_spark`. They are
+benchmark diagnostics and have no kill switch other than `--log-level`. Once the criterion-10
+evidence campaign concludes, PR-5 (or an earlier cleanup PR) must retire them or gate them behind
+a runtime flag - left unrecorded they ship into the flip as permanent unconditional log volume.
+Two fault-injection scenarios designed at that governance run are also unowned and not yet run,
+both inert until `prefer_spark` gives the Spark drain worker a live caller: a slow or blocked log
+sink with Spark live, and orphan attribution under outbox rejection or an agent crash between
+enqueue and send. The related findings are ledgered in
+`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (`4606-up1` through `4606-up6` and
+`4606-sre-no-removal-plan`).
 
 1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruled 2026-09-02 per
    §3 row 8). Runs
