@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -193,17 +194,33 @@ TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][c
     std::atomic<bool> pool_valid{false};
     std::atomic<bool> holding{false};
     std::atomic<bool> released{false};
+    // Plain (non-atomic) string: written once by the holder thread only on
+    // the acquire-failure path, before `holding`/`released` are touched, and
+    // read only after destroy.get() — covered by the same synchronizes-with
+    // edge as the atomics above, so no separate synchronization is needed.
+    std::string acquire_failure_info;
     auto destroy = std::async(std::launch::async, [&] {
         auto pool = std::make_unique<PgPool>(PgPool::Options{.conninfo = db.dsn(), .size = 2});
         pool_valid.store(pool->valid());
         std::thread holder([&] {
-            // Assertions stay on the MAIN thread — Catch2 macros are not
-            // thread-safe; the holder only SIGNALS state through atomics.
+            // Assertions AND info macros stay on the MAIN thread — Catch2
+            // macros (REQUIRE/CHECK/UNSCOPED_INFO alike) are not thread-safe;
+            // the holder only SIGNALS state through these atomics/string.
+            // acquire_or_explain's own UNSCOPED_INFO call (on this thread, on
+            // failure) is therefore silently discarded by Catch2 before the
+            // main thread's REQUIRE(holding.load()) ever runs — capture the
+            // same diagnostic here instead, in plain data, and surface it
+            // from the main thread below.
             auto lease = acquire_or_explain(*pool);
             if (lease) {
                 holding.store(true);                // lease is now HELD...
                 std::this_thread::sleep_for(200ms); // ...across the reset()...
                 released.store(true);               // ...then returns at scope exit
+            } else {
+                std::ostringstream oss;
+                oss << "PgPool::acquire failed — last_error: " << pool->last_error()
+                    << " (connect_breaker_open=" << pool->connect_breaker_open() << ")";
+                acquire_failure_info = oss.str();
             }
         });
         // Barrier, NOT a bare sleep: destroy the pool only once the holder
@@ -232,6 +249,8 @@ TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][c
     // All assertions run here, on the main thread, strictly after the async
     // task (and its inner holder thread) have fully completed.
     REQUIRE(pool_valid.load());
+    if (!holding.load() && !acquire_failure_info.empty())
+        UNSCOPED_INFO(acquire_failure_info);
     REQUIRE(holding.load());   // the holder did hold a lease
     CHECK(released.load());
 }
