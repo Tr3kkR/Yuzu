@@ -9051,7 +9051,8 @@ List approvals. Accepts `status` and `submitted_by` as query parameters. Respons
 envelope above. **Not migrated onto the checked read path**: on a genuine Postgres failure this
 route silently returns `{"approvals": []}` — indistinguishable from a real empty queue — rather
 than a `503`; prefer `GET /api/v1/approvals` or MCP `list_pending_approvals` for failure-honest
-polling.
+polling. `status` is validated against the same enum as the v1/MCP twins — an unrecognized value
+is rejected with `400` (#2146 A2-R4).
 
 #### `GET /api/approvals/pending/count`
 
