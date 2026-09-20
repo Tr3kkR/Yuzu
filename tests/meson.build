@@ -2526,6 +2526,17 @@ test('split interlock tripwire selftest',
   timeout: 30,
 )
 
+# #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
+# only while no first-party code references the conn-less libpq escape APIs
+# PQescapeString/PQescapeBytea (libpq's sole readers of the suppressed globals).
+# Also runs in .github/workflows/docs-lint.yml on every PR.
+test('no conn-less libpq escape references',
+  _python3_test,
+  args: [files('test_no_connless_pq_escape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.
