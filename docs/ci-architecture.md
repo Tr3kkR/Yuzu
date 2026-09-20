@@ -65,6 +65,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   runs 4 runner agents under one OS identity and a fixed path is a cross-job
   collision class (#1038 R-15).
 
+  libpq's own connect-time write-write race on its `static_std_strings`/
+  `static_client_encoding` globals (`pqSaveParameterStatus`) is suppressed by
+  a compiled-in `__tsan_default_suppressions` hook in
+  `tests/unit/test_runner_main.cpp`, kept honest by the
+  `tests/test_no_connless_pq_escape.py` tripwire (#1611).
+
   On Test **failure or job cancellation**, the TSan job's `Capture stack trace
   under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
   failing test binary from the meson junit, maps each to its binary+args via

@@ -171,9 +171,12 @@
     "method": "GET",
     "path": "/api/executions/{param}/children",
     "capability_id": "get.api-executions-param-children",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}/children"
+    },
+    "mcp_twin": "get_execution_children",
+    "status": "twinned"
   },
   {
     "method": "POST",

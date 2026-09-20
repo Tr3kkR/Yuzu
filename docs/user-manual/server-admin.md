@@ -238,6 +238,42 @@ The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=
 
 Retiring or gating these lines once the benchmark concludes is recorded in `docs/spark-flip-gate.md` §7.
 
+### vNEXT — gateway-fronted agents stay dispatchable across circuit-recovery replays (HA WS-4 4.4, `#4246` #6; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, a gateway that lost and regained its connection to the
+server (a core restart, replica failover, or an ordinary network blip) would
+replay its held agent registrations — and on EVERY such replay, the server
+wiped that agent's placement (`gateway_node`/capabilities) before deciding
+whether to reuse or refuse the session, silently making the agent
+unreachable via that gateway until it happened to reconnect on its own. This
+was reachable on a single, otherwise-healthy replica; no core restart was
+required.
+
+**What changes:** the server now decides adopt-vs-refuse for a replayed
+session before installing anything, the gateway re-announces the agent's own
+connection to converge placement on a successful adopt, and a genuinely
+superseded/stale replay is refused outright rather than silently accepted.
+New Prometheus counters (`yuzu_gw_upstream_notify_dropped_total`,
+`yuzu_server_gateway_route_desync_total{outcome="session_superseded"}`) give
+visibility into both the normal drop path and a refused replay. At
+fleet-wide reconnect-storm scale a re-announcement can still be dropped
+under load; that case is no longer stuck forever — the row now ages out and
+is purged within the route's existing lease TTL+grace window instead of
+being kept alive indefinitely by ordinary heartbeat renewals. This makes the
+stuck row observable (a new drop counter, plus the `shortfall` desync
+outcome on the next heartbeat) and eligible for reclaim, but it is not an
+instant fix — actual re-convergence still needs the next circuit-recovery
+replay or the agent's own reconnect. See
+`docs/adr/2002-high-availability-architecture.md` §7c for the full
+mechanism and two remaining known limitations: (1) a large fleet recovering
+from an outage longer than the lease grace window sees a transient wave of
+reclaim activity rather than instant convergence, and (2) a replay refused
+because the routing directory itself was degraded at that moment is not
+retried within that recovery cycle and can strand an agent server-unknown
+until its own next reconnect (`#4634`).
+
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 
 New, non-breaking, purely additive. No operator action required.
@@ -3197,6 +3233,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 **Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election — so budget `N_servers × 1` connections against Postgres `max_connections` on top of the pool size below. Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+
+**Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
 Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
 

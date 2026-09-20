@@ -80,22 +80,35 @@ constexpr std::size_t kMaxStreamHomeIdLen = 64;
 // is PER-SITE, not uniform (Task B's per-site fail-closed contract): as of
 // 4.2b Task C the directory IS read for dispatch (fallback-only, on a local
 // registry miss), so the reader's trust predicate — not the write posture —
-// is the integrity backstop. Only the write whose LOSS is otherwise
-// unrecoverable is worth refusing the RPC over:
-//   - register_fresh (the ProxyRegister fresh-registration branch) is the
-//     ONE fail-CLOSED site — it CREATES the row, and a missed create persists
-//     until reconnect/4.4 with no other write on the path able to fill in a
-//     first row, so its caller returns UNAVAILABLE right after this call
-//     (mirrors the existing #3401 register_agent-failure precedent).
+// is the integrity backstop for most sites. Only a write whose LOSS is
+// otherwise unrecoverable, OR a READ whose wrong answer is more dangerous
+// than a refusal, is worth refusing the RPC over:
+//   - register_fresh (the ProxyRegister fresh-registration branch) — it
+//     CREATES the row, and a missed create persists until reconnect with no
+//     other write on the path able to fill in a first row, so its caller
+//     returns UNAVAILABLE right after this call (mirrors the existing #3401
+//     register_agent-failure precedent).
+//   - HA WS-4 4.4 round-2 review fix (UP-4/COMP-6): the replay-ADOPT
+//     decision's OWN renew_leases and reclaim_tombstoned_session calls (in
+//     ProxyRegister's presented-session branch, BEFORE register_agent runs)
+//     are ALSO fail-CLOSED — a degraded read here can't tell "still valid,
+//     adopt" from "superseded, refuse" any better than we can, and a wrong
+//     ADOPT installs a placement that may belong to a genuine zombie
+//     session, unconditionally overwriting a healthy replica's correct one.
+//     This is a stronger failure mode than register_fresh's own (a missed
+//     CREATE is merely absent; a wrong ADOPT actively clobbers), so it gets
+//     the same fail-closed treatment.
 //   - Every OTHER site stays fail-OPEN and proceeds — see each call site's
 //     own comment for why that site specifically tolerates a degraded write:
 //     announce_connected (the CONNECTED notify is a droppable gen_server:cast
 //     and set_gateway_route already published in-memory — failing it would
-//     split memory/directory state and risk a black hole), the two
-//     ProxyRegister renew branches and BatchHeartbeat's renew (a renew
-//     failure only yields premature lease-staleness, which the reader's
-//     `routable` predicate already treats as not-routable), and deregister
-//     (bounded by the 90s lease TTL regardless).
+//     split memory/directory state and risk a black hole), BatchHeartbeat's
+//     OWN renew_leases call (a renew failure only yields premature
+//     lease-staleness, which the reader's `routable` predicate already
+//     treats as not-routable — a fundamentally different risk than the
+//     decision-phase renew above, which decides ADOPT vs REFUSE rather than
+//     merely extending an already-adopted lease), and deregister (bounded by
+//     the 90s lease TTL regardless).
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
@@ -155,14 +168,17 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
     if (metrics_) {
         metrics_->describe(
             "yuzu_server_gateway_route_write_failed_total",
-            "HA WS-4: GatewayRouteStore directory writes (register_fresh/"
-            "announce_connected/deregister/renew_leases) that degraded instead of "
-            "succeeding, by op and reason. PER-SITE posture (4.2b): register_fresh "
-            "is fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); the other "
-            "writers stay fail-OPEN (the RPC proceeds, integrity living at the "
-            "fallback-only dispatch reader's trust predicate) - so for the fail-open "
-            "writers this counter is the only signal a systemic write failure would "
-            "otherwise leave invisible.",
+            "HA WS-4: GatewayRouteStore directory writes/reads (register_fresh/"
+            "announce_connected/deregister/renew_leases/reclaim_tombstoned_session) "
+            "that degraded instead of succeeding, by op and reason. PER-SITE posture "
+            "(4.2b, extended 4.4 round-2 review UP-4/COMP-6): register_fresh, and the "
+            "replay-ADOPT decision's own renew_leases/reclaim_tombstoned_session calls, "
+            "are fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); every other "
+            "writer (announce_connected, BatchHeartbeat's own renew_leases, deregister) "
+            "stays fail-OPEN (the RPC proceeds, integrity living at the fallback-only "
+            "dispatch reader's trust predicate) - so for the fail-open writers this "
+            "counter is the only signal a systemic write failure would otherwise leave "
+            "invisible.",
             "counter");
         // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
         // pre-seed every (op,reason) combo this counter can ACTUALLY emit (record_route_store_failure
@@ -173,7 +189,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // catch a lone failure stays silent on it. Mirrors the desync counter's own pre-seed block
         // immediately below.
         for (const char* op :
-            {"register_fresh", "announce_connected", "deregister", "renew_leases"}) {
+            {"register_fresh", "announce_connected", "deregister", "renew_leases",
+             "reclaim_tombstoned_session"}) {
             for (const char* reason : {"store_unavailable", "db_error"}) {
                 metrics_->counter("yuzu_server_gateway_route_write_failed_total",
                                   {{"op", op}, {"reason", reason}});
@@ -224,7 +241,31 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "deregister"}, {"outcome", "malformed_home_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
+        // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+        // BLOCKER 2): a CONNECTED whose session_id is a live entry in
+        // gateway_sessions_ (passes the check above) but is no longer the
+        // CURRENTLY-installed session for this agent in the in-memory
+        // registry — a delayed/superseded reannounce arriving after a
+        // genuine newer registration has already installed. Rejected by
+        // AgentRegistry::set_gateway_route's own session check rather than
+        // clobbering the newer session's placement.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "notify_stream_status"}, {"outcome", "stale_connected_session"}});
+        // HA WS-4 4.4 (`#4246` #6): a replay's presented session belonged to
+        // a DIFFERENT, LIVE session by the time reclaim_tombstoned_session
+        // ran — a genuine stale/zombie replay, refused outright (see
+        // ProxyRegister's adopt/refuse decision above).
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "proxy_register"}, {"outcome", "session_superseded"}});
     }
+}
+
+std::shared_ptr<std::mutex>
+GatewayUpstreamServiceImpl::registration_lock_for(const std::string& agent_id) {
+    std::lock_guard lock(registration_locks_mu_);
+    auto& slot = registration_locks_[agent_id];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    return slot;
 }
 
 // -- ProxyRegister ------------------------------------------------------------
@@ -569,6 +610,182 @@ gw_enrolled:
         registry_.note_trusted_gateway_peer(extract_peer_ip(context->peer()));
     }
 
+    // HA WS-4 4.4 (`#4246` #6 / ADR-2002 §7 finding 6b's design review):
+    // decide the registration branch — fresh vs. replay-ADOPTING an existing
+    // session — BEFORE calling register_agent below. The pre-4.4 code called
+    // register_agent unconditionally first, then decided; register_agent
+    // ALWAYS installs a brand-new AgentSession over any prior one (see that
+    // struct's IMMUTABILITY CONTRACT comment, agent_registry.hpp), which
+    // means the "re-announce" branch's own gateway_node/wire_capabilities/
+    // stream_home_id were being wiped by the very same call that "won" the
+    // re-announce — a live, reachable bug on a single replica (no core
+    // restart needed), not just a multi-replica one. Deciding first lets a
+    // genuine stale/zombie replay be refused OUTRIGHT, before anything is
+    // installed, instead of installing then rolling back.
+    //
+    // gateway_route_store.hpp's FORWARD NOTE states the binding rule this
+    // block implements (docs-writer Gate 2 finding doc-S1: keep this quote
+    // in sync with that comment rather than restating an earlier draft of
+    // it — the reclaim_tombstoned_session clause below is NOT an
+    // undocumented deviation from the rule, it's the rule's second ADOPT
+    // path): "mechanism (c) must ADOPT the presented session into
+    // gateway_sessions_/registry only if the directory renew_leases call
+    // matched >= 1 row (a store-side CAS proving the row still belongs to
+    // that session) OR the guarded CAS reclaim_tombstoned_session re-arms a
+    // row this session's row was TOMBSTONED under — NEVER write back a
+    // server-minted session to a gateway whose agent still holds the
+    // original." register_fresh must NEVER run for an adopted session: it
+    // mints a fresh epoch and unconditionally wins the guarded upsert,
+    // which would clobber a route a NEWER
+    // connection already holds.
+    // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    // BLOCKER 1): held for the ENTIRE remainder of this function — every
+    // return path from here on releases it via RAII. See
+    // registration_locks_'s header comment for the exact interleaving this
+    // closes (a concurrent fresh registration for this SAME agent_id
+    // completing its own decide+install between THIS call's decide and its
+    // own register_agent/register_fresh/map_session install).
+    auto reg_lock_ptr = registration_lock_for(info.agent_id());
+    std::lock_guard<std::mutex> reg_lock(*reg_lock_ptr);
+
+    std::string presented_session;
+    if (context) {
+        presented_session = AgentServiceImpl::client_metadata_value(
+            *context, AgentServiceImpl::kSessionMetadataKey);
+    }
+
+    std::string session_id; // non-empty here means "adopting an existing session"
+    bool store_confirmed_adopt = false; // did renew_leases/reclaim actually touch a row?
+    if (!presented_session.empty()) {
+        bool adopt;
+        if (gateway_route_store_) {
+            // HA WS-4 4.4 review fix (F1): the DIRECTORY governs this
+            // decision whenever it is configured — an in-memory
+            // `gateway_sessions_` hit is NEVER trusted on its own to
+            // override it. `gateway_sessions_` is erased ONLY by a
+            // DISCONNECTED (NotifyStreamStatus), so a replica whose
+            // gateway uplink partitions for longer than the reap grace
+            // window (270s) with core itself still UP keeps a session
+            // "known in memory" long after `reap_stale_routes` has
+            // tombstoned (and later hard-deleted) its row — adopting on
+            // memory alone in that window would install a fresh
+            // AgentSession (wiping placement) and then have
+            // `announce_connected`'s fallback INSERT no-op against the
+            // still-tombstoned row (`ON CONFLICT DO NOTHING`), leaving the
+            // route permanently unrepaired. Worse, the same short-circuit
+            // let a genuine ZOMBIE through: an agent that reconnected to a
+            // DIFFERENT gateway node under a new session S2 (a fresh,
+            // correct directory row) while this node's stale local ETS
+            // entry for the OLD session S1 was still intact would ADOPT S1
+            // on memory alone and overwrite S2's live placement. Always
+            // consulting the store first closes both: the store already
+            // knows the right answer in every case memory could get wrong.
+            std::vector<std::string> renew_agents{info.agent_id()};
+            std::vector<std::string> renew_ids{presented_session};
+            auto renew_res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
+                                                                 kGatewayRouteLeaseTtlSecs);
+            if (!renew_res) {
+                // HA WS-4 4.4 review fix (round-2, UP-4/COMP-6): FAIL-CLOSED,
+                // deliberately breaking with this file's usual per-site
+                // fail-open convention (record_route_store_failure's header
+                // comment). Every OTHER fail-open site in this file degrades
+                // to "the lease looks slightly staler than it is" — bounded,
+                // low-consequence. THIS decision is different in kind: a
+                // wrong ADOPT here doesn't just accept a redundant write, it
+                // INSTALLS a placement that may belong to a genuine zombie
+                // session, unconditionally overwriting whatever a healthy
+                // replica correctly holds — the exact failure register_fresh
+                // is already fail-closed to prevent for a fresh registration.
+                // A degraded store can't distinguish "still valid, adopt" from
+                // "superseded, refuse" any better than we can, so refuse
+                // rather than gamble on the more dangerous of the two wrong
+                // answers. UNAVAILABLE (not FAILED_PRECONDITION): this is "we
+                // can't tell right now", not "we checked and it's stale" — the
+                // gateway's do_rpc/do_rpc_replay treats it as an ordinary
+                // transport-shaped failure (record_result_no_replay counts it
+                // against the breaker), not the FAILED_PRECONDITION-specific
+                // disconnect-and-force-reconnect path.
+                record_route_store_failure(metrics_, "renew_leases", renew_res.error());
+                spdlog::warn("[gateway] ProxyRegister: degraded renew_leases during replay-adopt "
+                            "decision for agent {} — refusing (fail-closed) rather than adopting "
+                            "an unverified session", info.agent_id());
+                return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                    "routing directory unavailable");
+            } else if (*renew_res >= 1) {
+                // The durable directory still owns this session for this
+                // agent (this replica's in-memory map may or may not have
+                // known it — either way the store just confirmed it).
+                adopt = true;
+                store_confirmed_adopt = true;
+            } else {
+                // Zero rows: no LIVE row under this session. Try to reclaim a
+                // TOMBSTONED (or entirely absent) row — a guarded CAS that
+                // can NEVER win against a row a DIFFERENT, LIVE session
+                // holds (gateway_route_store.hpp's reclaim_tombstoned_session
+                // doc comment).
+                auto reclaim_res = gateway_route_store_->reclaim_tombstoned_session(
+                    info.agent_id(), presented_session, kGatewayRouteLeaseTtlSecs);
+                if (!reclaim_res) {
+                    // Same fail-CLOSED rationale as the renew_leases degraded
+                    // branch above — see that comment.
+                    record_route_store_failure(metrics_, "reclaim_tombstoned_session",
+                                               reclaim_res.error());
+                    spdlog::warn("[gateway] ProxyRegister: degraded reclaim_tombstoned_session "
+                                "during replay-adopt decision for agent {} — refusing "
+                                "(fail-closed) rather than adopting an unverified session",
+                                info.agent_id());
+                    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                        "routing directory unavailable");
+                } else if (*reclaim_res) {
+                    adopt = true;
+                    store_confirmed_adopt = true;
+                } else {
+                    // The row belongs to a DIFFERENT, LIVE session — a
+                    // genuine stale/zombie replay (including the zombie
+                    // case above: THIS node's memory says S1, the store
+                    // says S2 owns the row). adopt stays false regardless
+                    // of what gateway_sessions_ believes.
+                    adopt = false;
+                }
+            }
+        } else {
+            // No directory configured to check against — trust the
+            // presented session IFF this replica's own memory still knows
+            // it, matching pre-4.1 behavior (nothing to fence with, so
+            // memory is the only signal there is).
+            std::lock_guard lock(sessions_mu_);
+            auto it = gateway_sessions_.find(presented_session);
+            adopt = it != gateway_sessions_.end() && it->second == info.agent_id();
+        }
+
+        if (!adopt) {
+            record_directory_desync(metrics_, "proxy_register", "session_superseded");
+            spdlog::warn("[gateway] ProxyRegister: presented session {} for agent {} is "
+                        "superseded by a different live session — refusing the replay so the "
+                        "gateway forces the agent to reconnect fresh",
+                        presented_session, info.agent_id());
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "session superseded; reconnect");
+        }
+        session_id = presented_session;
+    }
+
+    // Test-only interleave seam (HA WS-4 4.4 post-build review, PR #4636
+    // FortitudeEtc BLOCKER 1 regression test): fires once, synchronously,
+    // in the EXACT window the finding cited — after the decide-phase above,
+    // before register_agent installs anything. A test callback that itself
+    // dispatches a competing ProxyRegister for the SAME agent_id from here
+    // deterministically proves registration_lock_for's serialization (that
+    // competing call blocks on the same per-agent mutex this call already
+    // holds, rather than racing to install ahead of it). No-op (nullptr) in
+    // production. Mirrors AgentRegistry::register_agent's own
+    // register_agent_interleave_hook_for_test_ seam (Gate 5 CH-1a).
+    if (proxy_register_interleave_hook_for_test_) {
+        auto hook = std::move(proxy_register_interleave_hook_for_test_);
+        proxy_register_interleave_hook_for_test_ = nullptr;
+        hook();
+    }
+
     // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
     // itself errors. Note the peer trust note above already ran — a store fault does not
     // un-trust the gateway peer (that entry has its own TTL eviction, UP-2/UP-3); only the
@@ -591,121 +808,33 @@ gw_enrolled:
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
-    // HA WS-4 4.1 (routed-concern: gateway routing directory): a gateway
-    // circuit-recovery replay resends ProxyRegister carrying the ORIGINAL
-    // session id in the x-yuzu-session-id metadata — the same key + reader
-    // AgentServiceImpl::Subscribe uses on the direct path, reused here so
-    // the two paths cannot silently drift onto different metadata keys.
-    // Only trust it as a re-announce if that session is STILL known
-    // server-side (belt-and-braces against a forged/stale value); anything
-    // else falls through to minting a fresh session exactly as before.
-    std::string presented_session;
-    if (context) {
-        presented_session = AgentServiceImpl::client_metadata_value(
-            *context, AgentServiceImpl::kSessionMetadataKey);
-    }
-    bool presented_session_known = false;
-    if (!presented_session.empty()) {
-        std::lock_guard lock(sessions_mu_);
-        auto it = gateway_sessions_.find(presented_session);
-        presented_session_known = it != gateway_sessions_.end() && it->second == info.agent_id();
-    }
-
-    std::string session_id;
     bool lost_epoch_race = false;
-    if (presented_session_known) {
-        // -- Re-announce: reuse the caller's still-known session -------------
+    if (!session_id.empty()) {
+        // -- Adopted an existing session (replay path) -------------------------
         //
-        // Architecture-review decision (HA WS-4 4.1): minting a fresh
-        // session+epoch here would let a delayed/zombie replay of an OLDER
-        // connection's ProxyRegister clobber the route a NEWER connection
-        // already won — the epoch fence in gateway_route_store.hpp exists
-        // precisely to stop that, and register_fresh must therefore NOT be
-        // called on this branch. Reusing the presented session also fixes
-        // the pre-existing S'-vs-S session-mismatch this replay case had:
-        // the response and the in-proc `gateway_sessions_`/registry mapping
-        // now agree with the session the gateway actually holds.
-        session_id = presented_session;
-        if (gateway_route_store_) {
-            std::vector<std::string> renew_agents{info.agent_id()};
-            std::vector<std::string> renew_ids{session_id};
-            if (auto res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
-                                                              kGatewayRouteLeaseTtlSecs);
-                !res) {
-                // Task B (4.2b): fail-OPEN, deliberately — a degraded renew
-                // only yields premature lease-staleness on an EXISTING row
-                // (register_fresh already created it on the original
-                // connection), and a future reader already treats a stale
-                // lease as not-routable (RoutableRoute::routable's
-                // `lease_until >= now()` clause). Refusing the RPC over a
-                // renew failure would drop a re-announcing agent's connection
-                // for no correctness gain.
-                record_route_store_failure(metrics_, "renew_leases", res.error());
-            } else if (*res < static_cast<int>(renew_ids.size())) {
-                record_directory_desync(metrics_, "renew_leases", "shortfall",
-                                        static_cast<double>(renew_ids.size() - *res));
-            }
-        }
-        spdlog::debug("[gateway] ProxyRegister: re-announcing known session {} for agent {}",
-                     session_id, info.agent_id());
-    } else if (!presented_session.empty()) {
-        // -- 4.2a #2 (mechanism c): presented but UNKNOWN locally -------------
-        //
-        // A non-empty x-yuzu-session-id this replica's `gateway_sessions_`
-        // doesn't recognize is either a replica restart (the durable
-        // directory row may still be current — this replica just lost its
-        // in-memory map), a cross-replica delivery, or a genuinely stale/
-        // zombie replay whose session has since been superseded. Either way
-        // `register_fresh` must NEVER run here: it would mint a fresh epoch
-        // and unconditionally win (register_fresh's guarded UPSERT only
-        // fences CONCURRENT registrations, not a stale replay processed
-        // later — see gateway_route_store.hpp's "4.2 OBLIGATIONS" note),
-        // silently clobbering a live newer connection's route.
-        //
-        // Instead, renew the PRESENTED session (not the freshly-minted
-        // session_id below): if the durable row still belongs to it, the
-        // renew matches and the lease is correctly extended with no epoch
-        // change. If it's a zombie (the row now belongs to a different,
-        // newer session), the renew matches zero rows — counted below as a
-        // desync signal — and nothing is clobbered.
-        //
-        // SCOPE LIMIT (deferred to #6/4.4): the in-memory gateway_sessions_
-        // entry and the session_id returned to the caller below are left
-        // UNCHANGED from the pre-4.2a "fresh" behavior — a new session_id is
-        // still minted and returned. That means the response's session_id
-        // (S') and the directory row this branch may have just renewed
-        // (still keyed on the presented S) can disagree; closing that
-        // S'-vs-S gap is out of scope for this slice (directory writes
-        // only).
-        if (gateway_route_store_) {
-            std::vector<std::string> renew_agents{info.agent_id()};
-            std::vector<std::string> renew_ids{presented_session};
-            if (auto res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
-                                                              kGatewayRouteLeaseTtlSecs);
-                !res) {
-                // Task B (4.2b): fail-OPEN, deliberately — same rationale as
-                // the known-session re-announce renew above: this branch
-                // never CREATES a row (register_fresh never runs here), so a
-                // degraded renew here has no create to lose; at worst it
-                // leaves an existing row's lease stale, which a future reader
-                // already treats as not-routable.
-                record_route_store_failure(metrics_, "renew_leases", res.error());
-            } else if (*res < static_cast<int>(renew_ids.size())) {
-                record_directory_desync(metrics_, "renew_leases", "shortfall",
-                                        static_cast<double>(renew_ids.size() - *res));
-            }
-        }
-        spdlog::debug("[gateway] ProxyRegister: presented session {} for agent {} is unknown "
-                     "locally — renewed the presented session in the directory instead of "
-                     "minting a fresh epoch",
-                     presented_session, info.agent_id());
-        // Session-id minting and gateway_sessions_ population are UNCHANGED
-        // from the pre-4.2a behavior (deferred S'-vs-S fix, see above) —
-        // NO register_fresh call on this branch, per the mechanism-(c)
-        // contract: "never register_fresh" when a presented session is
-        // unknown locally.
-        session_id =
-            "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+        // register_agent above just installed a brand-new AgentSession, so
+        // this session's gateway_node/wire_capabilities/stream_home_id are
+        // EMPTY again regardless of what they held a moment ago — that trio
+        // is deliberately NOT carried forward here (it would risk publishing
+        // a stale placement past a concurrent teardown). Convergence is the
+        // gateway's job: `yuzu_gw_upstream`'s replay handler re-sends this
+        // agent's own CONNECTED notification once it sees this adoption
+        // succeed (HA WS-4 4.4, `yuzu_gw_agent.erl`'s `upstream_reannounced`
+        // handling), which republishes the trio through the existing,
+        // session-guarded `NotifyStreamStatus` → `set_gateway_route` path —
+        // the same mechanism every fresh connection already relies on.
+        // No further store write here (HA WS-4 4.4 review fix, F1): the
+        // decision block above already renewed or reclaimed the row via
+        // `renew_leases`/`reclaim_tombstoned_session` whenever
+        // `gateway_route_store_` is configured (`store_confirmed_adopt`) —
+        // a second renew here would be a redundant round trip, and doing
+        // it AGAIN with only `session_id` (no `store_confirmed_adopt`
+        // signal) is exactly the in-memory-trusts-itself shape that let a
+        // tombstoned/zombie row go unnoticed. When no store is configured
+        // there is nothing to renew.
+        spdlog::debug("[gateway] ProxyRegister: adopted presented session {} for agent {} "
+                     "(store-confirmed={})",
+                     session_id, info.agent_id(), store_confirmed_adopt);
     } else {
         // -- Fresh registration (unchanged behavior) --------------------------
         session_id =
@@ -1269,8 +1398,28 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             record_directory_desync(metrics_, "announce_connected", "malformed_home_id");
             stream_home_id.clear();
         }
-        registry_.set_gateway_route(agent_id, request->gateway_node(),
-                                    std::move(wire_capabilities), stream_home_id);
+        // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+        // BLOCKER 2): the session check just above (gateway_sessions_) only
+        // proves `session_id` is SOME live entry for this agent — multiple
+        // sessions can coexist there until each is individually torn down by
+        // its own DISCONNECTED — not that it is the CURRENT one. Without this
+        // check, set_gateway_route would publish a delayed/superseded
+        // session's placement over a genuinely newer registration's, ahead of
+        // the durable store even getting a chance to reject the corresponding
+        // announce_connected write below. A `false` return means a different,
+        // now-current session is installed for this agent — reject this
+        // CONNECTED outright rather than publishing a stale route or
+        // continuing to the (now-meaningless) announce_connected write.
+        if (!registry_.set_gateway_route(agent_id, session_id, request->gateway_node(),
+                                         std::move(wire_capabilities), stream_home_id)) {
+            spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) is "
+                        "no longer the currently-installed session — rejecting the publish "
+                        "rather than clobbering a newer registration's placement",
+                        session_id, agent_id);
+            record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
+            response->set_acknowledged(false);
+            return grpc::Status::OK;
+        }
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a

@@ -5419,13 +5419,59 @@ non-terminal, so offset-based paging would silently skip or duplicate rows; a ca
 exactly: the caller's visible agent set is resolved and pushed into the store query before `limit`
 (ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`.
 
+#### `GET /api/v1/executions/{id}/children` (#2146 A2-R1)
+
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint - same gate, same confinement
+rules, and the same `execution_child_row_json` shared builder as the legacy
+`GET /api/executions/{id}/children` route documented above (`docs/api-twin-recipe.md` Rule 1). MCP
+twin: `get_execution_children`. An invisible or nonexistent parent returns `404` with no existence
+oracle; under a confined grant, each child is checked against the caller's visibility
+**independently** of the parent's own visibility - a visible parent does not by itself disclose a
+child dispatched by, or targeting, someone else (#3789). Not audited on a successful read (matches
+the legacy route's own posture); a confined denial is audited as `execution.read`. The underlying
+query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible
+limit/cursor), with the cap now pushed down TOGETHER WITH the caller's own visibility scope, before
+`LIMIT` - a confined caller's cap applies to their own visible children, not the fleet-wide raw row
+set, so an invisible sibling can no longer displace a visible child out of the capped window;
+`data.result_truncated_by_cap: true` means that scoped row set exceeded the cap.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "children": [
+      { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is added (`true`):
+
+```json
+{
+  "data": {
+    "children": [ { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 } ],
+    "result_truncated_by_cap": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 #### `GET /api/v1/schedules`
 
 **Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is
 denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
 confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
-`list_schedules` (widened by this PR to include `execution_count`). **Not** the separate legacy
-unversioned `GET /api/schedules` documented above — a distinct, untouched capability.
+`list_schedules` (widened by this PR to include `execution_count`). Accepts `definition_id` and
+`enabled_only` query parameters (#2146 A2-R1). `enabled_only` is a real boolean here (`true`/`1` or
+`false`/`0`; any other value 400s), matching the #4034 precedent already set on `GET
+/api/v1/policies` and MCP `list_schedules` - **not** the legacy unversioned `GET /api/schedules`
+route's parsing, where any presence of `enabled_only` is treated as true regardless of value. This
+route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
+/api/schedules` documented above.
 
 ---
 
@@ -8863,7 +8909,11 @@ visible agents under a confined grant. **Response (404):** unknown or outside-sc
 **Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
 child is independently checked against the caller's visibility — a visible parent does not by
 itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
-outside-scope parent id.
+outside-scope parent id. The underlying query is hard-capped at 100 rows (governance Gate 8
+re-review fix, #2146 A2-R1; no caller-visible limit/cursor), with the cap now pushed down TOGETHER
+WITH the caller's own visibility scope, before `LIMIT` - a confined caller's cap applies to their
+own visible children, not the fleet-wide raw row set. `result_truncated_by_cap: true` is added
+alongside `children` when that scoped row set exceeded the cap.
 
 #### `POST /api/executions/{id}/rerun`
 

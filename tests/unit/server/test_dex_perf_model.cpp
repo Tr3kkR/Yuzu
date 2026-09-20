@@ -22,6 +22,7 @@
 #include "rest_api_v1.hpp"
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -707,10 +708,34 @@ struct RestPerfHarness {
                            const std::string&, const std::string&, const std::string&) -> bool {
             return true;
         };
+        // ADR-0031 WS-A4 (sixth family): the heartbeat-now routes now call the
+        // DexPerfApi seam, not `dex_perf_fn` directly — wrap the SAME `perf`
+        // provider (FnDexPerfApi, mirrors FnVerifyApi) so this harness's
+        // "perf endpoints depend on nothing else" contract still holds.
+        // Conditional, NOT unconditional: several existing tests construct
+        // `RestPerfHarness(DexPerfFn{})` specifically to prove the "no
+        // provider wired -> 503" path; an unconditionally-non-null seam would
+        // make `fleet_snapshot()` degrade to an empty-but-PRESENT snapshot
+        // instead (FnDexPerfApi's own null-fn contract), turning that 503
+        // into a 200.
+        std::shared_ptr<const yuzu::server::DexPerfApi> dex_perf_api_local;
+        if (perf)
+            dex_perf_api_local = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+                perf, yuzu::server::AppPerfProviders{});
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
-                            nullptr, nullptr, {}, {}, {}, std::move(perf));
+                            nullptr, nullptr, {}, {}, {}, std::move(perf),
+                            /*network_api=*/nullptr, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
+                            /*app_perf_providers=*/{}, /*engine_principal_store=*/nullptr,
+                            /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
+                            /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
+                            /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, /*fleet_read_fn=*/{},
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
+                            /*dex_visible_fn=*/{}, /*verify_api=*/nullptr,
+                            /*device_api=*/nullptr, /*dex_api=*/nullptr, dex_perf_api_local);
     }
 };
 

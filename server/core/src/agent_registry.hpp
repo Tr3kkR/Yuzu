@@ -654,9 +654,26 @@ public:
     /// `AgentSession::gateway_stream_home_id`'s comment. Defaults to empty so
     /// every pre-#4324 call site (tests, any caller not yet threading the
     /// wire field through) keeps compiling and behaving exactly as before.
-    void set_gateway_route(const std::string& agent_id, const std::string& node,
-                           std::vector<std::string> capabilities,
-                           std::string stream_home_id = {});
+    ///
+    /// HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    /// BLOCKER 2): `session_id` is now REQUIRED and checked against the
+    /// currently-installed session before anything is written — mirroring
+    /// `gateway_stream_home_id`'s own guard two members below, which already
+    /// had this check while this setter did not. Without it, a delayed
+    /// CONNECTED for a session already superseded by a genuine newer
+    /// registration (`NotifyStreamStatus`'s OWN session check only confirms
+    /// `session_id` is SOME live entry for this `agent_id` in
+    /// `gateway_sessions_`, not that it is the CURRENT one) could clobber the
+    /// live session's `gateway_node`/capabilities/`stream_home_id` before the
+    /// durable store even had a chance to reject the corresponding
+    /// `announce_connected` write. Returns `false` (no-op, nothing written)
+    /// when `agent_id` is unknown OR its currently-installed session's id
+    /// does not equal `session_id` — the caller must treat `false` as a
+    /// stale/rejected publish, not a silent success.
+    [[nodiscard]] bool set_gateway_route(const std::string& agent_id, const std::string& session_id,
+                                         const std::string& node,
+                                         std::vector<std::string> capabilities,
+                                         std::string stream_home_id = {});
 
     /// HA WS-4 #4324: the `stream_home_id` most recently published for
     /// `agent_id` via `set_gateway_route`, IFF the presented `session_id`

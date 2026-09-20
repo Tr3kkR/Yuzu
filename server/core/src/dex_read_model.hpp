@@ -10,12 +10,16 @@
 /// like the four sibling abstract headers (ADR-0031 WS-A4; the store-type-free
 /// property is enforced by check-seam-closure.py's abstract-header probe).
 ///
-/// The store-reaching `build_dex_*_model(GuaranteedStateStore*, …)` builders —
-/// and `dex_device_app_perf_json`, which names the `AppPerfDailyRow` store-row
-/// type — were SPLIT OUT into the core-only `dex_read_builders.hpp`
-/// (FortitudeEtc review on PR #4582): before the split this header bundled them
-/// WITH the pure structs, so `dex_api.hpp` transitively named
-/// `GuaranteedStateStore` and was NOT store-type-free like its siblings.
+/// The store-reaching `build_dex_*_model(GuaranteedStateStore*, …)` builders
+/// were SPLIT OUT into the core-only `dex_read_builders.hpp` (FortitudeEtc
+/// review on PR #4582): before the split this header bundled them WITH the
+/// pure structs, so `dex_api.hpp` transitively named `GuaranteedStateStore`
+/// and was NOT store-type-free like its siblings. `dex_device_app_perf_json`
+/// (the per-device app-perf drill serializer, which names the
+/// `AppPerfDailyRow` store-row type) briefly lived in `dex_read_builders.hpp`
+/// too, but has since been absorbed into the DexPerfApi seam's own
+/// `dex_app_perf_builders.hpp` (ADR-0031 WS-A4, the sixth family) — its real
+/// home, since it belongs to the app-perf-over-time surface, not DEX signals.
 ///
 /// `DexFleet`/`DexSignalGroup` and the DEX leaf value types (DexSignalCount,
 /// DexEntitySummary, GuardianObservationRow, …) live in the pure `dex_types.hpp`
@@ -60,8 +64,8 @@ std::string dex_device_score_json(const DexDeviceScoreModel& model, bool audit_p
 
 // (MCP-only gap #2: the per-device app-perf drill serializer
 // `dex_device_app_perf_json` names the `AppPerfDailyRow` store-row type, so it
-// lives in `dex_read_builders.hpp`, not here — keeping this header
-// store-type-free.)
+// lives in `dex_app_perf_builders.hpp` (the DexPerfApi seam, ADR-0031 WS-A4
+// sixth family), not here — keeping this header store-type-free.)
 
 // ── New twin #1: app blast-radius (/fragments/dex/app, GET /api/v1/dex/app?name=) ──
 
