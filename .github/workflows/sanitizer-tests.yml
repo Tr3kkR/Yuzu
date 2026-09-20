@@ -20,6 +20,15 @@ name: Sanitizer tests
 # on the target ref. The gate passes --ref $(git rev-parse HEAD), so this
 # file must be committed and pushed before /test --full can dispatch
 # against a new commit.
+#
+# TODO(#1611): this workflow provisions no Postgres service and sets no
+# YUZU_TEST_POSTGRES_DSN. Every Postgres-touching test SKIPs silently via
+# YUZU_REQUIRE_PG_DB when that DSN is unset (tests/unit/test_helpers.hpp), so
+# today this workflow cannot be trusted as evidence that a PG-touching
+# sanitizer issue (this one included) is actually exercised. Real fix is a
+# separate, larger CI change (adding a Postgres service + ensure-postgres.sh
+# wiring, mirroring ci.yml's server legs); out of scope here, tracked for
+# follow-up.
 
 on:
   workflow_dispatch:
@@ -271,6 +280,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 75
     env:
+      # TSan suppressions are COMPILED INTO the test binaries
+      # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+      # there is deliberately no `suppressions=` file here. Read that comment
+      # before adding one.
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
       # See asan-ubsan: harmless gateway-eunit default-cookie defence on the
       # shared 4-runner Big Tam host (matches ci.yml).

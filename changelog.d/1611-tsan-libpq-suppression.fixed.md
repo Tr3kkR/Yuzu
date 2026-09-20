@@ -1,0 +1,1 @@
+- Nightly TSan: suppress libpq's documented single-connection `static_std_strings`/`static_client_encoding` connect-time write-write race (`pqSaveParameterStatus`), anchored to the two globals and guarded by a tripwire that fails if any first-party code starts calling the conn-less `PQescapeString`/`PQescapeBytea` readers (#1611).
