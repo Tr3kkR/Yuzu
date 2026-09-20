@@ -1687,7 +1687,8 @@ behind a bounded non-blocking hand-off. A default-off runtime flag is not suffic
 because the write is still synchronous whenever the flag is on. On the live legacy path the same
 exposure is not new for `T_wire` on the guard worker (other `info` lines are already written on it),
 but per the adjudication `T_server` is, at thread level: for a guardian-only agent stream it is the
-first happy-path log line on the thread that reads that stream. The architect Gate 8 reviewer
+first per-event `info` line in the Subscribe read loop (that loop already writes `info` lines when a
+stream opens and when a command completes). The architect Gate 8 reviewer
 adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark path each derive
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING.
