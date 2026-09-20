@@ -1198,19 +1198,37 @@ for the **Service** mechanism only, on both platforms (Linux sd-bus, Windows SCM
 Service watch's `watch()` call returning success carries zero information about
 establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged` registration is
 what this channel actually observes), so it was the mechanism with the most acute gap.
-**Registry and File are explicitly out of scope here and tracked separately as #4340**
-— both have a weaker but non-zero implicit signal via `arm()`'s own success/failure
-(Registry can still return success while an establishment probe is outstanding past the
-caller-wait budget; File can accept a definite failure into observable retry state
-rather than rejecting it), which is why they were not folded into this same PR.
+**Registry and File landed (#4340, 2026-09-20).** Both mechanisms now override
+`watch_incarnation()`/`set_established_sink()` the same way Service does above,
+mirroring its shape byte-for-byte (mark under mu_ at every coverage-transition site,
+stage at the sweep visit, dispatch in `run_off_lock()` with mu_ released,
+established-before-actions ordering). One asymmetry the two do NOT share with each
+other, load-bearing for any consumer comparing their `coverage` streams: Registry's
+`RegNotifyChangeKeyValue` is one-shot, so coverage genuinely FLAPS
+`Notification -> None -> Notification` on every consumed Target-mode fire (a real
+notify-then-rearm cycle, not a bug); File's `ReadDirectoryChangesW` reissue is
+synchronous on an ordinary fire, so its coverage stays `Notification` across it and
+only drops on a genuine backend failure, teardown, or parent-directory loss. A
+consumer that assumes the two mechanisms' `coverage` streams mean the same thing is
+wrong without accounting for this.
+**established_at is per-INCARNATION, not per-key, carried forward for R5.7's own
+future use of this channel (and for any future criterion 10 built on it):** a
+fire-triggered re-arm on the SAME incarnation (Registry's ordinary fire path above)
+never re-stamps `established_at`, and `subscription_establishment()` is a pull query
+that is not guaranteed to observe the transient `None` mid-flap — Registry's `None`
+and the re-arm's `Notification` can land in the same sweep pass. A consumer that
+needs to observe "coverage was lost and regained across a re-arm cycle" must either
+disarm+arm (mints a fresh incarnation, and so a fresh `established_at`) or install a
+mechanism-direct `set_established_sink()` observer in its own harness — do not build
+that on polling `subscription_establishment()` for the re-arm half.
 **Latency caveat, carried forward for R5.7's own future use of this channel:**
 `established_at` is stamped by the MECHANISM at the point it commits successful
 notification coverage, not at the moment `report_established` is dispatched to a
-consumer, and Windows's own dispatch is bounded by `kServicePollCadence` (a 50ms wait
-CAP the mechanism's alertable wait clamps to whenever any probe is outstanding — not a
-fixed delay; commands/APCs can wake the thread earlier). Do not compare Service's
-poll-mediated establishment timestamp against a future Registry/File wiring's
-caller-wait-bounded path as if they measured the same thing.
+consumer, and Windows's own Service dispatch is bounded by `kServicePollCadence` (a
+50ms wait CAP the mechanism's alertable wait clamps to whenever any probe is
+outstanding — not a fixed delay; commands/APCs can wake the thread earlier). Do not
+compare Service's poll-mediated establishment timestamp against Registry's or File's
+own caller-wait-bounded path (both landed, #4340) as if they measured the same thing.
 **Windows live-registration-retry blind spot, carried forward for R5.7's own
 future use of this channel:** on a live-registration failure that occurs
 AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
@@ -1226,8 +1244,11 @@ OBSERVABLE (staging `SparkCoverage::None`, honestly, rather than leaving it
 invisible). A future R5.7 consumer treating Windows's `None` in this
 specific window as "confirmed absent" rather than "not yet re-confirmed"
 would be wrong; do not conflate the two without a discriminating signal
-Spark does not currently have (see also the forward-looking
-`SparkCoverage::None` ambiguity note for Registry/File, tracked as #4340).
+Spark does not currently have (see also the `SparkCoverage::None` ambiguity
+note for Registry/File, landed as #4340 — Registry's `None` is very often a
+genuine one-shot-notify-consumed flap rather than a Service-style "not yet
+re-confirmed" gap; a consumer must not conflate the two without checking
+which mechanism produced the report, per the asymmetry noted above).
 **R4 (stale-after-stop), carried forward from the delivery plan's own residual list:**
 after `SparkEngine::stop()`, `subscription_establishment(id)` keeps returning the
 subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A future
