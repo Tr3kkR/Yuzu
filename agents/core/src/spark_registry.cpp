@@ -489,6 +489,17 @@ struct RegWatch {
     bool grace_counted{false};
     bool needs_resync{false};
     std::uint64_t resync_epoch{0};
+    /// Establishment-signal state (rung 9c PR-6 item 1), all under mu_ like
+    /// everything else in this struct. `incarnation` identifies WHICH watch a
+    /// staged/dispatched report is about — forward-only rebind (never
+    /// decreases); `coverage`/`coverage_at` are the LAST-MARKED transition (set
+    /// by every coverage-transition site, §1.2 of the delivery plan — never
+    /// gated on the prior value); `coverage_report_due` is the sweep's staging
+    /// flag, cleared only after the entry is pushed into SweepWork::established.
+    SparkIncarnation incarnation{kNoSparkIncarnation};
+    SparkCoverage coverage{SparkCoverage::None};
+    Clock::time_point coverage_at{};
+    bool coverage_report_due{false};
     /// The outstanding re-arm was fire-triggered while in Ancestor mode. If it
     /// commits in Target mode the key APPEARED, which the base mechanism emitted
     /// (`old_mode == Target || w.mode == Target`) and this one must too. Kept as
@@ -571,9 +582,23 @@ struct SweepWork {
         /// before the call and skips a stale edge.
         RegWatch* watch{nullptr};
     };
+    /// A staged establishment-signal report (rung 9c PR-6 item 1). Mirrors
+    /// spark_service.cpp's PendingEstablished, minus `key_epoch`: Registry's
+    /// staged incarnation IS the identity check (§1.8 of the delivery plan —
+    /// SparkEngine::report_established drops a report whose incarnation no
+    /// longer names the key's current watch), so no separate staleness token
+    /// is needed here. A SEPARATE vector, not a new Action::Kind — Action's
+    /// positional-brace-init layout stays untouched.
+    struct PendingEstablished {
+        std::string key;
+        SparkIncarnation incarnation{kNoSparkIncarnation};
+        Clock::time_point at{};
+        SparkCoverage coverage{SparkCoverage::None};
+    };
     std::vector<ProbeLaunch> probe_launches;
     std::vector<DrainJob> drain_launches;
     std::vector<Action> actions; ///< in recorded order - per-watch ordering matters
+    std::vector<PendingEstablished> established; ///< staged coverage reports, dispatch-first order
     // discards (destroyed off-lock)
     std::vector<detail::EventHandle> old_events;
     std::vector<RegKeyHandle> old_keys;
@@ -604,6 +629,13 @@ public:
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1): start() being CALLED is what seals
+        // the establishment sink, whether or not this call does anything else —
+        // set first, before the idempotent early-return, so a repeat start()
+        // can never re-open the window (mirrors spark_service.cpp). Never
+        // cleared by stop(): SparkEngine is single-shot, so no production
+        // caller ever re-arms the sink after a stop().
+        sink_sealed_ = true;
         if (core_)
             return; // idempotent
         emit_ = std::move(emit);
@@ -664,6 +696,17 @@ public:
 
     std::expected<void, std::string> watch(const std::string& key,
                                            const SparkParams& params) override {
+        // The engine never calls this overload in production (it always calls
+        // watch_incarnation() below) — kept for direct/test callers that predate
+        // the establishment signal. kNoSparkIncarnation is a valid, harmless
+        // identity: nothing rejects it, it simply never matches a real engine
+        // incarnation.
+        return watch_incarnation(key, params, kNoSparkIncarnation);
+    }
+
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
         const auto* rp = std::get_if<RegistrySparkParams>(&params);
         if (!rp)
             return std::unexpected("registry mechanism: params are not RegistrySparkParams");
@@ -681,8 +724,24 @@ public:
             std::lock_guard lk(mu_);
             if (!started_ || stopping_)
                 return std::unexpected("registry mechanism not started");
-            if (watches_.contains(key))
+            if (auto existing = watches_.find(key); existing != watches_.end()) {
+                // Adoption / join (rung 9c PR-6 item 1, correction D): the engine
+                // skips unwatch() on a renewed key (SparkEngine::disarm() /
+                // unregister_consumer()), so without this the fresh incarnation
+                // would never be reported and subscription_establishment() would
+                // stay default-None for it forever. Forward-only rebind (never
+                // decreases); the re-report carries the watch's CURRENT coverage
+                // against the NEW incarnation, re-stamped `now()` so a first-wins
+                // established_at on the adopting incarnation can never predate its
+                // own armed_at (Astra round-3 finding 4 / MF4).
+                RegWatch& existing_w = *existing->second;
+                if (incarnation > existing_w.incarnation)
+                    existing_w.incarnation = incarnation;
+                existing_w.coverage_at = Clock::now();
+                existing_w.coverage_report_due = true;
+                nudge_locked();
                 return {}; // idempotent (engine dedups, but stay safe)
+            }
             if (sweep_cursor_.capacity() < key.size()) {
                 // The sweeper assigns the visited key into sweep_cursor_ under mu_;
                 // growing it HERE (a throw is an ordinary arm() failure, before any
@@ -707,6 +766,7 @@ public:
             uw->subkey = rp->key;
             uw->subkey_w = subkey_w;
             uw->owner = this;
+            uw->incarnation = incarnation;
             uw->accepted_at = Clock::now();
             uw->probe = ProbeState::Pending;
             uw->probe_gen = ++gen_;
@@ -766,7 +826,17 @@ public:
                 nudge_locked();
             } else if (taken) {
                 if (taken->has_value() && (*taken)->ok) {
+                    // `discards` (this call's local SweepWork) is destroyed
+                    // unread at the end of this scope — correction A: staging
+                    // into it here would be silently dropped. commit_locked()
+                    // marks coverage on `w` itself, which survives past this
+                    // function's return, so the mark is what carries the
+                    // establishment report forward, not anything pushed here.
                     commit_locked(*w, std::move(**taken), discards);
+                    // Correction B: without this nudge a fast-established watch
+                    // would wait up to next_wake_locked()'s 1h idle ceiling
+                    // before the sweeper ever visits it to stage the report.
+                    nudge_locked();
                 } else {
                     // Definite failure while the caller is still here: retire the
                     // insertion and report it - the engine rolls the arm back.
@@ -784,6 +854,7 @@ public:
                 // watching; a change in this window is caught by the synthetic fire
                 // the sweeper emits on commit.
                 w->call = std::move(call);
+                mark_coverage_locked(*w, SparkCoverage::None);
                 w->needs_resync = true;
                 w->resync_epoch = ++resync_epoch_;
                 nudge_locked();
@@ -795,11 +866,27 @@ public:
         return {};
     }
 
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_ = std::move(sink);
+        return true;
+    }
+
     void unwatch(const std::string& key) override {
         std::lock_guard lk(mu_);
         auto it = watches_.find(key);
         if (it == watches_.end())
             return;
+        // Deliberately NOT reported (delivery plan §1.9): the engine has
+        // already erased armed_[key] before calling unwatch() (or skipped the
+        // call entirely on adoption — watch_incarnation()'s rebind branch
+        // above), so a None report from here would be dropped by
+        // SparkEngine::report_established's identity check by construction.
+        // unwatch() also runs under the engine's per-type lock and must not
+        // call established_() synchronously (spark_mechanism.hpp's mechanism
+        // contract, the same reentrancy prohibition as emit()/fault()).
         std::unique_ptr<RegWatch> victim = std::move(it->second);
         watches_.erase(it);
         victim->active = false; // no re-arm, no commit, no dispatch from here on
@@ -889,6 +976,7 @@ public:
         started_ = false;
         emit_ = nullptr;
         fault_ = nullptr;
+        established_ = nullptr; // after the sweeper is joined, like emit_/fault_ above
         stopping_ = false;
         sweeper_stop_ = false;
         nudged_ = false;
@@ -957,6 +1045,7 @@ public:
         d.health_edges = health_edges_.load(std::memory_order_relaxed);
         d.emit_failed = emit_failed_.load(std::memory_order_relaxed);
         d.resync_retries = resync_retries_.load(std::memory_order_relaxed);
+        d.established_failed = established_failed_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         d.drain_workers_active = drain_lane_.active_workers();
         std::lock_guard lk(mu_);
@@ -1006,6 +1095,11 @@ public:
                 }
             }
             w.armed = false; // this notification is consumed; the watch must re-establish
+            // RegNotifyChangeKeyValue is one-shot (correction C / R6): every
+            // consumed notification is a genuine coverage loss, Target mode or
+            // Ancestor mode alike, until the re-arm below commits. Unconditional
+            // (MF1) - the mode gate lives only at commit_locked's positive site.
+            mark_coverage_locked(w, SparkCoverage::None);
             // Emit when the key existed before this fire (it changed / was deleted).
             // The (re)appearance case - Ancestor mode resolving to Target - is only
             // knowable at commit: `rearm_from_ancestor` carries it there. Pure-
@@ -1026,9 +1120,15 @@ public:
                 gen = w.probe_gen;
                 w.accepted_at = Clock::now();
                 w.grace_counted = false;
+            } else {
+                // A probe is already outstanding (Pending/Deferred) - it will
+                // re-establish; launching a second one would duplicate the
+                // obligation. Nothing else in this branch wakes the sweeper for
+                // the coverage mark just staged above (the `if (job)` branch's
+                // own off-lock launch reaches its own nudge further down), so
+                // nudge explicitly here (correction B).
+                nudge_locked();
             }
-            // else: a probe is already outstanding (Pending/Deferred) - it will
-            // re-establish; launching a second one would duplicate the obligation.
         }
         std::optional<DetachedCall<ProbeResult>> stale;
         if (job) {
@@ -1107,6 +1207,24 @@ private:
         cv_.notify_one();
     }
 
+    /// Coverage-transition marker (rung 9c PR-6 item 1, delivery plan §1.2):
+    /// every coverage-transition site calls this and nothing else — three
+    /// scalar writes, unconditional, never gated on the watch's prior
+    /// coverage (MF1: there is no "edge" logic anywhere in this mechanism).
+    /// Staging into SweepWork::established happens exactly once, later, at
+    /// the sweep visit (sweep_locked()); dispatch happens exactly once, later
+    /// still, in run_off_lock() with mu_ released (the established_ sink is
+    /// never called from here, or from any of this function's callers).
+    /// noexcept: reached from the noexcept recovery paths
+    /// (reconcile_probe_launches_locked(), on_fire()'s TP_WAIT-callback catch)
+    /// where an escaping exception is process death; std::chrono::steady_clock::now()
+    /// is itself noexcept, so three scalar writes is all this may ever be.
+    static void mark_coverage_locked(RegWatch& w, SparkCoverage c) noexcept {
+        w.coverage = c;
+        w.coverage_at = Clock::now();
+        w.coverage_report_due = true;
+    }
+
     static std::string describe_failure(const DetachedResult<ProbeResult>& r) {
         if (!r.has_value()) {
             switch (r.error()) {
@@ -1142,6 +1260,11 @@ private:
         ++w.admission_attempts;
         w.next_retry_at = Clock::now() + doubled(admission_seed(), w.admission_attempts,
                                                  kRegAdmissionBackoffCap);
+        // No coverage established on this path, in every calling context
+        // (watch_incarnation's admission-refused branch, on_fire's job-throw
+        // catch and re-arm-launch-refused branch, reconcile_probe_launches_
+        // locked()'s noexcept recovery) - mark unconditionally (R2/R6b/R9).
+        mark_coverage_locked(w, SparkCoverage::None);
     }
 
     /// Genuine backend failure: retry on the 30 s doubling schedule, report the
@@ -1157,6 +1280,10 @@ private:
             w.faulted_now = true;
             w.fault_reason = reason;
         }
+        // Genuine backend failure - no coverage, in every calling context
+        // (commit_locked's no-TP_WAIT branch, resolve_probe_locked's failure
+        // branch) - mark unconditionally (R8).
+        mark_coverage_locked(w, SparkCoverage::None);
         spdlog::warn("spark_registry: establishing '{}' failed ({}) - watch is deaf until the retry",
                      w.spark_key, reason);
     }
@@ -1187,6 +1314,17 @@ private:
         w.backend_attempts = 0;
         w.admission_attempts = 0;
         w.grace_counted = false;
+        // The one positive coverage site (R7): Target mode has live OS-level
+        // notification coverage, Ancestor mode does not (it watches the PARENT
+        // for the target's appearance, not the target itself) - unconditional
+        // gate on res.mode alone (MF1), never special-cased away for Ancestor:
+        // a Target -> Ancestor transition (the target was deleted; the re-arm
+        // resolved to the parent) is a real coverage loss that must overwrite
+        // whatever Notification the engine has cached. This single line also
+        // covers the Ancestor -> Target appearance case below (w.mode is
+        // already the new mode here) and the ordinary re-arm-stays-Target case.
+        mark_coverage_locked(w, w.mode == WatchMode::Target ? SparkCoverage::Notification
+                                                             : SparkCoverage::None);
         if (w.faulted_now) {
             w.faulted_now = false;
             w.fault_reason = "recovered";
@@ -1248,6 +1386,13 @@ private:
         const auto cadence = sweep_cadence();
         const auto grace = health_grace();
         for (const auto& [k, w] : watches_) {
+            // Correction B: a staged-but-unstaged coverage report must be
+            // picked up on the very next pass, never left for an idle watch's
+            // 1h default ceiling. Checked BEFORE the switch (not after it,
+            // like the grace check below) because the Idle case `continue`s
+            // past everything that follows the switch.
+            if (w->coverage_report_due)
+                wake = std::min(wake, now);
             switch (w->probe) {
             case ProbeState::Pending:
                 wake = std::min(wake, now + cadence);
@@ -1293,6 +1438,7 @@ private:
         work.dead_results.reserve(cap);
         work.stale_calls.reserve(cap + kDrainLaneCap);
         work.drain_launches.reserve(drain_lane_cap_.load(std::memory_order_relaxed));
+        work.established.reserve(cap); // rung 9c PR-6 item 1: one entry per visited watch
         if (sweep_hook_ && *sweep_hook_)
             (*sweep_hook_)(); // test seam: a throw here models an allocation failure
 
@@ -1341,6 +1487,21 @@ private:
             sweep_cursor_ = it->first; // capacity pre-grown in watch(): no allocation here
             ++it;
             const auto now = Clock::now();
+            // Drain the coverage marker BEFORE the switch (delivery plan §1.2,
+            // ordering rule 1): if the switch below commits Notification in
+            // this SAME visit (a Deferred retry resolving synchronously would
+            // not - probe launches are always off-lock - but a future direct
+            // caller must not silently break this), draining after would
+            // overwrite the just-staged None and it would never be reported.
+            // push_back (the key string copy, can throw) BEFORE clearing
+            // `due` (ordering rule 2, mirrors the Fault-edge staging below):
+            // a throw here leaves the marker set, so the NEXT pass re-attempts
+            // rather than silently believing the report already went out.
+            if (w.coverage_report_due) {
+                work.established.push_back(
+                    {w.spark_key, w.incarnation, w.coverage_at, w.coverage});
+                w.coverage_report_due = false;
+            }
             switch (w.probe) {
             case ProbeState::Pending:
                 if (w.call) {
@@ -1433,6 +1594,29 @@ private:
                 drain_outcomes_.emplace_back(lr.status, std::move(*lr.fn));
         }
         work.drain_launches.clear();
+
+        // Dispatch establishment reports FIRST, before emits/faults (rung 9c
+        // PR-6 item 1, delivery plan §1.8 - mirrors spark_service.cpp's chosen
+        // order: a consumer observing a Fired/Faulted event can already see
+        // the establishment report for the same key). established_ is read by
+        // reference, no copy, no mu_ - same argument as the emit_/fault_ read
+        // immediately below (written only by start(), before this thread
+        // exists, and by stop(), after this thread has been joined). A throw
+        // on one report is counted (established_failed_) and NOT re-staged -
+        // the engine's cache simply keeps the previous value until the next
+        // real transition, matching Service. No key_epoch/staleness re-check
+        // is needed: the staged incarnation IS the identity, and
+        // SparkEngine::report_established drops any report whose incarnation
+        // no longer names the key's current watch.
+        if (established_) {
+            for (const auto& e : work.established) {
+                try {
+                    established_(e.key, e.incarnation, e.at, e.coverage);
+                } catch (...) {
+                    established_failed_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
 
         // emit_/fault_ are read here with mu_ released: they are written only by
         // start() (before this thread exists) and by stop() after this thread has
@@ -1617,6 +1801,21 @@ private:
         // doc comment for the full failure chain and why it is safe to call
         // unconditionally here.
         reconcile_probe_launches_locked(work);
+        // Re-mark every staged establishment report REGARDLESS of `dispatched`
+        // (delivery plan §1.7): `dispatched == true` only means run_off_lock()
+        // was ENTERED, not that it reached this pass's established-dispatch
+        // loop before the throw that brought us here - the same distinction
+        // work.actions' own `dispatched` guard cannot make either. Do NOT
+        // restore the staged value: the next pass re-stages the watch's
+        // CURRENT coverage, which is at least as fresh as what was lost here.
+        // map::find on a const std::string& does not allocate, so this stays
+        // safe for the noexcept contract.
+        for (const auto& e : work.established) {
+            auto it = watches_.find(e.key);
+            if (it != watches_.end())
+                it->second->coverage_report_due = true;
+        }
+        work.established.clear();
         if (!dispatched) {
             for (const auto& a : work.actions) {
                 auto it = watches_.find(a.key);
@@ -1781,6 +1980,17 @@ private:
     std::condition_variable cv_;
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) - written once by
+    /// set_established_sink() before start(), read only by run_off_lock() on
+    /// the sweeper thread with mu_ released (same happens-before argument as
+    /// emit_/fault_ above: the write happens-before the sweeper thread spawns
+    /// in start(), and stop() nulls it only after the sweeper has been
+    /// joined).
+    SparkEstablishedFn established_;
+    /// One-way latch (rung 9c PR-6 item 1): set as the FIRST statement of
+    /// start(), never cleared by stop() - SparkEngine itself is single-shot,
+    /// so no production caller ever needs to re-arm the sink after a stop().
+    bool sink_sealed_{false};
     std::shared_ptr<PoolCore> core_;
     bool started_{false};
     bool stopping_{false};
@@ -1836,6 +2046,7 @@ private:
     std::atomic<std::uint64_t> health_edges_{0};
     std::atomic<std::uint64_t> emit_failed_{0};    ///< an emit() submit threw (either path)
     std::atomic<std::uint64_t> resync_retries_{0}; ///< restored debt re-staged by the sweeper
+    std::atomic<std::uint64_t> established_failed_{0}; ///< an established() submit threw (rung 9c PR-6 item 1)
     std::atomic<std::uint64_t> fault_failed_{0};     ///< a fault() submit threw (sweeper path)
     std::atomic<std::uint64_t> sweep_pass_failed_{0}; ///< sweeper passes that threw (sg-7/sre6-1)
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};

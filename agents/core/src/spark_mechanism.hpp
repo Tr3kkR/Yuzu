@@ -622,6 +622,7 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t health_edges{0};
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
+    std::uint64_t established_failed{0}; ///< established() threw on submit (rung 9c PR-6 item 1)
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};
