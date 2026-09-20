@@ -6256,6 +6256,550 @@ TEST_CASE("File spark (real mechanism): a shared-ancestor storm keeps concurrent
     engine.stop();
 }
 
+// ── #4340 (rung 9c PR-6 item 1): File establishment-signal ───────────────────
+//
+// Mirrors the Registry RF-1..RF-10 catalogue above (§4602) and spark_service.
+// cpp's shipped M3 shape. Every case here is DGRHP-only. Correction C (File
+// does NOT lose coverage on an ordinary fire - the reissue is synchronous,
+// unlike Registry's one-shot RegNotifyChangeKeyValue) means FF-4/FF-10 use a
+// parent-delete+recreate cycle / a forced notify_fail_hook loss respectively,
+// never a plain write, to exercise a genuine coverage transition.
+
+TEST_CASE("File mechanism (Windows, direct): set_established_sink seals at start(), still "
+          "sealed after stop() (#4340 FF-1)",
+          "[spark][established][windows]") {
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
+}
+
+TEST_CASE("File spark (real mechanism): an existing parent dir reaches Notification coverage "
+          "with a stamped established_at (#4340 FF-2)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_target");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): an absent parent dir watches its ancestor with None "
+          "coverage until it is created (#4340 FF-3, DoD 1)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    const fs::path root = yuzu::test::unique_temp_path("yuzu_test_spark_est4340_absent_");
+    const fs::path parent = root / "watched";
+    const fs::path target = parent / "file.txt";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root); // root exists; `parent` (the target's own dir) does not
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(target.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+
+    // Ancestor-mode establishment settles quickly too (root exists), but it
+    // must NEVER report Notification for the absent target - only None,
+    // unconditionally, per the mode gate (MF1).
+    std::this_thread::sleep_for(300ms);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Create the parent dir + file: the ancestor's own notification fires,
+    // the re-probe resolves to Target, and establishment must stamp.
+    fs::create_directories(parent);
+    { std::ofstream(target) << "seed"; }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("File spark (real mechanism): a parent-dir delete + recreate cycle loses and regains "
+          "coverage without ever re-stamping established_at (#4340 FF-4, DoD 2, correction C)",
+          "[spark][established][windows]") {
+    // Correction C: an ORDINARY write never drops File's coverage (the
+    // reissue is synchronous) - only losing the parent DIRECTORY does, so
+    // this exercises the delete+recreate cycle, not a plain write.
+    namespace fs = std::filesystem;
+    const fs::path root = yuzu::test::unique_temp_path("yuzu_test_spark_est4340_rearm_");
+    const fs::path parent = root / "watched";
+    const fs::path target = parent / "file.txt";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(parent);
+    { std::ofstream(target) << "seed"; }
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(target.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    fs::remove(target, ec);
+    fs::remove(parent, ec);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // loss of coverage never un-stamps established_at
+
+    fs::create_directories(parent);
+    { std::ofstream(target) << "recreated"; }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins - recovery never re-stamps
+
+    engine.disarm(*sub);
+    engine.stop();
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("File spark (real mechanism): a parked initial discovery probe leaves coverage None "
+          "until release, then stamps established_at (#4340 FF-5)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_late");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value()); // success-with-pending
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    std::this_thread::sleep_for(200ms); // well past the 50 ms caller budget/sweep cadence
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    const auto t_release = std::chrono::steady_clock::now();
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= t_release);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a deterministic completion failure reports None until "
+          "the recovery reissue commits Notification (#4340 FF-6)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_notify_fail");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // Force the NEXT real completion for this dir to be reported !ok
+    // (F6): a genuine coverage loss distinct from an ordinary fire.
+    std::atomic<bool> armed{true};
+    {
+        FileMechanismTestControls ctl;
+        ctl.notify_fail_hook = [&, dir = a.dir.wstring()](std::wstring_view d) {
+            if (d != dir)
+                return false;
+            return armed.exchange(false, std::memory_order_acq_rel); // one-shot
+        };
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    a.write("trigger a completion");
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // a coverage loss never un-stamps established_at
+
+    // Clear the hook: the mechanism's own stage_probe_locked recovery re-arms.
+    {
+        FileMechanismTestControls ctl; // null hook clears it
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a disarm racing a re-arm (adoption) still lets the "
+          "mechanism report establishment against the fresh incarnation (#4340 FF-7)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_adopt");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, spec); // dedup: same key -> the engine renews the
+                                           // existing armed_ entry, skipping unwatch()
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub2);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at); // MF4: never predates the adopting arm
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a key joining an already-established directory reads "
+          "Notification promptly, the sibling's own coverage is unchanged (#4340 FF-8, coalesce)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    ScratchDir dir("est_coalesce");
+    const fs::path file_b = dir.dir / "second.txt";
+    { std::ofstream(file_b) << "seed"; }
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = file_spec(dir.file.string());
+    auto sub_a = engine.arm(*c, spec_a);
+    REQUIRE(sub_a.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub_a);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est_a = engine.subscription_establishment(*sub_a);
+    REQUIRE(est_a.has_value());
+    REQUIRE(est_a->established_at.has_value());
+    const auto a_stamped = *est_a->established_at;
+
+    // B joins the SAME directory (already established): it must read
+    // Notification promptly (well under one sweep cadence), and A's own
+    // stamp must be untouched by the join.
+    const auto spec_b = file_spec(file_b.string());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto sub_b = engine.arm(*c, spec_b);
+    REQUIRE(sub_b.has_value());
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub_b);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        2000ms));
+    auto est_b = engine.subscription_establishment(*sub_b);
+    REQUIRE(est_b.has_value());
+    REQUIRE(est_b->established_at.has_value());
+    CHECK(*est_b->established_at >= est_b->armed_at);
+    CHECK(*est_b->established_at >= t0);
+
+    est_a = engine.subscription_establishment(*sub_a);
+    REQUIRE(est_a.has_value());
+    CHECK(*est_a->established_at == a_stamped); // sibling's join never re-stamps A
+
+    engine.disarm(*sub_a);
+    engine.disarm(*sub_b);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a key joining during a parked probe is None until "
+          "release, then both keys reach Notification (#4340 FF-9, coalesce)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    ScratchDir dir("est_coalesce_park");
+    const fs::path file_b = dir.dir / "second.txt";
+    { std::ofstream(file_b) << "seed"; }
+
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(dir.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = file_spec(dir.file.string());
+    auto sub_a = engine.arm(*c, spec_a);
+    REQUIRE(sub_a.has_value()); // success-with-pending; A's initial probe parks
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // B joins the SAME (not-yet-established) directory while A's probe is
+    // still parked - B rides along with A's own outstanding obligation, no
+    // second probe launched.
+    const auto spec_b = file_spec(file_b.string());
+    auto sub_b = engine.arm(*c, spec_b);
+    REQUIRE(sub_b.has_value());
+
+    std::this_thread::sleep_for(200ms);
+    auto est_a = engine.subscription_establishment(*sub_a);
+    auto est_b = engine.subscription_establishment(*sub_b);
+    REQUIRE(est_a.has_value());
+    REQUIRE(est_b.has_value());
+    CHECK(est_a->coverage == SparkCoverage::None);
+    CHECK(est_b->coverage == SparkCoverage::None);
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto ea = engine.subscription_establishment(*sub_a);
+            auto eb = engine.subscription_establishment(*sub_b);
+            return ea.has_value() && ea->coverage == SparkCoverage::Notification &&
+                  eb.has_value() && eb->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+
+    engine.disarm(*sub_a);
+    engine.disarm(*sub_b);
+    engine.stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): the establishment sink reports the ordered "
+          "coverage sequence [Notification, None, Notification] against a fixed incarnation, "
+          "and an intervening ordinary write produces NO extra report (#4340 FF-10, "
+          "correction C)",
+          "[spark][established][windows]") {
+    // Direct (no engine) so a real SparkIncarnation token can be supplied and
+    // every report's identity checked. Unlike Registry's RF-10 (which parks
+    // the RE-ARM probe to prove ordering), File's ordinary fire never even
+    // launches a probe (correction C: the reissue is synchronous) - the
+    // deterministic loss here comes from notify_fail_hook, mirroring FF-6.
+    ScratchDir a("est_direct_seq");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    struct EstEntry {
+        SparkIncarnation incarnation;
+        SparkCoverage coverage;
+    };
+    std::mutex mu;
+    std::vector<EstEntry> est_seq;
+    std::atomic<int> emits{0};
+
+    REQUIRE(mech->set_established_sink(
+        [&](const std::string&, SparkIncarnation inc, std::chrono::steady_clock::time_point,
+           SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            est_seq.push_back({inc, cov});
+        }));
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+
+    // Initial establishment: Notification, token 42, no emit yet.
+    REQUIRE(eventually([&] {
+        std::lock_guard lk(mu);
+        return !est_seq.empty();
+    }));
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 1);
+        CHECK(est_seq[0].incarnation == kToken);
+        CHECK(est_seq[0].coverage == SparkCoverage::Notification);
+    }
+    CHECK(emits.load() == 0);
+
+    // An ORDINARY write (correction C): the reissue is synchronous, so this
+    // must produce an emit but NO additional established report.
+    a.write("ordinary change");
+    REQUIRE(eventually([&] { return emits.load(std::memory_order_acquire) >= 1; }, 8000ms));
+    std::this_thread::sleep_for(200ms);
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 1); // still just the initial commit - F7x
+    }
+
+    // Force the NEXT completion for this dir to be reported !ok (F6): a
+    // genuine, deterministic coverage loss.
+    std::atomic<bool> armed{true};
+    {
+        FileMechanismTestControls ctl;
+        ctl.notify_fail_hook = [&, dir = a.dir.wstring()](std::wstring_view d) {
+            if (d != dir)
+                return false;
+            return armed.exchange(false, std::memory_order_acq_rel); // one-shot
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    a.write("trigger the forced loss");
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return est_seq.size() >= 2;
+        },
+        8000ms));
+    {
+        std::lock_guard lk(mu);
+        CHECK(est_seq[1].incarnation == kToken);
+        CHECK(est_seq[1].coverage == SparkCoverage::None);
+    }
+
+    // Clear the hook: the recovery reissue commits Notification again.
+    {
+        FileMechanismTestControls ctl; // null hook clears it
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(mu);
+            return est_seq.size() >= 3;
+        },
+        10000ms));
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(est_seq.size() == 3);
+        CHECK(est_seq[2].incarnation == kToken);
+        CHECK(est_seq[2].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+}
+
 // ── File T6-analogue (#2012 PR-B2, criterion #15, reentrancy half) ──────────
 //
 // Unlike Registry, File's unwatch()/stop() do NOT block the calling thread on a
