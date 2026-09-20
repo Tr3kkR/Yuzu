@@ -19590,7 +19590,10 @@ TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+    // Pinned to "aggregate must be..." (not the bare "must be a JSON string"
+    // substring, which op_column's own wrong-type error also contains) so this
+    // assertion stays discriminating if a future refactor touches both messages.
+    CHECK(body["error"]["message"].get<std::string>().find("aggregate must be a JSON string") !=
           std::string::npos);
 }
 

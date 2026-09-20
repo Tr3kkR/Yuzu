@@ -8706,14 +8706,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // #2146 A2-R2 governance finding (same defect class as op_column below,
-                // #2970B/A2-R1 lesson applied to this sibling): a present-but-wrong-
-                // JSON-type `aggregate` (e.g. a number) must not silently read as
-                // absent and default to "count" -- reject it instead. A well-typed but
-                // unrecognized string (e.g. "bogus") still falls through to Count below,
-                // matching the legacy route's own identical behavior -- that broader
-                // enum-validation gap is pre-existing and out of scope for this fix
-                // (tracked as #4643).
+                // #2146 A2-R2 governance finding, fixed by this commit (same defect
+                // class as op_column below, #2970B/A2-R1 lesson applied to this
+                // sibling, tracked and closed as #4643): a present-but-wrong-JSON-type
+                // `aggregate` (e.g. a number) must not silently read as absent and
+                // default to "count" -- reject it instead. A well-typed but
+                // unrecognized string (e.g. "bogus") still falls through to Count
+                // below, matching the legacy route's own identical behavior -- that
+                // SEPARATE, narrower enum-validation gap is pre-existing, untracked,
+                // and deliberately out of scope for this fix.
                 auto agg_str_opt = param_string_strict(args, "aggregate", "count");
                 if (!agg_str_opt) {
                     res.set_content(
