@@ -36,6 +36,7 @@
     [yuzu, gw, upstream, tls_handshake_failure],
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
+    [yuzu, gw, upstream, notify_dropped],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
     [yuzu, gw, guardian, forward_accepted],
@@ -164,6 +165,19 @@ handle_event([yuzu, gw, upstream, registration_replay],
              #{replayed := N, queue_depth := Q}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_registration_replay_total, [], N),
     prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
+
+%% HA WS-4 4.4 round-2 review (Gate 3 finding NEW-1 / Gate 6 COMP-2, NEW-2):
+%% yuzu_gw_upstream:handle_cast({notify_stream_status, ...}) emits this on
+%% BOTH drop paths (circuit_open | at_capacity) — without this clause the
+%% event fires into an unregistered telemetry event and never reaches
+%% Prometheus, same failure shape `forward_dropped` above exists to avoid,
+%% and specifically the failure mode that made the original F2 fix a no-op:
+%% a dropped CONNECTED for an ADOPTED replay session (this slice's
+%% reannounce/2 mechanism) left gateway_node/wire_capabilities/
+%% stream_home_id unconverged with literally zero operator-visible signal.
+handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, <<"unknown">>),
+    prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
 
 %% Guardian side-channel forwarding. `forward_accepted` is the denominator for a
 %% drop-rate SLO; `forward_dropped` is split by reason (circuit_open | at_capacity).
@@ -304,6 +318,16 @@ declare_metrics() ->
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
         {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_notify_dropped_total},
+        {labels, [reason]},
+        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications dropped "
+               "before delivery to the C++ server, by reason (circuit_open | "
+               "at_capacity). Includes HA WS-4 4.4's reannounce/2-triggered "
+               "CONNECTED after a replay-adopted session -- a sustained "
+               "non-zero rate here means agents are converging their "
+               "gateway_node placement slower than expected, or not at all, "
+               "during a recovery replay burst."}]),
     prometheus_counter:declare([
         {name, yuzu_gw_guardian_forward_accepted_total},
         {labels, []},
