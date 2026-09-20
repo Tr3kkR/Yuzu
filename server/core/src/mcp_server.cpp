@@ -8706,7 +8706,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agg_str = param_str(args, "aggregate", "count");
+                // #2146 A2-R2 governance finding (same defect class as op_column below,
+                // #2970B/A2-R1 lesson applied to this sibling): a present-but-wrong-
+                // JSON-type `aggregate` (e.g. a number) must not silently read as
+                // absent and default to "count" -- reject it instead. A well-typed but
+                // unrecognized string (e.g. "bogus") still falls through to Count below,
+                // matching the legacy route's own identical behavior -- that broader
+                // enum-validation gap is pre-existing and out of scope for this fix
+                // (tracked as #4643).
+                auto agg_str_opt = param_string_strict(args, "aggregate", "count");
+                if (!agg_str_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "aggregate must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                const std::string& agg_str = *agg_str_opt;
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;
                 else if (agg_str == "avg")
@@ -8750,7 +8765,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                aq.op_column = *op_column_opt;
+                // Assign the NORMALIZED value (cpp-safety governance finding): assigning
+                // the raw `*op_column_opt` here worked only because ResponseStore::
+                // aggregate() independently re-derives the same empty->"id" default --
+                // two implementations agreeing by coincidence, not by construction. A
+                // future edit to either default independently would silently diverge.
+                aq.op_column = effective_op_column;
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.

@@ -19560,6 +19560,40 @@ TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-ope
     CHECK_FALSE(result.contains("audit_persisted"));
 }
 
+TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "
+          "dropped to the \"count\" default (#2146 A2-R2, #4643)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["sum"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":97,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-agg-badtype","group_by":"status","aggregate":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `agg_str` fell back
+    // to "count", and the tool answered 200 with a count aggregate instead of
+    // rejecting the caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
+}
+
 TEST_CASE("MCP aggregate_responses: op_column is honored (#2146 A2-R2 -- previously silently "
           "ignored, every aggregate operated on the store's default operand column)",
           "[pg][mcp][integration][response][aggregate]") {
@@ -19586,6 +19620,50 @@ TEST_CASE("MCP aggregate_responses: op_column is honored (#2146 A2-R2 -- previou
     // (which would fall back to the store's own default operand column, "id",
     // and produce a small integer row-id max instead).
     CHECK(groups[0]["aggregate_value"].get<double>() == 200.0);
+}
+
+TEST_CASE("MCP aggregate_responses: omitted op_column matches explicit op_column:\"id\" "
+          "(#2146 A2-R2 governance finding -- the handler's own default and the store's "
+          "own default must stay in lock-step)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-2", 0, "ok", 200));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto omitted = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max"}}})");
+    REQUIRE(omitted);
+    REQUIRE(omitted->status == 200);
+    auto omitted_result = nlohmann::json::parse(omitted->body)["result"];
+    auto omitted_groups =
+        nlohmann::json::parse(omitted_result["content"][0]["text"].get<std::string>());
+    REQUIRE(omitted_groups.size() == 1);
+
+    auto explicit_id = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max",)"
+        R"("op_column":"id"}}})");
+    REQUIRE(explicit_id);
+    REQUIRE(explicit_id->status == 200);
+    auto explicit_result = nlohmann::json::parse(explicit_id->body)["result"];
+    auto explicit_groups =
+        nlohmann::json::parse(explicit_result["content"][0]["text"].get<std::string>());
+    REQUIRE(explicit_groups.size() == 1);
+
+    // If the handler's own empty->"id" default (mcp_server.cpp) and the store's
+    // independent empty->"id" default (ResponseStore::aggregate) ever drift apart,
+    // this fails: omitting op_column would silently aggregate a DIFFERENT column
+    // than explicitly asking for "id".
+    CHECK(omitted_groups[0]["aggregate_value"].get<double>() ==
+          explicit_groups[0]["aggregate_value"].get<double>());
 }
 
 TEST_CASE("MCP aggregate_responses: an invalid op_column is rejected with kInvalidParams, "

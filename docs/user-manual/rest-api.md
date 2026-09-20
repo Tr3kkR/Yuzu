@@ -5491,7 +5491,8 @@ and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 (the legacy routes are unmodified and keep their pre-existing behavior):
 
 - `limit` is clamped on **both** bounds on the two routes below that accept it — `GET
-  /api/v1/responses/{id}` (`[1,1000]`) and `GET /api/v1/responses/{id}/export` (`[1,10000]`);
+  /api/v1/responses/{id}` (`[1,1000]`, default 100 when omitted) and `GET
+  /api/v1/responses/{id}/export` (`[1,10000]`, default 10000 when omitted);
   `GET /api/v1/responses/{id}/aggregate` has no `limit` parameter. The legacy export route
   (`GET /api/responses/{id}/export`) only floors its own *default* at 10000 — a caller-supplied
   `?limit=` there has no ceiling at all and can attempt an unbounded fetch. Not fixed on the legacy
@@ -5513,7 +5514,7 @@ still emits its own distinct `denied` row (CC7.2 evidence), as the legacy routes
 the caller's visible agent set is resolved and pushed into the store query before `limit`, never
 filtered after the fact. The v1 twin of `GET /api/responses/{id}` above, MCP twin `query_responses`'s
 `instruction_id` path. Accepts `agent_id`, `status`, `since`, `until`, `limit` (clamped to
-`[1,1000]`) query parameters. Does not accept `offset` (see above).
+`[1,1000]`, default 100) query parameters. Does not accept `offset` (see above).
 
 **Response:**
 

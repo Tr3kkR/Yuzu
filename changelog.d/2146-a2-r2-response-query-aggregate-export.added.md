@@ -17,7 +17,12 @@
   on the store's own default operand column regardless of what a caller requested. A
   present-but-wrong-JSON-type `op_column` (e.g. a number) is rejected with `kInvalidParams`
   rather than silently read as absent and defaulted to `id` (same defect class as #2970B/#2146
-  A2-R1's `param_int_strict`/`param_bool_strict`/`param_string_strict` family).
+  A2-R1's `param_int_strict`/`param_bool_strict`/`param_string_strict` family). The pre-existing
+  `aggregate` parameter had the identical wrong-type gap (a number/array/object/boolean silently
+  became `count`) - fixed the same way in this PR rather than deferred, since a well-typed but
+  unrecognized `aggregate` string still falls through to `count` unchanged (matching the legacy
+  route's own behavior - that broader enum-validation gap is pre-existing and out of scope,
+  tracked as #4643).
 - `GET /api/v1/responses/{id}` and `GET /api/v1/responses/{id}/export` clamp a caller-supplied
   `limit` on **both** bounds (`[1,1000]` and `[1,10000]` respectively) - the legacy `GET
   /api/responses/{id}/export` route only floors its own *default* at 10000; an explicit

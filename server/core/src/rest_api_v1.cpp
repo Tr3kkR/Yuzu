@@ -8220,7 +8220,10 @@ void RestApiV1::register_routes(
             AggregationQuery aq;
             aq.group_by = group_by;
             aq.op = op;
-            aq.op_column = op_column_param;
+            // Assign the NORMALIZED value, not the raw (possibly-empty) param --
+            // see mcp_server.cpp's aggregate_responses handler for the same fix and
+            // its rationale (cpp-safety governance finding, #2146 A2-R2).
+            aq.op_column = effective_op_column;
 
             ResponseQuery filter;
             if (req.has_param("agent_id"))
