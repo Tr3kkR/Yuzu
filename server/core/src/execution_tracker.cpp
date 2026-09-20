@@ -51,8 +51,9 @@ constexpr int kExecutionChildrenCap = 100;
 
 // #2146 A2-R1 Gate 8 fix: get_children_checked's `WHERE parent_id = $1`
 // query has no supporting index (a plain CREATE INDEX migration for it was
-// authored and removed -- see the comment above kMigrations' v5 entry and
-// #4624 -- a policy-floor violation on an already-non-empty table, not a
+// authored and removed -- see the trailing comment inside kMigrations,
+// after the v5 entry, and #4624 -- a policy-floor violation on an
+// already-non-empty table, not a
 // deferred style choice) and would otherwise run under the pool's 30s
 // default statement_timeout_ms (pg_pool.hpp), vastly exceeding
 // kReadTimeout's ~1.5s acquire budget every other reader of this shared

@@ -8013,7 +8013,12 @@ TEST_CASE("MCP list_schedules: enabled_only wrong JSON type is rejected, not sil
 // value (a JSON number) as absent, so the caller who thinks they narrowed to
 // one definition_id got every schedule back with no error.
 // param_string_strict (mcp_server.cpp, sibling of param_int_strict/
-// param_bool_strict) closes this the same way.
+// param_bool_strict) closes this the same way. Covers more than one wrong
+// JSON type via SECTIONs (governance ledger
+// qa-2146-a2r1-param-bool-strict-single-type-tested flagged param_bool_strict's
+// sibling test for exercising only one wrong type against a single,
+// type-blind `!is_boolean()` predicate; param_string_strict's `!is_string()`
+// predicate is the same shape, so this test does not repeat that gap here).
 TEST_CASE("MCP list_schedules: definition_id wrong JSON type is rejected -- not silently "
           "dropped (#2146 A2-R1)",
           "[pg][mcp][integration][schedule]") {
@@ -8032,9 +8037,16 @@ TEST_CASE("MCP list_schedules: definition_id wrong JSON type is rejected -- not 
     ts.schedule_engine_for_test = &engine;
     ts.start("operator");
 
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = "[1,2]"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":773,"params":{"name":"list_schedules",)"
-        R"("arguments":{"definition_id":42}}})");
+        R"("arguments":{"definition_id":)" +
+        bad_json_value + R"(}}})");
     REQUIRE(res);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);

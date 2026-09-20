@@ -939,10 +939,10 @@ TEST_CASE("ExecutionTracker: get_children_checked's cap boundary is the "
 // executions(parent_id) was authored and then removed before this PR merged
 // (adversarial review found it a docs/postgres-store-playbook.md
 // non-transactional-migration policy-floor violation on an already-non-empty
-// table -- see the comment above execution_tracker.cpp's kMigrations v5 entry
-// and #4624). get_children_checked's query is therefore a deliberate,
-// disclosed sequential scan today; the test below pins its statement_timeout
-// bound instead of an index-presence assertion.
+// table -- see execution_tracker.cpp's trailing comment inside kMigrations,
+// after the v5 entry, and #4624). get_children_checked's query is therefore
+// a deliberate, disclosed sequential scan today; the test below pins its
+// statement_timeout bound instead of an index-presence assertion.
 
 // #2146 A2-R1 Gate 8 fix: get_children_checked's query ran under the pool's
 // 30s default statement_timeout, vastly exceeding the ~1.5s acquire budget
