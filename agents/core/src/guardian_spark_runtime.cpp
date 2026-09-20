@@ -3137,6 +3137,8 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     // bookkeeping does is inside a try, and a failure drops the timing, not the event.
     std::vector<EvalTimingRecord> staged;
     try {
+        if (fail_timing_reserve_for_test_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{}; // test seam: as if the reserve below failed
         staged.reserve(planned.size() * 2); // most rules produce 0-1 entries; recovery+compliance
                                              // pairs produce 2 sharing one detect stamp
     } catch (...) { // diagnostic only; the staging loop below re-guards its own allocations
@@ -3241,8 +3243,12 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             try {
                 const int fail_at = fail_timing_stage_at_for_test_.load(std::memory_order_relaxed);
                 for (const OutboxEntry& e : entries) {
-                    if (fail_at >= 0 && staged.size() == static_cast<std::size_t>(fail_at))
+                    if (fail_at >= 0 && staged.size() == static_cast<std::size_t>(fail_at)) {
+                        // One-shot: the erase below restores staged.size(), so a seam left armed
+                        // would fire again on the next rule.
+                        fail_timing_stage_at_for_test_.store(-1, std::memory_order_relaxed);
                         throw std::bad_alloc{}; // test seam: as if the copy below failed
+                    }
                     EvalTimingRecord r;
                     r.event_id = e.event_id; // the only allocating copy: a throw here must not
                                              // prevent the enqueue below

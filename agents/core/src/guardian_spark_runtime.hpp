@@ -910,11 +910,17 @@ public:
     [[nodiscard]] std::vector<EvalTimingRecord> last_eval_timings_for_test() const;
     /// Test seam (#4606): make the timing staging in evaluate_key() throw as if an allocation
     /// failed when it is about to stage the record at index `k` OF THE PASS (0 = the first
-    /// record, 1 = the second, ...; -1 = off, the default). Proves the bookkeeping is
+    /// record, 1 = the second, ...; -1 = off, the default). ONE-SHOT: it disarms itself when
+    /// it fires, so a later rule in the same pass stages normally. Proves the bookkeeping is
     /// best-effort: the real enqueue still happens, and only the failing rule's timing is
     /// dropped (records staged for earlier rules in the same pass survive).
     void fail_timing_stage_at_for_test(int k) noexcept {
         fail_timing_stage_at_for_test_.store(k, std::memory_order_relaxed);
+    }
+    /// Test seam (#4606): make the NEXT evaluate_key() timing `reserve()` throw as if it could
+    /// not allocate. One-shot. Proves the reserve guard: the pass still enqueues and wakes.
+    void fail_next_timing_reserve_for_test() noexcept {
+        fail_timing_reserve_for_test_.store(true, std::memory_order_relaxed);
     }
     [[nodiscard]] bool stopping() const;
 
@@ -2224,6 +2230,7 @@ private:
     mutable std::mutex last_eval_timings_mu_;
     std::vector<EvalTimingRecord> last_eval_timings_;
     std::atomic<int> fail_timing_stage_at_for_test_{-1}; ///< test seam, see fail_timing_stage_at_for_test()
+    std::atomic<bool> fail_timing_reserve_for_test_{false}; ///< test seam, see fail_next_timing_reserve_for_test()
 };
 
 /// R5.7 (docs/spark-stage2-guardian-consumer-design.md): human-readable rendering

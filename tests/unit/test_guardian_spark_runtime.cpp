@@ -2267,24 +2267,44 @@ TEST_CASE("#4606 criterion-10: a failure part-way through a rule's batch drops t
     CHECK(rt->last_eval_timings_for_test().empty());  // the half-staged record was erased too
 }
 
-TEST_CASE("#4606 criterion-10: a staging failure for one rule keeps an earlier rule's timing in the "
-          "same pass",
+TEST_CASE("#4606 criterion-10: a staging failure for one rule keeps the timing of the rules before "
+          "AND after it in the same pass",
           "[spark][runtime]") {
-    // Two rules on one key each emit one entry in one pass. Failing on the second record drops only
-    // the second rule's timing: the first rule's already-staged record survives and both events are
-    // still enqueued.
+    // Three rules on one key each emit one entry in one pass. The seam is one-shot and fails the
+    // second record: that rule's timing is dropped, the earlier rule's already-staged record
+    // survives, and the LATER rule stages normally (a seam that re-fired after the erase would leave
+    // only one record). All three events are still enqueued.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
     rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+    rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3", /*present=*/true), true);
 
     rt->fail_timing_stage_at_for_test(1);
-    r->file = read_unknown<FileSnapshot>("io"); // both rules edge -> two health entries
+    r->file = read_unknown<FileSnapshot>("io"); // all rules edge -> three health entries
     REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
-    CHECK(drain_all(*rt).size() == 2);                  // both events enqueued
-    CHECK(rt->last_eval_timings_for_test().size() == 1); // only the second rule's timing was dropped
+    CHECK(drain_all(*rt).size() == 3);                   // every event enqueued
+    CHECK(rt->last_eval_timings_for_test().size() == 2); // exactly the failing rule's timing dropped
+}
+
+TEST_CASE("#4606 criterion-10: a failure in the timing reserve() never drops the event",
+          "[spark][runtime]") {
+    // The reserve() runs before the registry commit. Its guard is a swallowed catch, so a failure
+    // there must leave the pass enqueuing and still staging timing (the loop re-allocates on its
+    // own); without the guard the exception would escape evaluate_key before any of that.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    rt->fail_next_timing_reserve_for_test();
+    r->file = read_unknown<FileSnapshot>("io"); // errored -> one health entry
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 1);                   // the event was enqueued
+    CHECK(rt->last_eval_timings_for_test().size() == 1); // and timing still staged (reserve is a hint)
 }
 
 TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trigger sentinel "
