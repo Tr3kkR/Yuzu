@@ -2546,10 +2546,9 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
         for (int i = 0; i < kIters; ++i) drain_all(*rt);
     });
     // Reader: the #4606 test accessor copies the last staged batch under its leaf mutex while the
-    // evaluators move-assign into it. It keeps reading until every writer has finished (a fixed
-    // iteration count finished before the first writer acquired the lock, so it never overlapped),
-    // so the reader-vs-writer path is really covered; writer-vs-writer is exercised by the
-    // evaluators themselves.
+    // evaluators move-assign into it. It keeps reading until every writer has finished, so it
+    // overlaps the writers (a fixed iteration count can finish before the first writer takes the
+    // lock); writer-vs-writer is exercised by the evaluators themselves.
     std::atomic<bool> writers_done{false};
     std::thread reader([&] {
         while (!go.load()) {}

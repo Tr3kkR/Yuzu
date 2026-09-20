@@ -198,7 +198,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // Agent-controlled identifiers are neutralised before they reach any key=value
             // log line: the NUL guard strips \0 but not CR/LF, a space or '=' forges extra
             // tokens, and the tightened YuzuGuardianEventsDropped alert directs operators to
-            // trust these logs (sec-M1). log_id_token is the same neutraliser and shortening
+            // trust these logs (sec-M1). log_id_token is the neutraliser and length rule that
             // the T_server line and the agent's T_wire/T_detect lines use, so an id reads
             // identically on every line an operator joins across. (sanitize_label above stays
             // for the observer path: the alert-sink labels and the observer-threw warns below,

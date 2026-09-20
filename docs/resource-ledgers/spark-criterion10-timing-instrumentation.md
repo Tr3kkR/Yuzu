@@ -2,7 +2,7 @@
 
 This ledger lists every lock, buffer, callback context and borrowed view the #4606 benchmark
 instrumentation introduces or moves, with its owner and release path, for the C++ diff of that change
-(`a9984d565..` its tip). A Resource Ledger is a policy-floor artifact
+(from `a9984d565` to the branch tip). A Resource Ledger is a policy-floor artifact
 (CLAUDE.md standing rule 2), so it is a standalone file rather than a line in a PR description or a
 governance transcript. The Gate 1 summary of the governance run carried the first two rows; the
 remaining rows were added as later fix rounds moved locks or added the shared neutraliser, and the
@@ -29,7 +29,7 @@ list. The only thread it adds is a test reader thread (last row of the agent tab
 
 | Resource | Owner | Acquire | Release | Failure path |
 |---|---|---|---|---|
-| `log_token(std::string_view)` / `log_id_token(std::string_view)` | Pure header-only functions returning owning `std::string`; the `string_view` parameter is borrowed for the call only | Per call | Returned string is a temporary or a local of the caller | Allocation failure throws `bad_alloc`. The `T_server` call sits inside the existing best-effort `try`/`catch(...)` block. The replay, conflict, error, oversized-detail and parse-failure warn lines call it outside a `try`. On the replay, conflict, error and oversized-detail lines that is the same allocation class `sanitize_label` already had (it also copied the string); the parse-failure warn previously printed the raw agent id with no copy, so it is the one line that now allocates where it did not, on an ingest thread that has no catch-all around it, alongside the unguarded `ev_row` string copies that already allocate there (OOM-only, and accepted). |
+| `log_token(std::string_view)` / `log_id_token(std::string_view)` | Pure header-only functions returning owning `std::string`; the `string_view` parameter is borrowed for the call only | Per call | Returned string is a temporary or a local of the caller | Allocation failure throws `bad_alloc`. The `T_server` call sits inside the existing best-effort `try`/`catch(...)` block. The replay (debug), conflict, error, oversized-detail and parse-failure lines call it outside a `try`. On the replay, conflict, error and oversized-detail lines that is the same allocation class `sanitize_label` already had (it also copied the string); the parse-failure warn previously printed the raw agent id with no copy, so it is the one line that now allocates where it did not, on an ingest thread that has no catch-all around it, alongside the unguarded `ev_row` string copies that already allocate there (OOM-only, and accepted). |
 | `T_server` block (`ingest_guardian_response`) | Locals only (`std::string` temporaries, `int64_t` values) | Per Inserted, non-observation event | Block scope | No lock is held and no I/O other than the `spdlog::info` call; wrapped in `try`/`catch(...)` so it cannot escape onto the gRPC ingest thread. Runs after the outcome switch and before the observers, changes no outcome and returns nothing. |
 | `EventInsertResult::committed_wall_ns` | Plain `int64_t` value member of a returned struct, in memory only | Set right after `txn.commit()` succeeds | Struct lifetime | Never persisted; `0` for every non-Inserted outcome. |
 | `audit_token` forwarding to `log_token` | Inline function, no state | n/a | n/a | Behaviour is byte-identical to the body it replaced (pinned by `test_log_token.cpp` and `test_web_utils.cpp`). |

@@ -53,9 +53,9 @@
  *     worker (legacy path). T_server: on the thread that reads the agent's Subscribe stream
  *     (direct path, where it is the whole read loop, so a stall also delays that agent's
  *     other responses) or on the server's ForwardGuardianMessage handler when the agent is
- *     behind a gateway. A log sink that blocks therefore
- *     stalls whichever of those is writing: Event evaluations queued behind it, a convergence
- *     sweep, the next send on that lane, or the next ingest. Removing the Spark-path coupling
+ *     behind a gateway. A log sink that blocks therefore stalls whichever of those is
+ *     writing: Event evaluations queued behind it, a convergence sweep, the next send on that
+ *     lane, or the next ingest. Removing the Spark-path coupling
  *     is a flip precondition (docs/spark-flip-gate.md section 7).
  *   - The agent-side lines carry no agent field (each agent has its own log); join on
  *     (agent, event_id), taking the agent from the log's origin and from T_server's agent=.
