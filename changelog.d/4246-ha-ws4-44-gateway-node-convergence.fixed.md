@@ -5,6 +5,8 @@
   adopt-vs-refuse before installing anything, converges placement via the gateway's own
   re-announcement, and refuses a genuinely stale/superseded replay outright rather than desyncing
   silently (HA WS-4 4.4, `#4246` #6). At fleet-reconnect-storm scale a re-announcement can itself be
-  dropped under load; that case now self-heals within the existing route lease's TTL+grace window
-  rather than persisting indefinitely, and is observable via a new drop counter — closing that window
-  further is tracked as a follow-up.
+  dropped under load; that case is no longer stuck forever — the row now ages out and is purged within
+  the existing lease TTL+grace window instead of being kept alive indefinitely by ordinary heartbeat
+  renewals, surfacing observably via a new drop counter and the next heartbeat's desync outcome. Actual
+  re-convergence still needs the next circuit-recovery replay or the agent's own reconnect; closing that
+  window further is tracked as a follow-up.

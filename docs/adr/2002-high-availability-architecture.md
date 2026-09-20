@@ -993,13 +993,23 @@ before push, none deferred:**
   heartbeating; the route stays permanently non-`routable`; nothing ever re-tombstones the row for a
   later `reclaim_tombstoned_session` to fix. Fixed at the root: `renew_leases`'s `SET lease_until=...`
   is now a `CASE` that LEAVES `lease_until` untouched when `cluster_id IS NULL` — heartbeat renewals
-  become a no-op for an unconverged row instead of an indefinite lease extension, so it now reaches its
-  OWN ordinary TTL+grace expiry and gets tombstoned by the existing, UNMODIFIED
-  `reap_stale_routes()` sweep (no reaper changes needed — that sweep already keys purely off
-  `lease_until`), giving the next replay (or the agent's own natural reconnect) another reclaim
-  attempt. A CONVERGED row is completely unaffected: `announce_connected` is the sole writer of
-  `cluster_id` and always grants a full, uncapped fresh lease on every genuine CONNECTED, independent
-  of anything `renew_leases` did beforehand.
+  become a no-op for an unconverged row instead of an indefinite lease extension. **Correction (final
+  pre-push adversarial pass, below): this alone is not sufficient for the row shape this bug actually
+  produces** — a `register_fresh` row's `lease_until` is NULL from creation (never set until
+  `announce_connected` runs), so freezing `lease_until` protects nothing for it; `reap_stale_routes`'s
+  sweep (a) (expired-lease tombstoning) requires `lease_until IS NOT NULL` and never sees this row at
+  all. The row this bug actually strands is only reachable by sweep (b), the tombstone/never-announced
+  purge, which keys on `updated_at` — and `renew_leases` was still bumping `updated_at`
+  unconditionally too, resetting that purge clock on every heartbeat. The complete fix extends the same
+  `CASE` to `updated_at`. Once both columns freeze, an unconverged row's `updated_at` stops advancing,
+  sweep (b) hard-deletes it after `kTombstonePurgeAgeSecs`, and a subsequent `reclaim_tombstoned_session`
+  (row absent, same code path as a real tombstone) or a fresh `register_fresh` admits the agent's next
+  replay or natural reconnect cleanly. This closes the loop only as far as making the stuck row
+  DELETED and OBSERVABLE (the next heartbeat's route lookup surfaces as the `shortfall` desync outcome)
+  — it is not an instant self-heal; actual re-convergence still requires that next circuit-recovery
+  replay or agent-driven reconnect. A CONVERGED row is completely unaffected: `announce_connected` is
+  the sole writer of `cluster_id` and always grants a full, uncapped fresh lease (and stamps its own
+  `updated_at`) on every genuine CONNECTED, independent of anything `renew_leases` did beforehand.
 - **NEW-1/NEW-2 (BLOCKING, a truth-contradiction, not just a code gap):** round 2's own claim
   ("both drop reasons now emit... telemetry ... mirroring the Guardian-forward path's existing
   `forward_dropped` counter") was FALSE as shipped — `[yuzu, gw, upstream, notify_dropped]` was
@@ -1030,6 +1040,21 @@ before push, none deferred:**
   round 2's `do_rpc` fix in BOTH `yuzu_gw_upstream.erl` and `yuzu_gw_heartbeat_buffer.erl` — same
   crash class, closed the same way, each with its own regression test (consistency-auditor c-1 /
   chaos-injector CH-2, which explicitly recommended fixing this now rather than deferring it).
+
+**Round 3, final pre-push adversarial pass** (a third, targeted Fable review of the round-3 fixes
+specifically) found the sec-H1 fix above incomplete as first shipped (corrected in place above) and one
+further, deliberately-deferred limitation:
+- **UP-4 mid-drip stranding (deferred, `#4634`):** the UP-4 fail-closed fix is the right call — an
+  `UNAVAILABLE` from a degraded Postgres read during the replay-ADOPT decision must refuse rather than
+  silently ADOPT — but the registration-replay drip (`yuzu_gw_upstream.erl`) has no retry mechanism for
+  a dropped entry: that agent's replay is popped from the queue and not re-queued, and the pre-existing
+  replay-reseed mechanism only fires on a genuine circuit-breaker recovery transition, which this single
+  degraded read does not guarantee. An agent whose replay hits exactly this window can stay
+  gateway-connected but server-unknown until it disconnects and reconnects on its own. This gap
+  pre-dates WS-4 4.4 (no dropped replay entry was ever retried); the fail-closed fix makes it reachable
+  via one additional trigger. Filed as `#4634` rather than fixed in this slice, per the review's own
+  offered alternative (a bounded re-queue-at-tail retry is more invasive than this slice's remaining
+  budget justifies).
 
 **The `yuzu_gw_cluster` gen_server** (adjacency/health/CPU/latency-based rebalancing gossip, named as
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the

@@ -229,12 +229,20 @@ New Prometheus counters (`yuzu_gw_upstream_notify_dropped_total`,
 `yuzu_server_gateway_route_desync_total{outcome="session_superseded"}`) give
 visibility into both the normal drop path and a refused replay. At
 fleet-wide reconnect-storm scale a re-announcement can still be dropped
-under load; that case now self-heals within the route's existing lease
-TTL+grace window instead of persisting indefinitely — see
+under load; that case is no longer stuck forever — the row now ages out and
+is purged within the route's existing lease TTL+grace window instead of
+being kept alive indefinitely by ordinary heartbeat renewals. This makes the
+stuck row observable (a new drop counter, plus the `shortfall` desync
+outcome on the next heartbeat) and eligible for reclaim, but it is not an
+instant fix — actual re-convergence still needs the next circuit-recovery
+replay or the agent's own reconnect. See
 `docs/adr/2002-high-availability-architecture.md` §7c for the full
-mechanism and its one remaining known limitation (a large fleet recovering
+mechanism and two remaining known limitations: (1) a large fleet recovering
 from an outage longer than the lease grace window sees a transient wave of
-reclaim activity rather than instant convergence).
+reclaim activity rather than instant convergence, and (2) a replay refused
+because the routing directory itself was degraded at that moment is not
+retried within that recovery cycle and can strand an agent server-unknown
+until its own next reconnect (`#4634`).
 
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 

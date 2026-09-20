@@ -116,6 +116,26 @@ void raw_bump_epoch(const std::string& dsn, const std::string& agent_id, std::in
     REQUIRE(r.status() == PGRES_COMMAND_OK);
 }
 
+// Raw read of `updated_at` (epoch-ms) for one row — GatewayRouteStore's own
+// RouteRow deliberately does not expose this column (nothing production-side
+// consumes it), so a test that needs to pin the sec-H1 fix's "freeze
+// updated_at too, not just lease_until" behavior reads it directly, mirroring
+// raw_bump_epoch's direct-connection pattern above.
+std::int64_t raw_read_updated_at_ms(const std::string& dsn, const std::string& agent_id) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const char* p1 = agent_id.c_str();
+    const char* params[1] = {p1};
+    pg::PgResult r{PQexecParams(
+        conn.get(),
+        "SELECT (extract(epoch FROM updated_at) * 1000)::bigint FROM "
+        "gateway_route_store.agent_routes WHERE agent_id=$1",
+        1, nullptr, params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return std::stoll(PQgetvalue(r.get(), 0, 0));
+}
+
 /// Real grpc::Server hosting a GatewayUpstreamServiceImpl wired to a
 /// caller-supplied GatewayRouteStore. Needed ONLY for the two cases that
 /// depend on a real x-yuzu-session-id client_metadata() value — every other
@@ -302,6 +322,8 @@ TEST_CASE("ProxyRegister: renew_leases does NOT extend the lease for a row still
     REQUIRE(row_before->has_value());
     CHECK_FALSE((*row_before)->cluster_id.has_value());
     CHECK_FALSE((*row_before)->lease_until_ms.has_value());
+    const std::int64_t updated_at_before =
+        raw_read_updated_at_ms(db.dsn(), "agent-unconverged-renew");
 
     // A replay re-announce (the same session, still known in-memory) is the
     // ordinary BatchHeartbeat-equivalent renewal path for this row.
@@ -317,6 +339,15 @@ TEST_CASE("ProxyRegister: renew_leases does NOT extend the lease for a row still
     // lease-expiry (never having had one extended) so reap_stale_routes can
     // eventually tombstone it and give a later reclaim another chance.
     CHECK_FALSE((*row_after)->lease_until_ms.has_value());
+    // The completing half of the same fix: `updated_at` must ALSO stay frozen
+    // for this row, not just `lease_until` — a `register_fresh` row's
+    // `lease_until` is already NULL from creation, so freezing only
+    // `lease_until` does nothing to protect it from sweep (b)'s
+    // `updated_at`-keyed tombstone-purge predicate (reap_stale_routes,
+    // `kTombstonePurgeAgeSecs`). Without this half a row stuck exactly in
+    // this state has its purge clock reset on every renewal forever, so it
+    // NEVER ages out for a later reclaim to find.
+    CHECK(raw_read_updated_at_ms(db.dsn(), "agent-unconverged-renew") == updated_at_before);
 
     // Once the SAME session's CONNECTED actually lands, convergence and
     // leasing resume completely normally — the fix has no lasting effect on
@@ -328,6 +359,9 @@ TEST_CASE("ProxyRegister: renew_leases does NOT extend the lease for a row still
     REQUIRE(row_converged->has_value());
     CHECK((*row_converged)->cluster_id == "zone-c");
     REQUIRE((*row_converged)->lease_until_ms.has_value());
+    // announce_connected stamps its own updated_at=now() — convergence is not
+    // itself frozen by this fix.
+    CHECK(raw_read_updated_at_ms(db.dsn(), "agent-unconverged-renew") >= updated_at_before);
 }
 
 TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id with NO existing row RECLAIMS "

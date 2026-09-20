@@ -554,33 +554,62 @@ GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
     session_views.reserve(session_ids.size());
     for (const std::string& s : session_ids)
         session_views.emplace_back(s);
-    // HA WS-4 4.4 round-2 review fix (sec-H1, BLOCKING): a row that was
-    // ADOPTED or RECLAIMED (session_id set) but never received its own
-    // confirming CONNECTED (cluster_id/gateway_node still NULL — e.g. the
+    // HA WS-4 4.4 review fix (sec-H1, BLOCKING; round-3 Fable pass extended
+    // it to `updated_at` too — see below): a row that was ADOPTED or
+    // RECLAIMED (session_id set) but never received its own confirming
+    // CONNECTED (cluster_id/gateway_node still NULL — e.g. the
     // reannounce/2 notification that would have confirmed it was dropped
     // at ?MAX_NOTIFY_INFLIGHT capacity or during a circuit-open window)
     // must NOT have its lease extended indefinitely by ordinary
     // BatchHeartbeat renewals — the agent keeps heartbeating (so nothing
     // else ever notices), while the row stays PERMANENTLY unroutable
     // (`routable` requires `cluster_id IS NOT NULL`) with no path back to
-    // `reclaim_tombstoned_session` ever running again. `LEAST(...)` caps a
-    // cluster_id-IS-NULL row's lease at whatever it already was — heartbeat
-    // renewals become a no-op for it instead of pushing it forward forever
-    // — so it lets the EXISTING expired-lease sweep in
-    // `reap_stale_routes()` tombstone it after the ordinary TTL+grace
-    // window (no reaper change needed: that sweep already keys purely off
-    // `lease_until`), giving the NEXT circuit-recovery replay (or the
-    // agent's own natural reconnect) another reclaim attempt. A CONVERGED
-    // row (cluster_id set) is completely unaffected — `announce_connected`
-    // is the sole writer of `cluster_id`, and it always grants a full,
-    // uncapped fresh lease on every genuine CONNECTED, independent of
-    // whatever this function did beforehand.
+    // `reclaim_tombstoned_session` ever running again. A plain `CASE`
+    // (never `LEAST(...)` — an earlier draft of this comment named the
+    // wrong construct) leaves a cluster_id-IS-NULL row's `lease_until` and
+    // `updated_at` UNCHANGED — heartbeat renewals become a complete no-op
+    // for it instead of pushing it forward forever.
+    //
+    // BOTH columns, not just `lease_until` (round-3 Fable review fix): a
+    // freshly `register_fresh`'d row never had a lease at all
+    // (`lease_until IS NULL` until its own `announce_connected`), so
+    // leaving only `lease_until` alone would do nothing for THIS row shape
+    // — sweep (a) below requires `lease_until IS NOT NULL` and never sees
+    // it, while sweep (b) (the tombstone/never-announced purge) keys on
+    // `updated_at`, which unconditional renewal was still bumping forever.
+    // Freezing `updated_at` too means a `register_fresh` row whose very
+    // FIRST CONNECTED is dropped is no longer immune to BOTH sweeps —
+    // sweep (b) purges it after `kTombstonePurgeAgeSecs` (see
+    // `reap_stale_routes()`), which then surfaces on every subsequent
+    // heartbeat as `renew_leases`'s own `shortfall` desync outcome instead
+    // of silently matching forever. This is bootstrap-safe: `register_fresh`,
+    // `announce_connected`, and `reclaim_tombstoned_session` all stamp their
+    // OWN `updated_at = now()` directly, so a row genuinely still converging
+    // (CONNECTED in flight, not yet 5 minutes stale) is untouched by this
+    // freeze — only a row BatchHeartbeat is the sole thing keeping "fresh"
+    // is affected, which is exactly the stuck state this fix targets.
+    //
+    // Either way, this closes the loop only as far as making a stuck row
+    // TOMBSTONED/PURGED and OBSERVABLE (via the `shortfall` desync outcome
+    // once heartbeats stop matching) — not instantly "healed": convergence
+    // itself still requires the NEXT circuit-recovery replay (which adopts
+    // the reclaimed/re-created row and re-triggers a reannounce) or the
+    // agent's own natural reconnect. If that replay's OWN reannounce is
+    // ALSO dropped, the same cycle repeats rather than compounding into a
+    // permanent state — see `?MAX_NOTIFY_INFLIGHT` follow-up `#4632` for
+    // the actual lever on how often that happens. A CONVERGED row
+    // (cluster_id set) is completely unaffected by any of this —
+    // `announce_connected` is the sole writer of `cluster_id`, and it
+    // always grants a full, unfrozen fresh lease + `updated_at` on every
+    // genuine CONNECTED, independent of whatever this function did
+    // beforehand.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes AS r SET "
         "  lease_until = CASE WHEN r.cluster_id IS NULL THEN r.lease_until "
         "                     ELSE now() + ($3 || ' seconds')::interval END, "
-        "  updated_at = now() "
+        "  updated_at = CASE WHEN r.cluster_id IS NULL THEN r.updated_at "
+        "                    ELSE now() END "
         "FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
         "WHERE r.agent_id = t.agent_id AND r.session_id = t.session_id "
         "RETURNING r.agent_id",
