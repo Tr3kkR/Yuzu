@@ -1325,14 +1325,14 @@ stable `None` means sampling `coverage` over time), and `nullopt` from
 `subscription_establishment()`, which means an unknown or already-disarmed subscription id (not
 an engine `stop()`: after `stop()` the query keeps returning last-known values, see R4 above).
 (e) The first
-production consumer, the detect-latency measurement tracked in #4606, must re-derive the
-stale-cache severity and cover these residuals itself: the check in (b) narrows only one
+production consumer, the detect-latency measurement tracked in #4606 (precondition list: #4659), must
+re-derive the stale-cache severity and cover these residuals itself: the check in (b) narrows only one
 Registry case and (g) has no such check, so there is no complete guard to copy. (f) There is no
 operator surface: a dropped report is counted in the `established_failed` debug counter (a test
 seam) and logged once (the first drop only). (g) File has no equivalent of (b)'s Registry
 narrowing: its `inert_` is written only in `start()` (spark_file.cpp) and never flips at
 runtime, and a File worker that keeps failing passes (its per-pass catch in `run()` unwinds and
-carries on, with no backoff, counter or log; a known gap, not yet fixed) is invisible to both
+carries on, with no backoff, counter or log; a known gap, tracked in #4658) is invisible to both
 `subscription_health()` and `inert`, so both guards pass on a deaf File watch.
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
