@@ -34,6 +34,40 @@ constexpr const char* kStoreName = "execution_tracker";
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// get_children_checked()'s row cap (#2146 A2-R1 governance re-review,
+// blocking): the query had no LIMIT at all before this fix. No
+// creation-side ceiling exists on how many children an execution can
+// accumulate, so a fleet can legitimately exceed this -- get_children_checked()
+// detects and reports it via ExecutionChildrenResult::truncated, mirroring
+// ScheduleEngine::query_schedules_checked's identical kScheduleListCap
+// pattern (schedule_engine.cpp). #2146 A2-R1 Gate 8 re-review (Astra
+// opinion, adjudicated): 100, not 500 -- ScheduleEngine's fixed, no-param
+// kScheduleListCap is the closer analogue (get_children, like
+// list_schedules, has no caller-supplied limit param to clamp) than MCP
+// list_executions' caller-ADJUSTABLE 500 ceiling, which bounds a
+// differently-shaped read. No hard evidence backs either number; 100 is a
+// conservative default, not a proven-correct one.
+constexpr int kExecutionChildrenCap = 100;
+
+// #2146 A2-R1 Gate 8 fix: get_children_checked's `WHERE parent_id = $1`
+// query has no supporting index (a plain CREATE INDEX migration for it was
+// authored and removed -- see the trailing comment inside kMigrations,
+// after the v5 entry, and #4624 -- a policy-floor violation on an
+// already-non-empty table, not a
+// deferred style choice) and would otherwise run under the pool's 30s
+// default statement_timeout_ms (pg_pool.hpp), vastly exceeding
+// kReadTimeout's ~1.5s acquire budget every other reader of this shared
+// pool_ (including rbac_store_, which shares one pg_pool_ singleton with
+// this store) assumes -- a slow sequential scan here could stall
+// connections other subsystems need. SET LOCAL scopes a tighter timeout to
+// this one statement inside its own transaction, matching the shared idiom
+// established by software_licensing_store.cpp / app_usage_store.cpp /
+// app_perf_rollup.cpp. This bound matters MORE without an index, not less
+// -- an unindexed scan is the slower case a timeout needs to catch -- so it
+// stays in place unconditionally on top of the row cap below, independent
+// of whether/when #4624's index ships.
+constexpr const char* kChildrenStatementTimeout = "1500ms";
+
 std::string generate_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist;
@@ -357,6 +391,31 @@ const std::vector<pg::PgMigration>& migrations() {
          "  DEFAULT pg_current_xact_id();"
          "ALTER TABLE event_outbox ADD COLUMN origin_replica TEXT NOT NULL DEFAULT '';"
          "CREATE INDEX idx_event_outbox_wxid ON event_outbox(w_xid, event_id);"},
+        // #2146 A2-R1 Gate 8 review round: a v6 migration adding a supporting
+        // index for get_children_checked's `WHERE parent_id = $1` query was
+        // authored here (a plain, non-CONCURRENT CREATE INDEX) and REMOVED
+        // before this PR merged -- adversarial review (Codex + Kimi-K3)
+        // correctly flagged it as a docs/postgres-store-playbook.md policy-
+        // floor violation: `executions` "can already be non-empty on an
+        // upgrading install" (this file's own admission at the time), and
+        // the playbook's "Non-transactional migrations (the deferred kind)"
+        // section is explicit that an index on an already-large table
+        // during a live rolling upgrade needs the non-transactional
+        // migration kind, which "must be built ... before such a migration
+        // ships. Do not weaken the transactional default to sneak one in" --
+        // that kind does not exist yet (tracked generally by #4432, for a
+        // different store). `get_children_checked` therefore stays an
+        // unindexed sequential scan today, bounded by kExecutionChildrenCap
+        // and kChildrenStatementTimeout (both above) -- a disclosed
+        // performance tradeoff, not a correctness gap. #4624 tracks adding
+        // `idx_executions_parent_id ON executions(parent_id)` here, through
+        // the non-transactional kind, once #4432 lands. Version 6 is
+        // deliberately NOT reserved for it -- this v6 never shipped (no
+        // release ever recorded it in schema_meta), and PgMigrationRunner
+        // only requires each store's own migrations() vector to be strictly
+        // increasing, not contiguous, so the next migration added here
+        // simply takes whatever the next free version number is at that
+        // time.
     };
     return kMigrations;
 }
@@ -827,37 +886,75 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
 }
 
 std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_id) const {
-    return get_children_checked(parent_id).value_or(std::vector<Execution>{});
+    // No confinement scope to thread from this best-effort convenience
+    // wrapper (test-only production usage today) -- explicit nullopt, never
+    // a defaulted parameter (#2146 A2-R1 Gate 8 fix; see get_children_checked's
+    // doc comment).
+    auto checked = get_children_checked(parent_id, std::nullopt);
+    return checked ? std::move(checked->children) : std::vector<Execution>{};
 }
 
-std::optional<std::vector<Execution>>
-ExecutionTracker::get_children_checked(const std::string& parent_id) const {
+std::optional<ExecutionChildrenResult>
+ExecutionTracker::get_children_checked(const std::string& parent_id,
+                                       const ExecutionScope& scope) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_children_checked degraded: tracker not open");
-        return std::nullopt;
-    }
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        spdlog::warn("ExecutionTracker::get_children_checked degraded: pool exhausted");
         return std::nullopt;
     }
 
     // get_children is used by workflow drill-down — opt out of the
     // error-detail subquery to keep the workflow-step expansion cheap.
+    // #2146 A2-R1 (governance re-review, blocking): query one row PAST the
+    // cap so a parent with EXACTLY kExecutionChildrenCap children is never
+    // misreported as truncated -- same +1-row sentinel idiom as
+    // ScheduleEngine::query_schedules_checked (schedule_engine.cpp), trimmed
+    // back off below and never returned to the caller.
     auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailEmpty +
-               " FROM execution_tracker.executions WHERE parent_id = $1 ORDER BY dispatched_at DESC";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{parent_id});
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("ExecutionTracker::get_children_checked degraded: query failed");
+               " FROM execution_tracker.executions WHERE parent_id = $1";
+    std::vector<std::string> params{parent_id};
+    int idx = 2;
+    // #2146 A2-R1 Gate 8 fix: MUST precede ORDER BY/LIMIT below -- ADR-0017
+    // INV-3, same rule query_executions_checked above already follows. A
+    // no-op when `scope` is nullopt (unrestricted), so the unscoped shape
+    // (and its existing raw-count boundary tests) is unchanged.
+    append_execution_scope_clause(sql, params, idx, scope);
+    sql += " ORDER BY dispatched_at DESC LIMIT $" + std::to_string(idx++);
+    params.push_back(std::to_string(kExecutionChildrenCap + 1));
+
+    // #2146 A2-R1 Gate 8 fix: SET LOCAL statement_timeout scopes a tighter
+    // bound to this one statement (kChildrenStatementTimeout, ~kReadTimeout's
+    // own acquire budget) instead of the pool's 30s default -- see this
+    // constant's doc comment above. Runs inside its own transaction because
+    // SET LOCAL is transaction-scoped; a plain autocommit statement has
+    // nothing to scope it to. Mirrors software_licensing_store.cpp's
+    // count_stale_agents / app_perf_rollup.cpp's roll_day idiom.
+    std::optional<ExecutionChildrenResult> out;
+    const bool committed = pool_.with_txn_for(kReadTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kChildrenStatementTimeout + "'")
+                  .c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        ExecutionChildrenResult result;
+        const int rows = PQntuples(res.get());
+        result.truncated = rows > kExecutionChildrenCap;
+        const int take = result.truncated ? kExecutionChildrenCap : rows;
+        result.children.reserve(static_cast<std::size_t>(take));
+        for (int i = 0; i < take; ++i)
+            result.children.push_back(row_to_exec(res.get(), i));
+        out = std::move(result);
+        return true;
+    });
+    if (!committed) {
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: acquire/statement-timeout/"
+                     "query failure");
         return std::nullopt;
     }
-
-    std::vector<Execution> results;
-    const int rows = PQntuples(res.get());
-    results.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        results.push_back(row_to_exec(res.get(), i));
-    return results;
+    return out;
 }
 
 // ---------------------------------------------------------------------------

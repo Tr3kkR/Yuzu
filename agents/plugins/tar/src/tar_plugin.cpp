@@ -1982,6 +1982,7 @@ private:
             r.instances = s.instances;
             r.cpu_pct = s.cpu_pct;
             r.ws_bytes = s.ws_bytes;
+            r.is_kthread = s.is_kthread;
             rows.push_back(std::move(r));
         }
         if (!db_->insert_proc_perf_samples(rows)) {

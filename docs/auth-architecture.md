@@ -2856,7 +2856,7 @@ Out of scope for this migration, flagged not fixed (none newly reachable by this
 
 **Third migration (#1634, this ADR-0017 continuation).** Closes the systemic gap #1634 tracked since 2026-06-23: the legacy REST `/api/responses/{id}/aggregate`/`/export`/catch-all-list routes (`server.cpp`), MCP `query_responses`/`aggregate_responses`, and REST `GET /api/v1/executions/{id}/visualization` all carried a per-row post-filter (`response_agent_in_scope`/`response_scope_fn`) that sat BEHIND a still-flat global gate — the exact "inert filter" shape #1711/#1550 shipped and this ADR names as the systemic defect. All five migrated onto `require_fleet_read`/`fleet_read_fn_` as their sole gate; the response list/export routes and `query_responses` additionally push the resolved visible-agent set into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)` **before** `LIMIT`/`OFFSET` (a new optional scope parameter, ADR-0017 INV-3) rather than post-filtering a capped/paginated read — the INV-3-compliant fix an adversarial review (Kimi + Codex) found the first migration pass had missed. `GET /api/v1/executions/{id}` (REST final-state lookup), `GET /api/v1/events` (REST SSE), `GET /sse/executions/{id}` (dashboard SSE — closing the #3699 gap above), and MCP `get_execution_status`/`list_executions` also migrated: all four collapse an invisible execution to the same 404/not-found shape a genuinely nonexistent one gets (no existence oracle), and a confined non-dispatcher's view is a redacted projection (recomputed per-agent counts from only the visible agent-status rows, `scope_expression`/`parameter_values` replaced with a fixed placeholder) — dispatcher ownership admits VISIBILITY only (avoids a false 404 on a just-dispatched execution with zero responses yet) and never bypasses this projection, a distinction the same adversarial-review round caught the first attempt getting wrong. `list_executions` has a weaker mechanism than the others — execution rows carry no single `agent_id` to filter by, so a confined caller is restricted to `dispatched_by = session->username` (`ExecutionQuery::dispatched_by`) rather than a real visible-agent intersection. As of the PR #3793 review round, `agents_targeted`/`agents_responded` on this route ARE now projected (a batched, non-N+1 `get_agent_statuses_for_executions` call) the same way `get_execution_status` projects them, closing that specific gap; the confinement AXIS itself remains own-dispatches-only, not a real visible-agent intersection. **Disclosure gap (found in the same review round, not fixed):** `dispatched_by = session->username` is scoped to the minting principal, not intersected against a service-scoped token's own service-tag scope — an admitted service token sees its minting user's full dispatch-history metadata (status/timing/lineage, no agent identities), not narrowed to its own service. Recorded here as disclosed, not fixed. The two SSE routes share one event projector (`execution_event_scope.hpp`): `agent-transition` events are filtered by `agent_id`, `execution-progress` is dropped for confined subscribers (execution-wide counts, no `agent_id`), and `execution-completed` is sanitized (real `status` field preserved, counts stripped) rather than dropped, so the client still closes its stream. `query_responses`/`aggregate_responses`/`get_execution_status`/`list_executions` are reclassified `ServiceScopeClass::confined` (`kToolSecurityRows`), matching the real `fleet_read_fn_` mechanism they now have.
 
-**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
+**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. (#2146 A2-R1 gave `/children` a REST v1 twin, `GET /api/v1/executions/{id}/children`, and an MCP twin, `get_execution_children` - both reuse this exact confinement logic via `execution_scope_rules.hpp`, never re-derived, and share a new `execution_child_row_json` builder with the legacy route.) The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
 
 The two mutating routes (`rerun`/`cancel`) keep `require_permission(Execution, Execute)` ahead of the fleet gate — `require_fleet_read` structurally rejects any operation but `Read` (its legacy-open `AdmitAll` branch has no MCP approval-ticket check, so a mutation must never reach it) — then additionally take `require_fleet_read(..., "Read")` purely for scope. Mutation admission is stricter than read visibility: an adversarial review (external model, Sol/gpt-5.6-sol) found that "every EXISTING agent-status row is in scope" is a false-admission path, because those rows are response-arrival-seeded — an execution targeting agents A and B can have only A's row while B, still pending, might be out of scope. The rule implemented instead: zero status rows (the just-dispatched window) admits ONLY the dispatcher; one or more rows requires the row count to equal `agents_targeted` (a complete ledger) AND every row's agent to be in scope — dispatcher ownership is not a bypass once rows exist. Nonexistent, zero-visible, partial-visibility, and incomplete-ledger all collapse to the identical 404 + non-distinguishing audit detail (a distinct status for "partial visibility" would itself be a hidden-cohort disclosure). `mark_cancelled`'s pre-existing false-success-on-nonexistent-id behavior (an `UPDATE` matching zero rows still reports `PGRES_COMMAND_OK`) is fixed as a side effect: an explicit existence check now runs before every cancel attempt, for confined and unconfined callers alike.
 
@@ -3306,6 +3306,30 @@ this section does not restate them.
   "self-service" throughout this section means *self-service subject to
   holding the relevant `ApiToken:*` grant*, never *available to any
   authenticated owner*.
+- **Under the shipped RBAC-OFF default, self-rotate was admin-only for
+  everyone else until #2963 fixed it — composed with the self-service-only
+  ownership check, the feature was reachable by nobody but an admin in the
+  actual out-of-the-box configuration.** RBAC ships off, so before this fix
+  `AuthRoutes::require_permission`/`require_scoped_permission`'s legacy
+  fallback denied every non-`Read` operation — `ApiToken:Rotate` included —
+  to a non-admin caller, exactly like `ApiToken:Write`/`Delete` above. But
+  rotation is inherently self-targeted in a way create/delete are not: the
+  store already refuses any `requesting_user` other than the resolved
+  token's own `principal_id`, so gating the ATTEMPT on an admin role added
+  no safety, only unreachability. The decision (#2963): `ApiToken:Rotate` is
+  now on the legacy self-service allowlist
+  (`server/core/src/legacy_self_service_allow.hpp`) — the ONLY (securable,
+  operation) pair on it today — so a plain non-admin, non-MCP-tier caller
+  (a cookie session or an untiered PAT) may attempt rotate/confirm under
+  RBAC-off; the store's ownership check is what actually decides whether it
+  succeeds. This is the mirror image of `authz_topology_floor.hpp`'s
+  `kTopologyFloor` (which narrows the legacy fallback for authorization-
+  topology reads regardless of the toggle) — one list widens a single
+  self-targeted exception, the other floors a fixed admin-only set; neither
+  overrides a live RBAC grant, and both apply strictly inside the legacy
+  branch, below it. The exemption does **not** widen to `ApiToken:Write`/
+  `Delete` or any other operation — see that header's own criteria for what
+  else could ever join it.
 - **Not an ownership-enumeration oracle.** The non-owner rejection is folded
   into the exact same wording the genuinely-nonexistent-token case uses
   (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
@@ -3380,28 +3404,96 @@ this section does not restate them.
   successor secret to themselves — with neither `ApiToken:Delete` nor a
   supervised-tier approval. No privilege gain, but a real residual:
   availability (the sibling's predecessor is destroyed) plus cross-consumer
-  credential capture, within one principal's own tokens.
-- **The guard also blocks the DE-escalating direction — an undocumented-
-  until-now capability loss, not a defect.** The guard is equality, not "no
-  broader than": a cookie or JIT-elevated interactive session carries an
-  empty `mcp_tier`/`scope_service`, which matches an untiered predecessor
-  but does **not** match a token that itself carries a tier or scope. So
-  the owner of an MCP-tiered or service-scoped token cannot rotate or
-  confirm it from the dashboard or a plain interactive REST session at
-  all — only the holder of that token's own secret (or an equally-tiered
-  session) can. This is backwards precisely when the token's secret is the
-  thing under suspicion, which is the main reason anyone rotates. Whether
-  to widen the guard to admit a strictly-higher-authority session rotating
-  a narrower token is an open product decision, not made by this fix — see
+  credential capture, within one principal's own tokens. **#2963 widens this
+  residual's reach, not its shape** (governance Gate 4 UP-3): a full-authority
+  session (empty tier/scope) can now rotate-then-confirm a same-principal
+  SIBLING that carries a tier or scope, not only an untiered/perpetual one —
+  previously the bare tier-equality guard blocked that combination
+  structurally. Concretely: a caller who compromises only a principal's
+  cookie session (e.g. via XSS/CSRF) can now silently rotate/confirm a
+  *different*, genuinely MCP-tiered automation token belonging to the same
+  principal, breaking whatever consumes it. Still no privilege gain — the
+  successor inherits the sibling's own tier/scope, never the attacker's — so
+  this stays an availability/credential-capture residual, not an
+  authorization one, and the disposition is unchanged: `ApiToken:Rotate`
+  remains deliberately not approval-gated (see above), and this is accepted,
+  not fixed, by this decision.
+- **The guard's blocking of the DE-escalating direction was decided and
+  fixed by #2963 — a single full-authority exception, not a tier lattice.**
+  The guard was originally bare equality, not "no broader than": a cookie
+  or JIT-elevated interactive session carries an empty `mcp_tier`/
+  `scope_service`, which matched an untiered predecessor but did **not**
+  match a token that itself carried a tier or scope — so the owner of an
+  MCP-tiered or service-scoped token could not rotate or confirm it from
+  the dashboard or a plain interactive REST session at all, only the
+  holder of that token's own secret (or an equally-tiered session) could.
+  This was backwards precisely when the token's secret is the thing under
+  suspicion, which is the main reason anyone rotates. The decision: a
+  caller presenting empty `""`/`""` — no standing tier/scope authority at
+  all — may now rotate/confirm ANY of its own tokens regardless of that
+  token's tier/scope (`caller_may_act_on_tiered_token`,
+  `api_token_store.cpp`). This is deliberately a single special case, never
+  a general "no broader than" ordering: such a caller already holds a
+  strict superset of what any tiered/scoped token can do, and the
+  successor still inherits the TOKEN's own narrower tier/scope verbatim,
+  never the caller's, so nothing is escalated. A caller holding SOME
+  non-empty tier/scope still refuses on exact equality against a
+  DIFFERENT one — no lattice comparison was introduced. See
   `docs/user-manual/authentication.md` "Rotating a Token" for the
-  operator-facing statement of both points, and
-  `docs/user-manual/rest-api.md`'s rotate/confirm error matrices for the
-  wire-level `400` row this adds. The `"no such token to rotate"`/`"...to
-  confirm"` wording is identical for this case and for absent/not-owned
-  by design (not an authority-probing oracle) — it is therefore misleading
-  for a token that exists and is genuinely the caller's own; this is
-  recorded, not changed, since disambiguating the wording would reopen the
-  oracle it exists to close.
+  operator-facing statement, and `docs/user-manual/rest-api.md`'s
+  rotate/confirm error matrices for the wire-level behavior. The
+  `"no such token to rotate"`/`"...to confirm"` wording stays identical
+  for absent/not-owned/genuinely-mismatched-tier and is still not an
+  authority-probing oracle — it no longer needs to also cover the
+  full-authority-caller case, since that case now succeeds instead of
+  being folded into the same denial.
+- **A token within 24h of its own expiry cannot be rotated — by design, not
+  a gap, decided explicitly by #2963.** The overlap window has a 24h floor
+  (`kOverlapFloorSecs`, `api_token_store.cpp`) and rotation is deliberately
+  lifetime-neutral (the successor inherits the predecessor's `expires_at`
+  verbatim, per the bullet above) — so `now + overlap_secs` cannot be made
+  to fit inside a window shorter than 24h without either extending the
+  token's lifetime or shrinking the overlap floor, and neither is
+  acceptable: the floor exists so both the old and new secrets are
+  verifiably live long enough for a controlled cutover. The store already
+  refuses this case with a specific, non-generic error
+  (`"overlap window would exceed the predecessor credential's expiry"`),
+  and #2963 confirms that message is the intended terminal answer, not a
+  bug to patch — rotation is not a renewal mechanism. The path for a token
+  nearing expiry is to mint a fresh one via `POST /api/v1/tokens` before
+  the old one lapses, exactly as for a caller wanting a longer-lived
+  replacement (the bullet above). No code change; this bullet exists so
+  the boundary is stated plainly instead of only discoverable from the
+  error text.
+- **A non-admin rotation caught mid-flight by an RBAC-off→on toggle can strand
+  at `confirm`, and can require MANUAL operator resolution, not merely a
+  delay — corrected 2026-09-17 after PR #4470 review, governance Gate 4 UP-6
+  originally understated this.** `ApiToken:Rotate` is granted only to
+  `Administrator`/`ApiTokenManager` under RBAC-on (`rbac_store.cpp`'s seed
+  data) — before #2963 only an admin could start a self-service rotation at
+  all, so this toggle race could only ever strand an admin, who already
+  holds the RBAC-on grant and is unaffected. Now a non-admin owner can start
+  one under the RBAC-off legacy allowlist; if an operator enables RBAC
+  before that caller confirms, `confirm` hits the RBAC-enforced branch and
+  403s for a non-admin role lacking the grant. **Whether this self-heals
+  depends entirely on whether the successor secret is ever actually
+  presented for authentication** — the background sweep's eligibility
+  predicate (`kRotationEligiblePredicate`, `api_token_store.cpp`) requires
+  the successor's `last_used_at <> 0`, which `confirm` never sets and which
+  only a real authenticated request using the new secret sets. A caller
+  whose automation is still waiting on a successful `confirm` signal before
+  switching to the new secret — precisely the shape of this stranded case —
+  may never present it, in which case the pair is **PERMANENTLY ineligible**
+  for the sweep (the same "dropped/lost secret" case documented above for an
+  ordinary rotation, not a special one), and requires an operator to revoke
+  one of the two credentials manually; it does not resolve on any documented
+  timescale on its own. There is no admin-override confirm path
+  (rotate-as-admin/confirm-as-admin is deliberately not offered, per the
+  identity-takeover rationale above). Accepted, not fixed, by this decision:
+  enabling RBAC mid-flight against in-progress self-service rotations is an
+  operator action outside this feature's scope to guard against, but the
+  operator-facing guidance must state the manual-resolution possibility
+  plainly rather than imply automatic recovery.
 - **Known residual gaps, tracked, not fixed by this capability:** three
   pre-existing issues were surfaced while building this feature and filed
   rather than folded in silently — `#2943` (a confirm-path fallthrough
@@ -3641,10 +3733,11 @@ persistent signer outage), the agent bounds its retries and gives up
 auto-provisioning for that run rather than looping.
 
 **Agent CA pinning is fail-closed (#1303).** When the agent has TLS on but no CA
-to pin — no `--ca-cert` **and** no install CA auto-discovered at the standard
-shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows) — it
-**refuses to connect** rather than silently falling back to the system trust
-store. An empty root set makes gRPC verify against the OS roots, which do **not**
+to pin — no `--ca-cert` **and** no install CA auto-discovered at any standard
+shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows, or
+`~/Library/Application Support/Yuzu/certs/default-ca.pem` for a non-root agent
+on macOS) — it **refuses to connect** rather than silently falling back to the
+system trust store. An empty root set makes gRPC verify against the OS roots, which do **not**
 trust a Yuzu self-signed install CA, so with the gateway one-way-TLS edge live any
 publicly-trusted impostor cert for the dial host would be accepted — a fail-open
 MITM on the command fan-out plane. The deliberate escape hatch is
@@ -3821,9 +3914,17 @@ cleared.
 
 To keep a momentary blip from becoming a console lockout, the **login-decision
 reads** `mfa_status` and `load_mfa_row` retry the acquire within a small bounded
-budget (`acquire_with_retry` in `auth_db.cpp`: the first acquire keeps its full
-`kReadTimeout` budget, then up to `kAcquireRetries` short retries — worst-case
-≈600 ms extra). `mfa_status` is the exact call #2396 names as denying **all**
+budget (`acquire_with_retry` in `auth_db.cpp`: the first acquire is attempted with
+`kReadTimeout` (1500 ms), then up to `kAcquireRetries` short retries; worst-case
+≈600 ms extra on top of the first attempt). **Since #2146 A2-R1 Gate 8's
+fast-fail-on-saturation clamp landed at the shared `PgPool` chokepoint
+(`pg_pool.hpp`'s `Options::saturated_fast_fail`, ADR-0012's 2026-09-20 Update),
+the first acquire no longer necessarily gets its full `kReadTimeout` budget: if
+the pool is already saturated at that instant, the wait is clamped to `min(1500
+ms, 500 ms)` = 500 ms instead. This makes the worst case FASTER under
+saturation (≈1100 ms total instead of ≈2100 ms), not slower; the `150 ms`
+`kAcquireRetryTimeout` retry leg was already below the 500 ms clamp and stays
+unaffected.** `mfa_status` is the exact call #2396 names as denying **all**
 logins: it `503`s a legitimate, correct-password login on a blip. This **never
 weakens fail-closed**: only the *acquire* is retried (a query that ran and
 errored is not retried — it will not self-heal in milliseconds), and on budget

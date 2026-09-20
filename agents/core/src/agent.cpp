@@ -40,19 +40,23 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
 #include "sync_source_device_ci.hpp"          // ADR-0016 device-CI inventory source
 #include "sync_source_software_licensing.hpp" // SLE (ADR-0024) software_licensing source
+#include "sync_source_app_usage.hpp"          // Wave 7 PR7.2 app_usage (last_used) source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
+#include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
@@ -387,8 +391,9 @@ private:
 // single local RAII variable, never copied or moved out of its declaring
 // scope, so the double-fire the deletion would guard against cannot
 // occur. Same reasoning, and the same corrected justification, apply to
-// the byte-identical sibling in `server/core/src/api_token_store.cpp`;
-// keep both aggregate, not just this one.
+// the byte-identical siblings in `server/core/src/api_token_store.cpp`
+// and `agents/core/src/spark_engine.cpp` (#2050) — keep all three
+// aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
@@ -1499,8 +1504,17 @@ public:
                     if (!cfg_.tls_allow_system_trust) {
                         spdlog::error(
                             "TLS is enabled but no CA could be pinned: --ca-cert was not given "
-                            "and no install CA was found at the standard path "
-                            "(/etc/yuzu/certs/default-ca.pem). Refusing to connect with the "
+                            "and no install CA was found at the standard path(s) "
+#ifdef _WIN32
+                            "(C:/ProgramData/Yuzu/certs/default-ca.pem). "
+#elif defined(__APPLE__)
+                            "(/etc/yuzu/certs/default-ca.pem, plus "
+                            "~/Library/Application Support/Yuzu/certs/default-ca.pem for a "
+                            "non-root agent). "
+#else
+                            "(/etc/yuzu/certs/default-ca.pem). "
+#endif
+                            "Refusing to connect with the "
                             "SYSTEM trust store, which does NOT trust a Yuzu self-signed install "
                             "CA — that would be a fail-open MITM posture. Fix one of: provide "
                             "--ca-cert; ensure the install CA exists at that path; pass "
@@ -2111,6 +2125,9 @@ public:
                     const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
                     // SLE (ADR-0024): the software_licensing source's backing plugin.
                     const YuzuPluginDescriptor* license_descriptor = nullptr;
+                    // Wave 7 PR7.2: the app_usage source's backing plugin (last-used
+                    // state, read-only over TAR's usage_daily fold).
+                    const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         if (pname == "installed_apps")
@@ -2127,6 +2144,8 @@ public:
                             netcfg_descriptor = handle.descriptor();
                         else if (pname == "license_scan")
                             license_descriptor = handle.descriptor();
+                        else if (pname == "app_usage")
+                            app_usage_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
@@ -2135,13 +2154,14 @@ public:
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
                                      "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
                                      "pushed (sources: installed_software, app_perf, device_ci, "
-                                     "software_licensing)");
+                                     "software_licensing, app_usage)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
                                                 netcfg_descriptor, license_descriptor,
+                                                app_usage_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -2195,8 +2215,16 @@ public:
                                 need.push_back(n);
                             return need;
                         };
-                        SyncScheduler scheduler(cfg_.agent_id, kv_get, kv_set, sender);
-                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        auto scheduler_ptr =
+                            std::make_shared<SyncScheduler>(cfg_.agent_id, kv_get, kv_set, sender);
+                        SyncScheduler& scheduler = *scheduler_ptr;
+                        // Clear the sync-on-demand handle on EVERY exit of this thread
+                        // (normal stop, or a throw out of tick()) so the command loop
+                        // never arms a scheduler whose thread is gone.
+                        ScopeExit clear_sync_handle{[this]() {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_.reset();
+                        }};
                         // DEX app-perf-over-time B1. Rides the same daily-sync thread +
                         // transport; collection is further gated by procperf_enabled (an
                         // empty rollup → the source skips the cycle) and the TAR plugin
@@ -2231,8 +2259,33 @@ public:
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));
                         }
-                        spdlog::info("Daily-sync thread started (sources=4: installed_software, "
-                                     "app_perf, device_ci, software_licensing)");
+                        // Wave 7 PR7.2: per-executable last-used state, derived from TAR's
+                        // usage_daily fold via the read-only app_usage plugin. Idles when
+                        // the app_usage plugin isn't loaded (null descriptor) or TAR's usage
+                        // source is disabled (constrained capture — skipped, not idled).
+                        // Registered here (before installed_software) rather than last: it's
+                        // a fast, local SQLite read, not the slow collector the reorder below
+                        // exists to deprioritize.
+                        scheduler.add_source(make_app_usage_source(app_usage_descriptor));
+                        // Registers LAST (round-3 item 4 / sync-speed fix): SyncScheduler's
+                        // per-forced-source immediate-RPC pass (tick()) processes forced
+                        // indices in ascending registration order, so when the header's
+                        // "Sync now" forces every source at once (kAllSources), the faster
+                        // collectors above report back to the server before this one's —
+                        // installed_software's macOS leg alone can take several seconds
+                        // (system_profiler + per-package pkgutil spawns) — even starts.
+                        // Registration order carries NO persisted meaning (KV keys and
+                        // request_now()'s name match are both name-keyed, per
+                        // sync_scheduler.hpp's own contract), so this reorder is safe.
+                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        // Publish AFTER the last add_source: request_now() reads sources_
+                        // without the mutex on the append-only-before-publication contract.
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_ = scheduler_ptr;
+                        }
+                        spdlog::info("Daily-sync thread started (sources=5: installed_software, "
+                                     "app_perf, device_ci, software_licensing, app_usage)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())
@@ -2240,6 +2293,11 @@ public:
                             auto sleep = scheduler.tick(now_secs);
                             auto remaining = sleep;
                             while (remaining.count() > 0 && !should_stop()) {
+                                // __sync__.now: re-tick immediately; the drain at the top of
+                                // tick() fires the requested source(s). Checked before the
+                                // first sleep so a request landing mid-tick is not lost.
+                                if (sync_wake_.exchange(false, std::memory_order_acq_rel))
+                                    break;
                                 auto step = std::min(remaining, std::chrono::seconds{2});
                                 std::this_thread::sleep_for(step);
                                 remaining -= step;
@@ -2380,13 +2438,17 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
-                                tags["yuzu.guardian_generation"] =
-                                    std::to_string(guardian_->policy_generation());
                                 // Drive durable lifecycle-journal maintenance on the
                                 // heartbeat cadence: retry any persist a prior write left
                                 // pending, so a failed write self-heals with no new push /
-                                // reconnect (item 7 PR-Ag; inert unless prefer_spark).
+                                // reconnect (item 7 PR-Ag; inert unless prefer_spark). rung
+                                // 9c PR-2 Unit 6: this is now ALSO the ack-bookkeeping drain
+                                // (§R5.3) - called BEFORE the generation tag is read below so
+                                // an acknowledgment this tick produces is visible on THIS
+                                // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                                tags["yuzu.guardian_generation"] =
+                                    std::to_string(guardian_->policy_generation());
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
@@ -2398,6 +2460,24 @@ public:
                                 // (prefer_spark off / worker not started), not a zero - so an
                                 // inert journal still adds no tags here.
                                 emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
+                                // rung 9c PR-3: ack-ledger re-statable gauges
+                                // (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed).
+                                // Dormancy is guardian_->arm_stats() returning nullopt:
+                                // prefer_spark_ off, the engine stopped, Spark itself
+                                // unavailable (Unwired/SparkFailed/SparkDisabled), or no
+                                // current application yet - see GuardianEngine::arm_stats()'s
+                                // own doc comment for why that four-way gate cannot be
+                                // inferred from the ledger alone.
+                                // A live application emits both tags including a genuine
+                                // zero, mirroring the journal age-gauge pair above.
+                                emit_guardian_arm_heartbeat_tags(tags, guardian_->arm_stats());
+                                // rung 9c PR-3 (Decision 3, Option B): R5.1's physical-
+                                // ceiling refusal count, a plain sparse monitor-only
+                                // counter (0 omits the tag) - not gated on prefer_spark_,
+                                // a zero count is equally truthful whether spark is
+                                // dormant or has simply never hit the ceiling.
+                                emit_guardian_io_ceiling_heartbeat_tags(
+                                    tags, guardian_->io_ceiling_rejections());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted, each suppressed repeat is counted (unhealthy_
                                 // suppressed), and each errored_refresh_ms-cadence re-emission is
@@ -3009,6 +3089,57 @@ public:
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
                             .increment();
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(resp, grpc::WriteOptions());
+                        continue;
+                    }
+
+                    // Reserved-name dispatch #2: `__sync__.now` — operator-triggered
+                    // sync-on-demand (ADR-0016 update). Arms the daily-sync scheduler
+                    // to run one source (or all) in its next pass and breaks its
+                    // sleep, so the report lands in seconds instead of ≤24h. Unlike
+                    // __guard__ this command IS dedup-claimed (the claim above exempts
+                    // only the literal "__guard__"), so its terminal MUST be recorded
+                    // before the write or a server re-send answers RUNNING forever.
+                    if (cmd.plugin() == "__sync__") {
+                        pb::CommandResponse resp;
+                        resp.set_command_id(cmd.command_id());
+                        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                        resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
+                        std::string source{SyncScheduler::kAllSources};
+                        if (auto it = cmd.parameters().find("source");
+                            it != cmd.parameters().end() && !it->second.empty())
+                            source = it->second;
+                        std::shared_ptr<SyncScheduler> sched;
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sched = sync_scheduler_;
+                        }
+                        // Decision logic (unknown action / no scheduler / unknown
+                        // source / success) lives in sync_now_decision.hpp — a pure
+                        // free function unit-tested without gRPC or a live command
+                        // loop (tests/unit/test_agent_sync_command.cpp). Everything
+                        // else about this command (the metrics counter below,
+                        // record_command_terminal-before-write, the stream->Write)
+                        // stays here, unchanged.
+                        auto decision = decide_sync_now(cmd.action(), source, cfg_.inventory_disable,
+                                                         sched.get());
+                        resp.set_status(decision.status == SyncNowDecision::Status::Success
+                                             ? pb::CommandResponse::SUCCESS
+                                             : pb::CommandResponse::FAILURE);
+                        resp.set_exit_code(decision.exit_code);
+                        resp.set_output(std::move(decision.output));
+                        if (decision.status == SyncNowDecision::Status::Success)
+                            sync_wake_.store(true, std::memory_order_release);
+                        resp.set_plugin("__sync__");
+                        resp.set_action(cmd.action());
+                        metrics_
+                            .counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", "__sync__"}})
+                            .increment();
+                        record_command_terminal(cmd.command_id(), resp);
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -3891,6 +4022,14 @@ private:
 
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    // Sync-on-demand (`__sync__.now`, ADR-0016 update): the command read loop
+    // arms the scheduler through this handle and breaks the sync thread's sleep.
+    // sync_scheduler_ is null under --inventory-disable and between connections
+    // (published by the 4b-sync thread after its sources are registered, cleared
+    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    std::atomic<bool> sync_wake_{false};
+    std::mutex sync_sched_mu_;
+    std::shared_ptr<SyncScheduler> sync_scheduler_;
     std::atomic<bool> keepalive_stop_{false}; // CHAOS-TTL-1 keepalive thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
     // Register resets the normal reconnect backoff, so a server that reaps every

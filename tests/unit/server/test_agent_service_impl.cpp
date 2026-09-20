@@ -33,6 +33,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent_registry.hpp"
+#include "app_usage_store.hpp"
 #include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -45,6 +46,7 @@
 #include "response_store.hpp"
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
+#include "typed_inventory_sources.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -1241,6 +1243,156 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     CHECK(custom_row->has_value()); // generic source still works
 }
 
+namespace {
+// Pre-migrated template covering both stores the app_usage composition tests
+// below need: the generic InventoryStore (mixed-version parity check) and
+// the typed AppUsageStore (Wave 7 PR7.2).
+yuzu::test::PgTestTemplate app_usage_composition_tpl{
+    "agent_svc_app_usage", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::InventoryStore inv_store{pool};
+        yuzu::server::AppUsageStore usage_store{pool};
+        if (!inv_store.is_open() || !usage_store.is_open())
+            throw std::runtime_error("agent_svc_app_usage template: a store failed to migrate");
+    }};
+
+// One `lu|`-kind app_usage wire blob (records 0x1E-joined, fields 0x1F-joined,
+// kind in field 0) carrying a single executable row — mirrors
+// app_usage_ingestion.cpp's parse_app_usage_blob contract exactly.
+std::string make_app_usage_blob(const std::string& exe_key) {
+    // Adjacent string literals ("\x1f" "1000") deliberately split the hex
+    // escape from the following digits — \x consumes every following hex
+    // digit greedily, so "\x1f1000" would try to parse "1f1000" as one
+    // (out-of-range) hex escape.
+    return "lu\x1f" + exe_key + "\x1f" "1000" "\x1f" "2000" "\x1f" "5" "\x1f" "600";
+}
+} // namespace
+
+TEST_CASE("ReportInventory (direct): reaches ingest_app_usage_report and persists rows",
+          "[pg][agent_service][app_usage]") {
+    using yuzu::server::AppUsageStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    h.svc.set_app_usage_store(&usage);
+
+    auto raw = h.auth_mgr.create_enrollment_token("t1", /*max_uses=*/1, std::chrono::hours(1));
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-usage");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+    apb::RegisterResponse resp;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+    REQUIRE(resp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(resp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("chrome.exe");
+    apb::InventoryAck ack;
+    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(ack.received());
+    // A successful full-replace never nacks.
+    CHECK(std::find(ack.need_full().begin(), ack.need_full().end(), "app_usage") ==
+          ack.need_full().end());
+
+    auto rows = usage.get_agent_last_used("agent-direct-usage");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].exe_key == "chrome.exe");
+}
+
+TEST_CASE("ProxyInventory (gateway): reaches ingest_app_usage_report and persists rows",
+          "[pg][agent_service][gateway][app_usage]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::AppUsageStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    gateway_svc.set_app_usage_store(&usage);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-usage", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("notepad.exe");
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(std::find(ack.need_full().begin(), ack.need_full().end(), "app_usage") ==
+          ack.need_full().end());
+
+    auto rows = usage.get_agent_last_used("agent-gw-usage");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].exe_key == "notepad.exe");
+}
+
+TEST_CASE("ProxyInventory: app_usage is NOT double-stored into the generic InventoryStore "
+          "(mixed-version parity, adjudication P1)",
+          "[pg][agent_service][gateway][inventory][app_usage]") {
+    // A gateway-proxied report carrying an app_usage blob must leave the
+    // generic InventoryStore with NO app_usage row for that agent — the same
+    // H1 parity/leak-prevention shape as the device_ci and software_licensing
+    // cases above, extended to the newest typed source.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::AppUsageStore;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    InventoryStore inv{pool}; // the generic blob store (read on Infrastructure:Read)
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    gateway_svc.set_app_usage_store(&usage);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-usage-mixed", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("firefox.exe"); // typed
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";                    // generic
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+
+    // The typed seam WAS reached (the store has the row)...
+    auto rows = usage.get_agent_last_used("agent-gw-usage-mixed");
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == 1);
+    // ...but the generic store never sees it.
+    auto usage_row = inv.get("agent-gw-usage-mixed", "app_usage");
+    REQUIRE(usage_row.has_value());      // not degraded
+    CHECK_FALSE(usage_row->has_value()); // not double-stored
+    auto custom_row = inv.get("agent-gw-usage-mixed", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic source still works
+}
+
 TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writes",
           "[pg][agent_service][gateway][inventory][security]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
@@ -1277,6 +1429,120 @@ TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writ
               .counter("yuzu_inventory_ingest_total",
                        {{"source", "__report__"}, {"outcome", "rejected"}})
               .value() == 1.0);
+}
+
+TEST_CASE("ProxyInventory: a per-source blob nesting past kMcpMaxJsonDepth is rejected, a "
+          "healthy sibling source in the same report still stores (#2437-class write-side guard)",
+          "[pg][agent_service][gateway][inventory][security]") {
+    // Regression for the #2437-class generic InventoryStore write-side guard:
+    // ProxyInventory's generic per-source loop is the ONLY call site of
+    // InventoryStore::upsert in the tree, and each blob is raw wire bytes off
+    // an agent with no prior validation. A blob nesting past kMcpMaxJsonDepth
+    // must be rejected (skipped) BEFORE it ever reaches upsert - dump() on a
+    // too-deep stored value is unboundedly recursive and would SIGSEGV the
+    // whole process on a later read. A poisoned source must not affect any
+    // OTHER healthy source in the same report.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-depth", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    // Reachability-proxy depth (35 > kMcpMaxJsonDepth's 32) - never the real
+    // ~100,000-level attack depth in a test.
+    const std::string poisoned = std::string(35, '[') + std::string(35, ']');
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_plugin_data())["poisoned_source"] = poisoned;
+    (*rpt.mutable_plugin_data())["healthy_source"] = R"({"k":1})";
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(ack.received()); // overall report still acked
+
+    auto poisoned_row = inv.get("agent-gw-depth", "poisoned_source");
+    REQUIRE(poisoned_row.has_value()); // not degraded
+    CHECK_FALSE(poisoned_row->has_value()); // rejected, never stored
+
+    auto healthy_row = inv.get("agent-gw-depth", "healthy_source");
+    REQUIRE(healthy_row.has_value());
+    REQUIRE(healthy_row->has_value());
+    CHECK((*healthy_row)->data_json == R"({"k":1})"); // healthy sibling stored correctly
+
+    // Fixed sentinel, never the raw plugin_name: that name is caller-supplied
+    // for the generic source family, so labeling on it would let one agent
+    // mint unbounded metric series (see the next TEST_CASE). outcome is its
+    // OWN "rejected_depth" value, distinct from the whole-report-cap
+    // "rejected" outcome (inventory_ingestion.cpp), so this per-blob
+    // rejection does not page the YuzuInventoryReportRejected alert's
+    // source-map-cap runbook.
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
+              .value() == 1.0);
+    // Adversarial-review finding: a per-blob depth rejection must NOT also
+    // increment the whole-report-cap outcome, or the YuzuInventoryReportRejected
+    // alert (which sums ALL outcome="rejected" series) fires with the wrong
+    // runbook for a single over-depth blob that never came close to the
+    // report's 64-source cap.
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__generic__"}, {"outcome", "rejected"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("ProxyInventory: rejecting over-depth blobs under many distinct caller-chosen source "
+          "names stays on ONE bounded metric series, not one per name (#2437-class cardinality)",
+          "[pg][agent_service][gateway][inventory][security]") {
+    // Gate 8 fix: an earlier version of the write-side guard used the raw,
+    // agent-supplied plugin_name as the metric label - an authenticated agent
+    // could mint an unbounded number of retained series just by resubmitting
+    // an over-depth blob under a different made-up source name each time.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-depth-2", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    const std::string poisoned = std::string(35, '[') + std::string(35, ']');
+    for (int i = 0; i < 5; ++i) {
+        apb::InventoryReport rpt;
+        rpt.set_session_id(rresp.session_id());
+        (*rpt.mutable_plugin_data())["source_" + std::to_string(i)] = poisoned;
+        apb::InventoryAck ack;
+        REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    }
+
+    // Five distinct source names, all rejected: if the fix still labeled on
+    // the raw name, each would land in its own series and this would read 1,
+    // not 5. Reading 5 is only possible if all five collapsed onto the SAME
+    // bounded sentinel series.
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
+              .value() == 5.0);
 }
 
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",
@@ -2693,4 +2959,17 @@ TEST_CASE("Webhook/offload delivery counters: all 6 pre-seeded to 0 at boot",
     for (const char* name : names) {
         CHECK(reg.counter(name).value() == 0.0);
     }
+}
+
+TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",
+          "[server][inventory][typed]") {
+    // Pins the byte-identical hunk this package and ws-7b2's p2.2 both add to
+    // typed_inventory_sources.hpp — a distinct TEST_CASE name from ws-7b2's
+    // own gateway-composition case so both survive the trivial merge when
+    // the second of the two lands.
+    CHECK(yuzu::server::is_typed_inventory_source("app_usage"));
+    CHECK(yuzu::server::is_typed_inventory_source("installed_software"));
+    CHECK(yuzu::server::is_typed_inventory_source("app_perf"));
+    CHECK(yuzu::server::is_typed_inventory_source("device_ci"));
+    CHECK(yuzu::server::is_typed_inventory_source("software_licensing"));
 }

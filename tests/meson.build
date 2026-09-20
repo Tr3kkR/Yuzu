@@ -74,9 +74,14 @@ invalid_name_fixture_plugin = shared_library(
 )
 
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
-# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
-# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
-# itself. Darwin-only; empty elsewhere.
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors.
+# agent-core links IOKit (a hard dependency, C0) and Security/CoreFoundation (A0's optional
+# probe) itself (agents/core/meson.build's darwin arm), but the test exe still pulls its own copy here: yuzu_agent_core_dep
+# (the declare_dependency() this exe consumes) declares no `dependencies:` kwarg at
+# all, so agent_platform_deps (IOKit/CoreFoundation/Security/ES) never propagates to
+# a consumer regardless of configuration -- not an AppleFrameworks -isystem quirk
+# (dependency('appleframeworks', ...) never emits -isystem args in the first place).
+# This stays a direct probe. Darwin-only; empty elsewhere.
 agent_test_native_deps = []
 agent_test_native_args = []
 if host_machine.system() == 'darwin'
@@ -92,6 +97,11 @@ if host_machine.system() == 'darwin'
     agent_test_native_deps += agent_test_security_dep
     agent_test_native_args += ['-DYUZU_HAVE_SECURITY_FRAMEWORK']
   endif
+  # Endpoint Security (A0): shared top-level probe, so a darwin test TU that
+  # includes agent-core's ES-dependent headers (es_client.hpp today; a full
+  # shared ES client in a later slice) compiles the same way core itself does.
+  agent_test_native_deps += endpoint_security_deps
+  agent_test_native_args += endpoint_security_args
 elif host_machine.system() == 'windows'
   # test_icmp_probe.cpp (Wave 2 WP-0): ws2_32 for WSAStartup/getaddrinfo/
   # htons, iphlpapi for IcmpCreateFile/IcmpCloseHandle -- icmp_probe.hpp's
@@ -255,6 +265,7 @@ agent_test_exe = executable(
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_arm_heartbeat.cpp', # rung 9c PR-3
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
@@ -268,6 +279,7 @@ agent_test_exe = executable(
     'unit/test_dex_perf_breach.cpp',
     'unit/test_net_quality_sampler.cpp',
     'unit/test_dex_linux_proc.cpp',
+    'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
@@ -288,6 +300,7 @@ agent_test_exe = executable(
     'unit/test_guardian_rule_eval.cpp',
     'unit/test_guardian_drift_event.cpp',
     'unit/test_guardian_scope_guard.cpp',
+    'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',
@@ -297,6 +310,7 @@ agent_test_exe = executable(
     'unit/test_guardian_outbox_send_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
+    'unit/test_guardian_arm_ack.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
@@ -307,9 +321,13 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
+                                          # from agent.cpp's __sync__.now reserved-command branch
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
+    'unit/test_launchctl_list.cpp',     # A0: shared launchctl-list row parser (agents/shared/launchctl_list.hpp)
+    'unit/test_launchd_state.cpp',      # A0 fix round: launchd_state_for (yuzu/agent/launchd_state.hpp)
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
@@ -328,14 +346,21 @@ agent_test_exe = executable(
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
+    'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
+    'unit/test_certificates_linux_store.cpp',  # WS-A a1: real syscall-level delete against a TempDir (certificates_linux_store.hpp; POSIX-guarded, runs on macOS too)
+    'unit/test_certificates_macos_actions.cpp',  # WS-B: action-level LocalDispatcher tests for the SecItem
+                                                  # sentinel + console-owner recheck orchestration (#4374 fix
+                                                  # shape 2 + 3); __APPLE__-guarded, empty TU elsewhere.
     'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
                                           # argv-izing the login-keychain read introduced.
+    'unit/test_keychain_read.cpp',        # #3246: bounded SecItem keychain read (agent-core seam); never-returning-read case is the regression test
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_es_client.cpp',                # A0: pure ES helpers relocated from tar_proc_es.cpp (yuzu/agent/es_client.hpp)
     'unit/test_native_raii.cpp',              # PR1.3: ScopedCFRef/ScopedIOObject/ScopedFd RAII
     'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
@@ -445,6 +470,9 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
+                                                # parser against a real captured fixture (macOS-only;
+                                                # a no-op TU elsewhere)
     'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
                                                 # pure winget/apt/yum/softwareupdate/dpkg-query parsers
     'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll
@@ -461,6 +489,10 @@ agent_test_exe = executable(
                                                 # driven end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
+    'unit/test_windows_optional_features_parsers.cpp',           # Wave 9 PR9.2a: DismSlot CAS state machine +
+                                                # row/parameter parsers (agents/shared, agent-core primitive)
+    'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
+                                                # dylib/.so/.dll driven end to end via LocalDispatcher
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -470,8 +502,23 @@ agent_test_exe = executable(
     'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
     'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
     'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
+    'unit/test_peripherals_parsers.cpp',           # Wave 9 PR9.1a: pure row formatters/hex helpers, fixture-driven
+    'unit/test_peripherals_local_dispatcher.cpp',  # Wave 9 PR9.1a: real peripherals dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_peripherals_linux_parsers.cpp',     # Wave 9 PR9.1a: pure sysfs walk/attr parsers over a committed fixture tree
+    'unit/test_peripherals_macos_parsers.cpp',     # Wave 9 PR9.1a: pure IOKit OSData decoders over this-Mac REAL CAPTURE fixtures
+    'unit/test_peripherals_win_parsers.cpp',       # Wave 9 PR9.1a2: pure SetupAPI hardware-id parsers over the-rig REAL CAPTURE fixtures
+    'unit/test_app_usage_parsers.cpp',           # Wave 7b PR7b.3: pure sqlite seam, :memory: db seeded from the REAL CAPTURE export
+    'unit/test_app_usage_local_dispatcher.cpp',  # Wave 7b PR7b.3: real plugin via LocalDispatcher, unguarded on every OS; seeded via StandalonePluginContext
+    'unit/test_sync_source_app_usage.cpp',       # Wave 7b PR7b.3: app_usage daily-sync source
+    'unit/test_execution_artifacts_parsers.cpp',   # Wave 7b PR7b.1: pure binary parsers over REAL CAPTURE fixtures + mutation fuzz
+    'unit/test_execution_artifacts_local_dispatcher.cpp',  # Wave 7b PR7b.1: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
+    'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
+    'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
+    'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
+    'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -480,8 +527,13 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
+    include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
+    include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
+    include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
+    include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -528,7 +580,11 @@ agent_test_exe = executable(
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
              '"',
              # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
-             # REQUIRE(exists), never skip.
+             # REQUIRE(exists), never skip. Wave 9 PR9.2a: test_windows_optional_features_parsers.cpp
+             # reads the-rig REAL CAPTURE fixtures via this same define. Wave 9 PR9.1a:
+             # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
+             # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
+             # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -593,6 +649,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                certificates_plugin_lib,
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
                 device_identity_plugin_lib,
@@ -618,7 +675,12 @@ agent_test_exe = executable(
                 wifi_plugin_lib,
                 power_health_plugin_lib,
                 autoruns_plugin_lib,  # Wave 7 PR7.1
+                app_usage_plugin_lib,  # Wave 7b PR7b.3
+                execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
+                windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
+                peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
+                printing_plugin_lib,  # Wave 9 PR9.1b
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -825,17 +887,16 @@ elif host_machine.system() == 'linux'
   endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
-  # audit-token helpers, gated on the framework being present (full Xcode SDK).
+  # audit-token helpers, gated on the ES SDK being present (lib+header pair,
+  # present in both the Command Line Tools SDK and the full Xcode SDK --
+  # "needs full Xcode" is a myth, see docs/darwin-compat.md's ES row).
   # The live client never starts in CI (unentitled) so the pure-mapping + clean-
-  # fallback tests run regardless; the ES TU only links the framework where it
-  # exists. Mirror the plugin's capability detection (docs/darwin-compat.md).
-  es_test_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
-  if es_test_dep.found()
-    tar_test_deps += es_test_dep
-    tar_test_deps += cxx.find_library('bsm')
-    # -fblocks required for the ES block literal in tar_proc_es.cpp (see plugin meson).
-    tar_test_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
-  endif
+  # fallback tests run regardless. Threads the SHARED top-level probe
+  # (meson.build's endpoint_security_dep/_deps/_args) through -- governance
+  # A0 fix round: a second, independent ES probe here duplicated the single
+  # top-level one this exe otherwise shares with agent-core and TAR.
+  tar_test_deps += endpoint_security_deps
+  tar_test_cpp_args += endpoint_security_args
   # Wave 6 PR6.3: test_tar_removable.cpp calls make_removable_cursor_source(), so
   # this exe compiles the removable collector — which on darwin needs its
   # DiskArbitration Objective-C++ TU and framework, exactly as the plugin does.
@@ -977,6 +1038,7 @@ if build_server
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_helper.cpp',
+      'unit/server/test_rest_scope_v1_routes.cpp', # #2146 Batch B2: POST /api/v1/scope/validate + /preview
       'unit/server/test_tag_store.cpp',
       'unit/server/test_tag_routes.cpp', # #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
       'unit/server/test_scope_engine.cpp',
@@ -986,6 +1048,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
@@ -1017,6 +1080,7 @@ if build_server
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
+      'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
 
       'unit/server/test_execution_event_bus.cpp',
@@ -1112,6 +1176,10 @@ if build_server
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
+      'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
+      'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
+      'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
@@ -1127,8 +1195,12 @@ if build_server
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
+      'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
+      'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
+      'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
+      'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -1196,6 +1268,7 @@ if build_server
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
+      'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
@@ -1258,6 +1331,9 @@ if build_server
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
+      'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
+      'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
+      'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
@@ -1283,9 +1359,11 @@ if build_server
       # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
       # spark_heartbeat.hpp (emit_spark_heartbeat_tags),
       # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
-      # (emit_guardian_journal_heartbeat_tags), and test_guardian_health_fleet_tags.cpp
+      # (emit_guardian_journal_heartbeat_tags), test_guardian_health_fleet_tags.cpp
       # includes guardian_health_heartbeat.hpp (emit_guardian_health_heartbeat_tags,
-      # #2298 gate 3 item 6d) - each asserting the agent's actual emitted keys equal the
+      # #2298 gate 3 item 6d), and test_guardian_arm_fleet_tags.cpp (rung 9c PR-3)
+      # includes guardian_arm_heartbeat.hpp + guardian_io_ceiling_heartbeat.hpp - each
+      # asserting the agent's actual emitted keys equal the
       # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
       # bind, no silent zero-reporting drift. Header-only templates - no link to
       # yuzu_agent_core, just the include path.
@@ -1348,6 +1426,21 @@ if build_server
                (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+    # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
+    # deliberately re-entrant tests (e.g. test_mcp_server.cpp's "duplicate id
+    # arriving MID-FLIGHT" SECTION, which calls back into the full streamed-POST
+    # handler stack from INSIDE a dispatch callback already on that same stack -
+    # two nested traversals of the JSON-RPC/session/stream-bridge/dispatch chain
+    # in one thread, in an unoptimized debug build). Growing this file's tool
+    # table (kTools[]) and test count over time has repeatedly pushed it closer
+    # to Windows-specific limits (see the C1128 COMDAT-section-count comment
+    # above) - a genuine EXCEPTION_STACK_OVERFLOW (0xC00000FD) here is a stack
+    # headroom problem, not a test-logic bug, so the fix is headroom, not
+    # touching the recursive test. 16 MiB is reserve only (Windows commits
+    # pages on demand), so this costs no real memory unless the recursion
+    # actually needs it. GCC/Clang are unaffected (larger default stacks,
+    # and no /STACK equivalent needed here).
+    link_args: (cxx.get_id() == 'msvc' ? ['/STACK:16777216'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here
@@ -2182,7 +2275,12 @@ test('plugin readme gate',
   _python3_test,
   args: [files('test_plugin_readmes.py')],
   suite: 'docs',
-  timeout: 60,
+  # Measured ~25-31s standalone; the self-hosted runner pools share one OS
+  # identity across 4 runner agents on one box (CLAUDE.md's documented
+  # shared-runner-under-load invariant), and this test was observed hitting
+  # the old 60s timeout under exactly that kind of concurrent docs-suite
+  # load on this session's own Mac (governance Gate 3, build-ci finding).
+  timeout: 120,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
@@ -2310,6 +2408,15 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+  # #4262: -Dbuild_examples=false must keep configuring a real build.
+  # Configure-only smoke test (no compile) so it stays cheap on every leg;
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  test('build_examples=false gating smoke test',
+    _bash_test,
+    args: [files('shell/test_build_examples_gating.sh')],
+    suite: 'docs',
+    timeout: 120,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -2330,20 +2437,18 @@ endif
 # to schedule it.
 #
 # CDX-P1-04/K-5: that "caught, not skipped" reasoning only holds when
-# capmatrix-gen SHOULD have been built. Under `-Dbuild_examples=false` (a
-# supported configuration, meson.build:508's `if build_agent and
-# build_examples`) the top-level build deliberately never builds
-# capmatrix-gen at all — there are no agents/plugins/*/ subdirs configured
-# for it to inspect — so this test's hard `[ -x "$CAPGEN" ]` requirement
-# would fail loudly for a configuration that is correct by design, not
-# broken. Gate registration on the SAME condition tools/capmatrix-gen's own
-# build is gated on (root meson.build: `if build_agent and build_examples`),
-# so `-Dbuild_agent=false` or `-Dbuild_examples=false` (with -Dbuild_tests=true)
-# both get a clean `meson test` rather than a false-red gate (gov-fix/build-ci:
-# the build_examples-only guard reproduced the same false-red class this PR
-# fixed under `-Dbuild_agent=false -Dbuild_tests=true`, since capmatrix-gen
-# lives under `if build_agent`).
-if _bash_test.found() and meson.can_run_host_binaries() and build_agent and build_examples
+# capmatrix-gen SHOULD have been built. Under `-Dbuild_agent=false` the
+# top-level build deliberately never builds capmatrix-gen at all — there is
+# no agent, no plugins, nothing for it to inspect — so this test's hard
+# `[ -x "$CAPGEN" ]` requirement would fail loudly for a configuration that
+# is correct by design, not broken. Gate registration on the SAME condition
+# tools/capmatrix-gen's own build is gated on (root meson.build: `if
+# build_agent`), so `-Dbuild_agent=false` (with -Dbuild_tests=true) gets a
+# clean `meson test` rather than a false-red gate. `build_examples` is
+# deliberately NOT part of this condition (#4262): every real plugin now
+# builds unconditionally under build_agent regardless of build_examples, so
+# capmatrix-gen always has something to inspect once build_agent is on.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],

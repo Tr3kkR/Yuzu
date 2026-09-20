@@ -1056,6 +1056,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
     "changelog": [
+      "changelog.d/20260916-hardware-sync-tags-actions-round2.added.md",
       "changelog.d/3216-svc-scope-gate-primitives-tagstore.fixed.md"
     ],
     "definitions": [

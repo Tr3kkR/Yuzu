@@ -406,6 +406,7 @@ yuzu_server_core_lib = static_library(
     'src/tag_store.cpp',
     'src/tag_routes.cpp',
     'src/scope_engine.cpp',
+    'src/scope_preview.cpp', # #2146 Batch B2: shared REST v1 + MCP scope-preview builder
     'src/yaml_scan.cpp',
     'src/scope_yaml.cpp',
     'src/analytics_event_store.cpp',
@@ -464,6 +465,7 @@ yuzu_server_core_lib = static_library(
     'src/result_set_store.cpp',
     'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
+    'src/result_set_model.cpp', # #2146 Batch B2: shared REST v1 + MCP builder
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',
@@ -488,10 +490,18 @@ yuzu_server_core_lib = static_library(
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
+    'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
     'src/compliance_routes.cpp',
+    'src/policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin — outside the seam)
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_read_model.cpp',
+    'src/execution_statistics_model.cpp', # #2146 Batch B3 -- shared REST+MCP builder (Rule 1)
+    'src/management_group_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
+    'src/api_token_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
+    'src/offload_target_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
+    'src/license_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
+    'src/software_deployment_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/dex_perf_model.cpp',
     'src/dex_app_perf_model.cpp',
     'src/dex_app_perf_ui.cpp',
@@ -500,12 +510,18 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
+    'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
     'src/device_ui.cpp',
     'src/group_agent_count_preview.cpp',
     'src/inventory_routes.cpp',
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
+    'src/hardware_list_model.cpp',
+    'src/hardware_routes.cpp',
+    'src/hardware_ui.cpp',
+    'src/hardware_actions_ui.cpp',
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
     'src/preflight_routes.cpp',
@@ -516,6 +532,7 @@ yuzu_server_core_lib = static_library(
     'src/verify_routes.cpp',
     'src/verify_ui.cpp',
     'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
+    'src/dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
     'src/deployment_run_store.cpp',
@@ -570,6 +587,10 @@ yuzu_server_core_lib = static_library(
     'src/product_registry_store.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
+    'src/app_usage_store.cpp',           # Wave 7b PR7b.2
+    'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
+    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
+    'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/agent_decommission.cpp',

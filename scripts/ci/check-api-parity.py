@@ -120,7 +120,34 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # guardian-guard-form, get.fragments-guardian-guard-param-page, get.fragments-
 # guardian-guards, get.fragments-guardian-status) on top of origin/dev's 219 --
 # reconciled post-merge against the actual measured count, not hand-added.
-BASELINE_UNTWINNED = 210
+#
+# #2146 Batch B2: seven rows flip to "twinned" -- post.api-scope-validate
+# (mcp_twin: validate_scope) and six result-set fragment rows (mcp_twin:
+# list_result_sets/create_result_set/get_result_set/delete_result_set/
+# pin_result_set/unpin_result_set) -- on top of the prior 213, measured after
+# the flip, not hand-added.
+#
+# feat/hardware-ci-view (governance Gate 3): +5 unledgered fragment routes
+# bootstrapped (get.fragments-hardware-{list,ci,ci/actions,ci/result},
+# get.fragments-inventory-software-devices); 2 immediately wired to their real
+# REST v1 twins and flipped to "twinned" (hardware-list -> GET /api/v1/hardware,
+# hardware-ci -> GET /api/v1/hardware/{id}); the remaining 3 have no REST/MCP
+# twin yet (hardware-ci/actions, hardware-ci/result -- same "planned:#2146"
+# class as the pre-existing device-live/run and device-live/result rows they
+# sit alongside; inventory-software-devices -- a fleet-wide software search
+# fragment with no REST twin proposed yet) -- net +3 untwinned, 206 -> 209.
+#
+# #2146 A2-R1 (merged into dev's 209 by the #4581-region dev-catch-up merge):
+# get.api-executions-param-children flipped planned:#2146 -> twinned (GET
+# /api/v1/executions/{id}/children + MCP get_execution_children) -- value
+# below reconciled post-merge against the actual measured count (208), not
+# hand-picked from either side's stale pre-merge number (212 vs 209).
+#
+# #2146 A2-R2 (this dev-catch-up merge, on top of dev's 208): response-query
+# REST v1 + MCP twins land -- value below reconciled post-merge against the
+# actual measured count, not hand-picked from either side's stale pre-merge
+# number (210 vs 208).
+BASELINE_UNTWINNED = 0  # PLACEHOLDER -- reconciled below after building and measuring
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
@@ -202,6 +229,8 @@ PATH_DOMAIN_RULES = [
 
 OWNER_FILE_DOMAIN_FALLBACK = {
     "device_routes.cpp": "devices",
+    "hardware_routes.cpp": "devices", # Hardware is THE device surface (round-3 plan) — /devices and
+                                       # /device?id= 302-redirect here; same domain as device_routes.cpp.
     "device_ui.cpp": "devices",
     "inventory_routes.cpp": "inventory",
     "dex_routes.cpp": "dex",

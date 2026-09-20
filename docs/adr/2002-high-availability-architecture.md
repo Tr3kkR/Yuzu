@@ -341,72 +341,325 @@ cluster unit; intra-zone scale is more nodes.
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
-**Status (WS-4): 4.1 done.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+**Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
+fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done
+— see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
-gateway-upstream connect/disconnect/heartbeat paths, but it is **INERT** — no dispatch surface reads it
-yet, so this slice changes no runtime routing behaviour. The epoch in "delayed replay from an older
-connection cannot overwrite a newer re-home" is a **server-internal** monotonic counter minted at
-`ProxyRegister` (never on the wire) that orders a fresh registration against the existing row via a
-guarded upsert; concretely, the delayed-replay scenario this closes is the gateway's circuit-recovery
-ProxyRegister REPLAY, which now carries the agent's existing `x-yuzu-session-id` outgoing metadata so
-the server re-announces (reuses the session) rather than minting a new one. Every post-register write
-(`announce_connected`/`deregister`/`renew_leases`) is instead guarded by **`session_id` equality** — the
-epoch settles who WINS a fresh registration race, `session_id` settles who may touch the row
-afterward. The wire gained only `StreamStatusNotification.cluster_id`. Posture is fail-open on a
-runtime write failure today (the directory isn't dispatch-authoritative yet); **4.2 (northbound
-dispatch rewire) must flip that to fail-closed** before a command's undeliverable-because-route-unknown
-case can be trusted. 4.3 (net-new distributed intra-cluster routing) and 4.4 (`gateway_node`
-convergence reconcile) remain outstanding.
+gateway-upstream connect/disconnect/heartbeat paths. **The directory is no longer literally INERT** —
+Task C wired `GatewayRouteStore::lookup_routes` into confined dispatch as a FALLBACK-ONLY consult
+(`dispatch_route_fallback.hpp`'s `GatewayRouteFallback`): one batched read per arm walk, fired only for
+candidates the local `AgentRegistry` has no live session for, and every send still passes the existing
+`authz::in_scope` confinement intersection before it goes out — the reader only supplies a `cluster_id`
+for an already-confined send, never bypasses it. **This changes ZERO monolith routing outcomes**: a
+direct-connected agent never gets a `GatewayRouteStore` row (only the gateway-service writer path
+writes rows), so on today's single-replica monolith a local miss means the agent is genuinely absent and
+the fallback consult only ever CONFIRMS "no route." Proven in Task C's own test suite ([dispatch] 2163
+assertions unchanged-green plus a decoy-directory-row test where a locally-known agent ignores a
+deliberately-wrong directory row). A routable local-miss queues via the new
+`AgentRegistry::send_via_directory` onto `gw_pending_`, carrying an optional `cluster_id` that is INERT
+until 4.3 (one `gw_mgmt_stub_` today, so multi-cluster fanout does not exist yet). The epoch in "delayed
+replay from an older connection cannot overwrite a newer re-home" is a **server-internal** monotonic
+counter minted at `ProxyRegister` (never on the wire) that orders a fresh registration against the
+existing row via a guarded upsert; concretely, the delayed-replay scenario this closes is the gateway's
+circuit-recovery ProxyRegister REPLAY, which now carries the agent's existing `x-yuzu-session-id`
+outgoing metadata so the server re-announces (reuses the session) rather than minting a new one. Every
+post-register write (`announce_connected`/`deregister`/`renew_leases`) is instead guarded by
+**`session_id` equality** — the epoch settles who WINS a fresh registration race, `session_id` settles
+who may touch the row afterward. The wire gained only `StreamStatusNotification.cluster_id`. Posture was
+fail-open on every runtime write failure through 4.2a; slice **4.2a** hardened the writer path itself
+(tombstone semantics, a stale-route reaper, a fresh-epoch-clobber fix, guard-rejection visibility) but
+deliberately deferred the fail-closed flip to **4.2b**. **4.2b Task B landed that flip as a PER-SITE
+contract, not a uniform one**: `register_fresh` (the row-CREATING write) is fail-closed, the other five
+writes stay fail-open (see the design-obligations bullets below for the full rationale). **4.2b Task D**
+consumed the degraded-read case Task C defined (`ConfinedDispatchOutcome::route_unreadable`): the
+command-outbox delivery loop now RESCHEDULES on it (a new
+`yuzu_server_command_outbox_deliver_retry_cause_total{cause}` counter separates the two causes), and it
+is discriminated at all FOUR operator-facing zero-reach cascade sites that can actually reach it
+(#3424/#3511: `mcp_server.cpp`/`command_routes.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`) —
+`server.cpp`'s legacy-forward site is Broadcast-only and correctly carries no `route_unreadable` branch
+(`ArmDispatchResult::route_unreadable` can never be set on that path) — plus two
+additional `ConfinedDispatchOutcome` consumers a grep of every `containment_unreadable` site caught
+(`deployment_engine.cpp`, `policy_evaluator.cpp`). **`route_unreadable` is deliberately NOT
+interchangeable with `containment_unreadable`** (Gate-8 finding UP-1): a fail-closed containment gate
+withholds every id BEFORE its send, forcing `sent == 0`, whereas a degraded directory read leaves the
+dispatch arm walk running — so a locally-connected device is genuinely sent while a directory-only
+device lands in `not_sent`. The command outbox can therefore reschedule the whole occurrence safely (it
+re-drives the STABLE `command_id`, so a re-send is absorbed by WS-0 receiver dedup and the terminal
+outcome replayed), but the two store consumers must NOT treat it all-or-nothing: `deployment_engine`
+lets a `route_unreadable` device revert INDIVIDUALLY via `not_sent` (a whole-batch revert would send an
+already-executing installer back a step and re-dispatch it next tick under a FRESH `command_id` that
+dedup cannot absorb — a double-execution), and `policy_evaluator` reports genuinely-delivered devices as
+delivered rather than whole-batch-undelivered. `YuzuGatewayRouteWriteFailed` (#4246 #1's alert-rule half)
+and `YuzuGatewayRouteUnreadable` (the closest available signal for #4246 #8's alert-rule half) both ship
+with this slice in `docs/prometheus/yuzu-alerts.yml`'s `yuzu-gateway` group — see the design-obligations
+bullets below. **What remains OUT of scope for 4.2b**: multi-cluster gateway fanout (4.3, today one
+`gw_mgmt_stub_`), the durable cross-replica session lookup (#4246 #3, re-homed to WS-5) — the reader
+stays FALLBACK-ONLY and behaviorally inert until that lands and makes a local miss actually mean
+something on a multi-replica deployment — and `gateway_node` convergence reconcile (4.4). The #4324
+per-home stream-generation fence (re-scoped from #4246 #4) is now CLOSED and MERGED to `origin/dev`
+(PR #4492, `c37306113`, 2026-09-17 — see the #4324 status paragraph below); 4.2b's review RE-VERIFIED the once-per-session property this section
+already established before landing the reader (see the design-obligations bullet on #4 above and the
+4.2b status paragraph below for the re-verification citation), and #4324's own slice re-verified it a
+second time before making the fence live (`governance.d/ha-ws4-4324-stream-fence-reverification.md`).
 
-**4.2 design obligations surfaced by the 4.1 governance review (all INERT today — latent because
-nothing reads the directory — but load-bearing the moment 4.2 makes it dispatch-authoritative; the
-"cannot overwrite a newer re-home" guarantee above is precise only for *overwrite*, and only
-intra-replica with a live session):**
-- **Epoch orders by server PROCESSING time, not connection recency.** The `nextval` is minted when a
-  ProxyRegister is *handled*. A zombie/delayed replay whose original session has already left the
-  in-memory `gateway_sessions_` map (post-DISCONNECTED, a replica restart, or a cross-replica fan-out)
-  falls into the FRESH branch, mints a *higher* epoch, and WINS the CAS — so the fence does not stop a
-  stale replay that has lost its session membership. 4.2 must gate the fresh-branch clobber (e.g. refuse
-  a fresh register while a live higher-epoch lease is unexpired) or treat session-eviction as the
-  explicit supersede signal.
-- **The re-announce REUSES the session id, so a late DISCONNECTED for that same id deletes the live
-  re-homed route** — the session guard cannot distinguish original-home teardown from re-home.
-- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`); under
+**4.2 design obligations surfaced by the 4.1 governance review (load-bearing now that 4.2b Task C made
+the directory dispatch-authoritative, fallback-only; the "cannot overwrite a newer re-home" guarantee
+above is precise only for *overwrite*, and only intra-replica with a live session). Tracked as `#4246`;
+**slice 4.2a closed items #2, #5, #7, #8's counter half, and #9**, **4.2b Task B closed #10 and
+partially closed #1**, **4.2b Task D shipped the #1 and (partial, via `route_unreadable`) #8
+alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
+- **Epoch orders by server PROCESSING time, not connection recency** (#4246 #2 — **CLOSED, 4.2a**). The
+  `nextval` is minted when a ProxyRegister is *handled*. A zombie/delayed replay whose original session
+  has already left the in-memory `gateway_sessions_` map (post-DISCONNECTED, a replica restart, or a
+  cross-replica fan-out) previously fell into the FRESH branch, minted a *higher* epoch, and WON the
+  CAS. **4.2a closes this**: `ProxyRegister`'s mechanism (c) branch — a presented session unknown to
+  this replica's `gateway_sessions_` — now renews the PRESENTED session in the directory instead of
+  calling `register_fresh`, so it never mints a fresh epoch or reaches the clobbering branch. The
+  session-id-minting/`gateway_sessions_`-population half of the gap (the S′-vs-S response desync) is
+  unchanged — see the next-but-one bullet.
+- **The re-announce REUSES the session id, so a late DISCONNECTED for that same id could tombstone the
+  live re-homed route** (#4246 #4 — **RE-SCOPED to #4324, CLOSED end-to-end as of that slice** (pending
+  merge on `feat/ha-ws4-4324-stream-fence`, tasks `46f1e72b6`/`4b248b504`/`feabccea7`) — see the #4324
+  status paragraph below for the closing mechanism; the historical analysis that follows records why the
+  gap was unreachable under the shipped gateway protocol at the time it was re-scoped, not the current
+  state). The MECHANISM is real and confirmed: `deregister`
+  (`gateway_route_store.cpp`) predicates its tombstone only on `agent_id AND session_id` with no
+  per-home discriminator; the re-announce reuses the session id; and the in-memory teardown
+  (`gateway_service_impl.cpp` `clear_stream_if_session`/`remove_agent_if_session`/`gateway_sessions_.erase`)
+  is likewise session-keyed. What 4.2a's TOMBSTONE actually closed is the OPPOSITE direction — item #5,
+  the late-`CONNECTED` resurrection: `deregister` now nulls `session_id`/`lease_until`/`cluster_id`/
+  `gateway_node` (retaining `connection_epoch`) instead of deleting, so a late CONNECTED for a now-gone
+  session no-ops against the tombstone (see the `announce_connected` fallback-INSERT bullet below). It
+  does NOT fence a same-session late-`DISCONNECTED` against a newer re-home, because the SQL has no
+  per-home generation. **This direction has no producer under the shipped gateway** and so is
+  unreachable today: `CONNECTED(S)` is emitted at most ONCE per session (`yuzu_gw_agent.erl:129`, in a
+  single-shot process; the `connecting(cast,{stream_ready,_})` re-attach clause at `:143` has no
+  PRODUCTION sender (only the gen_statem unit test casts it) and in any case emits no `CONNECTED`; every
+  stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). At-most-once is
+  *guaranteed*, not incidental: admission funnels through `yuzu_gw_registry:take_pending/1`, which uses
+  `ets:take/2` — a single ATOMIC retrieve-and-delete — so of N concurrent `Subscribe`s presenting the
+  same session id exactly one consumes the pending registration and spawns an agent (the others get
+  `undefined`); a per-`Subscribe` process races here on a `public` ETS table with no other serialization,
+  and this atomicity is the whole guarantee (a non-atomic lookup-then-delete previously let two win — PR
+  #4299 round 6). Pinned by the concurrent-barrier test in `yuzu_gw_registry_tests.erl` (exactly one
+  winner across many barrier-released rounds; verified RED on the old lookup+delete). A
+  normal agent reconnect uses `proxy_register/1` → plain `do_rpc` with NO `x-yuzu-session-id`
+  (`yuzu_gw_upstream.erl:174-181`), so it takes the server's FRESH branch and is minted a new session
+  `S'` (a late `DISCONNECTED(S)` then misses the `S'` row — `session_mismatch`, expected); only the
+  circuit-recovery REPLAY (`do_rpc_replay`, `:547-550`) re-announces `S` — and BOTH replay branches
+  (presented-session-known AND the presented-but-unknown "mechanism (c)", a replica restart) re-announce
+  via `renew_leases`, never `register_fresh`, emitting NO `CONNECTED`. `renew_leases` is session-guarded
+  (`WHERE session_id = ANY(...)`), so it can neither resurrect a tombstone (whose `session_id` is NULL)
+  nor clobber a newer session's row; in either arrival order the route is correctly torn down — a
+  delivered `DISCONNECTED(S)` tombstones it, and a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops
+  (circuit-open, or the `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease
+  reaper — and nothing resurrects a newer placement because none exists under a reused `S`. So there is
+  AT MOST ONE `CONNECTED(S)` and one `DISCONNECTED(S)` per session (an untrappable process/node kill or a
+  dropped notification only shrinks that count); the only reorder is item #5, which IS closed. The
+  invariant to hold: **`session_id` ≡ exactly one gateway stream placement.** The per-home generation fence
+  (a token stamped on both `CONNECTED`/`DISCONNECTED` — a `NotifyStreamStatus` protocol change, spanning
+  the legacy in-memory teardown path too, NOT a store-only change) is deferred to the first slice that
+  introduces a same-session re-CONNECT (4.3 intra-cluster re-home / 4.4 convergence / #6 replay-response
+  writeback). **4.2b's review RE-VERIFIED this once-per-session property before landing Task C's
+  dispatch wiring** (`governance.d/ha-ws4-42b-4324-reverification.md`): the single `CONNECTED` emit site
+  is unchanged (`yuzu_gw_agent.erl:129`, a single-shot process), admission still funnels through
+  `yuzu_gw_registry:take_pending/1`'s atomic `ets:take/2` (unchanged by the merged 4.2a, PR #4299), and
+  the concurrent-barrier test in `yuzu_gw_registry_tests.erl` (exactly one winner across many
+  barrier-released rounds) is still present and green. Tracked in #4324 (re-scoped from #4246 item #4) —
+  4.2b landed only the re-verification; **the per-home fence itself is CLOSED as of #4324's own slice,
+  MERGED to `origin/dev`** (PR #4492, `c37306113`, 2026-09-17; see the #4324 status paragraph below):
+  `StreamStatusNotification.stream_home_id`
+  (field 8, opaque per-connection-instance id minted once per `yuzu_gw_agent` process, task 1,
+  `46f1e72b6`), `GatewayRouteStore`'s asymmetric tombstone predicate on the new nullable
+  `stream_home_id` column (task 2, `4b248b504`, migration v3), and `gateway_service_impl.cpp`'s
+  `NotifyStreamStatus` DISCONNECTED branch resolving an identical fence against `AgentRegistry`'s
+  in-memory `gateway_stream_home_id` once, before the registry-clear/store-deregister/session-map-erase
+  effects run (task 3, `feabccea7`). #4324's own review re-verified the once-per-session property a
+  second time before landing this wiring (`governance.d/ha-ws4-4324-stream-fence-reverification.md`).
+  Deliberately NOT closed by #4324: a stale `DISCONNECTED(home1)` landing BEFORE the matching live
+  `CONNECTED(home2)` (two independent RPCs, no ordering guarantee) still tombstones the row, and
+  `announce_connected`'s `ON CONFLICT DO NOTHING` fallback cannot re-arm a tombstoned row — left for 4.3
+  (see `gateway_route_store.hpp`'s file-header FORWARD NOTE). The `duplicate_connected` positive
+  tripwire on `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` that #4324's own issue
+  checklist deferred is tracked separately as `#4464`.
+- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) (#4246 #3 —
+  **DEFERRED**, re-homed to its own slice under WS-5 shared agent presence, ADR §7a); under
   active-active a replay routed to a non-owning replica always takes the fresh branch. A durable
   cross-replica session lookup is required before the guarantee holds on more than one replica.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
   re-read on the replay branch, and a fresh re-register COALESCE-preserves the OLD cluster/node until a
   CONNECTED `announce_connected` lands; a 4.2 reader must not trust placement from a replay/fail-open
-  window.
-- **A stale-lease reaper is required** before 4.2 — a missed DISCONNECT leaves an orphan lease (growth
-  is PK-bounded, so not a capacity risk, but a dead route reads live). The reaper MUST also sweep
-  **lease-less rows** (`lease_until IS NULL`) by `updated_at` age: a won `register_fresh` resets the
-  lease to NULL (a new connection does not inherit the superseded one's lease — landed in 4.1), and a
-  NULL lease never reads `is_stale`, so a row whose stream never establishes (no CONNECTED, no
-  DISCONNECTED) would otherwise live forever.
+  window. Unaffected by 4.2a.
+- **A stale-lease reaper is required** before 4.2 (#4246 #7 — **CLOSED, 4.2a**) — a missed DISCONNECT
+  leaves an orphan lease (growth is PK-bounded, so not a capacity risk, but a dead route reads live).
+  **4.2a closes this**: `GatewayRouteStore::reap_stale_routes()`, a clock-guarded background pass
+  (`docs/clock-guarded-retention.md`'s adoption register has the full record) on a ~5-minute cadence,
+  sweeps (a) leases expired past a 180s grace window (2× the 90s TTL) — tombstoned, not deleted — and
+  (b) NULL-lease rows (tombstones, or a `register_fresh` that never got an `announce_connected`) past a
+  300s purge age — hard-deleted.
 - **`announce_connected`'s fallback INSERT can RESURRECT a row after `deregister`** when CONNECTED and
-  DISCONNECTED race (the gateway spawns one sender process per notification, no arrival-order
-  guarantee): a late CONNECTED for a just-deregistered session re-inserts `(epoch 0, session S, fresh
-  lease)` for a dead stream — neither the epoch fence (fallback hardcodes epoch 0) nor the session guard
-  (same session) stops it. 4.2 fix: tombstone on `deregister`, or epoch-guard the fallback insert.
+  DISCONNECTED race (#4246 #5 — **CLOSED, 4.2a**) — the gateway spawns one sender process per
+  notification, no arrival-order guarantee: a late CONNECTED for a just-deregistered session used to
+  re-insert `(epoch 0, session S, fresh lease)` for a dead stream. **4.2a closes this** via the same
+  `deregister` tombstone change above: the fallback INSERT is `ON CONFLICT (agent_id) DO NOTHING`, and
+  against an EXISTING tombstoned row it now no-ops instead of reviving a dead route.
 - **The gateway discards the replay `ProxyRegister` response, so a server-minted fresh session desyncs
-  silently.** When the presented session is unknown (core restart / replica failover / post-DISCONNECT
-  eviction) the server mints a NEW session and returns it, but the gateway's replay path ignores the
-  response and keeps stamping the OLD session id on every notify/heartbeat → `renew`/`announce`/
-  `deregister` all miss, the route is stale and wrong-sessioned until the agent reconnects or the 4.4
-  reconcile runs. 4.2/4.4 fix: write the replay response's `session_id` back into the gateway registry,
-  or reconcile. (ADR §7 already assigns core-restart convergence to 4.4; the point here is the 4.1
-  replay protocol itself manufactures the desync.)
-- **Guard-rejection no-ops are unobserved.** The 4.1 fail-open counter covers only Postgres WRITE
-  FAILURES; a systemic guard-rejection desync (e.g. every `renew` matching 0 rows, every `announce`
-  no-opping after the replay desync above) moves neither a log nor a metric. 4.2 must add a
-  no-op/mismatch counter (`announce matched=false` / `deregister removed=false` / `renew
-  renewed<requested`) so the desync is visible before a reader trusts the directory.
-- **Optionally correlate `agent_id` on `renew_leases`** — today renew matches `session_id` alone
-  (defense-in-depth gap against a compromised gateway renewing a foreign session; see the trust-rationale
-  comment at the BatchHeartbeat site). Pair `agent_id` per renewed session if the directory becomes
-  authoritative.
-- **Ship the write-failure alert rule + metrics-doc entry with the fail-closed flip.**
+  silently** (#4246 #6 — **DEFERRED to 4.4**). When the presented session is unknown (core restart /
+  replica failover / post-DISCONNECT eviction) the server mints a NEW session and returns it, but the
+  gateway's replay path ignores the response and keeps stamping the OLD session id on every
+  notify/heartbeat → `renew`/`announce`/`deregister` all miss, the route is stale and wrong-sessioned
+  until the agent reconnects or the 4.4 reconcile runs. 4.2a's mechanism (c) (see above) renews the
+  *presented* session server-side rather than clobbering it, which narrows the blast radius, but the
+  gateway-side session-id writeback itself remains 4.4's fix.
+- **Guard-rejection no-ops are unobserved** (#4246 #8 — **counter half CLOSED, 4.2a; alert-rule half
+  PARTIALLY CLOSED, 4.2b**). The 4.1 fail-open counter covers only Postgres WRITE FAILURES; a systemic
+  guard-rejection desync (e.g. every `renew` matching 0 rows, every `announce` no-opping) moved neither
+  a log nor a metric. **4.2a closes the counter half**: `yuzu_server_gateway_route_desync_total{op,
+  outcome}` (`op` ∈ `renew_leases`\|`announce_connected`\|`deregister`\|`notify_stream_status`,
+  `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`) — see
+  `docs/observability-conventions.md` and `docs/user-manual/metrics.md`. **4.2b ships
+  `YuzuGatewayRouteUnreadable`** (`docs/prometheus/yuzu-alerts.yml`, `yuzu-gateway` group), keyed on
+  `yuzu_server_command_outbox_deliver_retry_cause_total{cause="route_unreadable"}` (Task D) — the
+  closest available signal, since a *degraded directory read* during dispatch is the operationally
+  actionable half of "desync." This is deliberately NOT a direct alert on
+  `yuzu_server_gateway_route_desync_total`'s guard-rejection outcomes: that counter is expected at a
+  low background rate (a post-restart/failover baseline rise, a redelivered `DISCONNECTED`) and a
+  threshold that doesn't page on those needs real fleet data first — same reasoning as the #913
+  OTA-bounds alert-threshold lesson. The desync counter itself still has no dedicated alert.
+- **Correlate `agent_id` on `renew_leases`** (#4246 #10 — **CLOSED, 4.2b Task B**) — renew used to match
+  `session_id` alone (defense-in-depth gap against a compromised gateway renewing a foreign session).
+  `renew_leases` now takes PARALLEL `agent_ids`/`session_ids` arrays and its SQL correlates on BOTH
+  columns (`r.agent_id = t.agent_id AND r.session_id = t.session_id`, a `unnest()` join) — a renew
+  presenting the right session but the wrong agent_id now matches zero rows. All three call sites
+  (ProxyRegister's two renew branches, BatchHeartbeat) thread the resolved `agent_id` through — the
+  DURABLE `(agent_id, session_id)` binding already stored in the directory is the trust anchor, so a
+  correlation is deliberately checked against it rather than trusting any caller-supplied value; the
+  wire's `HeartbeatRequest` carries no `agent_id` at all (only `session_id`), so `BatchHeartbeat`
+  resolves it from the SAME per-replica in-memory `gateway_sessions_` map the #4246 #3 known-session
+  check above already uses. This means #10's correlation inherits THAT bullet's limitation, not a new
+  one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
+  (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
+  new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
+  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+- **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
+  landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
+  keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
+  ONE row-CREATING write, is fail-CLOSED (returns `UNAVAILABLE`, mirroring the existing #3401
+  `register_agent` precedent); the other five (`announce_connected`, both ProxyRegister `renew_leases`
+  branches, BatchHeartbeat's `renew_leases`, `deregister`) stay fail-OPEN — see
+  `record_route_store_failure`'s header comment (gateway_service_impl.cpp) for the per-site rationale.
+  The metrics-doc entries for both counter families exist (`docs/observability-conventions.md`,
+  `docs/user-manual/metrics.md`). **The alert rule shipped in 4.2b**: `YuzuGatewayRouteWriteFailed`
+  (`docs/prometheus/yuzu-alerts.yml`, `yuzu-gateway` group), a rate-based alert on
+  `yuzu_server_gateway_route_write_failed_total{op,reason}` — conservative/INITIAL thresholds, per the
+  #913 OTA-bounds lesson that alert thresholds are the top source of external-review findings, to be
+  tuned against real fleet data once it exists.
+
+**Status (4.2a, 2026-09-11): writer-path hardening DONE** — `deregister` tombstone semantics,
+`reap_stale_routes` (scheduled `ReplicaSafe` in `background_jobs.hpp`, WS-10 classification), the
+mechanism-(c) unknown-presented-session fix, the `yuzu_server_gateway_route_desync_total` counter, and
+the hot-path/reaper write-timeout split (500ms/2000ms) (#4246 #9 — **CLOSED, 4.2a**) all landed in that
+slice.
+
+**Status (4.2b, 2026-09-14): store-layer, writer-path posture, dispatch-wiring, and the
+`route_unreadable` consumer all DONE (Tasks A–D).** Task A made `announce_connected` the sole writer of
+placement (`register_fresh` NULLs `cluster_id`/`gateway_node` on a winning re-register) and added the
+batched `lookup_routes` read. Task B landed the per-site fail-closed contract above (#4246 #1, later
+fully closed by Task D's alert rule) and the `agent_id` renew correlation (#4246 #10, CLOSED). **Task C
+wired the reader into confined dispatch, FALLBACK-ONLY** — local `AgentRegistry` first, the directory
+consulted only on a local-registry miss, agent→cluster granularity — which **changes ZERO monolith
+routing outcomes** because a direct-connected agent never has a directory row; confinement
+(`authz::in_scope`) is checked before every send regardless of where the routing information came from.
+**Task D consumed the resulting `route_unreadable` outcome** (a degraded directory READ, the systemic
+sibling of `containment_unreadable`): the outbox delivery loop RESCHEDULES on it instead of marking
+`no_agents_reached`, it is discriminated at the FOUR operator-facing zero-reach cascade sites
+(#3424/#3511: `mcp_server.cpp`/`command_routes.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`;
+`server.cpp`'s legacy-forward is Broadcast-only, wires no route fallback, and correctly has no branch)
+plus the `deployment_engine.cpp`/`policy_evaluator.cpp` consumers, and the `YuzuGatewayRouteWriteFailed` /
+`YuzuGatewayRouteUnreadable` alert rules shipped (`docs/prometheus/yuzu-alerts.yml`). 4.2b's review also
+RE-VERIFIED the once-per-session property (#4324) before this wiring landed — see the design-obligations
+bullet above. **The directory is no longer literally inert, but it is still BEHAVIORALLY inert on the
+monolith** — the fallback path only ever fires for a candidate genuinely absent from the local registry,
+and no such candidate today has a directory row to find, so there is no observable routing-outcome
+change to validate (see the WS-9 note on `docs/ha-delivery-matrix.md`'s WS-4 row: a failover scenario
+for this reader has nothing to exercise until it becomes behaviorally live). Remaining WS-4 sub-work: 4.3
+(net-new distributed intra-cluster agent→node routing, multi-cluster fanout — today one
+`gw_mgmt_stub_`; 4.3 also owns the pre-CONNECT-race ordering gap #4324 deliberately left open, see its
+status paragraph below), the durable cross-replica session lookup (#4246 #3, re-homed to WS-5 — this is
+also what makes the reader behaviorally live, since only then can a directory row outlive the writing
+replica's own in-memory registry), and 4.4 (`gateway_node` convergence reconcile, replay-response
+writeback). The #4324 per-home stream-generation fence itself is now CLOSED — see below.
+
+**4.3a update (2026-09-18): the intra-cluster half of 4.3 is DONE** — per-agent `pg`-group agent→node
+lookup within one Erlang gateway cluster (`yuzu_gw_registry.erl`'s `lookup/1`/`lookup_remote/1`), the
+`fanout_terminal` cross-node-routing fix (`yuzu_gw_agent.erl`), and `remote_dispatched` telemetry
+(`yuzu_gw_router.erl`) — component-complete-and-INERT pending `#4555` (gateway multi-node cluster
+formation, entirely unimplemented in production). The pre-CONNECT-race ordering gap is **NOT**
+"deliberately left open" as this paragraph previously stated — it is RESOLVED as unreachable BY
+INVARIANT (see the #4324 status paragraph's PR-review-fix note below for the full resolution).
+Remaining WS-4 work is the REST of 4.3 (cross-cluster gateway fan-out — today one `gw_mgmt_stub_` —
+**and** `#4555` cluster formation itself, not fan-out logic alone) and 4.4.
+
+**Status (#4324, MERGED to `origin/dev` — PR #4492, `c37306113`, 2026-09-17T22:05:58Z): the per-home
+stream-generation fence is CLOSED end-to-end**, three tasks: task 1 (`46f1e72b6`) adds
+`StreamStatusNotification.stream_home_id = 8` to the canonical proto and both gateway-vendored
+mirrors — an opaque id the gateway mints once per `yuzu_gw_agent` process instance
+(`string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16)))`, 32 hex chars) and stamps on both
+the CONNECTED and DISCONNECTED notification that instance ever sends; task 2 (`4b248b504`) adds a
+nullable `agent_routes.stream_home_id` column (migration v3) plus the ASYMMETRIC tombstone predicate
+**`stream_home_id IS NULL OR stream_home_id = $3`** (fixed pre-merge, see the PR-review-fix note below —
+an earlier, buggy form of this predicate required the incoming value to also be empty) to
+`GatewayRouteStore::deregister` — a STAMPED stored home id requires an EXACT match to be torn down,
+never a row a stamped CONNECTED has since re-homed, which is what makes this safe across a
+rolling gateway upgrade (mixed old/new-build nodes is the normal state of one); task 3 (`feabccea7`)
+wires the caller's real `stream_home_id` through `AgentRegistry::set_gateway_route`/a new
+`gateway_stream_home_id()` accessor and restructures `gateway_service_impl.cpp`'s `NotifyStreamStatus`
+DISCONNECTED branch to resolve the fence ONCE, at the top, before any of the three teardown effects
+(registry clear, store deregister, `gateway_sessions_`/`lost_race_sessions_` erase) run — a
+design-review-mandated structural fix: fencing only a subset of the three is WORSE than the pre-#4324
+unfenced behavior (it would leave a live re-homed session permanently untearable by its own future
+events, a stale-placement trap). An oversized incoming `stream_home_id` (>64 bytes) is treated as
+malformed and clamped to empty rather than rejected or used unbounded, counted via new
+`yuzu_server_gateway_route_desync_total{op="announce_connected"\|"deregister",outcome="malformed_home_id"}`;
+a genuine stale-home mismatch counts as
+`{op="deregister",outcome="stale_home"}`. A regression test proving the core scenario end-to-end landed
+in `tests/unit/server/test_gateway_route_wiring.cpp`. This slice's review RE-VERIFIED the
+once-per-session property a second time before making the fence live
+(`governance.d/ha-ws4-4324-stream-fence-reverification.md`) — no regression found, same conclusion as
+4.2b's own re-verification. **PR-review fix, pre-merge (HIGH)**: external reviewer FortitudeEtc
+(Codex+Kimi panel, with empirical reproduction) found the task-2 predicate's ORIGINAL form —
+`stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')` — wrongly required the incoming value to
+also be empty before a stored-NULL row admitted it. Under the single-producer invariant a stored-NULL
+home does not only mean "legacy, never stamped" — it can equally mean "this session's own
+`announce_connected` (from CONNECTED) hasn't run yet," since the gateway dispatches CONNECTED and
+DISCONNECTED as two independently `spawn_monitor`'d RPC workers with no ordering guarantee between
+them. So an ORDINARY connect/disconnect (no re-home, just the first and only pair for a brand-new
+session) could have its DISCONNECTED reach the server before its own paired CONNECTED; the original
+predicate rejected that stamped, legitimate DISCONNECTED, the deregister/fence silently no-opped, and
+the delayed CONNECTED then published a route for an already-dead stream — a regression vs. the
+pre-#4324 unfenced behavior, reachable under ordinary operational churn with only the first pair
+(distinct from, and reachable without, the FORWARD NOTE gaps below, which all require a second
+CONNECTED/DISCONNECTED pair for the same session). Fixed to `stream_home_id IS NULL OR stream_home_id
+= $3` (commit `f7f12bd59`), mirrored identically in the in-memory fence
+(`gateway_service_impl.cpp`'s `home_matches`); a targeted Gate 8 re-review then caught a second stale
+copy of the old predicate formula on `deregister()`'s own declaration comment (`5160e0eeb`, doc-only).
+Both commits landed pre-merge in the same PR #4492. **Deliberately NOT closed by #4324**: if a stale `DISCONNECTED(home1)`
+arrives BEFORE a live re-home's `CONNECTED(home2)` — two independent RPCs, no ordering guarantee
+between them — the tombstone still wins and `announce_connected`'s `ON CONFLICT DO NOTHING` fallback
+cannot re-arm a tombstoned row, so the re-home is silently unroutable in the directory until the next
+full `ProxyRegister`. **Resolution UPDATED (WS-4 4.3a design review, 2026-09-18)**: the previously-stated
+"`register_fresh`'s ordered epoch or an explicit re-arm path" was the WRONG mechanism — a
+gateway-synthesized fresh session on re-home starves the agent's own heartbeat lease renewal,
+reproducing the `#4246` #6 desync deliberately. `gateway_route_store.hpp`'s file-header FORWARD NOTE
+now states the actual resolution: this gap is unreachable BY INVARIANT (agent-driven reconnect + the
+gateway's `NOT_FOUND` refusal on an unknown session mean no producer of a same-session different-home
+`CONNECTED` exists or is planned), backed by a standing design constraint on 4.3/4.4 plus a
+server-side tripwire (folds into `#4464`), not a new CAS primitive. See that file's FORWARD NOTE for
+the full resolution. The
+`duplicate_connected` positive tripwire on
+`yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` that #4324's own issue checklist
+explicitly deferred (it needs a `gateway_sessions_` value-type change reaching several call sites) is
+tracked separately as `#4464`, filed alongside this slice's docs pass.
 
 ### 7a. Shared agent presence / health / scope population (new, per review)
 `AgentRegistry` is **more than a stream router** — it is also the authoritative **live-agent set,
@@ -420,6 +673,165 @@ registration/heartbeat, **read by every core replica**; presentation obtains it 
 so scope resolution and the `yuzu_agents_connected` gauge are coherent across the core tier rather
 than per-instance. This is its own workstream, not a
 side-effect of the routing directory.
+
+### 7b. Gateway cluster formation mechanism (`#4555` design, 2026-09-18)
+`#4555` established that gateway multi-node cluster formation is **entirely unimplemented** — no
+`net_kernel`/`net_adm`/peer-discovery code exists anywhere in `gateway/`, `gateway/config/vm.args.src`
+hardcodes `-name yuzu_gw1@127.0.0.1` with a comment telling the operator to hand-edit it per node, and
+`docs/erlang-gateway-blueprint.md`'s three named discovery options (static seed nodes / Kubernetes
+headless service / AWS Cloud Map or Consul) are documented target-state, never built. This makes 4.3a's
+`pg`-based cross-node routing (§7 above) component-complete-and-inert: `pg` group membership only
+replicates across *connected* distributed-Erlang nodes, and nothing connects any today. This subsection
+records the mechanism-choice decisions for closing that gap, made via a structured design interview
+(`/grill-with-docs`) rather than picking from the blueprint's three options by inspection.
+
+**Decision: target only the static/DNS-based discovery family for v1 — no Kubernetes or cloud-registry
+discovery.** Yuzu ships zero Kubernetes deployment artifacts (no manifests, no Helm chart) anywhere in
+the repo; every shipped topology is Docker Compose plus native Linux/Windows/macOS packaging, and the
+precedent for "how a multi-node HA component ships" (WS-7, HA Postgres) is a Compose profile
+(Patroni+etcd+HAProxy), not a Kubernetes one. Building Kubernetes- or cloud-provider-specific discovery
+against a deployment target this repo cannot validate would be speculative work; the blueprint's Option
+B/C remain a documented, explicitly deferred, pluggable future seam (same shape as the coordination
+substrate's own Postgres-default-pluggable-for-SaaS pattern, §3 above) rather than v1 scope.
+
+**Decision: peer discovery resolves DNS A records for a configurable seed name, not Kubernetes-specific
+`inet_res` code.** The blueprint frames "static seed nodes" and "Kubernetes headless service via
+`inet_res`" as separate options, but the underlying *mechanism* of the latter is just "resolve a DNS
+name, get back multiple A records" — Docker Compose's own embedded DNS already does exactly this for a
+scaled service (`docker compose up --scale gateway=N` resolves the service name to one A record per
+replica) with zero Kubernetes-specific code and zero new infrastructure. A gateway node therefore
+resolves a seed name (`YUZU_GW_SEED_DNS_NAME`, default `gateway` — matching the reference Compose
+service name) to a set of addresses and attempts `net_kernel:connect_node/1` against each. This name is
+a **separate config value from `cluster_id`** — `cluster_id` is a logical/database identifier an
+operator names freely (a key into the Postgres routing directory), while the seed name is constrained by
+whatever the deployment's actual DNS/Compose naming is; coupling the two forces an operator's freely-chosen
+logical name to also be infrastructure's literal hostname (or vice versa). A separate
+`YUZU_GW_SEED_NODES` env var (an explicit comma-separated address list), when set, **replaces DNS
+resolution outright rather than merging with it** — a merge would let two independently-configured
+sources silently interact (a leftover test override quietly contributing addresses alongside a working
+DNS setup); "when set, this wins outright, full stop" is a simpler invariant, covering the air-gapped /
+no-DNS / hand-pinned-IPs deployment case.
+
+**Decision: plain A records, not TXT.** A TXT record could carry an explicit, free-form peer list
+(including full node names, not just addresses) — but this only has value if a node's identity needs
+more than its address. It doesn't (see below): once every replica shares one fixed short name and
+differs only by address, an A record already carries exactly the needed information, and choosing TXT
+would forfeit the "free with Compose's `--scale`" property (Compose auto-populates A records for a
+scaled service; nothing auto-populates a TXT record, so an operator would be back to hand-maintaining a
+list on every scale change — the static-list option this decision otherwise avoids, just relocated into
+DNS). **Correction (Fable design review, 2026-09-18): the "free with Compose `--scale`" premise is false
+for every shipped Compose file as they stand today** — all five gateway service definitions
+(`docker-compose.reference-gateway.yml:97`, `.full-uat.yml`, `.viz-uat.yml`, `.demo.yml`) pin
+`container_name:` (which Compose refuses to scale) and host-publish `50051`/`8081`/`9568` (which would
+collide across replicas). This is a real, currently-false claim, not a hypothetical — see the new
+scale-capable-rig decision below, which `#4555` must ship alongside the mechanism for the premise to
+hold in practice.
+
+**Decision: gateway node identity becomes dynamic — fixed short name, host part resolved at boot —
+rather than the current hardcoded-per-node scheme.** `vm.args.src`'s literal-per-node `-name` is
+incompatible with Compose's `--scale`: every scaled replica boots from the identical image and
+environment, so they cannot each carry a distinct hardcoded name. Gateway nodes are genuinely
+interchangeable (no operator-assigned per-node identity is needed beyond address), so the fix is
+foundational rather than incidental to discovery: every node uses the same short name (e.g. `yuzu_gw`),
+with the host part **resolved at boot to an IP LITERAL — never a hostname string.** **Correction (Fable
+design review): the original wording here ("auto-detected via the node's own resolvable hostname")
+does not interoperate with A-record-based dialing and would have been unreachable in practice.** The
+dialer only ever has the IPs a seed-name lookup returned, and constructs peer node atoms as
+`yuzu_gw@<ip>`; the OTP distribution handshake (`dist_util:recv_challenge`) requires the target's own
+registered name to match the dialed name EXACTLY, and a Docker PTR lookup on a container's IP returns
+the container name, not a matching short-ID hostname, so reverse-resolving a hostname back from an IP
+does not rescue this. The corrected self-address determination is: `YUZU_GW_ADVERTISE_ADDR` if set
+(explicit override, unchanged from the original decision) → else the address obtained by intersecting
+the seed name's own resolved set with this node's local interfaces (`inet:getifaddrs()`) — i.e. "which
+of the addresses my peers would also see, is one of mine" — → else resolve this node's own hostname to
+an IP (not use the hostname string itself) as a last resort. `YUZU_GW_SEED_NODES` entries (the static
+override) are likewise addresses, expanded to `yuzu_gw@<addr>`, never bare names. Two-nodes-on-one-host
+dev/test rigs keep a short-name override (matching the 4.3a `peer`-based test suite's own
+`peer:random_name`-with-shortnames pattern, `yuzu_gw_registry_multinode_tests.erl`), since two nodes
+literally sharing one address need distinguishing names — this is the one case "nodes are interchangeable,
+identity is address-only" does not cover, and it is a test/dev-only exception, not a normal-operation path.
+
+**Decision: WHERE dynamic naming happens must preserve the existing distribution-cookie boot guard's
+ordering (Fable design review finding, not in the original interview).** relx's `.src` config
+substitution cannot run code, so "resolve an address, then set `-name`" needs either (a) an entrypoint
+wrapper that computes `YUZU_GW_ADVERTISE_ADDR` and substitutes it into `vm.args.src`'s `-name
+yuzu_gw@${YUZU_GW_ADVERTISE_ADDR}` before the relx boot script starts the (already-distributed) VM, or
+(b) starting the VM non-distributed and calling `net_kernel:start/2` from application code once the
+address is known. **(a) is the required shape for `#4555`**: `yuzu_gw_app:check_distribution_cookie/0`
+(`yuzu_gw_app.erl:28`) runs at application boot and its `evaluate_cookie('nonode@nohost', _, _) -> ok`
+clause (`:93-94`) is written assuming distribution is already up by the time application code runs — under
+shape (b) that clause silently short-circuits the guard into a no-op on every production boot, reopening
+`#659` (the known-cookie fail-closed guard) as dead code. If a future change genuinely needs shape (b)
+for some other reason, moving the cookie check to run strictly after `net_kernel:start/2` succeeds is a
+required part of that same change, not an incidental cleanup.
+
+**Decision: a minimum distribution-cookie length floor ships in this same slice (Fable design review
+finding, not in the original interview).** DNS-sourced dial targets change the distribution-cookie
+threat model in one specific way beyond the existing boot guard: the OTP handshake has the INITIATOR
+send `MD5(cookie ‖ peer_challenge)` first, before the peer proves anything back — so anything able to
+influence what the seed name resolves to (a compromised/misconfigured DNS answer) gets an offline
+brute-force oracle against the cookie from a legitimately-configured node dialing out, which an inbound
+attacker against a normal listener never gets. `evaluate_cookie` (`yuzu_gw_app.erl:95-106`) today only
+denylists a few known-default substrings — a short custom cookie of any other value passes. `#4555`
+adds a minimum length floor (Fable's suggested figure: 32 chars) to that check, keeping the existing
+`YUZU_GW_ALLOW_DEFAULT_COOKIE` dev/CI override as the escape valve (no shipped Compose file sets a
+custom cookie today — all currently rely on that override, so this floor cannot regress an existing
+production deployment that already has a real cookie configured, only one relying on the override, which
+is explicitly documented as insecure already). A CIDR/RFC1918 allow-list on resolved addresses was
+considered and **rejected** as the wrong control here: a DMZ or a cloud VPC subnet is also RFC1918-shaped,
+so "private range" is not the same predicate as "inside my trust zone" (`CONTEXT.md`'s own "Gateway
+cluster" term already states clusters must not span a DMZ or a WAN) — the cookie is the actual security
+boundary and should be strengthened directly rather than proxied through an address-range heuristic that
+doesn't track the real one. Migrating the distribution protocol itself to `-proto_dist inet_tls` over the
+internal CA is filed as a follow-up, not this slice's scope. `#4555` also pins
+`inet_dist_listen_min`/`inet_dist_listen_max` in the kernel config (today the distribution port is
+randomly chosen per boot and therefore unfirewallable on a bare-VM deployment) and documents that fixed
+range as what an operator firewalls alongside the existing mgmt-plane (`:50063`) and agent-edge
+(`:50051`) guidance.
+
+**Decision: `#4555` ships a scale-capable reference Compose rig alongside the mechanism (Fable design
+review finding).** Per the correction above, no shipped Compose file can actually exercise `--scale
+gateway=N` today (`container_name:` blocks it; host-published `50051`/`8081`/`9568` would collide across
+replicas). Without a rig that can actually scale, the "free with Compose" property this whole design leans
+on is unverifiable in this repo, and a future reader has nothing to run to confirm the mechanism works.
+`#4555` therefore drops `container_name:` and the host-published gateway ports on at least one reference
+Compose variant suited to demonstrating a multi-node cluster (agents inside the same Compose network
+reach a scaled `gateway` service by its DNS name/port directly — they do not need the host-publish that a
+single-node demo rig uses for host-side access).
+
+**Decision: `#4555` owns an always-on discovery/redial loop, not a boot-time-only attempt — periodic
+adjacency/health tracking remains 4.4's scope (revised from the original interview finding, Fable design
+review).** The original reasoning — "Erlang distribution connections are symmetric once established, so
+a newly-added node dialing outward at its own boot suffices" — does not hold in this codebase specifically:
+`gateway/config/sys.config` and `sys.config.prod` both set **`{connect_all, false}`** (the blueprint's own
+prescription, deliberately chosen to avoid transitive auto-mesh gossip). With `connect_all` false, `pg`
+(which 4.3a's `lookup_remote/1` depends on) only ever sees membership across nodes THIS node has itself
+connected to — there is no `global`-driven self-healing of a partial mesh. A node that reaches only some
+of its resolvable peers at boot (a peer's `epmd` up but its own node not yet registered at the moment of
+the dial attempt, a transient DNS timeout, a `net_ticktime` disconnect after a network blip) stays
+permanently partially-meshed with nothing to ever redial it — the fail-open decision above already says
+the node "keeps retrying in the background," and an always-on retry loop **is** a periodic re-resolver;
+the only real design freedom was ever its stop condition, and "stop on first success" was the actual gap.
+`#4555`'s loop is therefore: on a **fixed interval, indefinitely** (unchanged from the original
+retry-cadence decision — no backoff, matching this codebase's existing fixed-interval retry idiom), resolve
+the seed name (or use the static override), subtract already-connected nodes, and `net_kernel:connect_node/1`
+each remaining address — a no-op against an already-connected peer, so the steady-state cost is one DNS
+query plus N cheap no-ops per interval. This loop is the full extent of `#4555`'s scope: it owns *whether
+a mesh forms and stays formed*, not *what a node knows about its peers' health/load* (adjacency table,
+CPU/memory gossip, latency-based rebalancing) — that remains 4.4's `yuzu_gw_cluster` gen_server, layered
+on top of the mesh this loop maintains.
+
+**Decision: ship two metrics plus an alert, not one gauge (revised from the original interview finding,
+Fable design review).** A single connected-peer-count gauge cannot distinguish "resolved 3 peers, connected
+to only 1" (a real problem — most likely a per-pair cookie mismatch, since `net_kernel:connect_node/1`
+reports that failure mode only as a bare `false`, no detail) from "resolved 1" (a different problem — wrong
+seed name, or a genuinely single-node deployment, which is not itself an error). `#4555` ships
+`yuzu_gw_cluster_peers_resolved` and `yuzu_gw_cluster_peers_connected` as separate gauges, plus a
+`yuzu_gw_cluster_connect_failures_total` counter, and a `docs/prometheus/yuzu-alerts.yml` rule firing when
+`peers_resolved - peers_connected > 0` holds for a sustained window (routed to `sre` + `architect` per
+`docs/observability-conventions.md`, same as every other alert-rule change) — closing the same
+fail-open-means-silent-by-design gap the original single-gauge decision identified, but with enough
+resolution for an operator to tell which runbook applies.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:

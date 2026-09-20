@@ -85,6 +85,17 @@ struct ExecutionKpi {
 [[nodiscard]] ExecutionKpi compute_execution_kpi(const std::vector<AgentExecStatus>& agents);
 nlohmann::json execution_kpi_json(const ExecutionKpi& k);
 
+/// One row of a resolved, already-confined child-execution read (`GET
+/// /api/v1/executions/{id}/children`, the legacy `GET
+/// /api/executions/{id}/children`, and MCP `get_execution_children` -
+/// #2146 A2-R1). Deliberately the narrower field set the legacy route has
+/// always returned (`id`/`status`/`dispatched_at`) - the caller has already
+/// applied `execution_scope_rules.hpp`'s `execution_visible` to `c`
+/// independently of its parent's own visibility (a visible parent does not
+/// by itself authorize enumerating a child dispatched by, or targeting,
+/// someone else).
+nlohmann::json execution_child_row_json(const Execution& c);
+
 /// Execution-scoped response row for `GET /api/v1/executions/{id}/responses`
 /// ONLY. *(Correction, #2146 A2-R2: this doc comment previously claimed
 /// FIELD-SET PARITY with MCP `query_responses` on the grounds that

@@ -8,6 +8,7 @@
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -359,7 +360,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two; the degrade branch below matches this
+            // same route's own agents_opt degrade handling just underneath.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded, retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #1634 (Doomgoose review finding, important): fail closed on a
             // transient tracker degrade rather than silently treat it as
             // "zero agents" — see get_agent_statuses_checked's doc comment.
@@ -908,7 +927,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  auto exec_id = req.matches[1].str();
-                 auto exec_opt = execution_tracker->get_execution(exec_id);
+                 // Governance fix (#2146 A2-R1 Gate 8 re-review): was the
+                 // plain get_execution(), which collapses "row genuinely
+                 // absent" and "read degraded" (pool/query failure) to the
+                 // same nullopt -- a transient degrade here fell through to
+                 // the not-found + denial-audit branch below, producing a
+                 // FALSE 404 for a legitimate owner and a permanently wrong
+                 // CC7.2 audit trail for a non-owner. get_execution_checked's
+                 // outer std::expected distinguishes the two; the degrade
+                 // branch below matches this same route's own agents_opt
+                 // degrade handling a few lines down.
+                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                 if (!exec_r) {
+                     res.status = 503;
+                     res.set_content("live updates unavailable, tracker degraded, retry "
+                                    "shortly",
+                                    "text/plain; charset=utf-8");
+                     return;
+                 }
+                 const auto& exec_opt = *exec_r;
                  // #1634 perf (governance Gate 3 finding): only fetch/scan agent
                  // statuses when confined — an unrestricted subscriber is always
                  // visible regardless, so this indexed lookup would be pure
@@ -2296,12 +2333,40 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
+                // #2146 A2-R1 (gov docs-writer/cpp-expert fix round): definition_id/
+                // enabled_only query params. The legacy GET /api/schedules route
+                // treats ANY presence of enabled_only as true, regardless of value
+                // -- this v1 twin does NOT reproduce that quirk. It follows the
+                // #4034 precedent already set on this same REST v1 surface
+                // (compliance_routes.cpp's PolicyQuery enabled_only fix) and
+                // matches the MCP twin list_schedules, which already honors the
+                // boolean value: presence alone must not decide it, or
+                // enabled_only=false would silently behave like enabled_only=true
+                // (the caller asked to see disabled/all schedules and got the
+                // opposite). An unrecognized value 400s.
+                ScheduleQuery q;
+                if (req.has_param("definition_id"))
+                    q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only")) {
+                    auto v = req.get_param_value("enabled_only");
+                    if (v == "true" || v == "1") {
+                        q.enabled_only = true;
+                    } else if (v == "false" || v == "0") {
+                        q.enabled_only = false;
+                    } else {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                            "application/json");
+                        return;
+                    }
+                }
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked();
+                auto scheds_result = schedule_engine->query_schedules_checked(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,
@@ -2375,6 +2440,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& def = **def_result;
+
+        // #2437-class guard: raw-text depth check before parse - a
+        // parsed-then-dumped "params" value below (`v.dump()`, non-string
+        // coercion) still crashes on the dump, so this has to run on the raw
+        // text before any allocation.
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                            "application/json");
+            return;
+        }
 
         // Parse request body
         nlohmann::json j;
@@ -2688,6 +2764,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // closing brace, so the discriminator fields it carries must be copied out
         // to these outer locals if the sent==0 branch further down is to use them.
         bool containment_unreadable = false;
+        // WS-4 4.2b Task D: mirrors containment_unreadable exactly — copied
+        // out of dispatch_outcome for the same reason (the try block's own
+        // scope ends before the sent==0 branch below reads it).
+        bool route_unreadable = false;
         std::size_t denied_quarantined_count = 0;
         std::size_t unknown_plugin_count = 0;
         std::optional<std::string> scope_parse_error;
@@ -2720,6 +2800,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             command_id = dispatch_outcome.command_id;
             sent = dispatch_outcome.sent;
             containment_unreadable = dispatch_outcome.containment_unreadable;
+            route_unreadable = dispatch_outcome.route_unreadable;
             denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
             scope_parse_error = dispatch_outcome.scope_parse_error;
@@ -2804,6 +2885,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                "failing closed and reaching no agent; check the "
                                                "quarantine store"},
                                    {"reason", "containment_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            } else if (route_unreadable) {
+                // WS-4 4.2b Task D: the exact sibling of containment_unreadable
+                // above — a degraded gateway routing-directory read, not a
+                // per-target fact. Same priority tier, checked right after.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "the gateway routing directory could not be "
+                                               "read for one or more targets — dispatch is "
+                                               "failing closed rather than guessing where to "
+                                               "route"},
+                                   {"reason", "route_unreadable"},
                                    {"retry_after_ms", 5000},
                                    {"correlation_id", detail::ensure_correlation_id(res)}}},
                          {"meta", {{"api_version", "v1"}}}})

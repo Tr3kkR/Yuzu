@@ -34,6 +34,7 @@
 
 #include "autoruns_legs.hpp"
 
+#include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
 #include <yuzu/agent/runner_status.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
@@ -264,7 +265,7 @@ std::string owner_uid_string(const std::string& path) {
 //
 // Root-parameterized (paths passed in, never hardcoded), generalizing
 // lnx_cron_d's already-correct constraint-composition pattern
-// (ConstraintAccumulator, autoruns_parsers.hpp) across every OTHER
+// (yuzu::shared::ConstraintAccumulator, agents/shared/constraint_accumulator.hpp) across every OTHER
 // collector below that walks several directories/files -- so a test can
 // point each one at constructed temp directories, including ones
 // engineered to fail for a real (non-ENOENT) reason. PR #4154 round 9's
@@ -303,7 +304,7 @@ CollectorScanResult scan_cron_d(const std::string& dir, SourceId id) {
                         : (listing.permission_denied ? "permission_denied" : listing.other_token);
         return out;
     }
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     for (const auto& name : listing.names) {
         if (!run_parts_valid_name(name)) continue;
         std::string full = dir + "/" + name;
@@ -352,7 +353,7 @@ CollectorScanResult scan_run_parts_dirs(const std::vector<std::string>& dirs, So
     bool any_dir_readable = false;
     bool any_permission_denied = false; // existing "partial_permission_denied"/
                                         // "permission_denied" wording, preserved
-    ConstraintAccumulator acc; // NEW: row_cap + non-permission dir-open
+    yuzu::shared::ConstraintAccumulator acc; // NEW: row_cap + non-permission dir-open
                                // failures + per-entry stat failures
     for (const auto& dir : dirs) {
         auto listing = list_dir(dir);
@@ -440,7 +441,7 @@ CollectorScanResult scan_user_crontabs(const std::vector<std::string>& dirs, Sou
                                         // exactly (docs/agent-privilege-model.md
                                         // names this literal token for this
                                         // source)
-    ConstraintAccumulator acc; // NEW: row_cap + every other previously-
+    yuzu::shared::ConstraintAccumulator acc; // NEW: row_cap + every other previously-
                                // dropped failure class (non-permission
                                // dir-open failures, non-permission per-file
                                // read failures, malformed crontab content)
@@ -528,7 +529,7 @@ CollectorScanResult scan_at_spool(const std::string& dir, SourceId id) {
         return out;
     }
     bool any_permission_denied = false; // file-level EACCES/EPERM -- existing wording
-    ConstraintAccumulator acc; // NEW: row_cap + every other previously-
+    yuzu::shared::ConstraintAccumulator acc; // NEW: row_cap + every other previously-
                                // dropped per-file failure class
     for (const auto& name : listing.names) {
         if (!name.empty() && name.front() == '.') continue; // e.g. ".SEQ" sequence file
@@ -631,7 +632,7 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home
                                         // (docs/agent-privilege-model.md
                                         // names this literal token for this
                                         // source), preserved exactly
-    ConstraintAccumulator acc; // NEW: row_cap + non-permission per-home
+    yuzu::shared::ConstraintAccumulator acc; // NEW: row_cap + non-permission per-home
                                // directory-open failures + every other
                                // previously-dropped per-file failure class
     if (home_listing.truncated) acc.add_failure("row_cap");
@@ -663,12 +664,25 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home
                 continue;
             }
             auto entry = parse_desktop_entry(*content);
+            if (entry.malformed) {
+                // No [Desktop Entry] group, or an empty/absent Exec with no
+                // DBusActivatable=true launch mechanism either -- there is
+                // nothing this leg could run or name, so this is a real
+                // constraint (AC4: never a plain `enabled` row with an
+                // empty target reported as a genuine autostart entry).
+                acc.add_failure("malformed");
+                continue;
+            }
             Row row;
             row.source_id = id;
             row.catalog_version = kAutorunSourceCatalogVersion;
             row.location = full;
             row.entry = name;
-            row.target = entry.exec;
+            // DBusActivatable=true with no Exec launches via D-Bus service
+            // activation, not a direct command -- name that mechanism
+            // instead of reporting an empty (and therefore misleading)
+            // target for a real persistence entry.
+            row.target = entry.exec.empty() ? "(dbus-activated, no Exec)" : entry.exec;
             row.enabled = entry.enabled;
             row.scope = Scope::user;
             row.user = uid;
@@ -1269,9 +1283,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         const SourceId id = SourceId::lnx_anacrontab;
         auto content = read_file_bounded("/etc/anacrontab");
         if (content) {
-            auto entries = parse_anacrontab(*content);
+            auto parsed = parse_anacrontab(*content);
             const std::int64_t mtime = mtime_of("/etc/anacrontab");
-            for (const auto& e : entries) {
+            for (const auto& e : parsed.entries) {
                 Row row;
                 row.source_id = id;
                 row.catalog_version = kAutorunSourceCatalogVersion;
@@ -1286,7 +1300,13 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 row.mtime = mtime;
                 ctx.write_output(format_row(row));
             }
-            emit_status(id, YUZU_SUPPORT_SUPPORTED, entries.size(), "-");
+            // A malformed line keeps its OTHER valid entries (never drops
+            // the whole file) but flags the source constrained -- matches
+            // lnx_cron_d's identical parse_crontab().rejected_lines
+            // consumption.
+            emit_status(id, parsed.rejected_lines > 0 ? YUZU_SUPPORT_CONSTRAINED
+                                                       : YUZU_SUPPORT_SUPPORTED,
+                       parsed.entries.size(), parsed.rejected_lines > 0 ? "malformed" : "-");
         } else {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/true);
             emit_status(id, cls.support, std::size_t{0}, cls.reason);
@@ -1497,12 +1517,25 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     continue;
                 }
                 auto entry = parse_desktop_entry(*content);
+                if (entry.malformed) {
+                    // No [Desktop Entry] group, or an empty/absent Exec with
+                    // no DBusActivatable=true launch mechanism either --
+                    // nothing this leg could run or name, so this is a real
+                    // constraint (AC4), matching the per-user XDG
+                    // autostart collector's identical handling above.
+                    note_file_constraint(any_file_constrained, file_constrained_reason,
+                                         "malformed");
+                    continue;
+                }
                 Row row;
                 row.source_id = id;
                 row.catalog_version = kAutorunSourceCatalogVersion;
                 row.location = full;
                 row.entry = name;
-                row.target = entry.exec;
+                // See the per-user collector above: D-Bus activation is a
+                // real launch mechanism, so name it instead of leaving the
+                // target empty.
+                row.target = entry.exec.empty() ? "(dbus-activated, no Exec)" : entry.exec;
                 row.enabled = entry.enabled;
                 row.scope = Scope::system;
                 row.user = "-";

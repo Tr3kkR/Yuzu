@@ -94,6 +94,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
   - [Result Sets](#result-sets)
+  - [Forensics](#forensics)
   - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -298,6 +299,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
@@ -407,8 +409,8 @@ Fetch one device's identity.
 }
 ```
 
-`tags` is present only when a TagStore is configured; it is omitted entirely (never an empty
-array) when it is not. A device outside the caller's fleet-read scope returns the SAME 404 as a
+`tags` is always present (`[]` when the device has no tags, or in the never-hit-in-production case
+of an unwired TagStore). A device outside the caller's fleet-read scope returns the SAME 404 as a
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).
@@ -969,7 +971,7 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints a successor token while the existing (predecessor) token stays valid for an overlap window — at most **two** active tokens in the rotation group during the overlap. `{token_id}` in the path is the **predecessor's** id. The raw successor secret is returned exactly once per reveal (see the grace-window re-serve note below), the same discipline the engine-principal `credentials/rotate` route above uses. MFA step-up runs on **every** call to this route, including an idempotent re-serve.
 
-**Permission:** `ApiToken:Rotate` — a DISTINCT operation from `ApiToken:Write` (round-4 security finding): `ApiToken:Write` also gates `POST /api/v1/tokens` (mint) and its settings twin, so a shared op would let an operator-tier MCP token mint a brand-new, caller-chosen-tier token — a privilege escalation, not a parity fix. See `mcp_policy.hpp`'s `tier_allows()` operator-tier comment for the full analysis.
+**Permission:** `ApiToken:Rotate` — a DISTINCT operation from `ApiToken:Write` (round-4 security finding): `ApiToken:Write` also gates `POST /api/v1/tokens` (mint) and its settings twin, so a shared op would let an operator-tier MCP token mint a brand-new, caller-chosen-tier token — a privilege escalation, not a parity fix. See `mcp_policy.hpp`'s `tier_allows()` operator-tier comment for the full analysis. Under the default RBAC-off configuration, this permission is reachable by any non-admin owner (#2963 legacy self-service allowlist) — ownership, not role, is what actually gates who can succeed; see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation.
 
 **Ownership constraint — self-service only, no admin bypass:** unlike `DELETE /api/v1/tokens/{token_id}` above, there is **no** admin override here. A human token's raw successor secret authenticates *as that user*, so an admin rotating or confirming someone else's token would hand out (or complete the cutover of) a credential that impersonates them — identity takeover, not a permission gap an admin role could legitimately cross. An admin who needs to act on another user's token still has `DELETE` (revoke). Attempting to rotate a token you do not own returns `404 token not found` — identical to the response for a token that does not exist, closing the same enumeration-oracle gap the DELETE route closes. Denied attempts are recorded in the audit log with `action=api_token.rotate`, `result=denied`, and `detail=owner=<real owner>`.
 
@@ -1008,10 +1010,10 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 | Condition | Response |
 |---|---|
 | No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
-| The token exists and IS owned by the caller, but the caller's OWN current `mcp_tier`/`scope_service` (from their authenticated session) does not equal the token's own (the authority-inheritance guard) — includes an untiered dashboard/cookie session attempting to rotate its owner's MCP-tiered or service-scoped token | `400` — `no such token to rotate` (store-level; distinct from the route's own `404` pre-check above, and worded identically to the absent/not-owned case on purpose, so this is not an authority-probing oracle either — see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation) |
+| The token exists and IS owned by the caller, but the caller's OWN current `mcp_tier`/`scope_service` (from their authenticated session) does not equal the token's own (the authority-inheritance guard), AND the caller holds SOME non-empty `mcp_tier`/`scope_service` of its own — a caller holding NO standing tier/scope at all (an untiered dashboard/cookie session) is instead admitted regardless of the token's own tier/scope (#2963; the successor still inherits the token's own tier/scope, never the caller's) | `400` — `no such token to rotate` (store-level; distinct from the route's own `404` pre-check above, and worded identically to the absent/not-owned case on purpose, so this is not an authority-probing oracle either — see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation) |
 | `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
 | Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
-| Overlap window would outlive the predecessor's or the successor's own expiry | `400` |
+| Overlap window would outlive the predecessor's or the successor's own expiry — by design, a token within 24h of its own expiry cannot be rotated (rotation is lifetime-neutral, so there is no way to shrink the overlap below the 24h floor to fit); mint a new token instead | `400` |
 | The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
 | The token is revoked or already expired | `400` — `credential is not currently active — nothing to rotate` |
 | Two active tokens in the rotation group exist but are not a recognized predecessor/successor pair | `400` — resolve via revoke, not rotate |
@@ -1053,7 +1055,7 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 }
 ```
 
-**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above; the successor's tier/scope are fixed at mint time and cannot legitimately diverge from what the caller who initiated the rotation already held, so this path is not reachable today outside a future bypass of `rotate`'s own guard).
+**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above, including the #2963 empty-tier/scope exception). **This is not a same-session pin** — the caller confirming does not have to be the same session that called `rotate`; ownership and the raw successor secret (proof of possession) are the actual gates on who may confirm. The check re-verifies that the CALLER'S CURRENT `mcp_tier`/`scope_service` equals the successor's own (or the caller holds no standing tier/scope at all, #2963) — since the successor's tier/scope are fixed at mint time and cannot legitimately diverge from the predecessor's, this defense-in-depth check is not reachable as a live path today for a caller presenting the correct current authority, outside a future bypass of `rotate`'s own guard.
 
 `secret` missing, empty, or not a string is `400` — `secret required` (checked before the `404` ownership belt, see above). A wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome, reachable only after every other admission check has already passed. If the authoritative successor row cannot be re-read to verify the secret (should not happen under the lock already held), that's a fail-closed `503` — `failed to verify rotation secret`, folded into the general store-failure `503` row above.
 
@@ -4222,7 +4224,8 @@ another OIDC field, restart first so the process is not holding the old value.
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
-> 'value' in request body", `400` "invalid JSON body", and a `503` "runtime config store unavailable"
+> 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
+> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
@@ -5417,13 +5420,59 @@ non-terminal, so offset-based paging would silently skip or duplicate rows; a ca
 exactly: the caller's visible agent set is resolved and pushed into the store query before `limit`
 (ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`.
 
+#### `GET /api/v1/executions/{id}/children` (#2146 A2-R1)
+
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint - same gate, same confinement
+rules, and the same `execution_child_row_json` shared builder as the legacy
+`GET /api/executions/{id}/children` route documented above (`docs/api-twin-recipe.md` Rule 1). MCP
+twin: `get_execution_children`. An invisible or nonexistent parent returns `404` with no existence
+oracle; under a confined grant, each child is checked against the caller's visibility
+**independently** of the parent's own visibility - a visible parent does not by itself disclose a
+child dispatched by, or targeting, someone else (#3789). Not audited on a successful read (matches
+the legacy route's own posture); a confined denial is audited as `execution.read`. The underlying
+query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible
+limit/cursor), with the cap now pushed down TOGETHER WITH the caller's own visibility scope, before
+`LIMIT` - a confined caller's cap applies to their own visible children, not the fleet-wide raw row
+set, so an invisible sibling can no longer displace a visible child out of the capped window;
+`data.result_truncated_by_cap: true` means that scoped row set exceeded the cap.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "children": [
+      { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is added (`true`):
+
+```json
+{
+  "data": {
+    "children": [ { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 } ],
+    "result_truncated_by_cap": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 #### `GET /api/v1/schedules`
 
 **Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is
 denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
 confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
-`list_schedules` (widened by this PR to include `execution_count`). **Not** the separate legacy
-unversioned `GET /api/schedules` documented above — a distinct, untouched capability.
+`list_schedules` (widened by this PR to include `execution_count`). Accepts `definition_id` and
+`enabled_only` query parameters (#2146 A2-R1). `enabled_only` is a real boolean here (`true`/`1` or
+`false`/`0`; any other value 400s), matching the #4034 precedent already set on `GET
+/api/v1/policies` and MCP `list_schedules` - **not** the legacy unversioned `GET /api/schedules`
+route's parsing, where any presence of `enabled_only` is treated as true regardless of value. This
+route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
+/api/schedules` documented above.
 
 ---
 
@@ -5550,7 +5599,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Like `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All seven share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds`, `plugin-docs` and `plugin-docs/{name}` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs`, and `/discover/plugin-docs/{name}` as the MCP resource template `yuzu://plugin-docs/{name}` (`resources/templates/list`). REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -5719,7 +5768,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 > **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
-Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). `resource` names the per-plugin endpoint below (or the MCP resource template of the same shape). The full manifest is that endpoint, or the whole-catalog one above it.
 
 #### `GET /api/v1/discover/plugin-docs`
 
@@ -5766,6 +5815,18 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
 
 Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
 
+#### `GET /api/v1/discover/plugin-docs/{name}`
+
+One plugin's manifest, narrower than the whole-catalog route above (#4108) — the exact same object the catalog carries at `plugins[]` for that name, byte-identical. Same `manifest_by_name` builder as the catalog and as the MCP resource template `yuzu://plugin-docs/{name}`, so all three cannot drift from each other. The permission gate runs BEFORE the name lookup, so a caller without `Infrastructure:Read` learns nothing about which plugin names exist.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:** the single manifest object shown above for `disk_actions` (same key set, no wrapping envelope — no `catalog`/`version`/`plugins[]`).
+
+**Errors:** `404` (A4 envelope) when no manifest documents that name.
+
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the catalog route.
+
 ---
 
 ### Inventory
@@ -5809,15 +5870,39 @@ One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
-narrowed.
+narrowed. **(#4496)** A candidate inventory record excluded by the JSON depth
+guard (a poisoned/over-nested `data_json` row; the exclusion check runs
+before condition matching, so a record's plugin/fields need not relate to
+the query's conditions to trigger it; see json-dump-depth-guard below) gets
+the identical treatment: the route returns **503**
+("inventory record(s) excluded for nesting too deeply ... refusing to
+materialise a result set narrower than the true match set") rather than
+silently dropping the poisoned agent from membership: this is a
+DELIBERATE choice, unlike the read-only `POST /api/v1/inventory/evaluate` and
+`POST /api/inventory/query` routes below, which surface the same exclusion as
+a `results_excluded_by_poison` count field, this route materialises its
+match set into a *durable* result set other operators/dispatches consume
+later, so a flag on this response would never reach them. **(#4496
+follow-up)** A candidate inventory record excluded because its `data_json`
+failed to parse as JSON at all gets the SAME **503** treatment
+("inventory record(s) excluded for failing to parse as JSON ... refusing to
+materialise a result set narrower than the true match set"), as a
+distinctly-named sibling refusal, checked in a fixed sequence AFTER the
+depth-guard one above: a candidate set carrying both problems reports only
+the depth-guard (`poison_excluded`) refusal on that call, and the
+parse-error refusal surfaces on a subsequent retry once the poisoned record
+is fixed - so a caller is always told which cause remains, never that both
+have cleared at once.
 
 **Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
 route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`; a
-service-scoped API token is denied by the same gate). The owner-scoped
+/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
+result-set siblings, a service-scoped token is admitted and confined here,
+not denied outright** - see the "Result Sets" section below for the exact
+gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
 result-set row it creates is only readable/mutable by its own creator
 through the routes below, which — like their HTMX dashboard twins — also
 deny a service-scoped token outright: `session->username` is the *minting*
@@ -5847,11 +5932,31 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 **supplied** `parent_id` that is empty, non-string, or `null` is refused with
 `400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
 
+**`{id}/re-eval` field bounds (#4373).** The original set's re-run fields are
+rechecked against the same bound values used elsewhere, because the original
+row may have been minted through `POST /api/v1/result-sets` directly (which
+carries no `source_kind` allowlist) rather than through
+`from-tar-query`/`from-instruction-result`, and so may never have been
+validated at all: `sql` (tar_query) at 100 KiB, the bound `from-tar-query`
+itself already enforces at creation time; and `instruction_id`
+(instruction_result) at 256 bytes plus `params` at 32 keys / 256-byte keys /
+64 KiB values, the same bounds REST's own `from-instruction-result` route now
+also enforces at creation time (#4373), matching the MCP tool
+`create_result_set_from_instruction_result`. A `params` that is present but
+not a JSON object (a string, array, or number) is refused outright rather
+than silently dispatching with an empty params map. A type-mismatched
+`sql`/`instruction_id` value (not a JSON string) is treated as absent, taking
+the existing missing-field 400 path, rather than surfacing as an uncaught
+exception (#4406, fixed on both `from-tar-query` and `from-instruction-result`
+in the same change).
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
@@ -5961,6 +6066,26 @@ absent devices may simply not have
 been read rather than not matching. (The typed software route carries the same
 flag inside `data` — placement alignment is tracked with #2633.)
 
+`results_excluded_by_poison` (integer, optional, #4496): emitted at the same
+top level, present and non-zero when one or more candidate inventory records
+were excluded because their stored `data_json` nested past the JSON depth
+guard (a poisoned/over-nested row; the exclusion check runs before condition
+matching, so a record's plugin/fields need not relate to the query's
+conditions to trigger it; see json-dump-depth-guard below). The returned
+matches may be missing some the caller cannot detect any other way.
+Distinct from `result_truncated_by_cap` (a row/byte cap on the underlying
+read, not a per-record exclusion); either, both, or neither may be present
+on a given response.
+
+`results_excluded_by_parse_error` (integer, optional, #4496 follow-up):
+emitted at the same top level, present and non-zero when one or more
+candidate inventory records were excluded because their stored `data_json`
+failed to parse as JSON at all (a syntax defect, not over-nesting). A
+distinctly-named sibling of `results_excluded_by_poison` above, kept separate
+so a caller can tell WHICH guard excluded a record - the two causes are
+different (malformed JSON vs. over-nested JSON) and both, either, or neither
+may be present on a given response alongside `result_truncated_by_cap`.
+
 **Errors:**
 
 | Status | Reason |
@@ -6027,6 +6152,10 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 ### Result Sets
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
+
+**JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
+
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -6104,6 +6233,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
+| 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 403 | Service-scoped API token |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
@@ -6199,6 +6329,47 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ---
 
+### Forensics
+
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+
+#### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
+
+One device's per-executable last-used projection — the per-agent drill. Because it renders behavioural data, every open is **audited fail-closed**: if the `app_usage.agent.view` audit row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no data is served.
+
+**Permission:** `Forensics:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "apps": [
+      {"exe_key": "chrome.exe", "first_seen": 1751000000, "last_seen": 1751600000,
+       "run_count_30d": 42, "total_seconds_30d": 86400}
+    ],
+    "collected_at": 1751600000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`first_seen`/`last_seen` are **within TAR's retained usage window** (31 days default, operator-tunable) — never a value spanning the executable's full run history. An executable absent from `apps` has not run inside that retained window; it does not mean the executable has never run. An agent that genuinely reported no rows for the window is `200` with `apps: []`.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `Forensics:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+
+---
+
 ### Software Licensing (SLE)
 
 The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
@@ -6244,7 +6415,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf, and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -6259,8 +6430,8 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted"},
-    "deleted": 4,
+               "software_licensing": "deleted", "app_usage": "deleted"},
+    "deleted": 5,
     "skipped": 1,
     "failed": 0
   },
@@ -6482,7 +6653,7 @@ Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bun
 
 | Status | Cause |
 |---|---|
-| `400` | Invalid JSON, missing/empty `agent_id`, missing/empty `steps`, more than 32 steps, an unsafe plugin/action identifier, or a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step). |
+| `400` | Invalid JSON, missing/empty `agent_id`, missing/empty `steps`, more than 32 steps, an unsafe plugin/action identifier, a param key/value over the size cap (key ≤ 256 B, value ≤ 64 KiB, ≤ 32 params/step), or a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`). |
 | `500` | The authenticated session resolved to an empty principal (a bundle must be attributable to its dispatcher). |
 | `503` | Command dispatch or response store unavailable. |
 
@@ -7081,6 +7252,7 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "data": [
     {
       "id": "alert-001",
+      "license_id": "lic-001",
       "alert_type": "expiration_warning",
       "message": "License expires in 30 days",
       "triggered_at": 1711900800,
@@ -7491,8 +7663,9 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+- **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7503,6 +7676,7 @@ Fetch a single rule.
 - **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token queries this route (same reasoning as `GET .../rules` above).
 - **5xx:** `503` if the store degrades (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.read` (`denied` only).
+- **MCP twin:** `get_guardian_rule` (#2146 Batch B1) — same store read.
 
 #### `PUT /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7512,9 +7686,10 @@ Update a rule. Version is incremented on every successful update regardless of w
 - **Request body:** Any subset of the create-body fields *except* `enforcement_mode` (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
 - **`enforcement_mode` is immutable.** A body whose `enforcement_mode` differs from the stored value is rejected with `400` (`enforcement_mode is immutable — create a new Guard for a different posture (Watch vs Enforce)`); a different posture is a different Guard. A no-op echo of the current value is accepted.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON, an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict; `403` if a service-scoped API token calls this route (same reasoning as the create route above).
+- **4xx:** `400` invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict; `403` if a service-scoped API token calls this route (same reasoning as the create route above).
 - **5xx:** `503` if the pre-update rule lookup hits a degraded store (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.update`.
+- **MCP twin:** `update_guardian_rule` (#2146 Batch B1) — same validation and version-bump. No optimistic-concurrency check against concurrent writers on either transport (tracked in #4303).
 
 #### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7523,6 +7698,7 @@ Delete a rule.
 - **Permission:** `GuaranteedState:Delete`
 - **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token calls this route (same reasoning as create/update above).
 - **Audit:** `guaranteed_state.rule.delete`.
+- **MCP twin:** `delete_guardian_rule` (#2146 Batch B1). Does NOT automatically push an unarm to agents already enforcing the rule (tracked in #4304).
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}/status`
 
@@ -7559,6 +7735,7 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 - **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it.
 - **5xx:** `503` if the Guaranteed-State rule store is degraded or unreachable (A4 envelope, `retry_after_ms: 5000`) — the push is refused rather than fanned out empty (ADR-0038). Retry once the store recovers; a `503` here means "cannot read the rules," never "zero rules configured." The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
+- **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.
 
 #### `GET /api/v1/guaranteed-state/events`
 
@@ -7618,6 +7795,7 @@ if the audit row cannot persist.
 - **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 - **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store (A4 envelope, `retry_after_ms: 5000`) — never a silent `0`.
+- **MCP twin:** `get_guardian_agent_status` (#2146 Batch B1) — calls the SAME `guardian_agent_status_rollup` builder and the SAME `scoped_perm_fn` gate, so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
 #### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 
@@ -7626,6 +7804,7 @@ Name-anchored, device-applicable Guardian compliance — the machine-readable si
 - **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **MCP twin:** `get_guardian_device_compliance` (#2146 Batch B1) — calls the SAME `guardian_device_compliance_rollup` builder and the SAME `scoped_perm_fn` gate; all four underlying reads complete before the access audit fires on either transport, so a degrade can never surface after an audited "success".
 - **Evidence integrity — fail-closed (CC7.2).** This is a behavioural-PII read, so if the `guardian.device.view` audit row cannot persist (locked store, disk-full, or a pipeline exception — including a throwing audit pipeline) the endpoint **refuses to serve**: it returns **`503` + `Sec-Audit-Failed: true`** with an A4 envelope carrying a `retry_after_ms` hint, and **withholds the compliance body** — parity with `GET /api/v1/dex/devices/{id}`. Serving audited per-device compliance while the evidence row is known-lost is exactly what audit-on-open prevents. The `503` is returned **before** the `404`, so an audit outage never reveals baseline existence without durable evidence. A CMDB integration should treat `Sec-Audit-Failed: true` as "retry after the audit subsystem recovers," not a permanent error; an audit-off deployment (no audit callback wired) serves normally. (The realistic failure modes also increment `yuzu_server_audit_emit_failed_total` and log to `spdlog`.) **Blast radius:** because this is the fleet-polled CMDB endpoint and there is no degraded-serve fallback, a *sustained* audit-store outage 503s **every** poll fleet-wide — size audit-store availability for the polling load, and expect a compliance-data blackout (not stale data) for the duration. (Per-route retry jitter to avoid synchronized retries across pollers is a tracked platform-wide hardening, #1647.)
 - **Query params:** `baseline` (the Baseline **name**, unique; URL-encode spaces, e.g. `ServiceNow%20Compliance`), `agent_id` (the device). Both required.
 - **`400`** if either param is missing, exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected), or contains control characters (bytes `< 0x20`); **`403`** if the caller lacks `Read` on the device's scope (checked **before** the baseline lookup, so an out-of-scope caller gets `403` even for an unknown name — no name-existence oracle); **`404`** if no Baseline has that name; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry, no `retry_after_ms`) **or if the baseline store or the guaranteed-state store itself faults** (DB locked/corrupt — *retryable*, A4 envelope with `retry_after_ms: 5000`; a transient store fault returns `503`, not the `404` a CMDB would otherwise read as "no such baseline → delete this CI"). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
@@ -7736,7 +7915,7 @@ One signal type's drill-down.
 Fleet device-performance now-stats — the same numbers as the `yuzu_fleet_perf_*` Prometheus gauges and the `/dex` Performance tab, computed at request time.
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online` counts online Windows devices — historically the coverage-honest denominator when perf collectors were Windows-only. **Known limitation:** the TAR perf collector now also runs on Linux, so `reporting` can legitimately exceed `windows_online` on mixed fleets; an OS-aware denominator is a tracked follow-up. Not audited.
+- **Response:** an object `{cpu_pct, commit_pct, disk_lat_ms, reporting, windows_online, linux_online, macos_online, reporting_windows, reporting_linux, reporting_macos}` where each metric is `{avg, p50, p90, max, n}` **or `null`** when no device reported it this cycle (absent, never 0). `reporting` counts devices contributing at least one metric; `windows_online`/`reporting` are byte-identical to their historical values — only the trailing fields are new. `linux_online`/`macos_online` are the same online-count per OS, and `reporting_windows`/`reporting_linux`/`reporting_macos` split the reporting population by OS, closing the previous known limitation where `reporting` could legitimately exceed the Windows-only `windows_online` denominator on a mixed fleet. `reporting_macos` is always 0 today — `macos_online` counts real online macOS agents, but no macOS perf collector exists yet (honest absence, not a bug). Not audited.
 
 #### `GET /api/v1/dex/perf/cohorts`
 
@@ -7759,8 +7938,8 @@ The direct **A-vs-B** cohort comparison (e.g. `image_type` vanilla vs layered, o
 The one device list behind every Performance drill: worst devices by a metric (default), the not-reporting complement, or one cohort's members.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (Windows devices with no perf sample this cycle. **Known limitation:** Linux perf devices are excluded from this complement list — same OS-aware-denominator follow-up as `/dex/perf/fleet` above — so a Linux non-reporter does not appear here); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
-- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric). `400` on an invalid `cohort_key` or `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
+- **Query parameters:** `metric` (`cpu` / `commit` / `disk_lat`, default `cpu`); `filter=not_reporting` (devices of an OS with a real perf collector — Windows and Linux today — that had no perf sample this cycle; a macOS device never appears, collector or not); `cohort_key` (display key — always resolved, default `model`, so rows carry real cohort values); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
+- **Response:** `data[]` of `{agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os}`, worst-first by the sort metric (`fleet_pctile` is the device's nearest-rank position among all reported values; omitted when the device did not report the metric; `os` is the normalized token — `windows`/`linux`/`macos`/empty for unrecognized). `400` on an invalid `cohort_key` or `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
 - **Audit (behavioral PII):** each row is an `agent_id` + its perf metrics, individual-identifying, fleet-wide — emits **`dex.perf.device.view`** (`target_type=GuaranteedState`, `target_id=` empty) before serving. A denied service-scoped token also emits this verb (`result=denied`). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list.
 
 ### Application performance over time
@@ -7784,6 +7963,17 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
 - **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
 - **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
 
+#### `GET /api/v1/dex/perf/app/devices`
+
+The version-row "which devices" drill: unlike `/perf/app` above, each row here names an `agent_id` — a fleet-wide fan-out of identified per-device data (B1, up to 31 days) — so this route's authorization posture is entirely different from its aggregate sibling. Devices reporting one EXACT `(app, version)` among their retained top-N daily summaries, one row per device at its most recent reporting day for that version. **Not a census**: a device absent here may still run this app-version, just not among its top-N resource consumers that day (use the [software inventory](inventory.md) endpoints for a full install census).
+
+- **Permission:** `GuaranteedState:Read`, gated on `AuthRoutes::require_fleet_read` (ADR-0017 admit-then-filter) as the **sole** gate — never stacked with a bare permission check. A management-group- or service-scoped caller gets the real, narrowed `agent_id` intersection pushed into the store query itself (never a post-fetch filter), so a confined caller never sees an unfiltered page and a fully-confined-empty caller sees zero rows, not the whole fleet.
+- **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters. `version` — **required and present** (unlike `/perf/app`'s "omit = all versions" convention): this drill is always scoped to exactly one version; pass an empty string for the unknown-version bucket (the only bucket Linux agents report today — Linux procperf does not yet capture a file version) rather than omitting the parameter, which is rejected with `400`.
+- **Response:** `{app, version, truncated, devices[]}` where each device is `{agent_id, last_day, samples, cpu_avg, ws_avg_bytes}`. Rows are ordered by descending `cpu_avg` and capped; `truncated:true` means only the highest-CPU devices are returned, not an arbitrary subset. `400` on a missing/invalid `app`/`version`; `403` if the caller lacks `GuaranteedState:Read`; `503` on store degrade or a dropped audit row (`Sec-Audit-Failed: true`).
+- **Retention mismatch:** per-device data (B1) retains only 31 days, shorter than the fleet trend's 180-day (B2) window above — a version last reported more than a month ago legitimately returns `devices: []` even though `/perf/app` still shows aggregate history for it. This is expected, not a bug; the two stores retain independently.
+- **Headers:** `X-Correlation-Id` echoed on every response path.
+- **Audit:** emits `dex.app_perf.devices.view` (`target_type=GuaranteedState`, `target_id=""`, `detail` carries `app=<name> version=<token> devices=<n> cid=<correlation_id>`) **after** the read (so the count is honest) but **before** the response is sent — fail-closed: a persist failure returns `503` + `Sec-Audit-Failed: true` and serves no device data, same contract as `GET /api/v1/dex/devices/{id}/app-perf`. **MCP twin:** `list_dex_app_perf_devices`, set-and-proceed (`audit_persisted:false` in the body on a dropped row, no `Sec-Audit-Failed` header channel).
+
 #### `GET /api/v1/dex/perf/group`
 
 The same trend shape, aggregated **on-the-fly over one management group's member devices** (B1, **up to 31 days** — shorter than the fleet's 180-day B2 window, so a group series is shorter for the same app).
@@ -7792,6 +7982,15 @@ The same trend shape, aggregated **on-the-fly over one management group's member
 - **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
 - **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade.
 - **Audit:** `dex.perf.group.view` (`denied` only — an ordinary successful read is not audited, matching this route's existing aggregate/cohort posture).
+
+#### `GET /api/v1/dex/perf/tag`
+
+The same trend shape as `/dex/perf/group` above, aggregated **on-the-fly over the devices carrying one tag VALUE** instead of a management-group id (B1, up to 31 days) — the REST/MCP twin of the dashboard's device-model cohort filter, mutually exclusive with the group scope. A tag-value cohort (e.g. one hardware model) is equally a "named set of specific devices", so it shares `/dex/perf/group`'s exact confinement, floor, and service-scoped-denial posture.
+
+- **Permission:** `GuaranteedState:Read`. Same global-permission gate and the same DIFFERENT-axis service-scoped-token caveat as `/dex/perf/group` — see that section. A service-scoped API token is denied outright (`403`).
+- **Query parameters:** `key` — optional tag key, default `"model"`; must match `^[A-Za-z0-9_.:-]{1,64}$` (`400` otherwise). `value` — **required**, ≤ 512 bytes, no control characters (an omitted or empty `value` is `400` — there is no "every value" wildcard). `app` — **required**, same rule. `version` — optional, same rule.
+- **Response:** `{key, value, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An unknown tag value returns `200` with `points: []` (not a `503`) — indistinguishable from a genuinely empty cohort. `400` on a missing/invalid parameter; `503` on store degrade.
+- **Audit:** `dex.perf.tag.view` (`denied` only — an ordinary successful read is not audited, matching `/dex/perf/group`'s posture).
 
 #### `GET /api/v1/dex/perf/compare`
 
@@ -8536,8 +8735,9 @@ uniqueness against existing definitions.
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
-`approval_mode`, malformed JSON, or an `id` under the reserved `mcp.` prefix).
-Body is `{"error": "<reason>"}`.
+`approval_mode`, malformed JSON, a request/`parameter_schema`/`visualization_spec`/
+`response_templates_spec` body nesting deeper than 32 levels (`kMcpMaxJsonDepth`),
+or an `id` under the reserved `mcp.` prefix). Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
 tickets, and a definition authored under that prefix could line up with an MCP
@@ -8817,7 +9017,11 @@ visible agents under a confined grant. **Response (404):** unknown or outside-sc
 **Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
 child is independently checked against the caller's visibility — a visible parent does not by
 itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
-outside-scope parent id.
+outside-scope parent id. The underlying query is hard-capped at 100 rows (governance Gate 8
+re-review fix, #2146 A2-R1; no caller-visible limit/cursor), with the cap now pushed down TOGETHER
+WITH the caller's own visibility scope, before `LIMIT` - a confined caller's cap applies to their
+own visible children, not the fleet-wide raw row set. `result_truncated_by_cap: true` is added
+alongside `children` when that scoped row set exceeded the cap.
 
 #### `POST /api/executions/{id}/rerun`
 
@@ -8960,6 +9164,79 @@ Validate a scope expression without executing it.
 }
 ```
 
+#### `POST /api/v1/scope/validate`
+
+Versioned twin of the legacy route above (#2146 Batch B2) — and of the MCP
+`validate_scope` tool. All three call the same `yuzu::scope::validate()`, so
+none of them can silently diverge on what counts as a valid expression.
+
+**Permission:** Session-authenticated only — no RBAC gate (a syntax-only
+check with no data disclosure), matching the legacy route and `validate_scope`
+exactly.
+
+**Request body:** same shape as the legacy route above.
+
+**Response:** `{"data": {"valid": true, "expression": "..."}, "meta": {"api_version": "v1"}}`, or
+`{"data": {"valid": false, "error": "..."}, "meta": {"api_version": "v1"}}` for a syntactically invalid
+expression (still a `200` — the *response* reports validity, the request itself is well-formed).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing or empty |
+
+#### `POST /api/v1/scope/preview`
+
+Versioned twin of the MCP `preview_scope_targets` tool (#2146 Batch B2) — no
+legacy unversioned twin exists (`POST /api/scope/estimate` below is a
+*different* capability: a matched/total **count** only, for the workflow
+builder's own confined `scope_fn`). Both this route and `preview_scope_targets`
+call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
+matched-agent set cannot drift between transports. A `tag:<key>` atom in the
+expression resolves from the persistent tag store **only** — unlike a real
+dispatch, which also falls back to a connected agent's own live self-report —
+see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+and `props.*` atoms are not resolved by this preview** - the resolver only
+populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
+(including `from_result_set:`, this feature's own headline scope-walking
+primitive) is treated as unset and never matches, silently returning
+`matched_count: 0` for a composed expression that uses one - a genuine
+dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
+rely on this preview for an expression containing `from_result_set:` or
+`props.`; tracked in `#4307`.
+
+**Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
+chokepoint (ADR-0017) — this route discloses agent identities, unlike the
+syntax-only validate route above, so a management-group-confined caller's
+`matched_agents`/`matched_count` are narrowed to their own visible devices
+before the preview builder runs, never the whole fleet.
+
+**Request body:** `{"expression": "..."}`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "expression": "os = 'windows'",
+    "matched_count": 42,
+    "matched_agents": ["agent-001", "agent-002"],
+    "warning": "scope matches 63 agents (>50). Phase 2 write operations targeting this scope will require approval."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`warning` is present only above the 50-agent display threshold.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing/empty, or fails to parse/validate |
+| 503 | The expression references a `tag:<key>` atom and the bulk tag-store preload degraded (`retry_after_ms: 5000`) — never silently under-reports the match set |
+
 #### `POST /api/scope/estimate`
 
 Estimate how many agents match a scope expression.
@@ -9058,8 +9335,14 @@ valid, else returned as a raw string. `404` if no record exists for that agent+p
 Query inventory records across agents. Request body (all fields optional):
 `{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
 `limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
-"count": N, "result_truncated_by_cap": bool}` — `result_truncated_by_cap` is `true` when
-more matching rows existed than `limit` allowed.
+"count": N, "result_truncated_by_cap": bool, "results_excluded_by_poison": N}`.
+`result_truncated_by_cap` is `true` when more matching rows existed than `limit`
+allowed; `results_excluded_by_poison` (#4496) is the count of matching rows
+excluded because their stored `data_json` nested past the JSON depth guard (a
+poisoned/over-nested row), emitted unconditionally (`0` when none were
+excluded) so a short `count` can never be mistaken for "nothing else
+matched": the two truncation causes are otherwise indistinguishable from the
+response alone.
 
 **Storage failure (all three routes):** a null/unopened inventory store returns `503`
 (`{"error":{"code":503,"message":"inventory store not available"}}`); a store that opens
@@ -9803,7 +10086,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `tools/list` | List available MCP tools for the current tier |
 | `tools/call` | Invoke an MCP tool by name with arguments |
 | `resources/list` | List available MCP resources |
-| `resources/read` | Read an MCP resource by URI |
+| `resources/templates/list` | List available MCP resource templates |
+| `resources/read` | Read an MCP resource by URI, or a resource template with a parameter substituted |
 | `prompts/list` | List available MCP prompts |
 | `prompts/get` | Get a prompt template by name |
 
@@ -9842,7 +10126,9 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 |---|---|
 | `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
-| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. Denial audited under `dex.perf.group.view`. |
+| `list_dex_app_perf_devices` | The version-row "which devices" drill — the MCP twin of `GET /api/v1/dex/perf/app/devices`. Required `app` AND `version` (version is present-required, unlike `get_dex_app_perf`'s "omit = all versions"; pass `""` for the unknown-version bucket). Unlike its aggregate siblings in this table, each row names an `agent_id`, so it gates on `require_fleet_read` (ADR-0017) instead of a bare permission check, confining a management-group/service-scoped caller to their visible devices with the filter pushed into the store query. Emits the dedicated `dex.app_perf.devices.view` audit verb (set-and-proceed, `audit_persisted:false` on a dropped row) plus the generic `mcp.list_dex_app_perf_devices` call audit. `truncated:true` means only the highest-CPU devices are returned. |
+| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. This tool's own interim deny call was retired as provably dead code (guardian-confinement-2298 PR 3 "the flip", #3290 Phase 2 bucket 1a): the shared `perm_fn` (`AuthRoutes::require_permission`) already denies any service-scoped token outright for `(GuaranteedState, Read)` before this tool-specific branch is reached, since the service-scope global-safe allow-list is seeded empty. That denial is audited under the generic `auth.permission_required` verb, not `dex.perf.group.view` (REST's twin route denies BEFORE `perm_fn` via its own `deny_fleet_wide_service_scoped` call, so REST's deny IS recorded under `dex.perf.group.view`). |
+| `get_dex_tag_app_perf` | The device-model tag-value cohort twin of `get_dex_group_app_perf` — the MCP twin of `GET /api/v1/dex/perf/tag`. Required `value` and `app`; optional `key` (default `"model"`, pattern `^[A-Za-z0-9_.:-]{1,64}$`) and `version`. An absent `key` defaults; a PRESENT `key` (including `""`) is validated like REST's `has_param`, so `key=""` `400`s identically on both transports rather than MCP silently substituting the default. Same sub-floor suppression, same service-scoped denial (`kPermissionDenied`) and the same retired-interim-deny-call / generic-`auth.permission_required`-verb posture as `get_dex_group_app_perf` above — not `dex.perf.tag.view` (REST's twin denies before `perm_fn` and IS recorded under that dedicated verb). |
 | `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. A successful call is **recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb) — but a service-scoped API token is denied outright (`kPermissionDenied`, found by this branch's own governance review, PR #3156) and that denial IS recorded under `dex.app_perf.compare`, matching its REST twin's deny-path verb rather than the generic one. |
 | `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = unavailable) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). |
 | `get_dex_device_app_perf` (#4035) | Per-device retained daily app-perf series — the MCP twin of `GET /api/v1/dex/devices/{id}/app-perf` (closes the gap this section previously documented as "no MCP twin"). Optional `app` narrows to one app. Same SCOPED gate + `dex.device.app_perf.view` audit posture as `get_dex_device_score`. |
@@ -9855,7 +10141,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `get_dex_trends` (#4035) | Cross-OS + per-family day-by-day trend — the MCP twin of `GET /api/v1/dex/trends`. Optional `window`. Not audited (no per-agent identity). |
 | `get_dex_overview` (#4035) | Fleet DEX overview — the MCP twin of `GET /api/v1/dex/overview`. Optional `window`. `top_devices[]` is confined to the caller's management-group scope (ADR-0017 World A), same as the REST twin. `deny_fleet_wide_service_scoped` (the separate service-scoped-token axis) + fail-closed `try_persist_audit` under `dex.overview.view`, same "REST/MCP add more rigor than the fragment" rationale as `get_dex_app` above. |
 
-The first three gate `GuaranteedState:Read` and are not audited (cohort posture) on success; `get_dex_group_app_perf` is now audited on a service-scoped-token deny (see above). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST, the `/device` dashboard DEX drill (the *Application performance over time* panel), **and now MCP** (`get_dex_device_app_perf`, #4035) — the REST route stays fail-closed (503 on a dropped audit row), while the MCP twin follows the set-and-proceed / `audit_persisted:false` posture every other DEX MCP read tool uses (different surface, different posture — see `docs/api-twin-recipe.md` §4). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
+The first three gate `GuaranteedState:Read` and are not audited (cohort posture) on success; `get_dex_group_app_perf`'s REST twin is audited on a service-scoped-token deny under the dedicated verb, but the MCP tool itself is not — its deny is recorded under the generic `auth.permission_required` verb instead (see above). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST, the `/device` dashboard DEX drill (the *Application performance over time* panel), **and now MCP** (`get_dex_device_app_perf`, #4035) — the REST route stays fail-closed (503 on a dropped audit row), while the MCP twin follows the set-and-proceed / `audit_persisted:false` posture every other DEX MCP read tool uses (different surface, different posture — see `docs/api-twin-recipe.md` §4). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

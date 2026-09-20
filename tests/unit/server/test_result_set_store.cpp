@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <stdexcept>
@@ -748,4 +749,249 @@ TEST_CASE("ResultSetStore: pin enforces kMaxPinsPerOwner, per owner", "[pg][resu
     auto bob_pin = store.pin(bobs->id);
     REQUIRE(bob_pin.has_value());
     CHECK(bob_pin->pinned);
+}
+
+// json-dump-depth-guard fix (#2437-class): mark_failed's whole job is to
+// merge a failure reason into source_payload and write it back, and
+// nlohmann::json::dump() is unboundedly recursive. It has no HTTP
+// request/response of its own to answer with a 400 (today it has no
+// production caller at all - a store method ahead of a future caller, not a
+// currently-wired background thread, per governance Gate 4/6), so it cannot
+// simply reject: it must still transition the row to `failed` while never
+// re-dumping a payload that could crash the process.
+TEST_CASE("ResultSetStore: mark_failed merges a failure reason into a healthy "
+          "pending row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-ok");
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "no agents reached");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "no agents reached");
+    // The original payload is PRESERVED (merged into), not discarded, when it
+    // is safely shallow: only a nesting-limit violation triggers discard.
+    CHECK(payload["sql"] == "SELECT 1");
+}
+
+TEST_CASE("ResultSetStore: mark_failed heals a source_payload nested past the "
+          "depth limit instead of re-dumping it",
+          "[pg][result_set][mark_failed][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth. kMcpMaxJsonDepth is 32; 40 is comfortably past it and still
+    // trivially safe to construct/dump directly in this test process,
+    // orders of magnitude short of the ~100,000-level depth that actually
+    // SIGSEGVs the real dump() call this guard exists to prevent.
+    r.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto rs = store.create_pending(r, "exec-poisoned");
+    REQUIRE(rs.has_value());
+
+    // This call must not crash (obviously, since we get to make the
+    // assertions below) AND must not leave the poisoned tree in place.
+    store.mark_failed(rs->id, "dispatch error");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    // Healed: the row is now safely shallow, not the original poisoned tree.
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "dispatch error");
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+}
+
+// #4493: mark_failed's SELECT/UPDATE are both gated on status = 'pending' by
+// design (heal_poisoned_payload below is the dedicated path for everything
+// else) -- this pins that scope down so it can't silently widen while other
+// work touches this file.
+TEST_CASE("ResultSetStore: mark_failed is a no-op on a materialized row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto rs = store.create_materialized(req("alice", "already-materialized"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "should not apply");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK_FALSE(payload.contains("failure"));
+}
+
+// #4493: a Materialized row has NO path through mark_failed, so a poisoned
+// source_payload on one was stuck forever (issue #4493). heal_poisoned_payload
+// is the dedicated, status-agnostic fix: it discards the poisoned blob the
+// same way mark_failed does for a pending row, but -- unlike mark_failed --
+// never rewrites status, since the row's members are real and still
+// scope-walkable regardless of what its provenance blob says.
+TEST_CASE("ResultSetStore: heal_poisoned_payload heals a materialized row's "
+          "poisoned source_payload without touching status or members",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // Same idiom as the poisoned-pending test above: 40 levels, comfortably
+    // past kMcpMaxJsonDepth (32) and orders of magnitude short of the real
+    // attack depth, safe to construct/dump directly in this test process.
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a", "dev-b"});
+    REQUIRE(rs.has_value());
+    REQUIRE(rs->status == ResultSetStatus::Materialized);
+
+    // Must not crash, and must report that it actually healed something.
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    // Status is UNCHANGED -- this is the whole point of the dedicated path.
+    CHECK(got->status == ResultSetStatus::Materialized);
+    CHECK(got->device_count == 2);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+
+    // The row's real members are untouched and still scope-walkable --
+    // healing the provenance blob must never touch result_set_members.
+    auto members = member_set_owned_ok(store, rs->id, "alice");
+    CHECK(members == std::unordered_set<std::string>{"dev-a", "dev-b"});
+}
+
+TEST_CASE("ResultSetStore: heal_poisoned_payload is a no-op on a healthy payload",
+          "[pg][result_set][heal_poisoned_payload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    // Byte-identical -- a no-op never rewrites a healthy row's payload.
+    CHECK(got->source_payload == r.source_payload);
+}
+
+// Acceptance criteria "for symmetry": a Failed row can be poisoned by the
+// same class of path (pre-guard write, direct DB manipulation) and had no
+// heal path either, since mark_failed's own predicate never matches a row
+// that is already 'failed'.
+TEST_CASE("ResultSetStore: heal_poisoned_payload also heals an already-failed row",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-failed");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-poisoned-failed");
+    REQUIRE(rs.has_value());
+
+    const std::string poisoned = std::string(R"({"failure":"no agents reached","junk":)") +
+                                  std::string(40, '[') + std::string(40, ']') + "}";
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET status = 'failed', "
+                        "source_payload = '" +
+                            poisoned + "' WHERE id = '" + rs->id + "'");
+
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("junk"));
+}
+
+// #4540 (BLOCKING finding 2): heal_poisoned_payload SELECTs the row, then
+// UPDATEs it -- if a concurrent delete_set / GC sweep removes the row in
+// between (both are independent connection leases with no shared lock), the
+// UPDATE must affect zero rows and the method must report that as a failure,
+// never as the success it used to report unconditionally once
+// PGRES_COMMAND_OK was seen. Simulated deterministically with a BEFORE
+// UPDATE trigger that deletes the row instead of letting the update apply --
+// installed only after the row is safely seeded, so from heal's own SELECT
+// the row looks present and poisoned, and by the time its UPDATE statement
+// runs the row is already gone, the same window a real concurrent delete
+// opens.
+TEST_CASE("ResultSetStore: heal_poisoned_payload reports failure (not success) "
+          "when the row is deleted out from under its own UPDATE",
+          "[pg][result_set][heal_poisoned_payload][security][heal_race_4540]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "vanishes-mid-heal");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    exec_sql(db.dsn(),
+             "CREATE OR REPLACE FUNCTION test_4540_vanish_mid_heal() RETURNS trigger AS $$ "
+             "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+             "END; $$ LANGUAGE plpgsql");
+    exec_sql(db.dsn(), "CREATE TRIGGER test_4540_vanish_mid_heal BEFORE UPDATE ON "
+                        "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                        "test_4540_vanish_mid_heal()");
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    exec_sql(db.dsn(), "DROP TRIGGER test_4540_vanish_mid_heal ON result_set_store.result_sets");
+    exec_sql(db.dsn(), "DROP FUNCTION test_4540_vanish_mid_heal()");
+
+    // The trigger's own DELETE really ran -- the row is genuinely gone, not
+    // merely reporting a mismatched status while still present.
+    CHECK_FALSE(get_ok(store, rs->id).has_value());
 }

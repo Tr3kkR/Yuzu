@@ -295,6 +295,67 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     CHECK(daily->rows[0][0] == "3");
 }
 
+TEST_CASE("execute_user_query: usage tables are denied to generic tar.sql (#4260)",
+          "[tar][store][security][usage]") {
+    // usage/usage_daily/usage_daily_user are read ONLY through the
+    // Forensics-gated app_usage plugin reads (p2.1/p2.2), which never go
+    // through execute_user_query. A generic tar.sql query touching any of
+    // them -- direct name, $Usage_* placeholder, alias, or JOIN/subquery --
+    // must be rejected by the read-only connection's SQLite authorizer, not
+    // silently return rows or an empty success.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'a.exe', 1, 10, 1000, 1010, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES (86400, 'a.exe', 'alice')"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
+        "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
+    REQUIRE(t.db.insert_process_events({[] {
+        ProcessEvent p;
+        p.ts = 1000;
+        p.snapshot_id = 1;
+        p.action = "started";
+        p.pid = 1;
+        p.name = "p.exe";
+        return p;
+    }()}));
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT * FROM usage_daily").has_value());
+
+    // Translation stays intact ($Usage_Daily -> usage_daily resolves) -- the
+    // authorizer denies post-translation, not the translator pre-emptively.
+    auto translated = validate_and_translate_sql("SELECT * FROM $Usage_Daily");
+    REQUIRE(translated.has_value());
+    CHECK(translated->find("usage_daily") != std::string::npos);
+    CHECK_FALSE(t.db.execute_user_query(*translated).has_value());
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT u.exe_key FROM usage_live u").has_value());
+    CHECK_FALSE(t.db
+                    .execute_user_query("SELECT p.name FROM process_live p JOIN usage_daily d "
+                                         "ON d.exe_key = p.name")
+                    .has_value());
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT (SELECT COUNT(*) FROM usage_daily_user)").has_value());
+
+    // Positive control: the authorizer isn't wedged shut -- a non-usage
+    // table via its dollar name still works. execute_user_query never
+    // translates $-names itself (confirmed against its implementation --
+    // it passes the raw string straight to sqlite3_prepare_v2), so this
+    // query must go through validate_and_translate_sql first, exactly like
+    // the $Usage_Daily denial check above; passing the bare $Process_Live
+    // string here previously hit SQLite's own "near $Process_Live: syntax
+    // error" before the authorizer ever ran.
+    auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Live");
+    REQUIRE(ctrl_sql.has_value());
+    auto ctrl = t.db.execute_user_query(*ctrl_sql);
+    REQUIRE(ctrl.has_value());
+    REQUIRE(ctrl->rows.size() == 1);
+    CHECK(ctrl->rows[0][0] == "1");
+}
+
 TEST_CASE("tar.export $Software summary projection references only existing columns",
           "[tar][store][software][export]") {
     // Regression guard (#1620): do_export's `software` UNION branch builds a summary
@@ -851,18 +912,23 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
         r.instances = i + 1;
         r.cpu_pct = 10.0 * (i + 1);
         r.ws_bytes = (100 << 20) * (i + 1);
+        r.is_kthread = (i == 1); // one kernel-thread row among ordinary ones
         rows.push_back(std::move(r));
     }
     REQUIRE(t.db.insert_proc_perf_samples(rows));
     REQUIRE(t.db.insert_proc_perf_samples({})); // empty batch is a no-op success
 
-    auto q = t.db.execute_query("SELECT name, version, instances, cpu_pct, ws_bytes FROM procperf_live "
-                                "ORDER BY name");
+    auto q = t.db.execute_query(
+        "SELECT name, version, instances, cpu_pct, ws_bytes, is_kthread FROM procperf_live "
+        "ORDER BY name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 3);
     CHECK(q->rows[0][0] == "app0.exe");
     CHECK(q->rows[0][1] == "1.2.0.0"); // version round-trips
     CHECK(q->rows[2][2] == "3");
+    CHECK(q->rows[0][5] == "0");
+    CHECK(q->rows[1][5] == "1"); // app1.exe's is_kthread round-trips
+    CHECK(q->rows[2][5] == "0");
 }
 
 TEST_CASE("TarDatabase: insert_netqual_samples batch round-trips", "[tar][store][netqual]") {
@@ -1305,7 +1371,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 6);
+    CHECK(reopened->schema_version() == 7);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1339,7 +1405,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6); // the 2→3→4→5→6 walk ran
+        CHECK(db->schema_version() == 7); // the 2→3→4→5→6→7 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1379,7 +1445,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6);
+        CHECK(db->schema_version() == 7);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1456,7 +1522,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6); // the v3→v4→v5→v6 walk ran
+        CHECK(db->schema_version() == 7); // the v3→v4→v5→v6→v7 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1481,6 +1547,70 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
         REQUIRE(q.has_value());
         REQUIRE(q->rows.size() == 1);
         CHECK(q->rows[0][0] == "124.0.6367.91");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf tier "
+          "(upgrade path)",
+          "[tar][store][lifecycle][procperf]") {
+    // Isolates the v7 step specifically: seed the exact POST-v6 shape (both
+    // tiers already carry `version`, from the v4 ALTER; schema_version=6) so
+    // create_warehouse_tables' IF-NOT-EXISTS leaves them alone and only the
+    // v7 block's ALTER TABLE ADD COLUMN is exercised.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v7_");
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO tar_config (key, value) VALUES ('schema_version', '6');
+            CREATE TABLE procperf_live (
+                ts INTEGER, snapshot_id INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '',
+                instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
+            CREATE TABLE procperf_hourly (
+                hour_ts INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '', samples INTEGER,
+                instances_max INTEGER, cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER,
+                ws_max_bytes INTEGER);
+        )";
+        REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 7); // the v6→v7 walk ran
+
+        // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            auto info = db->execute_query(std::string{"PRAGMA table_info("} + tbl + ")");
+            REQUIRE(info.has_value());
+            bool has_is_kthread = false;
+            for (const auto& row : info->rows)
+                if (row.size() > 1 && row[1] == "is_kthread")
+                    has_is_kthread = true;
+            CHECK(has_is_kthread);
+        }
+
+        // A real insert carrying is_kthread=true round-trips through the migrated
+        // table (stored as SQLite's INTEGER 0/1).
+        ProcPerfRow r;
+        r.ts = 21;
+        r.snapshot_id = 1;
+        r.name = "kworker/0:1";
+        r.instances = 1;
+        r.is_kthread = true;
+        REQUIRE(db->insert_proc_perf_samples({r}));
+        auto q =
+            db->execute_query("SELECT is_kthread FROM procperf_live WHERE name = 'kworker/0:1'");
+        REQUIRE(q.has_value());
+        REQUIRE(q->rows.size() == 1);
+        CHECK(q->rows[0][0] == "1");
     }
 
     std::error_code ec;
