@@ -65,6 +65,8 @@
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
+                                     // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
@@ -612,18 +614,28 @@ static const ToolDef kTools[] = {
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
      "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
-     "Fails closed (zero rows) when the RBAC store is corrupt.",
+     "Fails closed (zero rows) when the RBAC store is corrupt. Each row also carries "
+     "the response's own row id, its instruction_id, error_detail (populated on a "
+     "failed/errored response), the originating plugin name, and received_at_ms "
+     "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
+     "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
+     "(#2146 A2-R2).",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
-     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
-     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. Confined by management group: "
+     "Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. `op_column` picks "
+     "which column sum/avg/min/max operates on (ignored for count; defaults to \"id\" when omitted "
+     "— an arbitrary numeric column, NOT a row count; each group's `count` field already reports "
+     "the row count regardless of `op_column`); must be one of \"timestamp\", \"status\", \"id\" "
+     "(#2146 A2-R2 — previously silently ignored, every aggregate operated on the store's default column "
+     "regardless of what a caller asked for). Confined by management group: "
      "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
      "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
      "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
      "audit row is emitted on a drop.",
-     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})",
+     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]},"op_column":{"type":"string","enum":["timestamp","status","id"],"description":"Column for sum/avg/min/max; ignored for count. Defaults to \"id\" when omitted."}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
 
     {"query_inventory",
@@ -8434,15 +8446,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // a cap hit entirely inside another operator's out-of-scope rows.
                 const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
 
+                // #2146 A2-R2: shared builder with the v1 REST twin
+                // (response_query_model.hpp) -- widens the served row beyond
+                // the original agent_id/execution_id/status/output/timestamp
+                // set with id/instruction_id/error_detail/plugin/
+                // received_at_ms (all previously present on StoredResponse
+                // but never surfaced here). Applies uniformly to both the
+                // execution_id and instruction_id paths above.
                 JArr arr;
-                for (const auto& r : responses) {
-                    arr.add(JObj()
-                                .add("agent_id", r.agent_id)
-                                .add("execution_id", r.execution_id)
-                                .add("status", r.status)
-                                .add("output", r.output)
-                                .add("timestamp", r.timestamp));
-                }
+                for (const auto& r : responses)
+                    arr.add_raw(response_query_row_json(r).dump());
                 // A dropped-by-scope read is a security-relevant event — audit it
                 // distinctly (#1634) so an operator reaching outside their groups is
                 // visible in the chain, separate from the served-set success row. The
@@ -8693,7 +8706,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agg_str = param_str(args, "aggregate", "count");
+                // #2146 A2-R2 governance finding, fixed by this commit (same defect
+                // class as op_column below, #2970B/A2-R1 lesson applied to this
+                // sibling, tracked and closed as #4643): a present-but-wrong-JSON-type
+                // `aggregate` (e.g. a number) must not silently read as absent and
+                // default to "count" -- reject it instead. A well-typed but
+                // unrecognized string (e.g. "bogus") still falls through to Count
+                // below, matching the legacy route's own identical behavior -- that
+                // SEPARATE, narrower enum-validation gap is pre-existing, untracked,
+                // and deliberately out of scope for this fix.
+                auto agg_str_opt = param_string_strict(args, "aggregate", "count");
+                if (!agg_str_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "aggregate must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                const std::string& agg_str = *agg_str_opt;
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;
                 else if (agg_str == "avg")
@@ -8704,6 +8733,45 @@ McpServer::HandlerFn McpServer::build_handler(
                     aq.op = AggregateOp::Max;
                 else
                     aq.op = AggregateOp::Count;
+
+                // #2146 A2-R2 fix: op_column was never read from `args` here, so
+                // sum/avg/min/max silently operated on ResponseStore::aggregate()'s
+                // own default operand column ("id") regardless of what a caller
+                // asked for. Mirror response_routes.cpp's REST reference handler
+                // exactly: default to "id" when omitted, then validate the
+                // EFFECTIVE value against the store's own allow-list BEFORE calling
+                // in (#2691 Doomgoose finding #2 precedent — same rationale as
+                // group_by just above: a typo'd op_column would otherwise read as
+                // store degradation for a healthy database).
+                //
+                // Use `param_string_strict`, not `param_str` (same defect class as
+                // #2970B/#2146 A2-R1, applied proactively here since this call site
+                // is new in this change): a present-but-wrong-type `op_column` (e.g.
+                // `{"op_column": 42}`) must not silently read as absent and default
+                // to "id" -- the caller asked to aggregate a specific column and
+                // typed it wrong, not asked for the default.
+                auto op_column_opt = param_string_strict(args, "op_column");
+                if (!op_column_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "op_column must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                const std::string effective_op_column =
+                    op_column_opt->empty() ? "id" : *op_column_opt;
+                if (std::find(ResponseStore::allowed_op_column().begin(),
+                              ResponseStore::allowed_op_column().end(),
+                              effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid op_column"),
+                                    "application/json");
+                    return;
+                }
+                // Assign the NORMALIZED value (cpp-safety governance finding): assigning
+                // the raw `*op_column_opt` here worked only because ResponseStore::
+                // aggregate() independently re-derives the same empty->"id" default --
+                // two implementations agreeing by coincidence, not by construction. A
+                // future edit to either default independently would silently diverge.
+                aq.op_column = effective_op_column;
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
@@ -8747,13 +8815,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& results = *results_opt;
+                // #2146 A2-R2: shared builder with the v1 REST twin (response_query_model.hpp).
                 JArr arr;
-                for (const auto& r : results) {
-                    arr.add(JObj()
-                                .add("group_value", r.group_value)
-                                .add("count", r.count)
-                                .add("aggregate_value", r.aggregate_value));
-                }
+                for (const auto& r : results)
+                    arr.add_raw(response_aggregate_row_json(r).dump());
                 // A scope-dropped aggregate is a security-relevant event → a distinct
                 // "denied" audit row carrying the DISTINCT dropped-agent count, beside
                 // the served success row (parity with query_responses #1550/#1634).

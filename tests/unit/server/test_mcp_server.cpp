@@ -14146,6 +14146,48 @@ TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)"
     CHECK(rows.size() == 2);
 }
 
+TEST_CASE("MCP query_responses: rows carry the widened field set (#2146 A2-R2 -- "
+          "id/instruction_id/error_detail/plugin/received_at_ms)",
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::server::StoredResponse r = mk_resp("exec-wide", "instr-wide", "agent-1", 1, "out", 500);
+    r.error_detail = "boom";
+    r.plugin = "shellexec";
+    store.store(r);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // Both the execution_id path and the instruction_id path call the SAME
+    // shared builder (response_query_row_json) -- assert the widened field
+    // set on each.
+    for (const auto& args : {R"({"execution_id":"exec-wide"})", R"({"instruction_id":"instr-wide"})"}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":73,"params":{"name":"query_responses","arguments":)" +
+            std::string(args) + "}}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        REQUIRE(rows.size() == 1);
+        const auto& row = rows[0];
+        CHECK(row.contains("id"));
+        CHECK(row["instruction_id"] == "instr-wide");
+        CHECK(row["agent_id"] == "agent-1");
+        CHECK(row["execution_id"] == "exec-wide");
+        CHECK(row["status"] == 1);
+        CHECK(row["output"] == "out");
+        CHECK(row["error_detail"] == "boom");
+        CHECK(row["timestamp"] == 500);
+        CHECK(row["plugin"] == "shellexec");
+        CHECK(row.contains("received_at_ms"));
+    }
+}
+
 TEST_CASE("MCP query_responses: rejects when neither id provided",
           "[pg][mcp][integration][response][fanout]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -19537,6 +19579,172 @@ TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-ope
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.aggregate_responses|denied");
     CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "
+          "dropped to the \"count\" default (#2146 A2-R2, #4643)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["sum"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":97,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-agg-badtype","group_by":"status","aggregate":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `agg_str` fell back
+    // to "count", and the tool answered 200 with a count aggregate instead of
+    // rejecting the caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // Pinned to "aggregate must be..." (not the bare "must be a JSON string"
+    // substring, which op_column's own wrong-type error also contains) so this
+    // assertion stays discriminating if a future refactor touches both messages.
+    CHECK(body["error"]["message"].get<std::string>().find("aggregate must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP aggregate_responses: op_column is honored (#2146 A2-R2 -- previously silently "
+          "ignored, every aggregate operated on the store's default operand column)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-oc", "instr-oc", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-oc", "instr-oc", "agent-2", 0, "ok", 200));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-oc","group_by":"status","aggregate":"max","op_column":"timestamp"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    REQUIRE(groups.size() == 1);
+    // MAX(timestamp) over the two status=0 rows (100, 200) is 200 -- proves
+    // op_column actually reached the store rather than being silently dropped
+    // (which would fall back to the store's own default operand column, "id",
+    // and produce a small integer row-id max instead).
+    CHECK(groups[0]["aggregate_value"].get<double>() == 200.0);
+}
+
+TEST_CASE("MCP aggregate_responses: omitted op_column matches explicit op_column:\"id\" "
+          "(#2146 A2-R2 governance finding -- the handler's own default and the store's "
+          "own default must stay in lock-step)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-2", 0, "ok", 200));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto omitted = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max"}}})");
+    REQUIRE(omitted);
+    REQUIRE(omitted->status == 200);
+    auto omitted_result = nlohmann::json::parse(omitted->body)["result"];
+    auto omitted_groups =
+        nlohmann::json::parse(omitted_result["content"][0]["text"].get<std::string>());
+    REQUIRE(omitted_groups.size() == 1);
+
+    auto explicit_id = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max",)"
+        R"("op_column":"id"}}})");
+    REQUIRE(explicit_id);
+    REQUIRE(explicit_id->status == 200);
+    auto explicit_result = nlohmann::json::parse(explicit_id->body)["result"];
+    auto explicit_groups =
+        nlohmann::json::parse(explicit_result["content"][0]["text"].get<std::string>());
+    REQUIRE(explicit_groups.size() == 1);
+
+    // If the handler's own empty->"id" default (mcp_server.cpp) and the store's
+    // independent empty->"id" default (ResponseStore::aggregate) ever drift apart,
+    // this fails: omitting op_column would silently aggregate a DIFFERENT column
+    // than explicitly asking for "id".
+    CHECK(omitted_groups[0]["aggregate_value"].get<double>() ==
+          explicit_groups[0]["aggregate_value"].get<double>());
+}
+
+TEST_CASE("MCP aggregate_responses: an invalid op_column is rejected with kInvalidParams, "
+          "not silently mapped to the store default (#2146 A2-R2)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-oc-bad","group_by":"status","aggregate":"sum","op_column":"output"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("op_column") != std::string::npos);
+}
+
+TEST_CASE("MCP aggregate_responses: op_column wrong JSON type is rejected -- not silently "
+          "dropped to the default (#2146 A2-R2)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["timestamp"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-badtype","group_by":"status","aggregate":"sum",)"
+        R"("op_column":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `effective_op_column`
+    // fell back to "id" (a valid allow-listed value), and the tool answered
+    // 200 with an aggregate over the wrong column instead of rejecting the
+    // caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
