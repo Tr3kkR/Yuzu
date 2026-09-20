@@ -25,6 +25,7 @@
 #include "app_perf_daily_store.hpp" // AppPerfVersionDeviceRow
 #include "authz_gates.hpp"
 #include "rest_api_v1.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -122,6 +123,15 @@ struct Harness {
             };
         }
 
+        // ADR-0031 WS-A4 (sixth family): the route now calls the DexPerfApi
+        // seam, not `providers` directly — wrap the SAME `providers` struct
+        // (FnDexPerfApi, mirrors FnVerifyApi) so `wire_provider=false` still
+        // reaches the "provider unavailable" 503 exactly as before (this
+        // route's own `app_version_devices` degrades to nullopt when
+        // `providers.version_devices` is unset).
+        auto dex_perf_api_local =
+            std::make_shared<yuzu::server::test::FnDexPerfApi>(yuzu::server::DexPerfFn{}, providers);
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
@@ -142,7 +152,10 @@ struct Harness {
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
-                            /*list_read_fn=*/{}, std::move(fleet_read_fn));
+                            /*list_read_fn=*/{}, std::move(fleet_read_fn),
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
+                            /*dex_visible_fn=*/{}, /*verify_api=*/nullptr,
+                            /*device_api=*/nullptr, /*dex_api=*/nullptr, dex_perf_api_local);
     }
 
     bool has_audit(const std::string& result) const {

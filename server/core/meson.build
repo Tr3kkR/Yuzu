@@ -533,6 +533,7 @@ yuzu_server_core_lib = static_library(
     'src/verify_ui.cpp',
     'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
     'src/dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+    'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
     'src/deployment_run_store.cpp',

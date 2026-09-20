@@ -10,7 +10,6 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
-#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
@@ -1820,7 +1819,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1838,7 +1837,7 @@ void RestApiV1::register_routes(
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
                     std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
-                    std::move(dex_api));
+                    std::move(dex_api), std::move(dex_perf_api));
 }
 
 void RestApiV1::register_routes(
@@ -1864,7 +1863,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -12878,7 +12877,7 @@ void RestApiV1::register_routes(
     // concept.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/app-perf)",
-        [scoped_perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [scoped_perm_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
@@ -12891,7 +12890,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
-            if (!app_perf_providers.device) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12915,8 +12914,12 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            auto rows = app_perf_providers.device(agent_id);
-            if (!rows) { // AUTHORITATIVE read degrade
+            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
+            // #4035: shared seam (dex_perf_api.hpp) -- the MCP twin
+            // get_dex_device_app_perf calls the SAME seam so the two response
+            // shapes cannot drift (Rule 1).
+            auto body = dex_perf_api->device_app_perf_json(agent_id, app_filter);
+            if (!body) { // AUTHORITATIVE read degrade
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -12925,12 +12928,7 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
-            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
-            // get_dex_device_app_perf calls the SAME provider + serializer so
-            // the two response shapes cannot drift (Rule 1).
-            res.set_content(ok_json(dex_device_app_perf_json(agent_id, app_filter, *rows)),
-                            "application/json");
+            res.set_content(ok_json(*body), "application/json");
         });
 
     if (metrics_registry) {
@@ -13348,7 +13346,7 @@ void RestApiV1::register_routes(
     // GET /dex/perf/fleet — the now-stats per metric + the honest denominators
     // (the same numbers the yuzu_fleet_perf_* Prometheus gauges export).
     sink.Get("/api/v1/dex/perf/fleet",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
@@ -13356,7 +13354,7 @@ void RestApiV1::register_routes(
                  // id on every response + the A4 error envelope on failures.
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -13366,7 +13364,7 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                 const auto now = dex_perf_fleet_now(dex_perf_api->fleet_snapshot(std::string{}));
                  res.set_content(ok_json(JObj()
                                              .raw("cpu_pct", perf_stat_json(now.cpu))
                                              .raw("commit_pct", perf_stat_json(now.commit))
@@ -13390,14 +13388,14 @@ void RestApiV1::register_routes(
     // carry suppressed=true with their population and no stats; the untagged
     // residual is the cohort=="" row.
     sink.Get("/api/v1/dex/perf/cohorts",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -13415,7 +13413,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto snap = dex_perf_fn(key);
+                 const auto snap = dex_perf_api->fleet_snapshot(key);
                  JArr rows;
                  for (const auto& c : dex_perf_cohorts(snap)) {
                      JObj o;
@@ -13450,13 +13448,13 @@ void RestApiV1::register_routes(
     // half of the BRD F2c residual, row 100, is deferred: per-app data is
     // device-drill-only, not fleet render-time — see dex_perf_model.hpp.)
     sink.Get("/api/v1/dex/perf/cohort-diff",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -13498,7 +13496,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                 const auto d = dex_perf_cohort_diff(dex_perf_api->fleet_snapshot(key), a, b);
                  auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                      if (!found)
                          return "null";
@@ -13547,7 +13545,7 @@ void RestApiV1::register_routes(
     // (default), the not-reporting complement (filter=not_reporting), or a
     // cohort's members (cohort_key + cohort_value; empty value = untagged).
     sink.Get("/api/v1/dex/perf/devices",
-             [perm_fn, audit_fn, dex_perf_fn, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, dex_perf_api, deny_fleet_wide_service_scoped](
                  const httplib::Request& req, httplib::Response& res) {
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
@@ -13567,7 +13565,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -13633,8 +13631,8 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.perf.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const auto rows = dex_perf_device_list(dex_perf_fn(cohort_key), metric,
-                                                        not_reporting, cohort_filter, limit);
+                 const auto rows = dex_perf_device_list(dex_perf_api->fleet_snapshot(cohort_key),
+                                                        metric, not_reporting, cohort_filter, limit);
                  JArr arr;
                  for (const auto& r : rows) {
                      JObj o;
@@ -13681,12 +13679,12 @@ void RestApiV1::register_routes(
     // data, so a worker discovers which `app=` values are answerable (A2).
     sink.Get(
         "/api/v1/dex/perf/apps",
-        [perm_fn, app_perf_providers](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, dex_perf_api](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.apps) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13696,7 +13694,7 @@ void RestApiV1::register_routes(
                 return;
             }
             bool truncated = false;
-            auto apps = app_perf_providers.apps(truncated);
+            auto apps = dex_perf_api->apps(truncated);
             if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                 res.status = 503;
                 res.set_content(
@@ -13721,13 +13719,13 @@ void RestApiV1::register_routes(
     // (version omitted = every version, interleaved, each point tagged with its
     // canonicalized version). Exact fleet mean/max + bucket-resolution p50/p95.
     sink.Get("/api/v1/dex/perf/app",
-             [perm_fn, app_perf_providers, app_pct_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, app_pct_json](const httplib::Request& req,
                                                          httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!app_perf_providers.fleet) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(
                                          503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13763,8 +13761,8 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto rows = app_perf_providers.fleet(app, version);
-                 if (!rows) { // AUTHORITATIVE read degrade
+                 auto trend = dex_perf_api->app_fleet_trend(app, version);
+                 if (!trend) { // AUTHORITATIVE read degrade
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -13774,7 +13772,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  JArr points;
-                 for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                 for (const auto& pt : *trend) {
                      // The fleet path floors too now, so a sub-floor point carries
                      // suppressed=true with device_count only — same shape as the
                      // group endpoint; without the flag a suppressed point would read
@@ -13839,7 +13837,7 @@ void RestApiV1::register_routes(
     // honest instead of generic).
     sink.Get(
         "/api/v1/dex/perf/app/devices",
-        [fleet_read_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -13894,7 +13892,7 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
             if (!gate.admitted)
                 return;
-            if (!app_perf_providers.version_devices) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13907,7 +13905,7 @@ void RestApiV1::register_routes(
             if (gate.scope)
                 visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
             bool truncated = false;
-            auto rows = app_perf_providers.version_devices(app, version, visible_ids, truncated);
+            auto rows = dex_perf_api->app_version_devices(app, version, visible_ids, truncated);
             if (!rows) { // AUTHORITATIVE read degrade
                 (void)detail::try_persist_audit(
                     audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
@@ -13989,7 +13987,7 @@ void RestApiV1::register_routes(
     // adjacent fleet/cohort aggregates, which are likewise unaudited.
     sink.Get(
         "/api/v1/dex/perf/group",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.group.view", "GuaranteedState",
@@ -14000,7 +13998,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.group) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -14051,8 +14049,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.group(group_id, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+            auto trend = dex_perf_api->group_trend(group_id, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf group read degraded", cid,
@@ -14062,7 +14060,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)
@@ -14101,7 +14099,7 @@ void RestApiV1::register_routes(
     // cohort is equally a "named set of specific devices".
     sink.Get(
         "/api/v1/dex/perf/tag",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.tag.view", "GuaranteedState",
@@ -14112,7 +14110,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.tag_cohort) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -14172,8 +14170,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.tag_cohort(key, value, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+            auto trend = dex_perf_api->tag_trend(key, value, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf tag cohort read degraded", cid,
@@ -14183,7 +14181,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)

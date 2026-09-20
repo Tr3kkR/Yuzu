@@ -23,6 +23,7 @@
          register_agent/6,
          deregister_agent/1,
          lookup/1,
+         lookup_local_session/1,
          all_agents/0,
          all_agent_pids/0,
          all_register_reqs/0,
@@ -157,6 +158,32 @@ lookup_remote(AgentId) ->
                         []           -> error
                     end
             end
+    end.
+
+%% @doc HA WS-4 4.4 (`#4246` #6): the LOCAL live pid and CURRENT session id
+%% for `AgentId`, straight from ETS — never the `pg` cross-node fallback
+%% `lookup/1` uses. Used ONLY by `yuzu_gw_upstream`'s registration-replay
+%% drip to re-check liveness right before replaying a queued
+%% `{AgentId, SessionId, RegisterReq}` snapshot: the drip is self-paced
+%% (one agent per scheduled message, `replay_spacing_ms` apart), so by the
+%% time an entry's turn comes up the agent may have disconnected, or
+%% reconnected under a BRAND-NEW session (register_agent/6 overwrites the
+%% ETS row wholesale) — replaying the STALE snapshot's session in either
+%% case would present an orphaned session the server can no longer (or
+%% should no longer) adopt. `error` covers both "no longer registered" and
+%% "the live pid, if any, is not actually alive" (mirrors `lookup/1`'s own
+%% local liveness check, without its remote `pg` fallback — a replay is
+%% only ever meaningful against a LOCAL process).
+-spec lookup_local_session(binary()) -> {ok, {pid(), binary() | undefined}} | error.
+lookup_local_session(AgentId) ->
+    case ets:lookup(?TABLE, AgentId) of
+        [{_, Pid, _, SessionId, _, _, _, _}] ->
+            case is_process_alive(Pid) of
+                true  -> {ok, {Pid, SessionId}};
+                false -> error
+            end;
+        [] ->
+            error
     end.
 
 %% @doc Return all agent IDs.
