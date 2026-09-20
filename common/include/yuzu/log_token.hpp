@@ -15,20 +15,24 @@
  * differed between the two sides would silently break the join for exactly the ids that need
  * it.
  *
- * Two functions, one mapping core:
+ * Two functions over one mapping core (log_id_token calls log_token, so the predicate exists
+ * once):
  *   - log_token(s): control bytes, DEL, space, '=' and ',' -> '_'. Bytes >= 0x80 pass
  *     through. No length cap. This is the structured-audit-detail neutraliser (audit_token in
  *     server/core/src/web_utils.hpp forwards to it).
- *   - log_id_token(s): for an id written to a Guardian log line. Stricter: every byte outside
- *     printable ASCII, plus space, '=' and ',', becomes '_' (so a multi-byte character can
- *     neither be cut mid-sequence into invalid UTF-8 nor smuggle a Unicode line separator into
- *     a line), and an id longer than kGuardianLogIdMaxBytes is shortened to exactly that
- *     length as <head> '~' <last kGuardianLogIdTailBytes bytes>. Keeping the tail matters: a
- *     Guardian event id ends in `<wall_ms>-<seq>`, the part that tells two events of one rule
- *     apart, so a plain cut would collapse every event of a long rule id onto one token.
+ *   - log_id_token(s): for an id written to a Guardian log line. Stricter: it applies
+ *     log_token's mapping and then also maps every byte >= 0x80 to '_' (so a multi-byte
+ *     character can neither be cut mid-sequence into invalid UTF-8 nor smuggle a Unicode line
+ *     separator into a line), and an id longer than kGuardianLogIdMaxBytes is shortened to
+ *     exactly that length as <head> '~' <last kGuardianLogIdTailBytes bytes> before mapping.
+ *     Keeping the tail matters: a Guardian event id ends in `<wall_ms>-<seq>`, the part that
+ *     tells two events of one rule apart, so a plain cut would collapse every event of a long
+ *     rule id onto one token.
  *
- * Both are lossy by design: "a b" and "a_b" share a token, and so do two long ids that share
- * both their head and their last kGuardianLogIdTailBytes bytes.
+ * Both are lossy by design, so two different raw ids CAN share one token: "a b" and "a_b";
+ * two long ids that share both their head and their last kGuardianLogIdTailBytes bytes; and,
+ * because '~' is an ordinary character, a raw id of exactly kGuardianLogIdMaxBytes bytes that
+ * equals the shortened form of a longer one.
  */
 
 #include <cstddef>
@@ -70,12 +74,12 @@ static_assert(kGuardianLogIdMaxBytes > kGuardianLogIdTailBytes + 1,
     } else {
         raw.assign(s);
     }
-    for (char& ch : raw) {
-        const auto c = static_cast<unsigned char>(ch);
-        if (c < 0x21 || c > 0x7E || c == '=' || c == ',')
+    std::string out = log_token(raw);
+    for (char& ch : out) {
+        if (static_cast<unsigned char>(ch) >= 0x80)
             ch = '_';
     }
-    return raw;
+    return out;
 }
 
 } // namespace yuzu

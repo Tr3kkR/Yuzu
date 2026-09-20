@@ -2405,9 +2405,10 @@ TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a l
     e.event_id = rule + "-1789930557755-102";
     CHECK(format_eval_timing_line(e) != first);
 
-    // A multi-byte character (here U+2028 LINE SEPARATOR, and one that straddles the cut) never
+    // A multi-byte character (here U+2028 LINE SEPARATOR, and a run of lone lead bytes) never
     // reaches the line: every byte outside printable ASCII becomes '_', so the output is ASCII
-    // and cannot be split by a Unicode-aware consumer or made invalid UTF-8 by the cut.
+    // and cannot be split by a Unicode-aware consumer or made invalid UTF-8 by a cut (the exact
+    // straddle of the head boundary is pinned in test_log_token.cpp).
     e.event_id = "a\xE2\x80\xA8" "b" + std::string(300, '\xC3');
     for (const char c : format_eval_timing_line(e))
         CHECK(static_cast<unsigned char>(c) < 0x80);
@@ -2545,17 +2546,22 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
         for (int i = 0; i < kIters; ++i) drain_all(*rt);
     });
     // Reader: the #4606 test accessor copies the last staged batch under its leaf mutex while the
-    // evaluators move-assign into it, so a reader running concurrently with those writers is
-    // covered (writer-vs-writer was already exercised by the evaluators themselves).
-    threads.emplace_back([&] {
+    // evaluators move-assign into it. It keeps reading until every writer has finished (a fixed
+    // iteration count finished before the first writer acquired the lock, so it never overlapped),
+    // so the reader-vs-writer path is really covered; writer-vs-writer is exercised by the
+    // evaluators themselves.
+    std::atomic<bool> writers_done{false};
+    std::thread reader([&] {
         while (!go.load()) {}
         std::size_t seen = 0;
-        for (int i = 0; i < kIters; ++i) seen += rt->last_eval_timings_for_test().size();
+        while (!writers_done.load()) seen += rt->last_eval_timings_for_test().size();
         (void)seen;
     });
 
     go.store(true);
     for (auto& th : threads) th.join();
+    writers_done.store(true);
+    reader.join();
     rt->begin_stop();
     SUCCEED(); // no crash / no TSan report is the assertion
 }

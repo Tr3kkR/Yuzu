@@ -52,7 +52,8 @@
  *     lane and the compliance+health lane each have a single-flight executor) or on the guard
  *     worker (legacy path). T_server: on the thread that reads the agent's Subscribe stream
  *     (direct path, where it is the whole read loop, so a stall also delays that agent's
- *     other responses) or on the gateway's forward handler. A log sink that blocks therefore
+ *     other responses) or on the server's ForwardGuardianMessage handler when the agent is
+ *     behind a gateway. A log sink that blocks therefore
  *     stalls whichever of those is writing: Event evaluations queued behind it, a convergence
  *     sweep, the next send on that lane, or the next ingest. Removing the Spark-path coupling
  *     is a flip precondition (docs/spark-flip-gate.md section 7).
@@ -69,9 +70,11 @@
  *     and space, '=' and ',', becomes '_', and an id longer than 256 bytes is shortened to
  *     exactly 256 as <head> '~' <last 24 bytes>, which keeps the `<wall_ms>-<seq>` tail that
  *     tells two events of one rule apart. So an id with such characters, or of any length,
- *     still joins. Two raw ids can share one logged token only if they differ solely in
- *     neutralised characters, or are over-long and share both their head and their last 24
- *     bytes. The server's Redelivered, Conflict and Error lines use the same function.
+ *     still joins. Two different raw ids CAN share one logged token: when they differ solely
+ *     in neutralised characters, when they are over-long and share both their head and their
+ *     last 24 bytes, or (since '~' is an ordinary character) when a raw 256-byte id equals the
+ *     shortened form of a longer one. The server's Redelivered, Conflict and Error lines use
+ *     the same function.
  *   - Every T_* line is best-effort, so "no partner" is evidence, not proof: a line can be
  *     missing because the log call failed (the error is swallowed), the level was raised
  *     above info at run time, a file rotated, or the process stopped between the write and

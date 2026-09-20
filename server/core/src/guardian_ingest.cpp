@@ -198,11 +198,12 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // Agent-controlled identifiers are neutralised before they reach any key=value
             // log line: the NUL guard strips \0 but not CR/LF, a space or '=' forges extra
             // tokens, and the tightened YuzuGuardianEventsDropped alert directs operators to
-            // trust these logs (sec-M1). log_id_token is the same neutraliser and cap the
-            // T_server line and the agent's T_wire/T_detect lines use, so an id reads
+            // trust these logs (sec-M1). log_id_token is the same neutraliser and shortening
+            // the T_server line and the agent's T_wire/T_detect lines use, so an id reads
             // identically on every line an operator joins across. (sanitize_label above stays
-            // for the alert-sink labels, whose content is not a key=value line.) res.error
-            // is dropped on Conflict — it only repeats the (now-neutralised) event_id.
+            // for the observer path: the alert-sink labels and the observer-threw warns below,
+            // which are not key=value lines.) res.error is dropped on Conflict: it only
+            // repeats the (now-neutralised) event_id.
             spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
                           "event_id={} agent={} rule={}",
                           log_id_token(ev_row.event_id), log_id_token(agent_id),

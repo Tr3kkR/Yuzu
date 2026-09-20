@@ -355,17 +355,88 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
     CHECK(count(cline, " agent=") == 1);
     CHECK(count(ctext, "event_id collision") == 1);
 
-    // An id longer than the shared length is shortened by the SAME function the agent's
-    // T_wire/T_detect lines use (head, '~', last 24 bytes), so it still joins.
-    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'q');
-    const std::string shortened =
-        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'q') + "~" +
-        std::string(yuzu::kGuardianLogIdTailBytes, 'q');
+    // An over-long id is shortened by the SAME function the agent's T_wire/T_detect lines use:
+    // head, '~', and its LAST 24 bytes. The tail is the `<wall_ms>-<seq>` part, so two events of
+    // one very long rule id stay distinct (a plain prefix cut would collapse them onto one token).
+    constexpr std::size_t kHead = yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1;
+    const std::string base(300, 'q');
+    auto shortened_of = [&](const std::string& id) {
+        return std::string(kHead, 'q') + "~" + id.substr(id.size() - yuzu::kGuardianLogIdTailBytes);
+    };
+    const std::string id1 = base + "-1789930557755-101";
+    const std::string id2 = base + "-1789930557755-102";
     yuzu::test::LogCapture cap_long;
-    ingest_guardian_response(store, "agent-A", make_rule_event(longid, "rule-1"), nullptr, nullptr);
+    ingest_guardian_response(store, "agent-A", make_rule_event(id1, "rule-1"), nullptr, nullptr);
+    ingest_guardian_response(store, "agent-A", make_rule_event(id2, "rule-1"), nullptr, nullptr);
     cap_long.stop();
-    CHECK(cap_long.text().find("Guardian T_server event_id=" + shortened + " agent=") !=
+    CHECK(shortened_of(id1) != shortened_of(id2));
+    CHECK(cap_long.text().find("Guardian T_server event_id=" + shortened_of(id1) + " agent=") !=
+          std::string::npos);
+    CHECK(cap_long.text().find("Guardian T_server event_id=" + shortened_of(id2) + " agent=") !=
           std::string::npos);
     CHECK(cap_long.text().find(std::string(yuzu::kGuardianLogIdMaxBytes + 1, 'q')) ==
           std::string::npos);
+
+    // Non-ASCII bytes never reach the line (a cut could otherwise leave invalid UTF-8, and U+2028
+    // could split the record for a Unicode-aware consumer): each of the five bytes becomes '_'.
+    yuzu::test::LogCapture cap_na;
+    ingest_guardian_response(store, "agent-A", make_rule_event("e\xC3\xA9\xE2\x80\xA8x", "rule-1"),
+                             nullptr, nullptr);
+    cap_na.stop();
+    CHECK(cap_na.text().find("Guardian T_server event_id=e_____x agent=agent-A") != std::string::npos);
+}
+
+TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutralise ids too",
+          "[pg][guardian][ingest][diagnostics]") {
+    // Every Guardian ingest line that prints an agent- or operator-supplied id goes through the
+    // same neutraliser as T_server, so an id reads identically on every line an operator joins
+    // across and none can forge a token. Each case uses a hostile agent id (a space, '=' and,
+    // in one, a newline), which the registration gate only length-checks.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    {   // parse failure: the agent id is printed before any event is known
+        apb::CommandResponse malformed;
+        malformed.set_action("event");
+        malformed.set_payload(std::string("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", 11));
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1\nfake", malformed, nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("failed to parse GuaranteedStateEvent from agent agent_x_1_fake") !=
+              std::string::npos);
+        CHECK(cap.text().find("agent x=1") == std::string::npos);
+    }
+    {   // oversized detail_json: the agent id and the event id are printed
+        gpb::GuaranteedStateEvent ev;
+        ev.set_event_id("evt o=1");
+        ev.set_rule_id("rule-1");
+        ev.set_event_type("service.stopped");
+        ev.set_severity("high");
+        ev.set_detail_json(std::string(17 * 1024, 'x'));
+        ev.mutable_timestamp()->set_seconds(1718000000);
+        apb::CommandResponse resp;
+        resp.set_action("event");
+        resp.set_payload(ev.SerializeAsString());
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("from agent agent_x_1 event evt_o_1 (cap 16384)") != std::string::npos);
+    }
+    {   // store Error (an embedded NUL): the agent id and the rule id are printed
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1", make_error_event("evt e=1"), nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("event ingest error (agent=agent_x_1, rule=rule-err)") !=
+              std::string::npos);
+    }
+    {   // Redelivered (debug): event id, agent id and rule id are printed
+        const auto resp = make_rule_event("evt r=1", "rule r=1");
+        ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("idempotent event redelivery (no re-observe) event_id=evt_r_1 "
+                              "agent=agent_x_1 rule=rule_r_1") != std::string::npos);
+    }
 }
