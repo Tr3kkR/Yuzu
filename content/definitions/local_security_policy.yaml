@@ -1,0 +1,331 @@
+## Local Security Policy Definitions
+## Reports local password, lockout and audit policy posture and sudoers
+## content, read-only. Plugin: local_security_policy
+## Actions: password_policy, lockout_policy, audit_policy, sudoers
+##
+## Sources: Linux bounded config-file reads (login.defs, pwquality.conf,
+## faillock.conf, /etc/pam.d, audit.rules, sudoers); macOS `pwpolicy
+## -getaccountpolicies` (rung-2 argv leaf, parsed with CFPropertyList),
+## audit_control and sudoers; Windows one `secedit.exe /export` (rung-2 argv
+## leaf) parsed from its UTF-16LE INI. A source the OS reports missing is
+## `absent`; a refused or failed read is `unreadable`, never absent. See
+## agents/plugins/local_security_policy/README.md.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.password_policy
+  displayName: Local Password Policy
+  version: 1.0.0
+  description: >
+    Reports the local password policy as one row per setting: which
+    setting, its value and where it was read. Linux reads login.defs,
+    pwquality.conf and the password stacks in /etc/pam.d (pwquality,
+    pwhistory, cracklib and unix module lines); macOS reads the global
+    account policies from `pwpolicy -getaccountpolicies`; Windows reads
+    MinimumPasswordAge, MaximumPasswordAge, MinimumPasswordLength,
+    PasswordComplexity, PasswordHistorySize and ClearTextPassword from one
+    `secedit /export`. It reports what the configuration states, not the live
+    PAM or LSA decision. A source the OS reports missing reads `absent`; one
+    that could not be read reads `unreadable` with a reason and downgrades
+    the result to CONSTRAINED or PERMISSION_DENIED, never an empty success.
+  tags: [local_security_policy, password, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: password_policy
+    concurrency: per-device
+
+  result:
+    # password_policy|<key>|<value>|<source>
+    # (a failed dispatch writes one `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. A failed dispatch instead writes a two-field constrained|<reason> row, whose second field is the reason.'
+        values: [password_policy, constrained]
+        example: password_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: a login.defs / pwquality key, a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.'
+        example: PASS_MAX_DAYS
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.'
+        example: "99999"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> (macOS) or secedit (Windows).'
+        example: /etc/login.defs
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local password policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.lockout_policy
+  displayName: Local Lockout Policy
+  version: 1.0.0
+  description: >
+    Reports the local account lockout policy as one row per setting. Linux
+    reads the lockout keys of login.defs, faillock.conf and the
+    faillock/tally lines of the auth and account stacks in /etc/pam.d; macOS
+    reads the authentication policies from `pwpolicy -getaccountpolicies` (no
+    authentication policy reports `policies|none`, the default); Windows
+    reads LockoutBadCount, ResetLockoutCount and LockoutDuration from one
+    `secedit /export`. It reports configuration, not live lockout counters. A
+    source the OS reports missing reads `absent`; one that could not be read
+    reads `unreadable` with a reason and downgrades the result, never an empty
+    success.
+  tags: [local_security_policy, lockout, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: lockout_policy
+    concurrency: per-device
+
+  result:
+    # lockout_policy|<key>|<value>|<source>
+    # (a failed dispatch writes one `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. A failed dispatch instead writes a two-field constrained|<reason> row, whose second field is the reason.'
+        values: [lockout_policy, constrained]
+        example: lockout_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.'
+        example: LOGIN_RETRIES
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.'
+        example: "5"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows).'
+        example: /etc/login.defs
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local account lockout policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.audit_policy
+  displayName: Local Audit Policy
+  version: 1.0.0
+  description: >
+    Reports the local audit policy. Linux reads /etc/audit/audit.rules and
+    reports rule, watch-rule and syscall-rule counts, lines it does not
+    model, and the -e state (enabled, disabled, immutable or unset), from the
+    rule file only, not the live kernel rules; macOS reads
+    /etc/security/audit_control, which is absent by default on current
+    macOS (reported `absent`, not a failure); Windows reports every [Event
+    Audit] category from one `secedit /export` as none, success, failure or
+    success_failure. audit.rules is 0640 root, so an unprivileged Linux
+    agent reports `unreadable` and PERMISSION_DENIED.
+  tags: [local_security_policy, audit, policy, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: audit_policy
+    concurrency: per-device
+
+  result:
+    # audit_policy|<key>|<value>|<source>
+    # (a failed dispatch writes one `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always the action name. A failed dispatch instead writes a two-field constrained|<reason> row, whose second field is the reason.'
+        values: [audit_policy, constrained]
+        example: audit_policy
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Setting name: rules, watch_rules, syscall_rules, unmodelled_lines or enabled (Linux), an audit_control key (macOS), an [Event Audit] category name (Windows), or source_state when the source is absent or unreadable.'
+        example: watch_rules
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The setting value: a count (Linux), the audit_control value (macOS), none/success/failure/success_failure or unmodelled:<raw> (Windows), or enabled/disabled/immutable/unset for the Linux enabled row. For source_state, absent or unreadable:<reason>.'
+        example: "12"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the row was read: /etc/audit/audit.rules (Linux), /etc/security/audit_control (macOS) or secedit (Windows).'
+        example: /etc/audit/audit.rules
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report local audit policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.local_security_policy.sudoers
+  displayName: Sudoers Content
+  version: 1.0.0
+  description: >
+    Reports the parsed content of /etc/sudoers and every file in
+    /etc/sudoers.d, one row per Defaults line, alias, include directive or
+    user spec. Include directives are listed, not followed; a line the
+    parser does not recognise is kind `unmodelled` with the raw line, never
+    dropped; a file sudo would skip by name is kind `ignored`. Reading
+    /etc/sudoers needs root or the file's group (0440), so an unprivileged
+    agent reports kind `unreadable` and PERMISSION_DENIED, never an empty
+    list. Linux and macOS only; Windows has no sudoers.
+  tags: [local_security_policy, sudoers, privilege, compliance, security, posture]
+
+spec:
+  type: question
+  platforms: [linux, darwin]
+
+  execution:
+    plugin: local_security_policy
+    action: sudoers
+    concurrency: per-device
+
+  result:
+    # sudoers|<file>|<kind>|<subject>|<runas>|<nopasswd>|<commands>
+    # (a failed dispatch writes one `constrained|<reason>` row instead)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed row tag, always sudoers. A failed dispatch instead writes a two-field constrained|<reason> row, whose second field is the reason.'
+        values: [sudoers, constrained]
+        example: sudoers
+        platforms: [linux, darwin]
+      - name: file
+        type: string
+        description: 'The file the entry was read from.'
+        example: /etc/sudoers
+        platforms: [linux, darwin]
+      - name: kind
+        type: string
+        description: 'Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands). ignored: a sudoers.d file sudo skips by name. absent: the file does not exist. unreadable: the read failed (reason in commands).'
+        values: [defaults, alias, include, includedir, user_spec, unmodelled, ignored, absent, unreadable]
+        example: user_spec
+        platforms: [linux, darwin]
+      - name: subject
+        type: string
+        description: 'User, group or alias the entry applies to; the Defaults scope (user:, host:, cmnd:, runas:) for a scoped Defaults line; a dash when not applicable.'
+        example: '%sudo'
+        platforms: [linux, darwin]
+      - name: runas
+        type: string
+        description: 'Run-as user/group of a user spec; a dash when not applicable.'
+        example: ALL
+        platforms: [linux, darwin]
+      - name: nopasswd
+        type: string
+        description: 'Whether a user spec carries NOPASSWD: true or false; a dash on a row that is not a user spec.'
+        values: ['true', 'false']
+        example: 'false'
+        platforms: [linux, darwin]
+      - name: commands
+        type: string
+        description: 'The command list of a user spec, the Defaults or alias body, an include path, the raw text of an unmodelled line, or the reason on an ignored or unreadable row.'
+        example: ALL
+        platforms: [linux, darwin]
+    aggregation:
+      groupBy:
+        - kind
+      operations:
+        - count
+
+  readablePayload: "Report sudoers content"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [local_security_policy]
+
+status:
+  phase: active

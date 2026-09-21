@@ -519,6 +519,9 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
+    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure secedit/login.defs/pwquality/pam/auditd/sudoers/pwpolicy parsers over REAL CAPTURE fixtures
+    'unit/test_local_security_policy_scratch_sweep.cpp',    # Wave 8 PR8.3: pure Windows scratch-dir sweep + secedit run classification decisions, unguarded on every OS
+    'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real local_security_policy dylib/.so/.dll via LocalDispatcher, unguarded on every OS
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -531,6 +534,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/local_security_policy/src'),  # local_security_policy_*.hpp (pure helpers), Wave 8 PR8.3
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -681,6 +685,7 @@ agent_test_exe = executable(
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
+                local_security_policy_plugin_lib,  # Wave 8 PR8.3
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak

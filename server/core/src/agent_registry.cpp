@@ -947,6 +947,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // windows_optional_features
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags, Windows audit categories (read-only)"},
+        {"local_security_policy.sudoers", "Report parsed sudoers content: defaults, aliases, includes and user specs (Linux/macOS, read-only)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
