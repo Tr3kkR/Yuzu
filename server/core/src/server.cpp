@@ -191,6 +191,7 @@
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
+#include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -466,9 +467,9 @@ struct ScopedKeyZero {
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
 // #1290 adds (field confusion), and a CRLF could split the audit line. The
-// canonical implementation now lives in web_utils.hpp so the same neutralizer
-// guards every structured-audit call site (here + tar_tree_routes.cpp) without
-// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// shared mapping is yuzu::log_token (common/include/yuzu/log_token.hpp) and
+// web_utils.hpp's audit_token forwards to it, so the same neutralizer guards every
+// structured-audit call site (here + tar_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
 // spellings below resolving unchanged.
 using yuzu::server::audit_token;
 
@@ -16333,6 +16334,16 @@ private:
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_)
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
+        // instance backing GET /fragments/schedules (WorkflowRoutes),
+        // GET /api/v1/schedules (also WorkflowRoutes), and MCP
+        // list_schedules, so the three can never disagree. Gated on store
+        // presence, same posture as dex_api above: `!schedule_api` reads as
+        // "engine not available" wherever a consumer checks it, matching the
+        // pre-seam `if (!schedule_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::ScheduleApi> schedule_api;
+        if (schedule_engine_)
+            schedule_api = make_local_schedule_api(*schedule_engine_);
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -17317,7 +17328,9 @@ private:
         };
         wf_deps.workflow_engine = workflow_engine_.get();
         wf_deps.execution_tracker = execution_tracker_.get();
-        wf_deps.schedule_engine = schedule_engine_.get();
+        // ADR-0031 WS-A4 (seventh family): the SAME schedule_api instance
+        // constructed above (shared with mcp_server_->set_schedule_api below).
+        wf_deps.schedule_api = schedule_api;
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -18791,6 +18804,15 @@ private:
             // wiring change, and every server's stores fail closed at boot
             // regardless — behaviourally identical to the old direct calls.
             mcp_server_->set_dex_perf_api(dex_perf_api);
+            // ADR-0031 WS-A4 (seventh family): the SAME schedule-read API
+            // seam instance WorkflowRoutes uses for GET /fragments/schedules
+            // and GET /api/v1/schedules (wired into wf_deps.schedule_api
+            // above), so MCP list_schedules can never disagree with either.
+            // Gated on store presence at construction (schedule_api is
+            // nullptr when schedule_engine_ was never opened); the tool's own
+            // !schedule_api_ guard then answers "engine unavailable",
+            // matching the pre-seam !schedule_engine guard exactly.
+            mcp_server_->set_schedule_api(schedule_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see

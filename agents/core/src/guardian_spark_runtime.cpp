@@ -4,6 +4,7 @@
 #include "spark_key_rule_index.hpp"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -1049,7 +1050,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                      "or - rarely - an invariant violation) - disarming "
                                      "the stale success rather than adopting over the "
                                      "current live generation",
-                                     claim->rule_id, claim->generation);
+                                     ::yuzu::log_id_token(claim->rule_id), claim->generation);
                     } catch (...) {
                     }
                 } else if (wedge_may_adopt) {
@@ -1518,14 +1519,14 @@ void GuardianSparkRuntime::commit_new_generation_locked(
     // window-raise log above and spark_engine.cpp's own armed-log site.
     // FIELD ORDER IS PINNED by the #3990 driver's own regex
     // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T2_RE) - change
-    // both together.
+    // both together. The line is built by format_arm_committed_line (guardian_spark_timing.cpp),
+    // which neutralises the operator-authored rule id so a hostile id cannot forge a second
+    // log line.
     try {
         const auto attach_to_commit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                              clock_() - attach_now).count();
-        spdlog::info("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
-                     "type={}, via={}, attach_to_commit_ms={})",
-                     rule_id, detach_epoch_, gen, guard_type, commit_path_name(via),
-                     attach_to_commit_ms);
+        spdlog::info("{}", format_arm_committed_line(rule_id, detach_epoch_, gen, guard_type,
+                                                     commit_path_name(via), attach_to_commit_ms));
     } catch (...) {
     }
 }
@@ -1729,7 +1730,7 @@ void GuardianSparkRuntime::log_wedge_withdrawal_postcondition_violation(
         spdlog::critical(
             "Guardian spark #4508: a wedge candidate survived a withdrawal of rule "
             "'{}' - the sweep was skipped or reordered",
-            rule_id ? std::string{*rule_id} : std::string{"<all>"});
+            rule_id ? ::yuzu::log_id_token(*rule_id) : std::string{"<all>"});
     } catch (...) {
     }
 }
@@ -2797,7 +2798,8 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                                      "last-resort fallback, but this leftover fifo residue "
                                      "is left for the next same-key event to sweep (see "
                                      "detach_sweep_left_residue())",
-                                     *key_opt, eit->second.fifo.size(), rule_id);
+                                     *key_opt, eit->second.fifo.size(),
+                                     ::yuzu::log_id_token(rule_id));
                     } catch (...) {
                     }
                 } else {
@@ -3040,10 +3042,24 @@ void GuardianSparkRuntime::revalidate_subscriptions() {
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
     switch (ev.kind) {
-    case SparkEventKind::Fired:
+    case SparkEventKind::Fired: {
         // The event is an invalidation HINT; evaluate_key re-reads live state.
-        evaluate_key(ev.key, EvalReason::Event);
+        // #4606 criterion-10: T_handler (diagnostic) captured here, at queued-handler entry;
+        // T_mechanism read from ev.at (already stamped by SparkEngine::emit_event(), no
+        // producer change needed — this is purely consuming an existing value).
+        const auto handler_wall = std::chrono::system_clock::now();
+        const auto handler_mono = std::chrono::steady_clock::now();
+        EvalTrigger trigger;
+        trigger.mechanism_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        ev.at.time_since_epoch()).count();
+        trigger.handler_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       handler_wall.time_since_epoch()).count();
+        trigger.handler_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       handler_mono.time_since_epoch()).count();
+        trigger.seq = ev.seq;
+        evaluate_key(ev.key, EvalReason::Event, trigger);
         return;
+    }
     case SparkEventKind::Lost:
         on_subscription_lost(ev.key, ev.subscription_id, ev.detail);
         return;
@@ -3056,7 +3072,8 @@ void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
     }
 }
 
-void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason) {
+void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason,
+                                        std::optional<EvalTrigger> trigger) {
     std::shared_ptr<PerKey> pk;
     SparkSpec spec;
     {
@@ -3072,8 +3089,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
 
     // Serialise the whole pass (plan + read + fan-out + commit) for THIS key, so
     // read order == commit order and the freshest read commits last (no backward
-    // compliance). Per-key, so sibling keys run concurrently.
-    std::lock_guard<std::mutex> eval_lk{pk->eval_mu};
+    // compliance). Per-key, so sibling keys run concurrently. unique_lock (not
+    // lock_guard) so #4606 criterion-10's deferred log emission below can explicitly
+    // release it before doing any I/O.
+    std::unique_lock<std::mutex> eval_lk{pk->eval_mu};
 
     const bool is_file = spec.type == SparkType::File;
     const bool is_reg = spec.type == SparkType::Registry;
@@ -3112,6 +3131,20 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     }
     if (planned.empty())
         return;
+
+    // #4606 criterion-10: T_detect/T_fire staging for this pass, emitted as a
+    // best-effort deferred log line after both registry_mu_ and eval_lk release
+    // (see the end of this function). Purely diagnostic — read by nothing else here.
+    // BEST-EFFORT means it may never change what is enqueued: every allocation this
+    // bookkeeping does is inside a try, and a failure drops the timing, not the event.
+    std::vector<EvalTimingRecord> staged;
+    try {
+        if (fail_timing_reserve_for_test_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{}; // test seam: as if the reserve below failed
+        staged.reserve(planned.size() * 2); // most rules produce 0-1 entries; recovery+compliance
+                                             // pairs produce 2 sharing one detect stamp
+    } catch (...) { // diagnostic only; the staging loop below re-guards its own allocations
+    }
 
     // Snapshot the debounce clock BEFORE the blocking read too, so neither the clock
     // nor the agent-id provider is invoked on the detached-post-read path (a provider
@@ -3159,6 +3192,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                 eval_rule(spec, rg->assertion, scratch, now, rg->emit_compliant_edge,
                           is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                           is_svc ? &svc_read : nullptr);
+            // #4606 criterion-10: T_detect — the REAL clock, never clock_() (that's the
+            // injected eval-window seam for debounce logic, not a latency measurement).
+            const auto detect_wall = std::chrono::system_clock::now();
+            const auto detect_mono = std::chrono::steady_clock::now();
 
             // M1 item (a): a committed repeat Unknown (edge already fired earlier in this
             // errored episode) is due a REFRESH once errored_refresh_ms has elapsed since
@@ -3200,11 +3237,68 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
 
             std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id, refresh_due);
             const bool had_entries = !entries.empty(); // captured BEFORE the move below
+
+            // #4606 criterion-10: stage one EvalTimingRecord per entry (event_id/domain
+            // already final, minted by build_entries above) BEFORE entries moves into
+            // enqueue_all below.
+            const std::size_t staged_begin = staged.size();
+            try {
+                const int fail_at = fail_timing_stage_at_for_test_.load(std::memory_order_relaxed);
+                for (const OutboxEntry& e : entries) {
+                    if (fail_at >= 0 && staged.size() == static_cast<std::size_t>(fail_at)) {
+                        // One-shot: the erase below restores staged.size(), so a seam left armed
+                        // would fire again on the next rule.
+                        fail_timing_stage_at_for_test_.store(-1, std::memory_order_relaxed);
+                        throw std::bad_alloc{}; // test seam: as if the copy below failed
+                    }
+                    EvalTimingRecord r;
+                    r.event_id = e.event_id; // the only allocating copy: a throw here must not
+                                             // prevent the enqueue below
+                    r.domain = e.domain;
+                    r.detect_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_wall.time_since_epoch()).count();
+                    r.detect_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_mono.time_since_epoch()).count();
+                    r.trigger = trigger; // copied as-is; absent stays absent
+                    staged.push_back(std::move(r));
+                }
+            } catch (...) {
+                // Best-effort: drop THIS rule's timing (including any of its entries already staged
+                // before the failure), never its event, and keep earlier rules' records. erase() of a
+                // tail range does not allocate, so this handler cannot itself throw.
+                staged.erase(staged.begin() + static_cast<std::ptrdiff_t>(staged_begin),
+                             staged.end());
+            }
+
             bool accepted = true;
             if (had_entries) {
                 std::lock_guard<std::mutex> ob{outbox_mu_};
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
+
+            // #4606 criterion-10: backfill T_fire (or accepted=false) into the records
+            // just staged for this rule. MUST run regardless of `accepted` — placed
+            // before the `continue` below so a rejected batch's records still get
+            // accepted=false written, not silently left at their struct defaults. On a
+            // rejection fire_wall_ns/fire_mono_ns are deliberately left at their -1
+            // "never fired" sentinel defaults (guardian_spark_timing.hpp), never a
+            // fabricated 0. noexcept field writes only; nothing here may throw.
+            {
+                const auto fire_wall = accepted ? std::chrono::system_clock::now()
+                                                 : std::chrono::system_clock::time_point{};
+                const auto fire_mono = accepted ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+                for (std::size_t i = staged_begin; i < staged.size(); ++i) {
+                    staged[i].accepted = accepted;
+                    if (accepted) {
+                        staged[i].fire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     fire_wall.time_since_epoch()).count();
+                        staged[i].fire_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     fire_mono.time_since_epoch()).count();
+                    }
+                }
+            }
+
             if (!accepted)
                 continue; // outbox full: RuleEvalState scratch stays uncommitted (nothing
                           // written to rg->eval/last_unhealthy_emit), so eval retries the
@@ -3246,6 +3340,32 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     // drains everything pending regardless of how many entries accumulated.
     if (outbox_waker)
         outbox_waker();
+
+    // #4606 criterion-10: release eval_lk (this key's serialisation) BEFORE any I/O
+    // below, so a slow log write does not extend the window in which OTHER threads wait
+    // on this key, and the waker above has already fired, so nothing below delays the
+    // ENQUEUE or the drain worker's wake. That is the whole extent of the decoupling:
+    // the T_detect line is written synchronously on THIS thread (the Spark consumer
+    // thread for an Event pass, a convergence lane or the priority thread otherwise) and
+    // the T_wire line on a send worker, so a log sink that blocks stalls whichever thread
+    // is writing, including the next Event evaluation queued behind it on the consumer
+    // thread (see guardian_spark_timing.hpp). The waker also means a T_wire line can
+    // reach the log before its own T_detect line - correlate by event_id and the
+    // embedded *_wall_ns fields, never file order.
+    eval_lk.unlock();
+    if (!staged.empty()) {
+        try {
+            for (const EvalTimingRecord& r : staged)
+                spdlog::info("{}", format_eval_timing_line(r));
+        } catch (...) { // best-effort diagnostic; never propagate out of evaluate_key
+        }
+    }
+    {
+        // Test accessor only. Assigned AFTER the emission so it adds no allocation between the
+        // waker and the log line; the move is noexcept and `staged` is not used again.
+        std::lock_guard<std::mutex> lt{last_eval_timings_mu_};
+        last_eval_timings_ = std::move(staged);
+    }
 }
 
 EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const RuleAssertion& a,
@@ -3366,7 +3486,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
@@ -3409,7 +3529,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
@@ -3980,6 +4100,12 @@ GuardianSparkRuntime::pending_demoted_for_test(const std::string& key) const {
             out.push_back(rule_id);
     return out;
 }
+
+std::vector<EvalTimingRecord> GuardianSparkRuntime::last_eval_timings_for_test() const {
+    std::lock_guard<std::mutex> lk{last_eval_timings_mu_};
+    return last_eval_timings_;
+}
+
 bool GuardianSparkRuntime::stopping() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     return stopping_;
