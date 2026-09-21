@@ -69,7 +69,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "(Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED "
       "on a host with AppLocker configured, so CIM-sourced modes report unmodelled (the registry "
       "numbering is not assumed for them) and a policy delivered outside the SrpV2 key (for example by "
-      "MDM) is not read. The CIM namespace is caller-side allowlisted"}},
+      "MDM) is not read. An enforced mode is the configured mode, not proof the rules apply (the "
+      "Application Identity service is not read). The CIM namespace is caller-side allowlisted"}},
 };
 
 } // namespace

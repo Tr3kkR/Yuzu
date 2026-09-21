@@ -113,11 +113,14 @@ TEST_CASE("app_control rows: wdac / cip / applocker / unsupported / constrained 
     CHECK(format_cip_row("{1234-ABCD}.cip") == "wdac_cip|{1234-ABCD}|present");
     CHECK(format_cip_none_row() == "wdac_cip|none|absent");
 
-    CHECK(format_applocker_row("Exe", 1, 12) == "applocker|Exe|enforced|12");
-    CHECK(format_applocker_row("Dll", 0, 0) == "applocker|Dll|audit|0");
-    CHECK(format_applocker_row("Msi", 7, 3) == "applocker|Msi|unmodelled|3");
-    CHECK(format_applocker_row("Script", std::nullopt, 5) == "applocker|Script|absent|5");
-    CHECK(format_applocker_row("a|b", 1, 0) == "applocker|a\\|b|enforced|0"); // pipe escaped
+    CHECK(format_applocker_row({"Exe", 1, 12, true}) == "applocker|Exe|enforced|12");
+    CHECK(format_applocker_row({"Dll", 0, 0, true}) == "applocker|Dll|audit|0");
+    CHECK(format_applocker_row({"Msi", 7, 3, true}) == "applocker|Msi|unmodelled|3");
+    CHECK(format_applocker_row({"Script", std::nullopt, 5, true}) == "applocker|Script|absent|5");
+    CHECK(format_applocker_row({"a|b", 1, 0, true}) == "applocker|a\\|b|enforced|0"); // pipe escaped
+    // A CIM-sourced row never maps the registry numbering, whatever the number is.
+    CHECK(format_applocker_row({"Exe", 1, 12, false}) == "applocker|Exe|unmodelled|12");
+    CHECK(format_applocker_row({"Exe", std::nullopt, 0, false}) == "applocker|Exe|unmodelled|0");
     CHECK(format_applocker_none_row() == "applocker|none|absent|0");
 
     CHECK(format_unsupported_row("wdac_policy") == "wdac_policy|unsupported|windows_only_concept");
@@ -508,6 +511,13 @@ TEST_CASE("app_control CIM rows: canonical collection, unmodelled mode, every re
     CHECK(format_applocker_row(ApplockerRowData{"Exe", 1, 4, true}) == "applocker|Exe|enforced|4");
 }
 
+TEST_CASE("app_control provenance tokens keep their documented spellings", "[app_control][parsers]") {
+    // Pinned as literals: the README status table and the definition quote these strings.
+    CHECK(kProvenanceCiPolicy == "registry_ci_policy");
+    CHECK(kProvenanceCim == "cim_msft_applockerpolicy");
+    CHECK(kProvenanceSrpV2 == "registry_srpv2");
+}
+
 TEST_CASE("app_control enum_step: exactly the cap is complete; only a value past it is truncation",
           "[app_control][parsers]") {
     constexpr std::size_t kCap = 256;
@@ -530,7 +540,9 @@ TEST_CASE("app_control srpv2_collection_step: absent is a row, unreadable is ski
 }
 
 // Fails under: any source's failure not reaching the verdict, the `none` row emitted beside a
-// failure or rows, a refusal not becoming PERMISSION_DENIED, an OK run naming the wrong source.
+// failure or rows, a refusal not becoming PERMISSION_DENIED, an OK run naming the wrong source, the
+// SrpV2 walk running (or not running) against the CIM outcome. It drives the real settle_applocker,
+// the function the Windows shell calls, with only the registry walk stubbed.
 TEST_CASE("app_control finish_applocker: the CIM x SrpV2 product never reads a failure as absent",
           "[app_control][parsers]") {
     struct Cim {
@@ -563,26 +575,30 @@ TEST_CASE("app_control finish_applocker: the CIM x SrpV2 product never reads a f
             INFO("cim=" << c.name << " walk=" << w.name);
             const auto plan = plan_cim(c.error, c.rows, c.truncated);
             yuzu::shared::ConstraintAccumulator acc;
-            for (const auto& t : plan.failures)
-                acc.add_failure(t);
-            std::size_t walk_rows = 0;
-            bool denied = plan.denied;
-            if (!plan.use_cim) { // the shell walks SrpV2 only when no CIM row mapped
-                walk_rows = w.rows;
+            bool denied = false;
+            bool walked = false;
+            // The real settle_applocker: the walk callback stands in for the Win32 registry walk.
+            const auto fin = settle_applocker(plan, acc, denied, [&] {
+                walked = true;
                 denied = denied || w.denied;
                 for (const auto& t : w.tokens)
                     acc.add_failure(t);
-            }
-            const auto fin = finish_applocker(plan.use_cim, walk_rows, acc, denied,
-                                              plan.use_cim ? kProvenanceCim : kProvenanceSrpV2);
-            const bool failed = acc.any_failure();
-            CHECK((fin.verdict.status == YUZU_RESULT_STATUS_OK) == !failed);
-            CHECK((fin.verdict.rc == 0) == !failed);
-            CHECK(fin.verdict.constrained_row_due == failed);
-            CHECK(fin.none_row_due == (!plan.use_cim && walk_rows == 0 && !failed));
-            if (denied)
+                return w.rows;
+            });
+            CHECK(walked == !plan.use_cim); // the SrpV2 walk runs only when no CIM row mapped
+            // Expectations come from the inputs, not from the accumulator under test.
+            const std::size_t walk_rows = plan.use_cim ? 0 : w.rows;
+            const bool expect_fail = !plan.failures.empty() || (!plan.use_cim && !w.tokens.empty());
+            const bool expect_denied = plan.denied || (!plan.use_cim && w.denied);
+            CHECK((fin.verdict.status == YUZU_RESULT_STATUS_OK) == !expect_fail);
+            CHECK((fin.verdict.rc == 0) == !expect_fail);
+            CHECK(fin.verdict.constrained_row_due == expect_fail);
+            CHECK(fin.none_row_due == (!plan.use_cim && walk_rows == 0 && !expect_fail));
+            if (expect_denied)
                 CHECK(fin.verdict.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
-            if (!failed)
+            else if (expect_fail)
+                CHECK(fin.verdict.status == YUZU_RESULT_STATUS_CONSTRAINED);
+            if (!expect_fail)
                 CHECK(fin.verdict.provenance ==
                       std::string{plan.use_cim ? kProvenanceCim : kProvenanceSrpV2});
         }
@@ -617,6 +633,27 @@ TEST_CASE("app_control CipScan: the legacy single-format policy is one more acti
         CHECK(enoent.none_row_due());
         CHECK_FALSE(acc2.any_failure());
     }
+    SECTION("a path whose parent is not a directory is also a definitive absence") {
+        scan.observe_single(false, ec_of(std::errc::not_a_directory));
+        CHECK(scan.none_row_due());
+        CHECK_FALSE(acc.any_failure());
+    }
+#ifdef _WIN32
+    SECTION("MSVC system_category codes: file/path not found is an absence, not sipolicy_stat_failed") {
+        // What the Windows shell feeds when SiPolicy.p7b (or CodeIntegrity\) is not there. Inside the
+        // test body, never a TU guard.
+        for (const int code : {2, 3}) {
+            yuzu::shared::ConstraintAccumulator acc4;
+            bool denied4 = false;
+            CipScan absent{acc4, denied4};
+            absent.finish({});
+            absent.observe_single(false, std::error_code{code, std::system_category()});
+            INFO("win32 code " << code);
+            CHECK(absent.none_row_due());
+            CHECK_FALSE(acc4.any_failure());
+        }
+    }
+#endif
     SECTION("a refused stat is a denial, never an absence") {
         scan.observe_single(false, ec_of(std::errc::permission_denied));
         CHECK_FALSE(scan.none_row_due());

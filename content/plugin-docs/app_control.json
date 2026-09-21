@@ -19,7 +19,7 @@
           "support": "unsupported"
         },
         "windows": {
-          "fallback": "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace root\\\\StandardCimv2\\\\Security\\\\ApplicationControl does NOT exist on this host (WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no AppLocker policy configured, reports 'none'. The CIM property names (Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED on a host with AppLocker configured, so CIM-sourced modes report unmodelled (the registry numbering is not assumed for them) and a policy delivered outside the SrpV2 key (for example by MDM) is not read. The CIM namespace is caller-side allowlisted",
+          "fallback": "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace root\\\\StandardCimv2\\\\Security\\\\ApplicationControl does NOT exist on this host (WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no AppLocker policy configured, reports 'none'. The CIM property names (Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED on a host with AppLocker configured, so CIM-sourced modes report unmodelled (the registry numbering is not assumed for them) and a policy delivered outside the SrpV2 key (for example by MDM) is not read. An enforced mode is the configured mode, not proof the rules apply (the Application Identity service is not read). The CIM namespace is caller-side allowlisted",
           "mechanism": "wmi_bounded run_bounded_wmi_query root\\\\StandardCimv2\\\\Security\\\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\\\SOFTWARE\\\\Policies\\\\Microsoft\\\\Windows\\\\SrpV2\\\\<collection> when the class is absent, empty or failing",
           "rung": "1",
           "support": "constrained"
@@ -86,7 +86,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reads the configured Windows Defender Application Control (Code Integrity) posture: every value under HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy with its raw data and a named state, plus one row per active .cip policy file. The value `VerifiedAndReputablePolicyState` is the Smart App Control state, not the state of the listed policies, and a `present` file does not say whether its policy is enforced or audit-only; the legacy single-format SiPolicy.p7b is not read. A value the plugin does not model is reported `unmodelled`, never coerced; a key or directory the OS reports as not present is `absent`; a failed read is reported as a `constrained` row with a reason, never as absent. An `enforced` mode is the configured mode, not proof that rules apply (the Application Identity service is not read). Windows-only: application control has no Linux/macOS equivalent here.",
+      "description": "Reads the configured Windows Defender Application Control (Code Integrity) posture: every value under HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy with its raw data and a named state, plus one row per active .cip policy file. The value `VerifiedAndReputablePolicyState` is the Smart App Control state, not the state of the listed policies, and a `present` file does not say whether its policy is enforced or audit-only; the legacy single-format SiPolicy.p7b is reported by presence only. A value the plugin does not model is reported `unmodelled`, never coerced; a key or directory the OS reports as not present is `absent`; a failed read is reported as a `constrained` row with a reason, never as absent. An `enforced` mode is the configured mode, not proof that rules apply (the Application Identity service is not read). Windows-only: application control has no Linux/macOS equivalent here.",
       "display_name": "WDAC Policy Posture",
       "execute_roles": [
         "endpoint-admin",
@@ -230,7 +230,7 @@
       "definition_id": "windows.app_control.wdac_policy"
     }
   ],
-  "outputs_note": "Pipe-delimited rows via `write_output()`, the first field naming the row kind (`row_kind`, the first declared column). `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file (three fields: `state` stays empty); `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. Placeholders: `wdac|policy_key|-|absent` (the CI\\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` file and no `SiPolicy.p7b`), `applocker|none|absent|0` (the SrpV2 key does not exist: no AppLocker policy configured) — each a genuine \"nothing configured\" reported by the OS; when the SrpV2 key exists every collection that reads cleanly gets a row, and one that is not configured reads `applocker|<collection>|absent|0`. Any failed step instead writes `constrained|<reason>` beside a non-OK result status (the reason lands in the second column); a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.",
+  "outputs_note": "Pipe-delimited rows via `write_output()`, the first field naming the row kind (`row_kind`, the first declared column). `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file (three fields: `state` stays empty); `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. Placeholders: `wdac|policy_key|-|absent` (the CI\\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` file and no `SiPolicy.p7b`), `applocker|none|absent|0` (neither the CIM class nor the SrpV2 key shows a policy; one delivered another way, such as MDM, is not read) — each a definitive absence reported by the OS for the source read; when the SrpV2 key exists every collection that reads cleanly gets a row, and one that is not configured reads `applocker|<collection>|absent|0`. Any failed step instead writes `constrained|<reason>` beside a non-OK result status (the reason lands in the second column); a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.",
   "platforms": {
     "linux": "unsupported",
     "macos": "unsupported",
@@ -281,7 +281,7 @@
     },
     {
       "completeness": "PARTIAL",
-      "provenance": "`row_cap`, `value_too_large`, `cim_row_unrecognised`, `ci_policy_open_0x<hex>`, `ci_policy_enum_0x<hex>`, `srpv2_open_0x<hex>`, `srpv2_collection_open_0x<hex>`, `enforcement_mode_read_0x<hex>`, `srpv2_rule_count_0x<hex>`, `cip_stat_failed_<n>`, `cip_dir_failed_<n>`, `system_directory_unresolved`, a `wmi_bounded` error token",
+      "provenance": "`row_cap`, `value_too_large`, `cim_row_unrecognised`, `ci_policy_open_0x<hex>`, `ci_policy_enum_0x<hex>`, `srpv2_open_0x<hex>`, `srpv2_collection_open_0x<hex>`, `enforcement_mode_read_0x<hex>`, `srpv2_rule_count_0x<hex>`, `cip_stat_failed_<n>`, `cip_dir_failed_<n>`, `sipolicy_stat_failed_<n>`, `value_name_embedded_nul`, `system_directory_unresolved`, a `wmi_bounded` error token",
       "status": "`CONSTRAINED`",
       "when": "a bounded read hit its cap, a value or CIM row could not be interpreted, or a registry / directory / CIM step failed with a non-access-denied error; the reasons are joined in one status string"
     },
@@ -289,7 +289,7 @@
       "completeness": "PARTIAL",
       "provenance": "`unhandled exception: <what>`",
       "status": "`CONSTRAINED`",
-      "when": "an exception was caught inside `execute()`"
+      "when": "an exception was caught inside `execute()`; the row written is `constrained|internal_error`"
     },
     {
       "completeness": "PARTIAL",

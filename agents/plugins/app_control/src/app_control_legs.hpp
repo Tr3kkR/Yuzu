@@ -1,7 +1,8 @@
 /**
  * app_control_legs.hpp -- the Windows leg entry points, declared once for the portable TU
  * (app_control_plugin.cpp, which calls them under _WIN32) and their definitions in
- * app_control_win.cpp, so a signature drift is a compile error in both, not a link error.
+ * app_control_win.cpp, so the two TUs cannot silently disagree: a signature drift surfaces as a
+ * compile error (return type) or a link error (parameters).
  */
 #pragma once
 

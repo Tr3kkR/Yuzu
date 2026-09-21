@@ -114,8 +114,9 @@ TEST_CASE("app_control plugin: all three OS legs declared; Linux/macOS unsupport
         CHECK(d.linux_leg.fallback != nullptr);
         CHECK(d.macos_leg.fallback != nullptr);
         // wdac_policy is declared SUPPORTED (only VerifiedAndReputablePolicyState=0 was observed,
-        // and the legacy SiPolicy.p7b is not read); applocker_policy's CIM property names and SrpV2
-        // layout never were observed, so its Windows leg is declared CONSTRAINED.
+        // and the legacy SiPolicy.p7b is reported by presence only); applocker_policy's CIM
+        // property names and SrpV2 layout never were observed, so its Windows leg is declared
+        // CONSTRAINED.
         CHECK(d.windows_leg.support == (std::string_view{d.action} == "wdac_policy"
                                             ? YUZU_SUPPORT_SUPPORTED
                                             : YUZU_SUPPORT_CONSTRAINED));

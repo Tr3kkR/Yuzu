@@ -28,7 +28,7 @@ metadata:
     `VerifiedAndReputablePolicyState` is the Smart App Control state, not
     the state of the listed policies, and a `present` file does not say
     whether its policy is enforced or audit-only; the legacy single-format
-    SiPolicy.p7b is not read. A value the
+    SiPolicy.p7b is reported by presence only. A value the
     plugin does not model is reported `unmodelled`, never coerced; a key or
     directory the OS reports as not present is `absent`; a failed read is
     reported as a `constrained` row with a reason, never as absent.

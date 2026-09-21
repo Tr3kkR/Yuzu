@@ -4,7 +4,9 @@
  *
  *   wdac_policy      HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy (every 32-bit and
  *                    string value; VerifiedAndReputablePolicyState mapped) + presence of
- *                    %SystemRoot%\System32\CodeIntegrity\CiPolicies\Active\*.cip.
+ *                    %SystemRoot%\System32\CodeIntegrity\CiPolicies\Active\*.cip and of the
+ *                    legacy single-format %SystemRoot%\System32\CodeIntegrity\SiPolicy.p7b
+ *                    (a stat: presence only, never opened).
  *   applocker_policy wmi_bounded.hpp run_bounded_wmi_query against
  *                    root\StandardCimv2\Security\ApplicationControl / MSFT_ApplockerPolicy;
  *                    when the class is absent, empty or failing, a walk of
@@ -248,8 +250,8 @@ yuzu::shared::wmi::BoundedQueryResult bounded_cim_query(std::string_view ns, std
     }
     // sink: app_control/bounded_cim_query#1 -- rung 1, in-process CIM query (no PowerShell).
     yuzu::shared::wmi::BoundedQueryOptions opts;
-    // A handful of rows is expected: a wedged winmgmt must not hold the (instant) registry
-    // fallback back for minutes, so the enumeration bound is 15 s, not the helper's 60 s.
+    // A handful of rows is expected, so the enumeration stage is bounded at 15 s, not the helper's
+    // 60 s. The connect stage keeps the helper's own max-wait bound (it has no millisecond knob).
     opts.enumeration_deadline_ms = 15000;
     return yuzu::shared::wmi::run_bounded_wmi_query(yuzu::win::to_wide(ns), yuzu::win::to_wide(wql),
                                                     opts);
@@ -271,7 +273,7 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
         const auto step =
             srpv2_collection_step(o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query));
         if (step == CollectionStep::absent_row) { // collection not configured: a definitive row
-            ctx.write_output(format_applocker_row(collection, std::nullopt, 0));
+            ctx.write_output(format_applocker_row({std::string{collection}, std::nullopt, 0, true}));
             ++written;
             continue;
         }
@@ -292,7 +294,8 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
                              nullptr, nullptr, nullptr, nullptr, nullptr);
         if (o.note("srpv2_rule_count", info_rc, ReadKind::enumerate) != RegRead::ok)
             continue;
-        ctx.write_output(format_applocker_row(collection, mode, rule_subkeys));
+        ctx.write_output(
+            format_applocker_row({std::string{collection}, mode, rule_subkeys, true}));
         ++written;
     }
     return written;
@@ -315,14 +318,11 @@ int collect_applocker(yuzu::CommandContext& ctx) {
     const auto plan = plan_cim(q.error, q.rows, q.truncated);
     for (const auto& r : plan.rows)
         ctx.write_output(format_applocker_row(r));
-    for (const auto& token : plan.failures)
-        o.acc.add_failure(token);
-    o.denied |= plan.denied;
 
-    // No usable CIM rows (class absent / empty / failed): registry walk; CIM failures stay on `o`.
-    const std::size_t srpv2_rows = plan.use_cim ? 0 : walk_srpv2(ctx, o);
-    const auto fin = finish_applocker(plan.use_cim, srpv2_rows, o.acc, o.denied,
-                                      plan.use_cim ? kProvenanceCim : kProvenanceSrpV2);
+    // settle_applocker folds the CIM failures onto `o`, walks SrpV2 only when no CIM row mapped
+    // (class absent / empty / failed), and decides the `none` row and the verdict.
+    const auto fin =
+        settle_applocker(plan, o.acc, o.denied, [&] { return walk_srpv2(ctx, o); });
     if (fin.none_row_due)
         ctx.write_output(format_applocker_none_row());
     return apply_verdict(ctx, fin.verdict, o);

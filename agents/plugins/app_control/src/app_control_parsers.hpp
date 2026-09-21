@@ -13,7 +13,8 @@
  *
  * Rows (pipe-delimited; every untrusted field via yuzu::util::safe_output_field):
  *   wdac|<value_name>|<raw>|<state>          one per value under Control\CI\Policy
- *   wdac_cip|<policy_stem>|present           one per Active\*.cip policy file
+ *   wdac_cip|<policy_stem>|present           one per Active\*.cip policy file, and
+ *   wdac_cip|SiPolicy|present                the legacy single-format file (presence only)
  *   applocker|<collection>|<mode>|<rules>    one per AppLocker rule collection
  *   constrained|<reason>                     any failed step (typed status accompanies it)
  *   <action>|unsupported|windows_only_concept  non-Windows legs
@@ -44,6 +45,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace yuzu::app_control {
@@ -220,14 +222,6 @@ private:
 inline constexpr std::array<std::string_view, 5> kApplockerCollections{"Appx", "Dll", "Exe", "Msi",
                                                                        "Script"};
 
-inline std::string format_applocker_row(std::string_view collection,
-                                        std::optional<std::uint32_t> mode, std::size_t rules) {
-    const std::string_view mode_name =
-        mode ? policy_state_name(map_enforcement_mode(*mode)) : std::string_view{"absent"};
-    return "applocker|" + yuzu::util::safe_output_field(collection) + "|" + std::string{mode_name} +
-           "|" + std::to_string(rules);
-}
-
 /// SrpV2 root absent: a genuine "nothing configured", never a failed read.
 inline std::string format_applocker_none_row() {
     return "applocker|none|absent|0";
@@ -354,16 +348,20 @@ struct ApplockerRowData {
     std::optional<std::uint32_t> mode; // nullopt = absent
     std::size_t rules = 0;
     /// False for a CIM-sourced row: the registry's 0 = audit / 1 = enforce numbering is documented
-    /// for SrpV2 only, so it is NOT assumed for the (unverified) CIM class.
-    bool mode_verified = true;
+    /// for SrpV2 only, so it is NOT assumed for the (unverified) CIM class. No default: every
+    /// construction site states it.
+    bool mode_verified;
 };
 
-/// A CIM-sourced row reports its mode `unmodelled`; a registry-sourced one maps it.
+/// The one AppLocker row formatter. A CIM-sourced row reports its mode `unmodelled`; a
+/// registry-sourced one maps it (`absent` when the collection has no EnforcementMode).
 inline std::string format_applocker_row(const ApplockerRowData& r) {
-    if (r.mode_verified)
-        return format_applocker_row(r.collection, r.mode, r.rules);
-    return "applocker|" + yuzu::util::safe_output_field(r.collection) + "|" +
-           std::string{policy_state_name(PolicyState::unmodelled)} + "|" + std::to_string(r.rules);
+    const std::string_view mode_name =
+        !r.mode_verified ? policy_state_name(PolicyState::unmodelled)
+        : r.mode         ? policy_state_name(map_enforcement_mode(*r.mode))
+                         : std::string_view{"absent"};
+    return "applocker|" + yuzu::util::safe_output_field(r.collection) + "|" + std::string{mode_name} +
+           "|" + std::to_string(r.rules);
 }
 
 namespace detail {
@@ -429,6 +427,23 @@ struct ApplockerFinish {
                                                       bool denied, std::string_view source) {
     return {applocker_none_row_due(use_cim, srpv2_rows_written, acc),
             select_verdict(acc, denied, source)};
+}
+
+/// Both AppLocker sources settled by ONE function the shell calls, so a test observes the code that
+/// runs: the CIM plan's failures and refusal are folded into the caller's accumulator, the SrpV2
+/// walk (`walk()` returns the rows it wrote and records its own failures and refusal on the same
+/// accumulator) runs only when no CIM row mapped, and the product decides the `none` row and the
+/// typed verdict.
+template <typename Walk>
+[[nodiscard]] ApplockerFinish settle_applocker(const CimPlan& plan,
+                                               yuzu::shared::ConstraintAccumulator& acc, bool& denied,
+                                               Walk&& walk) {
+    for (const auto& token : plan.failures)
+        acc.add_failure(token);
+    denied = denied || plan.denied;
+    const std::size_t srpv2_rows = plan.use_cim ? 0 : walk();
+    return finish_applocker(plan.use_cim, srpv2_rows, acc, denied,
+                            plan.use_cim ? kProvenanceCim : kProvenanceSrpV2);
 }
 
 /// One step of the CI\Policy value enumeration, from the RegEnumValueW result and the index: exactly
