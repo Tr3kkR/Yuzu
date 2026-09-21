@@ -14,15 +14,27 @@
  * This TU owns ONLY the Win32 I/O; every mapping, row format, namespace floor and error
  * classification is the pure app_control_parsers.hpp (registry types stop at RegValueView).
  *
- * RIG PROBE (LocalSystem, S4U scheduled task) -- STATUS: PENDING. The engineer who
- * wrote this TU cannot reach the-rig; the integration rig session's output is to be
- * pasted VERBATIM below before merge. Nothing here is a claimed result:
- *   [PENDING] MSFT_ApplockerPolicy present in root\StandardCimv2\Security\ApplicationControl?
- *             Property names / EnforcementMode values, if so (pins parse_cim_applocker_row's
- *             UNVERIFIED Collection/EnforcementMode/RuleCount): ...
- *   [PENDING] SrpV2 registry walk outcome on an AppLocker-configured box: ...
- *   [PENDING] CI\Policy values under LocalSystem; VerifiedAndReputablePolicyState meaning: ...
- * The probe decides the AppLocker branch, so both are implemented and chosen at runtime.
+ * RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64; NT AUTHORITY\SYSTEM
+ * scheduled task, RunLevel Highest) -- COMPLETE for what this host can show. Real captures:
+ * tests/unit/fixtures/wave8/app_control/windows/ and docs/samples/windows.txt.
+ *   AppLocker CIM: the namespace root\StandardCimv2\Security\ApplicationControl does NOT exist.
+ *             A throwaway probe calling yuzu::shared::wmi::run_bounded_wmi_query (the same helper
+ *             this TU uses) returned `error=wmi_connect_failed_0x8004100e rows=0`
+ *             (WBEM_E_INVALID_NAMESPACE); PowerShell Get-CimClass says "Invalid namespace"
+ *             (managed HRESULT 0x80131500); root\StandardCimv2 holds only MS_409, MS_809,
+ *             embedded. So MSFT_ApplockerPolicy's property names (Collection / EnforcementMode /
+ *             RuleCount, pinned by parse_cim_applocker_row) are STILL UNVERIFIED on hardware.
+ *   SrpV2 walk: `reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 /s` -> "ERROR: The
+ *             system was unable to find the specified registry key or value." (no AppLocker policy
+ *             configured); the plugin reports `applocker|none|absent|0`, OK / FULL / registry_srpv2.
+ *             The rule-collection layout was therefore never read on an AppLocker-configured host.
+ *   CI\Policy values as SYSTEM: EmodePolicyRequired=0, SkuPolicyRequired=0,
+ *             VerifiedAndReputablePolicyState=0 (maps `disabled`), SAC_PreviousState=0xffffffff
+ *             (`unmodelled`); 8 default .cip policies in CodeIntegrity\CiPolicies\Active. Only
+ *             VerifiedAndReputablePolicyState=0 has been observed; 1/2 are mapped per documentation
+ *             and unverified on hardware.
+ * The probe decided the branch on this host: CIM class absent -> SrpV2 registry walk. Both
+ * branches are implemented and chosen at runtime; the CIM-present branch is untested on hardware.
  *
  * FAILURE SEMANTICS: every failed step records a token on ConstraintAccumulator and is
  * never rendered as absent. ERROR_ACCESS_DENIED -> PERMISSION_DENIED, anything else ->

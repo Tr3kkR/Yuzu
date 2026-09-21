@@ -206,7 +206,7 @@ inline const std::string* find_prop(const WmiRow& row, std::string_view name) {
 }
 } // namespace detail
 
-/// Maps one MSFT_ApplockerPolicy row. Property names are PENDING the-rig probe (see
+/// Maps one MSFT_ApplockerPolicy row. Property names are UNVERIFIED on hardware (the rig has no AppLocker provider namespace; see
 /// app_control_win.cpp's banner): a row lacking `Collection`, `EnforcementMode` or
 /// `RuleCount`, or with a non-numeric mode/count, returns nullopt and the caller
 /// records `cim_row_unrecognised` rather than emitting a guessed value.

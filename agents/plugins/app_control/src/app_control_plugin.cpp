@@ -35,9 +35,9 @@ int collect_applocker(yuzu::CommandContext& ctx);
 
 namespace {
 
-// Descriptor legs are FIXED, never preprocessor-conditional. The Windows notes' probe
-// outcomes are PENDING the integration rig session and are pasted verbatim from
-// app_control_win.cpp's banner before merge -- nothing below is a claimed probe result.
+// Descriptor legs are FIXED, never preprocessor-conditional. The Windows fallback texts
+// quote the rig probe recorded in app_control_win.cpp's banner (rig session A, 2026-09-21,
+// Windows 11 Pro 10.0.26200); anything the rig could not show is stated as UNVERIFIED.
 const YuzuOsLeg kLinuxLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
                           "Windows-only concept; Linux fapolicyd is a separate, unimplemented "
                           "leg of #282"};
@@ -50,19 +50,24 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 1,
       "RegEnumValueW HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy + std::filesystem "
       "listing of %SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active\\*.cip",
-      "RIG PROBE PENDING (CI\\Policy values under LocalSystem; VerifiedAndReputablePolicyState "
-      "value meanings): quoted verbatim from the integration rig session before merge. An "
-      "unmodelled value is reported 'unmodelled'; an unreadable key is constrained or "
-      "permission_denied, never absent"}},
+      "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): CI\\Policy holds "
+      "EmodePolicyRequired, SkuPolicyRequired, VerifiedAndReputablePolicyState (0 reads "
+      "'disabled') and SAC_PreviousState (0xffffffff reads 'unmodelled'), and 8 default .cip "
+      "policies are listed; only VerifiedAndReputablePolicyState=0 was observed, other values "
+      "are mapped per documentation and unverified on hardware. An unmodelled value is reported "
+      "'unmodelled'; an unreadable key is constrained or permission_denied, never absent"}},
     {"applocker_policy", kLinuxLeg, kMacosLeg,
      {YUZU_SUPPORT_SUPPORTED, 1,
       "wmi_bounded run_bounded_wmi_query root\\StandardCimv2\\Security\\ApplicationControl "
       "MSFT_ApplockerPolicy; registry walk of "
       "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2\\<collection> when the class is "
       "absent or empty",
-      "RIG PROBE PENDING (MSFT_ApplockerPolicy class presence + property names, SrpV2 walk): "
-      "quoted verbatim from the integration rig session before merge. The CIM namespace is "
-      "caller-side allowlisted"}},
+      "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace "
+      "root\\StandardCimv2\\Security\\ApplicationControl does NOT exist on this host "
+      "(WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no "
+      "AppLocker policy configured, reports 'none'. The CIM property names "
+      "(Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED "
+      "on a host with AppLocker configured. The CIM namespace is caller-side allowlisted"}},
 };
 
 } // namespace

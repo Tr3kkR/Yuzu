@@ -40,10 +40,10 @@ flowchart LR
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`applocker_policy` / Windows** — RIG PROBE PENDING (MSFT_ApplockerPolicy class presence + property names, SrpV2 walk): quoted verbatim from the integration rig session before merge. The CIM namespace is caller-side allowlisted
+- **`applocker_policy` / Windows** — Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace root\\StandardCimv2\\Security\\ApplicationControl does NOT exist on this host (WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no AppLocker policy configured, reports 'none'. The CIM property names (Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED on a host with AppLocker configured. The CIM namespace is caller-side allowlisted
 - **`applocker_policy` / macOS** — Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security
 - **`applocker_policy` / Linux** — Windows-only concept; Linux fapolicyd is a separate, unimplemented leg of #282
-- **`wdac_policy` / Windows** — RIG PROBE PENDING (CI\\Policy values under LocalSystem; VerifiedAndReputablePolicyState value meanings): quoted verbatim from the integration rig session before merge. An unmodelled value is reported 'unmodelled'; an unreadable key is constrained or permission_denied, never absent
+- **`wdac_policy` / Windows** — Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): CI\\Policy holds EmodePolicyRequired, SkuPolicyRequired, VerifiedAndReputablePolicyState (0 reads 'disabled') and SAC_PreviousState (0xffffffff reads 'unmodelled'), and 8 default .cip policies are listed; only VerifiedAndReputablePolicyState=0 was observed, other values are mapped per documentation and unverified on hardware. An unmodelled value is reported 'unmodelled'; an unreadable key is constrained or permission_denied, never absent
 - **`wdac_policy` / macOS** — Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security
 - **`wdac_policy` / Linux** — Windows-only concept; Linux fapolicyd is a separate, unimplemented leg of #282
 <!-- END GENERATED -->
@@ -110,7 +110,44 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind. `
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 67940cba360f
+
+```
+== action=wdac_policy
+wdac|EmodePolicyRequired|0|unmodelled
+wdac|SkuPolicyRequired|0|unmodelled
+wdac|VerifiedAndReputablePolicyState|0|disabled
+wdac|SAC_PreviousState|4294967295|unmodelled
+wdac_cip|{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}|present
+wdac_cip|{0939ED82-BFD5-4D32-B58E-D31D3C49715A}|present
+wdac_cip|{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}|present
+wdac_cip|{1678656C-05EF-481F-BC5B-EBD8C991502D}|present
+wdac_cip|{1939ED82-BFD5-4D32-B58E-D31D3C49715A}|present
+wdac_cip|{2678656C-05EF-481F-BC5B-EBD8C991502D}|present
+wdac_cip|{60FD87F8-4593-44A0-91B0-2E0DA022F248}|present
+wdac_cip|{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}|present
+[result_status] OK / FULL / registry_ci_policy
+
+== action=applocker_policy
+applocker|none|absent|0
+[result_status] OK / FULL / registry_srpv2
+```
+
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 67940cba360f
+
+```
+== action=wdac_policy
+wdac_policy|unsupported|windows_only_concept
+[result_status] UNAVAILABLE / PARTIAL / windows_only_concept
+[rc] 1
+
+== action=applocker_policy
+applocker_policy|unsupported|windows_only_concept
+[result_status] UNAVAILABLE / PARTIAL / windows_only_concept
+[rc] 1
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 67940cba360f
 
 ```
 == action=wdac_policy
@@ -129,7 +166,7 @@ applocker_policy|unsupported|windows_only_concept
 
 1. **Read-only posture only; #282 stays open.** The plugin refs #282 and does not close it: the issue also asks for `add_rule`, `remove_rule` and `get_blocked_events` (`docs/enterprise-parity-plan.md` Phase 12.11) and a Linux fapolicyd leg, none of which exist. Rule changes would be Destructive-class actions in a separate change.
 2. **Not EDR-class telemetry.** `docs/roadmap.md` Phase 18 "Out of scope" excludes re-implementing EDR at the agent; this plugin configures nothing and collects no detection data, it reports the state of the OS's own control. The two are not the same thing and a reviewer should not conflate them.
-3. **The CIM property names are unverified until the rig probe lands.** `MSFT_ApplockerPolicy`'s `Collection`, `EnforcementMode` and `RuleCount` are assumed by `parse_cim_applocker_row`; a row that lacks any of them is reported `cim_row_unrecognised` rather than guessed, and the `SrpV2` registry walk is the fallback source. The rig probe outcome is recorded in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.
+3. **The CIM property names remain unverified on hardware.** The AppLocker provider namespace `root\StandardCimv2\Security\ApplicationControl` does not exist on the-rig (Windows 11 Pro 10.0.26200, no AppLocker policy configured): the plugin's own bounded WMI helper returned `wmi_connect_failed_0x8004100e` (WBEM_E_INVALID_NAMESPACE), so `applocker_policy` fell back to the `SrpV2` registry walk, which is also absent (`applocker|none|absent|0`, OK / FULL). `Collection`, `EnforcementMode` and `RuleCount` are still assumed by `parse_cim_applocker_row` (a row lacking any of them is reported `cim_row_unrecognised` rather than guessed) and the `SrpV2` rule-collection layout has never been read on an AppLocker-configured host, so both are untested against real data until such a host is probed. The class-absent outcome is a real capture (`tests/unit/fixtures/wave8/app_control/windows/applocker_wmi_probe.txt`); the probe text is in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.
 4. **Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed.
 5. **Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is `platform_security`'s scope, and both legs return the honest `unsupported` row unconditionally.
 

@@ -19,7 +19,7 @@
           "support": "unsupported"
         },
         "windows": {
-          "fallback": "RIG PROBE PENDING (MSFT_ApplockerPolicy class presence + property names, SrpV2 walk): quoted verbatim from the integration rig session before merge. The CIM namespace is caller-side allowlisted",
+          "fallback": "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace root\\\\StandardCimv2\\\\Security\\\\ApplicationControl does NOT exist on this host (WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no AppLocker policy configured, reports 'none'. The CIM property names (Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED on a host with AppLocker configured. The CIM namespace is caller-side allowlisted",
           "mechanism": "wmi_bounded run_bounded_wmi_query root\\\\StandardCimv2\\\\Security\\\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\\\SOFTWARE\\\\Policies\\\\Microsoft\\\\Windows\\\\SrpV2\\\\<collection> when the class is absent or empty",
           "rung": "1",
           "support": "supported"
@@ -45,7 +45,7 @@
           "support": "unsupported"
         },
         "windows": {
-          "fallback": "RIG PROBE PENDING (CI\\\\Policy values under LocalSystem; VerifiedAndReputablePolicyState value meanings): quoted verbatim from the integration rig session before merge. An unmodelled value is reported 'unmodelled'; an unreadable key is constrained or permission_denied, never absent",
+          "fallback": "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): CI\\\\Policy holds EmodePolicyRequired, SkuPolicyRequired, VerifiedAndReputablePolicyState (0 reads 'disabled') and SAC_PreviousState (0xffffffff reads 'unmodelled'), and 8 default .cip policies are listed; only VerifiedAndReputablePolicyState=0 was observed, other values are mapped per documentation and unverified on hardware. An unmodelled value is reported 'unmodelled'; an unreadable key is constrained or permission_denied, never absent",
           "mechanism": "RegEnumValueW HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\CI\\\\Policy + std::filesystem listing of %SystemRoot%\\\\System32\\\\CodeIntegrity\\\\CiPolicies\\\\Active\\\\*.cip",
           "rung": "1",
           "support": "supported"
@@ -56,7 +56,7 @@
   "caveats": [
     "**Read-only posture only; #282 stays open.** The plugin refs #282 and does not close it: the issue also asks for `add_rule`, `remove_rule` and `get_blocked_events` (`docs/enterprise-parity-plan.md` Phase 12.11) and a Linux fapolicyd leg, none of which exist. Rule changes would be Destructive-class actions in a separate change.",
     "**Not EDR-class telemetry.** `docs/roadmap.md` Phase 18 \"Out of scope\" excludes re-implementing EDR at the agent; this plugin configures nothing and collects no detection data, it reports the state of the OS's own control. The two are not the same thing and a reviewer should not conflate them.",
-    "**The CIM property names are unverified until the rig probe lands.** `MSFT_ApplockerPolicy`'s `Collection`, `EnforcementMode` and `RuleCount` are assumed by `parse_cim_applocker_row`; a row that lacks any of them is reported `cim_row_unrecognised` rather than guessed, and the `SrpV2` registry walk is the fallback source. The rig probe outcome is recorded in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.",
+    "**The CIM property names remain unverified on hardware.** The AppLocker provider namespace `root\\StandardCimv2\\Security\\ApplicationControl` does not exist on the-rig (Windows 11 Pro 10.0.26200, no AppLocker policy configured): the plugin's own bounded WMI helper returned `wmi_connect_failed_0x8004100e` (WBEM_E_INVALID_NAMESPACE), so `applocker_policy` fell back to the `SrpV2` registry walk, which is also absent (`applocker|none|absent|0`, OK / FULL). `Collection`, `EnforcementMode` and `RuleCount` are still assumed by `parse_cim_applocker_row` (a row lacking any of them is reported `cim_row_unrecognised` rather than guessed) and the `SrpV2` rule-collection layout has never been read on an AppLocker-configured host, so both are untested against real data until such a host is probed. The class-absent outcome is a real capture (`tests/unit/fixtures/wave8/app_control/windows/applocker_wmi_probe.txt`); the probe text is in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.",
     "**Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed.",
     "**Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is `platform_security`'s scope, and both legs return the honest `unsupported` row unconditionally."
   ],
@@ -270,6 +270,50 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "wdac_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_concept",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "wdac_policy|unsupported|windows_only_concept"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "applocker_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_concept",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "applocker_policy|unsupported|windows_only_concept"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "container",
+        "leg_hash": "67940cba360f",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {
@@ -312,6 +356,54 @@
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "wdac_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "registry_ci_policy",
+            "status": "OK"
+          },
+          "row_count": 12,
+          "rows": [
+            "wdac|EmodePolicyRequired|0|unmodelled",
+            "wdac|SkuPolicyRequired|0|unmodelled",
+            "wdac|VerifiedAndReputablePolicyState|0|disabled",
+            "wdac|SAC_PreviousState|4294967295|unmodelled",
+            "wdac_cip|{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}|present"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "applocker_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "registry_srpv2",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "applocker|none|absent|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "bare-metal",
+        "leg_hash": "67940cba360f",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated)"
       }
     }
   },
