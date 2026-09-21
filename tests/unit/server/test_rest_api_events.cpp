@@ -1576,7 +1576,8 @@ TEST_CASE("GET /api/v1/approvals: permission denied → 403", "[pg][events][appr
 }
 
 TEST_CASE("GET /api/v1/approvals: a genuine store failure answers 503, never a false "
-          "empty list",
+          "empty list, and a permanent one (DROP TABLE, 42P01) is NOT presented as "
+          "retryable (review finding, PR #4656)",
           "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
     REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
@@ -1594,7 +1595,12 @@ TEST_CASE("GET /api/v1/approvals: a genuine store failure answers 503, never a f
     REQUIRE(res);
     REQUIRE(res->status == 503);
     REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
-    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+    // DROP TABLE is a class-42 (42P01) failure -- is_permanent_pg_error
+    // classifies it PERMANENT, so this must NOT carry the retryable hint:
+    // retry_after_ms=5000 on a condition that will not clear without an
+    // operator is an unbounded retry loop.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }
 
 // ── GET /api/v1/approvals/pending/count (#2146 A2-R4) ────────────────────────
@@ -1635,7 +1641,8 @@ TEST_CASE("GET /api/v1/approvals/pending/count: permission denied → 403",
 }
 
 TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 503, "
-          "never a false zero",
+          "never a false zero, and a permanent one (DROP TABLE, 42P01) is NOT "
+          "presented as retryable (review finding, PR #4656)",
           "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
     REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
@@ -1653,5 +1660,7 @@ TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 
     REQUIRE(res);
     REQUIRE(res->status == 503);
     REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
-    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+    // Same permanent (42P01) classification as the list route above.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }

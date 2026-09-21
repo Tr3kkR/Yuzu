@@ -1126,18 +1126,21 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List approval requests (REST v1 twin: GET /api/v1/approvals; "
      "also matches the legacy GET /api/approvals field set — #2146 A2-R4). Rows now also carry "
      "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
-     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure returns "
-     "a retryable error rather than a false empty list. The underlying query is hard-capped at "
+     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure never "
+     "presents as a false empty list -- retry_after_ms is a concrete hint on a transient "
+     "failure, null on a permanent one that will NOT clear on retry. The underlying query is hard-capped at "
      "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
      "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
      "exactly 100 matching rows is a complete, non-truncated result.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string"}}})",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string","maxLength":256,"description":"Exact-match filter on the submitting principal"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
 
     {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
      "/api/v1/approvals/pending/count; also matches the legacy GET "
      "/api/approvals/pending/count — #2146 A2-R4). Gated on pending_count_checked: a "
-     "store/pool failure returns a retryable error rather than a false zero count.",
+     "store/pool failure never presents as a false zero count -- retry_after_ms is a "
+     "concrete hint on a transient failure, null on a permanent one that will NOT clear "
+     "on retry.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]})j"},
 
@@ -12729,9 +12732,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto list_result = approval_manager->query_checked(aq);
                 if (!list_result) {
                     mcp_audit("failure", "store degraded; list_pending_approvals");
+                    // review finding (PR #4656): a permanent store failure
+                    // (schema drift, disk-full, store never opened) was
+                    // answered with the same retry_after_ms as a transient
+                    // one -- an unbounded "retry forever" loop that also
+                    // writes an audit row every attempt. Read-only sibling
+                    // of consume_ticket's approval_store_error_body -- same
+                    // sqlstate classification, wording that doesn't imply a
+                    // ticket was in play.
                     res.set_content(
-                        a4_error(kInternalError, "approval store degraded", {},
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       list_result.error().sqlstate),
                         "application/json");
                     return;
                 }
@@ -12790,9 +12801,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto count_result = approval_manager->pending_count_checked();
                 if (!count_result) {
                     mcp_audit("failure", "store degraded; get_pending_approval_count");
+                    // review finding (PR #4656): same permanent-vs-transient
+                    // misclassification as list_pending_approvals above.
                     res.set_content(
-                        a4_error(kInternalError, "approval store degraded", {},
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       count_result.error().sqlstate),
                         "application/json");
                     return;
                 }

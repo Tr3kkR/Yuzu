@@ -8055,8 +8055,9 @@ TEST_CASE("MCP list_pending_approvals: no approval_manager wired is an internal 
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
-TEST_CASE("MCP list_pending_approvals: a genuine store failure is retryable, never a "
-          "false empty list",
+TEST_CASE("MCP list_pending_approvals: a genuine store failure is never a false empty "
+          "list, and a permanent one (DROP TABLE, 42P01) is NOT presented as retryable "
+          "(review finding, PR #4656)",
           "[pg][mcp][approval]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
@@ -8081,9 +8082,60 @@ TEST_CASE("MCP list_pending_approvals: a genuine store failure is retryable, nev
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // DROP TABLE is a 42P01 (class 42) failure -- is_permanent_pg_error
+    // classifies it PERMANENT, so this must NOT be the retryable message
+    // (review finding, PR #4656): retry_after_ms=5000 on a condition that
+    // will not clear without an operator is an unbounded retry loop.
+    CHECK(body["error"]["message"] == "approval store unavailable");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("MCP list_pending_approvals: a TRANSIENT store failure (lock_not_available, "
+          "55P03) IS presented as retryable, the other half of the permanent/transient "
+          "split (cpp-safety finding, PR #4656)",
+          "[pg][mcp][approval]") {
+    // Same lock-timeout technique as "ApprovalManager: a store fault AT the
+    // binding check masks a foreign-submitter ticket's kind" above
+    // (test_approval_manager.cpp precedent, #2786/#2456): a second raw
+    // connection holds an ACCESS EXCLUSIVE table lock, and the manager under
+    // test is built with a short lock_timeout_ms so its blocked read fails
+    // with a real, deterministic transient SQLSTATE (55P03, class 55) rather
+    // than hanging.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    REQUIRE(appr_bundle->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = appr_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ApprovalManager mgr{short_lock_pool};
+    REQUIRE(mgr.is_open());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &mgr;
+    ts.start("operator");
+
+    pg::PgConn locker{PQconnectdb(appr_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE approval_manager.approvals IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"] == "approval store degraded");
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
-    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 }
 
 TEST_CASE("MCP list_pending_approvals: result_truncated_by_cap appears past the 100-row "
@@ -8157,8 +8209,9 @@ TEST_CASE("MCP get_pending_approval_count: no approval_manager wired is an inter
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
-TEST_CASE("MCP get_pending_approval_count: a genuine store failure is retryable, never "
-          "a false zero",
+TEST_CASE("MCP get_pending_approval_count: a genuine store failure is never a false "
+          "zero, and a permanent one (DROP TABLE, 42P01) is NOT presented as retryable "
+          "(review finding, PR #4656)",
           "[pg][mcp][approval]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
@@ -8183,9 +8236,10 @@ TEST_CASE("MCP get_pending_approval_count: a genuine store failure is retryable,
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-    CHECK(body["error"]["message"] == "approval store degraded");
+    // Same permanent (42P01) classification as list_pending_approvals above.
+    CHECK(body["error"]["message"] == "approval store unavailable");
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
-    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
 // guardian-confinement-2298 hardening sweep: ITServiceOwner grants full CRUD

@@ -21,10 +21,9 @@ constexpr const char* kStoreName = "approval_manager";
 
 // query()/query_checked() row cap. No creation-side check enforces this on
 // submit() — a legitimately busy queue can exceed it — query_checked()
-// detects and reports the overflow via ApprovalListResult::truncated.
-// MUST stay equal to query()'s own hardcoded `LIMIT 100` below (query() is
-// kept unmodified, per this constant's introducing PR's scope, rather than
-// switched onto this constant) — see ApprovalListResult's doc comment.
+// detects and reports the overflow via ApprovalListResult::truncated. Both
+// query() and query_checked() build their SQL from this constant (review
+// finding, PR #4656) — see ApprovalListResult's doc comment.
 constexpr int kApprovalListCap = 100;
 
 // Bounded acquires (ADR-0012 §2). No hot-path caller here — every runtime
@@ -509,7 +508,7 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     // LIMIT boundary was non-deterministic across identical calls -- id is
     // TEXT PRIMARY KEY, always unique, so appending it makes the result
     // order fully deterministic.
-    sql += " ORDER BY submitted_at DESC, id DESC LIMIT 100";
+    sql += " ORDER BY submitted_at DESC, id DESC LIMIT " + std::to_string(kApprovalListCap);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
@@ -574,7 +573,8 @@ ApprovalManager::query_checked(const ApprovalQuery& q) const {
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("ApprovalManager::query_checked degraded: query failed");
+        spdlog::warn("ApprovalManager::query_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
         return std::unexpected(StoreReadError{
             std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
     }
@@ -630,7 +630,8 @@ std::expected<int, StoreReadError> ApprovalManager::pending_count_checked() cons
         lease.get(), "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("ApprovalManager::pending_count_checked degraded: query failed");
+        spdlog::warn("ApprovalManager::pending_count_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
         return std::unexpected(StoreReadError{
             std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
     }

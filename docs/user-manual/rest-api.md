@@ -9157,7 +9157,7 @@ REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widene
 }
 ```
 
-**Errors:** `400` (invalid `status` value); `503` (approval store unavailable/degraded — A4 envelope with `retry_after_ms: 5000`, rather than a false empty list on a genuine store failure).
+**Errors:** `400` (invalid `status` value); `503` (a genuine store failure, never a false empty list — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
 
 #### `GET /api/v1/approvals/pending/count`
 
@@ -9172,7 +9172,7 @@ REST v1 twin of the legacy unversioned `GET /api/approvals/pending/count` below 
 }
 ```
 
-**Errors:** `503` (approval store unavailable/degraded — A4 envelope with `retry_after_ms: 5000`, rather than a false zero count on a genuine store failure).
+**Errors:** `503` (a genuine store failure, never a false zero count — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
 
 #### `GET /api/approvals`
 

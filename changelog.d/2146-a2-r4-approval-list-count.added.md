@@ -12,8 +12,10 @@
   approval queue returns - a silent false-negative on exactly the signal a
   maker-checker workflow depends on. New checked twins `query_checked()`/
   `pending_count_checked()` distinguish the two, so both the REST and MCP
-  surfaces now answer a genuine store failure with 503/a retryable error
-  instead of a false "all clear". The underlying list query is hard-capped
-  at 100 rows; a match count over the cap sets `result_truncated_by_cap`
+  surfaces now answer a genuine store failure with 503/an error envelope
+  instead of a false "all clear" - a concrete `retry_after_ms` hint on a
+  transient failure (e.g. pool exhaustion), `null` on a permanent one (e.g.
+  schema drift, disk-full) that will not clear on retry. The underlying
+  list query is hard-capped at 100 rows; a match count over the cap sets `result_truncated_by_cap`
   (pagination-nested on REST, top-level on MCP's structured output) rather
   than presenting the capped page as the complete queue.
