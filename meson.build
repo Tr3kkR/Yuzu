@@ -550,6 +550,7 @@ if build_agent
   subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
   subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
   subdir('agents/plugins/printing')  # Wave 9 PR9.1b
+  subdir('agents/plugins/browser_policy')  # Wave 10 PR10.2-b
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────
