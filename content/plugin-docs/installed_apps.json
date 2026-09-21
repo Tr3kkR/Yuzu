@@ -116,7 +116,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Enumerates all installed applications on the endpoint. On Windows, reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and HKCU), deduplicates by name+version, and skips system components. The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a logged-in user's: the agent runs as a system-context service (LocalSystem today, see #1442), so HKCU resolves to that account's profile and carries no end-user applications. This is deliberate machine scope, not a gap -- per-user applications are a separate action (list_per_user) that this one never invokes. On Linux, auto-detects the package manager (dpkg, rpm, or pacman). On macOS, queries system_profiler for GUI applications. Returns application name, version, publisher, and install date.",
+      "description": "Enumerates all installed applications on the endpoint. On Windows, reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and HKCU), deduplicates by name+version, and skips system components. The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a logged-in user's: the agent runs as a system-context service (LocalSystem today, see #1442), so HKCU resolves to that account's profile and carries no end-user applications. This is deliberate machine scope, not a gap -- per-user applications are a separate action (list_per_user) that this one never invokes. On Linux, auto-detects the package manager (dpkg, rpm, or pacman). On macOS, queries system_profiler for GUI applications. Returns application name, version, publisher, install date, install location, and (macOS) bundle identifier.",
       "display_name": "List Installed Applications",
       "execute_roles": [
         "endpoint-admin",
@@ -195,7 +195,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "47e1dd9008d0",
+  "leg_hash": "2d05d4707a05",
   "manifest_version": 1,
   "name": "installed_apps",
   "outputs": [
@@ -242,6 +242,27 @@
           "name": "install_date",
           "platforms": [
             "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Where the application is installed: the Uninstall key's InstallLocation value on Windows (\"-\" when the installer wrote none, as NSIS and portable installers often do), and the .app bundle path on macOS. Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\".",
+          "example": "C:\\Program Files\\7-Zip\\",
+          "name": "install_location",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The macOS CFBundleIdentifier read from the app bundle's Info.plist (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept, and \"-\" on macOS when the bundle carries none. Values: bundle identifier or \"-\".",
+          "example": "com.apple.Safari",
+          "name": "bundle_id",
+          "platforms": [
             "darwin"
           ],
           "type": "string",

@@ -6,6 +6,12 @@
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
 ##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
 ##   macOS:   system_profiler SPApplicationsDataType
+##
+## The `list` action carries six columns: name, version, publisher,
+## install_date, install_location, bundle_id. install_location is the
+## Uninstall-key InstallLocation on Windows and the .app bundle path on
+## macOS ("-" on Linux by design); bundle_id is the macOS
+## CFBundleIdentifier ("-" elsewhere).
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,7 +19,7 @@ kind: InstructionDefinition
 metadata:
   id: crossplatform.software.inventory
   displayName: List Installed Applications
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Enumerates all installed applications on the endpoint. On Windows,
     reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and
@@ -26,7 +32,8 @@ metadata:
     action (list_per_user) that this one never invokes.
     On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
     On macOS, queries system_profiler for GUI applications. Returns
-    application name, version, publisher, and install date.
+    application name, version, publisher, install date, install location,
+    and (macOS) bundle identifier.
   tags: [software, inventory, compliance]
 
 spec:
@@ -64,6 +71,16 @@ spec:
         description: "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
         example: "20260617"
         platforms: [windows, darwin]
+      - name: install_location
+        type: string
+        description: "Where the application is installed: the Uninstall key's InstallLocation value on Windows (\"-\" when the installer wrote none, as NSIS and portable installers often do), and the .app bundle path on macOS. Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\"."
+        example: "C:\\Program Files\\7-Zip\\"
+        platforms: [windows, darwin]
+      - name: bundle_id
+        type: string
+        description: "The macOS CFBundleIdentifier read from the app bundle's Info.plist (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept, and \"-\" on macOS when the bundle carries none. Values: bundle identifier or \"-\"."
+        example: "com.apple.Safari"
+        platforms: [darwin]
     aggregation:
       groupBy:
         - name

@@ -63,7 +63,7 @@ Binaries/subprocesses: Linux — `dpkg-query`, `rpm`, `pacman`, `apk` (`list_inv
 Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty. `list_inventory` emits a separate, extended `inv`-tagged 12-field row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder (`installed_apps_inventory.hpp:6-11`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`crossplatform.software.inventory` — `name|version|publisher|install_date`**
+**`crossplatform.software.inventory` — `name|version|publisher|install_date|install_location|bundle_id`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -71,6 +71,8 @@ Pipe-delimited rows, one per application, written via `write_output()`. `list`/`
 | `version` | string | - | Windows, Linux, macOS | `26.02` | The installed version string, or "-" when the source reports none. Values: free text or "-". |
 | `publisher` | string | - | Windows, Linux | `Igor Pavlov` | The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or "-". |
 | `install_date` | string | - | Windows, macOS | `20260617` | Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); "-" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or "-". |
+| `install_location` | string | - | Windows, macOS | `C:\Program Files\7-Zip\` | Where the application is installed: the Uninstall key's InstallLocation value on Windows ("-" when the installer wrote none, as NSIS and portable installers often do), and the .app bundle path on macOS. Always "-" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or "-". |
+| `bundle_id` | string | - | macOS | `com.apple.Safari` | The macOS CFBundleIdentifier read from the app bundle's Info.plist (reverse-DNS form). Always "-" on Windows and Linux, which have no bundle identifier concept, and "-" on macOS when the bundle carries none. Values: bundle identifier or "-". |
 
 **`crossplatform.software.per_user_inventory` — `username|name|version|publisher|install_date`**
 
@@ -289,6 +291,12 @@ inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u
 [result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
+
+## ADR-0028 sequencing dependency
+
+This change lands the `installed_apps`/`InstallLocation` sequencing dependency named as a binding condition in ADR-0028 (`docs/adr/0028-agent-component-inventory-collection.md:1458-1466`), for the `list` action only; the ADR-0016 daily-sync row is unchanged.
+
+**Why this anchor exists.** ADR-0028 (`docs/adr/0028-agent-component-inventory-collection.md:57-63`) records that "a large, modern CVE surface is invisible to today's collection model: dependencies **bundled inside an installed application** (Electron/Chromium embedded in Slack/Teams/Discord/VS Code, vendored `OpenSSL.dll`/`libcrypto.so`, embedded JARs — the Log4Shell distribution vector, statically-linked libraries) and **filesystem-resident language dependencies** (`node_modules`, Python venvs/site-packages, on-disk JARs, Go/Rust module graphs) that no package manager or OS registry enumerates." `install_location` and `bundle_id` give a later component-inventory walk a per-application path to start from; on their own they enumerate nothing beyond where each application lives. On Linux `install_location` is always `-` by design: a package installs files to many prefixes, so there is no single location to report.
 
 ## Caveats and known gaps
 
