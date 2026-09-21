@@ -17,6 +17,7 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "app_control_legs.hpp"
 #include "app_control_parsers.hpp"
 
 #include <yuzu/string_utils.hpp>
@@ -25,23 +26,15 @@
 #include <string>
 #include <string_view>
 
-#ifdef _WIN32
-namespace yuzu::app_control {
-// Defined in app_control_win.cpp (Windows-only source, meson.build).
-int collect_wdac(yuzu::CommandContext& ctx);
-int collect_applocker(yuzu::CommandContext& ctx);
-} // namespace yuzu::app_control
-#endif
-
 namespace {
 
 // Descriptor legs are FIXED, never preprocessor-conditional. The Windows fallback texts
 // quote the rig probe recorded in app_control_win.cpp's banner (rig session A, 2026-09-21,
 // Windows 11 Pro 10.0.26200); anything the rig could not show is stated as UNVERIFIED.
-const YuzuOsLeg kLinuxLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+constexpr YuzuOsLeg kLinuxLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
                           "Windows-only concept; Linux fapolicyd is a separate, unimplemented "
                           "leg of #282"};
-const YuzuOsLeg kMacosLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+constexpr YuzuOsLeg kMacosLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
                           "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is outside this "
                           "plugin's scope"};
 
@@ -57,7 +50,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "'disabled') and SAC_PreviousState (0xffffffff reads 'unmodelled'), and 8 default .cip "
       "policies are listed; only VerifiedAndReputablePolicyState=0 was observed, other values "
       "are mapped per documentation and unverified on hardware. An unmodelled value is reported "
-      "'unmodelled'; an unreadable key is constrained or permission_denied, never absent"}},
+      "'unmodelled'; an unreadable key is constrained or permission_denied, never absent. The "
+      "multiple-policy-format CiPolicies\\Active files and the legacy System32 SiPolicy.p7b are "
+      "reported by presence only; a single-format policy held only on the EFI system partition is "
+      "not visible"}},
     {"applocker_policy",
      kLinuxLeg,
      kMacosLeg,
@@ -71,7 +67,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "(WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no "
       "AppLocker policy configured, reports 'none'. The CIM property names "
       "(Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED "
-      "on a host with AppLocker configured. The CIM namespace is caller-side allowlisted"}},
+      "on a host with AppLocker configured, so CIM-sourced modes report unmodelled (the registry "
+      "numbering is not assumed for them) and a policy delivered outside the SrpV2 key (for example by "
+      "MDM) is not read. The CIM namespace is caller-side allowlisted"}},
 };
 
 } // namespace
@@ -81,7 +79,7 @@ public:
     std::string_view name() const noexcept override { return "app_control"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Read-only effective WDAC and AppLocker application-control policy posture "
+        return "Read-only WDAC and AppLocker application-control policy posture as configured "
                "(Windows-only)";
     }
 
@@ -124,13 +122,13 @@ public:
                              yuzu::util::safe_output_field(action));
             return 1;
         } catch (const std::exception& e) {
-            ctx.write_output(yuzu::app_control::format_constrained_row("unhandled_exception"));
+            ctx.write_output(yuzu::app_control::format_constrained_row("internal_error"));
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   std::string{"unhandled exception: "} +
                                       yuzu::util::safe_output_field(e.what()));
             return 1;
         } catch (...) {
-            ctx.write_output(yuzu::app_control::format_constrained_row("unhandled_exception"));
+            ctx.write_output(yuzu::app_control::format_constrained_row("internal_error"));
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "unhandled exception of unknown type inside execute()");
             return 1;

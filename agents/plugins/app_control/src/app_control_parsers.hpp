@@ -52,6 +52,11 @@ using WmiRow = std::map<std::string, std::string>;
 
 inline constexpr std::string_view kUnsupportedWindowsOnly = "windows_only_concept";
 
+/// Result provenance of an OK run, per source (README "Result status").
+inline constexpr std::string_view kProvenanceCiPolicy = "registry_ci_policy";
+inline constexpr std::string_view kProvenanceCim = "cim_msft_applockerpolicy";
+inline constexpr std::string_view kProvenanceSrpV2 = "registry_srpv2";
+
 enum class PolicyState { disabled, audit, enforced, unmodelled };
 
 inline constexpr std::string_view policy_state_name(PolicyState s) noexcept {
@@ -125,6 +130,11 @@ inline std::string format_cip_row(std::string_view filename) {
     return "wdac_cip|" + yuzu::util::safe_output_field(stem) + "|present";
 }
 
+/// The legacy single-policy file (System32\\CodeIntegrity\\SiPolicy.p7b) is presence-only, like a .cip.
+inline std::string format_cip_single_row() {
+    return "wdac_cip|SiPolicy|present";
+}
+
 inline std::string format_cip_none_row() {
     return "wdac_cip|none|absent";
 }
@@ -145,7 +155,7 @@ public:
     /// One directory entry: UTF-8 leaf name, whether it is a regular file, and the error (if any)
     /// from asking the filesystem. A failed stat is a failure, never "not a .cip". Returns false
     /// once the row cap is hit; the caller stops iterating.
-    bool observe(std::string_view leaf, bool is_regular, const std::error_code& stat_ec) {
+    [[nodiscard]] bool observe(std::string_view leaf, bool is_regular, const std::error_code& stat_ec) {
         observed_any_ = true;
         if (stat_ec) {
             record(stat_ec, "cip_stat_failed");
@@ -170,8 +180,20 @@ public:
         std::sort(names_.begin(), names_.end());
     }
 
-    /// True iff the definitive "no active policy files" row is due.
-    bool none_row_due() const noexcept { return names_.empty() && !failed_; }
+    /// The legacy single-format policy file: `present` when the shell found a regular file, a
+    /// definitive absence when it is not there, a failure otherwise (never an absence).
+    void observe_single(bool is_regular, const std::error_code& stat_ec) {
+        if (stat_ec) {
+            if (stat_ec != std::errc::no_such_file_or_directory && stat_ec != std::errc::not_a_directory)
+                record(stat_ec, "sipolicy_stat_failed");
+            return;
+        }
+        single_present_ = is_regular;
+    }
+
+    /// True iff the definitive "no active policy files" row is due (neither format holds one).
+    bool none_row_due() const noexcept { return names_.empty() && !single_present_ && !failed_; }
+    bool single_present() const noexcept { return single_present_; }
     /// The .cip leaf names found, sorted; valid after finish().
     const std::vector<std::string>& names() const noexcept { return names_; }
 
@@ -191,6 +213,7 @@ private:
     std::vector<std::string> names_;
     bool observed_any_ = false;
     bool failed_ = false;
+    bool single_present_ = false;
 };
 
 /// SrpV2 rule-collection subkey names, in output order.
@@ -216,7 +239,7 @@ inline std::string format_constrained_row(std::string_view reason) {
 }
 
 inline std::string format_unsupported_row(std::string_view action) {
-    return std::string{action} + "|unsupported|" + std::string{kUnsupportedWindowsOnly};
+    return yuzu::util::safe_output_field(action) + "|unsupported|" + std::string{kUnsupportedWindowsOnly};
 }
 
 // ── Win32 read classification (pure; app_control_win.cpp static_asserts the numbers) ──
@@ -226,6 +249,8 @@ inline constexpr std::uint32_t kErrorSuccess = 0;
 inline constexpr std::uint32_t kErrorFileNotFound = 2;
 inline constexpr std::uint32_t kErrorPathNotFound = 3;
 inline constexpr std::uint32_t kErrorAccessDenied = 5;
+inline constexpr std::uint32_t kErrorMoreData = 234;
+inline constexpr std::uint32_t kErrorNoMoreItems = 259;
 
 /// open_or_query: NOT_FOUND means the key/value definitively does not exist (absent).
 /// enumerate: a RegEnumValueW / RegQueryInfoKeyW error is never an absence.
@@ -240,7 +265,7 @@ struct ReadFailure {
     bool access_denied{false};
 };
 
-inline ReadFailure classify_win32_read(std::string_view what, std::uint32_t err, ReadKind kind) {
+[[nodiscard]] inline ReadFailure classify_win32_read(std::string_view what, std::uint32_t err, ReadKind kind) {
     if (err == kErrorSuccess)
         return {RegRead::ok, {}, false};
     if (kind == ReadKind::open_or_query && (err == kErrorFileNotFound || err == kErrorPathNotFound))
@@ -263,7 +288,7 @@ struct ActionVerdict {
 
 /// No failure: OK / FULL / `source` / rc 0. Any failure: CONSTRAINED (PERMISSION_DENIED when
 /// `denied`) / PARTIAL / the joined reasons / rc 1, and the `constrained|` row is due.
-inline ActionVerdict select_verdict(const yuzu::shared::ConstraintAccumulator& acc, bool denied,
+[[nodiscard]] inline ActionVerdict select_verdict(const yuzu::shared::ConstraintAccumulator& acc, bool denied,
                                     std::string_view source) {
     if (!acc.any_failure())
         return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, std::string{source}, 0,
@@ -328,7 +353,18 @@ struct ApplockerRowData {
     std::string collection;
     std::optional<std::uint32_t> mode; // nullopt = absent
     std::size_t rules = 0;
+    /// False for a CIM-sourced row: the registry's 0 = audit / 1 = enforce numbering is documented
+    /// for SrpV2 only, so it is NOT assumed for the (unverified) CIM class.
+    bool mode_verified = true;
 };
+
+/// A CIM-sourced row reports its mode `unmodelled`; a registry-sourced one maps it.
+inline std::string format_applocker_row(const ApplockerRowData& r) {
+    if (r.mode_verified)
+        return format_applocker_row(r.collection, r.mode, r.rules);
+    return "applocker|" + yuzu::util::safe_output_field(r.collection) + "|" +
+           std::string{policy_state_name(PolicyState::unmodelled)} + "|" + std::to_string(r.rules);
+}
 
 namespace detail {
 inline const std::string* find_prop(const WmiRow& row, std::string_view name) {
@@ -353,7 +389,11 @@ inline std::optional<ApplockerRowData> parse_cim_applocker_row(const WmiRow& row
     const auto r = parse_u32(*rules);
     if (!m || !r)
         return std::nullopt;
-    return ApplockerRowData{*coll, *m, static_cast<std::size_t>(*r)};
+    // The closed vocabulary: any other spelling (case aside) is unrecognised, not passed through.
+    for (const auto known : kApplockerCollections)
+        if (iequals(*coll, known))
+            return ApplockerRowData{std::string{known}, *m, static_cast<std::size_t>(*r), false};
+    return std::nullopt;
 }
 
 /// The whole classify -> map -> fallback decision over one bounded CIM result, so the Windows
@@ -367,15 +407,57 @@ struct CimPlan {
     bool use_cim{false};
 };
 
-/// "No AppLocker policy" is a definitive absence only when CIM gave no usable rows, the SrpV2
-/// walk wrote no row, and NOTHING failed anywhere in the action: a failed read never reads as
-/// absent.
-inline bool applocker_none_row_due(bool use_cim, std::size_t srpv2_rows_written,
+/// The single `none` row: neither source showed a policy (CIM gave no usable rows and the SrpV2
+/// walk wrote no row) AND nothing failed anywhere in the action, so a failed read never reads as
+/// absent. It means "no policy in the CIM class or under the SrpV2 registry key" and nothing more:
+/// a policy delivered another way (for example by MDM) is not read here.
+[[nodiscard]] inline bool applocker_none_row_due(bool use_cim, std::size_t srpv2_rows_written,
                                    const yuzu::shared::ConstraintAccumulator& acc) noexcept {
     return !use_cim && srpv2_rows_written == 0 && !acc.any_failure();
 }
 
-inline CimPlan plan_cim(const std::optional<std::string>& error, const std::vector<WmiRow>& rows,
+/// What collect_applocker decides once both sources have spoken: whether the `none` row is due and
+/// the typed verdict. One function, called by the shell, so the product of the two sources is
+/// tested through the code that runs and not through a copy of it.
+struct ApplockerFinish {
+    bool none_row_due;
+    ActionVerdict verdict;
+};
+
+[[nodiscard]] inline ApplockerFinish finish_applocker(bool use_cim, std::size_t srpv2_rows_written,
+                                                      const yuzu::shared::ConstraintAccumulator& acc,
+                                                      bool denied, std::string_view source) {
+    return {applocker_none_row_due(use_cim, srpv2_rows_written, acc),
+            select_verdict(acc, denied, source)};
+}
+
+/// One step of the CI\Policy value enumeration, from the RegEnumValueW result and the index: exactly
+/// `max_values` values is a COMPLETE enumeration (NO_MORE_ITEMS at that index), and only a value
+/// that exists past the cap is truncation.
+enum class EnumStep { take, skip_too_large, stop_done, stop_row_cap, stop_failed };
+
+[[nodiscard]] constexpr EnumStep enum_step(std::size_t index, std::size_t max_values,
+                                           std::uint32_t rc) noexcept {
+    if (rc == kErrorNoMoreItems)
+        return EnumStep::stop_done;
+    if (index >= max_values && (rc == kErrorSuccess || rc == kErrorMoreData))
+        return EnumStep::stop_row_cap;
+    if (rc == kErrorMoreData)
+        return EnumStep::skip_too_large;
+    return rc == kErrorSuccess ? EnumStep::take : EnumStep::stop_failed;
+}
+
+/// What the SrpV2 walk does with one collection subkey open result: a subkey the OS reports as not
+/// present is its own `absent` row; an unreadable one is skipped (its token is already recorded).
+enum class CollectionStep { read, absent_row, skip };
+
+[[nodiscard]] constexpr CollectionStep srpv2_collection_step(RegRead open) noexcept {
+    return open == RegRead::ok       ? CollectionStep::read
+           : open == RegRead::absent ? CollectionStep::absent_row
+                                     : CollectionStep::skip;
+}
+
+[[nodiscard]] inline CimPlan plan_cim(const std::optional<std::string>& error, const std::vector<WmiRow>& rows,
                         bool truncated) {
     CimPlan plan;
     switch (classify_cim_error(error)) {

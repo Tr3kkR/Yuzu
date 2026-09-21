@@ -1,5 +1,5 @@
 /**
- * app_control_win.cpp -- Windows leg of the app_control plugin: effective WDAC
+ * app_control_win.cpp -- Windows leg of the app_control plugin: configured WDAC
  * (Code Integrity) and AppLocker application-control posture, read-only.
  *
  *   wdac_policy      HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy (every 32-bit and
@@ -27,8 +27,8 @@
  *   SrpV2 walk: `reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 /s` -> "ERROR: The
  *             system was unable to find the specified registry key or value." (no AppLocker policy
  *             configured); the plugin reports `applocker|none|absent|0`, OK / FULL /
- * registry_srpv2. The rule-collection layout was therefore never read on an AppLocker-configured
- * host. CI\Policy values as SYSTEM: EmodePolicyRequired=0, SkuPolicyRequired=0,
+ *             registry_srpv2. The rule-collection layout was therefore never read on an
+ *             AppLocker-configured host. CI\Policy values as SYSTEM: EmodePolicyRequired=0, SkuPolicyRequired=0,
  *             VerifiedAndReputablePolicyState=0 (maps `disabled`), SAC_PreviousState=0xffffffff
  *             (`unmodelled`); 8 default .cip policies in CodeIntegrity\CiPolicies\Active. Only
  *             VerifiedAndReputablePolicyState=0 has been observed; 1/2 are mapped per documentation
@@ -39,7 +39,8 @@
  * FAILURE SEMANTICS: every failed step records a token on ConstraintAccumulator and is
  * never rendered as absent. ERROR_ACCESS_DENIED -> PERMISSION_DENIED, anything else ->
  * CONSTRAINED/PARTIAL; exit code 0 only on OK. The only "absent" outputs are a genuine
- * ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND of a key or directory.
+ * ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND of a key, a value (EnforcementMode) or a directory,
+ * and a directory read cleanly that held no policy file.
  */
 #if defined(_WIN32)
 
@@ -61,25 +62,27 @@
 
 #include <constraint_accumulator.hpp>
 
+#include "app_control_legs.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::app_control {
-
-int collect_wdac(yuzu::CommandContext& ctx);
-int collect_applocker(yuzu::CommandContext& ctx);
 
 namespace {
 
 constexpr wchar_t kCiPolicyKey[] = L"SYSTEM\\CurrentControlSet\\Control\\CI\\Policy";
 constexpr wchar_t kSrpV2Key[] = L"SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2";
 constexpr wchar_t kCipActiveSubdir[] = L"\\System32\\CodeIntegrity\\CiPolicies\\Active";
+constexpr wchar_t kSiPolicySubpath[] = L"\\System32\\CodeIntegrity\\SiPolicy.p7b";
 
 constexpr DWORD kMaxValueBytes = 4096;      // per-value data cap (CI\Policy values are tiny)
 constexpr DWORD kMaxValueNameChars = 16384; // registry's documented maximum value-name length
@@ -90,6 +93,14 @@ static_assert(kErrorSuccess == static_cast<std::uint32_t>(ERROR_SUCCESS));
 static_assert(kErrorFileNotFound == static_cast<std::uint32_t>(ERROR_FILE_NOT_FOUND));
 static_assert(kErrorPathNotFound == static_cast<std::uint32_t>(ERROR_PATH_NOT_FOUND));
 static_assert(kErrorAccessDenied == static_cast<std::uint32_t>(ERROR_ACCESS_DENIED));
+static_assert(kErrorMoreData == static_cast<std::uint32_t>(ERROR_MORE_DATA));
+static_assert(kErrorNoMoreItems == static_cast<std::uint32_t>(ERROR_NO_MORE_ITEMS));
+static_assert(kMaxValueBytes % sizeof(wchar_t) == 0, "the value buffer is sized in wchar_t units");
+// x64 only (the installer is x64compatible): a 32-bit build would be WOW64-redirected away from the
+// real CodeIntegrity\CiPolicies\Active and misreport it as an absent directory.
+static_assert(sizeof(void*) == 8);
+// plan_cim consumes the bounded query's rows directly.
+static_assert(std::is_same_v<yuzu::app_control::WmiRow, yuzu::shared::wmi::WmiRow>);
 
 struct Outcome {
     yuzu::shared::ConstraintAccumulator acc;
@@ -108,23 +119,30 @@ struct Outcome {
 };
 
 /// Emits the constrained row on any failure, sets the typed status; exit 0 only when OK.
-int finish(yuzu::CommandContext& ctx, const Outcome& o, std::string_view source) {
-    const auto v = select_verdict(o.acc, o.denied, source);
+int apply_verdict(yuzu::CommandContext& ctx, const ActionVerdict& v, const Outcome& o) {
     if (v.constrained_row_due)
         ctx.write_output(format_constrained_row(o.acc.reason()));
     ctx.set_result_status(v.status, v.completeness, v.provenance);
     return v.rc;
 }
 
+int finish(yuzu::CommandContext& ctx, const Outcome& o, std::string_view source) {
+    return apply_verdict(ctx, select_verdict(o.acc, o.denied, source), o);
+}
+
 /// One REG_DWORD: ERROR_SUCCESS, the query error, or ERROR_INVALID_DATA (wrong type/size).
-LONG read_u32(HKEY key, const wchar_t* name, std::uint32_t& out) {
+struct U32Read {
+    LONG rc;
+    std::uint32_t value{}; // meaningful only when rc == ERROR_SUCCESS
+};
+
+U32Read read_u32(HKEY key, const wchar_t* name) {
     DWORD type = 0, size = sizeof(DWORD), value = 0;
     const LONG rc =
         RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
     if (rc == ERROR_SUCCESS && (type != REG_DWORD || size != sizeof(DWORD)))
-        return ERROR_INVALID_DATA;
-    out = static_cast<std::uint32_t>(value);
-    return rc;
+        return {ERROR_INVALID_DATA, 0};
+    return {rc, static_cast<std::uint32_t>(value)};
 }
 
 void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
@@ -147,18 +165,25 @@ void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
         DWORD type = 0;
         const LONG rc = RegEnumValueW(key.get(), index, name.data(), &name_len, nullptr, &type,
                                       reinterpret_cast<BYTE*>(data.data()), &data_len);
-        if (rc == ERROR_NO_MORE_ITEMS)
+        const auto step = enum_step(index, kMaxValues, static_cast<std::uint32_t>(rc));
+        if (step == EnumStep::stop_done)
             break;
-        if (index >= kMaxValues && (rc == ERROR_SUCCESS || rc == ERROR_MORE_DATA)) {
+        if (step == EnumStep::stop_row_cap) {
             o.acc.add_failure("row_cap"); // a value exists beyond the cap: truncated
             break;
         }
-        if (rc == ERROR_MORE_DATA) {
+        if (step == EnumStep::skip_too_large) {
             o.acc.add_failure("value_too_large"); // skipped; enumeration continues
             continue;
         }
-        if (o.note("ci_policy_enum", rc, ReadKind::enumerate) != RegRead::ok)
+        if (step == EnumStep::stop_failed) {
+            (void)o.note("ci_policy_enum", rc, ReadKind::enumerate); // token / denial, never absent
             break;
+        }
+        if (std::wstring_view{name.data(), name_len}.find(L'\0') != std::wstring_view::npos) {
+            o.acc.add_failure("value_name_embedded_nul"); // its row would be cut at the NUL
+            continue;
+        }
 
         RegValueView v;
         v.name = yuzu::win::from_wide(name.data(), static_cast<int>(name_len));
@@ -195,16 +220,23 @@ void list_active_cip_files(yuzu::CommandContext& ctx, Outcome& o) {
     for (; !ec && it != std::filesystem::directory_iterator{}; it.increment(ec)) {
         std::error_code stat_ec;
         const bool regular = it->is_regular_file(stat_ec);
-        const auto u8 = it->path().filename().u8string();
-        const std::string leaf{u8.begin(), u8.end()};
+        // from_wide is total (a lone surrogate becomes U+FFFD); u8string() would throw on one.
+        const std::string leaf = yuzu::win::from_wide(it->path().filename().c_str());
         if (!scan.observe(leaf, regular, stat_ec))
             break;
     }
     scan.finish(ec);
+    // The legacy single-policy file is one more active policy (presence only).
+    std::error_code single_ec;
+    const bool single_regular =
+        std::filesystem::is_regular_file(std::wstring{win_dir} + kSiPolicySubpath, single_ec);
+    scan.observe_single(single_regular, single_ec);
     if (scan.none_row_due())
         ctx.write_output(format_cip_none_row());
     for (const auto& fname : scan.names())
         ctx.write_output(format_cip_row(fname));
+    if (scan.single_present())
+        ctx.write_output(format_cip_single_row());
 }
 
 /// Caller-side namespace floor (wmi_bounded.hpp does NO allowlisting).
@@ -215,8 +247,12 @@ yuzu::shared::wmi::BoundedQueryResult bounded_cim_query(std::string_view ns, std
         return refused;
     }
     // sink: app_control/bounded_cim_query#1 -- rung 1, in-process CIM query (no PowerShell).
-    return yuzu::shared::wmi::run_bounded_wmi_query(yuzu::win::to_wide(ns),
-                                                    yuzu::win::to_wide(wql));
+    yuzu::shared::wmi::BoundedQueryOptions opts;
+    // A handful of rows is expected: a wedged winmgmt must not hold the (instant) registry
+    // fallback back for minutes, so the enumeration bound is 15 s, not the helper's 60 s.
+    opts.enumeration_deadline_ms = 15000;
+    return yuzu::shared::wmi::run_bounded_wmi_query(yuzu::win::to_wide(ns), yuzu::win::to_wide(wql),
+                                                    opts);
 }
 
 /// SrpV2 registry walk. Returns the number of collection rows written.
@@ -232,23 +268,23 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
         yuzu::win::RegKey sub;
         const LONG sub_rc = RegOpenKeyExW(root.get(), yuzu::win::to_wide(collection).c_str(), 0,
                                           KEY_READ | KEY_WOW64_64KEY, sub.put());
-        const auto sub_read = o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query);
-        if (sub_read == RegRead::absent) { // collection not configured: a definitive row
+        const auto step =
+            srpv2_collection_step(o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query));
+        if (step == CollectionStep::absent_row) { // collection not configured: a definitive row
             ctx.write_output(format_applocker_row(collection, std::nullopt, 0));
             ++written;
             continue;
         }
-        if (sub_read != RegRead::ok)
+        if (step == CollectionStep::skip)
             continue; // unreadable: recorded, never absent
 
         std::optional<std::uint32_t> mode;
-        std::uint32_t raw_mode = 0;
-        const LONG mode_rc = read_u32(sub.get(), L"EnforcementMode", raw_mode);
-        const auto mode_read = o.note("enforcement_mode_read", mode_rc, ReadKind::open_or_query);
+        const auto mode_r = read_u32(sub.get(), L"EnforcementMode");
+        const auto mode_read = o.note("enforcement_mode_read", mode_r.rc, ReadKind::open_or_query);
         if (mode_read == RegRead::unreadable)
             continue; // wrong type / denied: never rendered as absent
         if (mode_read == RegRead::ok)
-            mode = raw_mode; // absent leaves it nullopt
+            mode = mode_r.value; // absent leaves it nullopt
 
         DWORD rule_subkeys = 0;
         const LONG info_rc =
@@ -268,7 +304,7 @@ int collect_wdac(yuzu::CommandContext& ctx) {
     Outcome o;
     read_ci_policy_values(ctx, o);
     list_active_cip_files(ctx, o);
-    return finish(ctx, o, "registry_ci_policy");
+    return finish(ctx, o, kProvenanceCiPolicy);
 }
 
 int collect_applocker(yuzu::CommandContext& ctx) {
@@ -278,16 +314,18 @@ int collect_applocker(yuzu::CommandContext& ctx) {
     const auto q = bounded_cim_query(kCimNamespace, kCimApplockerWql);
     const auto plan = plan_cim(q.error, q.rows, q.truncated);
     for (const auto& r : plan.rows)
-        ctx.write_output(format_applocker_row(r.collection, r.mode, r.rules));
+        ctx.write_output(format_applocker_row(r));
     for (const auto& token : plan.failures)
         o.acc.add_failure(token);
     o.denied |= plan.denied;
 
     // No usable CIM rows (class absent / empty / failed): registry walk; CIM failures stay on `o`.
     const std::size_t srpv2_rows = plan.use_cim ? 0 : walk_srpv2(ctx, o);
-    if (applocker_none_row_due(plan.use_cim, srpv2_rows, o.acc))
+    const auto fin = finish_applocker(plan.use_cim, srpv2_rows, o.acc, o.denied,
+                                      plan.use_cim ? kProvenanceCim : kProvenanceSrpV2);
+    if (fin.none_row_due)
         ctx.write_output(format_applocker_none_row());
-    return finish(ctx, o, plan.use_cim ? "cim_msft_applockerpolicy" : "registry_srpv2");
+    return apply_verdict(ctx, fin.verdict, o);
 }
 
 } // namespace yuzu::app_control

@@ -6,8 +6,9 @@
  * The [capture] cases read REAL CAPTURES from the-rig
  * (tests/unit/fixtures/wave8/app_control/windows/<capture>.txt, each with a
  * .provenance.txt) and REQUIRE they exist -- never a hand-invented fixture.
- * Malformed / empty inputs and the CIM-present shape are inline reconstructions (the latter
- * labelled ASSUMED SHAPE: no AppLocker-configured host has been captured).
+ * Malformed / empty inputs, the CIM-present shape and the HRESULT tokens of the CIM error cases
+ * are inline reconstructions (the CIM shape labelled ASSUMED SHAPE: no AppLocker-configured host
+ * has been captured; only `wmi_connect_failed_0x8004100e` is a real capture).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -174,6 +176,7 @@ TEST_CASE("app_control CipScan: absent is definitive, a failed read never reads 
         scan.finish(ec_of(std::errc::io_error));
         CHECK_FALSE(scan.none_row_due());
         CHECK(acc.any_failure());
+        CHECK(acc.reason().rfind("cip_dir_failed_", 0) == 0); // the token README documents
         CHECK_FALSE(denied);
 
         yuzu::shared::ConstraintAccumulator acc2;
@@ -189,6 +192,20 @@ TEST_CASE("app_control CipScan: absent is definitive, a failed read never reads 
         CHECK(acc.any_failure());
         CHECK_FALSE(scan.none_row_due());
     }
+#ifdef _WIN32
+    SECTION("Win32 system_category codes classify like their generic twins (the shell feeds these)") {
+        // ERROR_PATH_NOT_FOUND (3) with nothing observed is a definitive absence; ERROR_ACCESS_DENIED
+        // (5) is a refusal. Inside the test body, never a TU guard.
+        scan.finish(std::error_code{3, std::system_category()});
+        CHECK(scan.none_row_due());
+        yuzu::shared::ConstraintAccumulator acc2;
+        bool denied2 = false;
+        CipScan refused{acc2, denied2};
+        refused.finish(std::error_code{5, std::system_category()});
+        CHECK_FALSE(refused.none_row_due());
+        CHECK(denied2);
+    }
+#endif
     SECTION("the row cap stops the scan and records row_cap") {
         for (std::size_t i = 0; i < kMaxCipFiles; ++i)
             REQUIRE(scan.observe("{P" + std::to_string(i) + "}.cip", true, {}));
@@ -325,6 +342,10 @@ TEST_CASE("app_control CIM error classification and row mapping", "[app_control]
     CHECK(cls("wmi_query_failed_0x80041010") == CimOutcome::class_absent);
     CHECK(cls("wmi_connect_failed_0x80041003") == CimOutcome::permission_denied);
     CHECK(cls("wmi_query_failed_0x80070005") == CimOutcome::permission_denied);
+    CHECK(cls("wmi_next_failed_0x80041003") == CimOutcome::permission_denied);         // the Next() path
+    CHECK(cls("wmi_proxy_blanket_failed_0x80070005") == CimOutcome::permission_denied);
+    CHECK(cls("wmi_next_failed_0x80041010") == CimOutcome::class_absent);
+    CHECK(cls("wbem_locator_failed") == CimOutcome::failed);
     for (const char* t : {"wmi_deadline_exceeded", "com_init_failed", "namespace_not_allowed"})
         CHECK(cls(t) == CimOutcome::failed);
 
@@ -449,3 +470,175 @@ TEST_CASE("app_control real capture: MSFT_ApplockerPolicy probe classifies and m
     CHECK_FALSE(plan.denied);
     CHECK_FALSE(plan.use_cim);
 }
+
+// ── guards the first tests did not observe (governance round) ────────────────
+
+TEST_CASE("app_control rows: a wrong-typed SAC value is not mapped; a value NAME is untrusted text",
+          "[app_control][parsers]") {
+    RegValueView v;
+    v.name = "VerifiedAndReputablePolicyState";
+    v.kind = RegValueKind::text; // the modelled NAME with a non-DWORD type must never map to a state
+    v.text = "1";
+    CHECK(format_wdac_row(v) == "wdac|VerifiedAndReputablePolicyState|1|unmodelled");
+    v.kind = RegValueKind::u32;
+    v.u32 = 1;
+    v.name = "a|b\r\nc"; // a registry value name is attacker-writable: escaped like any other field
+    CHECK(format_wdac_row(v) == "wdac|a\\|b  c|1|unmodelled");
+    CHECK(format_unsupported_row("a|b") == "a\\|b|unsupported|windows_only_concept");
+}
+
+TEST_CASE("app_control CIM rows: canonical collection, unmodelled mode, every required property",
+          "[app_control][parsers]") {
+    const auto ok = parse_cim_applocker_row(kAssumedCimRow);
+    REQUIRE(ok);
+    CHECK(ok->collection == "Exe");
+    CHECK_FALSE(ok->mode_verified);
+    CHECK(format_applocker_row(*ok) == "applocker|Exe|unmodelled|4"); // registry numbering not assumed
+    const WmiRow lower{{"Collection", "script"}, {"EnforcementMode", "0"}, {"RuleCount", "1"}};
+    REQUIRE(parse_cim_applocker_row(lower));
+    CHECK(parse_cim_applocker_row(lower)->collection == "Script"); // the closed vocabulary, canonical
+    const WmiRow other{{"Collection", "Widgets"}, {"EnforcementMode", "0"}, {"RuleCount", "1"}};
+    CHECK_FALSE(parse_cim_applocker_row(other)); // unrecognised, never passed through
+    for (const char* drop : {"Collection", "EnforcementMode", "RuleCount"}) {
+        WmiRow r = kAssumedCimRow;
+        r.erase(drop);
+        INFO("missing " << drop);
+        CHECK_FALSE(parse_cim_applocker_row(r)); // RuleCount is dereferenced: its guard must hold
+    }
+    CHECK(format_applocker_row(ApplockerRowData{"Exe", 1, 4, true}) == "applocker|Exe|enforced|4");
+}
+
+TEST_CASE("app_control enum_step: exactly the cap is complete; only a value past it is truncation",
+          "[app_control][parsers]") {
+    constexpr std::size_t kCap = 256;
+    CHECK(enum_step(0, kCap, kErrorSuccess) == EnumStep::take);
+    CHECK(enum_step(255, kCap, kErrorSuccess) == EnumStep::take);
+    CHECK(enum_step(0, kCap, kErrorNoMoreItems) == EnumStep::stop_done);
+    CHECK(enum_step(256, kCap, kErrorNoMoreItems) == EnumStep::stop_done); // exactly 256 values
+    CHECK(enum_step(256, kCap, kErrorSuccess) == EnumStep::stop_row_cap);  // a 257th exists
+    CHECK(enum_step(256, kCap, kErrorMoreData) == EnumStep::stop_row_cap);
+    CHECK(enum_step(255, kCap, kErrorMoreData) == EnumStep::skip_too_large);
+    CHECK(enum_step(3, kCap, kErrorAccessDenied) == EnumStep::stop_failed);
+    CHECK(enum_step(300, kCap, kErrorAccessDenied) == EnumStep::stop_failed); // a failure is not a cap
+}
+
+TEST_CASE("app_control srpv2_collection_step: absent is a row, unreadable is skipped, ok is read",
+          "[app_control][parsers]") {
+    CHECK(srpv2_collection_step(RegRead::ok) == CollectionStep::read);
+    CHECK(srpv2_collection_step(RegRead::absent) == CollectionStep::absent_row);
+    CHECK(srpv2_collection_step(RegRead::unreadable) == CollectionStep::skip);
+}
+
+// Fails under: any source's failure not reaching the verdict, the `none` row emitted beside a
+// failure or rows, a refusal not becoming PERMISSION_DENIED, an OK run naming the wrong source.
+TEST_CASE("app_control finish_applocker: the CIM x SrpV2 product never reads a failure as absent",
+          "[app_control][parsers]") {
+    struct Cim {
+        const char* name;
+        std::optional<std::string> error;
+        std::vector<WmiRow> rows;
+        bool truncated;
+    };
+    const WmiRow bad{{"Collection", "Exe"}};
+    const std::vector<Cim> cims{
+        {"class_absent", std::string{"wmi_connect_failed_0x8004100e"}, {}, false},
+        {"empty", std::nullopt, {}, false},
+        {"mapped", std::nullopt, {kAssumedCimRow}, false},
+        {"mixed", std::nullopt, {kAssumedCimRow, bad}, false},
+        {"truncated", std::nullopt, {kAssumedCimRow}, true},
+        {"denied", std::string{"wmi_connect_failed_0x80041003"}, {}, false},
+        {"deadline", std::string{"wmi_deadline_exceeded"}, {}, false}};
+    struct Walk {
+        const char* name;
+        std::size_t rows;
+        std::vector<std::string> tokens;
+        bool denied;
+    };
+    const std::vector<Walk> walks{{"root_absent", 0, {}, false},
+                                  {"five_rows", 5, {}, false},
+                                  {"one_unreadable", 4, {"srpv2_collection_open_0x57"}, false},
+                                  {"root_unreadable", 0, {"permission_denied"}, true}};
+    for (const auto& c : cims) {
+        for (const auto& w : walks) {
+            INFO("cim=" << c.name << " walk=" << w.name);
+            const auto plan = plan_cim(c.error, c.rows, c.truncated);
+            yuzu::shared::ConstraintAccumulator acc;
+            for (const auto& t : plan.failures)
+                acc.add_failure(t);
+            std::size_t walk_rows = 0;
+            bool denied = plan.denied;
+            if (!plan.use_cim) { // the shell walks SrpV2 only when no CIM row mapped
+                walk_rows = w.rows;
+                denied = denied || w.denied;
+                for (const auto& t : w.tokens)
+                    acc.add_failure(t);
+            }
+            const auto fin = finish_applocker(plan.use_cim, walk_rows, acc, denied,
+                                              plan.use_cim ? kProvenanceCim : kProvenanceSrpV2);
+            const bool failed = acc.any_failure();
+            CHECK((fin.verdict.status == YUZU_RESULT_STATUS_OK) == !failed);
+            CHECK((fin.verdict.rc == 0) == !failed);
+            CHECK(fin.verdict.constrained_row_due == failed);
+            CHECK(fin.none_row_due == (!plan.use_cim && walk_rows == 0 && !failed));
+            if (denied)
+                CHECK(fin.verdict.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+            if (!failed)
+                CHECK(fin.verdict.provenance ==
+                      std::string{plan.use_cim ? kProvenanceCim : kProvenanceSrpV2});
+        }
+    }
+}
+
+// Fails under: the single-format file not counting as a policy (a host enforcing only it would read
+// `wdac_cip|none|absent`), an absent file read as a failure, or a failed stat read as an absence.
+TEST_CASE("app_control CipScan: the legacy single-format policy is one more active policy",
+          "[app_control][parsers]") {
+    const auto ec_of = [](std::errc e) { return std::make_error_code(e); };
+    yuzu::shared::ConstraintAccumulator acc;
+    bool denied = false;
+    CipScan scan{acc, denied};
+    scan.finish({}); // Active read cleanly and empty
+    CHECK(format_cip_single_row() == "wdac_cip|SiPolicy|present");
+
+    SECTION("a regular SiPolicy.p7b is a present policy and suppresses the none row") {
+        scan.observe_single(true, {});
+        CHECK(scan.single_present());
+        CHECK_FALSE(scan.none_row_due());
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("no such file (with or without an error code) is a definitive absence") {
+        scan.observe_single(false, {});
+        CHECK(scan.none_row_due());
+        yuzu::shared::ConstraintAccumulator acc2;
+        bool denied2 = false;
+        CipScan enoent{acc2, denied2};
+        enoent.finish({});
+        enoent.observe_single(false, ec_of(std::errc::no_such_file_or_directory));
+        CHECK(enoent.none_row_due());
+        CHECK_FALSE(acc2.any_failure());
+    }
+    SECTION("a refused stat is a denial, never an absence") {
+        scan.observe_single(false, ec_of(std::errc::permission_denied));
+        CHECK_FALSE(scan.none_row_due());
+        CHECK(denied);
+        CHECK(acc.reason() == "permission_denied");
+    }
+    SECTION("any other failed stat is a failure with its own token, never an absence") {
+        scan.observe_single(false, ec_of(std::errc::io_error));
+        CHECK_FALSE(scan.none_row_due());
+        CHECK_FALSE(denied);
+        CHECK(acc.reason().rfind("sipolicy_stat_failed_", 0) == 0);
+    }
+    SECTION("a .cip file and the single-format file are both reported") {
+        yuzu::shared::ConstraintAccumulator acc3;
+        bool denied3 = false;
+        CipScan both{acc3, denied3};
+        REQUIRE(both.observe("{A}.cip", true, {}));
+        both.finish({});
+        both.observe_single(true, {});
+        CHECK(both.names().size() == 1);
+        CHECK(both.single_present());
+        CHECK_FALSE(both.none_row_due());
+    }
+}
+

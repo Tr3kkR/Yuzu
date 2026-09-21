@@ -16,6 +16,8 @@
 
 #include "local_dispatcher.hpp"
 
+#include "../../agents/plugins/app_control/src/app_control_parsers.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -111,8 +113,9 @@ TEST_CASE("app_control plugin: all three OS legs declared; Linux/macOS unsupport
         CHECK(d.macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
         CHECK(d.linux_leg.fallback != nullptr);
         CHECK(d.macos_leg.fallback != nullptr);
-        // wdac_policy is fully observed on the rig; applocker_policy's CIM property names and
-        // SrpV2 layout never were, so its Windows leg is declared CONSTRAINED.
+        // wdac_policy is declared SUPPORTED (only VerifiedAndReputablePolicyState=0 was observed,
+        // and the legacy SiPolicy.p7b is not read); applocker_policy's CIM property names and SrpV2
+        // layout never were observed, so its Windows leg is declared CONSTRAINED.
         CHECK(d.windows_leg.support == (std::string_view{d.action} == "wdac_policy"
                                             ? YUZU_SUPPORT_SUPPORTED
                                             : YUZU_SUPPORT_CONSTRAINED));
@@ -140,6 +143,7 @@ TEST_CASE("app_control plugin: each action -- exact unsupported row + UNAVAILABL
             CHECK(rows[0] == action + "|unsupported|windows_only_concept");
             CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
             CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(result.result_provenance == "windows_only_concept");
             continue;
         }
 
@@ -147,6 +151,12 @@ TEST_CASE("app_control plugin: each action -- exact unsupported row + UNAVAILABL
         // never an empty success. rc 0 iff status OK.
         REQUIRE_FALSE(rows.empty());
         CHECK((result.rc == 0) == (result.result_status == YUZU_RESULT_STATUS_OK));
+        if (result.rc == 0) { // an OK run names its source (README "Result status")
+            const std::string_view prov = result.result_provenance;
+            using namespace yuzu::app_control;
+            CHECK((action == "wdac_policy" ? prov == kProvenanceCiPolicy
+                                           : prov == kProvenanceSrpV2 || prov == kProvenanceCim));
+        }
         for (const auto& r : rows) {
             INFO("row: " << r);
             const bool known = r.rfind("wdac|", 0) == 0 || r.rfind("wdac_cip|", 0) == 0 ||
