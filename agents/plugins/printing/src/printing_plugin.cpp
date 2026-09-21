@@ -576,12 +576,15 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     if (!job_id) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "invalid or missing 'job_id'");
-        ctx.write_output(format_clear_queue_row(printer, 0, "error", "invalid_job_id"));
+        ctx.write_output(format_clear_queue_row(printer_name_is_valid_windows(printer) ? printer : "-", 0, "error",
+                                                 "invalid_job_id"));
         return 1;
     }
-    // OpenPrinterW gives `,` special meaning (`,XcvPort ...`, `Printer, Job N`,
-    // `,LocalPrintServer` open non-printer handles) and a Windows printer name cannot
-    // contain one, so such a name is never a real printer: refuse it, do not open it.
+    // OpenPrinterW gives `,` special meaning (address syntaxes such as `,XcvPort ...`,
+    // `Printer, Job N`, `,LocalPrintServer`) and a Windows printer name cannot contain
+    // one, so such a name is never a real printer: refuse it, do not open it. (On real
+    // Windows, with this agent's PRINTER_ACCESS_USE, only the Xcv form was recognised,
+    // with error 5; this is hardening, not a closed hole.)
     if (!printer_name_is_valid_windows(printer)) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "invalid printer name");
@@ -982,7 +985,7 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     // No socket -> refused, never a TCP fallback for this mutating action: a
     // deliberate policy refusal (the agent will not cancel over TCP), even though
     // the same token also covers cupsd simply not running. `no_identity` below is
-    // an `error` instead, because there cupsd is never asked.
+    // an `error` instead, because a failed local lookup is not a policy decision.
     const auto socket_path = find_cups_socket();
     if (!socket_path) {
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,

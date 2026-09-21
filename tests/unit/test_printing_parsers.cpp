@@ -882,17 +882,100 @@ TEST_CASE("classify_job_listing: a job matches only by id AND its own job-printe
     const auto bare_rows = jobs_from_ipp(*bare);
     REQUIRE(bare_rows.size() == 2);
     CHECK(classify_job_listing(bare_rows, 6, "yuzu4616a") == JobListing::unconfirmed); // no job-printer-uri
+    CHECK(classify_job_listing(bare_rows, 7, "yuzu4616a") == JobListing::unconfirmed);
     CHECK(classify_job_listing(bare_rows, 99, "yuzu4616a") == JobListing::absent);
 }
 
 TEST_CASE("classify_job_listing: a printer literally named '-' does not match the absent-attribute "
-          "placeholder; an empty listing lists nothing",
+          "placeholder; an empty (present) job-printer-uri is unconfirmed too; an empty listing lists nothing",
           "[printing][binding]") {
     JobRow no_uri;
     no_uri.job_id = 5;
     no_uri.printer = "-"; // jobs_from_ipp's placeholder for an absent attribute
     CHECK(classify_job_listing({no_uri}, 5, "-") == JobListing::unconfirmed);
+    JobRow empty_uri;
+    empty_uri.job_id = 5;
+    empty_uri.printer = ""; // present but empty
+    CHECK(classify_job_listing({empty_uri}, 5, "yuzu4616a") == JobListing::unconfirmed);
     CHECK(classify_job_listing({}, 1, "yuzu4616a") == JobListing::absent);
+}
+
+TEST_CASE("classify_job_listing: the name comparison is exact up to ASCII case -- no prefix match, on "
+          "either side, and folding applies to BOTH sides",
+          "[printing][binding]") {
+    const auto row = [](const std::string& uri) {
+        JobRow r;
+        r.job_id = 5;
+        r.printer = uri;
+        return r;
+    };
+    const auto lower = row("ipp://localhost:631/printers/yuzu4616a");
+    const auto upper = row("ipp://localhost:631/printers/YUZU4616A");
+    CHECK(classify_job_listing({lower}, 5, "YUZU4616A") == JobListing::on_printer);
+    CHECK(classify_job_listing({upper}, 5, "yuzu4616a") == JobListing::on_printer); // the row folds too
+    CHECK(classify_job_listing({lower}, 5, "yuzu4616") == JobListing::elsewhere);   // request is a prefix of the row
+    CHECK(classify_job_listing({lower}, 5, "yuzu4616ab") == JobListing::elsewhere); // row is a prefix of the request
+    CHECK(classify_job_listing({row("ipp://localhost:631/printers/yuzu4616")}, 5, "yuzu4616a") == JobListing::elsewhere);
+    CHECK(classify_job_listing({row("http://localhost:631/printers/x")}, 5, "x") == JobListing::elsewhere); // not a cupsd URI
+    CHECK(classify_job_listing({row("ipp://localhost:631/printers/")}, 5, "x") == JobListing::elsewhere);
+}
+
+TEST_CASE("printer_name_from_cupsd_uri: cupsd's own job-printer-uri yields the WHOLE name, including one "
+          "with '?' (measured: cupsd leaves it unencoded); anything else yields nothing",
+          "[printing][binding]") {
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost:631/printers/yuzu4616a") == "yuzu4616a");
+    CHECK(printer_name_from_cupsd_uri("ipps://host/printers/a%20b") == "a b");
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost:631/classes/xp3cls") == "xp3cls");
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost:631/printers/a?b") == "a?b"); // legal queue name
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost:631/printers/a#b") == "a#b");
+    CHECK(printer_name_from_cupsd_uri("http://localhost:631/printers/x").empty());
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost:631/other/x").empty());
+    CHECK(printer_name_from_cupsd_uri("ipp://localhost").empty());
+    CHECK(printer_name_from_cupsd_uri("-").empty());
+    CHECK(printer_name_from_cupsd_uri("").empty());
+    // a queue named with '?' is on_printer for its own name
+    JobRow q;
+    q.job_id = 9;
+    q.printer = "ipp://localhost:631/printers/we?rd";
+    CHECK(classify_job_listing({q}, 9, "we?rd") == JobListing::on_printer);
+}
+
+TEST_CASE("is_valid_utf8 and the name validators: real UTF-8 names pass, malformed bytes never reach a "
+          "row (a stray byte would make the server's CommandResponse unparseable)",
+          "[printing][binding]") {
+    CHECK(is_valid_utf8(""));
+    CHECK(is_valid_utf8("plain"));
+    CHECK(is_valid_utf8("Caf\xC3\xA9"));           // é
+    CHECK(is_valid_utf8("B\xC3\xBCro"));           // ü
+    CHECK(is_valid_utf8("\xE2\x82\xAC"));         // euro sign (3 bytes)
+    CHECK(is_valid_utf8("\xF0\x9F\x98\x80"));    // U+1F600 (4 bytes)
+    CHECK_FALSE(is_valid_utf8("\xFF"));
+    CHECK_FALSE(is_valid_utf8("\xC3\x28"));        // bad continuation
+    CHECK_FALSE(is_valid_utf8("\x80"));             // stray continuation
+    CHECK_FALSE(is_valid_utf8("\xC0\x80"));        // overlong NUL
+    CHECK_FALSE(is_valid_utf8("\xE0\x80\x80"));   // overlong 3-byte
+    CHECK_FALSE(is_valid_utf8("\xED\xA0\x80"));   // surrogate
+    CHECK_FALSE(is_valid_utf8("\xF0\x80\x80\x80")); // overlong 4-byte
+    CHECK_FALSE(is_valid_utf8("\xF4\x90\x80\x80")); // above U+10FFFF
+    CHECK_FALSE(is_valid_utf8("\xF5\x80\x80\x80"));
+    CHECK_FALSE(is_valid_utf8("\xC3"));             // truncated
+    CHECK(printer_name_is_valid_posix("Caf\xC3\xA9"));
+    CHECK(printer_name_is_valid_posix("B\xC3\xBCro"));
+    CHECK_FALSE(printer_name_is_valid_posix("\xFF"));
+    CHECK_FALSE(printer_name_is_valid_posix("a\xC3\x28"));
+    CHECK(printer_name_is_valid_windows("Caf\xC3\xA9"));
+    CHECK_FALSE(printer_name_is_valid_windows("\xFF"));
+    CHECK(printer_echo_posix("ipp://localhost:631/printers/Caf%C3%A9") == "Caf\xC3\xA9");
+    CHECK(printer_echo_posix("ipp://localhost:631/printers/%FF") == "-");
+    CHECK(printer_echo_posix("ipp://localhost:631/printers/%C3%28") == "-");
+}
+
+TEST_CASE("run_clear_queue: a pasted URI whose name decodes to malformed UTF-8 sends nothing and shows '-'",
+          "[printing][binding]") {
+    FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
+    const auto d = run_clear_queue("ipp://localhost:631/printers/%FF", 16, "alex", kTestTokens, t);
+    CHECK(t.ops == kNoOps);
+    check_disposition(d, 1, ClearQueueStatus::unavailable, false, "clear_queue|-|16|error|invalid_printer");
 }
 
 TEST_CASE("job_binding_check_attrs: one printer's not-completed jobs, encoded name, ids and printer URIs only",
@@ -928,6 +1011,7 @@ TEST_CASE("percent_encode_path_segment / percent_decode: unreserved bytes pass, 
     CHECK(percent_decode("%2F") == "/");
     CHECK(percent_decode("%c3%A9") == "\xC3\xA9");
     CHECK(percent_decode("%zz") == "%zz"); // not hex: stays literal
+    CHECK(percent_decode("%G0") == "%G0"); // 'G' is not a hex digit
     CHECK(percent_decode("x%4") == "x%4"); // truncated: stays literal
     CHECK(percent_decode("%00") == std::string("\0", 1));
 }
@@ -966,6 +1050,9 @@ TEST_CASE("printer_name_is_valid_windows: a comma (OpenPrinterW's special-handle
     CHECK_FALSE(printer_name_is_valid_windows("Microsoft Print to PDF, Job 1"));
     CHECK_FALSE(printer_name_is_valid_windows(",LocalPrintServer"));
     CHECK_FALSE(printer_name_is_valid_windows("a\x01"));
+    CHECK_FALSE(printer_name_is_valid_windows("a\x1F"));
+    CHECK_FALSE(printer_name_is_valid_windows("a\x7F"));
+    CHECK(printer_name_is_valid_windows("a b")); // 0x20 is fine
     CHECK_FALSE(printer_name_is_valid_windows(""));
 }
 
@@ -975,6 +1062,9 @@ TEST_CASE("ascii_iequals: ASCII case folding only", "[printing][binding]") {
     CHECK_FALSE(ascii_iequals("yuzu4616a", "yuzu4616b"));
     CHECK_FALSE(ascii_iequals("abc", "abcd"));
     CHECK_FALSE(ascii_iequals("\xC3\xA9", "\xC3\x89")); // no Unicode folding
+    CHECK_FALSE(ascii_iequals("[", "{"));   // only A-Z fold, not the bytes 32 above them
+    CHECK_FALSE(ascii_iequals("@", "`"));
+    CHECK_FALSE(ascii_iequals("Z", "["));
 }
 
 TEST_CASE("encode_request refuses a value that does not fit the 16-bit IPP length (no attribute injection)",

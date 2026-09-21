@@ -245,7 +245,8 @@ spec:
           (`ipp://localhost:631/printers/NAME`) is also accepted, a job submitted
           to a printer class is addressed by the class name, and a name over 127
           bytes or containing control characters is refused (invalid_printer),
-          as is a Windows name containing a comma. macOS/Linux match the name
+          as is, on Windows, a name containing a comma or a control character.
+          macOS/Linux match the name
           case-insensitively, as cupsd does.
         validation:
           minLength: 1

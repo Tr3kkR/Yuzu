@@ -20,8 +20,10 @@ decoded result: 104 bytes; HTTP 200; status-code 0x0000 (successful-ok); two job
 groups carrying only `job-id` 6 and `job-id` 7 -- NO job-printer-uri.
 
 why it exists: it is the real shape of a listing whose job groups carry no
-job-printer-uri (cupsd returns only the attributes asked for; a requester under
-`JobPrivateValues all` also gets a job-id but no printer URI, read from upstream
-cupsd source, not reproduced here). A job listed this way cannot be confirmed to
+job-printer-uri (cupsd returns only the attributes asked for). Upstream cupsd
+emits job-printer-uri whenever it is requested, even under `JobPrivateValues`, so
+on a stock server this shape only arises from a request that did not ask for it;
+`run_clear_queue` treats it as unconfirmed as a defensive verdict for any server
+that omits the attribute. A job listed this way cannot be confirmed to
 be on the named printer, so `run_clear_queue` reports it as an error and sends
 no Cancel-Job.

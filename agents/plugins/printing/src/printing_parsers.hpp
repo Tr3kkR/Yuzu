@@ -498,11 +498,45 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
     return std::string(operand);
 }
 
+/// Strict UTF-8 (RFC 3629): no overlong forms, no surrogates, nothing above
+/// U+10FFFF. A row is a protobuf string, which the server must parse: a stray
+/// byte such as the 0xFF a pasted `%FF` decodes to would make the whole
+/// CommandResponse unparseable and end the server's read loop.
+[[nodiscard]] inline bool is_valid_utf8(std::string_view s) noexcept {
+    std::size_t i = 0;
+    const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+    const auto cont = [&](std::size_t k) { return k < s.size() && (at(k) & 0xC0) == 0x80; };
+    while (i < s.size()) {
+        const unsigned c = at(i);
+        if (c < 0x80) {
+            i += 1;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            if (!cont(i + 1)) return false;
+            i += 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            if (!cont(i + 1) || !cont(i + 2)) return false;
+            const unsigned c1 = at(i + 1);
+            if (c == 0xE0 && c1 < 0xA0) return false; // overlong
+            if (c == 0xED && c1 > 0x9F) return false; // surrogate
+            i += 3;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            if (!cont(i + 1) || !cont(i + 2) || !cont(i + 3)) return false;
+            const unsigned c1 = at(i + 1);
+            if (c == 0xF0 && c1 < 0x90) return false; // overlong
+            if (c == 0xF4 && c1 > 0x8F) return false; // above U+10FFFF
+            i += 4;
+        } else {
+            return false; // 0x80-0xC1 (stray/overlong lead) and 0xF5-0xFF
+        }
+    }
+    return true;
+}
+
 /// A name the macOS/Linux path will build a request for: non-empty, within the
-/// IPP name limit, and free of control characters (including one that appears
-/// only after percent-decoding a pasted URI, e.g. `%00`).
+/// IPP name limit, valid UTF-8, and free of control characters (including one
+/// that appears only after percent-decoding a pasted URI, e.g. `%00`).
 [[nodiscard]] inline bool printer_name_is_valid_posix(std::string_view name) noexcept {
-    if (name.empty() || name.size() > kMaxPosixPrinterNameBytes)
+    if (name.empty() || name.size() > kMaxPosixPrinterNameBytes || !is_valid_utf8(name))
         return false;
     return std::none_of(name.begin(), name.end(), [](char c) {
         const auto u = static_cast<unsigned char>(c);
@@ -526,6 +560,31 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
     return attrs;
 }
 
+/// The printer NAME out of a `job-printer-uri` that cupsd itself generated
+/// (`ipp[s]://host[:port]/printers/NAME` or `/classes/NAME`): the WHOLE remainder,
+/// percent-decoded. Unlike printer_name_from_operand (which refuses a segment
+/// holding `/`, `?` or `#` because an operator typed it), this never rejects a
+/// legal queue name: cupsd leaves a `?` in a name unencoded (measured), and a
+/// queue named with one is legal. Anything that is not that shape yields "",
+/// which never equals a printer name.
+[[nodiscard]] inline std::string printer_name_from_cupsd_uri(std::string_view uri) {
+    for (const std::string_view scheme : {std::string_view{"ipp://"}, std::string_view{"ipps://"}}) {
+        if (!uri.starts_with(scheme))
+            continue;
+        const auto rest = uri.substr(scheme.size());
+        const auto slash = rest.find('/');
+        if (slash == std::string_view::npos)
+            return {};
+        const auto path = rest.substr(slash);
+        for (const std::string_view prefix : {std::string_view{"/printers/"}, std::string_view{"/classes/"}}) {
+            if (path.starts_with(prefix))
+                return percent_decode(path.substr(prefix.size()));
+        }
+        return {};
+    }
+    return {};
+}
+
 /// ASCII case-insensitive equality. CUPS resolves printer names case-insensitively
 /// (cupsd answers a Get-Jobs for `YUZU4616A` with the jobs of `yuzu4616a`, whose
 /// job-printer-uri is lower case), so an exact comparison would report a live job
@@ -545,8 +604,9 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
 enum class JobListing {
     absent,      // the id is not listed at all
     elsewhere,   // listed, but its own job-printer-uri names a DIFFERENT printer
-    unconfirmed, // listed, but with no job-printer-uri to confirm the printer (e.g. cupsd's
-                 // JobPrivateValues hides it from this requester)
+    unconfirmed, // listed, but with no (or an empty) job-printer-uri to confirm the printer:
+                 // a defensive verdict for a server that omits the attribute -- this
+                 // Mac's cupsd returns it whenever asked, even under JobPrivateValues
     on_printer,  // listed AND its own job-printer-uri names the requested printer
 };
 
@@ -562,11 +622,11 @@ enum class JobListing {
         if (r.job_id != job_id)
             continue;
         seen = true;
-        if (r.printer == "-") {
+        if (r.printer == "-" || r.printer.empty()) { // absent, or present but empty
             unconfirmed = true;
             continue;
         }
-        if (ascii_iequals(printer_name_from_operand(r.printer), printer_name))
+        if (ascii_iequals(printer_name_from_cupsd_uri(r.printer), printer_name))
             return JobListing::on_printer;
     }
     if (!seen)
@@ -583,11 +643,13 @@ enum class JobListing {
 }
 
 /// Windows: a name the agent will hand to OpenPrinterW. A comma (or a control
-/// character) is refused: OpenPrinterW gives `,` special meaning (`,XcvPort ...`,
-/// `Printer, Job N`, `,LocalPrintServer`), and Windows printer names cannot
-/// contain one, so such a name is never a real printer.
+/// character, or invalid UTF-8) is refused: OpenPrinterW gives `,` special meaning
+/// (address syntaxes such as `,XcvPort ...`, `Printer, Job N`, `,LocalPrintServer`),
+/// and Windows printer names cannot contain one, so such a name is never a real
+/// printer. (Measured on real Windows with the agent's PRINTER_ACCESS_USE only the
+/// Xcv form was recognised, with error 5; the refusal is hardening.)
 [[nodiscard]] inline bool printer_name_is_valid_windows(std::string_view name) noexcept {
-    if (name.empty())
+    if (name.empty() || !is_valid_utf8(name))
         return false;
     return std::none_of(name.begin(), name.end(), [](char c) {
         const auto u = static_cast<unsigned char>(c);
