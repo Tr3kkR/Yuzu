@@ -8,7 +8,7 @@
  * dashboard observation; none of the three is logged here, and T_mechanism, the handler
  * instant and T_fire are fields of the T_detect line, not lines of their own. Deliberately NOT
  * part of GuardianSparkRuntime's class interface:
- *   - so the two format_*_line() functions are directly unit-testable (pure, no
+ *   - so the format_*_line() functions are directly unit-testable (pure, no
  *     I/O, no clock reads) without touching the runtime;
  *   - so the agent-side send-site logging (agent.cpp, T_wire) can use
  *     SendTimingRecord/make_outbox_send_timing/format_send_timing_line without
@@ -206,10 +206,10 @@ YUZU_EXPORT SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool 
 /// The runtime's arm-confirmation line (R5.7 T2), NOT a T_ line: it lives here only so the
 /// agent-side Guardian log-line formatters share one neutralisation point and one unit-test
 /// seam (the runtime's own spdlog output is not capturable from a test, see test_log_capture.hpp).
-/// The rule id is operator-authored and unvalidated, so it goes through log_id_token; for an
-/// id of [A-Za-z0-9._-] that is the identity, which is all the #3990 driver's T2_RE
-/// (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) ever parses. FIELD ORDER IS PINNED
-/// by that regex - change both together.
+/// The rule id is operator-authored and unvalidated, so it goes through log_id_token; for an id
+/// of up to 256 bytes drawn from [A-Za-z0-9._-] that is the identity, which covers every id the
+/// #3990 driver (docs/spark-rebuild-baselines/fullsync_blackout_diag.py, expected_rule_ids())
+/// expects. FIELD ORDER IS PINNED by that driver's T2_RE - change both together.
 YUZU_EXPORT std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
                                                   std::uint64_t incarnation, const char* type,
                                                   const char* via,

@@ -2505,9 +2505,12 @@ TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a l
     CHECK(format_send_timing_line(w) == "Guardian T_wire event_id=a___b domain=health sent=1 wire_wall_ns=9");
 }
 
-TEST_CASE("the runtime's arm-committed line keeps the #3990 driver's pinned shape and cannot be "
-          "forged through the rule id",
+TEST_CASE("format_arm_committed_line keeps the #3990 driver's pinned shape and cannot be forged "
+          "through the rule id",
           "[spark][runtime]") {
+    // Formatter-only: the runtime's own spdlog output is not capturable from a test (it lives in
+    // libyuzu_agent_core, see test_log_capture.hpp), so nothing here pins that the call sites in
+    // guardian_spark_runtime.cpp actually go through log_id_token. Those are checked by reading.
     // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
     // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
     CHECK(format_arm_committed_line("blackout-reg-01", 3, 101, "file", "inline-shared", 7) ==

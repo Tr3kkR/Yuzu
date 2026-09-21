@@ -1730,7 +1730,7 @@ void GuardianSparkRuntime::log_wedge_withdrawal_postcondition_violation(
         spdlog::critical(
             "Guardian spark #4508: a wedge candidate survived a withdrawal of rule "
             "'{}' - the sweep was skipped or reordered",
-            rule_id ? std::string{*rule_id} : std::string{"<all>"});
+            rule_id ? ::yuzu::log_id_token(*rule_id) : std::string{"<all>"});
     } catch (...) {
     }
 }
@@ -2798,7 +2798,8 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                                      "last-resort fallback, but this leftover fifo residue "
                                      "is left for the next same-key event to sweep (see "
                                      "detach_sweep_left_residue())",
-                                     *key_opt, eit->second.fifo.size(), rule_id);
+                                     *key_opt, eit->second.fifo.size(),
+                                     ::yuzu::log_id_token(rule_id));
                     } catch (...) {
                     }
                 } else {
@@ -3485,7 +3486,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
@@ -3528,7 +3529,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
