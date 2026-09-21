@@ -32,7 +32,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
+| `list` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner + native CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
 | `list_inventory` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman/apk via bounded argv runner |
 | `list_per_user` | ✅ supported · rung 1 · Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | ✅ supported · rung 2 · system_profiler + brew via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
 | `query` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
@@ -72,7 +72,7 @@ Pipe-delimited rows, one per application, written via `write_output()`. `list`/`
 | `name` | string | - | Windows, Linux, macOS | `7-Zip 26.02 (x64)` | The application's display name as read from the OS-native registry or package database. Values: free text. |
 | `version` | string | - | Windows, Linux, macOS | `26.02` | The installed version string, or "-" when the source reports none. Values: free text or "-". |
 | `publisher` | string | - | Windows, Linux | `Igor Pavlov` | The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or "-". |
-| `install_date` | string | - | Windows, macOS | `20260617` | Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); "-" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or "-". |
+| `install_date` | string | - | Windows, macOS | `20260617` | Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); "-" when the source reports none, which dpkg-based Linux hosts always do. A "\" or "\|" in the value is escaped like install_location (it no longer ends the row); no real value carries either. Values: free text or "-". |
 | `install_location` | string | - | Windows, macOS | `C:/Program Files/7-Zip/` | Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\Vendor is NOT expanded — or "-" when the installer wrote none (NSIS and portable installers often do not). macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always "-" on Linux by design: a package installs files to many prefixes, so there is no single install location. Backslashes are emitted as "/" and a literal "\|" as "\\|" (safe_output_field: the wire grammar cannot carry "\" before a delimiter), so C:\Program Files\7-Zip\ reads C:/Program Files/7-Zip/. Values: path or "-". |
 | `bundle_id` | string | - | macOS | `com.apple.ActivityMonitor` | The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always "-" on Windows and Linux, which have no bundle identifier concept; "-" on macOS when the location is not a bundle or carries no identifier, and for rows beyond the per-run enrichment cap (5000 applications / 120 s), which is not reported as degraded. Values: bundle identifier or "-". |
 
@@ -114,7 +114,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 2d05d4707a05
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 3690edc65cda
 
 ```
 == action=list
@@ -179,7 +179,7 @@ inv|DayZ||Bohemia Interactive||app|windows||||||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (jsmith; user-profile paths redacted) · leg-hash 2d05d4707a05
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (jsmith; user-profile paths redacted) · leg-hash 3690edc65cda
 
 ```
 == action=list
@@ -236,7 +236,7 @@ inv|Grapher|2.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 2d05d4707a05
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 3690edc65cda
 
 ```
 == action=list

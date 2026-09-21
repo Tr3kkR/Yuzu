@@ -14,7 +14,7 @@
         },
         "macos": {
           "fallback": "",
-          "mechanism": "system_profiler via bounded argv runner",
+          "mechanism": "system_profiler via bounded argv runner + native CFBundle enrichment",
           "rung": "2",
           "support": "supported"
         },
@@ -107,7 +107,7 @@
     "**Windows `list`/`query` machine scope is invisible to a partial failure.** `enumerate_uninstall_key` returns silently if `RegOpenKeyExW` fails and stops at the first non-`ERROR_SUCCESS` from `RegEnumKeyExW` (`installed_apps_plugin.cpp:312-330`); a partial registry walk still reports success today. `do_list_inventory`'s own comment (`installed_apps_plugin.cpp:817-824`) flags this as pre-existing and needing its own change to close, not something this plugin currently detects.",
     "**macOS `signature_status` is presence, not validity.** The `#2273` enrichment calls `SecCodeCopySigningInformation` only, never `SecStaticCodeCheckValidity` — a bundle with `Contents/_CodeSignature` deleted, or with bytes appended to its Mach-O, both still read `signed` (`installed_apps_macos_enrich.hpp:13-30`). Deep verification was deliberately left an open decision, not shipped.",
     "**`list`/`query`/`list_per_user` degrade loudly only on Linux/macOS.** A subprocess that is killed, times out, is truncated, or exits nonzero (outside the tolerated per-ID `pkgutil` lookup) makes these three emit `error|installed_apps: acquisition degraded (...)` and return rc 1 rather than a false-empty/partial list (`installed_apps_plugin.cpp:857-870`). The Windows registry path has no equivalent signal — see caveat 1. Separately, macOS `list_inventory` memoizes its `system_profiler` scan for 10 minutes (`ProfilerCache`/`kProfilerCacheTtl`), keyed on an `lstat` signature covering both the Applications-type directories and the two `pkgutil`-receipt directories (`installed_apps_macos_receipts.hpp`'s `kReceiptDirs`) — a degraded/empty scan is never cached, and most per-package version/install-date lookups now resolve in-process from the receipt plist rather than spawning `pkgutil --pkg-info <id>` (that spawn is a fallback for the rare miss; see the spawn-sink manifest's `get_inventory_macos#3` row).",
-    "**`list` carries two trailing columns for ADR-0028; `query`'s row stays four fields.** `list` emits `app|name|version|publisher|install_date|install_location|bundle_id` (`format_app_row`, `installed_apps_parsers.hpp`); the two trailing columns land the `installed_apps`/`InstallLocation` sequencing dependency ADR-0028 names as a binding condition (`docs/adr/0028-agent-component-inventory-collection.md:1458-1466`) for the operator `list` action only — the ADR-0016 daily-sync row is unchanged. ADR-0028 (`:57-63`) records why: \"a large, modern CVE surface is invisible to today's collection model: dependencies **bundled inside an installed application** (Electron/Chromium embedded in Slack/Teams/Discord/VS Code, vendored `OpenSSL.dll`/`libcrypto.so`, embedded JARs — the Log4Shell distribution vector, statically-linked libraries) and **filesystem-resident language dependencies** (`node_modules`, Python venvs/site-packages, on-disk JARs, Go/Rust module graphs) that no package manager or OS registry enumerates.\" `install_location` and `bundle_id` give a later component-inventory walk a per-application path to start from; on their own they enumerate nothing beyond where each application lives. Both pass through `safe_output_field` (`\\` folds to `/`, `|` is escaped) because the wire grammar cannot carry a `\\` before a delimiter; on Linux `install_location` is always `-` by design (a package installs to many prefixes). `do_query` still emits `app|name|version|publisher` — intentional per the YAML contract (`installed_apps.yaml`), not a truncation.",
+    "**`list` carries two trailing columns for ADR-0028; `query`'s row stays four fields.** `list` emits `app|name|version|publisher|install_date|install_location|bundle_id` (`format_app_row`, `installed_apps_parsers.hpp`); the two trailing columns land the `installed_apps`/`InstallLocation` sequencing dependency ADR-0028 names as a binding condition (`docs/adr/0028-agent-component-inventory-collection.md:1458-1466`) for the operator `list` action only — the ADR-0016 daily-sync row is unchanged. ADR-0028 (`:57-63`) records why: \"a large, modern CVE surface is invisible to today's collection model: dependencies **bundled inside an installed application** (Electron/Chromium embedded in Slack/Teams/Discord/VS Code, vendored `OpenSSL.dll`/`libcrypto.so`, embedded JARs — the Log4Shell distribution vector, statically-linked libraries) and **filesystem-resident language dependencies** (`node_modules`, Python venvs/site-packages, on-disk JARs, Go/Rust module graphs) that no package manager or OS registry enumerates.\" `install_location` and `bundle_id` give a later component-inventory walk a per-application path to start from; on their own they enumerate nothing beyond where each application lives. Both — and `install_date`, which stopped being the row's last field — pass through `safe_output_field` (`\\` folds to `/`, `|` is escaped) because the wire grammar cannot carry a `\\` before a delimiter (a no-op for every real `install_date`, which never contains either); on Linux `install_location` is always `-` by design (a package installs to many prefixes). `do_query` still emits `app|name|version|publisher` — intentional per the YAML contract (`installed_apps.yaml`), not a truncation.",
     "**The `list_inventory`/`list_per_user` samples were captured under the wrong identity on two of three OSes, and the macOS `list_per_user` `[rc] 1` traces to that.** macOS ran unprivileged (`euid 501`) and Linux ran as root inside a container (`euid 0`); neither matches the agent's actual production identity (root today on macOS, the intended `_yuzu` account on Linux) — see *Privileges and prerequisites*. On macOS, `do_list_per_user` first lists system apps via `system_profiler` (succeeds), then probes for Homebrew and, if found, runs `brew list --versions` (`installed_apps_plugin.cpp:1162-1165`); under the euid-501 capture identity that `brew` invocation exits nonzero, `run_tool` marks it `degraded` on any nonzero exit (`installed_apps_plugin.cpp:186-188`), and `report_if_degraded` then emits the `error|...` row and returns rc 1 (`installed_apps_plugin.cpp:857-870`, called at `:1166-1167`) — the traced cause of the sample's `[rc] 1`, not an unrelated fault."
   ],
   "definitions": [
@@ -116,7 +116,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Enumerates all installed applications on the endpoint. On Windows, reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and HKCU), deduplicates by name+version, and skips system components. The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a logged-in user's: the agent runs as a system-context service (LocalSystem today, see #1442), so HKCU resolves to that account's profile and carries no end-user applications. This is deliberate machine scope, not a gap -- per-user applications are a separate action (list_per_user) that this one never invokes. On Linux, auto-detects the package manager (dpkg, rpm, or pacman). On macOS, queries system_profiler for GUI applications. Returns application name, version, publisher, install date, install location, and (macOS) bundle identifier.",
+      "description": "Enumerates all installed applications on the endpoint. On Windows, reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and HKCU), deduplicates by name+version, and skips system components. The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a logged-in user's: the agent runs as a system-context service (LocalSystem today, see #1442), so HKCU resolves to that account's profile and carries no end-user applications. This is deliberate machine scope, not a gap -- per-user applications are a separate action (list_per_user) that this one never invokes. On Linux, auto-detects the package manager (dpkg, rpm, or pacman). On macOS, queries system_profiler for GUI applications. Returns application name, version, publisher, install date, install location, and (macOS) bundle identifier. The dashboard results table shows this definition's rows as key/value (app plus one remainder cell); read the six columns positionally from the raw output on the REST/MCP response routes.",
       "display_name": "List Installed Applications",
       "execute_roles": [
         "endpoint-admin",
@@ -195,7 +195,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "2d05d4707a05",
+  "leg_hash": "3690edc65cda",
   "manifest_version": 1,
   "name": "installed_apps",
   "outputs": [
@@ -237,7 +237,7 @@
           "values": null
         },
         {
-          "description": "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\".",
+          "description": "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. A \"\\\" or \"|\" in the value is escaped like install_location (it no longer ends the row); no real value carries either. Values: free text or \"-\".",
           "example": "20260617",
           "name": "install_date",
           "platforms": [
@@ -387,7 +387,7 @@
       "definition_id": "crossplatform.software.query"
     }
   ],
-  "outputs_note": "Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty or one that does not apply on that OS (`install_location`/`bundle_id` on Linux, `bundle_id` on Windows). `list_inventory` emits a separate, extended `inv`-tagged 12-field row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder (`installed_apps_inventory.hpp:6-11`).\n\n\n\n**Empty-result convention.** `list_inventory` drops a row outright if `name` is empty (`installed_apps_plugin.cpp:845-847`); there is no sentinel row, so an empty collection is empty output at rc 0. A *degraded* collection instead returns rc 1 (`installed_apps_plugin.cpp:834-841`) and the daily sync skips the whole cycle rather than committing a partial inventory as authoritative.",
+  "outputs_note": "Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty or one that does not apply on that OS (`install_location`/`bundle_id` on Linux, `bundle_id` on Windows). `list_inventory` emits a separate, extended `inv`-tagged 12-field row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder (`installed_apps_inventory.hpp:6-11`).\n\n**Server rendering (pre-existing).** `installed_apps` is one of the server's key/value plugins (`kKeyValuePlugins`, `server/core/src/result_parsing.hpp`), so the dashboard results table, its detail drawer, sort and facets split every row at the first pipe only — `app` plus one remainder cell — whatever columns the definition declares; `install_location` and `bundle_id`, like `version`/`publisher`/`install_date` before them, are not separately rendered, sortable or filterable there. `GET /api/v1/responses/{id}` (and its export) and MCP `query_responses` return the raw seven-field row in `output`, which is where automation should read the columns. A definition-aware server splitter is a recorded follow-up, not part of this plugin.\n\n\n\n**Empty-result convention.** `list_inventory` drops a row outright if `name` is empty (`installed_apps_plugin.cpp:845-847`); there is no sentinel row, so an empty collection is empty output at rc 0. A *degraded* collection instead returns rc 1 (`installed_apps_plugin.cpp:834-841`) and the daily sync skips the whole cycle rather than committing a partial inventory as authoritative.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -502,7 +502,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "2d05d4707a05",
+        "leg_hash": "3690edc65cda",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -590,7 +590,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "2d05d4707a05",
+        "leg_hash": "3690edc65cda",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith; user-profile paths redacted)"
@@ -682,7 +682,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "2d05d4707a05",
+        "leg_hash": "3690edc65cda",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated; profile name redacted to jsmith)"
