@@ -851,6 +851,33 @@ TEST_CASE("run_clear_queue: the destination URI the `jobs` action prints is acce
     CHECK(d2.row == "clear_queue|yuzu4616a|16|canceled|-"); // not a 5 KB row
 }
 
+TEST_CASE("run_clear_queue: the destination URI of a queue named with '?' is accepted and cancels (the listing "
+          "is the real capture with the queue name substituted: cupsd leaves '?' unencoded in a job-printer-uri)",
+          "[printing][binding]") {
+    IppResult listing = result_from_fixture("real_get_jobs_binding_check.ipp");
+    REQUIRE(listing.message.has_value());
+    for (auto& group : listing.message->groups)
+        for (auto& attr : group.second)
+            if (attr.name == "job-printer-uri")
+                for (auto& v : attr.values) {
+                    const std::string real = "yuzu4616a";
+                    const auto at = v.find(real);
+                    REQUIRE(at != std::string::npos);
+                    v.replace(at, real.size(), "we?rd");
+                }
+    FakeTransport t{listing, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
+    const auto d = run_clear_queue("ipp://localhost:631/printers/we?rd", 17, "alex", kTestTokens, t);
+    CHECK(t.ops == kListThenCancel);
+    REQUIRE(t.sent.size() == 2);
+    CHECK(t.sent[0][0].value == "ipp://localhost/printers/we%3Frd"); // the '?' goes out encoded
+    CHECK(t.sent[1][0].value == "ipp://localhost/printers/we%3Frd");
+    check_disposition(d, 0, ClearQueueStatus::ok, true, "clear_queue|we?rd|17|canceled|-");
+
+    FakeTransport t2{listing, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
+    check_disposition(run_clear_queue("we?rd", 16, "alex", kTestTokens, t2), 0, ClearQueueStatus::ok, true,
+                      "clear_queue|we?rd|16|canceled|-");
+}
+
 TEST_CASE("classify_job_listing: a job matches only by id AND its own job-printer-uri, case-insensitively "
           "(REAL captures)",
           "[printing][binding]") {
@@ -959,6 +986,16 @@ TEST_CASE("is_valid_utf8 and the name validators: real UTF-8 names pass, malform
     CHECK_FALSE(is_valid_utf8("\xF4\x90\x80\x80")); // above U+10FFFF
     CHECK_FALSE(is_valid_utf8("\xF5\x80\x80\x80"));
     CHECK_FALSE(is_valid_utf8("\xC3"));             // truncated
+    CHECK_FALSE(is_valid_utf8("\xC1\xBF"));        // overlong 2-byte (C1 is never a lead)
+    CHECK_FALSE(is_valid_utf8("\xE2\x82"));        // truncated 3-byte
+    CHECK_FALSE(is_valid_utf8("\xF0\x9F\x98"));   // truncated 4-byte
+    CHECK_FALSE(is_valid_utf8("\xE2\x82\x41"));   // bad 3rd byte
+    CHECK_FALSE(is_valid_utf8("\xF0\x9F\x98\x41")); // bad 4th byte
+    // legitimate names behind each multi-byte lead must not be refused
+    CHECK(is_valid_utf8("\xE0\xB8\x81"));         // U+0E01 Thai (E0 lead)
+    CHECK(is_valid_utf8("\xED\x95\x9C"));         // U+D55C Hangul (ED lead)
+    CHECK(is_valid_utf8("\xEF\xBC\xA1"));         // U+FF21 fullwidth A (EF lead)
+    CHECK(is_valid_utf8("\xF4\x8F\xBF\xBF"));    // U+10FFFF, the last code point (F4 lead)
     CHECK(printer_name_is_valid_posix("Caf\xC3\xA9"));
     CHECK(printer_name_is_valid_posix("B\xC3\xBCro"));
     CHECK_FALSE(printer_name_is_valid_posix("\xFF"));
@@ -1022,7 +1059,8 @@ TEST_CASE("printer_name_from_operand / printer_name_is_valid_posix / printer_ech
     CHECK(printer_name_from_operand("ipps://host/printers/a%20b") == "a b");
     CHECK(printer_name_from_operand("ipp://localhost:631/classes/xp3cls") == "xp3cls");
     CHECK(printer_name_from_operand("ipp://host/printers/a/b") == "ipp://host/printers/a/b"); // not a name
-    CHECK(printer_name_from_operand("ipp://host/printers/a?b") == "ipp://host/printers/a?b");
+    CHECK(printer_name_from_operand("ipp://host/printers/a?b") == "a?b"); // '?' is part of a queue name
+    CHECK(printer_name_from_operand("ipp://host/printers/a%3Fb") == "a?b");
     CHECK(printer_name_from_operand("ipp://host/printers/a#b") == "ipp://host/printers/a#b");
     CHECK(printer_name_from_operand("ipp://host/other/x") == "ipp://host/other/x");
     CHECK(printer_name_from_operand("http://host/printers/x") == "http://host/printers/x");

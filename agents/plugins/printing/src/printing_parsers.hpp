@@ -475,7 +475,10 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
 /// The printer NAME from what an operator supplied. The `jobs` action prints a
 /// printer as a destination URI on macOS/Linux (`ipp://localhost:631/printers/Q`,
 /// or `/classes/C` for a class), so that form is accepted and reduced to its
-/// last path segment (percent-decoded). Anything else is returned unchanged.
+/// last path segment (percent-decoded). Anything else is returned unchanged. A
+/// segment holding `/` or `#` is not a name (cupsd bars both in a queue name) and is
+/// returned unchanged; a `?` IS part of a name (cupsd allows it), so the `jobs` URI of
+/// a queue named with one is accepted.
 [[nodiscard]] inline std::string printer_name_from_operand(std::string_view operand) {
     for (const std::string_view scheme : {std::string_view{"ipp://"}, std::string_view{"ipps://"}}) {
         if (!operand.starts_with(scheme))
@@ -489,7 +492,7 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
             if (!path.starts_with(prefix))
                 continue;
             const auto segment = path.substr(prefix.size());
-            if (segment.find_first_of("/?#") != std::string_view::npos)
+            if (segment.find_first_of("/#") != std::string_view::npos)
                 return std::string(operand);
             return percent_decode(segment);
         }
@@ -563,10 +566,11 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
 /// The printer NAME out of a `job-printer-uri` that cupsd itself generated
 /// (`ipp[s]://host[:port]/printers/NAME` or `/classes/NAME`): the WHOLE remainder,
 /// percent-decoded. Unlike printer_name_from_operand (which refuses a segment
-/// holding `/`, `?` or `#` because an operator typed it), this never rejects a
-/// legal queue name: cupsd leaves a `?` in a name unencoded (measured), and a
-/// queue named with one is legal. Anything that is not that shape yields "",
-/// which never equals a printer name.
+/// holding `/` or `#` because an operator typed it), this reads the whole remainder
+/// and never rejects a queue name: libcups's httpAssembleURIf, which cupsd's
+/// copy_job_attrs() uses to build the URI, leaves a `?` in a name unencoded (measured
+/// with a scratch driver), and a queue named with one is legal. Anything that is not
+/// that shape yields "", which never equals a printer name.
 [[nodiscard]] inline std::string printer_name_from_cupsd_uri(std::string_view uri) {
     for (const std::string_view scheme : {std::string_view{"ipp://"}, std::string_view{"ipps://"}}) {
         if (!uri.starts_with(scheme))
@@ -603,10 +607,13 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
 /// What a printer's not-completed listing says about one job id.
 enum class JobListing {
     absent,      // the id is not listed at all
-    elsewhere,   // listed, but its own job-printer-uri names a DIFFERENT printer
+    elsewhere,   // listed, but its own job-printer-uri names a DIFFERENT printer, or is not a
+                 // recognised ipp[s]://.../printers|classes/NAME URI (fail closed either way)
     unconfirmed, // listed, but with no (or an empty) job-printer-uri to confirm the printer:
-                 // a defensive verdict for a server that omits the attribute -- this
-                 // Mac's cupsd returns it whenever asked, even under JobPrivateValues
+                 // a defensive verdict for a server that omits the attribute -- upstream
+                 // copy_job_attrs() emits it whenever it is requested, even under
+                 // JobPrivateValues (read in the upstream source), and this Mac's cupsd
+                 // returns it when asked (real capture)
     on_printer,  // listed AND its own job-printer-uri names the requested printer
 };
 
@@ -646,8 +653,8 @@ enum class JobListing {
 /// character, or invalid UTF-8) is refused: OpenPrinterW gives `,` special meaning
 /// (address syntaxes such as `,XcvPort ...`, `Printer, Job N`, `,LocalPrintServer`),
 /// and Windows printer names cannot contain one, so such a name is never a real
-/// printer. (Measured on real Windows with the agent's PRINTER_ACCESS_USE only the
-/// Xcv form was recognised, with error 5; the refusal is hardening.)
+/// printer. (Measured on real Windows with the agent's PRINTER_ACCESS_USE only
+/// `,XcvMonitor Local Port` was recognised, with error 5; the refusal is hardening.)
 [[nodiscard]] inline bool printer_name_is_valid_windows(std::string_view name) noexcept {
     if (name.empty() || !is_valid_utf8(name))
         return false;

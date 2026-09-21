@@ -583,8 +583,8 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     // OpenPrinterW gives `,` special meaning (address syntaxes such as `,XcvPort ...`,
     // `Printer, Job N`, `,LocalPrintServer`) and a Windows printer name cannot contain
     // one, so such a name is never a real printer: refuse it, do not open it. (On real
-    // Windows, with this agent's PRINTER_ACCESS_USE, only the Xcv form was recognised,
-    // with error 5; this is hardening, not a closed hole.)
+    // Windows, with this agent's PRINTER_ACCESS_USE, only `,XcvMonitor Local Port` was
+    // recognised, with error 5; this is hardening, not a closed hole.)
     if (!printer_name_is_valid_windows(printer)) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "invalid printer name");
