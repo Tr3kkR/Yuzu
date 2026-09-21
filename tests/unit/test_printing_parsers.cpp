@@ -419,7 +419,7 @@ TEST_CASE("REAL CAPTURE ubuntu:26.04 cupsd container 2026-09-08: nobody (real ui
 // `EnumPrintersW(LOCAL|CONNECTIONS, level 2)` section — the-rig
 // (desktop-04dnsig), captured under BOTH the admin SSH identity and the
 // SYSTEM scheduled task, byte-identical in shape either way (see
-// the-rig-print-probe-findings.md). `Microsoft Print to PDF` is the only
+// enum_printers.txt.provenance.txt). `Microsoft Print to PDF` is the only
 // printer this host had paused with a nonzero queue, so it is the only
 // live triplet exercising `kPrinterStatusPaused`; the other three rows
 // (`OneNote (Desktop)`, `Microsoft XPS Document Writer`, `Fax`) are all
@@ -513,4 +513,51 @@ TEST_CASE("format_printer_row / format_job_row / format_clear_queue_row shapes",
 
     CHECK(format_clear_queue_row("Office-LaserJet", 5, "canceled", "-") ==
           "clear_queue|Office-LaserJet|5|canceled|-");
+}
+
+TEST_CASE("format_clear_queue_row: an empty printer (the missing_printer row) is emitted as \"-\"",
+          "[printing][format]") {
+    CHECK(format_clear_queue_row("", 0, "error", "missing_printer") ==
+          "clear_queue|-|0|error|missing_printer");
+}
+
+// ────────────────────────────────────── Cancel-Job / OpenPrinterW mapping ──
+
+// Status values are RFC 8010 §3.1.6.1 / RFC 8011 §4.1.6, not captures: the
+// only real-capture statuses in the tree are 0x0000 and 0x0406 (asserted
+// against the decoded fixtures above); the rest are protocol constants.
+TEST_CASE("classify_cancel_job_status: successful-* (0x0000-0x00FF) is canceled",
+          "[printing][classify]") {
+    CHECK(classify_cancel_job_status(0x0000) == CancelStatusClass::canceled);
+    CHECK(classify_cancel_job_status(0x0001) == CancelStatusClass::canceled);
+    CHECK(classify_cancel_job_status(0x00FF) == CancelStatusClass::canceled);
+}
+
+TEST_CASE("classify_cancel_job_status: not-found, and the three auth-related client errors",
+          "[printing][classify]") {
+    CHECK(classify_cancel_job_status(0x0406) == CancelStatusClass::not_found);
+    CHECK(classify_cancel_job_status(0x0401) == CancelStatusClass::refused); // forbidden
+    CHECK(classify_cancel_job_status(0x0402) == CancelStatusClass::refused); // not-authenticated
+    CHECK(classify_cancel_job_status(0x0403) == CancelStatusClass::refused); // not-authorized
+}
+
+TEST_CASE("classify_cancel_job_status: bad-request is a protocol fault, never a false 'refused'",
+          "[printing][classify]") {
+    CHECK(classify_cancel_job_status(0x0400) == CancelStatusClass::error); // bad-request
+    CHECK(classify_cancel_job_status(0x0404) == CancelStatusClass::error); // not-possible
+    CHECK(classify_cancel_job_status(0x0500) == CancelStatusClass::error); // server-error-*
+    CHECK(classify_cancel_job_status(0x0100) == CancelStatusClass::error); // just past successful-*
+}
+
+TEST_CASE("classify_open_printer_error: access-denied and invalid-printer-name are distinguished",
+          "[printing][classify]") {
+    CHECK(classify_open_printer_error(5) == OpenPrinterFailure::refused);      // ERROR_ACCESS_DENIED
+    CHECK(classify_open_printer_error(1801) == OpenPrinterFailure::not_found); // ERROR_INVALID_PRINTER_NAME
+}
+
+TEST_CASE("classify_open_printer_error: every other failure is an error, never a false not_found",
+          "[printing][classify]") {
+    CHECK(classify_open_printer_error(0) == OpenPrinterFailure::error);
+    CHECK(classify_open_printer_error(87) == OpenPrinterFailure::error);   // ERROR_INVALID_PARAMETER
+    CHECK(classify_open_printer_error(1722) == OpenPrinterFailure::error); // RPC_S_SERVER_UNAVAILABLE
 }

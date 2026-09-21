@@ -307,6 +307,30 @@ TEST_CASE("printing plugin: clear_queue — missing job_id is rc 1 error|invalid
     CHECK(f[4] == "invalid_job_id");
 }
 
+TEST_CASE("printing plugin: clear_queue — missing printer is rc 1 error|missing_printer with a "
+          "\"-\" printer field, before any I/O",
+          "[printing][actions][clear_queue]") {
+    auto plugin = load_printing_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    const YuzuParam params[] = {{"job_id", "1"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "clear_queue", params);
+    CHECK(result.rc == 1);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto f = split_fields(rows.front());
+    REQUIRE(f.size() == 5);
+    CHECK(f[0] == "clear_queue");
+    CHECK(f[1] == "-");
+    CHECK(f[3] == "error");
+    CHECK(f[4] == "missing_printer");
+}
+
 TEST_CASE("printing plugin: clear_queue — job_id=\"all\" is rc 1, never a purge-all path",
           "[printing][actions][clear_queue]") {
     auto plugin = load_printing_plugin();

@@ -331,12 +331,63 @@ inline constexpr uint32_t kJobStatusRestart = 0x00000800;
                         r.status, r.submitted_at, r.size_bytes);
 }
 
-/// `outcome`: canceled | not_found | refused | error.
+/// `outcome`: canceled | not_found | refused | error. An empty `printer`
+/// (the `missing_printer` row) is emitted as "-", matching the definition's
+/// documented "-" when the param itself was missing.
 [[nodiscard]] inline std::string format_clear_queue_row(std::string_view printer, int64_t job_id,
                                                           std::string_view outcome,
                                                           std::string_view detail) {
-    return std::format("clear_queue|{}|{}|{}|{}", yuzu::util::safe_output_field(printer), job_id, outcome,
-                        yuzu::util::safe_output_field(detail));
+    return std::format("clear_queue|{}|{}|{}|{}", printer.empty() ? "-" : yuzu::util::safe_output_field(printer),
+                        job_id, outcome, yuzu::util::safe_output_field(detail));
+}
+
+/// How a CUPS Cancel-Job response status maps onto a `clear_queue` outcome.
+enum class CancelStatusClass { canceled, not_found, refused, error };
+
+/// Pure so the mapping is unit-testable without a cupsd. Status values are
+/// RFC 8011 §4.1.6 (client-error-*) and RFC 8010 §3.1.6.1 (successful-*):
+///   0x0000-0x00FF successful-*            -> canceled
+///   0x0406 client-error-not-found         -> not_found
+///   0x0401 client-error-forbidden         -> refused
+///   0x0402 client-error-not-authenticated -> refused
+///   0x0403 client-error-not-authorized    -> refused
+/// Everything else, deliberately including 0x0400 client-error-bad-request
+/// (a malformed request is a protocol fault, not an authorization decision),
+/// is `error` so it surfaces as `unexpected_status` rather than a false
+/// "refused".
+[[nodiscard]] inline CancelStatusClass classify_cancel_job_status(uint16_t status) noexcept {
+    if (status <= 0x00FF)
+        return CancelStatusClass::canceled;
+    switch (status) {
+    case 0x0406:
+        return CancelStatusClass::not_found;
+    case 0x0401:
+    case 0x0402:
+    case 0x0403:
+        return CancelStatusClass::refused;
+    default:
+        return CancelStatusClass::error;
+    }
+}
+
+/// How a failed Windows `OpenPrinterW` maps onto a `clear_queue` outcome.
+enum class OpenPrinterFailure { not_found, refused, error };
+
+/// `last_error` is `GetLastError()` read immediately after the failed call.
+/// Win32 values are stable ABI, restated here (winerror.h) so the mapping
+/// stays in the pure header: 5 ERROR_ACCESS_DENIED -> refused (the caller
+/// exists but may not open the queue), 1801 ERROR_INVALID_PRINTER_NAME ->
+/// not_found. Every other failure (spooler stopped, RPC unavailable, ...) is
+/// `error`: reporting it as not_found would tell an operator a printer is
+/// gone when the spooler is merely down.
+[[nodiscard]] inline OpenPrinterFailure classify_open_printer_error(uint32_t last_error) noexcept {
+    constexpr uint32_t kErrorAccessDenied = 5;
+    constexpr uint32_t kErrorInvalidPrinterName = 1801;
+    if (last_error == kErrorAccessDenied)
+        return OpenPrinterFailure::refused;
+    if (last_error == kErrorInvalidPrinterName)
+        return OpenPrinterFailure::not_found;
+    return OpenPrinterFailure::error;
 }
 
 /// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never

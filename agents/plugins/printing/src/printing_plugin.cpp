@@ -66,7 +66,7 @@
  * (winspool.h). `kReadDesiredAccess`/`kCancelDesiredAccess` below are
  * RECONCILED against P93-2's the-rig measurement (both admin and SYSTEM,
  * against `Microsoft Print to PDF`) — see
- * tests/unit/fixtures/wave9/probes/the-rig-print-probe-findings.md.
+ * tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
  */
 
 #include <yuzu/plugin.hpp>
@@ -192,7 +192,10 @@ auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
 // cancelling a real job successfully under BOTH admin and SYSTEM
 // (GetLastError()==0), matching the winspool "manage your own submission"
 // semantics rather than JOB_ACCESS_ADMINISTER's admin-any-job scope — see
-// the-rig-print-probe-findings.md. Kept narrower than
+// tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
+// Both measured identities (BUILTIN\Administrators, NT AUTHORITY\SYSTEM) are
+// already elevated; a least-privileged identity cancelling a job it does not
+// own was NOT measured (docs/agent-privilege-model.md). Kept narrower than
 // PRINTER_ALL_ACCESS/JOB_ACCESS_ADMINISTER on purpose: clear_queue cancels
 // exactly one job id and needs no broader grant than that.
 constexpr DWORD kCancelDesiredAccess = PRINTER_ACCESS_USE;
@@ -228,12 +231,19 @@ private:
     HANDLE h_ = nullptr;
 };
 
-[[nodiscard]] std::optional<PrinterHandle> open_printer(const std::wstring& name, DWORD access) {
+// `last_error`, when non-null, receives GetLastError() read immediately after
+// a failed OpenPrinterW -- before anything else can overwrite it -- so a
+// caller can tell access-denied from a nonexistent printer.
+[[nodiscard]] std::optional<PrinterHandle> open_printer(const std::wstring& name, DWORD access,
+                                                         DWORD* last_error = nullptr) {
     PRINTER_DEFAULTSW defaults{};
     defaults.DesiredAccess = access;
     HANDLE raw = nullptr;
-    if (!OpenPrinterW(const_cast<LPWSTR>(name.c_str()), &raw, &defaults) || raw == nullptr)
+    if (!OpenPrinterW(const_cast<LPWSTR>(name.c_str()), &raw, &defaults) || raw == nullptr) {
+        if (last_error != nullptr)
+            *last_error = GetLastError();
         return std::nullopt;
+    }
     return PrinterHandle{raw};
 }
 
@@ -560,11 +570,28 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
 
     const std::wstring wprinter = yuzu::win::to_wide(printer);
 
-    auto handle = open_printer(wprinter, kCancelDesiredAccess);
+    DWORD open_error = 0;
+    auto handle = open_printer(wprinter, kCancelDesiredAccess, &open_error);
     if (!handle) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               "OpenPrinterW failed");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
+        switch (classify_open_printer_error(static_cast<uint32_t>(open_error))) {
+        case OpenPrinterFailure::not_found:
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
+                                   "OpenPrinterW: printer not found");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
+            break;
+        case OpenPrinterFailure::refused:
+            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                                   "OpenPrinterW: access denied");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "refused", "windows:winspool:access_denied"));
+            break;
+        case OpenPrinterFailure::error:
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   std::format("OpenPrinterW failed (Win32 error {})", open_error));
+            ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokOpenPrinterFailed));
+            break;
+        }
         return 1;
     }
 
@@ -572,7 +599,7 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     DWORD needed = 0;
     GetJobW(handle->get(), static_cast<DWORD>(*job_id), 1, nullptr, 0, &needed);
     if (GetLastError() == ERROR_INVALID_PARAMETER) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
                                "GetJobW: job not found");
         ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:job_not_found"));
         return 1;
@@ -661,6 +688,7 @@ constexpr std::string_view kTokDecodeFailed = "macos:cups:decode_failed";
 constexpr std::string_view kTokAccessDenied = "macos:cups:access_denied";
 constexpr std::string_view kTokNotFound = "macos:cups:not_found";
 constexpr std::string_view kTokUnexpectedStatus = "macos:cups:unexpected_status";
+constexpr std::string_view kTokNoIdentity = "macos:cups:no_identity";
 #else
 constexpr std::string_view kTokSocketUnavailable = "linux:cups:socket_unavailable";
 constexpr std::string_view kTokConnectFailed = "linux:cups:connect_failed";
@@ -668,6 +696,7 @@ constexpr std::string_view kTokDecodeFailed = "linux:cups:decode_failed";
 constexpr std::string_view kTokAccessDenied = "linux:cups:access_denied";
 constexpr std::string_view kTokNotFound = "linux:cups:not_found";
 constexpr std::string_view kTokUnexpectedStatus = "linux:cups:unexpected_status";
+constexpr std::string_view kTokNoIdentity = "linux:cups:no_identity";
 #endif
 
 constexpr int kConnectTimeoutSec = 2;
@@ -905,7 +934,16 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
         return 1;
     }
 
+    // No resolvable effective-user identity -> refuse locally. Sending an
+    // empty requesting-user-name and a malformed `Authorization: PeerCred `
+    // header would make cupsd's answer about a request we never meant to send.
     const std::string user = current_username();
+    if (user.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                               "no resolvable effective-user identity; refusing to cancel");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokNoIdentity));
+        return 1;
+    }
 
     std::vector<ipp::OperationAttr> attrs;
     attrs.push_back({ipp::kTagUri, "printer-uri", "ipp://localhost/printers/" + printer, {}});
@@ -939,19 +977,19 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     }
 
     const uint16_t status = result.message->op_or_status;
-    // RFC 8010 §3.1.6.1: successful-* is 0x0000-0x00FF.
-    if (status <= 0x00FF) {
+    const CancelStatusClass cls = classify_cancel_job_status(status);
+    if (cls == CancelStatusClass::canceled) {
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
         ctx.write_output(format_clear_queue_row(printer, *job_id, "canceled", "-"));
         return 0;
     }
-    if (status == 0x0406) { // client-error-not-found
+    if (cls == CancelStatusClass::not_found) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
                                "Cancel-Job: job not found");
         ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", kTokNotFound));
         return 1;
     }
-    if (status == 0x0400 || status == 0x0401 || status == 0x0403) {
+    if (cls == CancelStatusClass::refused) {
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
                                "Cancel-Job: not authorized");
         ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokAccessDenied));
