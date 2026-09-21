@@ -44,15 +44,17 @@ Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRI
 
 ### First: confirm you are running the current pipeline
 
-This skill and **both** routed-concern tables (`.claude/routed-concerns.md` and
-`.claude/routed-concerns-access-control.md`) are read **from your working tree**, so a branch
+This skill and **all three** routed-concern tables (`.claude/routed-concerns.md`,
+`.claude/routed-concerns-access-control.md` and `.claude/routed-concerns-security-posture.md`)
+are read **from your working tree**, so a branch
 that predates a change to either silently runs the old pipeline. At the time #2604
 merged, 81 of 81 local branches predated it.
 
 ```bash
 git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
 for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md \
-         .claude/routed-concerns-access-control.md CLAUDE.md; do
+         .claude/routed-concerns-access-control.md \
+         .claude/routed-concerns-security-posture.md CLAUDE.md; do
   git diff --quiet origin/dev -- "$f" \
     && echo "  ok       $f" \
     || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
@@ -117,21 +119,23 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
-### Load and MATCH both routed-concern tables — do not rely on memory
+### Load and MATCH all three routed-concern tables — do not rely on memory
 
 ```bash
 # Every changed path, against every routed-concern row.
 git diff --name-only <range>
 ```
 
-Open **BOTH** `.claude/routed-concerns.md` **and**
-`.claude/routed-concerns-access-control.md` and walk them row by row against that
-path list. There are TWO files — the table was split when the first hit CLAUDE.md's
-40k-character ceiling and a new catastrophic-invariant row physically would not fit.
+Open **ALL THREE** `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`
+**and** `.claude/routed-concerns-security-posture.md` and walk them row by row against that
+path list. There are THREE files — the table was split when the first hit CLAUDE.md's
+40k-character ceiling and a new catastrophic-invariant row physically would not fit, and
+split again in Wave 8 into a security-posture sibling so `routed-concerns.md` stops growing.
 Walking only the first silently skips every access-control and request-admission
 chokepoint, which is where the highest-severity rows live: the authz-topology floor,
 dispatch confinement, dispatch targeting, the pre-auth body cap, and the ADR-1005
-spine. A row that is never opened routes nobody, which defeats the row's only job.
+spine — and every read-only security-posture plugin invariant. A row that is never opened
+routes nobody, which defeats the row's only job.
 Each row names the files/change-types it covers and the agents that MUST load on
 them. Those agents are selected **unconditionally** — see the standing rule under
 the Gate 3 decision matrix. Write the matched rows into your Gate 1 summary so the
@@ -1409,10 +1413,10 @@ new restatement anywhere means adding it to this list in the same change.
 only.** It carries its own text for standing rules 1 and 4:
 
 - **Rule 1:** there is **no routed-concerns walk at all** on that leg — its
-  `## Domain Routing` is an independently-authored heuristic list, and neither
-  `.claude/routed-concerns.md` nor `.claude/routed-concerns-access-control.md` is
-  referenced anywhere in that file. Tracked as **#2684**. This is the only record of
-  that gap in the tree.
+  `## Domain Routing` is an independently-authored heuristic list, and none of
+  `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md` or
+  `.claude/routed-concerns-security-posture.md` is referenced anywhere in that file. Tracked as
+  **#2684**. This is the only record of that gap in the tree.
 - **Rule 4:** a weaker Gate 8 phrasing ("re-run affected gates") — precisely the
   formulation that shipped the broken macOS leg on #2580.
 
@@ -1427,10 +1431,10 @@ to close rather than a contradiction to adjudicate.
    that agent raised nothing in round 1**.
 
    Concretely, against the **fix diff** (not the original):
-   - **Gate 3** — re-run the decision matrix, including **both** routed-concern
-     tables: `.claude/routed-concerns.md` AND
-     `.claude/routed-concerns-access-control.md`. Opening only the first misses
-     every auth, access-control and request-admission invariant.
+   - **Gate 3** — re-run the decision matrix, including **all three** routed-concern
+     tables: `.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`
+     AND `.claude/routed-concerns-security-posture.md`. Opening only the first misses
+     every auth, access-control, request-admission and read-only security-posture invariant.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.
    - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its
