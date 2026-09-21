@@ -21,6 +21,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <string>
+#include <vector>
 
 using namespace yuzu::installed_apps::parsers;
 
@@ -382,7 +385,7 @@ TEST_CASE("format_app_row: absent InstallLocation renders '-', never fabricated"
     // bundle_id absent alone (Windows/Linux shape with a location, or a macOS
     // bundle that carries no CFBundleIdentifier).
     CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "C:\\Program Files\\Tool", ""}) ==
-          "app|Tool|1.0|Acme|20200101|C:\\Program Files\\Tool|-");
+          "app|Tool|1.0|Acme|20200101|C:/Program Files/Tool|-");
     // location present, bundle id absent.
     CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "", "com.acme.tool"}) ==
           "app|Tool|1.0|Acme|20200101|-|com.acme.tool");
@@ -395,13 +398,85 @@ TEST_CASE("format_app_row: empty optional fields all render '-', always seven fi
     CHECK(std::count(row.begin(), row.end(), '|') == 6);
 }
 
+namespace {
+
+// Copy of the escape-aware splitter in test_installed_apps_actions.cpp: backslash-pipe
+// is one escaped pipe, a bare '|' is a delimiter -- the shared server decoder's
+// find_unescaped_pipe/unescape_pipes grammar (server/core/src/result_parsing.hpp).
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("format_app_row: a trailing backslash in install_location cannot swallow the "
+          "delimiter (B1)",
+          "[installed_apps]") {
+    // A Windows InstallLocation ends in a backslash (9 of 241 rows in the pre-fix
+    // Windows capture). Raw, that backslash plus the following delimiter reads as an
+    // escaped pipe: the backslash is deleted and the row loses a field.
+    // safe_output_field folds the backslash to '/', so the row keeps seven fields
+    // under an escape-aware split.
+    const auto row = format_app_row({.name = "7-Zip",
+                                     .version = "26.02",
+                                     .publisher = "Igor Pavlov",
+                                     .install_location = "C:\\Program Files\\7-Zip\\"});
+    CHECK(row == "app|7-Zip|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-");
+    CHECK(split_fields_escape_aware(row).size() == 7);
+
+    // A literal '|' in the two ADR-0028 columns is escaped, not a delimiter.
+    const auto piped = format_app_row({.name = "X", .install_location = "a|b"});
+    CHECK(piped == "app|X|-|-|-|a\\|b|-");
+    const auto fields = split_fields_escape_aware(piped);
+    CHECK(fields.size() == 7);
+    CHECK(fields[5] == "a|b");
+}
+
+TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-field row",
+          "[installed_apps]") {
+    // do_list emits this for a healthy-but-empty acquisition; deriving it from
+    // format_app_row keeps the sentinel and the row shape defined in one place.
+    CHECK(format_app_row({.name = "No applications found"}) ==
+          "app|No applications found|-|-|-|-|-");
+}
+
 TEST_CASE("format_app_row: a '|' inside a field is emitted as-is (pre-existing gap, pinned)",
           "[installed_apps]") {
-    // The plugin's list row has never escaped '|' (sanitize_utf8 only repairs
-    // invalid UTF-8). This pins that the formatter does not change that:
-    // such a row splits into more than seven naive fields. Recorded as a
-    // deferred item; a future escaping change must update this case.
+    // The four pre-existing list columns (name/version/publisher/install_date) have
+    // never escaped '|' (sanitize_utf8 only repairs invalid UTF-8); only the two
+    // ADR-0028 columns are safe_output_field-escaped (see the B1 case above). This
+    // pins that the formatter does not change the four: such a row splits into more
+    // than seven naive fields. Recorded as a deferred item; a future escaping change
+    // must update this case.
     const auto row = format_app_row({"A|B", "1", "P", "D", "L", "B"});
     CHECK(row == "app|A|B|1|P|D|L|B");
     CHECK(std::count(row.begin(), row.end(), '|') == 7);
+}
+
+// ── Windows registry value types (InstallLocation acceptance) ───────────────
+// Pure predicate -- the RegQueryValueExW call it gates is Windows-only, but the
+// decision is testable on every host. 1 = REG_SZ, 2 = REG_EXPAND_SZ,
+// 3 = REG_BINARY, 7 = REG_MULTI_SZ (plugin.cpp static_asserts the first two).
+
+TEST_CASE("reg_string_type_accepted: REG_SZ always, REG_EXPAND_SZ only when accepted",
+          "[installed_apps]") {
+    CHECK(reg_string_type_accepted(1, false));
+    CHECK_FALSE(reg_string_type_accepted(2, false));
+    CHECK(reg_string_type_accepted(2, true));
+    CHECK_FALSE(reg_string_type_accepted(3, true));
+    CHECK_FALSE(reg_string_type_accepted(7, true));
 }

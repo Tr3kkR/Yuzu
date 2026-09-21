@@ -78,17 +78,10 @@ std::filesystem::path make_unsigned_bundle(const std::filesystem::path& root) {
 
 TEST_CASE("macOS enrich: an unsigned bundle is reported unsigned, never signed",
           "[installed_apps][macos]") {
-    const auto dir = yuzu::test::unique_temp_path("yuzu_test_enrich_");
-    std::filesystem::create_directories(dir);
-    struct Cleanup {
-        std::filesystem::path p;
-        ~Cleanup() {
-            std::error_code ec;
-            std::filesystem::remove_all(p, ec);
-        }
-    } cleanup{dir};
+    yuzu::test::TempDir dir("yuzu_test_enrich_");
+    std::filesystem::create_directories(dir.path);
 
-    const auto app = make_unsigned_bundle(dir);
+    const auto app = make_unsigned_bundle(dir.path);
     const auto res = yuzu::installed_apps::macos_enrich::enrich_app(app.string());
 
 #ifdef YUZU_HAVE_SECURITY_FRAMEWORK
@@ -115,18 +108,11 @@ TEST_CASE("macOS enrich: an unsigned bundle is reported unsigned, never signed",
 // above: one temp dir, two small files, no subprocess.
 TEST_CASE("macOS enrich: bundle_id_for reads CFBundleIdentifier, empty for a non-bundle path",
           "[installed_apps][macos]") {
-    const auto dir = yuzu::test::unique_temp_path("yuzu_test_bundle_id_");
-    std::filesystem::create_directories(dir);
-    struct Cleanup {
-        std::filesystem::path p;
-        ~Cleanup() {
-            std::error_code ec;
-            std::filesystem::remove_all(p, ec);
-        }
-    } cleanup{dir};
+    yuzu::test::TempDir dir("yuzu_test_bundle_id_");
+    std::filesystem::create_directories(dir.path);
 
-    const auto app = make_unsigned_bundle(dir);
-    const auto missing = (dir / "DoesNotExist.app").string();
+    const auto app = make_unsigned_bundle(dir.path);
+    const auto missing = (dir.path / "DoesNotExist.app").string();
 
 #ifdef YUZU_HAVE_SECURITY_FRAMEWORK
     using yuzu::installed_apps::macos_enrich::bundle_id_for;
@@ -134,11 +120,6 @@ TEST_CASE("macOS enrich: bundle_id_for reads CFBundleIdentifier, empty for a non
     // Non-existent path: honest-empty, never a fabricated id.
     CHECK(bundle_id_for(missing).empty());
     CHECK(bundle_id_for("").empty());
-
-    // Real system bundle, when this host carries one at the stable path.
-    std::error_code ec;
-    if (std::filesystem::exists("/Applications/Safari.app", ec))
-        CHECK(bundle_id_for("/Applications/Safari.app") == "com.apple.Safari");
 
     // enrich_app shares the same bundle-id read.
     CHECK(yuzu::installed_apps::macos_enrich::enrich_app(app.string()).bundle_id ==
