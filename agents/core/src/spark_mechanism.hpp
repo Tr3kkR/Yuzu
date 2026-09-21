@@ -92,19 +92,29 @@ using SparkFaultFn =
 /// doc comment). A mechanism calls it — from its OWN thread, lock released, NEVER
 /// from inside watch()/unwatch() (the same reentrancy prohibition as emit()/fault()
 /// above) — reporting EVERY coverage transition for `key`, not only the first: a
-/// mechanism that later loses coverage (a fault, a teardown, a backend error) calls
-/// this again with `SparkCoverage::None` so the engine's cached coverage never goes
-/// stale. `incarnation` identifies WHICH watch this report is about (the engine
-/// drops a report whose incarnation no longer matches the key's current one — a
-/// stale report against a superseded or torn-down watch); `at` is the mechanism's
-/// own timestamp taken at the point it committed the transition (source, never
-/// delivery — a queued/polled mechanism's dispatch latency must not leak into the
-/// recorded value). Optional: default `ISparkMechanism::set_established_sink`
-/// installs no sink, so a mechanism that never calls this (every one except the two
-/// Service platform classes, today) is unaffected. Called with the engine lock
-/// released, like emit()/fault() — MAY THROW under the same #2012/#3840 allocation
-/// posture as those two; a mechanism that owns one calls it from a context that can
-/// tolerate the throw (see spark_service.cpp's own containment at each call site).
+/// mechanism that later loses coverage (a fault, a backend error) calls this again
+/// with `SparkCoverage::None`. Registry and File deliberately report nothing for
+/// unwatch() (the engine has already erased armed_[key], so the report would be
+/// dropped by the identity check by construction) or for an orderly stop() (neither
+/// marks a coverage transition; the engine's cache is left as it was). The engine's
+/// cache is therefore the LAST DELIVERED value, not an authoritative live state: a
+/// report dropped by a throwing sink, or a Registry sweeper that keeps failing before
+/// it flips `inert`, leaves it stale. `incarnation` identifies WHICH
+/// watch this report is about (the engine drops a report whose incarnation no longer
+/// matches the key's current one — a stale report against a superseded or torn-down
+/// watch); `at` is the mechanism's own timestamp taken at the point it committed the
+/// transition (source, never delivery — a queued/polled mechanism's dispatch latency
+/// must not leak into the recorded value). Exception: an adoption/join re-report
+/// (Registry, File) is stamped now(), not at the original commit. Optional: default
+/// `ISparkMechanism::set_established_sink` installs no sink, so a mechanism that never
+/// calls this is unaffected — Registry, File and both Service classes override it;
+/// only a bare test fake leaves it default. Called with the engine lock released,
+/// like emit()/fault() — MAY THROW under the same #2012/#3840 allocation posture as
+/// those two; a mechanism that owns one calls it from a context that can tolerate the
+/// throw. Registry and File wrap each call in their own try/catch and count the dropped
+/// report (`established_failed`); Service has no per-call catch, so a throw there reaches
+/// its run() catch, which invalidates every tracked key's coverage to `None` and stops the
+/// mechanism accepting new watches (spark_service.cpp).
 using SparkEstablishedFn = std::function<void(const std::string& key, SparkIncarnation incarnation,
                                               std::chrono::steady_clock::time_point at,
                                               SparkCoverage coverage)>;
@@ -244,10 +254,11 @@ public:
     [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
 
     /// Additive establishment-signal seam (rung 9c PR-6 item 1). Default forwards to
-    /// watch() so every existing mechanism (Registry, File, every test fake) compiles
-    /// and behaves unchanged — the engine ALWAYS calls THIS overload, never the plain
-    /// watch() above, so a mechanism that wants to correlate its establishment reports
-    /// (see SparkEstablishedFn) against a stable identity overrides this one instead.
+    /// watch() so a mechanism with no need to override it (a bare test fake) compiles
+    /// and behaves unchanged — Registry, File and both Service classes override this
+    /// instead, to correlate their establishment reports (see SparkEstablishedFn)
+    /// against a stable identity. The engine ALWAYS calls THIS overload, never the
+    /// plain watch() above.
     /// A DISTINCT NAME, deliberately not an overload of watch(): an overload would be
     /// a change to the frozen watch()/unwatch() seam this class's own header comment
     /// documents as reviewed and settled; a new name is purely additive.
@@ -549,6 +560,7 @@ struct FileMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit
     std::uint64_t fault_failed{0};   ///< fault() threw on submit
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged on a later pass
+    std::uint64_t established_failed{0}; ///< established() threw when invoked
     std::size_t probe_workers_active{0};
     std::size_t live_dirs{0};
     std::size_t live_ancestors{0};
@@ -622,6 +634,7 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t health_edges{0};
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
+    std::uint64_t established_failed{0}; ///< established() threw when invoked
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};
