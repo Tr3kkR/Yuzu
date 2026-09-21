@@ -200,7 +200,7 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "dispatch reader's trust predicate) - so for the fail-open writers this "
             "counter is the only signal a systemic write failure would otherwise leave "
             "invisible. #4669: op=\"cluster_affinity_check\" is a SEPARATE READ (the "
-            "pre-check ahead of set_gateway_route) — also fail-OPEN on a degraded read, "
+            "pre-check ahead of set_gateway_route) - also fail-OPEN on a degraded read, "
             "deliberately counted under its OWN op label rather than folded into "
             "\"announce_connected\", which stays the write's own count.",
             "counter");
@@ -238,7 +238,7 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "baseline rise (a replica that lost its in-memory session map until agents "
             "re-announce), and a redelivered/duplicate DISCONNECTED notification. #4669: "
             "outcome=\"cluster_affinity_violation\" (op=\"announce_connected\") is the ONE "
-            "exception to \"benign, don't page\" above — a session-matched CONNECTED claiming a "
+            "exception to \"benign, don't page\" above - a session-matched CONNECTED claiming a "
             "DIFFERENT cluster_id than the agent's durably-bound home affinity, refused "
             "fail-closed. ANY non-zero rate is worth investigating (a misconfigured/renamed "
             "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
