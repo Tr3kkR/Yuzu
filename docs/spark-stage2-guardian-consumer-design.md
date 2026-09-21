@@ -1368,8 +1368,9 @@ successful pass. After the cause is removed, a quiet directory waits for the cur
 deadline, up to the 30 s cap; a real notification in any watched directory runs a pass at once,
 while a `watch()`/`unwatch()` control wake is absorbed until the deadline, so a watch added
 mid-episode is not armed before it and removing the poisoned watch does not shorten it. The
-"failed #1" and "recovered" lines are logged on every episode; the 1, 2, 4, 8 gate bounds only an unbroken one, so
-intermittent failure while directories churn is not rate-limited across episodes. Only an
+`worker pass failed (consecutive #1)` and `recovered` lines are logged on every episode; the 1, 2,
+4, 8 gate bounds only an unbroken one, so intermittent failure while directories churn is not
+rate-limited across episodes. Only an
 exception that ESCAPES a pass counts: a throwing emit or fault sink is caught inside the pass,
 counted in `emit_failed`/`fault_failed`, and does not count toward the three. (5) The
 `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only through
