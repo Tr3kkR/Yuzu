@@ -7,16 +7,17 @@
  *
  * RUNS ON ALL THREE PLATFORMS -- no platform guard on the TU (a guarded
  * dispatcher TU once hid a never-loaded plugin). Only the two host-specific
- * assertions consult a constexpr: on Linux/macOS the leg is this package's
- * and must emit exactly one row per allowlisted key; the Windows leg is a
- * sibling package's, so there only the row grammar and the status/token
- * contract are asserted. The Windows leg's <state> vocabulary is {on, off, default,
- * unmodelled, absent, unreadable} by Architect ruling (a tri-state override,
- * not a hardening level), so the row-grammar check keys the accepted set on
- * the host. There is no host-specific VALUE assertion anywhere: CI runners
- * are shared and unknown-hardware, and an absent key (no Yama on a Docker
- * kernel, no MitigationOptions on a default Windows install) is a legitimate,
- * modal host answer: it adds no failure token and does not lower the status.
+ * assertions consult a constexpr: on Linux/macOS the leg reads an allowlist
+ * and must emit exactly one row per allowlisted key; the Windows leg emits one
+ * row per decoded policy (a host-dependent count), so there only the row
+ * grammar and the status/token contract are asserted. The Windows leg's
+ * <state> vocabulary is {on, off, default, unmodelled, absent, unreadable} by
+ * design (a tri-state override, not a hardening level), so the row-grammar
+ * check keys the accepted set on the host. There is no host-specific VALUE
+ * assertion anywhere: CI runners are shared and unknown-hardware, and an
+ * absent key (no Yama on a Docker kernel, no MitigationOptions on a default
+ * Windows install) is a legitimate, modal host answer: it adds no failure
+ * token and does not lower the status.
  * Only an UNREADABLE key is a failure. The status test below holds on every
  * host, Windows included, because that contract is the same on all three legs.
  */
@@ -46,23 +47,23 @@ namespace {
 
 #if defined(_WIN32)
 constexpr const char* kPluginExt = ".dll";
-constexpr bool kLegIsThisPackages = false;
-constexpr std::size_t kExpectedRows = 0; // unused: the Windows leg is not this package's
+constexpr bool kAllowlistLeg = false;
+constexpr std::size_t kExpectedRows = 0; // unused: Windows rows are per decoded policy, not per allowlisted key
 constexpr std::string_view kExpectedOs = "windows";
-// Quoted from the sibling leg's ROW contract (its win-parsers header's ROW comment;
-// P81b-2 respec s4) -- a tri-state override, not a hardening level. If the
-// sibling changes its vocabulary this test fails on Windows CI, which is the guard.
+// Mirrors the Windows leg's ROW contract (the ROW comment in system_hardening_win_parsers.hpp):
+// a tri-state override, not a hardening level. If that vocabulary changes this test fails on
+// Windows CI, which is the guard.
 constexpr std::array<std::string_view, 6> kHostStateTokens{"on",         "off",    "default",
                                                             "unmodelled", "absent", "unreadable"};
 #elif defined(__APPLE__)
 constexpr const char* kPluginExt = ".dylib";
-constexpr bool kLegIsThisPackages = true;
+constexpr bool kAllowlistLeg = true;
 const std::size_t kExpectedRows = kMacosAllowlist.size();
 constexpr std::string_view kExpectedOs = "macos";
 const auto& kHostStateTokens = kStateTokens;
 #else
 constexpr const char* kPluginExt = ".so";
-constexpr bool kLegIsThisPackages = true;
+constexpr bool kAllowlistLeg = true;
 const std::size_t kExpectedRows = kLinuxAllowlist.size();
 constexpr std::string_view kExpectedOs = "linux";
 const auto& kHostStateTokens = kStateTokens;
@@ -200,7 +201,7 @@ TEST_CASE("system_hardening plugin: one row per allowlisted key, in allowlist or
         require_plugin_or_skip();
         return;
     }
-    if (!kLegIsThisPackages) SKIP("Windows leg is a sibling package's; its rows are shape-checked above");
+    if (!kAllowlistLeg) SKIP("allowlist order applies to the Linux/macOS legs; Windows rows are shape-checked above");
     yuzu::agent::LocalDispatcher dispatcher;
     const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "posture").captured);
     // Rows are emitted for absent/unreadable keys too, so the count is host-independent.
@@ -240,7 +241,7 @@ TEST_CASE("system_hardening plugin: the typed status agrees with the rows; only 
     // Only the Windows leg sets PERMISSION_DENIED (ERROR_ACCESS_DENIED); the Linux/macOS
     // legs (emit_posture) never emit it.
     const bool is_denied =
-        !kLegIsThisPackages && result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
+        !kAllowlistLeg && result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
     REQUIRE((is_ok || is_constrained || is_denied));
     const auto tokens = split_tokens(result.result_provenance);
     if (is_ok) {

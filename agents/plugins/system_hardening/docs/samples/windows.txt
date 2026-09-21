@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash pending
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 280e3355d168
 == action=posture
 posture|windows|mitigation_options|-|absent
 posture|windows|mitigation_audit_options|-|absent
@@ -9,5 +9,5 @@ posture|windows|self.aslr_high_entropy|5|on
 posture|windows|self.cfg|0|off
 posture|windows|self.cfg_export_suppression|0|off
 posture|windows|self.cfg_strict_mode|0|off
-[result_status] CONSTRAINED / PARTIAL / mitigation_options:not_found,mitigation_audit_options:not_found
+[result_status] OK / FULL / 
 

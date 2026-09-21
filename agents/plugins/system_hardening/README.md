@@ -40,6 +40,10 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `posture` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel mitigation registry + GetProcessMitigationPolicy (agent process) | ✅ supported · rung 1 · allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs) | ✅ supported · rung 1 · allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`posture` / Windows** — Rig-verified 2026-09-21: MitigationOptions/MitigationAuditOptions are ABSENT on a default Windows 11 install (rows read `absent`, not a failure); a present value decodes as 16 two-bit nibbles (dep, sehop, aslr_bottom_up, aslr_high_entropy and cfg confirmed on hardware); GetProcessMitigationPolicy succeeds for DEP/ASLR/CFG on x64.
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -94,6 +98,22 @@ Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `w
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 280e3355d168
+
+```
+== action=posture
+posture|windows|mitigation_options|-|absent
+posture|windows|mitigation_audit_options|-|absent
+posture|windows|self.dep|3|on
+posture|windows|self.aslr_bottom_up|5|on
+posture|windows|self.aslr_force_relocate|5|off
+posture|windows|self.aslr_high_entropy|5|on
+posture|windows|self.cfg|0|off
+posture|windows|self.cfg_export_suppression|0|off
+posture|windows|self.cfg_strict_mode|0|off
+[result_status] OK / FULL
+```
+
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 280e3355d168
 
 ```
@@ -102,6 +122,24 @@ posture|macos|kern.securelevel|0|disabled
 posture|macos|kern.coredump|1|disabled
 posture|macos|kern.sugid_coredump|0|enabled
 posture|macos|kern.bootargs||enabled
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 280e3355d168
+
+```
+== action=posture
+posture|linux|kernel.randomize_va_space|2|enabled
+posture|linux|kernel.kptr_restrict|0|disabled
+posture|linux|kernel.yama.ptrace_scope|-|absent
+posture|linux|kernel.dmesg_restrict|1|enabled
+posture|linux|kernel.unprivileged_bpf_disabled|0|disabled
+posture|linux|kernel.sysrq|1|disabled
+posture|linux|fs.protected_hardlinks|1|enabled
+posture|linux|fs.protected_symlinks|1|enabled
+posture|linux|fs.protected_fifos|0|disabled
+posture|linux|fs.protected_regular|0|disabled
+posture|linux|fs.suid_dumpable|0|enabled
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
