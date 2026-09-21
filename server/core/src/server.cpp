@@ -12307,6 +12307,28 @@ private:
                 *req.mutable_command() = gp.cmd;
                 req.set_timeout_seconds(300);
 
+                // #4672 Gate-2/Gate-3 fix (security-guardian HIGH + cpp-safety
+                // BLOCKING, independently confirmed): this MUST live outside
+                // the retry loop, not per-attempt. `process_gateway_response`
+                // is not idempotent — a second terminal write for the same
+                // command_id is a silent tracker overwrite plus a duplicate
+                // response_store row, not a safe no-op. A real terminal frame
+                // can be legitimately applied in one attempt (e.g. `Read()`
+                // delivers it) and THAT SAME attempt's `Finish()` can still
+                // report a transport-level non-OK status (stream fault after
+                // the last frame, before a clean close) or an earlier attempt
+                // can apply a response while a LATER attempt independently
+                // hits UNAUTHENTICATED/other/exhausted-UNAVAILABLE. Every
+                // synthesizing call site below must be gated on this,
+                // cumulative across the whole command's attempts — only the
+                // `agent_mismatch` site (status.ok() branch) was gated
+                // before this fix; the other three (UNAUTHENTICATED, the
+                // generic "other" branch, and exhausted-retries) were not,
+                // which could clobber an already-applied real SUCCESS/FAILURE
+                // with a synthetic FAILURE — a worse defect than the
+                // stuck-forever bug this issue set out to close.
+                bool applied_response = false;
+
                 // Retry up to 3 times on transient connection failures
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     if (attempt > 0) {
@@ -12333,15 +12355,6 @@ private:
                     // outcomes. Track whether this attempt saw a non-apply
                     // outcome and gate the terminal "ok" increment on it.
                     bool saw_non_apply = false;
-                    // #4672: whether ANY frame this attempt read was actually
-                    // applied via process_gateway_response for OUR agent —
-                    // set at both call sites below (the not_connected repair
-                    // and the general apply). Distinct from `!saw_non_apply`:
-                    // a stream can carry BOTH a legitimate frame and an
-                    // agent_mismatch frame, in which case the command_id is
-                    // already resolved and no synthetic terminal write is
-                    // needed below.
-                    bool applied_response = false;
                     while (reader->Read(&resp)) {
                         ++resp_count;
                         // HA WS-4 4.3: classification is a pure function
@@ -12450,16 +12463,24 @@ private:
                                      {{"cluster_id", cluster_label},
                                       {"status", "unauthenticated"}})
                             .increment();
-                        // #4672: config/security defect — the cert this
-                        // server presents does not satisfy the gateway's
-                        // peer pin, and that does not change by waiting.
-                        // Resolve terminally now rather than leaving the
-                        // command_id stuck until an operator happens to
-                        // notice via the absence of agent activity.
-                        apply_gateway_forward_terminal_failure(
-                            svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
-                            "Gateway REJECTED by the gateway's mgmt-plane peer pin "
-                            "(UNAUTHENTICATED) — command not delivered");
+                        // #4672 (fixed post-Gate-2/3: security-guardian HIGH
+                        // + cpp-safety/cpp-expert independently confirmed) —
+                        // gate on `applied_response`: an earlier attempt, or
+                        // this same attempt's `Read()` loop, may already have
+                        // applied a real terminal frame before `Finish()`
+                        // surfaced this UNAUTHENTICATED status. Synthesizing
+                        // here anyway would silently overwrite that real
+                        // result (tracker last-write-wins) and insert a
+                        // duplicate response_store row. Still log/count the
+                        // rejection either way — it's a real, observable
+                        // config defect — just don't double-resolve the
+                        // command_id.
+                        if (!applied_response) {
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
+                                "Gateway REJECTED by the gateway's mgmt-plane peer pin "
+                                "(UNAUTHENTICATED) — command not delivered");
+                        }
                         return; // config defect — retry cannot help
                     }
                     // Only retry on UNAVAILABLE (connection refused / not ready)
@@ -12477,10 +12498,13 @@ private:
                         // four named branches, but the shape (and the fix)
                         // is identical, and leaving it unresolved while every
                         // sibling branch resolves would just move the bug
-                        // rather than close it.
-                        apply_gateway_forward_terminal_failure(
-                            svc, expected_agent_id, cmd_id, "gateway_forward_failed",
-                            "Gateway SendCommand RPC failed: " + status.error_message());
+                        // rather than close it. Same `applied_response` guard
+                        // as the UNAUTHENTICATED branch above, same reason.
+                        if (!applied_response) {
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_forward_failed",
+                                "Gateway SendCommand RPC failed: " + status.error_message());
+                        }
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
@@ -12498,9 +12522,15 @@ private:
                 // own doc comment for why this is immediate-terminal rather
                 // than a durable outbox re-drive (granularity mismatch +
                 // #3279 — deliberately scoped out, not silently dropped).
-                apply_gateway_forward_terminal_failure(
-                    svc, expected_agent_id, cmd_id, "gateway_unavailable",
-                    "Gateway unreachable after 3 attempts — command not delivered");
+                // Same `applied_response` guard as the two branches above —
+                // an earlier attempt in this same 3-try loop may have
+                // already applied a real terminal frame before a later
+                // attempt exhausted on UNAVAILABLE.
+                if (!applied_response) {
+                    apply_gateway_forward_terminal_failure(
+                        svc, expected_agent_id, cmd_id, "gateway_unavailable",
+                        "Gateway unreachable after 3 attempts — command not delivered");
+                }
             }).detach();
         }
     }
