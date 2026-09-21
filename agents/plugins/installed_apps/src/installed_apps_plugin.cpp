@@ -18,7 +18,7 @@
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
  * (content/definitions/installed_apps.yaml et al.). `list`'s two trailing
- * columns were added under ADR-0028's binding condition (PR10.1-a) with its
+ * columns were added under ADR-0028's binding condition, with its
  * first five fields unchanged; never widen `query`/`list_per_user` — extend
  * `list_inventory` for anything the daily sync needs.
  */
@@ -367,7 +367,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 wchar_t buf[512]{};
                 DWORD size = sizeof(buf); // size in BYTES; buf is written as bytes and read back
                 DWORD type = 0;           // through its declared wchar_t lvalue (LPBYTE is align-1)
-                // The single byte-type aliasing cast (docs/cpp-conventions.md exemption):
+                // The single byte-type aliasing cast (docs/cpp-conventions.md asks for this proof):
                 // `buf` is a local that outlives the call and `size` bounds the write.
                 if (RegQueryValueExW(app_key, to_wide(value_name).c_str(), nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
@@ -512,7 +512,7 @@ AppCollection get_installed_apps_macos() {
         if (res.ran && parsed.empty())
             degraded = true;
         for (auto& rec : parsed) {
-            // rec.location (the .app bundle path) is now the `list` action's
+            // rec.location (normally the .app bundle path) is now the `list` action's
             // install_location column (ADR-0028 binding condition). bundle_id is
             // filled separately, and only on the `list` path (with_bundle_ids).
             apps.push_back({std::move(rec.name), std::move(rec.version), "-",

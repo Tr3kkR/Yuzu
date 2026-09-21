@@ -14,8 +14,11 @@ cadences.
   the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
   the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
   macOS: `system_profiler`). The operator-facing `list` action keeps its
-  original 4-column `app|...` row shape for every successful acquisition —
-  automation built on parsing that shape is unaffected. On Linux/macOS, a
+  original four columns (`name`, `version`, `publisher`, `install_date`) in
+  the same order and appends two trailing columns, `install_location` and
+  `bundle_id` (ADR-0028); automation that reads the first columns by position
+  is unaffected, automation that assumed a fixed field count needs an update.
+  On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
