@@ -108,21 +108,23 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
         using yuzu::local_security_policy::LocalPolicyAction;
-        const auto which = yuzu::local_security_policy::parse_local_policy_action(action);
-        if (which == LocalPolicyAction::Unknown) {
-            ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
-            return 1;
-        }
-#if defined(_WIN32)
-        if (which == LocalPolicyAction::Sudoers) {
-            ctx.write_output("sudoers|-|unsupported|-|-|-|windows_has_no_sudoers");
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "windows_has_no_sudoers");
-            return 1;
-        }
-#endif
-        // One containment for every leg (frozen-seam rule): nothing crosses the plugin ABI.
+        // One containment for the whole body (frozen-seam rule): nothing crosses the plugin ABI,
+        // including the unknown-action row and the early returns below.
         try {
+            const auto which = yuzu::local_security_policy::parse_local_policy_action(action);
+            if (which == LocalPolicyAction::Unknown) {
+                ctx.write_output(std::string{"unknown action: "} +
+                                 yuzu::util::safe_output_field(action));
+                return 1;
+            }
+#if defined(_WIN32)
+            if (which == LocalPolicyAction::Sudoers) {
+                ctx.write_output("sudoers|-|unsupported|-|-|-|windows_has_no_sudoers");
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, "windows_has_no_sudoers");
+                return 1;
+            }
+#endif
 #if defined(_WIN32)
             return yuzu::local_security_policy::collect_windows_policy(ctx, action, data_dir_);
 #elif defined(__APPLE__)
