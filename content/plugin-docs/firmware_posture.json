@@ -203,6 +203,37 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "firmware",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 4,
+          "rows": [
+            "firmware|vendor|absent|dmi",
+            "firmware|version|absent|dmi",
+            "firmware|release_date|absent|dmi",
+            "firmware|update_pending|unavailable|fwupd"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "container",
+        "leg_hash": "e3b945e9e6db",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {
@@ -233,6 +264,38 @@
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "firmware",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 8,
+          "rows": [
+            "firmware|vendor|American Megatrends Inc.|wmi",
+            "firmware|version|3801|wmi",
+            "firmware|release_date|2021-07-30|wmi",
+            "firmware|vendor|American Megatrends Inc.|smbios",
+            "firmware|version|3801|smbios"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "bare-metal",
+        "leg_hash": "e3b945e9e6db",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated)"
       }
     }
   },

@@ -34,15 +34,17 @@
  * FirmwareReport and hands it to finish_report.
  *
  * ── Probe record (run-context: symbol + service-identity in the banner) ──
- * GetSystemFirmwareTable: NO in-tree precedent. NOT YET PROBED ON THE RIG:
- * engineers never touch the-rig in this run, so neither the symbol/size
- * probe, the LocalSystem-vs-Administrator outcome, nor the Win32_BIOS row
- * has been recorded here. The rig session owner records, verbatim, before
- * merge: (a) GetSystemFirmwareTable('RSMB',0,NULL,0) return size, (b) the
- * same call as LocalSystem (S-1-5-18) via the S4U scheduled-task recipe,
- * (c) the Win32_BIOS row as LocalSystem, alongside tests/unit/fixtures/
- * wave8/firmware_posture/windows/rsmb.bin and its .provenance.txt. Until
- * then this banner is a placeholder, not a measurement.
+ * the-rig, Windows 11 Pro 10.0.26200 x64, 2026-09-21, run as NT AUTHORITY\SYSTEM (scheduled task,
+ * RunLevel Highest; the transcript is in the PR body):
+ *   GetSystemFirmwareTable('RSMB', 0, NULL, 0)  -> 3233 (the required size); the second call
+ *     copied 3233 bytes, an 8-byte RawSMBIOSData header (SMBIOS 3.3) plus 83 structures.
+ *   The plugin as SYSTEM returned OK / FULL with both sources agreeing: vendor "American Megatrends
+ *     Inc.", version 3801, release_date 2021-07-30 (WMI and SMBIOS), rom_size_bytes 16777216,
+ *     bios_release 5.17 (SMBIOS only).
+ *   Not measured: an Administrator (non-SYSTEM) identity, a host with no RSMB provider, and a
+ *     machine whose BIOS reports a non-standard release date.
+ * The trimmed table is tests/unit/fixtures/wave8/firmware_posture/windows/rsmb.bin (see its
+ * .provenance.txt: the other structures carry the system UUID and serials).
  */
 #include "firmware_posture_legs.hpp"
 

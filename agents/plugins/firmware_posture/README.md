@@ -99,6 +99,21 @@ Pipe-delimited rows written via `write_output()`. The first field is the fixed t
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash e3b945e9e6db
+
+```
+== action=firmware
+firmware|vendor|American Megatrends Inc.|wmi
+firmware|version|3801|wmi
+firmware|release_date|2021-07-30|wmi
+firmware|vendor|American Megatrends Inc.|smbios
+firmware|version|3801|smbios
+firmware|release_date|2021-07-30|smbios
+firmware|rom_size_bytes|16777216|smbios
+firmware|bios_release|5.17|smbios
+[result_status] OK / FULL
+```
+
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash e3b945e9e6db
 
 ```
@@ -108,6 +123,17 @@ firmware|version|mBoot-18000.161.10|iokit
 firmware|release_date|absent|iokit
 firmware|version_source|IODeviceTree:/chosen#system-firmware-version|iokit
 firmware|model|Mac16,10|sysctl
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash e3b945e9e6db
+
+```
+== action=firmware
+firmware|vendor|absent|dmi
+firmware|version|absent|dmi
+firmware|release_date|absent|dmi
+firmware|update_pending|unavailable|fwupd
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->

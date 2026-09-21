@@ -197,6 +197,14 @@ TEST_CASE("parse_smbios_type0: the-rig REAL CAPTURE rsmb.bin parses and every pr
     const auto r = parse_smbios_type0(raw);
     REQUIRE_FALSE(r.constrained);
     CHECK((r.data.vendor.value && r.data.version.value && r.data.release_date.value));
+    // The values Win32_BIOS reported on the same host (see rsmb.bin.provenance.txt).
+    const auto rows = smbios_rows(r.data);
+    REQUIRE(rows.size() == 5);
+    CHECK(row_str(rows[0]) == "firmware|vendor|American Megatrends Inc.|smbios");
+    CHECK(row_str(rows[1]) == "firmware|version|3801|smbios");
+    CHECK(row_str(rows[2]) == "firmware|release_date|2021-07-30|smbios");
+    CHECK(row_str(rows[3]) == "firmware|rom_size_bytes|16777216|smbios");
+    CHECK(row_str(rows[4]) == "firmware|bios_release|5.17|smbios");
     require_all_prefixes_constrained(raw);
 }
 
