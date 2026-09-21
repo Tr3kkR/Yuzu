@@ -211,7 +211,7 @@
     {
       "grant": "None expected: registry reads (`KEY_READ`), a directory listing and a WMI SELECT; no privilege is enabled",
       "if_refused": "a `constrained|<reason>` row plus result status `PERMISSION_DENIED` (registry `ERROR_ACCESS_DENIED`, CIM `WBEM_E_ACCESS_DENIED`) or `CONSTRAINED` (any other failure)",
-      "measured": "Not yet measured under LocalSystem (the-rig probe pending; see the source banner in `app_control_win.cpp`)",
+      "measured": "Measured under LocalSystem on 2026-09-21 on a host with no AppLocker policy configured; least-privilege service-account behaviour is still unverified (see the source banner in `app_control_win.cpp`)",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
