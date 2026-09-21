@@ -55,6 +55,15 @@ Interleaved A/B on the same box, saved binaries (`binaries.sha256`): the pre-cha
   8065 in the head one). The full-suite runs are summarised in `full_*_summary.txt`; their raw logs
   are not committed.
 
+## promql/
+The `promtool` check the flip-gate section 5 entry for #4685 refers to. `rules-4685.yml` holds the two
+published expressions (File and Registry) exactly as they appear there; `test-4685.yml` is a
+`promtool test rules` unit test over synthetic series (it includes the absent-mechanism-series case);
+`test-4685-negctl.yml` is the same test with flipped expectations, so promtool must FAIL it. Run from
+this directory. Re-run by the orchestrating session on 2026-09-21 with promtool 3.13.2
+(`prom/prometheus:latest` container, no network): `test-4685.yml` exits 0 (SUCCESS) and
+`test-4685-negctl.yml` exits 1. Synthetic series only: nothing here measures a real fleet.
+
 ## Limits (do not read more into this than it says)
 - One machine, one session, small samples. No non-author human ran it.
 - A first independent full-suite attempt at an earlier commit timed out at 240 s because another

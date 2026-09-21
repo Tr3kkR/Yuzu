@@ -1575,7 +1575,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     ```
 
     The Registry form is a separate query with `mechanism="registry"` in both selectors. Both
-    were checked with promtool against synthetic series only. Unlike the mechanism-gap recipe in
+    were checked with promtool against synthetic series only (the rules, the test and a
+    flipped-expectation negative control are committed under
+    `docs/spark-rebuild-baselines/raw/4658-windows-evidence/promql/`). Unlike the mechanism-gap recipe in
     `docs/user-manual/metrics.md`, this query is deliberately silent when the mechanism series is
     absent (an absent mechanism is not functional, so there is nothing recovered to be stuck).
     Blind spot: the query needs the two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
