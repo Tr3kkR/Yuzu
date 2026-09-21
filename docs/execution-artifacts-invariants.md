@@ -3,8 +3,9 @@
 Detail for the `execution_artifacts` plugin (Windows execution-evidence reads: ShimCache, AmCache,
 Prefetch). `.claude/routed-concerns.md` carries the four catastrophic-if-violated invariants as a
 short always-loaded row; this document keeps the full original wording — the rationale, the defect
-history and the exact types. **The row is authoritative: where the two differ the row wins, and
-this document is corrected to match.** The wording below was moved out of that row unchanged.
+history and the exact types. **The row carries the four invariants in condensed form and this document the original wording:
+where the two ever differ the stricter reading governs, and the row is corrected to match.** The
+wording below was moved out of that row unchanged.
 
 Related: `docs/agent-privilege-model.md`, the header banner of
 `agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp`, and
