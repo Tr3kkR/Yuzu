@@ -867,7 +867,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
-| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string |
+| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string, install_location:string, bundle_id:string |
 | `crossplatform.software.query` | query | Q | WLM | name:string (req) | found:bool, name:string, version:string, publisher:string |
 | `device.software_actions.list_upgradable` | upgradable | Q | WLM | *(none)* | package_name:string, current_version:string, available_version:string |
 | `device.software_actions.installed_count` | count | Q | WLM | *(none)* | count:int32 |

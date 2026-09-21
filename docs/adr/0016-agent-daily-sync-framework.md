@@ -405,7 +405,10 @@ Mechanics:
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
-  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+  stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
+  VENDOR). *Amended 2026-09-21:* `list` gained two trailing columns
+  (`install_location`, `bundle_id`) under ADR-0028's binding condition; its
+  first five fields and the `inv|` rows are unchanged.
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
