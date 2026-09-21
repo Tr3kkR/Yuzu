@@ -4,7 +4,7 @@ How to decide **where a rule belongs** — and why the answer is usually "not in
 
 ## Why this exists
 
-Four files load into every agent session before any work starts:
+Five files load into every agent session before any work starts:
 
 | File | Read by | Budget | Hard cap |
 |---|---|---|---|
@@ -20,7 +20,7 @@ Every character in them is paid on every session, whether or not the work touche
 This ceiling has been hit three times. #2147 closed the first (44.6k → 23.1k, by moving the
 routed-concerns table into an `@`-imported file). The second was found at **39,996 of 40,000 bytes —
 four bytes free** — and split the table again. Both fixes were splits. **Splitting is now exhausted:
-there is no fifth file to split into, and the total context cost is unchanged by splitting anyway.** (Wave 8 nonetheless added `.claude/routed-concerns-security-posture.md` as a third table file, so the security-posture plugin rows land there and `routed-concerns.md` gains none — a stopgap, not a new capacity.)
+another file adds no capacity, and the total context cost is unchanged by splitting anyway.** (Wave 8 nonetheless added `.claude/routed-concerns-security-posture.md` as a third table file, so the security-posture plugin rows land there and `routed-concerns.md` gains none — a stopgap, not a new capacity.)
 
 The failure was never a single bad commit. It was ~235 characters a day of individually reasonable
 additions, each one cheaper to put in CLAUDE.md than to route properly.
