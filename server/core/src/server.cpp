@@ -10178,8 +10178,20 @@ public:
         // existing UAF window, not a no-op relocation. Moving the reset here,
         // after every other quiesce/drain this function performs, does not CLOSE
         // #3279 (that fix is join/drain forward_gateway_pending()'s workers,
-        // tracked there) but restores parity with the pre-4.3 timing instead of
-        // regressing it.
+        // tracked there).
+        //
+        // pr-rev correction (FortitudeEtc/Codex+Kimi, SHOULD 5): an earlier
+        // version of this comment claimed this placement "restores parity
+        // with the pre-4.3 timing" — that overstates it. gw_mgmt_pool_ is
+        // STILL explicitly reset here, INSIDE stop(), which is still
+        // strictly earlier than the pre-4.3 baseline (implicit member
+        // destruction, which ran only after this entire function RETURNED —
+        // i.e. after even this line). The honest claim: this is the LATEST
+        // PRACTICAL point achievable inside stop() itself, which narrows
+        // #3279's window as far as an explicit in-function reset can, but
+        // does not fully match — let alone restore — the old timing. Fully
+        // closing the gap needs #3279's actual fix (join/drain the detached
+        // workers before any reset), not a reordering within this function.
         if (gateway_service_)
             gateway_service_->set_known_gateway_clusters(nullptr);
         gw_mgmt_pool_.reset();
@@ -12199,6 +12211,17 @@ private:
 
                     ::yuzu::server::v1::SendCommandResponse resp;
                     int resp_count = 0;
+                    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD 1):
+                    // Finish() still returns OK regardless of what the
+                    // stream's individual responses classified as, so a
+                    // not_connected/agent_mismatch response was ALSO
+                    // counted "ok" below unconditionally — a misconfigured
+                    // cluster read as a healthy ok rate for commands that
+                    // never ran, contradicting gateway_mgmt_stub_pool.hpp's
+                    // own "instead of / rather than ok" doc claim for both
+                    // outcomes. Track whether this attempt saw a non-apply
+                    // outcome and gate the terminal "ok" increment on it.
+                    bool saw_non_apply = false;
                     while (reader->Read(&resp)) {
                         ++resp_count;
                         // HA WS-4 4.3: classification is a pure function
@@ -12209,6 +12232,7 @@ private:
                         auto outcome = yuzu::server::classify_gateway_forward_response(
                             resp, expected_agent_id);
                         if (outcome == yuzu::server::GatewayForwardOutcome::kAgentMismatch) {
+                            saw_non_apply = true;
                             spdlog::error(
                                 "Gateway SendCommand for {} received a response for agent "
                                 "'{}' but this request targeted '{}' — REFUSING to apply it "
@@ -12222,11 +12246,31 @@ private:
                             continue;
                         }
                         if (outcome == yuzu::server::GatewayForwardOutcome::kNotConnected) {
+                            saw_non_apply = true;
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},
                                           {"status", "not_connected"}})
                                 .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD
+                            // 4, "mixed-version correlation"): a gateway
+                            // still running a PRE-4.3 build (rolling
+                            // upgrade window) sends this same not_connected
+                            // shape with command_id == "" — the Erlang fix
+                            // (yuzu_gw_mgmt_service.erl's stream_responses/3)
+                            // only threads the real id through a build that
+                            // HAS it. Core already knows the real command_id
+                            // (cmd_id, from the request it sent) regardless
+                            // of gateway version — repair the response
+                            // before it reaches process_gateway_response so
+                            // execution-tracker correlation works
+                            // independent of which gateway build answered.
+                            if (resp.response().command_id().empty()) {
+                                auto repaired = resp.response();
+                                repaired.set_command_id(cmd_id);
+                                svc->process_gateway_response(resp.agent_id(), repaired);
+                                continue;
+                            }
                         }
                         svc->process_gateway_response(resp.agent_id(), resp.response());
                     }
@@ -12234,10 +12278,17 @@ private:
                     if (status.ok()) {
                         spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
                                       cmd_id, resp_count);
-                        metrics
-                            ->counter("yuzu_server_gateway_forward_total",
-                                     {{"cluster_id", cluster_label}, {"status", "ok"}})
-                            .increment();
+                        // Retrying cannot help either outcome any more than
+                        // it could the pre-existing UNAUTHENTICATED branch
+                        // below (not_connected/agent_mismatch are not
+                        // transient) — still return (no retry) regardless
+                        // of saw_non_apply, just don't ALSO claim "ok".
+                        if (!saw_non_apply) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "ok"}})
+                                .increment();
+                        }
                         return; // success — done
                     }
                     // #1422: the gateway's mgmt-plane peer pin rejects with

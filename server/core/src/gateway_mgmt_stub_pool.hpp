@@ -92,6 +92,24 @@
 /// isolation between clusters for a given agent.
 namespace yuzu::server {
 
+/// The literal both single-cluster and multi-cluster mode use for the
+/// legacy/default entry — see the file header comment. Declared before
+/// `parse_gateway_cluster_addrs` (which validates against
+/// `kUnknownGatewayClusterLabel`), not after.
+inline constexpr std::string_view kDefaultGatewayClusterKey = "default";
+/// The literal `GatewayMgmtStubPool::resolve()` returns for an unroutable
+/// cluster_id (unmapped in multi-cluster mode, or a malformed value clamped
+/// to this sentinel at ingest — see gateway_service_impl.cpp's
+/// kMaxClusterIdLen clamp, pr-rev finding SHOULD 2). RESERVED: rejected as
+/// an operator-configured `--gateway-cluster-addr` key by
+/// `parse_gateway_cluster_addrs` below, so it can never collide with a real
+/// cluster and silently resolve a malformed/oversized cluster_id to an
+/// actual configured cluster instead of the genuine unknown_cluster path.
+/// `kDefaultGatewayClusterKey` carries no such restriction — an operator
+/// explicitly naming a cluster "default" is a pre-existing, deliberately
+/// tolerated case (see the pool constructor's auto-alias logic).
+inline constexpr std::string_view kUnknownGatewayClusterLabel = "unknown";
+
 /// Parses `--gateway-cluster-addr` entries, each already a single
 /// `"cluster_id=host:port"` token (CLI11's `->delimiter(',')` has already
 /// split the comma list before this runs — see main.cpp). Returns an error
@@ -99,8 +117,8 @@ namespace yuzu::server {
 /// Rejected: an entry with no `=`, an empty key or value, a key exceeding
 /// `max_cluster_id_len` (pass `gateway_service_impl.hpp`'s `kMaxClusterIdLen`
 /// — declared there, not duplicated, so this call site and the CONNECTED-time
-/// ingest clamp in `gateway_service_impl.cpp` share the same bound), or a
-/// duplicate key.
+/// ingest clamp in `gateway_service_impl.cpp` share the same bound), the
+/// reserved `kUnknownGatewayClusterLabel` value, or a duplicate key.
 [[nodiscard]] inline std::expected<std::unordered_map<std::string, std::string>, std::string>
 parse_gateway_cluster_addrs(const std::vector<std::string>& entries,
                             std::size_t max_cluster_id_len) {
@@ -126,6 +144,12 @@ parse_gateway_cluster_addrs(const std::vector<std::string>& entries,
                                    "' exceeds the maximum length (" +
                                    std::to_string(max_cluster_id_len) + " bytes)");
         }
+        if (key == kUnknownGatewayClusterLabel) {
+            return std::unexpected("--gateway-cluster-addr cluster_id '" + key +
+                                   "' is reserved (used as the sentinel for an "
+                                   "unroutable/malformed cluster_id) and cannot be "
+                                   "configured as a real cluster");
+        }
         if (!result.emplace(std::move(key), std::move(value)).second) {
             return std::unexpected("--gateway-cluster-addr has a duplicate cluster_id '" +
                                    entry.substr(0, eq) + "'");
@@ -133,11 +157,6 @@ parse_gateway_cluster_addrs(const std::vector<std::string>& entries,
     }
     return result;
 }
-
-/// The literal both single-cluster and multi-cluster mode use for the
-/// legacy/default entry — see the file header comment.
-inline constexpr std::string_view kDefaultGatewayClusterKey = "default";
-inline constexpr std::string_view kUnknownGatewayClusterLabel = "unknown";
 
 class GatewayMgmtStubPool {
 public:

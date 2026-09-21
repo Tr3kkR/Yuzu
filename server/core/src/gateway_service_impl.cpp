@@ -1417,7 +1417,21 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         std::string cluster_id = request->cluster_id();
         if (cluster_id.size() > kMaxClusterIdLen) {
             record_directory_desync(metrics_, "announce_connected", "malformed_cluster_id");
-            cluster_id.clear();
+            // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD 2): clamping
+            // to EMPTY made a malformed value indistinguishable from
+            // "legitimately never set" — empty resolves to the "default"
+            // cluster in GatewayMgmtStubPool::resolve() (the correct
+            // behavior for the real "gateway never announced one" case),
+            // so an oversized/malformed cluster_id was silently routed to
+            // whatever cluster "default" happens to be, contradicting
+            // "never a silent fallback to the wrong cluster". Clamp to the
+            // reserved kUnknownGatewayClusterLabel sentinel instead — in
+            // multi-cluster mode this can never match a real configured
+            // key (parse_gateway_cluster_addrs rejects it as a config
+            // value, see main.cpp/gateway_mgmt_stub_pool.hpp), so it
+            // resolves to the genuine unknown_cluster/unmapped_cluster_seen
+            // path instead of a silent default.
+            cluster_id = std::string(yuzu::server::kUnknownGatewayClusterLabel);
         }
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
         // BLOCKER 2): the session check just above (gateway_sessions_) only

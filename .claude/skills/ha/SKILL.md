@@ -151,15 +151,25 @@ fan-out — `AgentSession`/`GatewayPendingCmd` now carry `cluster_id` end-to-end
 from the common `send_to`/`send_to_all` path (not just the 4.2b directory
 fallback), a new eager `GatewayMgmtStubPool` dials the OWNING cluster per
 command instead of the single legacy stub, `--gateway-cluster-addr` config,
-a response-agent forgery guard, and one small required Erlang fix
+a response-agent forgery guard (closes ONE forgery shape — a cluster answering
+as a different agent — NOT a rogue gateway claiming an agent's own identity via
+`ProxyRegister`, which needs no per-agent secret; **multi-cluster mode does NOT
+yet provide trust-zone isolation between clusters for a given agent, tracked
+as `#4669`, pr-rev-caught pre-merge**), and one small required Erlang fix
 (`stream_responses/3` threads the real `command_id` so a gateway-side
-"not connected on this cluster" error is no longer invisible). Closed WS-4's
-last named gate item. **This closes WS-4 entirely** — the only remaining
-safe-to-scale gate items are WS-5, WS-6, WS-8-readyz. See the blockquote below
-and ADR-2002 §7d for the full mechanism, including the 5 findings a
-pre-implementation Fable review caught before any code was written (the
-original resolution rule would have broken every upgrade).
-Next gate items: WS-5, WS-6, WS-8-readyz.**
+"not connected on this cluster" error is no longer invisible). **Closes WS-4's
+dial-selection half** — the durable re-drive-on-failure half of §7's design
+remains open (`#4672`), and `#4669` above is a separate, not-yet-closed item
+(non-blocking today: zero production multi-cluster deployments). The
+remaining safe-to-scale gate items are WS-5, WS-6, WS-8-readyz. See the
+blockquote below and ADR-2002 §7d for the full mechanism, including the 5
+findings a pre-implementation Fable review caught before any code was written
+(the original resolution rule would have broken every upgrade), and the
+pr-rev (FortitudeEtc/Codex+Kimi) round that caught the response-forgery
+overclaim plus two real code bugs (terminal-outcome double-counting; an
+oversized `cluster_id` silently routing to the default cluster instead of
+being rejected) before merge.
+Next gate items: WS-5, WS-6, WS-8-readyz. Also open: `#4669`, `#4672`.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -393,13 +403,22 @@ constraint. Delivery phases (dependency-ordered):
 
 **Suggested next slices** (as of 2026-09-21 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
-- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
-  (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4 entirely** (4.1+4.2a+4.2b+`#4324`+
-  `#4555` (gateway multi-node cluster formation, `495cf24c4`)+4.3a
-  (intra-cluster `pg`-group agent→node lookup)+4.4 (`gateway_node`
-  convergence + `#4246` #6 writeback, ADR-2002 §7c)+rest-of-4.3
-  (cross-cluster gateway fan-out, ADR-2002 §7d)), WS-7 (#3627),
-  WS-10 10.1/10.2. The storage axis is complete.
+- **Done (dial-selection, the safe-to-scale gate's WS-4 item):** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a
+  (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4's
+  dial-selection half** (4.1+4.2a+4.2b+`#4324`+`#4555` (gateway multi-node
+  cluster formation, `495cf24c4`)+4.3a (intra-cluster `pg`-group agent→node
+  lookup)+4.4 (`gateway_node` convergence + `#4246` #6 writeback, ADR-2002
+  §7c)+rest-of-4.3 (cross-cluster gateway fan-out, ADR-2002 §7d)), WS-7
+  (#3627), WS-10 10.1/10.2. The storage axis is complete. **WS-4 is NOT
+  entirely done** — two named items remain open and are tracked, not
+  disclosed-only: `#4669` (multi-cluster mode has no agent↔cluster
+  affinity/peer-identity binding, so it does not yet provide trust-zone
+  isolation — caught by pr-rev, FortitudeEtc/Codex+Kimi, pre-merge on the
+  rest-of-4.3 PR) and `#4672` (§7's durable outbox re-drive was never wired
+  into `forward_gateway_pending`'s terminal-failure branches). Neither blocks
+  the safe-to-scale gate today (multi-cluster mode has zero production
+  deployments; the re-drive gap is inherited from before 4.3, not introduced
+  by it), but do not read "WS-4 done" as "WS-4's every design goal closed."
 - The **highest-leverage next** is now the remaining gate set directly:
   **WS-5** (presence — durable cross-replica session lookup; NOT unblocked by
   4.3's own work, contra an earlier version of this note — 4.3 built the

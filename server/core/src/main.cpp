@@ -408,7 +408,10 @@ int main(int argc, char* argv[]) {
                    "Per-cluster gateway ManagementService address(es) for cross-cluster command "
                    "fan-out, cluster_id=host:port (e.g. us-east=10.0.1.5:50063). Repeatable or "
                    "comma-separated. Unset (default) = single-cluster mode: "
-                   "--gateway-command-addr alone is used for every cluster_id.")
+                   "--gateway-command-addr alone is used for every cluster_id. Per-cluster "
+                   "routing only -- trust-zone isolation between clusters is not yet provided "
+                   "(#4669); do not rely on this to keep one cluster's gateway from being able "
+                   "to answer for an agent on another cluster.")
         ->delimiter(',')
         ->envname("YUZU_GATEWAY_CLUSTER_ADDR");
     app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
