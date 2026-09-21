@@ -1,0 +1,1 @@
+- local_security_policy plugin: read-only password, lockout, audit and sudoers policy posture (Windows secedit export, rung 2; Linux PAM/login.defs/pwquality/auditd/sudoers; macOS pwpolicy, rung 2; audit_control/sudoers reported as absent/unreadable by default).
