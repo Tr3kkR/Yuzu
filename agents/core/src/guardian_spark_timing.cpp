@@ -73,8 +73,9 @@ std::string format_send_timing_line(const SendTimingRecord& r) {
 std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
                                       std::uint64_t incarnation, const char* type, const char* via,
                                       std::int64_t attach_to_commit_ms) {
-    // std::format on a null const char* is undefined (the spdlog/fmt path this replaced threw a
-    // catchable format_error). "unknown" also keeps the token inside the driver's T2_RE [\w-]+.
+    // std::format on a null const char* is undefined (the spdlog/fmt path this replaced rejected
+    // it with a format_error that spdlog swallowed). "unknown" also keeps the token inside the
+    // driver's T2_RE [\w-]+.
     return std::format("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
                        "type={}, via={}, attach_to_commit_ms={})",
                        id_token(rule_id), epoch, incarnation, type ? type : "unknown",
