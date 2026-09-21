@@ -39,6 +39,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace yuzu::app_control {
@@ -115,6 +116,70 @@ inline std::string format_cip_row(std::string_view filename) {
 }
 
 inline std::string format_cip_none_row() { return "wdac_cip|none|absent"; }
+
+/// Most active *.cip rows emitted; a directory holding more records the `row_cap` failure.
+inline constexpr std::size_t kMaxCipFiles = 64;
+
+/// One scan of CodeIntegrity\CiPolicies\Active. The Windows shell owns only the std::filesystem
+/// calls and feeds every entry (then the iterator's terminal error) in here, so every decision
+/// about what a result MEANS is unit-tested on every OS. The rule: "no policy files" is a
+/// definitive absence only when the directory is absent or was read cleanly and held none; any
+/// failed stat or iterator error is recorded as a failure and suppresses the absent row.
+class CipScan {
+public:
+    /// Failures land in `acc`; a permission refusal also sets `denied` (PERMISSION_DENIED status).
+    CipScan(yuzu::shared::ConstraintAccumulator& acc, bool& denied) : acc_(acc), denied_(denied) {}
+
+    /// One directory entry: UTF-8 leaf name, whether it is a regular file, and the error (if any)
+    /// from asking the filesystem. A failed stat is a failure, never "not a .cip". Returns false
+    /// once the row cap is hit; the caller stops iterating.
+    bool observe(std::string_view leaf, bool is_regular, const std::error_code& stat_ec) {
+        observed_any_ = true;
+        if (stat_ec) {
+            record(stat_ec, "cip_stat_failed");
+            return true;
+        }
+        if (!is_regular || !is_cip_filename(leaf))
+            return true;
+        if (names_.size() >= kMaxCipFiles) {
+            failed_ = true;
+            acc_.add_failure("row_cap");
+            return false;
+        }
+        names_.emplace_back(leaf);
+        return true;
+    }
+
+    /// The directory iterator's terminal state, after the last observe(). A directory that does
+    /// not exist (before any entry was seen) is a definitive absence, not a failure.
+    void finish(const std::error_code& iter_ec) {
+        if (iter_ec && !(iter_ec == std::errc::no_such_file_or_directory && !observed_any_))
+            record(iter_ec, "cip_dir_failed");
+        std::sort(names_.begin(), names_.end());
+    }
+
+    /// True iff the definitive "no active policy files" row is due.
+    bool none_row_due() const noexcept { return names_.empty() && !failed_; }
+    /// The .cip leaf names found, sorted; valid after finish().
+    const std::vector<std::string>& names() const noexcept { return names_; }
+
+private:
+    void record(const std::error_code& ec, std::string_view what) {
+        failed_ = true;
+        if (ec == std::errc::permission_denied) {
+            denied_ = true;
+            acc_.add_failure("permission_denied");
+        } else {
+            acc_.add_failure(std::string{what} + "_" + std::to_string(ec.value()));
+        }
+    }
+
+    yuzu::shared::ConstraintAccumulator& acc_;
+    bool& denied_;
+    std::vector<std::string> names_;
+    bool observed_any_ = false;
+    bool failed_ = false;
+};
 
 /// SrpV2 rule-collection subkey names, in output order.
 inline constexpr std::array<std::string_view, 5> kApplockerCollections{"Appx", "Dll", "Exe", "Msi",

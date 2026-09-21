@@ -52,7 +52,7 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None expected: registry reads (`KEY_READ`), a directory listing and a WMI SELECT; no privilege is enabled | Not yet measured under LocalSystem (the-rig probe pending; see the source banner in `app_control_win.cpp`) | a `constrained\|<reason>` row plus result status `PERMISSION_DENIED` (registry `ERROR_ACCESS_DENIED`, CIM `WBEM_E_ACCESS_DENIED`) or `CONSTRAINED` (any other failure) |
+| Windows | agent service account (LocalSystem today, #1442) | None expected: registry reads (`KEY_READ`), a directory listing and a WMI SELECT; no privilege is enabled | Measured under LocalSystem on 2026-09-21 on a host with no AppLocker policy configured; least-privilege service-account behaviour is still unverified (see the source banner in `app_control_win.cpp`) | a `constrained\|<reason>` row plus result status `PERMISSION_DENIED` (registry `ERROR_ACCESS_DENIED`, CIM `WBEM_E_ACCESS_DENIED`) or `CONSTRAINED` (any other failure) |
 | macOS | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | not applicable (Windows-only concept) | n/a — no OS call is attempted |
 | Linux | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | not applicable (Windows-only concept) | n/a — no OS call is attempted |
 

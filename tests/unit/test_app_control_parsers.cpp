@@ -18,6 +18,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
@@ -109,6 +110,79 @@ TEST_CASE("app_control rows: wdac / cip / applocker / unsupported / constrained 
     CHECK(format_unsupported_row("wdac_policy") == "wdac_policy|unsupported|windows_only_concept");
     CHECK(format_constrained_row("permission_denied,row_cap") ==
           "constrained|permission_denied,row_cap");
+}
+
+TEST_CASE("app_control CipScan: absent is definitive, a failed read never reads as absent",
+          "[app_control][parsers][cip]") {
+    const auto ec_of = [](std::errc e) { return std::make_error_code(e); };
+    yuzu::shared::ConstraintAccumulator acc;
+    bool denied = false;
+    CipScan scan{acc, denied};
+
+    SECTION("an existing directory that held nothing is a definitive none") {
+        scan.finish({});
+        CHECK(scan.none_row_due());
+        CHECK(scan.names().empty());
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("a missing directory is a definitive none, not a failure") {
+        scan.finish(ec_of(std::errc::no_such_file_or_directory));
+        CHECK(scan.none_row_due());
+        CHECK_FALSE(acc.any_failure());
+        CHECK_FALSE(denied);
+    }
+    SECTION("only regular .cip leaves are kept, sorted; other entries are ignored") {
+        CHECK(scan.observe("{B}.cip", true, {}));
+        CHECK(scan.observe("{A}.CIP", true, {}));
+        CHECK(scan.observe("notes.txt", true, {}));
+        CHECK(scan.observe("{C}.cip", false, {})); // a directory named like a policy
+        scan.finish({});
+        CHECK_FALSE(scan.none_row_due());
+        CHECK(scan.names() == std::vector<std::string>{"{A}.CIP", "{B}.cip"});
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("a failed stat is a failure and suppresses the absent row") {
+        CHECK(scan.observe("{A}.cip", false, ec_of(std::errc::io_error)));
+        scan.finish({});
+        CHECK_FALSE(scan.none_row_due());
+        CHECK(acc.any_failure());
+        CHECK(acc.reason() == "cip_stat_failed_" + std::to_string(ec_of(std::errc::io_error).value()));
+        CHECK_FALSE(denied);
+    }
+    SECTION("a permission-refused stat reaches the denied flag") {
+        CHECK(scan.observe("{A}.cip", false, ec_of(std::errc::permission_denied)));
+        scan.finish({});
+        CHECK_FALSE(scan.none_row_due());
+        CHECK(denied);
+        CHECK(acc.reason() == "permission_denied");
+    }
+    SECTION("an iterator failure is a failure; permission refusal is denied") {
+        scan.finish(ec_of(std::errc::io_error));
+        CHECK_FALSE(scan.none_row_due());
+        CHECK(acc.any_failure());
+        CHECK_FALSE(denied);
+
+        yuzu::shared::ConstraintAccumulator acc2;
+        bool denied2 = false;
+        CipScan refused{acc2, denied2};
+        refused.finish(ec_of(std::errc::permission_denied));
+        CHECK_FALSE(refused.none_row_due());
+        CHECK(denied2);
+    }
+    SECTION("a directory that vanishes after entries were seen is a failure, not an absence") {
+        CHECK(scan.observe("{A}.cip", true, {}));
+        scan.finish(ec_of(std::errc::no_such_file_or_directory));
+        CHECK(acc.any_failure());
+        CHECK_FALSE(scan.none_row_due());
+    }
+    SECTION("the row cap stops the scan and records row_cap") {
+        for (std::size_t i = 0; i < kMaxCipFiles; ++i)
+            REQUIRE(scan.observe("{P" + std::to_string(i) + "}.cip", true, {}));
+        CHECK_FALSE(scan.observe("{extra}.cip", true, {}));
+        scan.finish({});
+        CHECK(scan.names().size() == kMaxCipFiles);
+        CHECK(acc.reason() == "row_cap");
+    }
 }
 
 TEST_CASE("app_control CIM floor: only the one allowlisted namespace passes",

@@ -85,8 +85,6 @@ constexpr wchar_t kCipActiveSubdir[] = L"\\System32\\CodeIntegrity\\CiPolicies\\
 constexpr DWORD kMaxValueBytes = 4096;      // per-value data cap (CI\Policy values are tiny)
 constexpr DWORD kMaxValueNameChars = 16384; // registry's documented maximum value-name length
 constexpr DWORD kMaxValues = 256;
-constexpr std::size_t kMaxCipFiles = 64;
-
 struct Outcome {
     yuzu::shared::ConstraintAccumulator acc;
     bool denied = false;
@@ -191,44 +189,23 @@ void list_active_cip_files(yuzu::CommandContext& ctx, Outcome& o) {
     }
     const std::filesystem::path dir = std::wstring{win_dir} + kCipActiveSubdir;
 
+    // The shell owns only the filesystem calls; CipScan decides what each result means (and when
+    // "no policy files" is a definitive absence rather than a failed read).
     std::error_code ec;
-    std::vector<std::string> names;
+    CipScan scan{o.acc, o.denied};
     auto it = std::filesystem::directory_iterator(dir, ec);
-    if (ec == std::errc::no_such_file_or_directory) {
-        ctx.write_output(format_cip_none_row());
-        return;
-    }
     for (; !ec && it != std::filesystem::directory_iterator{}; it.increment(ec)) {
         std::error_code stat_ec;
         const bool regular = it->is_regular_file(stat_ec);
-        if (stat_ec) {
-            o.acc.add_failure("cip_stat_failed"); // a failed stat is not "not a .cip"
-            continue;
-        }
-        if (!regular)
-            continue;
         const auto u8 = it->path().filename().u8string();
-        std::string fname{u8.begin(), u8.end()};
-        if (!is_cip_filename(fname))
-            continue;
-        if (names.size() >= kMaxCipFiles) {
-            o.acc.add_failure("row_cap");
+        const std::string leaf{u8.begin(), u8.end()};
+        if (!scan.observe(leaf, regular, stat_ec))
             break;
-        }
-        names.push_back(std::move(fname));
     }
-    if (ec) {
-        if (ec == std::errc::permission_denied) {
-            o.denied = true;
-            o.acc.add_failure("permission_denied");
-        } else {
-            o.acc.add_failure(std::format("cip_dir_failed_{}", ec.value()));
-        }
-    }
-    std::sort(names.begin(), names.end());
-    if (names.empty() && !ec)
+    scan.finish(ec);
+    if (scan.none_row_due())
         ctx.write_output(format_cip_none_row());
-    for (const auto& fname : names)
+    for (const auto& fname : scan.names())
         ctx.write_output(format_cip_row(fname));
 }
 
