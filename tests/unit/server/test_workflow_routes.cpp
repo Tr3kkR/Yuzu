@@ -28,6 +28,9 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
+#include "schedule_engine.hpp" // full ScheduleEngine definition -- this harness constructs a real one (with_schedule_engine)
+#include "test_schedule_api_double.hpp" // ADR-0031 WS-A4 (seventh family): FnScheduleApi
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -150,8 +153,13 @@ struct ExecHarness {
     std::unique_ptr<WorkflowEngine> workflows;
     /// #2146 A2-R1: opt-in real ScheduleEngine, same rationale as `workflows`
     /// above -- unpaid cost on every other test in this file, which is
-    /// content with the pre-existing schedule_engine==nullptr path.
+    /// content with the pre-existing schedule_api==nullptr path.
     std::unique_ptr<ScheduleEngine> schedule_engine;
+    /// ADR-0031 WS-A4 (seventh family): the seam wrapping `schedule_engine`
+    /// above, wired into `wf_deps.schedule_api` below when
+    /// `with_schedule_engine` is true -- mirrors the production
+    /// `schedule_engine_`-gated `schedule_api` construction in server.cpp.
+    std::shared_ptr<ScheduleApi> schedule_api;
     /// Opt-in `ProductPackStore` so `/api/product-packs*` (install/uninstall fan-out into
     /// InstructionStore/PolicyStore/WorkflowEngine, ADR-0064) is reachable. Opt-in for the same
     /// reason as `workflows` above — unpaid cost on every other test in this file.
@@ -287,8 +295,18 @@ struct ExecHarness {
                          // the same reason as with_workflow_engine above --
                          // unpaid cost on every other test in this file,
                          // which is content with the pre-existing
-                         // schedule_engine==nullptr "Not available" path.
-                         bool with_schedule_engine = false)
+                         // schedule_api==nullptr "Not available" path.
+                         bool with_schedule_engine = false,
+                         // ADR-0031 WS-A4 (seventh family): a test-supplied
+                         // ScheduleApi (typically FnScheduleApi, see
+                         // test_schedule_api_double.hpp) -- takes precedence
+                         // over with_schedule_engine above, letting a test
+                         // inject an arbitrary list_schedules result
+                         // (including a store failure) without a real
+                         // ScheduleEngine/Postgres connection. Same
+                         // captured-by-value-at-construction contract as
+                         // auth_override/fleet_read_override above.
+                         std::shared_ptr<ScheduleApi> schedule_api_override = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -334,12 +352,20 @@ struct ExecHarness {
             product_pack_store->set_require_signed_packs(false); // unsigned test bundles
         }
 
-        // #2146 A2-R1: ScheduleEngine is Postgres-backed (ADR-0065) -- shares
-        // this harness's `pool` (schema-per-store, ADR-0008), same as
-        // WorkflowEngine/InstructionStore/ResponseStore above.
-        if (with_schedule_engine) {
+        // ADR-0031 WS-A4 (seventh family): an injected test double takes
+        // precedence over constructing a real engine (see
+        // schedule_api_override's own doc comment above).
+        if (schedule_api_override) {
+            schedule_api = schedule_api_override;
+        } else if (with_schedule_engine) {
+            // #2146 A2-R1: ScheduleEngine is Postgres-backed (ADR-0065) --
+            // shares this harness's `pool` (schema-per-store, ADR-0008), same
+            // as WorkflowEngine/InstructionStore/ResponseStore above.
             schedule_engine = std::make_unique<ScheduleEngine>(pool);
             REQUIRE(schedule_engine->is_open());
+            // ADR-0031 WS-A4 (seventh family): the seam, not the raw engine,
+            // is what Deps actually takes now.
+            schedule_api = make_local_schedule_api(*schedule_engine);
         }
 
         WorkflowRoutes::AuthFn auth_fn =
@@ -451,7 +477,7 @@ struct ExecHarness {
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
         wf_deps.product_pack_store = product_pack_store.get();
-        wf_deps.schedule_engine = schedule_engine.get(); // #2146 A2-R1
+        wf_deps.schedule_api = schedule_api; // ADR-0031 WS-A4 (seventh family), was #2146 A2-R1's raw engine
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -3224,7 +3250,7 @@ TEST_CASE("ADR-0064: a genuine WorkflowEngine DB failure during pack install 503
 // all, and — even with a Schedule:Read gate — ITServiceOwner grants full
 // CRUD on Schedule with no owner/service filter anywhere in the query, so a
 // service-scoped token could enumerate every schedule from every other
-// service. schedule_engine stays nullptr in ExecHarness (never wired) —
+// service. schedule_api stays nullptr in ExecHarness (never wired) —
 // the deny fires before the null-check, so these tests need no real store.
 
 TEST_CASE("/fragments/schedules: an ordinary session is now gated on Schedule:Read",
@@ -3270,10 +3296,79 @@ TEST_CASE("/fragments/schedules: an ordinary session with Schedule:Read reaches 
     auto res = h.sink.Get("/fragments/schedules");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // schedule_engine is nullptr in this harness — the "Not available" branch,
+    // schedule_api is nullptr in this harness — the "Not available" branch,
     // not a denial. Confirms the deny/gate above didn't also block the
     // legitimate path.
     CHECK(res->body.find("Not available") != std::string::npos);
+}
+
+// ADR-0031 WS-A4 (seventh family): before this seam, the fragment called the
+// unchecked ScheduleEngine::query_schedules(), which had no way to signal a
+// store FAILURE distinct from a genuinely empty table — no existing test
+// harness could inject that distinction at all. FnScheduleApi (see
+// test_schedule_api_double.hpp) makes it directly testable: a `list_schedules`
+// std::unexpected must render a distinct degraded state, never the "No
+// schedules configured" empty-state string, and must never echo the
+// (internal-only) error string into the HTML.
+TEST_CASE("/fragments/schedules: a store failure renders a distinct degraded state, "
+          "not \"No schedules configured\"",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto failing_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
+        [](const ScheduleQuery&) -> std::expected<ScheduleListResult, std::string> {
+            return std::unexpected(std::string{"pool exhausted (internal, must not render)"});
+        });
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/failing_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("No schedules configured") == std::string::npos);
+    CHECK(res->body.find("pool exhausted") == std::string::npos);
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+}
+
+// adversarial-review-kimi pre-push round (Codex C1 / Kimi K1, cross-confirmed):
+// schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+// fragment) must surface this [truncated], never present the capped count as
+// the fleet's true total" -- the fragment shipped in the same commit that
+// wrote that contract without honouring it for its own case. This proves the
+// fix: a truncated result renders a partial-list notice, not a table that
+// silently looks complete.
+TEST_CASE("/fragments/schedules: a truncated result renders a partial-list notice",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto truncated_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
+        [](const ScheduleQuery&) -> std::expected<ScheduleListResult, std::string> {
+            ScheduleListResult r;
+            InstructionSchedule s;
+            s.id = "sched-1";
+            s.name = "capped-schedule";
+            s.frequency_type = "once";
+            s.enabled = true;
+            r.schedules.push_back(s);
+            r.truncated = true;
+            return r;
+        });
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/truncated_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("capped-schedule") != std::string::npos);
+    CHECK(res->body.find("partial list") != std::string::npos);
 }
 
 // guardian-confinement-2298 PR3 §3e: POST /api/scope/estimate is auth_fn-only
@@ -3698,7 +3793,7 @@ TEST_CASE("GET /api/v1/schedules: reaches the same two-stage gate as the fragmen
 
     auto res = h.sink.Get("/api/v1/schedules");
     REQUIRE(res);
-    // schedule_engine is nullptr in this harness (matches the fragment twin's
+    // schedule_api is nullptr in this harness (matches the fragment twin's
     // own "Not available" test above) — 503, not a denial.
     CHECK(res->status == 503);
 }

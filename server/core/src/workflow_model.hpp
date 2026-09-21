@@ -1,18 +1,25 @@
 #pragma once
 
 /// @file workflow_model.hpp
-/// Shared, pure JSON row builders for the WorkflowEngine/ScheduleEngine read
-/// surface (workflow list/detail, workflow-execution detail, schedule list)
-/// — REST v1 (`workflow_routes.cpp`) and MCP (`mcp_server.cpp`) call these
-/// SAME functions so their JSON shapes cannot drift from each other by
+/// Shared, pure JSON row builders for the WorkflowEngine read surface
+/// (workflow list/detail, workflow-execution detail) — REST v1
+/// (`workflow_routes.cpp`) and MCP (`mcp_server.cpp`) call these SAME
+/// functions so their JSON shapes cannot drift from each other by
 /// construction (`docs/api-twin-recipe.md` Rule 1).
 ///
-/// No `httplib.h`, no MCP-specific include — pure, I/O-free.
+/// No `httplib.h`, no MCP-specific include. It DOES include the store header
+/// `workflow_engine.hpp` (for `Workflow`/`WorkflowExecution`) — `workflow` is
+/// not yet seamed (a future WS-A4 family), so this header is I/O-free but
+/// NOT store-free, unlike an abstract `*_api.hpp`. (An earlier version of
+/// this file claimed "pure, I/O-free" while also holding the schedule-family
+/// builder and `#include`ing `schedule_engine.hpp` too — that claim was false
+/// by the WS-A4 seam's own bar; ADR-0031 WS-A4's seventh family split the
+/// schedule builder out into the genuinely pure `schedule_model.hpp`, which
+/// this file no longer needs.)
 ///
 /// #4030: executions/workflows/schedules read-twin programme.
 
 #include "authz_model.hpp" // authz::VisibleSet / authz::in_scope
-#include "schedule_engine.hpp"
 #include "workflow_engine.hpp"
 
 #include <nlohmann/json.hpp>
@@ -101,10 +108,5 @@ nlohmann::json confined_workflow_agent_ids_json(const std::string& agent_ids_jso
 /// `workflow_execution_detail_json` and the legacy route for the same
 /// no-drift reason as `confined_workflow_agent_ids_json` above.
 nlohmann::json confined_workflow_step_result_json(const std::string& result_json, bool confined);
-
-/// `GET /fragments/schedules` / `GET /api/v1/schedules` / MCP
-/// `list_schedules` row — adds `execution_count` (a real, already-populated
-/// `InstructionSchedule` field) to `list_schedules`' pre-#4030 output.
-nlohmann::json schedule_row_json(const InstructionSchedule& s);
 
 } // namespace yuzu::server

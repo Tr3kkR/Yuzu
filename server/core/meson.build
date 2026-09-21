@@ -432,6 +432,8 @@ yuzu_server_core_lib = static_library(
     'src/schedule_engine.cpp',
     'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',
+    'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
+    'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',

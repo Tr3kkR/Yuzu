@@ -65,7 +65,8 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
-#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -5241,6 +5242,12 @@ McpServer::HandlerFn McpServer::build_handler(
     InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
     ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+    // `schedule_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, seventh family — list_schedules routes through the member
+    // `schedule_api_`/`set_schedule_api` instead, mcp_server.hpp's doc
+    // comment). Kept, unremoved, for constructor-signature stability across
+    // the three forwarding overloads below — a disclosed, deferred
+    // follow-up, not an oversight.
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
@@ -10895,7 +10902,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                // ADR-0031 WS-A4 (seventh family): routed through the
+                // ScheduleApi seam (schedule_api_, set_schedule_api) —
+                // supersedes a direct `schedule_engine` reach; the
+                // `build_handler` parameter of that name is now unused in
+                // this handler, kept for constructor-signature stability
+                // across the two forwarding overloads that construct
+                // build_handler's caller (mcp_server.cpp's two
+                // `ScheduleEngine* schedule_engine` overload parameters
+                // that forward into this call -- a bounded, 2-site ripple,
+                // not an open-ended one; see mcp_server.hpp's
+                // set_schedule_api doc comment).
+                if (!schedule_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Schedule engine unavailable"),
                         "application/json");
@@ -10943,7 +10961,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 sq.enabled_only = *enabled_only_opt;
-                auto schedules_result = schedule_engine->query_schedules_checked(sq);
+                auto schedules_result = schedule_api_->list_schedules(sq);
                 if (!schedules_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -10953,10 +10971,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
-                // widens this tool's output with execution_count, the one field
-                // the dashboard fragment showed that this tool didn't. Same
-                // builder as GET /api/v1/schedules, so the two cannot drift.
+                // #4030: shared builder (schedule_row_json, schedule_model.hpp,
+                // split out of workflow_model.hpp by the ADR-0031 WS-A4
+                // seventh-family seam) — widens this tool's output with
+                // execution_count, the one field the dashboard fragment
+                // showed that this tool didn't. Same builder as
+                // GET /api/v1/schedules, so the two cannot drift.
                 JArr arr;
                 for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());
