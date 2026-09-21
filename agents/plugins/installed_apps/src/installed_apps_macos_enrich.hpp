@@ -1,6 +1,7 @@
 #pragma once
 
-// installed_apps_macos_enrich.hpp -- #2273 macOS `list_inventory` enrichment:
+// installed_apps_macos_enrich.hpp -- #2273 macOS `list_inventory` enrichment (and, since
+// ADR-0028's binding condition, the `list` action's bundle_id via bundle_id_for):
 // per-app bundle identifier + signer + integrity, read NATIVELY (CFBundle +
 // Security.framework's SecStaticCode API), never a subprocess. Modeled on
 // certificates_plugin.cpp's read_keychain_secitem() for the

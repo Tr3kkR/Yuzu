@@ -22,7 +22,8 @@
  * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
  * whenever a test's runtime depends on process creation):
  *   - What it costs, measured on this host (macOS 26, arm64, 2026-08-24):
- *     `list` 4.5 s wall, `list_inventory` a few seconds more. `list` is
+ *     `list` 1.4-2.3 s wall (2026-09-21; the 2026-08-24 base figure was 4.5 s),
+ *     `list_inventory` a few seconds more. `list` is
  *     dominated by one `system_profiler` call plus that in-process pass (no
  *     process fan-out); the pkgutil receipt leg is a bounded per-id loop under
  *     kMaxPkgutilPackages.
@@ -177,15 +178,13 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
 
     // Wire contract (ADR-0028 binding condition): every row is
     // app|name|version|publisher|install_date|install_location|bundle_id --
-    // exactly 7 escape-aware fields, the "No applications found" sentinel
-    // included. The last three columns (install_date, install_location, bundle_id)
-    // are safe_output_field-escaped; name/version/publisher are not (pre-existing,
-    // recorded in the PR body), so this is stated over rows whose name/publisher
-    // contain no unescaped '|': a real host's names/vendors do not contain one.
+    // exactly 7 escape-aware fields on every host, the sentinel included, because
+    // format_app_row escapes every field (governance r1 C01); a `|` in a real name
+    // is escaped, not a delimiter.
     std::istringstream iss(result.captured);
     std::string line;
     std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
-    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0,
+    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0, bundle_rows = 0,
                                  non_dash_trailing = 0;
     while (std::getline(iss, line)) {
         if (line.empty())
@@ -206,6 +205,8 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
             ++abs_location_rows;
         if (fields[5].starts_with("/System/Applications/") && fields[6].starts_with("com.apple."))
             ++system_app_rows;
+        if (fields[6] != "-")
+            ++bundle_rows;
 #elif defined(__linux__)
         if (fields[5] != "-" || fields[6] != "-")
             ++non_dash_trailing;
@@ -224,6 +225,8 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     CHECK(abs_location_rows > 0);
 #ifdef YUZU_HAVE_SECURITY_FRAMEWORK
     CHECK(system_app_rows > 0);
+#else
+    CHECK(bundle_rows == 0); // no Security framework: the stub yields "-" for every row
 #endif
 #elif defined(__linux__)
     // Linux has no install location or bundle id concept: both columns are "-" by design.

@@ -305,6 +305,27 @@ TEST_CASE("system_profiler apps: deeper-indented lines are never app headers",
     CHECK(apps[0].version == "1.2");
 }
 
+TEST_CASE("system_profiler apps: a Location value must be absolute and control-byte free",
+          "[installed_apps]") {
+    // Governance r1 C02 defence in depth (not a closure -- see the issue on
+    // structured system_profiler output). Mutation: removing the guard yields
+    // "relative.app" as the location.
+    constexpr std::string_view out = "    Rel:\n"
+                                     "      Version: 1\n"
+                                     "      Location: relative.app\n"
+                                     "    Ctl:\n"
+                                     "      Version: 1\n"
+                                     "      Location: /Applications/x\ty.app\n"
+                                     "    Ok:\n"
+                                     "      Version: 1\n"
+                                     "      Location: /Applications/Ok.app\n";
+    const auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].location.empty());
+    CHECK(apps[1].location.empty());
+    CHECK(apps[2].location == "/Applications/Ok.app");
+}
+
 // ── macOS: brew list --versions ─────────────────────────────────────────
 
 TEST_CASE("brew list: name/version split, missing version tolerated — documented-format reconstruction",
@@ -442,7 +463,7 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     const auto piped = format_app_row({.name = "X", .install_location = "a|b"});
     CHECK(piped == "app|X|-|-|-|a\\|b|-");
     const auto fields = split_fields_escape_aware(piped);
-    CHECK(fields.size() == 7);
+    REQUIRE(fields.size() == 7);
     CHECK(fields[5] == "a|b");
 
     // bundle_id passes through the same escape (dropping safe_output_field on the last
@@ -452,8 +473,8 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     CHECK(split_fields_escape_aware(bid).size() == 7);
 
     // install_date is no longer the row's last field, so a trailing backslash in it
-    // would swallow the install_location delimiter; it is escaped like the two new
-    // columns (dropping that must fail here).
+    // would swallow the install_location delimiter; every field is escaped (see the
+    // next case).
     const auto dated = format_app_row({.name = "X", .install_date = "20260101\\"});
     CHECK(dated == "app|X|-|-|20260101/|-|-");
     CHECK(split_fields_escape_aware(dated).size() == 7);
@@ -467,23 +488,66 @@ TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-
           "app|No applications found|-|-|-|-|-");
 }
 
-TEST_CASE("format_app_row: a '|' inside a field is emitted as-is (pre-existing gap, pinned)",
+TEST_CASE("format_app_row: hostile bytes in ANY field cannot forge or split a row",
           "[installed_apps]") {
-    // The three leading columns (name/version/publisher) have never escaped '|'
-    // (sanitize_utf8 only repairs invalid UTF-8); install_date and the two ADR-0028
-    // columns are safe_output_field-escaped (see the case above). This pins that the
-    // formatter does not change the three: such a row splits into more than seven
-    // naive fields. Recorded as a deferred item; a future escaping change must
-    // update this case.
-    const auto row = format_app_row({"A|B", "1", "P", "D", "L", "B"});
-    CHECK(row == "app|A|B|1|P|D|L|B");
-    CHECK(std::count(row.begin(), row.end(), '|') == 7);
+    // Governance r1 C01/C04 (chaos T1). Every one of the six fields carries the
+    // full hostile alphabet; the row must stay one NUL-free line of exactly seven
+    // escape-aware tokens that decode to the folded value. Mutation: dropping
+    // list_field on `name` (raw std::string append) fails the first sub-case.
+    const std::string hostile = "a|b\\c\r\nd";
+    const std::string folded = "a|b/c  d";
+    const AppRowFields f{"N", "V", "P", "D", "L", "B"};
+    for (std::size_t i = 0; i < 6; ++i) {
+        AppRowFields g = f;
+        std::string* gslots[] = {&g.name,         &g.version,          &g.publisher,
+                                 &g.install_date, &g.install_location, &g.bundle_id};
+        *gslots[i] = hostile;
+        const auto row = format_app_row(g);
+        INFO("field " << i);
+        CHECK(row.find('\n') == std::string::npos);
+        CHECK(row.find('\r') == std::string::npos);
+        const auto fields = split_fields_escape_aware(row);
+        REQUIRE(fields.size() == 7);
+        CHECK(fields[i + 1] == folded);
+    }
+}
+
+TEST_CASE("format_app_row: an interior NUL cuts the FIELD, never the row", "[installed_apps]") {
+    // write_output hands the row to a C string (plugin.hpp:71); before this fix an
+    // interior NUL in publisher truncated the row to the 4-token `query` shape.
+    // Mutation: removing the NUL cut in list_field leaves a NUL in the row.
+    const auto row = format_app_row({"X", "1", std::string("p\0x", 3), "D", "L", "B"});
+    CHECK(row.find('\0') == std::string::npos);
+    CHECK(row == "app|X|1|p|D|L|B");
+    // A field that is nothing but NUL renders "-".
+    CHECK(format_app_row({"X", std::string("\0", 1), "", "", "", ""}) == "app|X|-|-|-|-|-");
+}
+
+TEST_CASE("format_app_row: every field is length-bounded at a UTF-8 boundary",
+          "[installed_apps]") {
+    // Governance r1 C03 (chaos T2): CoreFoundation returns a 5 MiB
+    // CFBundleIdentifier in full (probe_bigid_bundle); one such row would exceed
+    // the 4 MiB gRPC receive default. Mutation: removing the bound in list_field
+    // fails the size check.
+    const auto big = format_app_row({.name = "X", .bundle_id = std::string(5u << 20, 'a')});
+    const auto fields = split_fields_escape_aware(big);
+    REQUIRE(fields.size() == 7);
+    CHECK(fields[6].size() == kMaxListFieldBytes);
+    // The cut never splits a multi-byte sequence: 4095 ASCII bytes + a 2-byte
+    // sequence is cut before the sequence, not inside it.
+    const auto edge =
+        format_app_row({.name = std::string(kMaxListFieldBytes - 1, 'a') + "\xC3\xA9"});
+    CHECK(split_fields_escape_aware(edge)[1].size() == kMaxListFieldBytes - 1);
+    // A field exactly at the bound is untouched.
+    const auto exact = format_app_row({.name = std::string(kMaxListFieldBytes, 'a')});
+    CHECK(split_fields_escape_aware(exact)[1].size() == kMaxListFieldBytes);
 }
 
 // ── Windows registry value types (InstallLocation acceptance) ───────────────
 // Pure predicate -- the RegQueryValueExW call it gates is Windows-only, but the
 // decision is testable on every host. 1 = REG_SZ, 2 = REG_EXPAND_SZ,
-// 3 = REG_BINARY, 7 = REG_MULTI_SZ (plugin.cpp static_asserts the first two).
+// 3 = REG_BINARY, 7 = REG_MULTI_SZ (installed_apps_registry_utf8.hpp static_asserts the
+// first two on Windows).
 
 TEST_CASE("reg_string_type_accepted: REG_SZ always, REG_EXPAND_SZ only when accepted",
           "[installed_apps]") {
@@ -494,66 +558,68 @@ TEST_CASE("reg_string_type_accepted: REG_SZ always, REG_EXPAND_SZ only when acce
     CHECK_FALSE(reg_string_type_accepted(7, true));
 }
 
-// ── Windows dedupe: the `list` column is layered after the base survivor ─────
-// Input is already sorted by (name, version) as the plugin sorts it; the run order
-// below is fixed by the test, not by std::sort (equal keys have no defined order),
-// so each case pins one arrangement explicitly. Mutation: making
-// backfill_install_location_from_duplicates return immediately fails the first case.
+// ── Windows dedupe: the plugin's own pipeline (sort + location layer + unique) ─
+// dedupe_uninstall_records is the function the plugin calls, instantiated with
+// the same record type (AppInfo aliases AppRowFields), so these cases observe the
+// comparator, the placement of the location layer and unique() -- not a mirror.
 
-namespace {
-// Mirrors get_installed_apps_windows(): backfill, then unique() on name+version.
-std::vector<AppRowFields> dedupe_like_plugin(std::vector<AppRowFields> v) {
-    backfill_install_location_from_duplicates(v);
-    v.erase(std::unique(v.begin(), v.end(),
-                        [](const AppRowFields& a, const AppRowFields& b) {
-                            return a.name == b.name && a.version == b.version;
-                        }),
-            v.end());
-    return v;
-}
-} // namespace
-
-TEST_CASE("backfill_install_location_from_duplicates: the survivor keeps its own fields and "
-          "gains a duplicate's location",
+TEST_CASE("dedupe_uninstall_records: unsorted input is sorted by (name, version) and the "
+          "survivor keeps its own fields while gaining a duplicate's location",
           "[installed_apps]") {
-    auto out = dedupe_like_plugin({
+    // Mutations: deleting the std::sort leaves Zed first; moving the location
+    // layer after unique() leaves Tool 1.0's location empty.
+    std::vector<AppRowFields> v{
+        {.name = "Zed", .version = "1.0", .install_location = "C:\\Zed\\"},
+        {.name = "Tool", .version = "2.0"},
         {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101"},
         {.name = "Tool", .version = "1.0", .publisher = "Acme Inc", .install_date = "20240202",
          .install_location = "C:\\Program Files\\Tool\\"},
-    });
-    REQUIRE(out.size() == 1);
-    CHECK(out[0].publisher == "Acme"); // the base survivor's fields, untouched
-    CHECK(out[0].install_date == "20200101");
-    CHECK(out[0].install_location == "C:\\Program Files\\Tool\\");
+    };
+    dedupe_uninstall_records(v);
+    REQUIRE(v.size() == 3);
+    CHECK(v[0].name == "Tool");
+    CHECK(v[0].version == "1.0");
+    CHECK(v[0].publisher == "Acme"); // first record of the run as given: base survivor
+    CHECK(v[0].install_date == "20200101");
+    CHECK(v[0].install_location == "C:\\Program Files\\Tool\\");
+    CHECK(v[1].version == "2.0");
+    CHECK(v[1].install_location.empty()); // never borrowed across versions
+    CHECK(v[2].name == "Zed");
 }
 
-TEST_CASE("backfill_install_location_from_duplicates: a populated first record is never "
-          "overwritten",
+TEST_CASE("dedupe_uninstall_records: among populated locations the lexicographic minimum wins, "
+          "whatever the run order",
           "[installed_apps]") {
-    auto out = dedupe_like_plugin({
-        {.name = "Tool", .version = "1.0", .publisher = "Acme Inc", .install_date = "20240202",
-         .install_location = "C:\\A\\"},
-        {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101",
-         .install_location = "C:\\B\\"},
-        {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101"},
-    });
-    REQUIRE(out.size() == 1);
-    CHECK(out[0].publisher == "Acme Inc");
-    CHECK(out[0].install_date == "20240202");
-    CHECK(out[0].install_location == "C:\\A\\");
-}
-
-TEST_CASE("backfill_install_location_from_duplicates: distinct versions are distinct runs; a "
-          "run with no location stays empty",
-          "[installed_apps]") {
-    auto out = dedupe_like_plugin({
+    // Governance r1 CP-2/UP-6 (chaos T5): the value must not depend on the order
+    // std::sort leaves equal keys in. Mutation: "first populated wins" fails the
+    // permutation whose first record is C:\B\.
+    std::vector<AppRowFields> run{
+        {.name = "Tool", .version = "1.0", .install_location = "C:\\B\\"},
+        {.name = "Tool", .version = "1.0", .install_location = "C:\\A\\"},
         {.name = "Tool", .version = "1.0"},
-        {.name = "Tool", .version = "2.0", .install_location = "C:\\Tool2\\"},
-        {.name = "Zed", .version = "1.0"},
-        {.name = "Zed", .version = "1.0"},
-    });
-    REQUIRE(out.size() == 3);
-    CHECK(out[0].install_location.empty());          // no Tool 1.0 duplicate has one
-    CHECK(out[1].install_location == "C:\\Tool2\\"); // never borrowed across versions
-    CHECK(out[2].install_location.empty());
+    };
+    const auto by_location = [](const AppRowFields& a, const AppRowFields& b) {
+        return a.install_location < b.install_location;
+    };
+    std::sort(run.begin(), run.end(), by_location);
+    do {
+        auto v = run;
+        dedupe_uninstall_records(v);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0].install_location == "C:\\A\\");
+    } while (std::next_permutation(run.begin(), run.end(), by_location));
+}
+
+TEST_CASE("dedupe_uninstall_records: a location never leaks across products sharing a version",
+          "[installed_apps]") {
+    // Governance r1 QE-3: dropping the `name` compare in the run detection makes
+    // A inherit B's location.
+    std::vector<AppRowFields> v{
+        {.name = "A", .version = "1.0"},
+        {.name = "B", .version = "1.0", .install_location = "C:\\B\\"},
+    };
+    dedupe_uninstall_records(v);
+    REQUIRE(v.size() == 2);
+    CHECK(v[0].install_location.empty());
+    CHECK(v[1].install_location == "C:\\B\\");
 }

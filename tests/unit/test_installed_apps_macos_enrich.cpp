@@ -45,8 +45,10 @@
 
 namespace {
 
-// Build a minimal, genuinely unsigned .app bundle under `root`.
-std::filesystem::path make_unsigned_bundle(const std::filesystem::path& root) {
+// Build a minimal, genuinely unsigned .app bundle under `root`. `with_identifier`
+// false omits CFBundleIdentifier from the Info.plist (a bundle with no identifier).
+std::filesystem::path make_unsigned_bundle(const std::filesystem::path& root,
+                                           bool with_identifier = true) {
     const auto app = root / "YuzuUnsigned.app";
     const auto macos_dir = app / "Contents" / "MacOS";
     std::filesystem::create_directories(macos_dir);
@@ -55,9 +57,10 @@ std::filesystem::path make_unsigned_bundle(const std::filesystem::path& root) {
     plist << R"(<?xml version="1.0" encoding="UTF-8"?>)"
           << R"(<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" )"
           << R"("http://www.apple.com/DTDs/PropertyList-1.0.dtd">)"
-          << R"(<plist version="1.0"><dict>)"
-          << R"(<key>CFBundleIdentifier</key><string>com.yuzu.test.unsigned</string>)"
-          << R"(<key>CFBundleName</key><string>YuzuUnsigned</string>)"
+          << R"(<plist version="1.0"><dict>)";
+    if (with_identifier)
+        plist << R"(<key>CFBundleIdentifier</key><string>com.yuzu.test.unsigned</string>)";
+    plist << R"(<key>CFBundleName</key><string>YuzuUnsigned</string>)"
           << R"(<key>CFBundleExecutable</key><string>yuzu_unsigned</string>)"
           << R"(</dict></plist>)" << '\n';
     plist.close();
@@ -120,6 +123,13 @@ TEST_CASE("macOS enrich: bundle_id_for reads CFBundleIdentifier, empty for a non
     // Non-existent path: honest-empty, never a fabricated id.
     CHECK(bundle_id_for(missing).empty());
     CHECK(bundle_id_for("").empty());
+
+    // A bundle with no CFBundleIdentifier: honest-empty, never fabricated
+    // (mutation: returning a placeholder from bundle_id_for_url on a null
+    // identifier fails here).
+    std::filesystem::create_directories(dir.path / "anon");
+    const auto anon = make_unsigned_bundle(dir.path / "anon", /*with_identifier=*/false);
+    CHECK(bundle_id_for(anon.string()).empty());
 
     // enrich_app shares the same bundle-id read.
     CHECK(yuzu::installed_apps::macos_enrich::enrich_app(app.string()).bundle_id ==
