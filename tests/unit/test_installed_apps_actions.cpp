@@ -47,6 +47,7 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -118,6 +119,26 @@ std::size_t count_non_matching_lines(const std::string& captured, std::string_vi
     return bad;
 }
 
+/// Escape-aware field split (shape of test_peripherals_local_dispatcher.cpp's
+/// helper): a backslash-escaped '|' does not start a new field.
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/system_profiler argv",
@@ -147,6 +168,35 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // real app/package or the plugin's own "No applications found" sentinel
     // -- never a stray error string or fragment from a reverted parser.
     CHECK(count_non_matching_lines(result.captured, "app|") == 0);
+
+    // Wire contract (ADR-0028 binding condition): every row is
+    // app|name|version|publisher|install_date|install_location|bundle_id --
+    // exactly 7 escape-aware fields, the "No applications found" sentinel
+    // included. Stated over rows whose name/publisher contain no unescaped
+    // '|': the plugin has never escaped '|' in these columns (pre-existing,
+    // recorded in the PR body), and a real host's names/vendors do not
+    // contain one.
+    std::istringstream iss(result.captured);
+    std::string line;
+    std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        ++rows;
+        const auto fields = split_fields_escape_aware(line);
+        if (fields.size() != 7) {
+            ++bad_field_count;
+            continue;
+        }
+        // Empty optional columns render "-", never an empty string (a
+        // shifted column would surface here as an empty field).
+        for (std::size_t i = 1; i < fields.size(); ++i)
+            if (fields[i].empty())
+                ++empty_field;
+    }
+    CHECK(rows > 0);
+    CHECK(bad_field_count == 0);
+    CHECK(empty_field == 0);
 }
 
 #if defined(__APPLE__)

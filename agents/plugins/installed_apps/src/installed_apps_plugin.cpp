@@ -214,6 +214,11 @@ struct AppInfo {
     std::string version;
     std::string publisher;
     std::string install_date;
+    // `list` action's trailing columns (ADR-0028 binding condition). NOT part of
+    // the ADR-0016 InvRecord; empty renders "-" (designed for Linux, which has
+    // no single install prefix / no bundle id).
+    std::string install_location;
+    std::string bundle_id;
 };
 
 // Acquisition result + its health, returned together. `docs/cpp-conventions.md`
@@ -354,6 +359,25 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 }
                 return {};
             };
+            // InstallLocation only. Deliberately a SECOND lambda rather than a
+            // widened read_str: read_str feeds DisplayName/DisplayVersion/
+            // Publisher/InstallDate, which reach the ADR-0016 hashed blob-v2 rows
+            // (get_inventory_windows), so accepting expandable strings there would
+            // change what that chain hashes. The value is returned RAW (an
+            // unexpanded "%ProgramFiles%" prefix stays as written); absent stays
+            // empty and is never derived from DisplayIcon/UninstallString.
+            auto read_str_expandable = [&](const char* value_name) -> std::string {
+                wchar_t buf[512]{};
+                DWORD size = sizeof(buf); // size in BYTES
+                DWORD type = 0;
+                if (RegQueryValueExW(app_key, to_wide(value_name).c_str(), nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+                    if ((type == REG_SZ || type == REG_EXPAND_SZ) && size >= sizeof(wchar_t)) {
+                        return reg_sz_to_utf8(buf, size);
+                    }
+                }
+                return {};
+            };
 
             auto display_name = read_str("DisplayName");
             if (!display_name.empty()) {
@@ -369,6 +393,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 app.version = read_str("DisplayVersion");
                 app.publisher = read_str("Publisher");
                 app.install_date = read_str("InstallDate");
+                app.install_location = read_str_expandable("InstallLocation");
                 apps.push_back(std::move(app));
             }
         }
@@ -426,7 +451,7 @@ AppCollection get_installed_apps_linux() {
         for (auto& rec : parsers::parse_dpkg_list(out)) {
             // parse_dpkg_list already filters to "install ok installed" rows.
             apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), "-"});
+                            std::move(rec.publisher), "-", {}, {}});
         }
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
               !path.empty()) {
@@ -438,7 +463,7 @@ AppCollection get_installed_apps_linux() {
         auto out = std::move(res.output);
         for (auto& rec : parsers::parse_rpm_list(out)) {
             apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), std::move(rec.install_date)});
+                            std::move(rec.publisher), std::move(rec.install_date), {}, {}});
         }
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {
@@ -448,7 +473,7 @@ AppCollection get_installed_apps_linux() {
         degraded = degraded || res.degraded;
         auto out = std::move(res.output);
         for (auto& rec : parsers::parse_pacman_list(out))
-            apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
+            apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-", {}, {}});
     }
 
     std::sort(apps.begin(), apps.end(),
@@ -483,8 +508,11 @@ AppCollection get_installed_apps_macos() {
         if (res.ran && parsed.empty())
             degraded = true;
         for (auto& rec : parsed) {
-            apps.push_back(
-                {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
+            // rec.location (the .app bundle path) is now the `list` action's
+            // install_location column (ADR-0028 binding condition). bundle_id is
+            // filled separately, and only on the `list` path (with_bundle_ids).
+            apps.push_back({std::move(rec.name), std::move(rec.version), "-",
+                            std::move(rec.install_date), std::move(rec.location), {}});
         }
     }
 
@@ -620,6 +648,35 @@ InvCollection get_inventory_linux() {
 // wrong, which is exactly when degrading is right.
 constexpr std::size_t kMaxEnrichApps = 5000;
 constexpr std::size_t kMaxPkgutilPackages = 5000;
+
+// Fills AppInfo::bundle_id (CFBundle only, no SecStaticCode) for the `list`
+// action. Called from do_list ONLY: do_query and do_list_per_user also use
+// get_installed_apps_macos() but never emit bundle_id, so filling it inside the
+// acquisition would waste up to kMaxEnrichApps CFBundleCreate calls there.
+// YUZU_HAVE_SECURITY_FRAMEWORK: meson.build resolves ['Security',
+// 'CoreFoundation'] as ONE dependency() call that never partially resolves, so
+// CFBundle is available exactly when the enrichment header's guard is.
+// Same kMaxEnrichApps / over_budget shape as get_inventory_macos_uncached, but
+// `list` is interactive and the column is informational: on exhaustion the
+// remaining rows keep an empty bundle_id (rendered "-") and the run is NOT
+// reported degraded -- unlike the daily-sync leg, where a silently hollowed-out
+// security-posture field must not publish as authoritative.
+std::vector<AppInfo> with_bundle_ids(std::vector<AppInfo> apps) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto over_budget = [start]() {
+        return std::chrono::steady_clock::now() - start > kCollectionBudget;
+    };
+    std::size_t filled = 0;
+    for (auto& app : apps) {
+        if (app.install_location.empty())
+            continue;
+        if (filled >= kMaxEnrichApps || over_budget())
+            break;
+        ++filled;
+        app.bundle_id = yuzu::installed_apps::macos_enrich::bundle_id_for(app.install_location);
+    }
+    return apps;
+}
 
 InvCollection get_inventory_macos_uncached() {
     bool degraded = false;
@@ -1067,6 +1124,7 @@ int do_list(yuzu::CommandContext& ctx) {
     auto apps = get_installed_apps_linux();
 #elif defined(__APPLE__)
     auto apps = get_installed_apps_macos();
+    apps.apps = with_bundle_ids(std::move(apps.apps));
 #else
     AppCollection apps;
 #endif
@@ -1080,15 +1138,14 @@ int do_list(yuzu::CommandContext& ctx) {
         return 1;
 
     if (apps.apps.empty()) {
-        ctx.write_output("app|No applications found|-|-|-");
+        ctx.write_output("app|No applications found|-|-|-|-|-");
         return 0;
     }
 
     for (const auto& app : apps.apps) {
-        ctx.write_output(sanitize_utf8(
-            std::format("app|{}|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                        app.publisher.empty() ? "-" : app.publisher,
-                        app.install_date.empty() ? "-" : app.install_date)));
+        ctx.write_output(sanitize_utf8(parsers::format_app_row(
+            {app.name, app.version, app.publisher, app.install_date, app.install_location,
+             app.bundle_id})));
     }
     return 0;
 }

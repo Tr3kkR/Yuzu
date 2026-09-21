@@ -110,4 +110,44 @@ TEST_CASE("macOS enrich: an unsigned bundle is reported unsigned, never signed",
 #endif
 }
 
+// bundle_id_for(): the single CFBundle read behind the `list` action's
+// bundle_id column (ADR-0028 binding condition). Same cost class as the case
+// above: one temp dir, two small files, no subprocess.
+TEST_CASE("macOS enrich: bundle_id_for reads CFBundleIdentifier, empty for a non-bundle path",
+          "[installed_apps][macos]") {
+    const auto dir = yuzu::test::unique_temp_path("yuzu_test_bundle_id_");
+    std::filesystem::create_directories(dir);
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{dir};
+
+    const auto app = make_unsigned_bundle(dir);
+    const auto missing = (dir / "DoesNotExist.app").string();
+
+#ifdef YUZU_HAVE_SECURITY_FRAMEWORK
+    using yuzu::installed_apps::macos_enrich::bundle_id_for;
+    CHECK(bundle_id_for(app.string()) == "com.yuzu.test.unsigned");
+    // Non-existent path: honest-empty, never a fabricated id.
+    CHECK(bundle_id_for(missing).empty());
+    CHECK(bundle_id_for("").empty());
+
+    // Real system bundle, when this host carries one at the stable path.
+    std::error_code ec;
+    if (std::filesystem::exists("/Applications/Safari.app", ec))
+        CHECK(bundle_id_for("/Applications/Safari.app") == "com.apple.Safari");
+
+    // enrich_app shares the same bundle-id read.
+    CHECK(yuzu::installed_apps::macos_enrich::enrich_app(app.string()).bundle_id ==
+          bundle_id_for(app.string()));
+#else
+    // No Security framework at build time: the honest no-op.
+    CHECK(yuzu::installed_apps::macos_enrich::bundle_id_for(app.string()).empty());
+    CHECK(yuzu::installed_apps::macos_enrich::bundle_id_for(missing).empty());
+#endif
+}
+
 #endif // __APPLE__

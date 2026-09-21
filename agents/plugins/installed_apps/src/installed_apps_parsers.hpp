@@ -36,15 +36,17 @@ namespace yuzu::installed_apps::parsers {
 using yuzu::shared::is_degraded_run;
 
 // Mirrors installed_apps_plugin.cpp's (still plugin-local) AppInfo shape,
-// plus one INTERNAL-only field: `location`. `location` (macOS
-// system_profiler's "Location:" line -- the app bundle's absolute path) is
-// never emitted through the stable `app|name|version|publisher|install_date`
-// list/query wire format; it exists solely so get_inventory_macos() can hand
-// the bundle path to the #2273 native CFBundle/SecStaticCode enrichment in
-// installed_apps_macos_enrich.hpp. Honest-empty when the source format
-// doesn't carry a given field (matches installed_apps_inventory.hpp's own
-// convention) -- never synthesised, never a "-" placeholder (the plugin
-// applies that display convention itself, at format time).
+// plus one parser-side field: `location` (macOS system_profiler's "Location:"
+// line -- the app bundle's absolute path). As of ADR-0028's binding condition
+// `location` is emitted as the `list` action's trailing `install_location`
+// column (format_app_row below); it is still NOT part of the ADR-0016
+// InvRecord (installed_apps_inventory.hpp), where it only feeds the #2273
+// native CFBundle/SecStaticCode enrichment in installed_apps_macos_enrich.hpp.
+// The `query` and `list_per_user` wire formats do not carry it. Honest-empty
+// when the source format doesn't carry a given field (matches
+// installed_apps_inventory.hpp's own convention) -- never synthesised, never a
+// "-" placeholder (format_app_row applies that display convention itself, at
+// format time).
 struct AppRecord {
     std::string name;
     std::string version;
@@ -340,6 +342,39 @@ struct PkgutilInfo {
             info.install_time = std::string(value);
     }
     return info;
+}
+
+// ── `list` row formatting ───────────────────────────────────────────────────
+
+// Field set of one `list` row; mirrors installed_apps_plugin.cpp's AppInfo
+// (kept separate so the formatter stays pure and unit-testable on any host).
+struct AppRowFields {
+    std::string name;
+    std::string version;
+    std::string publisher;
+    std::string install_date;
+    std::string install_location;
+    std::string bundle_id;
+};
+
+// `app|name|version|publisher|install_date|install_location|bundle_id`.
+// Every field but `name` renders "-" when empty (an absent InstallLocation /
+// bundle_id is a designed "-", never fabricated). No escaping is applied here:
+// like the pre-existing four columns, a '|' inside a field is emitted as-is
+// (known gap, out of scope); the caller applies sanitize_utf8 to the result.
+[[nodiscard]] inline std::string format_app_row(const AppRowFields& f) {
+    const auto or_dash = [](const std::string& v) -> const std::string& {
+        static const std::string kDash = "-";
+        return v.empty() ? kDash : v;
+    };
+    std::string out = "app|";
+    out += f.name;
+    for (const auto* v : {&f.version, &f.publisher, &f.install_date, &f.install_location,
+                          &f.bundle_id}) {
+        out += '|';
+        out += or_dash(*v);
+    }
+    return out;
 }
 
 } // namespace yuzu::installed_apps::parsers

@@ -39,6 +39,10 @@
 // open decision for the repo owner, recorded here and in the gate report,
 // deliberately not taken unilaterally in this PR.
 //
+// ADR-0028 binding condition (list-only): bundle_id_for() below feeds the
+// `list` action's trailing bundle_id column. That is an operator-facing column
+// only; the ADR-0016 InvRecord is untouched (see the next paragraph).
+//
 // ADR-0016 CRITICAL: the blob-v2 12-field row (installed_apps_inventory.hpp)
 // is hashed byte-identically on agent and server. This header hands its
 // caller a bundle id, publisher, and a binary signed/unsigned verdict; the
@@ -102,6 +106,31 @@ inline std::string cfstring_to_utf8(CFStringRef s) {
 
 } // namespace detail
 
+// Bundle identifier (CFBundleIdentifier) for the app at `app_path` (an absolute
+// .app path), or "" when the path is not a readable bundle or carries no
+// identifier. The ONE bundle-id read in this plugin: enrich_app() below and the
+// `list` action's bundle_id column both call it. No SecStaticCode -- CFBundle
+// only, so it is cheap enough for the interactive `list` path.
+inline std::string bundle_id_for(const std::string& app_path) {
+    yuzu::agent::ScopedCFRef<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        // reinterpret_cast char* -> const UInt8*: byte-type aliasing is the
+        // explicit exemption to the strict-aliasing rule, and `app_path` is a
+        // caller-owned lvalue that outlives this call, so the buffer stays
+        // valid for the whole of CFURLCreateFromFileSystemRepresentation.
+        nullptr, reinterpret_cast<const UInt8*>(app_path.c_str()),
+        static_cast<CFIndex>(app_path.size()), /*isDirectory=*/true));
+    if (!url)
+        return {};
+    auto* raw_bundle = CFBundleCreate(nullptr, url.get());
+    if (!raw_bundle)
+        return {};
+    yuzu::agent::ScopedCFRef<CFBundleRef> bundle(raw_bundle);
+    // CFBundleGetIdentifier returns a BORROWED (Get-rule) reference owned
+    // by the bundle -- never itself ScopedCFRef-wrapped, matching
+    // certificates_plugin.cpp's own borrowed-vs-owned discipline.
+    return detail::cfstring_to_utf8(CFBundleGetIdentifier(bundle.get()));
+}
+
 // Enrich one app bundle at `app_path` (an absolute .app path, taken from a
 // system_profiler "Location:" line -- see installed_apps_parsers.hpp).
 // Every CoreFoundation object here is ScopedCFRef-owned (scoped_cfref.hpp) --
@@ -120,15 +149,8 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     if (!url)
         return out;
 
-    // -- bundle identifier via CFBundle --
-    if (auto* raw_bundle = CFBundleCreate(nullptr, url.get())) {
-        yuzu::agent::ScopedCFRef<CFBundleRef> bundle(raw_bundle);
-        // CFBundleGetIdentifier returns a BORROWED (Get-rule) reference owned
-        // by the bundle -- never itself ScopedCFRef-wrapped, matching
-        // certificates_plugin.cpp's own borrowed-vs-owned discipline.
-        if (CFStringRef ident = CFBundleGetIdentifier(bundle.get()))
-            out.bundle_id = detail::cfstring_to_utf8(ident);
-    }
+    // -- bundle identifier via CFBundle (shared read, see bundle_id_for) --
+    out.bundle_id = bundle_id_for(app_path);
 
     // -- signer + integrity via SecStaticCode --
     // ADOPT FIRST, TEST SECOND. Testing the status before adopting leaves a
@@ -216,6 +238,7 @@ inline EnrichResult enrich_app(const std::string& app_path) {
 // no-op -- every field stays empty, matching certificates/meson.build's own
 // `required: false` fallback contract.
 inline EnrichResult enrich_app(const std::string& /*app_path*/) { return EnrichResult{}; }
+inline std::string bundle_id_for(const std::string& /*app_path*/) { return {}; }
 
 #endif // YUZU_HAVE_SECURITY_FRAMEWORK
 

@@ -20,6 +20,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
 using namespace yuzu::installed_apps::parsers;
 
 // ── acquisition-health decision ─────────────────────────────────────────
@@ -362,4 +364,44 @@ TEST_CASE("pkgutil pkg-info: malformed/empty input yields an all-empty result, n
     auto garbage = parse_pkgutil_pkg_info("not a key-value line at all\n");
     CHECK(garbage.version.empty());
     CHECK(garbage.install_time.empty());
+}
+
+// ── list row formatting (ADR-0028 binding condition) ────────────────────────
+// Pure formatter -- no fixture provenance needed; inputs are literals.
+
+TEST_CASE("format_app_row: all six fields present", "[installed_apps]") {
+    CHECK(format_app_row({"Safari", "26.0", "Apple", "2026-08-13", "/Applications/Safari.app",
+                          "com.apple.Safari"}) ==
+          "app|Safari|26.0|Apple|2026-08-13|/Applications/Safari.app|com.apple.Safari");
+}
+
+TEST_CASE("format_app_row: absent InstallLocation renders '-', never fabricated",
+          "[installed_apps]") {
+    CHECK(format_app_row({"Legacy Tool", "1.0", "Acme", "20200101", "", ""}) ==
+          "app|Legacy Tool|1.0|Acme|20200101|-|-");
+    // bundle_id absent alone (Windows/Linux shape with a location, or a macOS
+    // bundle that carries no CFBundleIdentifier).
+    CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "C:\\Program Files\\Tool", ""}) ==
+          "app|Tool|1.0|Acme|20200101|C:\\Program Files\\Tool|-");
+    // location present, bundle id absent.
+    CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "", "com.acme.tool"}) ==
+          "app|Tool|1.0|Acme|20200101|-|com.acme.tool");
+}
+
+TEST_CASE("format_app_row: empty optional fields all render '-', always seven fields",
+          "[installed_apps]") {
+    const auto row = format_app_row({"OnlyName", "", "", "", "", ""});
+    CHECK(row == "app|OnlyName|-|-|-|-|-");
+    CHECK(std::count(row.begin(), row.end(), '|') == 6);
+}
+
+TEST_CASE("format_app_row: a '|' inside a field is emitted as-is (pre-existing gap, pinned)",
+          "[installed_apps]") {
+    // The plugin's list row has never escaped '|' (sanitize_utf8 only repairs
+    // invalid UTF-8). This pins that the formatter does not change that:
+    // such a row splits into more than seven naive fields. Recorded as a
+    // deferred item; a future escaping change must update this case.
+    const auto row = format_app_row({"A|B", "1", "P", "D", "L", "B"});
+    CHECK(row == "app|A|B|1|P|D|L|B");
+    CHECK(std::count(row.begin(), row.end(), '|') == 7);
 }
