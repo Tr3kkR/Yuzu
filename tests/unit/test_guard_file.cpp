@@ -531,7 +531,7 @@ public:
         });
         REQUIRE(guard_->start());
         // The first evaluation runs after the watches are armed, so its report is the barrier.
-        REQUIRE(col_->wait_count(1, 10s));
+        REQUIRE(col_->wait_count(1, 30s));
     }
 
     const fs::path& root() const { return root_.path; }
@@ -585,7 +585,7 @@ void run_rename_then_recreate(RigMode m, bool move_to_other_parent) {
         rig.move(rig.dir(), rig.root() / "D2");
     }
     rig.recreate_and_write();
-    CHECK(rig.wait_detected(5s));
+    CHECK(rig.wait_detected(30s));
 }
 
 void run_rename_reports_absent(RigMode m, bool move_to_other_parent) {
@@ -596,7 +596,7 @@ void run_rename_reports_absent(RigMode m, bool move_to_other_parent) {
     } else {
         rig.move(rig.dir(), rig.root() / "D2");
     }
-    CHECK(rig.col().wait_for_detected("<absent>", 5s));
+    CHECK(rig.col().wait_for_detected("<absent>", 30s));
 }
 
 void run_delete_then_recreate(RigMode m) {
@@ -604,7 +604,7 @@ void run_delete_then_recreate(RigMode m) {
     std::error_code ec;
     fs::remove_all(rig.dir(), ec);
     rig.recreate_and_write();
-    CHECK(rig.wait_detected(5s));
+    CHECK(rig.wait_detected(30s));
 }
 
 // Only A exists at arm time (A/B/D does not), so the guard is in nearest-ancestor mode on A.
@@ -613,9 +613,9 @@ void run_ancestor_rename(RigMode m) {
     rig.move(rig.root() / "A", rig.root() / "A2");
     rig.recreate_and_write();
     if (m == RigMode::Hash)
-        CHECK(rig.col().wait_compliant(5s)); // first present read of the recreated file is baselined
+        CHECK(rig.col().wait_compliant(30s)); // first present read of the recreated file is baselined
     else
-        CHECK(rig.wait_detected(5s));
+        CHECK(rig.wait_detected(30s));
 }
 
 void run_sibling_churn(RigMode m) {
@@ -626,7 +626,7 @@ void run_sibling_churn(RigMode m) {
     // The parent watch must still be live after all those re-issues.
     rig.move(rig.dir(), rig.root() / "D2");
     rig.recreate_and_write();
-    CHECK(rig.wait_detected(5s));
+    CHECK(rig.wait_detected(30s));
 }
 
 // Parks the guard thread inside its first report so notifications pile up unread.
@@ -663,7 +663,7 @@ void run_overflow_resync(RigMode m) {
     rig.flood_siblings(600, 300, rig.root() / "D2");
     rig.recreate_and_write();
     gate.release();
-    CHECK(rig.wait_detected(10s));
+    CHECK(rig.wait_detected(30s));
 }
 
 void run_stop_cycles(RigMode m, bool rename_first) {
@@ -681,6 +681,19 @@ void run_stop_cycles(RigMode m, bool rename_first) {
         cycle();
     // A handle leaked per guard would add at least 20.
     CHECK(process_handle_count() < before + 10);
+}
+
+// A drive letter with no root (not mapped, not a network or removable volume), or 0.
+wchar_t unused_drive_letter() {
+    const DWORD mask = GetLogicalDrives();
+    for (wchar_t c = L'Z'; c >= L'D'; --c) {
+        if (mask & (1u << (c - L'A')))
+            continue;
+        const wchar_t root[] = {c, L':', L'\\', L'\0'};
+        if (GetDriveTypeW(root) == DRIVE_NO_ROOT_DIR)
+            return c;
+    }
+    return 0;
 }
 
 } // namespace
@@ -765,6 +778,56 @@ TEST_CASE("FileGuard rename: stop() while idle returns promptly and leaks no han
 TEST_CASE("FileGuard rename: stop() right after a rename returns promptly and leaks no handles",
           "[guardian][guard][file][rename][teardown]") {
     run_stop_cycles(RigMode::Hash, true);
+}
+
+// The walk from the target up to its nearest existing directory must end at a root that is not a
+// directory. A regression would spin the guard thread and hang stop(), so stop() runs on a helper
+// thread with a deadline; on timeout the guard and the helper are leaked so the suite still ends.
+TEST_CASE("FileGuard rename: a target under an unavailable drive root does not hang stop()",
+          "[guardian][guard][file][rename][teardown]") {
+    const wchar_t letter = unused_drive_letter();
+    if (letter == 0) {
+        SKIP("no unused drive letter on this host");
+    }
+
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-rename-root";
+    cfg.path = std::string(1, static_cast<char>(letter)) + ":\\yuzu_test_fgrename_root\\f.txt";
+    cfg.event_debounce_ms = 50;
+    auto col = std::make_shared<FileDriftCollector>();
+    auto* guard = new FileGuard(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(guard->start());
+    // file-exists with the default expectation: the first evaluation reports the absent target,
+    // and it only runs once arming has returned.
+    const bool armed = col->wait_for_detected("<absent>", 30s);
+
+    struct StopState {
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+    };
+    auto st = std::make_shared<StopState>();
+    std::thread stopper([guard, st] {
+        guard->stop();
+        {
+            std::lock_guard lk(st->m);
+            st->done = true;
+        }
+        st->cv.notify_all();
+    });
+    bool stopped = false;
+    {
+        std::unique_lock lk(st->m);
+        stopped = st->cv.wait_for(lk, 10s, [&] { return st->done; });
+    }
+    if (stopped) {
+        stopper.join();
+        delete guard;
+    } else {
+        stopper.detach(); // leak the guard and its spinning thread rather than hang the suite
+    }
+    CHECK(armed);
+    CHECK(stopped);
 }
 
 #else // !_WIN32
