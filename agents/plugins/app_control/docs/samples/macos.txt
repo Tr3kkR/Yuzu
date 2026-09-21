@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 4d9ef9de22fc
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash b47a1cdbe79e
 == action=wdac_policy
 wdac_policy|unsupported|windows_only_concept
 [result_status] UNAVAILABLE / PARTIAL / windows_only_concept

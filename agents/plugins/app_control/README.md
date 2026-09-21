@@ -14,7 +14,7 @@
 
 ## How it works
 
-`wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`; when the class is absent or returns no rows it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count).
+`wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`; when the class is absent, returns no usable rows or fails it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count).
 
 **Why it exists.** `docs/capability-map.md` §9.10 (Application Whitelisting, graded partial by this plugin) and `docs/roadmap.md` Issue 12.11 (#282, Open) are the tracked demand; `docs/enterprise-parity-plan.md` Phase 12.11 names the full action set (`get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`). This plugin delivers only the read-only posture; the rest is listed under Caveats.
 
@@ -35,7 +35,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `applocker_policy` | 🟡 constrained · rung 1 · wmi_bounded run_bounded_wmi_query root\\StandardCimv2\\Security\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2\\<collection> when the class is absent or empty | ⛔ unsupported | ⛔ unsupported |
+| `applocker_policy` | 🟡 constrained · rung 1 · wmi_bounded run_bounded_wmi_query root\\StandardCimv2\\Security\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2\\<collection> when the class is absent, empty or failing | ⛔ unsupported | ⛔ unsupported |
 | `wdac_policy` | ✅ supported · rung 1 · RegEnumValueW HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy + std::filesystem listing of %SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active\\*.cip | ⛔ unsupported | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -102,7 +102,7 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind. `
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. `gather.ttlSeconds: 300` only caps how often a repeat dispatch is served from cache; nothing runs on a schedule.
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. nothing runs on a schedule.
 - **Sensitivity.** Rows describe the device's application-control configuration (enforcement mode, rule counts, the file stem of each active policy). No username, hostname or rule content appears in any field; a `REG_SZ`/`REG_EXPAND_SZ` value under `CI\Policy` is reported verbatim (escaped, at most 4 KiB), so a string value could carry a path. The posture itself is security-relevant: it tells a reader which controls are not enforced.
 - **Siblings:** `antivirus` (Defender and exclusion state, not application control), `windows_optional_features` (OS feature state), `registry` / `wmi` (general-purpose reads this plugin's narrow surface deliberately does not replace) — none join with this plugin's output.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.app_control.wdac_policy")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
@@ -110,7 +110,7 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind. `
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 4d9ef9de22fc
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash b47a1cdbe79e
 
 ```
 == action=wdac_policy
@@ -133,7 +133,7 @@ applocker|none|absent|0
 [result_status] OK / FULL / registry_srpv2
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 4d9ef9de22fc
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash b47a1cdbe79e
 
 ```
 == action=wdac_policy
@@ -147,7 +147,7 @@ applocker_policy|unsupported|windows_only_concept
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 4d9ef9de22fc
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash b47a1cdbe79e
 
 ```
 == action=wdac_policy
@@ -167,7 +167,7 @@ applocker_policy|unsupported|windows_only_concept
 1. **Read-only posture only; #282 stays open.** The plugin refs #282 and does not close it: the issue also asks for `add_rule`, `remove_rule` and `get_blocked_events` (`docs/enterprise-parity-plan.md` Phase 12.11) and a Linux fapolicyd leg, none of which exist. Rule changes would be Destructive-class actions in a separate change.
 2. **Not EDR-class telemetry.** `docs/roadmap.md` Phase 18 "Out of scope" excludes re-implementing EDR at the agent; this plugin configures nothing and collects no detection data, it reports the state of the OS's own control. The two are not the same thing and a reviewer should not conflate them.
 3. **The CIM property names remain unverified on hardware.** The AppLocker provider namespace `root\StandardCimv2\Security\ApplicationControl` does not exist on the-rig (Windows 11 Pro 10.0.26200, no AppLocker policy configured): the plugin's own bounded WMI helper returned `wmi_connect_failed_0x8004100e` (WBEM_E_INVALID_NAMESPACE), so `applocker_policy` fell back to the `SrpV2` registry walk, which is also absent (`applocker|none|absent|0`, OK / FULL). `Collection`, `EnforcementMode` and `RuleCount` are still assumed by `parse_cim_applocker_row` (a row lacking any of them is reported `cim_row_unrecognised` rather than guessed) and the `SrpV2` rule-collection layout has never been read on an AppLocker-configured host, so both are untested against real data until such a host is probed. The class-absent outcome is a real capture (`tests/unit/fixtures/wave8/app_control/windows/applocker_wmi_probe.txt`); the probe text is in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.
-4. **Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed.
+4. **Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed. The legacy single-policy file `SiPolicy.p7b` is not listed, so `wdac_cip|none|absent` means "no multiple-policy-format files", not "no WDAC policy": a host that enforces only a single-format policy reads that row.
 5. **Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is outside this plugin's scope, and both legs return the honest `unsupported` row unconditionally.
 
 ## Source and tests

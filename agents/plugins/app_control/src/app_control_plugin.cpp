@@ -46,7 +46,9 @@ const YuzuOsLeg kMacosLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
                           "plugin's scope"};
 
 const YuzuActionDescriptor kActionDescriptors[] = {
-    {"wdac_policy", kLinuxLeg, kMacosLeg,
+    {"wdac_policy",
+     kLinuxLeg,
+     kMacosLeg,
      {YUZU_SUPPORT_SUPPORTED, 1,
       "RegEnumValueW HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy + std::filesystem "
       "listing of %SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active\\*.cip",
@@ -56,12 +58,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "policies are listed; only VerifiedAndReputablePolicyState=0 was observed, other values "
       "are mapped per documentation and unverified on hardware. An unmodelled value is reported "
       "'unmodelled'; an unreadable key is constrained or permission_denied, never absent"}},
-    {"applocker_policy", kLinuxLeg, kMacosLeg,
+    {"applocker_policy",
+     kLinuxLeg,
+     kMacosLeg,
      {YUZU_SUPPORT_CONSTRAINED, 1,
       "wmi_bounded run_bounded_wmi_query root\\StandardCimv2\\Security\\ApplicationControl "
       "MSFT_ApplockerPolicy; registry walk of "
       "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2\\<collection> when the class is "
-      "absent or empty",
+      "absent, empty or failing",
       "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace "
       "root\\StandardCimv2\\Security\\ApplicationControl does NOT exist on this host "
       "(WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no "
@@ -104,7 +108,7 @@ public:
             if (action == "wdac_policy" || action == "applocker_policy") {
 #ifdef _WIN32
                 return action == "wdac_policy" ? yuzu::app_control::collect_wdac(ctx)
-                           : yuzu::app_control::collect_applocker(ctx);
+                                               : yuzu::app_control::collect_applocker(ctx);
 #else
                 ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                       YUZU_RESULT_COMPLETENESS_PARTIAL,
