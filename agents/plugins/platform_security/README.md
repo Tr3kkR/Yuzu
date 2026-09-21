@@ -1,6 +1,15 @@
 # platform_security
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Secure Boot and code-integrity enforcement posture (read-only) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.platform_security.secure_boot, crossplatform.platform_security.code_integrity) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `code_integrity` (definition `crossplatform.platform_security.code_integrity`) · `secure_boot` (definition `crossplatform.platform_security.secure_boot`) |
+| **Security** | securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -28,6 +37,14 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `code_integrity` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values | ✅ supported · rung 2 · spctl --status + csrutil status via run_bounded_subprocess | ✅ supported · rung 1 · securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) |
+| `secure_boot` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled) | ⛔ unsupported | ✅ supported · rung 1 · efivarfs reads of /sys/firmware/efi/efivars/SecureBoot-* and SetupMode-* (4-byte attributes + 1 data byte; errno-classified absent/unreadable) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`secure_boot` / macOS** — no public API; SIP reported under code_integrity
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -45,6 +62,7 @@ Binaries and subprocesses: macOS `code_integrity` runs exactly two, `/usr/sbin/s
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -52,6 +70,25 @@ Binaries and subprocesses: macOS `code_integrity` runs exactly two, `/usr/sbin/s
 Pipe-delimited rows written via `write_output()`, in read order. The first field is the fixed action literal (`secure_boot` or `code_integrity`), then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent`, `unreadable`, `unsupported`); a raw value that was read passes through the shared untrusted-output escaper, which turns a backslash into `/` and escapes a pipe. Linux `secure_boot` writes `secure_boot` then `setup_mode`, `code_integrity` writes `lsm` then `lockdown`; macOS writes `gatekeeper` then `sip`. Windows rows can outnumber the named values because every `CI\Policy` value is listed, sorted by name, with the one modelled value mapped and the rest `unmodelled`. The action returns 0 for every data-level outcome; only an internal exception returns 1, with the single two-field row `constrained|internal_error`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.platform_security.code_integrity` — `row_kind|os|key|raw|state`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `code_integrity` `constrained` | Windows, Linux, macOS | `code_integrity` | Row family: `code_integrity` (one per key read) or `constrained` (an internal-error row: the two-field row `constrained\|internal_error`, which carries no os, key, raw or state). |
+| `os` | string | `linux` `macos` `windows` | Windows, Linux, macOS | `linux` | The leg that produced the row. |
+| `key` | string | - | Windows, Linux, macOS | `lsm` | Value read: lsm and lockdown (Linux); gatekeeper and sip (macOS); ci_policy.<value name> for every value under CI\Policy, deviceguard.EnableVirtualizationBasedSecurity, deviceguard.RequirePlatformSecurityFeatures, deviceguard.HypervisorEnforcedCodeIntegrity, deviceguard.hvci_scenario_enabled and lsa.LsaCfgFlags (Windows; LsaCfgFlags lives under Control\Lsa, not DeviceGuard). |
+| `raw` | string | - | Windows, Linux, macOS | `capability,landlock,yama,apparmor` | The raw text or number read (the LSM list, the lockdown line with its bracketed active mode, the first line of tool output, or the registry value); "-" when nothing was read (absent or unreadable). |
+| `state` | string | `enabled` `disabled` `partial` `evaluation` `enabled_locked` `unmodelled` `absent` `unreadable` | Windows, Linux, macOS | `enabled` | enabled, disabled and partial describe the PROTECTION, not the raw value (Linux lockdown integrity is partial, confidentiality is enabled; macOS SIP with a custom configuration is partial). evaluation (Smart App Control in evaluation mode) and enabled_locked (Credential Guard with a UEFI lock) are Windows-only. unmodelled = a value was read that this table has no interpretation for (raw keeps it). absent = the OS definitively says it is not there (no lockdown LSM, no DeviceGuard values on a default Windows install), a normal answer and not a failure. unreadable = the read failed. |
+
+**`crossplatform.platform_security.secure_boot` — `row_kind|os|key|raw|state`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `secure_boot` `constrained` | Windows, Linux, macOS | `secure_boot` | Row family: `secure_boot` (one per key read) or `constrained` (an internal-error row: the two-field row `constrained\|internal_error`, which carries no os, key, raw or state). |
+| `os` | string | `linux` `macos` `windows` | Windows, Linux, macOS | `linux` | The leg that produced the row. |
+| `key` | string | - | Windows, Linux, macOS | `secure_boot` | Value read: secure_boot and setup_mode (Linux efivars), secure_boot (macOS, unsupported row), UEFISecureBootEnabled (Windows). |
+| `raw` | string | - | Windows, Linux, macOS | `1` | The raw value read (the efivar data byte, or the registry DWORD as a number); "-" when nothing was read (absent, unreadable or unsupported). |
+| `state` | string | `enabled` `disabled` `unmodelled` `absent` `unreadable` `unsupported` | Windows, Linux, macOS | `enabled` | enabled = Secure Boot enforcing (for setup_mode: User Mode, a Platform Key is enrolled); disabled = Secure Boot off (for setup_mode: Setup Mode, no Platform Key, any image may load). The state describes the protection, not the raw number. unmodelled = a value was read that this table has no interpretation for (raw keeps it). absent = the OS definitively says it is not there (a BIOS/CSM boot has no efivars or SecureBoot\State), a normal answer and not a failure. unreadable = the read failed. unsupported = no mechanism on this OS (macOS). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -74,6 +111,52 @@ Pipe-delimited rows written via `write_output()`, in read order. The first field
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash fb2bb3055717
+
+```
+== action=secure_boot
+secure_boot|windows|UEFISecureBootEnabled|1|enabled
+[result_status] OK / FULL
+
+== action=code_integrity
+code_integrity|windows|ci_policy.EmodePolicyRequired|0|unmodelled
+code_integrity|windows|ci_policy.SAC_PreviousState|4294967295|unmodelled
+code_integrity|windows|ci_policy.SkuPolicyRequired|0|unmodelled
+code_integrity|windows|ci_policy.VerifiedAndReputablePolicyState|0|disabled
+code_integrity|windows|deviceguard.EnableVirtualizationBasedSecurity|-|absent
+code_integrity|windows|deviceguard.HypervisorEnforcedCodeIntegrity|-|absent
+code_integrity|windows|deviceguard.RequirePlatformSecurityFeatures|-|absent
+code_integrity|windows|deviceguard.hvci_scenario_enabled|-|absent
+code_integrity|windows|lsa.LsaCfgFlags|-|absent
+[result_status] OK / FULL
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash fb2bb3055717
+
+```
+== action=secure_boot
+secure_boot|macos|secure_boot|-|unsupported
+[result_status] UNAVAILABLE / FULL / no public API; SIP reported under code_integrity
+
+== action=code_integrity
+code_integrity|macos|gatekeeper|assessments enabled|enabled
+code_integrity|macos|sip|System Integrity Protection status: enabled.|enabled
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash fb2bb3055717
+
+```
+== action=secure_boot
+secure_boot|linux|secure_boot|-|absent
+secure_boot|linux|setup_mode|-|absent
+[result_status] OK / FULL
+
+== action=code_integrity
+code_integrity|linux|lsm|-|absent
+code_integrity|linux|lockdown|-|absent
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -87,4 +170,9 @@ Pipe-delimited rows written via `write_output()`, in read order. The first field
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/platform_security/src/platform_security_legs.hpp` · `agents/plugins/platform_security/src/platform_security_linux.cpp` · `agents/plugins/platform_security/src/platform_security_macos.cpp` · `agents/plugins/platform_security/src/platform_security_parsers.hpp` · `agents/plugins/platform_security/src/platform_security_plugin.cpp` · `agents/plugins/platform_security/src/platform_security_win.cpp` · `agents/plugins/platform_security/src/platform_security_win_parsers.hpp`
+- Definitions: `content/definitions/platform_security.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp`
+- Tests: `tests/unit/test_platform_security_local_dispatcher.cpp` · `tests/unit/test_platform_security_parsers.cpp` · `tests/unit/test_platform_security_win_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

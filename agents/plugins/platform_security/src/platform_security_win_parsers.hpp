@@ -512,11 +512,30 @@ inline const RegExportKey* find_key(const RegExport& e, std::string_view path) {
 }
 
 /// A KeyRead from an exported key (what the TU would have observed reading it live).
-inline KeyRead key_read_from_export(const RegExportKey* k) {
+/// The KeyRead the shell would have produced for an exported key. The shell reads every value of an
+/// `enumerate` key but ONLY the named ones of any other (one query per name, a missing one is an
+/// `absent` outcome), so `spec` reproduces that: a real export holds values the plugin never asks
+/// for (PolicyPublisher, CachedDrtmAuthIndex) and lacks ones it does.
+inline KeyRead key_read_from_export(const RegExportKey* k, const KeySpec* spec = nullptr) {
     KeyRead kr;
     if (!k)
         return {false, classify_win32_failure("export", kErrorFileNotFound), {}, true};
-    kr.values = k->values;
+    for (const auto& v : k->values)
+        if (!spec || spec->enumerate || find_expected(*spec, v.name))
+            kr.values.push_back(v);
+    if (spec && !spec->enumerate)
+        for (const auto& e : spec->expected) {
+            const bool present = std::any_of(kr.values.begin(), kr.values.end(), [&](const ValueOutcome& v) {
+                return find_expected(*spec, v.name) == &e;
+            });
+            if (!present) {
+                ValueOutcome o;
+                o.name = std::string{e.name};
+                o.ok = false;
+                o.failure = classify_win32_failure("export", kErrorFileNotFound);
+                kr.values.push_back(std::move(o));
+            }
+        }
     return kr;
 }
 

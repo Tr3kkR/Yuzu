@@ -17,14 +17,23 @@
  *   HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy (present, 4 values, all REG_DWORD):
  *     EmodePolicyRequired 0x0 | SkuPolicyRequired 0x0 | VerifiedAndReputablePolicyState 0x0 |
  *     SAC_PreviousState 0xffffffff   (fixtures/wave8/platform_security/windows/ci_policy.reg)
- * NOT YET PROBED (engineers never touch the rig; the integrator pastes rig session C output here
- * before the PR, verbatim, replacing each tag):
- *   SecureBoot\State values, ON and OFF -- PENDING RIG SESSION
- *   Control\DeviceGuard values -- PENDING RIG SESSION
- *   DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity values -- PENDING RIG SESSION
- *   Control\Lsa\LsaCfgFlags (policy mirror under HKLM\SOFTWARE\Policies = evidence only) -- PENDING RIG SESSION
- *   WLDP GetProcAddress(LoadLibraryExW(L"wldp.dll", LOAD_LIBRARY_SEARCH_SYSTEM32), "WldpGetLockdownPolicy")
- *   resolution + return code; evidence only, a row only if it returns what the registry lacks -- PENDING RIG SESSION
+ * RIG SESSION C (2026-09-21, the-rig, same identity; the transcript is in the PR body), verbatim:
+ *   SecureBoot\State (Secure Boot ON; Confirm-SecureBootUEFI = True): UEFISecureBootEnabled REG_DWORD 0x1 |
+ *     PolicyPublisher REG_SZ {77fa9abd-0359-4d32-bd60-28f4e78f784b} | PolicyVersion REG_DWORD 0x1
+ *     (fixtures/wave8/platform_security/windows/secureboot_state.reg). The OFF state was NOT captured:
+ *     the firmware toggle cannot be flipped remotely.
+ *   Control\DeviceGuard (default host, VBS/HVCI not configured): CachedDrtmAuthIndex 0x0 |
+ *     RequireMicrosoftSignedBootChain 0x1; EnableVirtualizationBasedSecurity,
+ *     RequirePlatformSecurityFeatures and HypervisorEnforcedCodeIntegrity are ABSENT; Scenarios has
+ *     CredentialGuard\Enabled 0x0 and KeyGuard\Status (deviceguard_real.reg).
+ *   DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity: ABSENT (no such subkey).
+ *   Control\Lsa: LsaCfgFlags ABSENT (only LsaCfgFlagsDefault 0x0 exists); the policy mirror
+ *     HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard is ABSENT.
+ *   WLDP: LoadLibraryExW(wldp.dll, LOAD_LIBRARY_SEARCH_SYSTEM32) succeeded and WldpGetLockdownPolicy
+ *     resolves. Called with hostId GLOBAL it returns E_INVALIDARG (0x80070057); with hostId POWERSHELL
+ *     and ALL it returns S_OK and lockdownState 0x80000000 (undefined), i.e. nothing the registry
+ *     lacks, so no WLDP row is emitted.
+ *   Never measured: any VBS/HVCI/Credential Guard ON state, a non-zero LsaCfgFlags, Secure Boot OFF.
  */
 
 #if defined(_WIN32)

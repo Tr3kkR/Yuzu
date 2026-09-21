@@ -37,7 +37,7 @@ RegExport load(const std::string& name) {
 }
 
 KeyRead read_of(const RegExport& e, const KeySpec& spec) {
-    return key_read_from_export(find_key(e, spec.path));
+    return key_read_from_export(find_key(e, spec.path), &spec);
 }
 
 std::vector<std::string> lines(const Report& r) {
@@ -164,6 +164,31 @@ TEST_CASE("code_integrity over the DeviceGuard reconstruction", "[platform_secur
     CHECK(select_status(rep).status == YUZU_RESULT_STATUS_OK);
 }
 
+TEST_CASE("code_integrity over the-rig's REAL CAPTURE: the configured VBS/HVCI/LSA values are absent",
+          "[platform_security][win_parsers]") {
+    // REAL CAPTURE (ci_policy.reg + deviceguard_real.reg): a default host that does not configure
+    // VBS/HVCI has none of the configured DeviceGuard values, no HypervisorEnforcedCodeIntegrity
+    // scenario key and no LsaCfgFlags (that last read is `reg query` evidence, see the provenance):
+    // each is a definitive `absent` row and the run is OK. Fails if any absent reads as a failure or
+    // if a value from the KeyGuard/CredentialGuard scenarios leaks into a row.
+    const auto ci = load("ci_policy.reg");
+    const auto dg = load("deviceguard_real.reg");
+    const auto rep = build_code_integrity_report(read_of(ci, kCiPolicyKey), read_of(dg, kDeviceGuardKey),
+                                                 read_of(dg, kHvciScenarioKey), absent_key());
+    CHECK(lines(rep) == Lines{
+        "code_integrity|windows|ci_policy.EmodePolicyRequired|0|unmodelled",
+        "code_integrity|windows|ci_policy.SAC_PreviousState|4294967295|unmodelled",
+        "code_integrity|windows|ci_policy.SkuPolicyRequired|0|unmodelled",
+        "code_integrity|windows|ci_policy.VerifiedAndReputablePolicyState|0|disabled",
+        "code_integrity|windows|deviceguard.EnableVirtualizationBasedSecurity|-|absent",
+        "code_integrity|windows|deviceguard.HypervisorEnforcedCodeIntegrity|-|absent",
+        "code_integrity|windows|deviceguard.RequirePlatformSecurityFeatures|-|absent",
+        "code_integrity|windows|deviceguard.hvci_scenario_enabled|-|absent",
+        "code_integrity|windows|lsa.LsaCfgFlags|-|absent"});
+    CHECK(select_status(rep).status == YUZU_RESULT_STATUS_OK);
+    CHECK(select_status(rep).completeness == YUZU_RESULT_COMPLETENESS_FULL);
+}
+
 TEST_CASE("code_integrity: LsaCfgFlags is read from Control\\Lsa", "[platform_security][win_parsers]") {
     // RECONSTRUCTION (inline): Microsoft Learn "Configure Credential Guard" puts LsaCfgFlags under
     // Control\Lsa. Fails if kLsaKey's path moves, its row key reverts to deviceguard.*, or 2 stops
@@ -178,7 +203,7 @@ TEST_CASE("code_integrity: LsaCfgFlags is read from Control\\Lsa", "[platform_se
 
 TEST_CASE("secure_boot: on, off, unmodelled, absent and unreadable are five distinct rows",
           "[platform_security][win_parsers]") {
-    // on = RECONSTRUCTION fixture; off/unmodelled rewrite its dword text. Fails if any pair
+    // on = REAL CAPTURE (Secure Boot ON on the-rig); off/unmodelled rewrite its dword text. Fails if any pair
     // collapses (absent vs unreadable is the "failure never reads as absent" pin).
     const std::string on = fixture_text("secureboot_state.reg");
     const auto rows = [&](const std::string& text) {
