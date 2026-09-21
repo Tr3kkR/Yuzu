@@ -707,9 +707,12 @@ public:
     /// mirrors `set_dex_perf_api` above: `build_handler`'s own
     /// `ScheduleEngine* schedule_engine` parameter is now unused inside the
     /// `list_schedules` handler body (superseded by this seam) but is kept,
-    /// unremoved, for constructor-signature stability — a disclosed,
-    /// deferred follow-up, not an oversight (matrix doc, `schedule` family
-    /// row). Unset (default-constructed null) ⇒ the tool's own `!schedule_api_`
+    /// unremoved, for constructor-signature stability — a bounded, two-site
+    /// ripple (the two `ScheduleEngine* schedule_engine` forwarding-overload
+    /// parameters in mcp_server.cpp that construct `build_handler`'s caller),
+    /// not an open-ended one; a disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `schedule` family row). Unset (default-constructed
+    /// null) ⇒ the tool's own `!schedule_api_`
     /// readiness guard answers "Schedule engine unavailable", matching the
     /// pre-seam `!schedule_engine` guard's behaviour exactly.
     void set_schedule_api(std::shared_ptr<const ScheduleApi> a) { schedule_api_ = std::move(a); }

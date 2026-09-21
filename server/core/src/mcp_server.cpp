@@ -10887,7 +10887,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // supersedes a direct `schedule_engine` reach; the
                 // `build_handler` parameter of that name is now unused in
                 // this handler, kept for constructor-signature stability
-                // (mcp_server.hpp's set_schedule_api doc comment).
+                // across the two forwarding overloads that construct
+                // build_handler's caller (mcp_server.cpp's two
+                // `ScheduleEngine* schedule_engine` overload parameters
+                // that forward into this call -- a bounded, 2-site ripple,
+                // not an open-ended one; see mcp_server.hpp's
+                // set_schedule_api doc comment).
                 if (!schedule_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Schedule engine unavailable"),
