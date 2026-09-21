@@ -1341,21 +1341,21 @@ cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive
 clearing on the next success. Two residuals remain: a real directory notification during an
 episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
 rather than the backoff; and a single poison obligation fails the whole pass, starving the others
-until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open. The
-list below sets out that gap, the contract a consumer of `inert` needs and two further recorded
-limits.
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open
+(#4685). The list below sets out that gap, the contract a consumer of `inert` needs and two
+further recorded limits.
 
 **R5.7 (g), continued: the File worker-failure contract (#4658).**
 
-1. KNOWN open gap, a precondition for the F14 flip. No issue exists for this yet; it must be filed
-   and cited here before the F14 flip. While File is runtime-inert, a Guardian reconcile (a
-   full-sync policy push, for example) builds its capability set without File
-   (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File rule it touches
-   `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule already armed
-   through Spark and withdraws its legacy guard, and a full sync tears both backends down first
-   (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`). Live File
-   rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so they
-   stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
+1. KNOWN open gap, a precondition for the F14 flip. Tracked as issue #4685, with an entry in the
+   flip-gate risk-accept register (`docs/spark-flip-gate.md` section 5). While File is
+   runtime-inert, a Guardian reconcile (a full-sync policy push, for example) builds its capability
+   set without File (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File
+   rule it touches `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule
+   already armed through Spark and withdraws its legacy guard, and a full sync tears both backends
+   down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`).
+   Live File rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so
+   they stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
    reconcile or an agent restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
    has the same shape and predates #4658. `guardian_engine.cpp` is unchanged by #4658, so it is
    cited by symbol.
@@ -1391,7 +1391,7 @@ limits.
      Deferred watch.
    - The `worker pass failed (consecutive #1)` and `recovered` lines are logged on every episode;
      the 1, 2, 4, 8 gate bounds only an unbroken one, so intermittent failure while directories
-     churn is not rate-limited across episodes.
+     churn is not rate-limited across episodes (#4686).
    - Only an exception that ESCAPES a pass counts: a throwing emit or fault sink is caught inside
      the pass, counted in `emit_failed`/`fault_failed`, and does not count toward the three.
    - Known limit: a retry pass that finds nothing due counts as a SUCCESS (it clears the failure
