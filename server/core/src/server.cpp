@@ -1660,12 +1660,12 @@ public:
                           "cluster / not_connected = agent not connected on the dialed "
                           "cluster / agent_mismatch = response named a different agent, "
                           "refused / other), labelled by the resolved cluster_id "
-                          "(config key, or 'unknown' — never the raw gateway-asserted "
+                          "(config key, or 'unknown' - never the raw gateway-asserted "
                           "value). Any non-ok movement means commands to gateway-connected "
                           "agents are being lost. A DISTINCT, non-dispatch outcome shares "
                           "this metric name: unmapped_cluster_seen (emitted from "
                           "gateway_service_impl.cpp at gateway CONNECT time, cluster_id "
-                          "always 'unknown') — an early-warning signal that a session "
+                          "always 'unknown') - an early-warning signal that a session "
                           "announced an unmapped cluster before any command was even "
                           "attempted against it, consistency-auditor Gate 4 finding.",
                           "counter");
