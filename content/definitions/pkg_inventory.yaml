@@ -24,8 +24,10 @@
 ##
 ## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge.
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
-## bundles that installed_apps' macOS `list` also reports via system_profiler;
-## this plugin adds the manager identity and the cask version.
+## bundles that installed_apps' macOS `list` also reports via system_profiler, and
+## installed_apps' `list_per_user` lists Homebrew formulae per user (user_app|brew|...);
+## this plugin is the machine-scope, zero-subprocess view of the same store and
+## adds the manager identity and the cask version.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -82,7 +84,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: 'Manager rows: whether the manager was readable. Values: present, unavailable (detected but nothing could be read; see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).'
+        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).'
         values: [present, unavailable, supported, constrained, unsupported]
         example: present
         platforms: [windows, linux, darwin]
@@ -108,7 +110,8 @@ spec:
         platforms: [linux, darwin]
     aggregation:
       groupBy:
-        - name
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.
+        - row_kind
       operations:
         - count
 
@@ -142,16 +145,18 @@ metadata:
     Reports the packages installed under a package manager, read from
     directory names with no subprocess. macOS reports Homebrew formulae
     (Cellar/<formula>/<version>) and casks (Caskroom/<cask>/<version>) over
-    both /opt/homebrew and /usr/local. Linux is UNSUPPORTED by design:
+    both /opt/homebrew and /usr/local. A formula or cask present under both
+    prefixes yields one row per prefix. Linux is UNSUPPORTED by design:
     installed_apps owns the Linux package roster, so this action reports
     `status|packages|unsupported|linux:owned_by_installed_apps` and no
     package row. Windows is planned this release and reports
     `status|packages|unsupported|windows:planned`. Machine scope only:
     per-user package stores are out of scope, deferred to the user-context
     bridge. Homebrew casks install .app bundles that installed_apps' macOS
-    `list` also reports via system_profiler, so this action does not claim
-    to be disjoint from it; it adds the manager identity and the cask
-    version.
+    `list` also reports via system_profiler, and installed_apps'
+    `list_per_user` lists Homebrew formulae per user, so this action does not
+    claim to be disjoint from either; it adds the manager identity and the
+    cask version.
   tags: [software, package-managers, inventory]
 
 spec:
@@ -202,7 +207,8 @@ spec:
         platforms: [darwin]
     aggregation:
       groupBy:
-        - kind
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.
+        - row_kind
       operations:
         - count
 

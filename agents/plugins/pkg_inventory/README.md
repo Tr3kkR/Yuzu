@@ -14,15 +14,15 @@
 
 ## How it works
 
-`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW`): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned. Every action writes a `status` row first, then data rows. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. On Linux, `managers` is a planned placeholder that reads nothing and reports `status|managers|unsupported|linux:planned` (the manager identity and config-fact leg for dpkg, apt, rpm, dnf, pacman and apk follows as its own PR), and `packages` is deliberately unsupported (`installed_apps` owns the Linux package roster). Both Windows legs are planned placeholders too. Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree.
+`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW`): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned. Every action writes a `status` row first, then data rows. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. On Linux, `managers` reads nothing and reports `status|managers|unsupported|linux:planned` (caveat 3), and `packages` is unsupported by design (`installed_apps` owns the Linux package roster). On Windows both actions read nothing and report `status|<action>|unsupported|windows:planned` (caveat 5). Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree and through the real emission seam.
 
 ```mermaid
 flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[pkg_inventory.execute]
-  EX --> WIN[Windows leg<br/>planned placeholder, status row only]
+  EX --> WIN[Windows leg<br/>status row only: windows:planned]
   EX --> MAC[macOS leg<br/>Homebrew Taps / Cellar / Caskroom directory names]
-  EX --> LIN[Linux leg<br/>planned placeholder, status row only]
+  EX --> LIN[Linux leg<br/>status row only: linux:planned / linux:owned_by_installed_apps]
   WIN & MAC & LIN --> ROWS[status row then data rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
@@ -46,9 +46,9 @@ The capability-matrix rows for this plugin in `docs/os-capability-matrix.md` are
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None — the leg reads nothing yet | Not measured — the leg is a planned placeholder that emits only a status row | n/a — no read is attempted; every action reports `status\|<action>\|unsupported\|windows:planned` |
+| Windows | agent service account (LocalSystem today, #1442) | None — the leg reads nothing | Not measured — the leg emits only a status row (caveat 5) | n/a — no read is attempted; every action reports `status\|<action>\|unsupported\|windows:planned` |
 | macOS | agent daemon, root today (LaunchDaemon carries no `UserName` key — `docs/agent-privilege-model.md` TL;DR); this plugin's own reads need no elevation beyond that default | None documented — Homebrew's `Cellar`, `Caskroom` and `Library/Taps` are ordinary directories | Not yet measured under the agent identity; the walk was exercised over a real formulae-only capture of this Mac's `/opt/homebrew/Cellar` (`tests/unit/fixtures/wave10/pkg_inventory/macos/provenance.txt`) | A location that exists but cannot be opened or listed makes the status row `constrained` with `macos:<source>:permission_denied` (or another detail token); a missing prefix is zero rows and `supported`, never a failure |
-| Linux | agent daemon, default | None — the leg reads nothing yet | Not measured — `managers` is a planned placeholder and `packages` is unsupported by design, so the leg emits only a status row | n/a — no read is attempted; `managers` reports `status\|managers\|unsupported\|linux:planned` and `packages` reports `status\|packages\|unsupported\|linux:owned_by_installed_apps` |
+| Linux | agent daemon, default | None — the leg reads nothing | Not measured — the leg emits only a status row for either action (caveat 3) | n/a — no read is attempted; `managers` reports `status\|managers\|unsupported\|linux:planned` and `packages` reports `status\|packages\|unsupported\|linux:owned_by_installed_apps` |
 
 Binaries/subprocesses: none — every read is an in-process filesystem read. Network: none.
 
@@ -62,7 +62,7 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows written via `write_output()`, two shapes per stream discriminated by field 0: exactly one `status|<action>|<supported\|constrained\|unsupported>|<failure tokens or ->` row first, then zero or more data rows — `manager|<name>|<present\|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->` for `managers`, `package|homebrew|<id>|<version>|<formula\|cask>` for `packages`. A genuinely absent manager or prefix is `supported` with zero data rows; an unreadable location is `constrained` with a token, never an empty success. `root_path` is the logical path (`/opt/homebrew`, `/usr/local`), never an injected test root, and `version` is always `-` in this release. Every OS-supplied field goes through the shared escaper `yuzu::util::safe_output_field`, so a pipe or trailing backslash in a directory name cannot shift a column. This plugin is not in the server's `kKeyValuePlugins` set, so the server does not decode its rows as two-cell `key|rest`; the columns below are the definition's own.
+Pipe-delimited rows written via `write_output()`, two shapes per stream discriminated by field 0: exactly one `status|<action>|<supported\|constrained\|unsupported>|<failure tokens or ->` row first, then zero or more data rows — `manager|<name>|<present\|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->` for `managers`, `package|homebrew|<id>|<version>|<formula\|cask>` for `packages`. A genuinely absent manager or prefix is `supported` with zero data rows; an unreadable location is `constrained` with a token, never an empty success. `root_path` is the logical path (`/opt/homebrew`, `/usr/local`), never an injected test root; a manager row's `version` is always `-` in this release (no `brew --version` is run), while a package row's `version` is the real version directory name. A formula or cask present under both prefixes yields one `package|` row per prefix; the package row carries no prefix column — the manager rows say which prefixes exist. Every OS-supplied field goes through the shared escaper `yuzu::util::safe_output_field`, so a pipe or trailing backslash in a directory name cannot shift a column. This plugin is not in the server's `kKeyValuePlugins` set, so the server does not decode its rows as two-cell `key|rest`; the columns below are the definition's own.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.software.package_manager_packages` — `row_kind|manager|id|version|kind`**
@@ -95,15 +95,15 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 | `OK` | `FULL` | — | The read completed: managers or packages were found, or none were (an absent manager or prefix is a complete answer, not a degradation). |
 | `CONSTRAINED` | `PARTIAL` | `<os>:<source>:<detail>` | At least one location could not be read completely. `<os>` is `macos`; `<source>` names the location (`homebrew_taps`, `homebrew_cellar`, `homebrew_caskroom`); `<detail>` is `permission_denied`, `symlink_refused`, `not_a_directory`, `io_error`, `entry_cap` or `enumeration_error` (directory listing truncated or errored), or `row_cap` (Homebrew package-row cap reached). Several tokens are comma-joined. |
 | `UNAVAILABLE` | `PARTIAL` | `linux:owned_by_installed_apps` | Linux `packages`: unsupported by design; `installed_apps` owns the Linux package roster. |
-| `UNAVAILABLE` | `PARTIAL` | `linux:planned` | Linux `managers`: the leg is a planned placeholder and emits only `status\|managers\|unsupported\|linux:planned`. |
-| `UNAVAILABLE` | `PARTIAL` | `windows:planned` | Windows, either action: the leg is a planned placeholder and emits only `status\|<action>\|unsupported\|windows:planned`. |
+| `UNAVAILABLE` | `PARTIAL` | `linux:planned` | Linux `managers`: the leg reads nothing and emits only `status\|managers\|unsupported\|linux:planned` (caveat 3). |
+| `UNAVAILABLE` | `PARTIAL` | `windows:planned` | Windows, either action: the leg reads nothing and emits only `status\|<action>\|unsupported\|windows:planned` (caveat 5). |
 
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Both actions are gathered definitions (`crossplatform.software.package_managers` and `crossplatform.software.package_manager_packages`, 300s TTL).
 - **Not consumed by** daily-sync, TAR, DEX, or metrics.
 - **Sensitivity.** Rows name installed software (Homebrew formula and cask names and versions) and the Homebrew prefixes present on the host with their tap, formula and cask counts — a software inventory by another route. No row carries a username, account name or user-profile path.
-- **Siblings:** `installed_apps` (owns the Linux package roster and the macOS application list; see caveat 4 for the overlap) and `software_actions` (installs and removes software; this plugin only reads).
+- **Siblings:** `installed_apps` (owns the Linux package roster and the macOS application list, and its `list_per_user` also lists Homebrew formulae per user — see caveat 4 for both overlaps) and `software_actions` (installs and removes software; this plugin only reads).
 
 ## Sample output
 
@@ -151,7 +151,7 @@ status|packages|unsupported|linux:owned_by_installed_apps
 1. **No documented business driver.** The roadmap verification of 2026-09-19 found zero documented business driver anywhere in the four planning docs for this plugin; it ships as a read-only inventory fact source, not a response to a stated customer requirement.
 2. **Machine scope only.** Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. Per-user Homebrew, npm global-versus-user, pip user installs and cargo are not read.
 3. **Linux is identity and config only, and `managers` follows as its own PR.** The Linux leg will report which package managers are present and their configuration facts, never a package roster: installed_apps owns the roster, so Linux `packages` is unsupported by design and never emits a `package|` row. Until the Linux `managers` leg lands it reports `status|managers|unsupported|linux:planned` and no manager rows.
-4. **Casks overlap `installed_apps` on macOS, and cask and tap rows are unexercised against real data.** Homebrew casks install `.app` bundles that `installed_apps`' macOS `list` also reports via `system_profiler`; this plugin adds the manager identity and the cask version and does not claim to be disjoint from it. The real-capture host had a populated `Cellar` only (no `Library/Taps`, empty `Caskroom`), so the tap and cask counting is covered only by programmatic test layouts, not by a real capture.
+4. **Homebrew rows overlap `installed_apps` on macOS, and cask and tap rows are unexercised against real data.** Homebrew casks install `.app` bundles that `installed_apps`' macOS `list` also reports via `system_profiler`, and `installed_apps`' `list_per_user` already lists Homebrew formulae per user as `user_app|brew|<name>|<version>|-|-` (it runs `brew list --versions`); this plugin is the machine-scope, zero-subprocess view of the same store (manager identity, prefixes, cask versions) and does not claim to be disjoint from either. The real-capture host had a populated `Cellar` only (no `Library/Taps`, empty `Caskroom`, no `/usr/local` Homebrew), so tap and cask counting and the Intel prefix are covered only by synthetic in-code layouts that encode the layout the walk assumes, not by a real capture.
 5. **Windows and Linux `managers` legs planned — each follows as its own PR.** Both Windows actions report `status|<action>|unsupported|windows:planned` and no data rows, and Linux `managers` reports `status|managers|unsupported|linux:planned` and no data rows. The Chocolatey `lib\` directory walk with `.nuspec` metadata, winget presence and the Linux manager identity and config walk follow as their own PRs; nothing for them is built here.
 
 ## Source and tests
