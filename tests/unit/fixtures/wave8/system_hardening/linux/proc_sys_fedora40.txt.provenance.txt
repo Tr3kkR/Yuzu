@@ -1,0 +1,7 @@
+host: braga (Docker Desktop 29.7.2 linuxkit VM), container image fedora:40
+os: Linux 7.0.12-linuxkit (same VM kernel as the debian:12 capture, so values match by construction; kept as a second real container run)
+identity: root (uid 0) in container
+command: for k in <11 allowlisted keys>; do p=/proc/sys/$(echo $k | tr . /); v=$(cat $p 2>&1) && printf "%s\tok\t%s\n" $k "$v" || printf "%s\terr\t%s\n" $k "$v"; done   (docker run --rm <image> sh cap.sh)
+date: 2026-09-21
+status: REAL CAPTURE. Same ENOENT for kernel.yama.ptrace_scope.
+lines: 11 (budget 20)
