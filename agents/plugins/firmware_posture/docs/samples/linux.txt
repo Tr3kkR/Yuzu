@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash e3b945e9e6db
+== action=firmware
+firmware|vendor|absent|dmi
+firmware|version|absent|dmi
+firmware|release_date|absent|dmi
+firmware|update_pending|unavailable|fwupd
+[result_status] OK / FULL / 
+
