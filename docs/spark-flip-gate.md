@@ -1688,9 +1688,9 @@ requirement and were not separately adjudicated.) Once Spark is live, a blocked 
 whichever of those is writing. The Gate 8 review of #4606 traced consequences that include a full
 consumer queue dropping `SparkEvent`s and delayed subscription recovery (read from the code, not
 reproduced), and the convergence lanes have no queue, drop or detach containment, so a fix has to cover
-them and not only the consumer and send worker. Criterion: before the flip, retire the benchmark lines,
-or move their emission (and that of the Spark runtime's own lines above) behind a bounded non-blocking
-hand-off; the arm-committed line is never retired. A default-off runtime flag is not sufficient by itself,
+them and not only the consumer and send worker. Criterion: before the flip, retire the benchmark lines
+or move their emission behind a bounded non-blocking hand-off, and move the Spark runtime's own lines
+above behind one too; the arm-committed line is never retired. A default-off runtime flag is not sufficient by itself,
 because the write is still synchronous whenever the flag is on. On the live legacy path the same
 exposure is not new for `T_wire` on the guard worker (other `info` lines are already written on it),
 but per the adjudication `T_server` is, at thread level: for a guardian-only agent stream it is the

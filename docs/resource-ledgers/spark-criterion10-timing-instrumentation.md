@@ -9,7 +9,7 @@ remaining rows were added as later fix rounds moved locks or added the shared ne
 Gate 8 reviewers (`cpp-safety`, `security-guardian`) re-derived them independently. The
 `format_arm_committed_line` row was added by the later rule-id neutralisation round of PR #4657; that
 round's review findings are recorded in `governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl`
-(pass 18).
+(`pass_ordinal` 18).
 
 Nothing in this change adds a file descriptor, HANDLE, SOCKET, `FILE*`, `sqlite3*`/`sqlite3_stmt*`,
 OpenSSL or BCrypt object, allocated C string, mapped library, temp path, subprocess or production
