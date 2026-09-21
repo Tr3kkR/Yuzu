@@ -534,6 +534,12 @@ implementation is.
 | peripherals | thunderbolt | linux | constrained | 1 | /sys/bus/thunderbolt/devices sysfs reads | walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run |
 | peripherals | thunderbolt | macos | supported | 1 | IOKit IOServiceMatching(IOThunderboltSwitch) | - |
 | peripherals | thunderbolt | windows | constrained | 1 | SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | string-heuristic identification; no Thunderbolt device class in SetupAPI |
+| platform_security | secure_boot | linux | supported | 1 | efivarfs reads of /sys/firmware/efi/efivars/SecureBoot-* and SetupMode-* (4-byte attributes + 1 data byte; errno-classified absent/unreadable) | - |
+| platform_security | secure_boot | macos | unsupported | - | - | no public API; SIP reported under code_integrity |
+| platform_security | secure_boot | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled) | - |
+| platform_security | code_integrity | linux | supported | 1 | securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) | - |
+| platform_security | code_integrity | macos | supported | 2 | spctl --status + csrutil status via run_bounded_subprocess | - |
+| platform_security | code_integrity | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values | - |
 | power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
 | power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
 | power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging |

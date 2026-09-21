@@ -1,0 +1,11 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash pending
+== action=secure_boot
+secure_boot|linux|secure_boot|-|absent
+secure_boot|linux|setup_mode|-|absent
+[result_status] OK / FULL / 
+
+== action=code_integrity
+code_integrity|linux|lsm|-|absent
+code_integrity|linux|lockdown|-|absent
+[result_status] OK / FULL / 
+
