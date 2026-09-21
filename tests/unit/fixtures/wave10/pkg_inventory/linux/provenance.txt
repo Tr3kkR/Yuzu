@@ -1,0 +1,26 @@
+Directory: tests/unit/fixtures/wave10/pkg_inventory/linux/
+Package: P1c-1 (pkg_inventory parsers), captured 2026-09-21 on an Apple-silicon Mac
+(Docker Desktop, linux/arm64 images). Command-only containers; nothing was installed
+beyond what each command below does.
+
+dpkg_arch.txt
+  Status: REAL CAPTURE
+  Source: debian:bookworm (debian@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26)
+  Command: docker run --rm debian:bookworm sh -c 'dpkg --add-architecture i386; cat /var/lib/dpkg/arch'
+  Note: /var/lib/dpkg/arch does not exist in a stock debian:bookworm image; dpkg
+        creates it on the first `--add-architecture`. The content is what real dpkg
+        wrote (native architecture first, then the foreign one), not hand-edited.
+        `dpkg --print-architecture` -> arm64, `dpkg --print-foreign-architectures`
+        -> i386 in the same container.
+
+apk_repositories.txt
+  Status: REAL CAPTURE
+  Source: alpine:3.20 (alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc)
+  Command: docker run --rm alpine:3.20 cat /etc/apk/repositories
+  Note: unmodified image content; no @tag-pinned lines occur in it (tag handling is
+        covered by inline strings in the parser test, not a fixture).
+
+apk_arch.txt
+  Status: REAL CAPTURE
+  Source: alpine:3.20 (same image as above)
+  Command: docker run --rm alpine:3.20 cat /etc/apk/arch
