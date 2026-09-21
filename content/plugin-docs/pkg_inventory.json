@@ -7,10 +7,10 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "follows as its own PR",
           "mechanism": "tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, /etc/apk/repositories + /etc/apk/arch",
           "rung": "1",
-          "support": "supported"
+          "support": "planned"
         },
         "macos": {
           "fallback": "",
@@ -56,9 +56,9 @@
   "caveats": [
     "**No documented business driver.** The roadmap verification of 2026-09-19 found zero documented business driver anywhere in the four planning docs for this plugin; it ships as a read-only inventory fact source, not a response to a stated customer requirement.",
     "**Machine scope only.** Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. Per-user Homebrew, npm global-versus-user, pip user installs and cargo are not read.",
-    "**Linux is identity and config only.** The Linux leg reports which package managers are present and their configuration facts, never a package roster: installed_apps owns the roster, so Linux `packages` is unsupported by design and never emits a `package|` row.",
+    "**Linux is identity and config only, and `managers` follows as its own PR.** The Linux leg will report which package managers are present and their configuration facts, never a package roster: installed_apps owns the roster, so Linux `packages` is unsupported by design and never emits a `package|` row. Until the Linux `managers` leg lands it reports `status|managers|unsupported|linux:planned` and no manager rows.",
     "**Casks overlap `installed_apps` on macOS, and cask and tap rows are unexercised against real data.** Homebrew casks install `.app` bundles that `installed_apps`' macOS `list` also reports via `system_profiler`; this plugin adds the manager identity and the cask version and does not claim to be disjoint from it. The real-capture host had a populated `Cellar` only (no `Library/Taps`, empty `Caskroom`), so the tap and cask counting is covered only by programmatic test layouts, not by a real capture.",
-    "**Windows leg planned — follows as its own PR.** Both Windows actions report `status|<action>|unsupported|windows:planned` and no data rows. The Chocolatey `lib\\` directory walk with `.nuspec` metadata and winget presence follow as their own PR; nothing for them is built here."
+    "**Windows and Linux `managers` legs planned — each follows as its own PR.** Both Windows actions report `status|<action>|unsupported|windows:planned` and no data rows, and Linux `managers` reports `status|managers|unsupported|linux:planned` and no data rows. The Chocolatey `lib\\` directory walk with `.nuspec` metadata, winget presence and the Linux manager identity and config walk follow as their own PRs; nothing for them is built here."
   ],
   "definitions": [
     {
@@ -87,7 +87,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports which package managers are present on the endpoint and their manager-level configuration facts, read from the filesystem with no subprocess. Linux reports dpkg, apt, rpm, dnf, pacman and apk identity and config facts (architecture list, source-file and repository counts) and never a package roster; macOS reports each Homebrew prefix found under /opt/homebrew and /usr/local with tap, formula and cask counts. Windows is planned this release and reports `status|managers|unsupported|windows:planned`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. A status row always comes first; a genuinely absent manager produces no manager row, while an unreadable location makes the status row `constrained` with a failure token.",
+      "description": "Reports which package managers are present on the endpoint and their manager-level configuration facts, read from the filesystem with no subprocess. macOS reports each Homebrew prefix found under /opt/homebrew and /usr/local with tap, formula and cask counts. The Linux leg (dpkg, apt, rpm, dnf, pacman and apk identity and config facts, never a package roster) follows as its own PR: until then Linux reports `status|managers|unsupported|linux:planned` and no manager rows. Windows is planned this release and reports `status|managers|unsupported|windows:planned`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. A status row always comes first; a genuinely absent manager produces no manager row, while an unreadable location makes the status row `constrained` with a failure token.",
       "display_name": "Package Manager Inventory",
       "execute_roles": [
         "endpoint-admin",
@@ -105,14 +105,14 @@
     }
   ],
   "description": "Machine-scope package-manager inventory (managers and packages); per-user package stores are out of scope, deferred to the user-context bridge",
-  "how_it_works": "`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW`): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned, and `/var/lib/dpkg/status` is never opened. Every action writes a `status` row first, then data rows. On Linux, `managers` checks for the dpkg, apt, rpm, dnf, pacman and apk tools and reads config identity only: the dpkg architecture list, apt and dnf source-file counts, pacman.conf and mirrorlist line counts, apk repository counts. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. Linux `packages` is deliberately unsupported (`installed_apps` owns the Linux package roster), and both Windows legs are planned placeholders. Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree.",
+  "how_it_works": "`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW`): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned. Every action writes a `status` row first, then data rows. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. On Linux, `managers` is a planned placeholder that reads nothing and reports `status|managers|unsupported|linux:planned` (the manager identity and config-fact leg for dpkg, apt, rpm, dnf, pacman and apk follows as its own PR), and `packages` is deliberately unsupported (`installed_apps` owns the Linux package roster). Both Windows legs are planned placeholders too. Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "504f046cb56e",
+  "leg_hash": "57448de65bb7",
   "manifest_version": 1,
   "name": "pkg_inventory",
   "outputs": [
@@ -203,8 +203,8 @@
           ]
         },
         {
-          "description": "Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew. Status rows: the action name, always managers.",
-          "example": "dpkg",
+          "description": "Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew. Only homebrew is emitted in this release: Linux managers leg planned; on Linux the status row reports unsupported|linux:planned and there are no manager rows. Status rows: the action name, always managers.",
+          "example": "homebrew",
           "name": "name",
           "platforms": [
             "windows",
@@ -215,7 +215,7 @@
           "values": null
         },
         {
-          "description": "Manager rows: whether the manager was readable. Values: present, unavailable (detected but nothing could be read; see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows planned leg).",
+          "description": "Manager rows: whether the manager was readable. Values: present, unavailable (detected but nothing could be read; see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).",
           "example": "present",
           "name": "state",
           "platforms": [
@@ -233,7 +233,7 @@
           ]
         },
         {
-          "description": "Manager rows: the manager version, or \"-\" (versions are not read in this release, so always \"-\"). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. linux:apt_sources_d:permission_denied) or windows:planned.",
+          "description": "Manager rows: the manager version, or \"-\" (versions are not read in this release, so always \"-\"). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied), linux:planned or windows:planned.",
           "example": "-",
           "name": "version",
           "platforms": [
@@ -245,8 +245,8 @@
           "values": null
         },
         {
-          "description": "Manager rows only: the logical root the facts were read from (e.g. /etc/apt, /opt/homebrew), never an injected test root; \"-\" when the manager has no single root (rpm).",
-          "example": "/etc/apt",
+          "description": "Manager rows only: the logical root the facts were read from (e.g. /opt/homebrew, /usr/local; /etc/apt once the Linux managers leg lands), never an injected test root; \"-\" when the manager has no single root (Linux rpm).",
+          "example": "/opt/homebrew",
           "name": "root_path",
           "platforms": [
             "linux",
@@ -256,8 +256,8 @@
           "values": null
         },
         {
-          "description": "Manager rows only: semicolon-separated key=value manager-level facts, or \"-\". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read.",
-          "example": "sources_list_lines=0;sources_d_files=1",
+          "description": "Manager rows only: semicolon-separated key=value manager-level facts, or \"-\". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read. Only the homebrew keys are emitted in this release (Linux managers leg planned).",
+          "example": "taps=0;formulae=66;casks=0",
           "name": "facts",
           "platforms": [
             "linux",
@@ -281,9 +281,9 @@
       "definition_id": "crossplatform.software.package_managers"
     }
   ],
-  "outputs_note": "Pipe-delimited rows written via `write_output()`, two shapes per stream discriminated by field 0: exactly one `status|<action>|<supported\\|constrained\\|unsupported>|<failure tokens or ->` row first, then zero or more data rows — `manager|<name>|<present\\|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->` for `managers`, `package|homebrew|<id>|<version>|<formula\\|cask>` for `packages`. A genuinely absent manager or prefix is `supported` with zero data rows; an unreadable location is `constrained` with a token, never an empty success. `root_path` is the logical path (`/etc/apt`, `/opt/homebrew`), never an injected test root, and `version` is always `-` in this release. Every OS-supplied field goes through the shared escaper `yuzu::util::safe_output_field`, so a pipe or trailing backslash in a directory name cannot shift a column. This plugin is not in the server's `kKeyValuePlugins` set, so the server does not decode its rows as two-cell `key|rest`; the columns below are the definition's own.",
+  "outputs_note": "Pipe-delimited rows written via `write_output()`, two shapes per stream discriminated by field 0: exactly one `status|<action>|<supported\\|constrained\\|unsupported>|<failure tokens or ->` row first, then zero or more data rows — `manager|<name>|<present\\|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->` for `managers`, `package|homebrew|<id>|<version>|<formula\\|cask>` for `packages`. A genuinely absent manager or prefix is `supported` with zero data rows; an unreadable location is `constrained` with a token, never an empty success. `root_path` is the logical path (`/opt/homebrew`, `/usr/local`), never an injected test root, and `version` is always `-` in this release. Every OS-supplied field goes through the shared escaper `yuzu::util::safe_output_field`, so a pipe or trailing backslash in a directory name cannot shift a column. This plugin is not in the server's `kKeyValuePlugins` set, so the server does not decode its rows as two-cell `key|rest`; the columns below are the definition's own.",
   "platforms": {
-    "linux": "supported",
+    "linux": "planned",
     "macos": "supported",
     "windows": "planned"
   },
@@ -303,9 +303,9 @@
       "runs_as": "agent daemon, root today (LaunchDaemon carries no `UserName` key — `docs/agent-privilege-model.md` TL;DR); this plugin's own reads need no elevation beyond that default"
     },
     {
-      "grant": "None documented — the config files and directories read are world-readable on stock distributions",
-      "if_refused": "An unreadable file or directory makes the status row `constrained` with `linux:<source>:permission_denied` (or another detail token) and omits that fact rather than reporting a false count; an absent manager is no row and `supported`",
-      "measured": "Not yet measured under the agent identity; the walk was exercised over a fixture tree built from real debian:bookworm, rockylinux:9 and alpine container listings (`tests/unit/fixtures/wave10/pkg_inventory/linux/provenance.txt`)",
+      "grant": "None — the leg reads nothing yet",
+      "if_refused": "n/a — no read is attempted; `managers` reports `status|managers|unsupported|linux:planned` and `packages` reports `status|packages|unsupported|linux:owned_by_installed_apps`",
+      "measured": "Not measured — `managers` is a planned placeholder and `packages` is unsupported by design, so the leg emits only a status row",
       "os": "Linux",
       "runs_as": "agent daemon, default"
     }
@@ -322,13 +322,19 @@
       "completeness": "`PARTIAL`",
       "provenance": "`<os>:<source>:<detail>`",
       "status": "`CONSTRAINED`",
-      "when": "At least one location could not be read completely. `<os>` is `linux` or `macos`; `<source>` names the location (`dpkg_tool`, `dpkg_arch`, `apt_tool`, `apt_sources_list`, `apt_sources_d`, `rpm_tool`, `dnf_tool`, `dnf_repos_d`, `dnf_conf`, `pacman_tool`, `pacman_conf`, `pacman_mirrorlist`, `apk_tool`, `apk_repositories`, `apk_arch`, `homebrew_taps`, `homebrew_cellar`, `homebrew_caskroom`); `<detail>` is `permission_denied`, `symlink_refused`, `not_a_directory`, `io_error`, `oversized` (file over 256 KiB, count is a lower bound), `malformed` (an architecture line that is not a valid token), `entry_cap` or `enumeration_error` (directory listing truncated or errored), or `row_cap` (Homebrew package-row cap reached). Several tokens are comma-joined."
+      "when": "At least one location could not be read completely. `<os>` is `macos`; `<source>` names the location (`homebrew_taps`, `homebrew_cellar`, `homebrew_caskroom`); `<detail>` is `permission_denied`, `symlink_refused`, `not_a_directory`, `io_error`, `entry_cap` or `enumeration_error` (directory listing truncated or errored), or `row_cap` (Homebrew package-row cap reached). Several tokens are comma-joined."
     },
     {
       "completeness": "`PARTIAL`",
       "provenance": "`linux:owned_by_installed_apps`",
       "status": "`UNAVAILABLE`",
       "when": "Linux `packages`: unsupported by design; `installed_apps` owns the Linux package roster."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`linux:planned`",
+      "status": "`UNAVAILABLE`",
+      "when": "Linux `managers`: the leg is a planned placeholder and emits only `status|managers|unsupported|linux:planned`."
     },
     {
       "completeness": "`PARTIAL`",
@@ -346,15 +352,13 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "FULL",
-            "provenance": "",
-            "status": "OK"
+            "completeness": "PARTIAL",
+            "provenance": "linux:planned",
+            "status": "UNAVAILABLE"
           },
-          "row_count": 3,
+          "row_count": 1,
           "rows": [
-            "status|managers|supported|-",
-            "manager|dpkg|present|-|/var/lib/dpkg|-|-",
-            "manager|apt|present|-|/etc/apt|sources_list_lines=0;sources_d_files=1|-"
+            "status|managers|unsupported|linux:planned"
           ],
           "truncated": false
         },
@@ -378,7 +382,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "504f046cb56e",
+        "leg_hash": "57448de65bb7",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -427,7 +431,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "504f046cb56e",
+        "leg_hash": "57448de65bb7",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -465,7 +469,6 @@
     "plugin": [
       "agents/plugins/pkg_inventory/src/pkg_inventory_legs.hpp",
       "agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp",
-      "agents/plugins/pkg_inventory/src/pkg_inventory_linux_parsers.hpp",
       "agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp",
       "agents/plugins/pkg_inventory/src/pkg_inventory_macos_parsers.hpp",
       "agents/plugins/pkg_inventory/src/pkg_inventory_parsers.hpp",
@@ -474,7 +477,6 @@
     ],
     "privilege_row": true,
     "tests": [
-      "tests/unit/test_pkg_inventory_linux_parsers.cpp",
       "tests/unit/test_pkg_inventory_local_dispatcher.cpp",
       "tests/unit/test_pkg_inventory_macos_parsers.cpp",
       "tests/unit/test_pkg_inventory_parsers.cpp"
@@ -484,7 +486,7 @@
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Both actions are gathered definitions (`crossplatform.software.package_managers` and `crossplatform.software.package_manager_packages`, 300s TTL).",
     "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
-    "**Sensitivity.** Rows name installed software (Homebrew formula and cask names and versions) and the package managers and source counts configured on the host — a software inventory by another route. Apk repository URLs are never emitted, only counts. No row carries a username, account name or user-profile path.",
+    "**Sensitivity.** Rows name installed software (Homebrew formula and cask names and versions) and the Homebrew prefixes present on the host with their tap, formula and cask counts — a software inventory by another route. No row carries a username, account name or user-profile path.",
     "**Siblings:** `installed_apps` (owns the Linux package roster and the macOS application list; see caveat 4 for the overlap) and `software_actions` (installs and removes software; this plugin only reads)."
   ]
 }

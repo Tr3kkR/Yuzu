@@ -6,7 +6,7 @@
 | **What it does** | Machine-scope package-manager inventory (managers and packages); per-user package stores are out of scope, deferred to the user-context bridge |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.software.package_managers, crossplatform.software.package_manager_packages) |
-| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
+| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux 🟡 planned |
 | **Actions** | `managers` (definition `crossplatform.software.package_managers`) · `packages` (definition `crossplatform.software.package_manager_packages`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
@@ -31,11 +31,12 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `managers` | 🟡 planned · rung 1 · ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller folder presence for winget; follows as its own PR | ✅ supported · rung 1 · Homebrew prefix layout: Library/Taps, Cellar, Caskroom | ✅ supported · rung 1 · tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, /etc/apk/repositories + /etc/apk/arch |
+| `managers` | 🟡 planned · rung 1 · ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller folder presence for winget; follows as its own PR | ✅ supported · rung 1 · Homebrew prefix layout: Library/Taps, Cellar, Caskroom | 🟡 planned · rung 1 · tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, /etc/apk/repositories + /etc/apk/arch |
 | `packages` | 🟡 planned · rung 1 · chocolatey lib/<id>/<id>.nuspec via libxml2; follows as its own PR | ✅ supported · rung 1 · Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names | ⛔ unsupported · rung 1 · none by design |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
+- **`managers` / Linux** — follows as its own PR
 - **`packages` / Linux** — installed_apps.get_inventory_linux owns the Linux package roster
 <!-- END GENERATED -->
 
@@ -79,11 +80,11 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `row_kind` | string | `status` `manager` | Windows, Linux, macOS | `manager` | Row shape discriminator. Values: status (exactly one per result, always first), manager (one per package manager detected). |
-| `name` | string | - | Windows, Linux, macOS | `dpkg` | Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew. Status rows: the action name, always managers. |
-| `state` | string | `present` `unavailable` `supported` `constrained` `unsupported` | Windows, Linux, macOS | `present` | Manager rows: whether the manager was readable. Values: present, unavailable (detected but nothing could be read; see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows planned leg). |
-| `version` | string | - | Windows, Linux, macOS | `-` | Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. linux:apt_sources_d:permission_denied) or windows:planned. |
-| `root_path` | string | - | Linux, macOS | `/etc/apt` | Manager rows only: the logical root the facts were read from (e.g. /etc/apt, /opt/homebrew), never an injected test root; "-" when the manager has no single root (rpm). |
-| `facts` | string | - | Linux, macOS | `sources_list_lines=0;sources_d_files=1` | Manager rows only: semicolon-separated key=value manager-level facts, or "-". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read. |
+| `name` | string | - | Windows, Linux, macOS | `homebrew` | Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew. Only homebrew is emitted in this release: Linux managers leg planned; on Linux the status row reports unsupported\|linux:planned and there are no manager rows. Status rows: the action name, always managers. |
+| `state` | string | `present` `unavailable` `supported` `constrained` `unsupported` | Windows, Linux, macOS | `present` | Manager rows: whether the manager was readable. Values: present, unavailable (detected but nothing could be read; see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs). |
+| `version` | string | - | Windows, Linux, macOS | `-` | Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied), linux:planned or windows:planned. |
+| `root_path` | string | - | Linux, macOS | `/opt/homebrew` | Manager rows only: the logical root the facts were read from (e.g. /opt/homebrew, /usr/local; /etc/apt once the Linux managers leg lands), never an injected test root; "-" when the manager has no single root (Linux rpm). |
+| `facts` | string | - | Linux, macOS | `taps=0;formulae=66;casks=0` | Manager rows only: semicolon-separated key=value manager-level facts, or "-". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read. Only the homebrew keys are emitted in this release (Linux managers leg planned). |
 | `reason` | string | - | Linux, macOS | `-` | Manager rows only: failure tokens for an unavailable manager, or "-". |
 <!-- END GENERATED -->
 
@@ -107,7 +108,7 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 504f046cb56e
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 57448de65bb7
 
 ```
 == action=managers
@@ -132,14 +133,12 @@ package|homebrew|cmake|4.4.2|formula
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 504f046cb56e
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 57448de65bb7
 
 ```
 == action=managers
-status|managers|supported|-
-manager|dpkg|present|-|/var/lib/dpkg|-|-
-manager|apt|present|-|/etc/apt|sources_list_lines=0;sources_d_files=1|-
-[result_status] OK / FULL
+status|managers|unsupported|linux:planned
+[result_status] UNAVAILABLE / PARTIAL / linux:planned
 
 == action=packages
 status|packages|unsupported|linux:owned_by_installed_apps
@@ -158,9 +157,9 @@ status|packages|unsupported|linux:owned_by_installed_apps
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/pkg_inventory/src/pkg_inventory_legs.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_linux_parsers.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_macos_parsers.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_parsers.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_plugin.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_win.cpp`
+- Plugin: `agents/plugins/pkg_inventory/src/pkg_inventory_legs.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_macos_parsers.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_parsers.hpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_plugin.cpp` · `agents/plugins/pkg_inventory/src/pkg_inventory_win.cpp`
 - Definitions: `content/definitions/pkg_inventory.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp`
-- Tests: `tests/unit/test_pkg_inventory_linux_parsers.cpp` · `tests/unit/test_pkg_inventory_local_dispatcher.cpp` · `tests/unit/test_pkg_inventory_macos_parsers.cpp` · `tests/unit/test_pkg_inventory_parsers.cpp`
+- Tests: `tests/unit/test_pkg_inventory_local_dispatcher.cpp` · `tests/unit/test_pkg_inventory_macos_parsers.cpp` · `tests/unit/test_pkg_inventory_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

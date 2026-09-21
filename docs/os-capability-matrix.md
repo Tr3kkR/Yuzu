@@ -534,7 +534,7 @@ implementation is.
 | peripherals | thunderbolt | linux | constrained | 1 | /sys/bus/thunderbolt/devices sysfs reads | walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run |
 | peripherals | thunderbolt | macos | supported | 1 | IOKit IOServiceMatching(IOThunderboltSwitch) | - |
 | peripherals | thunderbolt | windows | constrained | 1 | SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | string-heuristic identification; no Thunderbolt device class in SetupAPI |
-| pkg_inventory | managers | linux | supported | 1 | tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, /etc/apk/repositories + /etc/apk/arch | - |
+| pkg_inventory | managers | linux | planned | 1 | tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, /etc/apk/repositories + /etc/apk/arch | follows as its own PR |
 | pkg_inventory | managers | macos | supported | 1 | Homebrew prefix layout: Library/Taps, Cellar, Caskroom | - |
 | pkg_inventory | managers | windows | planned | 1 | ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller folder presence for winget; follows as its own PR | - |
 | pkg_inventory | packages | linux | unsupported | 1 | none by design | installed_apps.get_inventory_linux owns the Linux package roster |
