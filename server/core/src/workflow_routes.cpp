@@ -17,7 +17,8 @@
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
-#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -117,7 +118,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
-    auto* schedule_engine = deps.schedule_engine;
+    auto schedule_api = deps.schedule_api; // ADR-0031 WS-A4 (seventh family)
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
@@ -1216,7 +1217,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+    sink.Get("/fragments/schedules", [perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
         // deny_service_scoped_schedule_list already resolved (and validated)
@@ -1232,12 +1233,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // confinement-2298 hardening sweep).
         if (!perm_fn(req, res, "Schedule", "Read"))
             return;
-        if (!schedule_engine) {
+        if (!schedule_api) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
         }
 
-        auto scheds = schedule_engine->query_schedules();
+        // ADR-0031 WS-A4 (seventh family): routed through the SAME
+        // `ScheduleApi::list_schedules` seam call the REST v1/MCP twins use
+        // — the pre-seam unchecked `ScheduleEngine::query_schedules()` read
+        // could not tell "the store failed" from "there are no schedules"
+        // (see `schedule_types.hpp`'s `ScheduleListResult` doc comment); this
+        // is a deliberate, disclosed behaviour delta, not a silent
+        // byte-identical rewire. `result.error()` is an internal store
+        // diagnostic and is NEVER rendered — a distinct degraded state
+        // instead. `truncated` is deliberately not surfaced on this fragment
+        // this round (a separate, undecided delta) — the REST v1/MCP twins
+        // already surface it.
+        auto result = schedule_api->list_schedules(ScheduleQuery{});
+        if (!result) {
+            res.set_content(
+                "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
+                "retry shortly.</div>",
+                "text/html");
+            return;
+        }
+        const auto& scheds = result->schedules;
         std::string html;
         if (scheds.empty()) {
             html = "<div class=\"empty-state\">No schedules configured.</div>";
@@ -2321,13 +2341,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // fleet_read_fn does not apply here (matches the fragment's own gate
     // shape, not a per-agent list).
     sink.Get("/api/v1/schedules",
-            [perm_fn, schedule_engine, deny_service_scoped_schedule_list](
+            [perm_fn, schedule_api, deny_service_scoped_schedule_list](
                 const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_schedule_list(req, res))
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                if (!schedule_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "schedule engine not available"),
                                     "application/json");
@@ -2366,7 +2386,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked(q);
+                // ADR-0031 WS-A4 (seventh family): now routed through the
+                // ScheduleApi seam (schedule_api.hpp) — the SAME checked call
+                // the dashboard fragment and MCP list_schedules also make.
+                auto scheds_result = schedule_api->list_schedules(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,

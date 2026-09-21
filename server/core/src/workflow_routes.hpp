@@ -17,7 +17,7 @@
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
-#include "schedule_engine.hpp"
+#include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): ScheduleApi — replaces a direct ScheduleEngine reach
 #include "tag_store.hpp"
 #include "workflow_engine.hpp"
 
@@ -147,7 +147,15 @@ public:
         ScopeEstimateFn scope_fn;
         WorkflowEngine* workflow_engine{nullptr};
         ExecutionTracker* execution_tracker{nullptr};
-        ScheduleEngine* schedule_engine{nullptr};
+        /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
+        /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
+        /// `GET /api/v1/schedules` (the seamed read triad; the unversioned
+        /// legacy `/api/schedules` mutators in `schedule_routes.cpp` are a
+        /// separate, untouched capability and keep their own `ScheduleEngine*`
+        /// wiring, unaffected by this seam). Unwired (default-constructed
+        /// null `shared_ptr`) ⇒ both routes answer 503, matching the
+        /// pre-seam `if (!schedule_engine)` guard's behaviour exactly.
+        std::shared_ptr<const ScheduleApi> schedule_api;
         ProductPackStore* product_pack_store{nullptr};
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};

@@ -748,6 +748,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
+#include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1585,6 +1586,19 @@ private:
         if (app_perf_providers_for_test.cohort)
             verify_api_for_test = std::make_shared<yuzu::server::test::FnVerifyApi>(
                 app_perf_providers_for_test.cohort);
+
+        // ADR-0031 WS-A4 (seventh family): wire the REAL ScheduleApi seam
+        // over this test's schedule_engine_for_test — same setter idiom as
+        // set_dex_api/set_dex_perf_api above (`build_handler`'s own
+        // `ScheduleEngine* schedule_engine` param below is now unused inside
+        // list_schedules, kept for signature stability). Gated on
+        // schedule_engine_for_test's presence, mirroring production's
+        // schedule_engine_-gated construction: unwired -> null seam -> the
+        // tool's `!schedule_api_` guard answers "Schedule engine
+        // unavailable", preserving every pre-seam test's default behaviour.
+        if (schedule_engine_for_test)
+            mcp.set_schedule_api(
+                yuzu::server::make_local_schedule_api(*schedule_engine_for_test));
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),

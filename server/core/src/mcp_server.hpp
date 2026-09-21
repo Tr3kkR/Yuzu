@@ -58,7 +58,8 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
-#include "schedule_engine.hpp"
+#include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
+#include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
@@ -698,6 +699,21 @@ public:
         std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
 
+    /// ADR-0031 WS-A4 (seventh family): the SAME in-process schedule-read API
+    /// seam the REST `GET /api/v1/schedules` handler and the dashboard
+    /// fragment (`GET /fragments/schedules`) use — server.cpp wires the
+    /// IDENTICAL instance so `list_schedules` can never disagree with either.
+    /// A SETTER, not a `build_handler` parameter (unlike `network_api`) —
+    /// mirrors `set_dex_perf_api` above: `build_handler`'s own
+    /// `ScheduleEngine* schedule_engine` parameter is now unused inside the
+    /// `list_schedules` handler body (superseded by this seam) but is kept,
+    /// unremoved, for constructor-signature stability — a disclosed,
+    /// deferred follow-up, not an oversight (matrix doc, `schedule` family
+    /// row). Unset (default-constructed null) ⇒ the tool's own `!schedule_api_`
+    /// readiness guard answers "Schedule engine unavailable", matching the
+    /// pre-seam `!schedule_engine` guard's behaviour exactly.
+    void set_schedule_api(std::shared_ptr<const ScheduleApi> a) { schedule_api_ = std::move(a); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1151,6 +1167,8 @@ private:
     std::shared_ptr<const DexPerfApi> dex_perf_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
+    // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
+    std::shared_ptr<const ScheduleApi> schedule_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
