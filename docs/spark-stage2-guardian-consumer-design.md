@@ -1306,9 +1306,10 @@ false, and the cache can still read `Notification` if the `None` report was drop
 Registry test that characterises exactly this drops every `None` and deletes the target). A
 Registry sweeper in persistent failure also leaves a stale `Notification`, unflagged until it
 flips `inert` after `kSweeperInertAfterFailures` (3) consecutive failed passes. Checking
-`!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows ONLY that
-Registry sweeper-failure case, and only once the flag has flipped; it does not cover a dropped
-report, and it does not cover File (see (g)). (c) `Notification` means the mechanism holds the
+`!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows the Registry
+sweeper-failure and File worker-failure cases, and only once the flag has flipped (three
+consecutive failed passes for either, `kSweeperInertAfterFailures` /
+`kFileWorkerInertAfterFailures`); it does not cover a dropped report. (c) `Notification` means the mechanism holds the
 watch and issued the read (Registry: the key exists and the notify is armed; File: the parent
 directory handle is watched, even when the file itself is absent). It is a probe result, NOT an
 end-to-end detection guarantee; whether File's handle-based watch reports the rename of the
@@ -1326,14 +1327,15 @@ stable `None` means sampling `coverage` over time), and `nullopt` from
 an engine `stop()`: after `stop()` the query keeps returning last-known values, see R4 above).
 (e) The first
 production consumer, the detect-latency measurement tracked in #4606 (precondition list: #4659), must
-re-derive the stale-cache severity and cover these residuals itself: the check in (b) narrows only one
-Registry case and (g) has no such check, so there is no complete guard to copy. (f) There is no
+re-derive the stale-cache severity and cover these residuals itself: the check in (b) narrows only
+the Registry and File worker-failure cases, so there is no complete guard to copy. (f) There is no
 operator surface: a dropped report is counted in the `established_failed` debug counter (a test
-seam) and logged once (the first drop only). (g) File has no equivalent of (b)'s Registry
-narrowing: its `inert_` is written only in `start()` (spark_file.cpp) and never flips at
-runtime, and a File worker that keeps failing passes (its per-pass catch in `run()` unwinds and
-carries on, with no backoff, counter or log; a known gap, tracked in #4658) is invisible to both
-`subscription_health()` and `inert`, so both guards pass on a deaf File watch.
+seam) and logged once (the first drop only). (g) File now has (b)'s narrowing (#4658): its
+worker counts, backs off (doubling from `sweep_cadence`, 30 s cap) and flips `inert` after three
+consecutive failed passes, clearing on the next success. Two residuals remain: a real directory
+notification during an episode still runs a (failing) pass, so the pass rate is bounded by the
+kernel's notification rate rather than the backoff; and a single poison obligation fails the whole
+pass, starving the others until it clears (same as Registry).
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
 calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
