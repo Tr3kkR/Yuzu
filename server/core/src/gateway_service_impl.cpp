@@ -9,6 +9,7 @@
 #include "audit_store.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
+#include "gateway_mgmt_stub_pool.hpp" // kUnknownGatewayClusterLabel
 #include "grpc_audit_signal.hpp"
 #include "grpc_on_behalf_enforce.hpp"
 #include "guaranteed_state_store.hpp"
@@ -1492,7 +1493,19 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             bool first_warning = false;
             {
                 std::lock_guard lock(unmapped_clusters_warned_mu_);
-                first_warning = unmapped_clusters_warned_.insert(cluster_id).second;
+                // sre Gate 3: unmapped_clusters_warned_ is per-entry bounded
+                // (kMaxClusterIdLen) but was previously unbounded in COUNT — a
+                // session cycling through many distinct malformed/misconfigured
+                // cluster_id values grew it indefinitely. Cap the entry count;
+                // past the cap, dedup degrades to "always warn" for a NEW
+                // distinct id rather than growing further — bounded memory,
+                // slightly noisier logging under the degenerate case, never a
+                // silent stop.
+                if (unmapped_clusters_warned_.size() >= kMaxUnmappedClustersWarned) {
+                    first_warning = !unmapped_clusters_warned_.contains(cluster_id);
+                } else {
+                    first_warning = unmapped_clusters_warned_.insert(cluster_id).second;
+                }
             }
             if (first_warning) {
                 spdlog::warn("[gateway] Agent {} connected announcing cluster_id '{}', which is "
@@ -1503,7 +1516,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             }
             if (metrics_) {
                 metrics_->counter("yuzu_server_gateway_forward_total",
-                                  {{"cluster_id", "unknown"}, {"status", "unmapped_cluster_seen"}})
+                                  {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                   {"status", "unmapped_cluster_seen"}})
                     .increment();
             }
         }

@@ -211,3 +211,107 @@ TEST_CASE("GatewayMgmtStubPool: multi-cluster mode with no default address confi
     CHECK(r_default.stub == nullptr);
     CHECK(r_default.label == kUnknownGatewayClusterLabel);
 }
+
+TEST_CASE("GatewayMgmtStubPool: resolve treats a present-but-empty cluster_id identically to "
+          "nullopt in both modes",
+          "[server][gateway_mgmt_stub_pool]") {
+    GatewayMgmtStubPool single("legacy-host:50063", {}, grpc::InsecureChannelCredentials(),
+                               fake_channel_factory);
+    auto r_none = single.resolve(std::nullopt);
+    auto r_empty = single.resolve(std::optional<std::string>(""));
+    REQUIRE(r_none.stub != nullptr);
+    CHECK(r_empty.stub == r_none.stub);
+    CHECK(r_empty.label == r_none.label);
+
+    GatewayMgmtStubPool multi("legacy-host:50063", {{"us-east", "10.0.1.5:50063"}},
+                              grpc::InsecureChannelCredentials(), fake_channel_factory);
+    auto m_none = multi.resolve(std::nullopt);
+    auto m_empty = multi.resolve(std::optional<std::string>(""));
+    REQUIRE(m_none.stub != nullptr);
+    CHECK(m_empty.stub == m_none.stub);
+    CHECK(m_empty.label == m_none.label);
+    CHECK(m_empty.label == kDefaultGatewayClusterKey);
+}
+
+// ── classify_gateway_forward_response ────────────────────────────────────
+
+TEST_CASE("classify_gateway_forward_response: a matching agent_id with a genuine SUCCESS is "
+          "kApply",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-1");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::SUCCESS);
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kApply);
+}
+
+TEST_CASE("classify_gateway_forward_response: a matching agent_id with an ORDINARY plugin "
+          "FAILURE (not the gateway's synthetic not_connected shape) is kApply, not "
+          "kNotConnected",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-1");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    resp.mutable_response()->set_exit_code(1); // a REAL plugin exit code, not the sentinel -1
+    resp.mutable_response()->set_output("plugin exploded");
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kApply);
+}
+
+TEST_CASE("classify_gateway_forward_response: the gateway's synthetic not_connected error shape "
+          "(FAILURE, exit_code -1, output 'not_connected') is kNotConnected",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-1");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    resp.mutable_response()->set_exit_code(-1);
+    resp.mutable_response()->set_output("not_connected");
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kNotConnected);
+}
+
+TEST_CASE("classify_gateway_forward_response: agent_disconnected is ALSO kNotConnected "
+          "(yuzu_gw_agent.erl's own disconnected-mid-command shape)",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-1");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    resp.mutable_response()->set_exit_code(-1);
+    resp.mutable_response()->set_output("agent_disconnected");
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kNotConnected);
+}
+
+TEST_CASE("classify_gateway_forward_response: a mismatched agent_id is kAgentMismatch "
+          "REGARDLESS of the response's own status/output — the forgery guard fires before "
+          "any content is inspected",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-attacker-controlled");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::SUCCESS);
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kAgentMismatch);
+
+    // Even a response that LOOKS like the not_connected shape is still a
+    // mismatch first, never silently reclassified as kNotConnected.
+    ::yuzu::server::v1::SendCommandResponse resp2;
+    resp2.set_agent_id("agent-attacker-controlled");
+    resp2.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    resp2.mutable_response()->set_exit_code(-1);
+    resp2.mutable_response()->set_output("not_connected");
+    CHECK(yuzu::server::classify_gateway_forward_response(resp2, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kAgentMismatch);
+}
+
+TEST_CASE("classify_gateway_forward_response: a FAILURE with exit_code -1 but output NOT "
+          "matching either sentinel string is kApply (an ordinary failure with a coincidentally "
+          "-1 exit code, not the gateway's synthetic shape)",
+          "[server][gateway_mgmt_stub_pool]") {
+    ::yuzu::server::v1::SendCommandResponse resp;
+    resp.set_agent_id("agent-1");
+    resp.mutable_response()->set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    resp.mutable_response()->set_exit_code(-1);
+    resp.mutable_response()->set_output("some other plugin error");
+    CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
+         yuzu::server::GatewayForwardOutcome::kApply);
+}

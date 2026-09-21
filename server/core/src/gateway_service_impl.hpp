@@ -59,6 +59,16 @@ namespace pb = ::yuzu::agent::v1;
 // call sites, never a duplicated magic number.
 inline constexpr std::size_t kMaxClusterIdLen = 64;
 
+// HA WS-4 4.3 (sre Gate 3): caps GatewayUpstreamServiceImpl::
+// unmapped_clusters_warned_'s ENTRY COUNT — each entry is already
+// per-entry-bounded by kMaxClusterIdLen, but the set itself had no cap on
+// how many distinct unmapped cluster_id values it could accumulate over
+// process lifetime. 256 is generous headroom over any real deployment's
+// cluster count (a handful to low tens) while still bounding worst-case
+// memory from a session cycling through many distinct malformed/
+// misconfigured values.
+inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
+
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
     GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus, auth::AuthManager& auth_mgr,

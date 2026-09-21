@@ -254,6 +254,30 @@ groups:
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
+      # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning
+      # above, not YuzuGatewayRouteUnreadable's rate-tuned one: this is a
+      # potential response-forgery signal (forward_gateway_pending refusing
+      # a SendCommandResponse whose agent_id doesn't match the single agent
+      # the request targeted), not a background-rate config-drift class —
+      # ANY occurrence is actionable regardless of fleet baseline, same as
+      # an mgmt-plane peer rejection.
+      - alert: YuzuGatewayResponseAgentMismatch
+        expr: |
+          increase(yuzu_server_gateway_forward_total{status="agent_mismatch"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway forwarded a response for an unrequested agent ({{ $value }} in 1h)"
+          description: >-
+            forward_gateway_pending refused at least one SendCommandResponse
+            whose agent_id did not match the single agent the request
+            targeted — either a gateway bug, or (in a multi-cluster
+            deployment where every cluster shares one core credential) a
+            compromised gateway attempting to forge a terminal status for an
+            agent it never held. Check the cluster_id label and the
+            corresponding gateway's logs. See ADR-2002 §7d.
+
       # HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b).
       # Fail-open boot semantics (a node that resolves zero peers still boots
       # and serves its own agents fine) mean a misconfigured seed name fails

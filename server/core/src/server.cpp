@@ -1678,6 +1678,19 @@ public:
                                      {{"cluster_id", cl}, {"status", st}});
                 }
             }
+            // sre Gate 3: unmapped_cluster_seen (gateway_service_impl.cpp's
+            // CONNECTED-time early-warning counter) is a DISTINCT event from
+            // the dispatch-time outcomes above — always fired with cluster_id
+            // "unknown" — and was missing from this seed, breaking the
+            // absent-vs-zero convention for exactly the metric designed to
+            // warn an operator BEFORE the first dropped command. Only
+            // meaningful once "unknown" is even in the label set (multi
+            // -cluster mode configured), same gate as that insert above.
+            if (!cfg_.gateway_cluster_addresses.empty()) {
+                metrics_.counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                  {"status", "unmapped_cluster_seen"}});
+            }
         }
 
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
@@ -9555,13 +9568,6 @@ public:
         if (gateway_service_)
             gateway_service_->set_gateway_route_store(nullptr);
         gateway_route_store_.reset();
-        // HA WS-4 4.3: same discipline — gateway_service_ holds a raw
-        // pointer to gw_mgmt_pool_'s known_clusters() set (CONNECTED-time
-        // unmapped-cluster warning), null it before the pool it points into
-        // is destroyed.
-        if (gateway_service_)
-            gateway_service_->set_known_gateway_clusters(nullptr);
-        gw_mgmt_pool_.reset();
         // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
         // every HTTP/MCP handler thread is already quiesced by the drain above);
@@ -9855,6 +9861,17 @@ public:
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
         //
+        // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
+        // now includes a raw `Stub*` resolved from gw_mgmt_pool_
+        // (GatewayMgmtStubPool::resolve(), captured per-command into the same
+        // forward_gateway_pending() detached thread). Unlike metrics_ above,
+        // this one is NOT a subset-of-existing-envelope case — see the
+        // gw_mgmt_pool_.reset() call site (immediately before pg_pool_.reset()
+        // below) for why it was deliberately placed as late as practical in
+        // this function rather than mirrored next to gateway_route_store_'s
+        // reset, and why that placement restores parity with, rather than
+        // widening, the pre-4.3 timing.
+        //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
         // the nvd_sync leak-and-continue precedent (Gate 8 unhappy-path
@@ -10130,6 +10147,30 @@ public:
         ca_store_.reset();
         // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
         // before auth_key_provider_ (the codec borrows it) — see that comment.
+        //
+        // HA WS-4 4.3 (Gate 2 security-guardian finding, pre-push): gw_mgmt_pool_
+        // is deliberately reset HERE — the latest practical point in stop(), not
+        // alongside gateway_route_store_ above (where it originally sat, mirroring
+        // that store's own reset). The mirror was WRONG for this resource: unlike
+        // gateway_route_store_ (read only from gRPC handler threads that
+        // mgmt_server_->Shutdown(deadline) has already drained by that point),
+        // gw_mgmt_pool_ is also read by forward_gateway_pending()'s DETACHED,
+        // UNTRACKED std::thread(...).detach() workers (#3279 — see that comment
+        // block above response_store_.reset()/notification_store_.reset(), which
+        // this same untracked-thread class already reaches). Placing the reset
+        // where gateway_route_store_'s sits would free the pool's channels/stubs
+        // up to ~60s+ EARLIER than the pre-4.3 code ever did (the old single
+        // gw_mgmt_stub_/gw_mgmt_channel_ pair was never explicitly reset in stop()
+        // at all — it lived until IMPLICIT member destruction, which only runs
+        // after this entire function returns) — a real widening of #3279's
+        // existing UAF window, not a no-op relocation. Moving the reset here,
+        // after every other quiesce/drain this function performs, does not CLOSE
+        // #3279 (that fix is join/drain forward_gateway_pending()'s workers,
+        // tracked there) but restores parity with the pre-4.3 timing instead of
+        // regressing it.
+        if (gateway_service_)
+            gateway_service_->set_known_gateway_clusters(nullptr);
+        gw_mgmt_pool_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -12120,15 +12161,14 @@ private:
                     int resp_count = 0;
                     while (reader->Read(&resp)) {
                         ++resp_count;
-                        // HA WS-4 4.3 (Fable pre-implementation review,
-                        // finding 6a): this request names exactly ONE
-                        // agent_id — a response naming a different one is
-                        // either a gateway bug or, on a compromised
-                        // gateway, a forged terminal status for an agent
-                        // that gateway never held. ADR-2002 §7's whole
-                        // reason for per-cluster isolation is trust-zone
-                        // separation; refuse rather than apply it.
-                        if (resp.agent_id() != expected_agent_id) {
+                        // HA WS-4 4.3: classification is a pure function
+                        // (gateway_mgmt_stub_pool.hpp) — see its doc comment
+                        // for the two Fable pre-implementation review
+                        // findings (6a agent-mismatch/forgery, 1a
+                        // not_connected) it implements.
+                        auto outcome = yuzu::server::classify_gateway_forward_response(
+                            resp, expected_agent_id);
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kAgentMismatch) {
                             spdlog::error(
                                 "Gateway SendCommand for {} received a response for agent "
                                 "'{}' but this request targeted '{}' — REFUSING to apply it "
@@ -12141,21 +12181,7 @@ private:
                                 .increment();
                             continue;
                         }
-                        // HA WS-4 4.3 (Fable pre-implementation review,
-                        // finding 1a): a gateway-side "agent not connected
-                        // on this cluster" error (yuzu_gw_mgmt_service.erl's
-                        // stream_responses/3) is a FAILURE response with a
-                        // real command_id (as of the paired gateway fix) but
-                        // a synthetic output/exit_code — distinguish it so
-                        // it isn't silently folded into "ok" below (Finish()
-                        // still returns OK for a streamed response). This is
-                        // the PRIMARY signal of a stale/wrong cluster
-                        // resolution in a multi-cluster deployment.
-                        if (resp.response().status() ==
-                                ::yuzu::agent::v1::CommandResponse::FAILURE &&
-                            resp.response().exit_code() == -1 &&
-                            (resp.response().output() == "not_connected" ||
-                             resp.response().output() == "agent_disconnected")) {
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kNotConnected) {
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},

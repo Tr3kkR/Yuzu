@@ -12,10 +12,11 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "agent.grpc.pb.h" // yuzu::agent::v1::CommandResponse (classify_gateway_forward_response)
 #include "management.grpc.pb.h"
 
 /// @file gateway_mgmt_stub_pool.hpp
-/// HA WS-4 "rest of 4.3" — cross-cluster gateway fan-out. Two independent
+/// HA WS-4 "rest of 4.3" — cross-cluster gateway fan-out. Three independent
 /// pieces:
 ///
 ///   - `parse_gateway_cluster_addrs`: pure parser for `--gateway-cluster-addr`
@@ -30,6 +31,14 @@
 ///     `grpc::CreateChannel` is itself lazy-connecting, so eager construction
 ///     of every configured channel/stub costs nothing and needs no lock on
 ///     the dispatch hot path (`ServerImpl::forward_gateway_pending`).
+///   - `classify_gateway_forward_response`: pure classification of one
+///     `SendCommandResponse` read off a forwarding stream, extracted out of
+///     `forward_gateway_pending`'s detached-thread lambda (quality-engineer
+///     Gate 3 finding) so the agent-id mismatch guard and the `not_connected`
+///     synthetic-failure detection are unit-testable without a live gRPC
+///     connection — no fake `ManagementService` harness exists in this
+///     codebase, and this is the cheap seam that avoids needing one for
+///     these two decisions specifically.
 ///
 /// Design per the 4.3 plan's Fable pre-implementation review:
 ///   - Resolution is TWO-MODE, not a uniform "empty means default, non-empty
@@ -58,9 +67,10 @@ namespace yuzu::server {
 /// split the comma list before this runs — see main.cpp). Returns an error
 /// string, never exits — the caller (main.cpp) decides how loudly to fail.
 /// Rejected: an entry with no `=`, an empty key or value, a key exceeding
-/// `max_cluster_id_len` (pass `gateway_service_impl.cpp`'s `kMaxClusterIdLen`
-/// — kept in sync manually, there is no shared header between the two
-/// without adding one purely for a length constant), or a duplicate key.
+/// `max_cluster_id_len` (pass `gateway_service_impl.hpp`'s `kMaxClusterIdLen`
+/// — declared there, not duplicated, so this call site and the CONNECTED-time
+/// ingest clamp in `gateway_service_impl.cpp` share the same bound), or a
+/// duplicate key.
 [[nodiscard]] inline std::expected<std::unordered_map<std::string, std::string>, std::string>
 parse_gateway_cluster_addrs(const std::vector<std::string>& entries,
                             std::size_t max_cluster_id_len) {
@@ -194,5 +204,48 @@ private:
     std::unordered_map<std::string, Entry> entries_;
     std::unordered_set<std::string> known_clusters_;
 };
+
+/// Outcome of classifying one `SendCommandResponse` read from a forwarding
+/// stream, against the single `agent_id` the enclosing request targeted
+/// (`forward_gateway_pending` sends exactly one per request — never a
+/// broadcast). `kAgentMismatch` means REFUSE: the caller must NOT apply the
+/// response (`process_gateway_response`) — see `classify_gateway_forward_
+/// response`'s doc comment for why. `kApply` and `kNotConnected` both mean
+/// apply it; `kNotConnected` additionally means the caller should count a
+/// DISTINCT metric outcome instead of the generic terminal "ok" the
+/// surrounding `Finish()` check would otherwise record (a streamed error
+/// response still completes the RPC with `OK`).
+enum class GatewayForwardOutcome { kApply, kAgentMismatch, kNotConnected };
+
+/// Fable pre-implementation review, finding 6a (cross-trust-zone response
+/// forgery): a response naming a different `agent_id` than the one this
+/// request targeted is either a gateway bug or — on a compromised gateway
+/// sharing one core credential across multiple trust-zone clusters (the
+/// design this slice ships) — a forged terminal status for an agent that
+/// gateway never held. ADR-2002 §7's whole reason for per-cluster isolation
+/// is trust-zone separation; refuse rather than apply it.
+///
+/// Fable pre-implementation review, finding 1a: a gateway-side "agent not
+/// connected on this cluster" error (`yuzu_gw_mgmt_service.erl`'s
+/// `stream_responses/3`) arrives as a FAILURE response with a real
+/// `command_id` (as of the paired gateway fix) but a synthetic
+/// `output`/`exit_code` — distinguish it so it isn't silently folded into
+/// "ok" by the caller (a streamed error response still returns `Finish() ==
+/// OK`). This is the PRIMARY signal of a stale/wrong cluster resolution in a
+/// multi-cluster deployment, so it must be separately countable.
+[[nodiscard]] inline GatewayForwardOutcome
+classify_gateway_forward_response(const ::yuzu::server::v1::SendCommandResponse& resp,
+                                  const std::string& expected_agent_id) {
+    if (resp.agent_id() != expected_agent_id) {
+        return GatewayForwardOutcome::kAgentMismatch;
+    }
+    if (resp.response().status() == ::yuzu::agent::v1::CommandResponse::FAILURE &&
+        resp.response().exit_code() == -1 &&
+        (resp.response().output() == "not_connected" ||
+         resp.response().output() == "agent_disconnected")) {
+        return GatewayForwardOutcome::kNotConnected;
+    }
+    return GatewayForwardOutcome::kApply;
+}
 
 } // namespace yuzu::server
