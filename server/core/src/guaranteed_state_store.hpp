@@ -209,6 +209,13 @@ enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
 struct EventInsertResult {
     EventInsertOutcome outcome{EventInsertOutcome::Error};
     std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
+    std::int64_t committed_wall_ns{0}; ///< Application-observed wall-clock instant (ns since the
+                                        ///< Unix epoch) captured immediately after a successful
+                                        ///< COMMIT, for `Inserted` only — 0 for every other
+                                        ///< outcome. This is NOT a durable column and NOT the
+                                        ///< database's internal commit instant: it is a
+                                        ///< benchmark-diagnostic field on this in-memory result
+                                        ///< only (#4606 criterion-10 T_server). Never persisted.
 };
 
 // Error surface for the type-distinguishable single-object read (`get_rule`).

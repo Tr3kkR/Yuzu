@@ -6,7 +6,10 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers five families — `network`, `verify`, `compliance`, `device`, `dex` (see FAMILIES below).
+covers seven families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule` (see FAMILIES below; this docstring previously read
+"five", already stale by `dex_perf` before the `schedule` family was added —
+corrected here, not merely for `schedule`).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -77,8 +80,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks five families — `network`, `verify`, `compliance`,
-`device` and `dex` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks seven families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf` and `schedule` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -159,6 +162,16 @@ FORBIDDEN_HEADER_PATTERNS = [
     "agent_registry.hpp",
     "pg/*.hpp",
     "*_api_local.hpp",
+    # `schedule` (seventh family) / a future `workflow` seam, Fable review:
+    # `ScheduleEngine`/`WorkflowEngine` are Postgres-backed stores
+    # (`pg::PgPool&` constructor dependency) but are named `*_engine.hpp`,
+    # not `*_store.hpp` — the first pattern above does not catch them, and
+    # neither is named `agent_registry.hpp`. Without this pair, an abstract
+    # seam header could `#include`/forward-declare either and CI would stay
+    # green — the same blindness class `agent_registry.hpp` above was added
+    # to close, just for a different store header naming convention.
+    "schedule_engine.hpp",
+    "workflow_engine.hpp",
 ]
 
 # ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
@@ -186,6 +199,7 @@ IMPL_TUS = [
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
     "server/core/src/dex_perf_api.cpp",
+    "server/core/src/schedule_api.cpp",
     # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
     # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
@@ -219,6 +233,7 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/device_api.hpp",
     "server/core/src/dex_api.hpp",
     "server/core/src/dex_perf_api.hpp",
+    "server/core/src/schedule_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -250,8 +265,16 @@ ABSTRACT_API_HEADERS = [
 # (the verify seam's own pure model) that legitimately appears in verify_api.hpp's
 # closure — it is NOT a store type, so listing it would be a false positive.
 STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
+# `ScheduleEngine`/`WorkflowEngine`: `schedule` (seventh family) / a future
+# `workflow` seam, Fable review — the same naming-convention gap
+# `FORBIDDEN_HEADER_PATTERNS`' `schedule_engine.hpp`/`workflow_engine.hpp`
+# entries close for the HEADER-include probe, closed here for the
+# TYPE-NAME-in-code probe (a forward-declared `class ScheduleEngine;` plus a
+# `list_schedules(ScheduleEngine*, …)` signature names the type without
+# including its header).
 EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
-                           "AgentRegistry", "ExecutionTracker", "PgPool"]
+                           "AgentRegistry", "ExecutionTracker", "PgPool",
+                           "ScheduleEngine", "WorkflowEngine"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -376,6 +399,35 @@ FAMILIES = {
             "server/core/src/dex_perf_model.hpp",
             "server/core/src/dex_perf_api.hpp",
             "server/core/src/dex_perf_api_local.hpp",
+        ],
+    },
+    # `schedule` (ADR-0031 WS-A4, the SEVENTH family through the seam) — the
+    # recurring-schedule READ surface (GET /fragments/schedules, GET
+    # /api/v1/schedules, MCP list_schedules — all three share ONE
+    # ScheduleApi::list_schedules call). Header-only posture, same reason as
+    # `dex`/`dex_perf`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the unseamed `workflow` family's routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and the dashboard fragment ARE rewired (server.cpp / mcp_server.cpp
+    # both call the seam). `schedule_types.hpp` was relocated out of
+    # `schedule_engine.hpp`; `schedule_model.hpp`/`.cpp` (schedule_row_json)
+    # was split out of the entangled `workflow_model.hpp`, which previously
+    # bundled it with the (unseamed) workflow builders and `#include`d BOTH
+    # `schedule_engine.hpp` AND `workflow_engine.hpp` despite claiming
+    # "pure, I/O-free" — the exact anti-pattern the `dex_perf` seam's own
+    # design note (PR #4582) warns against. The unversioned legacy
+    # `/api/schedules` POST/DELETE/enable mutators (`schedule_routes.cpp`)
+    # are a SEPARATE, deliberately untouched capability with no public
+    # REST v1/MCP twin — nothing to carve out of this family's enforced set,
+    # unlike `compliance`'s WS-A3 mutator gap.
+    "schedule": {
+        "tus": [
+            "server/core/src/schedule_types.hpp",
+            "server/core/src/schedule_model.hpp",
+            "server/core/src/schedule_model.cpp",
+            "server/core/src/schedule_api.hpp",
+            "server/core/src/schedule_api_local.hpp",
         ],
     },
 }

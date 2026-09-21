@@ -407,6 +407,12 @@ struct KeyBinding {
     std::wstring dirkey;
     std::wstring fname;
     std::uint64_t gen{0};
+    /// Establishment-signal identity for THIS key (rung 9c PR-6 item 1) — per
+    /// key, not per directory, since several keys can share one DirWatch.
+    /// Forward-only rebind everywhere it is written (never decreases); see
+    /// watch_incarnation()'s two `key_index_[key] = {...}` sites for why the
+    /// prior value must be read BEFORE that whole-struct aggregate assignment.
+    SparkIncarnation incarnation{kNoSparkIncarnation};
     [[nodiscard]] bool same_target(const std::wstring& d, const std::wstring& f) const {
         return dirkey == d && fname == f;
     }
@@ -507,6 +513,19 @@ struct DirWatch {
     /// that confirmation lands, whatever its outcome, so this never becomes a
     /// permanent poll loop.
     bool confirmation_due{false};
+
+    /// Establishment-signal coverage (rung 9c PR-6 item 1), per DIRECTORY —
+    /// real dirs only, like the health fields above; never set on an
+    /// ancestors_ entry (a dependent's own coverage reflects whether IT is
+    /// sheltered, None while sheltered, not whether the shelter itself is
+    /// healthy). Written by every coverage-transition site via
+    /// mark_coverage_locked() — three scalar writes, unconditional, never
+    /// gated on the prior value. `coverage_report_due` is drained at the
+    /// sweep visit, staging one PendingEstablished entry per key currently in
+    /// `keys` (each carrying that key's own KeyBinding::incarnation).
+    SparkCoverage coverage{SparkCoverage::None};
+    Clock::time_point coverage_at{};
+    bool coverage_report_due{false};
 };
 
 /// Everything one pass wants to do OUTSIDE mu_: launches, dispatch, and the
@@ -568,8 +587,24 @@ struct FilePassWork {
         enum class Outcome : std::uint8_t { Unattempted, Submitted, Failed, Stale } outcome{
             Outcome::Unattempted};
     };
+    /// A staged establishment-signal report (rung 9c PR-6 item 1) — one per
+    /// spark KEY currently in the staging watch's `keys` map (not one per
+    /// directory: several keys can share a DirWatch, and each carries its own
+    /// KeyBinding::incarnation). `dirkey` is used only by unwind_pass_locked
+    /// to re-find the watch and re-mark `coverage_report_due`; dispatch itself
+    /// needs no staleness re-check (the staged incarnation IS the identity —
+    /// SparkEngine::report_established drops a report whose incarnation no
+    /// longer names the key's current watch), unlike Notice above.
+    struct PendingEstablished {
+        std::string key;
+        SparkIncarnation incarnation{kNoSparkIncarnation};
+        Clock::time_point at{};
+        SparkCoverage coverage{SparkCoverage::None};
+        std::wstring dirkey;
+    };
     std::vector<ProbeLaunch> probe_launches;
     std::vector<Notice> notices; ///< in recorded order — per-key ordering matters
+    std::vector<PendingEstablished> established; ///< staged coverage reports, dispatch-first order
     // discards (destroyed off-lock)
     std::vector<DirHandle> old_handles;
     std::vector<FileProbeResult> dead_results;
@@ -622,6 +657,14 @@ public:
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1): start() being CALLED is what seals
+        // the establishment sink, whether or not this call does anything else —
+        // set first, before the idempotent early-return, so a repeat start()
+        // can never re-open the window (mirrors spark_service.cpp /
+        // spark_registry.cpp). Never cleared by stop(): SparkEngine is
+        // single-shot, so no production caller ever re-arms the sink after a
+        // stop().
+        sink_sealed_ = true;
         if (iocp_)
             return; // idempotent
         emit_ = std::move(emit);
@@ -651,6 +694,17 @@ public:
 
     std::expected<void, std::string> watch(const std::string& key,
                                            const SparkParams& params) override {
+        // The engine never calls this overload in production (it always calls
+        // watch_incarnation() below) — kept for direct/test callers that predate
+        // the establishment signal. kNoSparkIncarnation is a valid, harmless
+        // identity: nothing rejects it, it simply never matches a real engine
+        // incarnation.
+        return watch_incarnation(key, params, kNoSparkIncarnation);
+    }
+
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
         const auto* fp = std::get_if<FileSparkParams>(&params);
         if (!fp)
             return std::unexpected("file mechanism: params are not FileSparkParams");
@@ -713,6 +767,14 @@ public:
             // failure path) is safe and matches this mechanism's existing
             // contract.
             try {
+                // Implementation trap (rung 9c PR-6 item 1): the aggregate
+                // assignment below is a WHOLE-STRUCT
+                // overwrite. Read the prior incarnation (if any) BEFORE it, or
+                // this registration would silently reset a key that somehow
+                // already had one back to kNoSparkIncarnation.
+                SparkIncarnation prior_inc = kNoSparkIncarnation;
+                if (auto pi = key_index_.find(key); pi != key_index_.end())
+                    prior_inc = pi->second.incarnation;
                 if (watch_register_fail_hook_)
                     watch_register_fail_hook_(dirkey); // test seam: may throw to model an
                                                         // allocation failing anywhere below
@@ -723,14 +785,20 @@ public:
                 key_index_[key] = {dirkey, fname, ++key_gen_}; // #2012/#3840 review finding 8:
                                                                // gen bumped on every registration
                                                                // - see key_gen_'s doc comment
+                key_index_[key].incarnation = std::max(prior_inc, incarnation); // forward-only rebind
             } catch (...) {
                 dirs_.erase(dirkey); // nothing was ever armed/probed — safe to discard whole
                 throw;
             }
         } else {
             try {
+                // See the `fresh` branch's identical comment above.
+                SparkIncarnation prior_inc = kNoSparkIncarnation;
+                if (auto pi = key_index_.find(key); pi != key_index_.end())
+                    prior_inc = pi->second.incarnation;
                 slot->keys[fname].insert(key);
                 key_index_[key] = {dirkey, fname, ++key_gen_};
+                key_index_[key].incarnation = std::max(prior_inc, incarnation); // forward-only rebind
             } catch (...) {
                 // Existing, already-armed dir: roll back a partial key-
                 // membership add so a later watch()/unwatch() for this key
@@ -800,6 +868,25 @@ public:
             }
             if (needs_prompt_sweep)
                 nudge_locked();
+            // Establishment-signal join / adoption / coalesce report (rung 9c
+            // PR-6 item 1): the engine
+            // skips unwatch() on a renewed SAME key (SparkEngine::disarm() /
+            // unregister_consumer()), and a genuinely NEW key joining an
+            // already-established directory (coalesce) also needs its own
+            // report — its own KeyBinding::incarnation was just stamped
+            // above. Mark the directory's CURRENT coverage (whatever it is)
+            // due, re-stamped `now()` so a first-wins established_at can
+            // never predate the joining/adopting incarnation's own armed_at.
+            // The sweep stages ONE entry per key currently in `keys`
+            // (stage_established_locked), so every sibling key gets a
+            // redundant identical report too — the engine assigns coverage
+            // unconditionally and latches established_at first-wins, so a
+            // repeat is harmless. The whole directory's coverage_at is
+            // re-stamped, so a sibling not yet latched takes the later time.
+            slot->coverage_at = Clock::now();
+            slot->coverage_report_due = true;
+            nudge_locked(); // unconditional: needs_prompt_sweep above is conditional on
+                            // unrelated health/resync state and must not gate this report
             return {}; // rides along with whatever obligation this dir already has
         }
 
@@ -886,6 +973,18 @@ public:
                 // synthetic fire the sweep emits on commit (#2012/#3840
                 // gap-2 trigger: published-pending establishment; mirrors
                 // spark_registry.cpp watch()'s identical site).
+                //
+                // Establishment signal: this obligation is accepted but not yet watching, so it has
+                // NO coverage yet — report None explicitly, exactly as
+                // spark_registry.cpp's identical branch does. The engine's
+                // armed-entry cache already defaults to None, so the pull
+                // query alone cannot tell this mark from its absence; a
+                // direct mechanism-level sink observer can. Under mu_, so the
+                // mark lands in the same lock hold that publishes w->call: the
+                // first sweep visit that sees the pending call also sees the
+                // due marker. The shared nudge_locked() below (this branch is
+                // `live`) wakes the sweeper — no second nudge here.
+                mark_coverage_locked(*w, SparkCoverage::None);
                 w->call = std::move(call);
                 w->needs_resync = true;
                 w->resync_epoch = ++resync_epoch_;
@@ -902,8 +1001,27 @@ public:
         return {};
     }
 
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_ = std::move(sink);
+        return true;
+    }
+
     void unwatch(const std::string& key) override {
         std::lock_guard lk(mu_);
+        // Deliberately NOT reported: the engine has
+        // already erased armed_[key] before calling unwatch() (or skipped the
+        // call entirely on adoption — watch_incarnation()'s join branch
+        // above), so a report from here would be dropped by
+        // SparkEngine::report_established's identity check by construction.
+        // unwatch() also must not call established_() synchronously
+        // (spark_mechanism.hpp's mechanism contract, the same reentrancy
+        // prohibition as emit()/fault()). A remaining sibling key's own
+        // coverage is unchanged — the directory's watch itself is untouched
+        // unless `keys` becomes empty, in which case there is no DirWatch
+        // left to report against.
         FilePassWork discards;
         reserve_discard_capacity(discards);
         unwatch_locked(key, discards);
@@ -1014,6 +1132,7 @@ public:
         iocp_.reset();
         emit_ = nullptr;
         fault_ = nullptr;
+        established_ = nullptr; // after the worker is joined, like emit_/fault_ above
     }
 
     /// Lock-free — callable from any thread without coordinating with mu_.
@@ -1091,6 +1210,7 @@ public:
         d.emit_failed = emit_failed_.load(std::memory_order_relaxed);
         d.fault_failed = fault_failed_.load(std::memory_order_relaxed);
         d.resync_retries = resync_retries_.load(std::memory_order_relaxed);
+        d.established_failed = established_failed_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         std::lock_guard lk(mu_);
         d.live_dirs = dirs_.size();
@@ -1158,6 +1278,24 @@ private:
     void nudge_locked() {
         if (iocp_)
             ::PostQueuedCompletionStatus(iocp_.get(), 0, kControlKey, nullptr);
+    }
+
+    /// Coverage-transition marker (rung 9c PR-6 item 1):
+    /// every coverage-transition site calls this and nothing else — three
+    /// scalar writes, unconditional, never gated on the watch's prior
+    /// coverage (there is no "edge" logic anywhere in this mechanism).
+    /// Staging into FilePassWork::established happens exactly once, later, at
+    /// the sweep visit (sweep_probes_locked() via stage_established_locked());
+    /// dispatch happens exactly once, later still, in run_off_lock() with mu_
+    /// released (established_ is never called from here, or from any of this
+    /// function's callers). noexcept: reached from noexcept call sites
+    /// (defer_admission_locked() via reconcile_probe_launches_locked()) where
+    /// an escaping exception is process death; std::chrono::steady_clock::now()
+    /// is itself noexcept, so three scalar writes is all this may ever be.
+    static void mark_coverage_locked(DirWatch& w, SparkCoverage c) noexcept {
+        w.coverage = c;
+        w.coverage_at = Clock::now();
+        w.coverage_report_due = true;
     }
 
     /// Reserve a discovery/establishment obligation for real dir `w`: no I/O,
@@ -1240,6 +1378,11 @@ private:
         ++w.admission_attempts;
         w.next_retry_at =
             Clock::now() + doubled(admission_seed(), w.admission_attempts, kFileAdmissionBackoffCap);
+        // No coverage established on this path, in every calling context
+        // (watch_incarnation's admission-refused branch, reconcile_probe_
+        // launches_locked's noexcept recovery, unwind_pass_locked's consumed-
+        // completion recovery) - mark unconditionally.
+        mark_coverage_locked(w, SparkCoverage::None);
     }
 
     /// key_index_'s CURRENT registration generation for `k` (0 if `k` is
@@ -1249,6 +1392,14 @@ private:
     [[nodiscard]] std::uint64_t key_gen_for(const std::string& k) const {
         auto it = key_index_.find(k);
         return it != key_index_.end() ? it->second.gen : 0;
+    }
+
+    /// key_index_'s CURRENT SparkIncarnation for `k` (rung 9c PR-6 item 1) —
+    /// kNoSparkIncarnation if `k` is somehow not registered, same defensive
+    /// shape as key_gen_for() above. Under mu_.
+    [[nodiscard]] SparkIncarnation key_incarnation_for(const std::string& k) const {
+        auto it = key_index_.find(k);
+        return it != key_index_.end() ? it->second.incarnation : kNoSparkIncarnation;
     }
 
     /// Fan a Fault (or recovered) edge out to every key currently in `w.keys`
@@ -1274,6 +1425,28 @@ private:
         health_edges_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// Drain `w`'s coverage marker into `work.established` — one entry per
+    /// spark key currently in `w.keys`, each carrying that key's OWN KeyBinding::
+    /// incarnation, not a shared per-directory value. Mirrors check_health_
+    /// edge_locked's shape: reserve BEFORE staging (a throw mid-fan-out must
+    /// not leave a partial batch staged that this function's own `due` check
+    /// would then never re-attempt — `coverage_report_due` is cleared only
+    /// AFTER the loop below, same "push before flip" ordering rule 2 as
+    /// Fault-edge staging). No-op if nothing is due. Under mu_.
+    void stage_established_locked(DirWatch& w, FilePassWork& work) {
+        if (!w.coverage_report_due)
+            return;
+        std::size_t n = 0;
+        for (auto& [fname, keys] : w.keys)
+            n += keys.size();
+        work.established.reserve(work.established.size() + n);
+        for (auto& [fname, keys] : w.keys)
+            for (const auto& k : keys)
+                work.established.push_back(
+                    {k, key_incarnation_for(k), w.coverage_at, w.coverage, w.map_key});
+        w.coverage_report_due = false;
+    }
+
     /// Bookkeeping-only half of a genuine backend failure: transitions the
     /// probe to Deferred and schedules a retry on the 30 s doubling
     /// schedule. Deliberately does NOT touch health state or stage any
@@ -1295,6 +1468,11 @@ private:
         ++w.backend_attempts;
         w.next_retry_at =
             Clock::now() + doubled(backend_retry_base(), w.backend_attempts, kFileBackendRetryCap);
+        // Genuine backend failure - no coverage, in every calling context
+        // (fail_backend_locked, commit_probe_locked's/attach_*_locked's catch
+        // and failure branches, watch()'s Decision #3 fast-resolve path) -
+        // mark unconditionally.
+        mark_coverage_locked(w, SparkCoverage::None);
         spdlog::warn("spark_file: establishing '{}' failed ({}, err={}) - watch is deaf until the "
                      "retry",
                      fs::path(w.dir).string(), reason, err);
@@ -1703,6 +1881,18 @@ private:
         w.backend_attempts = 0;
         w.admission_attempts = 0;
         w.grace_counted = false;
+        // The one positive coverage site: Target mode has live OS-level
+        // notification coverage, Ancestor mode does not (it watches an
+        // ancestor for the target's appearance, not the target itself) -
+        // unconditional gate on res.mode alone, never special-cased
+        // away for Ancestor: a Target -> Ancestor transition (the target was
+        // deleted; the re-probe resolved to a shelter) is a real coverage
+        // loss that must overwrite whatever Notification the engine has
+        // cached. Also covers the "already sheltered here" duplicate-handle
+        // branch inside attach_ancestor_locked (still Ancestor mode, still
+        // correctly None) and an Ancestor -> Ancestor shelter CHANGE.
+        mark_coverage_locked(w, res.mode == WatchMode::Target ? SparkCoverage::Notification
+                                                               : SparkCoverage::None);
         if (res.mode == WatchMode::Target) {
             w.probe_is_reappearance = false;
             if (was_reappearance) {
@@ -1980,6 +2170,11 @@ private:
                 // (#2012/#3840 gap-2 trigger: loss of target coverage).
                 w.needs_resync = true;
                 w.resync_epoch = ++resync_epoch_;
+                // Genuine coverage loss, unconditional, regardless of
+                // whether staging the retry probe below succeeds or falls
+                // back to defer_backend_retry_locked's own (redundant) mark
+                // in its catch.
+                mark_coverage_locked(w, SparkCoverage::None);
                 try {
                     stage_probe_locked(w, work);
                 } catch (...) {
@@ -2084,6 +2279,9 @@ private:
             // trigger: loss of target coverage).
             w.needs_resync = true;
             w.resync_epoch = ++resync_epoch_;
+            // Genuine coverage loss, unconditional — see the !ok branch's
+            // identical mark, above.
+            mark_coverage_locked(w, SparkCoverage::None);
             try {
                 stage_probe_locked(w, work);
             } catch (...) {
@@ -2141,6 +2339,14 @@ private:
             // reported faulted. No-ops when desired already equals
             // reported — see check_health_edge_locked's own guard.
             check_health_edge_locked(w, work);
+            // Drain the coverage marker BEFORE the switch: if the switch
+            // below commits Notification in this SAME visit (the Pending
+            // case's resolve_probe_locked -> commit_probe_locked path),
+            // draining after would overwrite the just-staged None and it would
+            // never be reported. The commit re-marks `due`, and
+            // wait_timeout_locked's own `due -> now` clause lands the
+            // Notification on the very next pass.
+            stage_established_locked(w, work);
             switch (w.probe) {
             case ProbeState::Pending:
                 if (w.call) {
@@ -2227,6 +2433,15 @@ private:
             // this, `any` could stay false and the loop block INFINITE with
             // the mismatch never reconciled.
             if (w.health_desired_faulted != w.health_reported_faulted) {
+                wake = std::min(wake, now);
+                any = true;
+            }
+            // A marked-but-not-yet-dispatched coverage report — same
+            // stranded-wake reasoning as the health-edge
+            // mismatch clause above: a watch already Idle with nothing else
+            // outstanding would otherwise leave this report parked for up to
+            // an hour.
+            if (w.coverage_report_due) {
                 wake = std::min(wake, now);
                 any = true;
             }
@@ -2332,6 +2547,51 @@ private:
             (*test_emit_bookkeeping_hook_)(); // test seam (mirrors PR #4225's fix): models an
                                               // allocation failure landing right after a probe in
                                               // this same pass already launched
+
+        // Dispatch establishment reports before this pass's notices (rung 9c
+        // PR-6 item 1; same order as spark_service.cpp and
+        // spark_registry.cpp). What that order guarantees: within ONE dispatch
+        // pass, `work.established` is delivered before that pass's own
+        // notices. It does NOT cover a commit's own Notification: the commit
+        // stages its notice in this visit but re-marks coverage after the
+        // visit's drain, so the Notification is staged one pass AFTER that
+        // notice. established_ is read by
+        // reference, no copy, no mu_ - the write happens-before this thread
+        // exists (set_established_sink(), pre-seal, under mu_) and the only
+        // later write is stop()'s null-out, after this thread has been
+        // joined. A throw on one report is counted (established_failed_; the
+        // first one is also logged) and the report is dropped, NOT re-staged:
+        // the engine's cache keeps the last delivered value until the next
+        // transition of that key, and a persistent throw would otherwise spin
+        // the worker. This DIVERGES
+        // from spark_service.cpp by design: Service has no per-call catch, so
+        // a throw there reaches its run() catch, which invalidates every key
+        // to None; here the worker never exits on an exception, so no such
+        // invalidation exists. (A throw elsewhere in the pass is different:
+        // unwind_pass_locked re-marks every staged report.) No key_gen/
+        // staleness re-check is needed here (unlike Notice's
+        // notice_still_current): the staged incarnation IS the identity, and
+        // SparkEngine::report_established drops any report whose incarnation
+        // no longer names the key's current watch.
+        if (established_) {
+            for (const auto& e : work.established) {
+                try {
+                    established_(e.key, e.incarnation, e.at, e.coverage);
+                } catch (...) {
+                    // Log only the FIRST drop; the rest are counted. The log
+                    // itself must never throw out of this handler.
+                    if (established_failed_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        try {
+                            spdlog::warn("spark_file: an establishment report for '{}' was "
+                                         "dropped (sink threw); further drops are not logged",
+                                         e.key);
+                        } catch (...) {
+                        }
+                    }
+                }
+            }
+        }
+
         for (auto& n : work.notices) {
             try {
                 // #2012/#3840 review finding 8: revalidate EVERY notice
@@ -2581,6 +2841,21 @@ private:
         reconcile_notice_outcomes_locked(work);
         restore_unattempted_notices_locked(work);
         work.notices.clear();
+        // Re-mark every staged establishment report REGARDLESS of
+        // `dispatched` (same reasoning as the notice
+        // reconciliation above: `dispatched == true` only means run_off_lock()
+        // was ENTERED, not that its established-dispatch loop was reached
+        // before the throw that brought us here). Do NOT restore the staged
+        // value: the next pass re-stages the watch's CURRENT coverage, which
+        // is at least as fresh as what was lost here. dirs_.find on a const
+        // std::wstring& does not allocate, so this stays safe for the
+        // noexcept contract.
+        for (const auto& e : work.established) {
+            auto it = dirs_.find(e.dirkey);
+            if (it != dirs_.end() && it->second)
+                it->second->coverage_report_due = true;
+        }
+        work.established.clear();
         if (!dispatched) {
             // Consumed-completion recovery: `dispatched == false` here means mu_ was NEVER
             // released between run()'s dequeue (which already cleared consumed->io_pending) and
@@ -2932,12 +3207,23 @@ private:
     detail::EventHandle iocp_; ///< IOCP handle (closed via CloseHandle)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) - written once by
+    /// set_established_sink() before start(), read only by run_off_lock() on
+    /// the worker thread with mu_ released (same happens-before argument as
+    /// emit_/fault_ above: the write happens-before the worker thread spawns
+    /// in start(), and stop() nulls it only after the worker has been
+    /// joined).
+    SparkEstablishedFn established_;
+    /// One-way latch (rung 9c PR-6 item 1): set as the FIRST statement of
+    /// start(), never cleared by stop() - SparkEngine itself is single-shot,
+    /// so no production caller ever needs to re-arm the sink after a stop().
+    bool sink_sealed_{false};
     std::thread worker_;
     std::atomic<bool> stop_{true};
     std::unordered_map<std::wstring, std::unique_ptr<DirWatch>> dirs_;      ///< real watched dirs
     std::unordered_map<std::wstring, std::unique_ptr<DirWatch>> ancestors_; ///< recreate-recovery
     std::vector<std::unique_ptr<DirWatch>> retiring_; ///< watches awaiting a drained completion
-    std::unordered_map<std::string, KeyBinding> key_index_; ///< key→(dir,fname,gen)
+    std::unordered_map<std::string, KeyBinding> key_index_; ///< key→(dir,fname,gen,incarnation)
     /// Mechanism-global: bumped every time a key is (re-)registered via
     /// watch() (#2012/#3840 review finding 8) — a Notice staged for one
     /// registration of a key must not land on a REPLACEMENT registration of
@@ -2970,6 +3256,7 @@ private:
     std::atomic<std::uint64_t> emit_failed_{0};
     std::atomic<std::uint64_t> fault_failed_{0};
     std::atomic<std::uint64_t> resync_retries_{0};
+    std::atomic<std::uint64_t> established_failed_{0}; ///< established() threw when invoked
 
     std::atomic<std::size_t> retiring_cap_override_{0}; ///< 0 = use kRetiringCap
     std::atomic<std::int64_t> caller_wait_ms_{kFileCallerWaitBudget.count()};
