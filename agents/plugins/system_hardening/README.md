@@ -69,10 +69,11 @@ The action takes no parameters.
 Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `write_output()`. The first field is the fixed literal `posture`, then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent` or `unreadable`); a raw value that WAS read passes through the shared untrusted-output escaper. Windows rows can outnumber the allowlist: one registry value decodes into one row per policy field, and a blob longer than the documented table adds `unmodelled` rows rather than being dropped. The action returns 0 for every data-level outcome (an unreadable key is a degraded result and an absent key is not a failure; neither is ever a failed command); only an internal exception returns 1 (any leg), with the single row `constrained|internal_error`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`crossplatform.system_hardening.posture` — `os|key|raw|state`**
+**`crossplatform.system_hardening.posture` — `row_kind|os|key|raw|state`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
+| `row_kind` | string | `posture` `constrained` | Windows, Linux, macOS | `posture` | Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row; its reason lands in the next column). |
 | `os` | string | `linux` `macos` `windows` | Windows, Linux, macOS | `linux` | The leg that produced the row. |
 | `key` | string | - | Windows, Linux, macOS | `kernel.randomize_va_space` | Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process, or the value name itself for a failed read). |
 | `raw` | string | - | Windows, Linux, macOS | `2` | The raw value read (integer, string, or 0x-prefixed hex on Windows); "-" when nothing was read (absent or unreadable). An empty macOS kern.bootargs is a successful read and an empty column. |
@@ -98,7 +99,7 @@ Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `w
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 280e3355d168
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 26c1ee54c2ae
 
 ```
 == action=posture
@@ -114,7 +115,7 @@ posture|windows|self.cfg_strict_mode|0|off
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 280e3355d168
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 26c1ee54c2ae
 
 ```
 == action=posture
@@ -125,7 +126,7 @@ posture|macos|kern.bootargs||enabled
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 280e3355d168
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 26c1ee54c2ae
 
 ```
 == action=posture

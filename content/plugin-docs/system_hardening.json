@@ -66,12 +66,27 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "280e3355d168",
+  "leg_hash": "26c1ee54c2ae",
   "manifest_version": 1,
   "name": "system_hardening",
   "outputs": [
     {
       "columns": [
+        {
+          "description": "Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row; its reason lands in the next column).",
+          "example": "posture",
+          "name": "row_kind",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "posture",
+            "constrained"
+          ]
+        },
         {
           "description": "The leg that produced the row.",
           "example": "linux",
@@ -221,7 +236,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "280e3355d168",
+        "leg_hash": "26c1ee54c2ae",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -252,7 +267,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "280e3355d168",
+        "leg_hash": "26c1ee54c2ae",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -284,7 +299,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "280e3355d168",
+        "leg_hash": "26c1ee54c2ae",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"

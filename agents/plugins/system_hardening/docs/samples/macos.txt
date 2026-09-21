@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 280e3355d168
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 26c1ee54c2ae
 == action=posture
 posture|macos|kern.securelevel|0|disabled
 posture|macos|kern.coredump|1|disabled

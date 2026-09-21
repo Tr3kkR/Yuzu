@@ -43,8 +43,14 @@ spec:
     properties: {}
 
   result:
-    # posture|<os>|<key>|<raw>|<state>
+    # posture|<os>|<key>|<raw>|<state>   (also: constrained|<reason> on an internal error)
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row; its reason lands in the next column).'
+        values: [posture, constrained]
+        example: posture
+        platforms: [windows, linux, darwin]
       - name: os
         type: string
         description: 'The leg that produced the row.'
