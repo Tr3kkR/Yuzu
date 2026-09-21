@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 67940cba360f
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 4d9ef9de22fc
 == action=wdac_policy
 wdac|EmodePolicyRequired|0|unmodelled
 wdac|SkuPolicyRequired|0|unmodelled

@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 67940cba360f
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 4d9ef9de22fc
 == action=wdac_policy
 wdac_policy|unsupported|windows_only_concept
 [result_status] UNAVAILABLE / PARTIAL / windows_only_concept

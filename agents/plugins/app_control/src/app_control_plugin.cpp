@@ -42,8 +42,8 @@ const YuzuOsLeg kLinuxLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
                           "Windows-only concept; Linux fapolicyd is a separate, unimplemented "
                           "leg of #282"};
 const YuzuOsLeg kMacosLeg{YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
-                          "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by "
-                          "platform_security"};
+                          "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is outside this "
+                          "plugin's scope"};
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"wdac_policy", kLinuxLeg, kMacosLeg,
@@ -57,7 +57,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "are mapped per documentation and unverified on hardware. An unmodelled value is reported "
       "'unmodelled'; an unreadable key is constrained or permission_denied, never absent"}},
     {"applocker_policy", kLinuxLeg, kMacosLeg,
-     {YUZU_SUPPORT_SUPPORTED, 1,
+     {YUZU_SUPPORT_CONSTRAINED, 1,
       "wmi_bounded run_bounded_wmi_query root\\StandardCimv2\\Security\\ApplicationControl "
       "MSFT_ApplockerPolicy; registry walk of "
       "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2\\<collection> when the class is "

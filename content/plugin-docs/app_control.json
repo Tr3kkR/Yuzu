@@ -13,7 +13,7 @@
           "support": "unsupported"
         },
         "macos": {
-          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security",
+          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is outside this plugin's scope",
           "mechanism": "",
           "rung": "",
           "support": "unsupported"
@@ -22,7 +22,7 @@
           "fallback": "Rig-verified 2026-09-21 (Windows 11 Pro 10.0.26200, LocalSystem): the CIM namespace root\\\\StandardCimv2\\\\Security\\\\ApplicationControl does NOT exist on this host (WBEM_E_INVALID_NAMESPACE 0x8004100e), so the SrpV2 registry walk runs and, with no AppLocker policy configured, reports 'none'. The CIM property names (Collection/EnforcementMode/RuleCount) and the SrpV2 rule-collection layout are UNVERIFIED on a host with AppLocker configured. The CIM namespace is caller-side allowlisted",
           "mechanism": "wmi_bounded run_bounded_wmi_query root\\\\StandardCimv2\\\\Security\\\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\\\SOFTWARE\\\\Policies\\\\Microsoft\\\\Windows\\\\SrpV2\\\\<collection> when the class is absent or empty",
           "rung": "1",
-          "support": "supported"
+          "support": "constrained"
         }
       }
     },
@@ -39,7 +39,7 @@
           "support": "unsupported"
         },
         "macos": {
-          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security",
+          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is outside this plugin's scope",
           "mechanism": "",
           "rung": "",
           "support": "unsupported"
@@ -58,7 +58,7 @@
     "**Not EDR-class telemetry.** `docs/roadmap.md` Phase 18 \"Out of scope\" excludes re-implementing EDR at the agent; this plugin configures nothing and collects no detection data, it reports the state of the OS's own control. The two are not the same thing and a reviewer should not conflate them.",
     "**The CIM property names remain unverified on hardware.** The AppLocker provider namespace `root\\StandardCimv2\\Security\\ApplicationControl` does not exist on the-rig (Windows 11 Pro 10.0.26200, no AppLocker policy configured): the plugin's own bounded WMI helper returned `wmi_connect_failed_0x8004100e` (WBEM_E_INVALID_NAMESPACE), so `applocker_policy` fell back to the `SrpV2` registry walk, which is also absent (`applocker|none|absent|0`, OK / FULL). `Collection`, `EnforcementMode` and `RuleCount` are still assumed by `parse_cim_applocker_row` (a row lacking any of them is reported `cim_row_unrecognised` rather than guessed) and the `SrpV2` rule-collection layout has never been read on an AppLocker-configured host, so both are untested against real data until such a host is probed. The class-absent outcome is a real capture (`tests/unit/fixtures/wave8/app_control/windows/applocker_wmi_probe.txt`); the probe text is in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.",
     "**Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed.",
-    "**Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is `platform_security`'s scope, and both legs return the honest `unsupported` row unconditionally."
+    "**Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is outside this plugin's scope, and both legs return the honest `unsupported` row unconditionally."
   ],
   "definitions": [
     {
@@ -70,7 +70,8 @@
       "display_name": "AppLocker Policy Posture",
       "execute_roles": [
         "endpoint-admin",
-        "endpoint-operator"
+        "endpoint-operator",
+        "security-admin"
       ],
       "gather": {
         "ttlSeconds": 300
@@ -89,7 +90,8 @@
       "display_name": "WDAC Policy Posture",
       "execute_roles": [
         "endpoint-admin",
-        "endpoint-operator"
+        "endpoint-operator",
+        "security-admin"
       ],
       "gather": {
         "ttlSeconds": 300
@@ -108,7 +110,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "67940cba360f",
+  "leg_hash": "4d9ef9de22fc",
   "manifest_version": 1,
   "name": "app_control",
   "outputs": [
@@ -252,7 +254,7 @@
     },
     {
       "completeness": "PARTIAL",
-      "provenance": "`row_cap`, `value_too_large`, `cim_row_unrecognised`, `ci_policy_open_<hex>`, `ci_policy_enum_<hex>`, `srpv2_open_<hex>`, `srpv2_collection_open_<hex>`, `enforcement_mode_read_<hex>`, `srpv2_rule_count_<hex>`, `cip_stat_failed`, `cip_dir_failed_<n>`, `system_directory_unresolved`, a `wmi_bounded` error token",
+      "provenance": "`row_cap`, `value_too_large`, `cim_row_unrecognised`, `ci_policy_open_<hex>`, `ci_policy_enum_<hex>`, `srpv2_open_<hex>`, `srpv2_collection_open_<hex>`, `enforcement_mode_read_<hex>`, `srpv2_rule_count_<hex>`, `cip_stat_failed_<n>`, `cip_dir_failed_<n>`, `system_directory_unresolved`, a `wmi_bounded` error token",
       "status": "`CONSTRAINED`",
       "when": "a bounded read hit its cap, a value or CIM row could not be interpreted, or a registry / directory / CIM step failed with a non-access-denied error; the reasons are joined in one status string"
     },
@@ -308,7 +310,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "67940cba360f",
+        "leg_hash": "4d9ef9de22fc",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -352,7 +354,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "67940cba360f",
+        "leg_hash": "4d9ef9de22fc",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -400,7 +402,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "67940cba360f",
+        "leg_hash": "4d9ef9de22fc",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
@@ -415,7 +417,7 @@
       "mutability": "None",
       "operation": "Read",
       "risk_tier": "Low",
-      "securable": "Inventory"
+      "securable": "Security"
     },
     {
       "action": "applocker_policy",
@@ -424,7 +426,7 @@
       "mutability": "None",
       "operation": "Read",
       "risk_tier": "Low",
-      "securable": "Inventory"
+      "securable": "Security"
     }
   ],
   "source": {
@@ -450,7 +452,7 @@
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}`.",
     "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. `gather.ttlSeconds: 300` only caps how often a repeat dispatch is served from cache; nothing runs on a schedule.",
-    "**Sensitivity.** Rows describe the device's application-control configuration (enforcement mode, rule counts, the file stem of each active policy). No username, hostname, file path or rule content appears in any field, but the posture itself is security-relevant: it tells a reader which controls are not enforced.",
+    "**Sensitivity.** Rows describe the device's application-control configuration (enforcement mode, rule counts, the file stem of each active policy). No username, hostname or rule content appears in any field; a `REG_SZ`/`REG_EXPAND_SZ` value under `CI\\Policy` is reported verbatim (escaped, at most 4 KiB), so a string value could carry a path. The posture itself is security-relevant: it tells a reader which controls are not enforced.",
     "**Siblings:** `antivirus` (Defender and exclusion state, not application control), `windows_optional_features` (OS feature state), `registry` / `wmi` (general-purpose reads this plugin's narrow surface deliberately does not replace) — none join with this plugin's output.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.app_control.wdac_policy\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]
