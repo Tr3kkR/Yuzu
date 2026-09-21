@@ -6,9 +6,11 @@
  * Watches a target file in REAL TIME via ReadDirectoryChangesW on its parent
  * directory (kernel-notified, NO polling — unlike the Trigger Engine's mtime
  * poll). Resilient like RegistryGuard (C1/C2): the watch is live from arm until
- * the rule is disabled, survives the parent directory being deleted and
- * recreated (a nearest-existing-ancestor watch catches the recreation), and
- * reconciles the target's state from scratch on every wake.
+ * the rule is disabled, survives the parent directory (or an ancestor) being
+ * deleted, renamed or moved, and recreated (a nearest-existing-ancestor watch
+ * catches a recreation; a watch on the armed directory's own parent catches
+ * its rename or move), and reconciles the target's state from scratch on
+ * every wake.
  *
  * B1 implements the `file-exists` assertion: drift when the file's presence
  * (exists / absent) differs from the rule's expected state — i.e. realtime

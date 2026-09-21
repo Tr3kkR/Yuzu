@@ -67,7 +67,7 @@ Three guard types ship today: the **registry** guard (above, Windows-only), the 
 
 ## File guards — detect a file changed or deleted, in realtime
 
-A `file-change` spark watches a file via `ReadDirectoryChangesW` on its parent directory — kernel-notified, **no polling**, so detection is realtime. The watch is resilient: it survives the parent directory (and its whole ancestor chain) being deleted and recreated. Two assertions decide what counts as drift:
+A `file-change` spark watches a file via `ReadDirectoryChangesW` on its parent directory — kernel-notified, **no polling**, so detection is realtime. The watch is resilient: it survives the parent directory (and its whole ancestor chain) being deleted, renamed or moved, and recreated. A rename or move of the watched directory is evaluated like any other change to the guarded path: a guarded file that is no longer at its original path is reported as absent under a `file-exists` rule that expects it present and under a `file-hash-equals` rule, and changes made after the original path is recreated are detected. Paths hosted on network shares were not part of this behaviour and are not covered by it. Two assertions decide what counts as drift:
 
 | Assertion | Drift when | Key params |
 |---|---|---|
