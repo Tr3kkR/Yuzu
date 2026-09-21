@@ -1,0 +1,208 @@
+/**
+ * firmware_posture_win.cpp -- Windows leg: Win32_BIOS via WMI + the raw
+ * SMBIOS table via GetSystemFirmwareTable('RSMB').
+ *
+ * Two sources, both rung 1 (in-process, no spawn, no wmic/PowerShell):
+ *
+ *   wmi     run_bounded_wmi_query(L"root\\CIMV2", "SELECT Manufacturer,
+ *           SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS") -- the same
+ *           column names hardware_plugin.cpp:316 reads, through the same
+ *           bounded helper bitlocker_plugin.cpp:107-109 uses. The first row
+ *           goes to wmi_bios_rows (pure).
+ *           NOT selected: the BIOSVersion column. It is a string ARRAY
+ *           (VT_ARRAY|VT_BSTR) and agents/shared/wmi_bounded.hpp's
+ *           variant_to_string returns empty for every non-scalar VARIANT, so
+ *           extract_row drops it and it could never reach a row (changing that
+ *           shared helper is its own PR). SMBIOSBIOSVersion carries the same
+ *           version as a scalar. Consequence: 3 of the 4 columns a spec might
+ *           name are reachable, and Windows never emits a `bios_version_list`
+ *           row.
+ *   smbios  GetSystemFirmwareTable('RSMB', 0, ...) with the documented
+ *           two-call size probe (first call returns the required size, the
+ *           second fills the buffer). The bytes -- including the 8-byte
+ *           RawSMBIOSData header -- go to parse_smbios_type0 (pure,
+ *           bounds-checked). This TU never interprets a byte.
+ *
+ * Failure vs absence (run-context CONTRACT DECISION): a definitive
+ * not-there (WMI class/namespace absent, no RSMB provider) adds NO row and NO
+ * failure token; a refused call (ERROR_ACCESS_DENIED / WBEM access denied)
+ * and any other failure go through FirmwareReport::fail as an `unreadable`
+ * row plus a `<source>:<cause>` token (the refusal also sets the denial flag).
+ * Every classification (classify_win32_error / classify_hresult) and row
+ * mapping (wmi_bios_rows / parse_smbios_type0 / smbios_rows) is a pure
+ * function in the parsers header; this TU only performs the calls, builds a
+ * FirmwareReport and hands it to finish_report.
+ *
+ * ── Probe record (run-context: symbol + service-identity in the banner) ──
+ * GetSystemFirmwareTable: NO in-tree precedent. NOT YET PROBED ON THE RIG:
+ * engineers never touch the-rig in this run, so neither the symbol/size
+ * probe, the LocalSystem-vs-Administrator outcome, nor the Win32_BIOS row
+ * has been recorded here. The rig session owner records, verbatim, before
+ * merge: (a) GetSystemFirmwareTable('RSMB',0,NULL,0) return size, (b) the
+ * same call as LocalSystem (S-1-5-18) via the S4U scheduled-task recipe,
+ * (c) the Win32_BIOS row as LocalSystem, alongside tests/unit/fixtures/
+ * wave8/firmware_posture/windows/rsmb.bin and its .provenance.txt. Until
+ * then this banner is a placeholder, not a measurement.
+ */
+#include "firmware_posture_legs.hpp"
+
+#if defined(_WIN32)
+
+#include <wmi_bounded.hpp> // yuzu::shared::wmi bounded WMI query (agents/shared)
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <wbemidl.h>
+
+#include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <vector>
+
+// The pure classifiers carry these numbers as bare integers (they must stay
+// OS-header-free); pin every one against the SDK so a wrong constant fails
+// the Windows build instead of silently misclassifying a refusal as absence.
+static_assert(ERROR_FILE_NOT_FOUND == 2 && ERROR_PATH_NOT_FOUND == 3 && ERROR_ACCESS_DENIED == 5,
+              "classify_win32_error's Win32 numbers must match winerror.h");
+static_assert(static_cast<std::uint32_t>(WBEM_E_ACCESS_DENIED) == 0x80041003u,
+              "classify_hresult: WBEM_E_ACCESS_DENIED");
+static_assert(static_cast<std::uint32_t>(E_ACCESSDENIED) == 0x80070005u,
+              "classify_hresult: E_ACCESSDENIED");
+static_assert(static_cast<std::uint32_t>(WBEM_E_INVALID_NAMESPACE) == 0x8004100Eu,
+              "classify_hresult: WBEM_E_INVALID_NAMESPACE");
+static_assert(static_cast<std::uint32_t>(WBEM_E_INVALID_CLASS) == 0x80041010u,
+              "classify_hresult: WBEM_E_INVALID_CLASS");
+static_assert(static_cast<std::uint32_t>(WBEM_E_NOT_FOUND) == 0x80041002u,
+              "classify_hresult: WBEM_E_NOT_FOUND");
+
+namespace yuzu::firmware_posture {
+
+namespace {
+
+// 'RSMB' as the little-endian DWORD GetSystemFirmwareTable takes (a
+// multi-character literal is implementation-defined, so spell the value).
+constexpr DWORD kRsmbProvider = 0x52534D42;
+
+// A real RawSMBIOSData table is tens of KiB; refuse anything an order of
+// magnitude past that rather than allocate whatever a broken provider claims.
+constexpr std::size_t kMaxSmbiosBytes = 1u << 20; // 1 MiB
+
+// The table can change size between the probe and the fill (rare: a
+// hot-plug SMBIOS update). Retry the pair a bounded number of times.
+constexpr int kMaxSmbiosAttempts = 3;
+
+// ── wmi ──────────────────────────────────────────────────────────────────
+
+/// The HRESULT a wmi_bounded error token ends in (`..._0x<8 hex digits>`,
+/// e.g. wmi_connect_failed_0x80041003), or nullopt for a token that carries
+/// none (com_init_failed, wmi_next_timeout, ...). Extraction only: what the
+/// HRESULT means is classify_hresult's job.
+std::optional<std::uint32_t> hresult_from_token(const std::string& token) {
+    constexpr std::size_t kTail = 10; // "0x" + 8 hex digits
+    if (token.size() < kTail)
+        return std::nullopt;
+    const char* first = token.data() + token.size() - kTail;
+    if (first[0] != '0' || first[1] != 'x')
+        return std::nullopt;
+    std::uint32_t hr = 0;
+    const char* last = token.data() + token.size();
+    const auto [ptr, ec] = std::from_chars(first + 2, last, hr, 16);
+    if (ec != std::errc{} || ptr != last)
+        return std::nullopt;
+    return hr;
+}
+
+void collect_wmi(FirmwareReport& report) {
+    // rung 1: in-process bounded WMI query (Win32_BIOS); no wmic/PowerShell
+    // spawn (not a spawn sink).
+    auto query = yuzu::shared::wmi::run_bounded_wmi_query(
+        L"root\\CIMV2", L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS");
+
+    if (query.error.has_value()) {
+        const auto hr = hresult_from_token(*query.error);
+        const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
+        if (o == ReadOutcome::absent)
+            return; // namespace/class not there: definitive absence, no row, no token
+        report.fail("vendor", kSrcWmi, "wmi:" + *query.error, o == ReadOutcome::denied);
+        return;
+    }
+    if (query.truncated)
+        report.note_failure("wmi:row_cap");
+    // Win32_BIOS is a singleton on every host seen; if a host reports more
+    // than one instance the first is authoritative and the rest ignored.
+    if (query.rows.empty())
+        return; // class present, no instance: definitive absence
+    report.add_all(wmi_bios_rows(query.rows.front()));
+}
+
+// ── smbios ───────────────────────────────────────────────────────────────
+
+/// A GetSystemFirmwareTable call that returned 0: classify GetLastError().
+void smbios_call_failed(FirmwareReport& report, DWORD err) {
+    const ReadOutcome o = classify_win32_error(static_cast<std::uint32_t>(err));
+    if (o == ReadOutcome::absent)
+        return; // no RSMB provider on this host: definitive absence
+    report.fail("vendor", kSrcSmbios, "smbios:win32_" + std::to_string(err),
+                o == ReadOutcome::denied);
+}
+
+void collect_smbios(FirmwareReport& report) {
+    std::vector<std::uint8_t> table;
+    for (int attempt = 0; attempt < kMaxSmbiosAttempts; ++attempt) {
+        // rung 1: in-process
+        // GetSystemFirmwareTable size probe (buffer NULL, size 0 -> returns
+        // the required byte count, or 0 with GetLastError set).
+        const UINT need = ::GetSystemFirmwareTable(kRsmbProvider, 0, nullptr, 0);
+        if (need == 0) {
+            smbios_call_failed(report, ::GetLastError());
+            return;
+        }
+        if (need > kMaxSmbiosBytes) {
+            report.fail("vendor", kSrcSmbios, "smbios:oversized");
+            return;
+        }
+
+        table.assign(need, 0);
+        // The fill call returns the bytes written, or the (larger) required
+        // size if the table grew since the probe, or 0 on failure.
+        const UINT got = ::GetSystemFirmwareTable(kRsmbProvider, 0, table.data(), need);
+        if (got == 0) {
+            smbios_call_failed(report, ::GetLastError());
+            return;
+        }
+        if (got > need)
+            continue; // grew between the two calls: probe again
+        table.resize(got);
+
+        const Smbios0Result r = parse_smbios_type0(std::span<const std::uint8_t>{table});
+        if (r.constrained)
+            report.fail("vendor", kSrcSmbios, r.token); // smbios:truncated|malformed|no_type0
+        else
+            report.add_all(smbios_rows(r.data));
+        return;
+    }
+    report.fail("vendor", kSrcSmbios, "smbios:size_race");
+}
+
+} // namespace
+
+int collect_firmware_win(yuzu::CommandContext& ctx) {
+    FirmwareReport report;
+    collect_wmi(report);
+    collect_smbios(report);
+    return finish_report(ctx, report);
+}
+
+} // namespace yuzu::firmware_posture
+
+#endif // _WIN32
