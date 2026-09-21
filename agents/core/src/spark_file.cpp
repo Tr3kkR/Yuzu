@@ -2500,6 +2500,21 @@ private:
                 any = true;
             }
         }
+        // Pass-failure backoff floor (#4658): while a failed pass is backing
+        // off, EVERY deadline computed above is clamped to the backoff
+        // deadline, and the retry itself is an obligation (`any = true`) so
+        // an otherwise idle worker still retries and `inert` can clear with
+        // no external wake. `wake` is only a real deadline once `any` is set
+        // (it starts at now + 1h), so an idle worker takes the backoff
+        // deadline itself, never max() against that placeholder. One clamp on
+        // the FINAL value, never per clause: seven producers above can yield
+        // `now` (health edge, coverage marker, confirmation, dead ancestor, a
+        // past Deferred/resync/grace deadline), and the unwind itself
+        // re-creates one of them.
+        if (pass_backoff_until_ > now) {
+            wake = any ? std::max(wake, pass_backoff_until_) : pass_backoff_until_;
+            any = true;
+        }
         if (!any)
             return INFINITE;
         const auto delta = wake - now;
@@ -2828,6 +2843,69 @@ private:
             pass_fail_hook_();
     }
 
+    /// What the caller logs once mu_ is released (never log under mu_ from the
+    /// worker: the log I/O would extend the per-type-lock hold watch() sees).
+    struct PassOutcome {
+        unsigned failures{0};
+        std::int64_t delay_ms{0};
+        bool flipped_inert{false};
+        bool recovered{false};
+    };
+
+    /// Per-pass outcome bookkeeping (#4658), under mu_, noexcept. Mirrors
+    /// spark_registry.cpp's sweeper_main() success/failure arms, with one
+    /// deliberate difference: the retry deadline is a floor consulted by
+    /// wait_timeout_locked() (this mechanism's only timer) rather than a
+    /// separate stop-only wait, because run() is also the IOCP consumer.
+    [[nodiscard]] PassOutcome note_pass_outcome_locked(bool ok) noexcept {
+        PassOutcome out;
+        if (ok) {
+            if (pass_failures_ != 0) {
+                out.recovered = true;
+                out.failures = pass_failures_;
+                pass_failures_ = 0;
+                pass_backoff_until_ = {}; // MUST reset: a stale deadline would floor the next
+                pass_backoff_ = {};       // wake and absorb the next nudge
+                inert_.store(false, std::memory_order_release);
+            }
+            return out;
+        }
+        pass_failed_.fetch_add(1, std::memory_order_relaxed);
+        if (pass_failures_ != (std::numeric_limits<unsigned>::max)())
+            ++pass_failures_;
+        pass_backoff_ = doubled(sweep_cadence(), pass_failures_, kFileAdmissionBackoffCap);
+        pass_backoff_until_ = Clock::now() + pass_backoff_;
+        out.failures = pass_failures_;
+        out.delay_ms = pass_backoff_.count();
+        if (pass_failures_ >= kFileWorkerInertAfterFailures &&
+            !inert_.load(std::memory_order_acquire)) {
+            inert_.store(true, std::memory_order_release);
+            out.flipped_inert = true;
+        }
+        return out;
+    }
+
+    /// Off-lock, noexcept: run() has NO outer catch, so a throw from a log call
+    /// here would be worker death, the very thing the pass catch exists to
+    /// prevent. Same wrapping rule as every other diagnostic in a recovery path
+    /// in this file.
+    static void log_pass_outcome(const PassOutcome& o) noexcept {
+        try {
+            if (o.recovered) {
+                spdlog::info("spark_file: worker pass recovered after {} failure(s)", o.failures);
+                return;
+            }
+            if (o.failures != 0 && (o.failures & (o.failures - 1)) == 0) // 1, 2, 4, 8, ...
+                spdlog::error(
+                    "spark_file: worker pass failed (consecutive #{}) - retrying in {} ms",
+                    o.failures, o.delay_ms);
+            if (o.flipped_inert)
+                spdlog::error("spark_file: worker failing persistently - file sparks reported "
+                              "inert until a pass succeeds");
+        } catch (...) {
+        }
+    }
+
     /// Undo a pass that threw, under mu_, noexcept: retirements/launches this
     /// pass staged are reconciled the same way publish_pass_locked() would
     /// have (reconcile_probe_launches_locked is unconditional on both paths —
@@ -3145,6 +3223,7 @@ private:
                 work.consumed_ok = static_cast<bool>(gqcs_ok);
                 work.consumed_is_anc = is_ancestor_watch(w);
                 bool dispatched = false;
+                bool ok = true;
                 try {
                     // Reserves moved inside the try (#2012/#3840 review,
                     // round-3 table opine): they used to run BEFORE this
@@ -3171,11 +3250,10 @@ private:
                 } catch (...) {
                     if (!lk.owns_lock())
                         lk.lock();
+                    ok = false;
                     unwind_pass_locked(work, dispatched);
-                    pass_failed_.fetch_add(1, std::memory_order_relaxed);
-                    if (pass_failures_ != (std::numeric_limits<unsigned>::max)())
-                        ++pass_failures_;
                 }
+                const PassOutcome po = note_pass_outcome_locked(ok);
                 // FilePassWork's own doc comment: "Destroyed only with mu_
                 // released" (#2012/#3840 review finding 3) — publish_pass_
                 // locked()/unwind_pass_locked() both need mu_ HELD while
@@ -3187,12 +3265,24 @@ private:
                 // mu_ is released, on EITHER path — matches spark_registry.
                 // cpp's `dead = std::move(work)` pattern.
                 lk.unlock();
+                log_pass_outcome(po);
                 { FilePassWork dead = std::move(work); }
                 lk.lock();
                 continue;
             }
             if (stop_.load(std::memory_order_acquire))
                 break;
+            // Pass-failure backoff (#4658): a control wake (watch()/unwatch()/
+            // apply_test_controls() nudge, or a timeout that landed a tick
+            // early) inside an active backoff is ABSORBED, as
+            // spark_registry.cpp's stop-only backoff predicate absorbs
+            // nudged_: what the nudge announced is durable state in dirs_/
+            // ancestors_ and is served by the retry pass at the deadline. Sits
+            // after the stop_ check above, so stop() never waits on a backoff.
+            // A real completion (the branch above) is never absorbed: its
+            // io_pending bookkeeping was consumed at dequeue.
+            if (pass_backoff_until_ > Clock::now())
+                continue;
             // Control wake (ckey == kControlKey, posted by watch()/unwatch()/
             // apply_test_controls()/stop() — though stop() already checked
             // above) or a scheduled timeout (WAIT_TIMEOUT) — either way,
@@ -3200,6 +3290,7 @@ private:
             // us to look now.
             FilePassWork work;
             bool dispatched = false;
+            bool ok = true;
             try {
                 // Reserves moved inside the try (#2012/#3840 review,
                 // round-3 table opine) — same reasoning as the
@@ -3222,14 +3313,14 @@ private:
             } catch (...) {
                 if (!lk.owns_lock())
                     lk.lock();
+                ok = false;
                 unwind_pass_locked(work, dispatched);
-                pass_failed_.fetch_add(1, std::memory_order_relaxed);
-                if (pass_failures_ != (std::numeric_limits<unsigned>::max)())
-                    ++pass_failures_;
             }
+            const PassOutcome po = note_pass_outcome_locked(ok);
             // See the identical comment on the real_completion branch above
             // (#2012/#3840 review finding 3).
             lk.unlock();
+            log_pass_outcome(po);
             { FilePassWork dead = std::move(work); }
             lk.lock();
         }
