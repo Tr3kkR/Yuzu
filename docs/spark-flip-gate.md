@@ -1559,7 +1559,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   item for the flip; this entry records the exposure and the compensating control only.
 
 **#4685** (Guardian: Unsupported rules not re-reconciled after a File/Registry episode, #4658)
-- Detection signal: none dedicated. The three signals below are hints, not proof.
+- Detection signal: none dedicated. The fleet query and the agent log below are hints, not proof,
+  and no alert ships (last bullet).
   - Fleet (aggregate: the gauges are server-side sums and cannot name a host). The query below
     returns a series while `yuzu_fleet_spark_unsupported` for the mechanism is above zero and
     that mechanism's `yuzu_fleet_spark_mechanisms` series equals `yuzu_fleet_spark_reporting`
@@ -1577,8 +1578,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     were checked with promtool against synthetic series only. Unlike the mechanism-gap recipe in
     `docs/user-manual/metrics.md`, this query is deliberately silent when the mechanism series is
     absent (an absent mechanism is not functional, so there is nothing recovered to be stuck).
-    Blind spot: the query needs the
-    two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
+    Blind spot: the query needs the two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
     agent, or an unrelated concurrent episode) silences it fleet-wide; silence proves nothing
     while any agent lacks the mechanism. Only a sustained hold is a hint: the gauges trail the
     agent by up to about 45 s (`docs/user-manual/guaranteed-state.md`, "Fleet lag").
@@ -1605,12 +1605,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   agent reports itself converged and the server's heartbeat reconcile does not re-push
   (`agent_gen >= current`, `server.cpp`; see the recovery-path note in the
   `#2815 + #2818 + #2833 + #2839` entry above), and the Unsupported branch's own comment says
-  `get_status()` is deliberately untouched, so no per-rule status contradicts "converged".
+  `get_status()` is deliberately untouched and reports every stored rule as `errored`
+  (`guardian_engine.cpp`), so it cannot tell this state from any other.
   After the mechanism has recovered, re-run the reconcile on the affected host, narrowest
   first: restart that agent (`start_local()` re-arms its cached rules through
   `reconcile_rule_locked`), or send the scoped push in `docs/user-manual/guaranteed-state.md`
   section 4 (`POST /api/v1/guaranteed-state/push` with a `scope` that selects only the affected
-  hosts and `"full_sync": true`; requires `GuaranteedState:Push`). Avoid the fleet-wide route (a
+  hosts and `"full_sync": true`; requires `GuaranteedState:Push`). The fleet gauges cannot name a
+  host and the agent log is the only per-host evidence, so an operator who cannot identify the
+  affected hosts is left with the same push over a wider scope, at the cost below. Avoid the
+  fleet-wide route (a
   Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` tears
   down and re-arms every rule on every in-scope agent (R5.7 (g)(1); its cost is the #3990
   blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`) and re-classifies any
@@ -1812,8 +1816,10 @@ the driver.
 **NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
 #4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
 not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry. The
-per-mechanism fleet alert it relies on for detection is tracked in #2084 and must ship before the
-flip as well.**
+per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
+detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
+the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
+on the section 5 query.**
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
