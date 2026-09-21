@@ -77,15 +77,16 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
         namespace ps = yuzu::platform_security;
-        const bool secure_boot = action == ps::kSecureBootAction;
-        if (!secure_boot && action != ps::kCodeIntegrityAction) {
-            // `action` is request-supplied and lands in a pipe-delimited stream.
-            ctx.write_output("unknown action: " + yuzu::util::safe_output_field(action));
-            return 1;
-        }
-        // Frozen seam: nothing may escape the plugin ABI (the SDK trampoline does not catch);
-        // every leg returns 0 for a data-level outcome, so 1 means exactly this.
+        // Frozen seam: nothing may escape the plugin ABI (the SDK trampoline does not catch), so
+        // the whole body, the unknown-action row included, sits inside the one try; every leg
+        // returns 0 for a data-level outcome, so 1 means exactly this.
         try {
+            const bool secure_boot = action == ps::kSecureBootAction;
+            if (!secure_boot && action != ps::kCodeIntegrityAction) {
+                // `action` is request-supplied and lands in a pipe-delimited stream.
+                ctx.write_output("unknown action: " + yuzu::util::safe_output_field(action));
+                return 1;
+            }
             // Yuzu targets exactly these three OSes, so there is no fourth branch.
 #if defined(_WIN32)
             return secure_boot ? ps::collect_secure_boot_win(ctx) : ps::collect_code_integrity_win(ctx);
