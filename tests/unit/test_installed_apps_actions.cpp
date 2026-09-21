@@ -9,11 +9,15 @@
  * host, end to end, not just that the pure parsers in
  * installed_apps_parsers.hpp accept a fixture string.
  *
- * `list` is the fast, local, always-available action (no params; on macOS
- * one bounded in-process CFBundle read per listed app for bundle_id, 1.63 s for
- * 323 apps measured 2026-09-21) -- assertions are on rc and output SHAPE
- * (every emitted line matches the `app|` wire prefix), never on specific
- * app names/counts, which are entirely host-dependent.
+ * `list` is the fast, local, always-available action (no params; on macOS one
+ * bounded in-process CFBundle read per listed app for bundle_id, inside the noise
+ * of the single system_profiler call on this Mac, 2026-09-21) -- assertions are on
+ * rc and output SHAPE (every emitted line matches the `app|` wire prefix), never
+ * on specific app names/counts, which are host-dependent, with ONE deliberate
+ * exception: the `list` case asserts value-level facts every Mac guarantees
+ * (`*.app` rows under `/System/Applications/` with `com.apple.*` bundle ids,
+ * absolute locations), because shape-only checks survive reverting either half of the
+ * ADR-0028 wiring (see that case's own comment).
  *
  * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
  * whenever a test's runtime depends on process creation):
@@ -174,10 +178,10 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // Wire contract (ADR-0028 binding condition): every row is
     // app|name|version|publisher|install_date|install_location|bundle_id --
     // exactly 7 escape-aware fields, the "No applications found" sentinel
-    // included. The two trailing columns are safe_output_field-escaped; the
-    // first four are not (pre-existing, recorded in the PR body), so this is
-    // stated over rows whose name/publisher contain no unescaped '|': a real
-    // host's names/vendors do not contain one.
+    // included. The last three columns (install_date, install_location, bundle_id)
+    // are safe_output_field-escaped; name/version/publisher are not (pre-existing,
+    // recorded in the PR body), so this is stated over rows whose name/publisher
+    // contain no unescaped '|': a real host's names/vendors do not contain one.
     std::istringstream iss(result.captured);
     std::string line;
     std::size_t rows = 0, bad_field_count = 0, empty_field = 0;

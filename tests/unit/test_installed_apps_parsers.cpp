@@ -450,6 +450,13 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     const auto bid = format_app_row({.name = "X", .bundle_id = "a|b\\c"});
     CHECK(bid == "app|X|-|-|-|-|a\\|b/c");
     CHECK(split_fields_escape_aware(bid).size() == 7);
+
+    // install_date is no longer the row's last field, so a trailing backslash in it
+    // would swallow the install_location delimiter; it is escaped like the two new
+    // columns (dropping that must fail here).
+    const auto dated = format_app_row({.name = "X", .install_date = "20260101\\"});
+    CHECK(dated == "app|X|-|-|20260101/|-|-");
+    CHECK(split_fields_escape_aware(dated).size() == 7);
 }
 
 TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-field row",
@@ -462,12 +469,12 @@ TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-
 
 TEST_CASE("format_app_row: a '|' inside a field is emitted as-is (pre-existing gap, pinned)",
           "[installed_apps]") {
-    // The four pre-existing list columns (name/version/publisher/install_date) have
-    // never escaped '|' (sanitize_utf8 only repairs invalid UTF-8); only the two
-    // ADR-0028 columns are safe_output_field-escaped (see the B1 case above). This
-    // pins that the formatter does not change the four: such a row splits into more
-    // than seven naive fields. Recorded as a deferred item; a future escaping change
-    // must update this case.
+    // The three leading columns (name/version/publisher) have never escaped '|'
+    // (sanitize_utf8 only repairs invalid UTF-8); install_date and the two ADR-0028
+    // columns are safe_output_field-escaped (see the case above). This pins that the
+    // formatter does not change the three: such a row splits into more than seven
+    // naive fields. Recorded as a deferred item; a future escaping change must
+    // update this case.
     const auto row = format_app_row({"A|B", "1", "P", "D", "L", "B"});
     CHECK(row == "app|A|B|1|P|D|L|B");
     CHECK(std::count(row.begin(), row.end(), '|') == 7);
@@ -485,4 +492,68 @@ TEST_CASE("reg_string_type_accepted: REG_SZ always, REG_EXPAND_SZ only when acce
     CHECK(reg_string_type_accepted(2, true));
     CHECK_FALSE(reg_string_type_accepted(3, true));
     CHECK_FALSE(reg_string_type_accepted(7, true));
+}
+
+// ── Windows dedupe: the `list` column is layered after the base survivor ─────
+// Input is already sorted by (name, version) as the plugin sorts it; the run order
+// below is fixed by the test, not by std::sort (equal keys have no defined order),
+// so each case pins one arrangement explicitly. Mutation: making
+// backfill_install_location_from_duplicates return immediately fails the first case.
+
+namespace {
+// Mirrors get_installed_apps_windows(): backfill, then unique() on name+version.
+std::vector<AppRowFields> dedupe_like_plugin(std::vector<AppRowFields> v) {
+    backfill_install_location_from_duplicates(v);
+    v.erase(std::unique(v.begin(), v.end(),
+                        [](const AppRowFields& a, const AppRowFields& b) {
+                            return a.name == b.name && a.version == b.version;
+                        }),
+            v.end());
+    return v;
+}
+} // namespace
+
+TEST_CASE("backfill_install_location_from_duplicates: the survivor keeps its own fields and "
+          "gains a duplicate's location",
+          "[installed_apps]") {
+    auto out = dedupe_like_plugin({
+        {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101"},
+        {.name = "Tool", .version = "1.0", .publisher = "Acme Inc", .install_date = "20240202",
+         .install_location = "C:\\Program Files\\Tool\\"},
+    });
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].publisher == "Acme"); // the base survivor's fields, untouched
+    CHECK(out[0].install_date == "20200101");
+    CHECK(out[0].install_location == "C:\\Program Files\\Tool\\");
+}
+
+TEST_CASE("backfill_install_location_from_duplicates: a populated first record is never "
+          "overwritten",
+          "[installed_apps]") {
+    auto out = dedupe_like_plugin({
+        {.name = "Tool", .version = "1.0", .publisher = "Acme Inc", .install_date = "20240202",
+         .install_location = "C:\\A\\"},
+        {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101",
+         .install_location = "C:\\B\\"},
+        {.name = "Tool", .version = "1.0", .publisher = "Acme", .install_date = "20200101"},
+    });
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].publisher == "Acme Inc");
+    CHECK(out[0].install_date == "20240202");
+    CHECK(out[0].install_location == "C:\\A\\");
+}
+
+TEST_CASE("backfill_install_location_from_duplicates: distinct versions are distinct runs; a "
+          "run with no location stays empty",
+          "[installed_apps]") {
+    auto out = dedupe_like_plugin({
+        {.name = "Tool", .version = "1.0"},
+        {.name = "Tool", .version = "2.0", .install_location = "C:\\Tool2\\"},
+        {.name = "Zed", .version = "1.0"},
+        {.name = "Zed", .version = "1.0"},
+    });
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].install_location.empty());          // no Tool 1.0 duplicate has one
+    CHECK(out[1].install_location == "C:\\Tool2\\"); // never borrowed across versions
+    CHECK(out[2].install_location.empty());
 }

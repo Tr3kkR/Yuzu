@@ -18,6 +18,7 @@
 // acquisition's own pure parsers (`pkgutil --pkgs` id list, `pkgutil
 // --pkg-info <id>` version/install-time extraction).
 
+#include <cstddef>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -159,9 +160,9 @@ inline void strip_trailing_cr(std::string& line) {
 // piped this through
 // `grep -E '^ {4}\w|Version:|Last Modified:'` before any C++ ever saw it;
 // with that shell stage gone (rung 2: clean argv, no pipe), this function
-// replicates that three-way selection in-process. `list`/`query`'s emitted
-// rows are byte-identical to before FOR EVERY APP THE OLD GREP ADMITTED,
-// with TWO deliberate, documented deviations:
+// replicates that three-way selection in-process. `query`'s emitted rows, and
+// the first five fields of `list`'s, are byte-identical to before FOR EVERY APP
+// THE OLD GREP ADMITTED, with TWO deliberate, documented deviations:
 //   (1) the header-character WIDENING described below -- additive only;
 //   (2) the header-BEFORE-attribute branch order (see the ordering comment in
 //       the loop): an app named "Location"/"Version"/"Last Modified" is now
@@ -186,12 +187,13 @@ inline void strip_trailing_cr(std::string& line) {
 //   - everything else (Obtained from/Kind/Signed by/Location, in the mini
 //     detail's normal case) was never visible to the old grep and is
 //     likewise skipped here for those three fields.
-// "Location:" is the one deliberate ADDITION (Wave 4 PR4.3a, #2273): it was
-// never part of the old grep/parse and is not emitted via list/query's wire
-// format, but the app's absolute bundle path is exactly what the new macOS
-// list_inventory enrichment (installed_apps_macos_enrich.hpp) needs to call
-// CFBundleCreate/SecStaticCodeCreateWithPath against -- capturing it here
-// only ever adds an internal field, never changes list/query's emitted shape.
+// "Location:" was added in Wave 4 PR4.3a (#2273) for the macOS list_inventory
+// enrichment (installed_apps_macos_enrich.hpp), which calls CFBundleCreate/
+// SecStaticCodeCreateWithPath against the app's absolute bundle path; it never
+// enters the ADR-0016 InvRecord. Since ADR-0028's binding condition it is ALSO
+// emitted by `list` as the trailing install_location column (format_app_row),
+// so a change to its capture changes `list`'s rows; `query` and `list_per_user`
+// still do not carry it.
 [[nodiscard]] inline std::vector<AppRecord> parse_system_profiler_apps(std::string_view output) {
     std::vector<AppRecord> apps;
     std::string buf(output);
@@ -368,14 +370,51 @@ constexpr unsigned long kRegExpandSz = 2;
     return type == kRegSz || (accept_expand_sz && type == kRegExpandSz);
 }
 
+// ── Windows `list`: install_location across name+version duplicates ─────────
+
+// The three Uninstall hives (HKLM 64-bit, WoW6432Node, HKCU) can register one
+// product several times; the plugin sorts by (name, version) and unique() keeps
+// the FIRST record of each equal run -- the survivor whose publisher/install_date
+// reach the ADR-0016 `inv|` rows and `query`, unchanged since before ADR-0028.
+// This pass runs between that sort and that unique(): when the first record of a
+// run has an empty install_location and a later record in the run has one, the
+// location (and ONLY the location) is copied into the first record, so `list`
+// never shows '-' for a product another hive locates. Equal name+version records
+// have no defined order (std::sort is unstable), so among several populated
+// locations the first in sort order wins -- deterministic per host, not
+// specified. Templated because the plugin's AppInfo is TU-local; any record with
+// name/version/install_location std::string members qualifies (AppRowFields in
+// the tests). Pure, so the decision is tested on every host.
+template <class Rec>
+inline void backfill_install_location_from_duplicates(std::vector<Rec>& sorted_by_name_version) {
+    auto& v = sorted_by_name_version;
+    for (std::size_t i = 0; i < v.size();) {
+        std::size_t end = i + 1;
+        while (end < v.size() && v[end].name == v[i].name && v[end].version == v[i].version)
+            ++end;
+        if (v[i].install_location.empty()) {
+            for (std::size_t k = i + 1; k < end; ++k) {
+                if (!v[k].install_location.empty()) {
+                    v[i].install_location = v[k].install_location;
+                    break;
+                }
+            }
+        }
+        i = end;
+    }
+}
+
 // `app|name|version|publisher|install_date|install_location|bundle_id`.
 // Every field but `name` renders "-" when empty (an absent InstallLocation /
 // bundle_id is a designed "-", never fabricated).
-// The two ADR-0028 columns pass through safe_output_field ('\' folds to '/', '|' -> "\|",
-// CR/LF -> ' '): a Windows InstallLocation ends in '\' and the shared decoder
-// (server/core/src/result_parsing.hpp find_unescaped_pipe) reads "\|" as an escaped pipe. The
-// four pre-existing columns stay raw (known gap, pinned below). The caller applies
-// sanitize_utf8 to the result.
+// install_date and the two ADR-0028 columns pass through safe_output_field ('\'
+// folds to '/', '|' -> "\|", CR/LF -> ' '): a Windows InstallLocation ends in '\'
+// and the shared decoder (server/core/src/result_parsing.hpp find_unescaped_pipe)
+// reads "\|" as an escaped pipe. install_date is included because it ended the
+// row before ADR-0028 and now precedes a delimiter; every real value (YYYYMMDD, a
+// localized date-time, "-") is free of '\' and '|', so its bytes do not change.
+// name/version/publisher stay raw (pre-existing '|' gap, pinned in the tests).
+// The caller applies sanitize_utf8 to the result.
 [[nodiscard]] inline std::string format_app_row(const AppRowFields& f) {
     const auto or_dash = [](const std::string& v) -> const std::string& {
         static const std::string kDash = "-";
@@ -383,11 +422,11 @@ constexpr unsigned long kRegExpandSz = 2;
     };
     std::string out = "app|";
     out += f.name;
-    for (const auto* v : {&f.version, &f.publisher, &f.install_date}) {
+    for (const auto* v : {&f.version, &f.publisher}) {
         out += '|';
         out += or_dash(*v);
     }
-    for (const auto* v : {&f.install_location, &f.bundle_id}) {
+    for (const auto* v : {&f.install_date, &f.install_location, &f.bundle_id}) {
         out += '|';
         out += v->empty() ? std::string("-") : yuzu::util::safe_output_field(*v);
     }

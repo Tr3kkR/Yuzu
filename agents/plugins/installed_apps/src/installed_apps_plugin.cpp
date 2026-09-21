@@ -416,14 +416,17 @@ AppCollection get_installed_apps_windows() {
     // Current user
     enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
 
-    // Deduplicate by name+version. A populated install_location sorts first among
-    // name+version duplicates across the three hives, so unique() keeps it (never a
-    // '-' shadowing a real path).
+    // Deduplicate by name+version (comparator and survivor unchanged since before
+    // ADR-0028: unique() keeps the first record of each equal name+version run, and
+    // that record's publisher/install_date feed the ADR-0016 `inv|` rows and
+    // `query`). The `list` column is layered AFTER the sort and BEFORE unique(): an
+    // empty install_location on the surviving record is filled from a duplicate in
+    // the same run that has one, so a '-' never shadows a real path and no other
+    // field moves.
     std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
-        const bool a_empty = a.install_location.empty();
-        const bool b_empty = b.install_location.empty();
-        return std::tie(a.name, a.version, a_empty) < std::tie(b.name, b.version, b_empty);
+        return a.name < b.name || (a.name == b.name && a.version < b.version);
     });
+    parsers::backfill_install_location_from_duplicates(apps);
     apps.erase(std::unique(apps.begin(), apps.end(),
                            [](const AppInfo& a, const AppInfo& b) {
                                return a.name == b.name && a.version == b.version;
@@ -668,8 +671,14 @@ constexpr std::size_t kMaxPkgutilPackages = 5000;
 // remaining rows keep an empty bundle_id (rendered "-") and the run is NOT
 // reported degraded -- unlike the daily-sync leg, where a silently hollowed-out
 // security-posture field must not publish as authoritative.
-// Measured 1.63 s for 323 apps (this Mac, 2026-09-21), so kCollectionBudget is a runaway guard,
-// not the expected cost.
+// Budget semantics: kCollectionBudget is checked BETWEEN apps, so it bounds how
+// many CFBundle reads start, not how long one takes -- a single wedged read (a
+// stale network mount under a listed location) holds this dispatch worker until
+// it returns, the accepted residual recorded at kCollectionBudget's declaration.
+// A complete `list` (system_profiler + parse + this pass) measured 1.4-2.3 s wall
+// for 323 apps on this Mac (2026-09-21); the pass is inside the run-to-run noise
+// of the one system_profiler call, so the budget is a runaway guard, not the
+// expected cost.
 std::vector<AppInfo> with_bundle_ids(std::vector<AppInfo> apps) {
     const auto start = std::chrono::steady_clock::now();
     const auto over_budget = [start]() {
@@ -1225,7 +1234,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "system_profiler via bounded argv runner + native CFBundle enrichment",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
     },
