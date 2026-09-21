@@ -177,6 +177,9 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 - **macOS:** `autoconf`, `automake`, `libtool`
   (`brew install autoconf automake libtool`) — same libpq port runs
   autoreconf. Windows needs nothing extra (vcpkg auto-acquires winflexbison).
+- **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
+  [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
+  recipe, or run `bash scripts/setup-rhel9.sh`.
 
 ### Quick Start
 
@@ -208,7 +211,7 @@ meson compile -C build-windows
 | `-Dbuild_agent` | true | Agent daemon |
 | `-Dbuild_server` | true | Server daemon |
 | `-Dbuild_tests` | false | Catch2 test suite |
-| `-Dbuild_examples` | true | Example plugins |
+| `-Dbuild_examples` | true | Demo plugins only (`example`, `chargen`, `procfetch`, `netprobe`) — every other plugin builds under `-Dbuild_agent` regardless |
 | `-Db_lto` | false | Link-time optimisation |
 | `-Db_sanitize=address,undefined` | — | ASan + UBSan |
 
@@ -243,7 +246,7 @@ Open `http://localhost:8080` for the web dashboard.
 
 ## Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.
+See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap — 17 tracked phases (0–16, 126 issues) from foundation completion through policy engine, security, Guardian, and scale-out architecture, plus three proposed extensions.
 
 See [`docs/capability-map.md`](docs/capability-map.md) for the live capability inventory and progress.
 

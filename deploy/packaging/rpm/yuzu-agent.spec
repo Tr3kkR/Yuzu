@@ -15,6 +15,12 @@ install -D -m 0755 %{_sourcedir}/yuzu-agent %{buildroot}%{_bindir}/yuzu-agent
 install -D -m 0644 %{_sourcedir}/yuzu-agent.service %{buildroot}%{_unitdir}/yuzu-agent.service
 install -d -m 0755 %{buildroot}%{_libdir}/yuzu/plugins
 install -d -m 0750 %{buildroot}/var/lib/yuzu-agent
+# OTA update trust anchor (#416/#3807), at parity with debian/postinst. root-owned
+# and 0755: on Linux the agent runs unprivileged, so it genuinely cannot rewrite
+# the anchor that authorises its own updates. Empty by design -- the operator
+# places the PEM bundle here; nothing is installed into it.
+install -d -m 0755 %{buildroot}/etc/yuzu-agent
+install -d -m 0755 %{buildroot}/etc/yuzu-agent/certs
 
 # Agent core shared library (plugins link against it)
 if ls %{_sourcedir}/libyuzu_agent_core.so* 1>/dev/null 2>&1; then
@@ -54,3 +60,5 @@ ldconfig
 %{_libdir}/yuzu/plugins/*.so
 /etc/ld.so.conf.d/yuzu.conf
 %dir %attr(0750,yuzu-agent,yuzu-agent) /var/lib/yuzu-agent
+%dir %attr(0755,root,root) /etc/yuzu-agent
+%dir %attr(0755,root,root) /etc/yuzu-agent/certs

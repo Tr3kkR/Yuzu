@@ -1,5 +1,6 @@
 #include "cert_reloader.hpp"
 #include "audit_store.hpp"
+#include "background_jobs.hpp"
 #include "file_utils.hpp"
 
 #include <yuzu/secure_zero.hpp>
@@ -67,6 +68,7 @@ CertReloader::~CertReloader() {
 
 void CertReloader::start() {
     stop_requested_.store(false, std::memory_order_release);
+    YUZU_ASSERT_BACKGROUND_JOB("cert_reloader.run_loop"); // WS-10 ReplicaSafe (per-replica)
     thread_ = std::thread([this] { run_loop(); });
 }
 

@@ -1,20 +1,44 @@
 #pragma once
 
-#include <sqlite3.h>
-
-#include <cstdint>
-#include <expected>
-#include <filesystem>
-#include <optional>
-#include <shared_mutex>
-#include <string>
-#include <unordered_set>
-#include <vector>
-
-namespace yuzu::server {
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Result sets — the unit of composable scope ("scope walking").
+/// @file result_set_store.hpp
+/// Migrated Postgres store (ADR-0006, ADR-0036, schema `result_set_store`) for
+/// the scope-walking result-set primitive (design: docs/scope-walking-design.md).
+/// Was `result_sets.db` (SQLite). `migrate_from_sqlite()` retired
+/// (chore/retire-migrate-from-sqlite-batch-b, #3623) — see ADR-0036's Update;
+/// `server.cpp` now runs a detect-and-warn probe over the legacy file instead.
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and
+/// runtime. The database IS the source of truth for scope-walking lineage —
+/// there is no in-memory fallback. Construction failure (`!is_open()`) is
+/// fatal (server.cpp sets `startup_failed_`), same as every other
+/// Postgres-backed store.
+///
+/// **Every authorization/targeting-relevant read is type-distinguishable
+/// (2026-07-25, program policy — see `docs/postgres-store-playbook.md`
+/// "Authoritative reads must be type-distinguishable").** `get`, `contains`,
+/// `resolve_alias`, and `member_set_owned` return `std::expected<T,
+/// ResultSetError>` — a runtime DB error is `std::unexpected(DbError)`,
+/// NEVER an empty/false/nullopt value indistinguishable from a genuine
+/// "not found" or "not a member". This is load-bearing: `member_set_owned`
+/// backs `AgentRegistry::evaluate_scope`'s `from_result_set:` membership
+/// check, and under a `NOT from_result_set:<id>` scope a silently-empty
+/// membership (the pre-2026-07-25 behavior) INVERTS to "matches every
+/// device" — a concrete command-dispatch fleet-wide fail-open, not a
+/// theoretical one. Every caller of these four methods MUST apply the
+/// reviewer test: "if this value were silently empty/false, could any
+/// downstream branch grant/target/enforce/skip/invert(NOT)/report success?
+/// If yes, fail closed (abort/503) on `DbError` — never treat it as
+/// empty-container." `list_by_owner`, `members`, `lineage`,
+/// `count_for_owner`, `counts`, and `list_pending` remain plain-optional/
+/// container reads (deny-or-benign failure modes; not yet widened — tracked
+/// as a follow-up, see ADR-0036).
+///
+/// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
+/// `sqlite3*`), runs its schema migration at construction on a pinned lease,
+/// and schema-qualifies every runtime statement (`result_set_store.result_sets`)
+/// — pooled connections carry no per-store search_path. Mutate-and-return uses
+/// `RETURNING` (the #1033-banning idiom), never `sqlite3_changes()`. No
+/// secrets — plain columns, no `SecretCodec`.
 //
 // A result set is a named, TTL-bounded, lineage-tracked set of device IDs
 // produced by a query, action result, or operator-curated list. Each narrowing
@@ -30,6 +54,19 @@ namespace yuzu::server {
 //     `source_execution_id`, and the server's maintenance thread materialises it
 //     once the execution reaches a terminal state.
 // ─────────────────────────────────────────────────────────────────────────────
+
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace yuzu::server::pg {
+class PgPool;
+}
+
+namespace yuzu::server {
 
 /// Lifecycle state of a result set's membership list.
 enum class ResultSetStatus { Pending, Materialized, Failed };
@@ -110,13 +147,15 @@ public:
     static constexpr int kMaxPinsPerOwner = 50;          // pin-storm guard
     static constexpr int kLineageDepthCap = 10;          // breadcrumb truncation
 
-    explicit ResultSetStore(const std::filesystem::path& db_path);
-    ~ResultSetStore();
+    /// Borrows the shared pool and runs the `result_set_store` schema
+    /// migration on a pinned lease. `is_open()` is false if the lease was
+    /// empty or the migration failed.
+    explicit ResultSetStore(pg::PgPool& pool);
 
     ResultSetStore(const ResultSetStore&) = delete;
     ResultSetStore& operator=(const ResultSetStore&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     // ── Create ───────────────────────────────────────────────────────────────
     /// Synchronous create: members are known now; lands `materialized`.
@@ -129,29 +168,66 @@ public:
                                                             const std::string& execution_id);
 
     // ── Read ─────────────────────────────────────────────────────────────────
-    std::optional<ResultSet> get(const std::string& id) const;
+    /// `std::unexpected(DbError)` on a runtime Postgres error — type-
+    /// distinguishable from a genuine absent row (`std::optional` holding
+    /// `nullopt`). Backs the owner gate at `scope_yaml.cpp` / the dashboard
+    /// and REST result-set routes; a caller MUST treat `DbError` as "cannot
+    /// verify ownership" (fail closed / 503), never as "not found" (404) —
+    /// collapsing the two would let a transient DB blip read as a clean
+    /// not-found on an authorization-relevant lookup.
+    std::expected<std::optional<ResultSet>, ResultSetError> get(const std::string& id);
     /// Owner-scoped list, sorted last_used_at then created_at DESC. `cursor` is
     /// an opaque created_at|id token ("" for first page). Returns up to `limit`
     /// rows; `out_next_cursor` is set empty when the last page is reached.
+    /// NOT YET widened to a typed error (deny-or-benign failure mode — an
+    /// empty page just re-renders the sidebar empty, no grant/target/enforce
+    /// downstream); tracked as a follow-up alongside `members`/`lineage`.
     std::vector<ResultSet> list_by_owner(const std::string& owner, const std::string& cursor,
-                                         int limit, std::string& out_next_cursor) const;
+                                         int limit, std::string& out_next_cursor);
     std::vector<std::string> members(const std::string& id, const std::string& cursor, int limit,
-                                     std::string& out_next_cursor) const;
+                                     std::string& out_next_cursor);
     /// Lineage chain root→leaf, walking parent_id. Owner-filtered: the walk
     /// stops at the first ancestor not owned by `owner`, so a child parented
     /// onto another operator's set cannot leak that set's metadata (review B2).
-    std::vector<LineageNode> lineage(const std::string& id, const std::string& owner) const;
-    bool contains(const std::string& id, const std::string& device_id) const;
-    /// All members of `id` iff owned by `owner`; empty otherwise. Lets the scope
-    /// resolver preload owner-checked membership once per set instead of an
-    /// under-lock query per agent (review findings B1 + F).
-    std::unordered_set<std::string> member_set_owned(const std::string& id,
-                                                     const std::string& owner) const;
-    /// Resolve an owner-scoped alias to a canonical id. Empty if not found.
-    std::optional<std::string> resolve_alias(const std::string& owner,
-                                             const std::string& name) const;
-    int count_for_owner(const std::string& owner) const;
-    int count_pinned_for_owner(const std::string& owner) const;
+    std::vector<LineageNode> lineage(const std::string& id, const std::string& owner);
+    /// `std::unexpected(DbError)` on a runtime error — see the type-
+    /// distinguishable-reads note above the `get()` declaration. (No current
+    /// production caller — `AgentRegistry`'s membership check uses
+    /// `member_set_owned` instead; widened for API consistency and the
+    /// authorization-primitive contract this store advertises.)
+    ///
+    /// CAUTION: `!contains(...)` tests the ERROR state (`std::expected`'s
+    /// `operator!`/`operator bool`), NOT "device is not a member" — a bare
+    /// `!contains(...)` silently treats a DB error the same as "not a
+    /// member" and a successful `false` the same as "degraded", both wrong.
+    /// Check `.has_value()` first, then dereference (`**result` or
+    /// `result.value()`) for the actual boolean membership answer.
+    std::expected<bool, ResultSetError> contains(const std::string& id,
+                                                 const std::string& device_id);
+    /// All members of `id` iff owned by `owner`; empty set otherwise (absent id
+    /// and "not owned" are intentionally indistinguishable — design's
+    /// documented "stale/not-yours members drop silently" contract, review
+    /// findings B1 + F). `std::unexpected(DbError)` on a runtime error is
+    /// DISTINCT from both — see the type-distinguishable-reads note above.
+    /// THE authorization gate for `AgentRegistry::evaluate_scope`'s
+    /// `from_result_set:` scope kind: a caller that lets `DbError` fall
+    /// through as an empty set converts a transient DB blip into "no
+    /// members", which under a `NOT from_result_set:<id>` scope inverts to
+    /// "every device matches" — the fleet-wide fail-open this contract exists
+    /// to prevent. Callers MUST abort (not dispatch) on `DbError`.
+    std::expected<std::unordered_set<std::string>, ResultSetError>
+    member_set_owned(const std::string& id, const std::string& owner);
+    /// Resolve an owner-scoped alias to a canonical id; `nullopt` if not
+    /// found. `std::unexpected(DbError)` on a runtime error — see the
+    /// type-distinguishable-reads note above the `get()` declaration. Feeds
+    /// `resolve_scope_aliases()` (scope_yaml.cpp), which must PROPAGATE a
+    /// `DbError` (abort resolution) rather than leaving the alias atom
+    /// unresolved — an unresolved atom no-matches downstream and, under NOT,
+    /// inverts to match-all, same class of fail-open as `member_set_owned`.
+    std::expected<std::optional<std::string>, ResultSetError>
+    resolve_alias(const std::string& owner, const std::string& name);
+    int count_for_owner(const std::string& owner);
+    int count_pinned_for_owner(const std::string& owner);
 
     /// Fleet-wide aggregate counts for observability gauges.
     struct Counts {
@@ -159,7 +235,7 @@ public:
         int pinned{0};
         int pending{0};
     };
-    Counts counts() const;
+    Counts counts();
 
     // ── Mutate ───────────────────────────────────────────────────────────────
     std::expected<ResultSet, ResultSetError> pin(const std::string& id);
@@ -170,25 +246,74 @@ public:
     std::expected<void, ResultSetError> delete_set(const std::string& id);
 
     // ── Async materialisation (server maintenance thread) ────────────────────
-    std::vector<PendingSet> list_pending() const;
+    std::vector<PendingSet> list_pending();
     /// Populate members, flip status → materialized, set device_count.
     std::expected<void, ResultSetError> materialize(const std::string& id,
                                                     const std::vector<std::string>& members);
     void mark_failed(const std::string& id, const std::string& reason);
+
+    /// #4493 heal path for a row `mark_failed` cannot reach: `mark_failed`'s
+    /// SELECT/UPDATE are both gated on `status = 'pending'`, so a
+    /// `materialized` (or `failed`) row whose `source_payload` nests past
+    /// `kMcpMaxJsonDepth` had no way back to a safe, dumpable payload. This
+    /// method is status-agnostic on purpose: unlike `mark_failed`, whose job
+    /// IS the pending -> failed transition, this NEVER writes `status`, since
+    /// a `materialized` row's members are real and still scope-walkable
+    /// (`member_set_owned` never filters on status), so forcing it to
+    /// `failed` would misrepresent a working set as having produced nothing
+    /// to every status-reading consumer (REST/MCP response body, the
+    /// dashboard badge). Re-checks the raw text itself (never trusts a
+    /// caller's prior check) and is a no-op (returns false, writes nothing)
+    /// when the payload is not actually poisoned, so it can never silently
+    /// overwrite a healthy row's provenance. Returns true only when the
+    /// UPDATE below actually affected exactly one row -- a poisoned payload
+    /// was found and replaced with the same fixed `note` text `mark_failed`
+    /// writes for its own poisoned-pending case (not the same full object --
+    /// `mark_failed`'s also carries a caller-supplied `failure` reason this
+    /// method has no equivalent argument for).
+    ///
+    /// `false` is overloaded across seven distinct causes: the store is not
+    /// open, no connection lease was available, the initial SELECT failed
+    /// (a genuine read error, connection already held), the row was already
+    /// gone at that SELECT, the payload was never actually poisoned (the
+    /// no-op case), the UPDATE itself failed (a genuine write error,
+    /// connection already held), or the row was deleted between the SELECT
+    /// and the UPDATE (#4540 -- a concurrent `delete_set`/GC sweep on an
+    /// independent connection lease with no shared lock, caught via
+    /// `RETURNING id` + an affected-row check, same idiom as `materialize`'s
+    /// own UPDATE) -- a caller needing to distinguish a genuine write failure
+    /// from a harmless no-op cannot do so from the return value alone
+    /// (#4524).
+    ///
+    /// Deliberately has NO owner check of its own -- same shape as
+    /// `mark_failed`. Both of this method's only two production callers
+    /// (REST `/re-eval`, MCP `reevaluate_result_set`) call it only after
+    /// their own `load_owned`/`rs_load_owned` has already confirmed the
+    /// caller owns `id`; a future caller must do the same before invoking
+    /// this method directly.
+    ///
+    /// Invariant this method's safety depends on and that is NOT enforced by
+    /// any type or assertion: today, REST's `/re-eval` and MCP
+    /// `reevaluate_result_set` are the ONLY code paths that ever parse
+    /// `source_payload` back into JSON, and both already depth-check it
+    /// first. A future consumer of `source_payload` (a dashboard/lineage
+    /// view, a list endpoint) that parses it WITHOUT its own depth check
+    /// would reopen the #2437 SIGSEGV class this guard exists to close --
+    /// healing on read here does not protect a consumer that never calls it.
+    bool heal_poisoned_payload(const std::string& id);
 
     // ── GC ───────────────────────────────────────────────────────────────────
     /// Delete unpinned rows past TTL; cascades to members. Returns count removed.
     int gc_sweep();
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::shared_mutex mtx_;
-    void create_tables();
+    pg::PgPool& pool_;
+    bool open_{false};
 
-    // Internal helpers, called under an already-held lock (no re-lock).
     static std::string generate_id();
-    std::optional<ResultSet> get_impl(const std::string& id) const;
-    int count_pinned_for_owner_unlocked(const std::string& owner) const;
+    // Shared body for create_materialized/create_pending: dedups members,
+    // enforces the per-set cap client-side, then inserts the row + member
+    // batch inside ONE transaction (quota check + insert + members atomic).
     std::expected<ResultSet, ResultSetError> insert_row_impl(
         const CreateRequest& req, ResultSetStatus status, const std::string& execution_id,
         const std::vector<std::string>& members);

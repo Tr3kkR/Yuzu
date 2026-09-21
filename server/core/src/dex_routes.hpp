@@ -1,5 +1,10 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+#include "dex_view_types.hpp" // ADR-0031 WS-A4 prep: DexAgentResponse + DexDispatchFn/DexResponsesFn/
+                              // DexAuditFn + dex_iso_since/dex_signal_label -- hoisted store-free so a
+                              // family (e.g. device) can use these without the whole DEX surface
+
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
 /// 110-signal catalogue (crashes, hangs, service failures, device stability,
@@ -23,8 +28,12 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
+#include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
+#include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
+#include "dex_read_builders.hpp" // PR #4582 FIX 4: re-export dex_device_score (relocated here) to this header's callers
 
 #include <httplib.h>
 
@@ -41,54 +50,23 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
-struct GuardianObservationRow;
 class HttpRouteSink;
 
-/// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` is the coverage-honest
-/// denominator (only the OS with a crash collector today); `total_online` is
-/// context. A struct (not a registry dep) keeps render pure + testable.
-struct DexFleet {
-    int64_t windows_online{0};
-    int64_t total_online{0};
-    /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
-    /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
-    /// lens. Empty when nothing is connected.
-    std::vector<std::string> connected_os;
-    /// CONNECTED agents as (agent_id, normalized-os: "windows"/"linux"/"macos").
-    /// The Overview computes a per-device DEX score for each (window-respecting) to
-    /// build the experience distribution AND groups by os for the segment breakdown.
-    /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
-    std::vector<std::pair<std::string, std::string>> connected_agents;
-};
+// `DexFleet`/`DexSignalGroup` and the signal-catalogue accessors
+// (`dex_signal_groups` / `dex_catalogued_type_count` / `dex_family_index`) were
+// relocated to the pure `dex_types.hpp` (included above) for the ADR-0031 WS-A4
+// DexApi seam (PR #4582 FIX 4) — re-exported here transitively, so every
+// existing caller is unaffected while dex_read_model.cpp can call them without
+// this httplib-coupled header.
 
-/// One display family of the server-side signal catalogue. PUBLIC since F1:
-/// the Settings → DEX alerts panel renders the routable-type list from this
-/// same single source of truth (the /dex Catalogue's grouping).
-struct DexSignalGroup {
-    const char* name;
-    std::vector<const char*> types;
-};
+/// Friendly display label for an obs_type — hoisted to `dex_view_types.hpp`
+/// (store-free; see that header for the doc comment).
 
-/// The catalogued signal types, grouped for display — the server-side mirror
-/// of the agent catalogue (keep in sync; the paired drift-net tests bite).
-const std::vector<DexSignalGroup>& dex_signal_groups();
-
-/// Total catalogued display types (sum over the groups).
-std::size_t dex_catalogued_type_count();
-
-/// Friendly display label for an obs_type; unknown types fall back to the
-/// HTML-escaped raw obs_type (forward-compatible, render-safe).
-std::string dex_signal_label(const std::string& obs_type);
-
-/// Shared window-selector resolvers — the single source of truth for how both the
-/// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
-/// token. `dex_window_to_days` maps "24h"/"7d"/"30d"/"all" (anything else → 7d) to
-/// a day count (0 = "all"); `dex_iso_since` turns that day count into an ISO-8601
-/// UTC cutoff ("" when days<=0 = "all"). Thin wrappers over the dashboard's
-/// internal helpers so REST and HTMX can never drift on the window vocabulary.
-int dex_window_to_days(const std::string& window);
-std::string dex_iso_since(int days);
+// `dex_window_to_days` / `dex_iso_since` / `dex_normalize_os_filter` — the shared
+// window-selector + OS-filter resolvers — are now declared in the pure
+// `dex_window.hpp` (included above), so the core `DexApi` impl can resolve a
+// window/os token without pulling this httplib-coupled header. Re-exported here
+// transitively; every existing caller is unaffected.
 
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
@@ -101,19 +79,14 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                          const std::string& since, int window_days, DexFleet fleet,
                                          const std::set<std::string>* visible = nullptr);
 
-/// Per-obs_type platform coverage: which OSes collect this signal type today
-/// (windows = the whole catalogue; linux/macos = the collector subsets). The thin
-/// explicit map the Catalogue's coverage view reads; keep in sync with the agent
-/// collectors (a schema↔catalogue cross-check test guards drift — H2/G9 style).
-std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
-
-/// Per-device DEX experience score (0–100) — the per-device projection of the
-/// canonical severity-weighted composite (100 − Σ family deductions over the
-/// device's OWN observations; benign families don't deduct, events gently scaled).
-/// Cheap server-side read (dex_device_signal_summary); returns -1 when `store` is
-/// null. The fleet-scale path (heartbeat rollup) is a follow-up.
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since);
+// The PURE catalogue/health helpers `dex_obs_platforms`, `dex_family_rollup`
+// (+ `DexFamilyRollup`), `dex_family_health_deduction`, and `dex_compute_health`
+// (+ `DexHealthResult`) — plus the store-reaching `dex_device_score` — were
+// relocated (PR #4582 FIX 4): the pure ones to `dex_types.hpp`, `dex_device_score`
+// to the core-only `dex_read_builders.hpp` (both included above), so
+// dex_read_model.cpp can call them without this httplib-coupled header. They are
+// re-exported here transitively, so this header's existing callers are
+// unaffected; the definitions are unchanged in their .cpp.
 
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
@@ -199,15 +172,8 @@ std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const st
 
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
-/// One agent's stored response to a dispatched command — the narrow seam the
-/// device perf panel needs from the ResponseStore (a struct, not a store dep,
-/// keeps DexRoutes decoupled and the routes testable with a fake).
-struct DexAgentResponse {
-    std::string agent_id;
-    int status{0}; ///< CommandResponse::Status enum value (0=RUNNING, 1=SUCCESS, 2=FAILURE, …)
-    std::string output;
-    std::string error_detail;
-};
+/// `DexAgentResponse` — hoisted to `dex_view_types.hpp` (store-free; see that
+/// header for the doc comment).
 
 /// One parsed hourly perf point out of the device's TAR edge warehouse
 /// (`$Perf_Hourly` — see agents/plugins/tar perf tier, BRD A1).
@@ -335,36 +301,23 @@ public:
     using FleetFn = std::function<DexFleet()>;
 
     /// Audit hook — used to log per-device drill-down opens (behavioral PII).
-    /// May be empty (audit then degrades to a no-op). **Bool-returning** (was
-    /// void pre-#1549 review): returns true iff the event was persisted (or the
-    /// deployment runs audit-off — both look the same to a caller), false on a
-    /// silent persistence failure. PII-emitting drill-downs capture this and
-    /// surface the gap to the operator (Sec-Audit-Failed header) so a dropped
-    /// works-council/SOC 2 evidence row is visible. The dashboard is an HTML/HTMX
-    /// surface served to a browser, so on a failure it STILL renders the fragment
-    /// (a transient audit hiccup must not blank the dashboard) but flags the gap —
-    /// unlike the strict-fail-closed REST per-device endpoints.
-    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
-                                       const std::string& result, const std::string& target_type,
-                                       const std::string& target_id, const std::string& detail)>;
+    /// Hoisted to `dex_view_types.hpp` as `DexAuditFn` (store-free; see that
+    /// header for the full doc comment) — aliased here so `DexRoutes::AuditFn`
+    /// keeps resolving for every existing includer, with ONE definition.
+    using AuditFn = DexAuditFn;
 
-    /// A4: dispatch a plugin command to specific agents (same 5-param shape as
-    /// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
-    /// perf query. May be empty → the perf panel renders "unavailable".
-    using DispatchFn = std::function<std::pair<std::string, int>(
-        const std::string& plugin, const std::string& action,
-        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters)>;
+    /// A4: dispatch a plugin command to specific agents. Hoisted to
+    /// `dex_view_types.hpp` as `DexDispatchFn` (store-free; see that header for
+    /// the full doc comment) — aliased here so `DexRoutes::DispatchFn` keeps
+    /// resolving for every existing includer, with ONE definition.
+    using DispatchFn = DexDispatchFn;
 
-    /// A4: read the stored responses for a command_id (narrow ResponseStore
-    /// seam). May be empty → the perf panel renders "unavailable".
-    // #1634 seam-scoping: the poll reads are scoped to the originating agent AT THE
-    // STORE SEAM (the lambda passes ResponseQuery{.agent_id=...} to ResponseStore),
-    // not only post-filtered in the route. A dropped/refactored post-filter therefore
-    // cannot become a cross-agent disclosure. Every caller passes the agent_id it
-    // already validated for scope.
-    using ResponsesFn = std::function<std::vector<DexAgentResponse>(
-        const std::string& command_id, const std::string& agent_id)>;
+    /// A4: read the stored responses for a command_id. Hoisted to
+    /// `dex_view_types.hpp` as `DexResponsesFn` (store-free; see that header
+    /// for the full doc comment, incl. the #1634 seam-scoping note) — aliased
+    /// here so `DexRoutes::ResponsesFn` keeps resolving for every existing
+    /// includer, with ONE definition.
+    using ResponsesFn = DexResponsesFn;
 
     /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
     /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
@@ -375,6 +328,27 @@ public:
     /// name + member count), sourced from ManagementGroupStore::list_groups. May
     /// be empty → the scope selector is omitted (whole-fleet only).
     using GroupListFn = std::function<std::vector<DexGroupOption>()>;
+
+    /// The version-drill "which devices" fragment's SOLE authorization gate —
+    /// the injected-callback twin of `AuthRoutes::require_fleet_read`
+    /// (authz_gates.hpp), identical shape/contract to `RestApiV1::FleetReadFn` /
+    /// `McpServer::FleetReadFn` (server.cpp wires the SAME conversion lambda into
+    /// all three surfaces so they cannot drift). Deliberately NOT `perm_fn_` +
+    /// `resolve_visible` (this file's pre-existing `VisibleSetFn`, username-keyed
+    /// on `Infrastructure:Read`) — that pairing is the exact confinement gap this
+    /// gate exists to avoid for a route whose rows carry `agent_id` (see the
+    /// fragment's own registration comment). Trailing optional dep, appended
+    /// after `group_list_fn` to keep every existing `register_routes` call site
+    /// source-stable; `{}` (the default) makes the new fragment answer an honest
+    /// "unavailable" placeholder rather than silently falling back to a weaker
+    /// gate — an unwired gate is misconfiguration, never "no filter" (matches
+    /// `RestApiV1`/`McpServer`'s own unwired contract for the identical seam,
+    /// adapted to this dashboard surface's 200-not-503 fragment posture since
+    /// htmx drops 4xx/5xx bodies).
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
 
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
@@ -387,7 +361,7 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -397,9 +371,27 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
 private:
+    /// Deny a service-scoped API token on a fleet-wide fragment that names more
+    /// than one agent_id — the SEC-2/SEC-3 confinement-gap class:
+    /// `resolve_visible`'s VisibleSetFn is username-keyed and does not confine
+    /// a service token whose principal resolves to an unscoped grant. Writes the
+    /// 403 FIRST (mirrors GuardianRoutes::deny_service_scoped_ — a throwing
+    /// audit_fn_ must not be able to suppress the 403), audits after via the
+    /// shared try_persist_audit kernel. `target_type` defaults to
+    /// "GuaranteedState" (every caller but the per-signal fragment, whose
+    /// dex.signal.view contract — the REST/MCP twins, and audit-log.md — uses
+    /// "ObsType"; gov Gate 4 consistency review: the denial row must match its
+    /// own verb's established target_type, not silently diverge from it).
+    /// Returns true iff denied (caller returns immediately); false means the
+    /// caller should proceed to perm_fn_.
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
+                                            const std::string& audit_detail,
+                                            const std::string& target_type = "GuaranteedState") const;
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     ScopedPermFn scoped_perm_fn_;
@@ -412,6 +404,7 @@ private:
     PerfFn perf_fn_;
     AppPerfProviders app_perf_providers_;
     GroupListFn group_list_fn_;
+    FleetReadFn fleet_read_fn_;
 };
 
 } // namespace yuzu::server

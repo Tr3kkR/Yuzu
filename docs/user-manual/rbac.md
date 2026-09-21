@@ -4,7 +4,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 ## Enabling RBAC
 
-RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role). When enabled, every API call and UI action is checked against the caller's assigned roles.
+RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that require admin regardless of the toggle; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
 
 Toggle RBAC via the Settings page or the server configuration file:
 
@@ -23,8 +23,20 @@ enabled = true
 > `ITServiceOwner` role on the root "All Devices" group; see
 > [`management-groups.md`](management-groups.md) for the delegation API.
 
-> **RBAC store integrity (fail-closed).** If the RBAC store cannot open or
-> migrate (e.g. a corrupt `rbac.db`), the server fails **closed**: device
+> **Storage (ADR-0041).** RBAC configuration — roles, grants, principal→role
+> assignments, groups + membership, and the global `rbac_enabled` flag — lives in
+> the server's **PostgreSQL** substrate, schema `rbac_store` (it moved off the
+> legacy SQLite `rbac.db` file). It is a single shared database across all server
+> replicas, so administer it with one `psql`, not per-node.
+>
+> **RBAC store integrity (fail-closed / deny-on-degrade).** The `rbac_store`
+> substrate fails **closed at boot** — an unreachable PostgreSQL (or an
+> unreadable durable `rbac_enabled` flag) makes the server refuse to start,
+> rather than serving RBAC-off on a fleet that enabled it. At runtime, an
+> authorization read that cannot resolve (pool-acquire timeout, query error)
+> **denies** rather than allowing (deny-on-degrade, ADR-0041 — this closes the
+> prior "corrupt `rbac.db` fails open" behavior); watch the
+> `yuzu_server_rbac_read_degrade_total` metric. In that degraded state, device
 > visibility falls back to the role-scoped path for every caller, so agents stop
 > appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
 > the whole fleet being exposed. **The same fail-closed posture covers MOST
@@ -32,21 +44,198 @@ enabled = true
 > `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
 > / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
 > returns `503`) on a corrupt store rather than reopening the cross-operator
-> fleet-wide read. **Not yet covered (#1634 follow-up — these still fail OPEN on a
+> fleet-wide read.
+>
+> **The dashboard's facet/scope surfaces are covered too, on a narrower anchor
+> (#1712, ADR-0017 —** `docs/adr/0017-management-group-confinement-list-reads.md`
+> **):** `GET /fragments/results/filter-bar` (facet dropdown values + line
+> counts) and `GET /fragments/create-group-form` (matching-agent count) scope
+> their aggregate queries in SQL against the caller's `Response:Read`-visible
+> agent set. `POST /api/dashboard/group-from-results` fetches its matching id
+> list unscoped, then intersects it in C++ against that same visible set
+> before materialising group membership, audits any ids the intersection
+> drops, and — if every id is dropped — returns the same "no agents match"
+> response as a genuine no-match (the caller cannot tell a filtered result
+> from an empty one). All three resolve the visible set via
+> `RbacStore::visible_agents_for_permission` (deny-aware, management-group
+> hierarchy expanded, permission-specific to `Response:Read`).
+>
+> A degraded **management-group** store fails **closed** here too: an
+> empty visible set makes the two GETs return success-empty without the
+> query ever reaching the response store, and makes `group-from-results`
+> report "no agents match." A degraded **RBAC** store behaves differently —
+> it never reaches this scoping at all, because each route's own flat
+> admission gate (below) denies with `403` first, the same as any other
+> RBAC-store outage. A degraded **response** store keeps its own distinct
+> existing rendering instead — a disabled "unavailable" dropdown on the
+> filter bar, "agent count unavailable (store degraded)" on the
+> create-group form, and `503` from `group-from-results` — since that
+> failure is orthogonal to agent visibility.
+>
+> **Admission on these three routes is unchanged (#1712 follow-up, tracked for
+> ADR-0017 PR-B).** Each route still gates on its own flat
+> `require_permission`, which never consults management groups: the filter
+> bar requires flat `Response:Read`; the two group routes require flat
+> `ManagementGroup:Write`. A caller whose only grant of a route's own gate
+> permission is management-group-scoped is denied at that route (`403`)
+> before the scoping above ever runs. But the two gates are different
+> permissions — a caller admitted to the group routes by a global
+> `ManagementGroup:Write` grant, who holds `Response:Read` only through a
+> management group, is admitted today and does observe the scoping (as does
+> any JIT-elevated session admitted without a global `Response:Read`
+> grant). Group-scoped-only admission becomes universal across all three
+> routes once they migrate onto the ADR-0017 list-read gate.
+>
+> **Not yet covered (#1634 follow-up — these still fail OPEN on a
 > corrupt store):** the dashboard `/fragments/results/…` table and the workflow
 > executions-drawer reader have no per-agent filter and will expose the whole
-> fleet's responses on a corrupt `rbac.db`. So a corrupt store looks like "no
+> fleet's responses when the RBAC store is degraded. So a degraded store looks like "no
 > agents in scope" / "no responses" **on the covered surfaces, but is a visibility
 > leak via those two uncovered ones** — check the server startup log for `RbacStore`
-> errors and the `/health` store status, then restore or remove the file and
-> restart immediately. (If Grafana panels or scripted aggregate consumers show zero
+> errors, the `/health` store status, and `yuzu_server_rbac_read_degrade_total`,
+> then restore PostgreSQL (`rbac_store`) availability
+> immediately. (If Grafana panels or scripted aggregate consumers show zero
 > rows after an upgrade or restart, check for `RbacStore` open/migrate errors first.)
 >
 > **Note (#1634):** the per-agent filter on the covered response readers is, under
 > *normal* RBAC operation, currently **inert** — a holder of global `Response:Read`
 > sees all agents' responses; per-management-group scoping of these reads is not yet
 > effective (the gate change is tracked in #1634). Today the filter's only active
-> effect is the corrupt-store fail-closed described above.
+> effect is the corrupt-store fail-closed described above. The three facet surfaces
+> above are a partial exception: their scope filter is active for any caller
+> who clears that route's own flat gate, not only during a corrupt-store
+> degrade. It does not by itself make anyone admissible — a caller whose
+> only grant of a route's own gate permission is management-group-scoped is
+> still denied at the gate, unaffected by this filter.
+> fleet-wide read. **Now also covered (#1712, #3290 Phase 2 continuation):** the
+> dashboard `/fragments/results` table and the workflow executions-drawer reader
+> (both its responses section and its per-agent status grid/table) migrated onto
+> `require_fleet_read` — same fail-closed posture as everything else on this
+> page: a degraded `rbac_store`/`mgmt_group_store` returns `503`, and a healthy
+> store applies a real per-agent filter rather than exposing the whole fleet.
+> **Still not covered, but NOT a fail-open-on-degrade risk** — these remaining
+> readers gate on `perm_fn_`/`require_permission`, which has been deny-on-degrade
+> since ADR-0041 regardless of confinement, so a corrupt store 403s them rather
+> than exposing anything. Their gap is a *different* shape: a caller who holds
+> the flat permission (globally, not confined) still gets an unscoped read/write
+> with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
+> `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
+> (tracked #3489; #3525 tracked the same finding and was closed as its
+> duplicate); REST `GET /api/v1/execution-statistics/agents` and the
+> workflow executions LIST fragment `/fragments/executions` (tracked #3526). So
+> a degraded store looks like "no agents in scope" / "no responses" / `503`
+> across every reader on this page now — check the server startup log for
+> `RbacStore` errors, the `/health` store status, and
+> `yuzu_server_rbac_read_degrade_total`, then restore PostgreSQL (`rbac_store`)
+> availability immediately. (If Grafana panels or scripted aggregate consumers
+> show zero rows after an upgrade or restart, check for `RbacStore` open/migrate
+> errors first.)
+>
+> **Note (#1634):** the per-agent filter on `query_responses`/`aggregate_responses`/the
+> REST visualization+responses endpoints is, under *normal* RBAC operation, currently
+> **inert** — a holder of global `Response:Read` sees all agents' responses;
+> per-management-group scoping of these specific reads is not yet effective (the
+> gate change is tracked in #1634; this is a *different*, older primitive
+> [`response_scope_fn`] than `require_fleet_read` below). Today that filter's only
+> active effect is the corrupt-store fail-closed described above.
+>
+> **This does NOT apply to `/fragments/results` or the workflow executions-drawer**
+> (#1712) — both migrated onto `require_fleet_read`, a *different* primitive whose
+> per-agent filter is real and effective under normal RBAC operation, not inert:
+> a management-group-confined or correctly service-scoped caller genuinely sees only
+> their in-scope agents' data on those two readers today.
+>
+> **Update (#1634, closed):** the "inert" `response_scope_fn` filter described in
+> both notes above is retired. `query_responses`, `aggregate_responses`, REST
+> `/executions/{id}/visualization`, and the legacy `/api/responses/{id}`
+> (`GET`/`/aggregate`/`/export`) are all now on `require_fleet_read`, the same
+> real, effective primitive as `/fragments/results` and the workflow
+> executions-drawer — a management-group-confined caller genuinely sees only
+> their in-scope agents' data on every response reader on this page, not just
+> the two named above. `GET /api/v1/executions/{id}`, `GET /api/v1/events`, and
+> the dashboard `GET /sse/executions/{id}` migrated in the same round. See
+> `docs/auth-architecture.md`'s "Third migration (#1634)" section for the full
+> account, including the residuals it left open (a weaker own-dispatches-only
+> confinement for MCP `list_executions`, since execution rows carry no single
+> `agent_id` to filter by).
+
+## The authorization topology floor (#2376)
+
+Five reads are treated as **authorization topology** rather than ordinary
+operational data, and require the `admin` session role no matter how the
+`[rbac] enabled` toggle is set:
+
+| Securable:Operation | Surface |
+|---|---|
+| `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*` |
+| `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
+| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
+| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
+| `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
+
+**Why this exists.** With RBAC **disabled**, the legacy fallback described
+above allows any authenticated non-engine session to perform every `Read` —
+that includes these five. On a default install (RBAC ships disabled) that
+handed a plain `user` session read access to the authorization topology
+itself: who holds what role, and the complete access-review grant
+population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
+access. The floor closes that gap by denying these five reads to a
+non-admin whenever the legacy fallback is the branch in effect — never by
+changing behavior under a live RBAC grant.
+
+**This does not affect RBAC-enabled deployments beyond the one closed
+gap.** The floor only ever engages inside the legacy (RBAC-off) fallback; a
+live RBAC branch always answers first when RBAC is enabled and enforced. In
+particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
++ `AccessReview:Attest`) continues to reach the access-review export exactly
+as before — the floor never overrides that grant.
+
+**If you are relying on a non-admin reaching one of these five reads on an
+RBAC-disabled install,** that access is now denied. The supported remedy is
+to enable RBAC and grant the appropriate role rather than to expect a
+non-admin session to reach authorization topology while RBAC is off:
+
+- For the access-review export: enable RBAC and assign the built-in
+  `Reviewer` role (`AccessReview:Read` + `AccessReview:Attest`).
+- For `/rbac/roles`: enable RBAC and grant `UserManagement:Read` (the
+  built-in `Viewer` role holds it already).
+- For the engine-principal inventory/roles reads: enable RBAC and grant
+  `EnginePrincipal:Read` (the built-in `Viewer` role holds it already; a
+  **custom** role that was granted `Security:Read` specifically to reach
+  these routes must be re-granted `EnginePrincipal:Read` — see "Upgrade
+  Notes" in [`server-admin.md`](server-admin.md)).
+- For the enrollment auto-approve-rules/pending-agents reads: enable RBAC
+  and grant `Enrollment:Read` — no built-in non-admin role holds it
+  (`Administrator` only; unlike `EnginePrincipal`/`Directory`, `Viewer`
+  deliberately does not, since these surfaces gate the fleet's enrollment
+  admission policy).
+- For the OIDC SSO config status read: enable RBAC and grant
+  `OidcConfig:Read` — `Administrator`-only for the same reason.
+
+The floor is deliberately **not configurable** — there is no setting that
+widens it back open. It is keyed on `(securable, operation)`, not on route
+path, because an MCP tool and a REST route can share the same wire path
+(every MCP tool call goes through the single `/mcp/v1/` JSON-RPC endpoint)
+while gating different securables; a route-keyed floor could not
+distinguish them. A denial from the floor is audited with a distinct reason
+(`"topology floor: ..."` on the `auth.permission_required` /
+`auth.scoped_permission_required` audit actions, `result=denied`) and
+counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
+
+> **Caveat — this counter is currently noisy (#2829).** Routes that PROBE a second
+> permission to decide whether to include part of a response — `GET /api/v1/discover/permissions`,
+> its MCP twin, and `GET /api/v1/management-groups/{id}/roles` — run that probe through the same
+> auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
+> an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
+> #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
+> authorization topology — correlate with the route in the audit row first.
+from an ordinary legacy-fallback denial, so a spike in floored denials is
+visible without grepping audit-log text.
+
+See `docs/auth-architecture.md` → "The authorization topology floor
+(#2376)" for the full design rationale, and
+`docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded
+decision (including what was deliberately excluded from the floor and why).
 
 ## Concepts
 
@@ -55,7 +244,7 @@ enabled = true
 | **Principal** | A user or group identity. Matches the authenticated username or an OIDC group claim. |
 | **Role** | A named collection of permissions. Can be system-defined or custom. |
 | **Securable type** | A category of resource that permissions apply to (e.g., `Infrastructure`, `Tag`). |
-| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`, `Push`). |
+| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`, `Push`, `Attest`, `Rotate`). |
 | **Permission** | A single `(securable_type, operation, effect)` entry. Effect is `Allow` or `Deny`. |
 | **Role assignment** | Binds a principal to a role, optionally scoped to a management group. |
 
@@ -65,12 +254,12 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 20 securable types, plus Push on GuaranteedState (101 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (118 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
-| **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 17 securable types, plus Push on GuaranteedState (86 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 19 securable types (all except Infrastructure) (19 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Decommission:Delete (92 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
 
@@ -96,6 +285,9 @@ Six roles are created automatically and cannot be deleted:
 | `FileRetrieval` | File upload and download operations |
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
+| `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection). Administrator-only by default (absent from the Viewer read-list); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
+| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
 
 ## Operations
 
@@ -107,6 +299,8 @@ Six roles are created automatically and cannot be deleted:
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve a pending workflow item |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
+| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
+| `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
 
 ## Permission Resolution
 
@@ -257,11 +451,11 @@ curl -s -b cookies.txt \
 }
 ```
 
-(Truncated for brevity. The full ITServiceOwner role contains 50 permissions across 10 securable types.)
+(Truncated for brevity. The full ITServiceOwner role contains 92 permissions across 18 securable types — the 92nd is the targeted `Decommission:Delete` grant, Wave 7 PR7.2.)
 
 ### Custom Roles (Planned)
 
-Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly via the SQLite database.
+Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
 
 **Planned endpoints (not yet available):**
 
@@ -293,9 +487,13 @@ curl -s -b cookies.txt -X POST \
 Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via the Settings UI or direct database access, since the role creation API is not yet available):
 
 ```sql
--- Example: create a deny role directly in the RBAC database
-INSERT INTO roles (name, description, is_system, created_at) VALUES ('NoDeletion', 'Explicit deny on infrastructure deletion', 0, strftime('%s','now'));
-INSERT INTO role_permissions VALUES ('NoDeletion', 'Infrastructure', 'Delete', 'deny');
+-- Example: create a deny role directly against the shared rbac_store schema
+-- (psql against the server's PostgreSQL instance — see the "Storage (ADR-0041)"
+-- callout above; this is a single shared store, not a per-node SQLite file).
+INSERT INTO rbac_store.roles (name, description, is_system, created_at)
+  VALUES ('NoDeletion', 'Explicit deny on infrastructure deletion', false, extract(epoch from now())::bigint);
+INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, effect)
+  VALUES ('NoDeletion', 'Infrastructure', 'Delete', 'deny');
 ```
 
 Assign this role alongside any other roles. Because deny overrides allow, the user will be unable to delete infrastructure resources regardless of their other role assignments.

@@ -36,13 +36,18 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 
 The agent reserves a small namespace of plugin names for internal dispatch intercepts. Any plugin declaring one of these names in `YuzuPluginDescriptor::name` is **rejected at load time** by `PluginLoader::scan` (see `agents/core/include/yuzu/agent/plugin_loader.hpp` `kReservedPluginNames`) — the rejection is logged at `error` and counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}`.
 
-| Name          | Purpose                                                            |
-|---------------|--------------------------------------------------------------------|
-| `__guard__`   | Guardian engine dispatch (see `docs/yuzu-guardian-design-v1.1.md` §7.2) |
-| `__system__`  | Reserved for future system-scope commands                          |
-| `__update__`  | Reserved for OTA update commands                                   |
+| Name                    | Purpose                                                            |
+|-------------------------|--------------------------------------------------------------------|
+| `__guard__`             | Guardian engine command dispatch (see `docs/yuzu-guardian-design-v1.1.md` §7.2) |
+| `__system__`            | Reserved for future system-scope commands                          |
+| `__update__`            | Reserved for OTA update commands                                   |
+| `__guardian_journal__`  | Guardian lifecycle-journal `kv_store` namespace (#2303 C2)         |
+| `__guardian__`          | GuardianEngine rule-state `kv_store` namespace (#2303 sec-M)       |
+| `__sync__`              | Daily-sync scheduler-state `kv_store` namespace (#2303 sec-L)      |
 
-Do not pick names matching `__*__` for third-party plugins; treat the double-underscore-bracketed convention as the internal-dispatch namespace and avoid it entirely. Adding a new reserved name requires updating `kReservedPluginNames` and the unit test in `tests/unit/test_plugin_loader.cpp` that pins the exact set.
+The last three are `kv_store` namespaces keyed by a plugin's own declared name (`yuzu_ctx_storage_*`) on a shared connection: reserving them stops a plugin from reading, deleting, or forging the state the owning subsystem loads as authoritative (Guardian rule state, the arm/disarm audit journal, daily-sync state). Native plugins are trusted (the plugin ABI has no sandbox), so this is a hygiene / audit-integrity control, not isolation; there is no isolation mechanism to invoke instead. Each `kv_store`-namespace entry is pinned to its source constant by a `static_assert` in the owning translation unit so the two cannot drift.
+
+Do not pick names matching `__*__` for third-party plugins; treat the double-underscore-bracketed convention as the internal-dispatch namespace and avoid it entirely. Adding a new reserved name requires updating `kReservedPluginNames`, the unit test in `tests/unit/test_plugin_loader.cpp` that pins the exact set, this table, and the `reserved_name` rejection-reason row in `docs/user-manual/metrics.md`.
 
 ## Entry points
 
@@ -69,6 +74,16 @@ Both the agent and the server use:
 Governance is stricter than style guidance: every C++ diff must prove ownership for each resource boundary it adds or touches. The Gate 1 Resource Ledger names the owner type, acquisition point, release point, transfer behavior, and failure cleanup for every fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, mapped library, temp path, subprocess, callback context, and thread.
 
 New or touched C++ code should use a small RAII owner, `std::unique_ptr` with a deleter, or a local scope guard. Manual cleanup is a governance finding unless the code documents why a wrapper is impossible or would be less safe. Check every early return between acquisition and release.
+
+The repo's shared owners live in `agents/core/include/yuzu/agent/` — reach for these before writing a new one:
+
+| Wrapper | Owns | Header |
+|---|---|---|
+| `ScopedFd` | a POSIX file descriptor | `scoped_fd.hpp` |
+| `ScopedCFRef<T>` | a CoreFoundation `+1` reference (macOS) | `scoped_cfref.hpp` |
+| `ScopedIOObject` | an IOKit `io_object_t` / Mach send right (macOS) | `scoped_ioobject.hpp` |
+
+All three are move-only and release exactly once. The `reset()` contract differs by resource, and the difference is deliberate. For the two REFCOUNTED owners (`ScopedCFRef`, `ScopedIOObject`) the argument is an **owned `+1`** consumed **even when it shares identity with the current value**, because a same-identity `+1` is a distinct release obligation — an equality early-return leaks it, and `reset(get())` is caller misuse, not a no-op. `ScopedFd` keeps an `fd == fd_` early-return and is right to: a descriptor is a value, not a refcount, so two live owning claims on one number cannot coexist, and dropping the guard would close the fd and then retain the closed number. Objective-C++/ARC specifics are in `docs/native-objcpp-conventions.md`.
 
 Resource owner types must be non-copyable when copying would double-release. Prefer move-only wrappers with explicit transfer semantics; any use of `release()` must immediately hand the resource to another named owner.
 
@@ -111,6 +126,7 @@ Use for vendored assets (Three.js r168, ECharts, Inter typeface, htmx bundles la
 
 - Raw error codes or output parameters (use `std::expected`).
 - printf-family calls (use `std::format` or spdlog).
+- scanf-family calls (`sscanf`/`fscanf`/`scanf`): glibc 2.38 redirects them to versioned `__isoc23_*` symbols under C23/C++23, so binaries built on new-glibc toolchains refuse to load on RHEL-era glibc. Parse with `std::strtol`-family + end-pointer checks (width-capped fields: see `tar_mapdrive_collector.cpp::scan_int`).
 - Raw `new`/`delete` (use RAII).
 - Manual resource cleanup (use RAII / smart pointers).
 - C++ types crossing the C ABI boundary in `plugin.h`.

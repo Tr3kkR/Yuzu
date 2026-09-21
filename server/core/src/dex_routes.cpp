@@ -2,7 +2,11 @@
 
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "app_perf_compare.hpp" // app_perf_param_valid/kAppPerfParamCap — this validation
+                              // chokepoint owns its dependency (relocated from dex_app_perf_model.hpp, #4250)
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +17,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/version_string.hpp> // canon_version — the perf trend's `version` filter
+                                   // must match the SAME canonical key the store filters on
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp);
 // {{TITLE}}/{{FRAGMENT}} are substituted per request. Reused verbatim so the DEX
@@ -498,11 +505,14 @@ std::string history_detail(const GuardianObservationRow& r) {
 
 } // namespace
 
-// Public wrappers over the internal window helpers (declared in dex_routes.hpp) so
+// Public wrappers over the internal window helpers (declared in dex_window.hpp) so
 // the /api/v1/dex REST surface resolves the window token through the exact same
 // logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
 int dex_window_to_days(const std::string& window) { return window_to_days(window); }
 std::string dex_iso_since(int days) { return iso_days_ago(days); }
+std::string dex_normalize_os_filter(const std::string& os) {
+    return (os == "windows" || os == "linux" || os == "macos") ? os : std::string{};
+}
 
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
@@ -510,12 +520,16 @@ std::string dex_window_token(int window_days) {
     return window_days == 1 ? "24h" : window_days == 30 ? "30d" : window_days == 0 ? "all" : "7d";
 }
 
-// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends · Performance ·
-// Network). htmx core attrs into the page mount — CSP-safe (no hx-on). The Network
-// tab loads the /fragments/network/* renderers (network_ui.cpp), which render this
-// same sub-nav with "network" active — so Network sits UNDER DEX rather than as its
-// own top-level nav item. The network fragments ignore the threaded ?window= (the
-// quality view is a now-view with no window of its own).
+// Shared DEX sub-nav (Overview · Apps · Catalogue · Health score · Trends ·
+// Performance · App Performance · Network). htmx core attrs into the page mount —
+// CSP-safe (no hx-on). The Network tab loads the /fragments/network/* renderers
+// (network_ui.cpp), which render this same sub-nav with "network" active — so
+// Network sits UNDER DEX rather than as its own top-level nav item. The network
+// fragments ignore the threaded ?window= (the quality view is a now-view with no
+// window of its own). "App Performance" is a SIBLING of "Performance", not a
+// replacement — "Performance" is the live fleet-now widget (F2a,
+// render_dex_perf_fragment), "App Performance" is the retained per-(app,version)
+// trend picker (F2b, render_dex_app_perf_picker) — do not merge or confuse them.
 std::string dex_subnav(const std::string& active, int window_days) {
     const std::string w = dex_window_token(window_days);
     auto tab = [&](const char* id, const char* label, const char* frag) {
@@ -529,6 +543,7 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("health", "Health score", "/fragments/dex/health") +
            tab("trends", "Trends", "/fragments/dex/trends") +
            tab("perf", "Performance", "/fragments/dex/perf") +
+           tab("app_perf", "App Performance", "/fragments/dex/perf/apps") +
            tab("network", "Network", "/fragments/network/overview") + "</div>";
 }
 
@@ -545,19 +560,10 @@ std::string dex_window_chips(const char* frag, int window_days) {
 }
 
 // One family's rollup over the window (events, active count, blast radius, leader).
-struct DexFamilyRollup {
-    int64_t events = 0;
-    int active = 0;
-    int total = 0;
-    // #1374: the MAX of member signals' distinct-device counts, NOT the family-wide
-    // union. Two disjoint 50-device signals yield 50, not 100. Named explicitly so
-    // the UI label and the health-deduction basis agree (a true union would need a
-    // per-family COUNT(DISTINCT agent_id) query — deferred; this is a secondary,
-    // already-cross-family-overlapping composite).
-    int64_t max_signal_devices = 0;
-    const DexSignalCount* top = nullptr;
-    bool benign = false;
-};
+// #4035: DexFamilyRollup itself moved to dex_routes.hpp (external linkage, no
+// longer inside this TU's anonymous namespace below) so dex_read_model.cpp can
+// build the same rollup without a second copy (Rule 1) — this stays the ONE definition
+// of the function, now implementing the header's declared struct.
 DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
                                   const std::vector<DexSignalCount>& signals) {
     DexFamilyRollup r;
@@ -593,7 +599,6 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
 
     // -- Coverage scope: which platforms are in view ("all" = connected fleet) --
     auto norm = [](std::string o) -> std::string {
@@ -603,9 +608,21 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" || os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token
+    // ("all" when unscoped).
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
+
+    // -- Per-OS scoping (#1746): "all" keeps the established all-connected
+    // composite (windows_online + the all-OS signal rollup) — byte-unchanged. A
+    // single-OS chip scores that OS against its OWN online count and its OWN
+    // signals, so a Linux/macOS family score is never silently Windows-derived. --
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
+    const auto signals_scoped = store->dex_signal_summary(since, plat);
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -628,8 +645,10 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     // -- Per-family health score: the ONE canonical composite, projected per family
     // (score = 100 − that family's deduction; same formula as dex_compute_health).
-    // Windows-denominated today (the existing fleet composite); a per-OS read is the
-    // shared follow-up. --
+    // Scoped per #1746: the "all" chip stays the fleet-wide composite
+    // (windows_online + all-OS signals); a single-OS chip is now scored against
+    // n_scoped/signals_scoped ABOVE — that OS's own online count and own signals,
+    // never a Windows-derived number read under a Linux/macOS heading. --
     std::size_t total_types = dex_catalogued_type_count();
     std::size_t mon_types = 0;
     for (const auto& g : dex_signal_groups())
@@ -665,16 +684,16 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     h += "<div class=\"gp-fgrid\">";
     for (const auto& g : dex_signal_groups()) {
-        const auto r = dex_family_rollup(g, signals);
+        const auto r = dex_family_rollup(g, signals_scoped);
         int mon = 0;
         for (const char* t : g.types)
             if (monitored(t))
                 ++mon;
         const bool dark = (mon == 0);
         double score = -1.0;
-        if (!dark && fleet.windows_online > 0)
+        if (!dark && n_scoped > 0)
             score = std::clamp(
-                100.0 - dex_family_health_deduction(g, signals, fleet.windows_online), 0.0, 100.0);
+                100.0 - dex_family_health_deduction(g, signals_scoped, n_scoped), 0.0, 100.0);
         const char* tone =
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
@@ -683,15 +702,26 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
         h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
              num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
+        // UP-8: three distinct states, not two. `dark` = the family is not
+        // monitored on any connected platform. `no_data` = it IS monitored but
+        // no online agent is reporting (an absent denominator: n_scoped == 0),
+        // which is a "come back when a device is online" state, NOT "healthy"
+        // and NOT "unmonitored". Only a real, scored family shows a number.
+        const bool no_data = !dark && score < 0;
         if (score < 0)
             h += "<div class=\"fev\">&mdash;</div>";
         else
             h += "<div class=\"fev " + std::string(tone) + "\">" +
                  std::to_string(static_cast<int>(score + 0.5)) + "</div>";
         h += "<div class=\"fmeta\">" +
-             std::string(dark ? "not collected on your fleet" : "health score") + "</div>";
+             std::string(dark        ? "not collected on your fleet"
+                         : no_data   ? "no online agents reporting"
+                                     : "health score") +
+             "</div>";
         if (dark)
             h += "<div class=\"ftop\">no connected platform watches these</div>";
+        else if (no_data)
+            h += "<div class=\"ftop\">monitored, but no device is online to report</div>";
         else if (r.events > 0 && r.top)
             h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> &middot; " +
                  num(r.events) + " events</div>";
@@ -712,7 +742,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // so nothing the fleet reports is silently dropped.)
     {
         std::vector<const DexSignalCount*> extras;
-        for (const auto& sig : signals) {
+        for (const auto& sig : signals_scoped) {
             bool known = false;
             for (const auto& g : dex_signal_groups()) {
                 for (const char* t : g.types)
@@ -766,14 +796,6 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         return placeholder("Unknown family", "No such signal family: " + esc(group_name));
 
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
-    const auto r = dex_family_rollup(*grp, signals);
-    auto find_sig = [&](const char* t) -> const DexSignalCount* {
-        for (const auto& s : signals)
-            if (s.obs_type == t)
-                return &s;
-        return nullptr;
-    };
 
     // -- Coverage scope (mirrors the grid: a type is MONITORED when an in-scope
     // connected platform collects it — not merely when it fired). This is the
@@ -785,10 +807,25 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
+
+    // -- Per-OS scoping (#1746 BR-001): resolved BEFORE the summary read so the
+    // drill-down reads the SAME lens as the grid — "all" keeps the fleet-wide
+    // rollup (byte-unchanged); a single-OS chip reads only that OS's signals.
+    // This single read flows into the family rollup, the per-signal table rows,
+    // AND the score below, so the whole drill-down is OS-consistent with View 1. --
+    const auto signals = store->dex_signal_summary(since, plat);
+    const auto r = dex_family_rollup(*grp, signals);
+    auto find_sig = [&](const char* t) -> const DexSignalCount* {
+        for (const auto& s : signals)
+            if (s.obs_type == t)
+                return &s;
+        return nullptr;
+    };
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -870,9 +907,15 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
     // Coverage + activity tiles. Health score = this family's slice of the fleet
     // composite (same formula as the grid card), shown when something is monitored.
     h += "<div class=\"gp-tiles\">";
+    // Per-OS denominator (#1746 BR-001), same lens as the grid: a single-OS chip
+    // scores against THAT OS's own online count, never a Windows-derived number
+    // read under a Linux/macOS heading.
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
     double score = -1.0;
-    if (mon > 0 && fleet.windows_online > 0)
-        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, fleet.windows_online),
+    if (mon > 0 && n_scoped > 0)
+        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, n_scoped),
                            0.0, 100.0);
     if (score >= 0)
         h += tile(score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"),
@@ -950,10 +993,10 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     if (obs_type.empty())
         return placeholder("No signal selected", "Pick a signal type from a family.");
     const std::string w = dex_window_token(window_days);
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
 
     const char* family = nullptr;
     for (const auto& g : dex_signal_groups()) {
@@ -966,13 +1009,22 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
             break;
     }
 
-    const auto subjects = store->dex_signal_subjects(obs_type, since, 15);
+    // OS-scope the detail lists to the selected lens (#C-DEX-1): a single-OS
+    // filter must not show cross-OS subjects/devices/days. `by_os` is deliberately
+    // left cross-OS — it IS the OS-split chart, so it always spans every OS.
+    // (`plat` computed above via the shared normaliser.)
+    const auto subjects = store->dex_signal_subjects(obs_type, since, 15, plat);
     const auto by_os = store->dex_signal_by_os(obs_type, since);
-    const auto devices = store->dex_signal_devices(obs_type, since, 15);
-    const auto by_day = store->dex_signal_by_day(obs_type, since);
+    const auto devices = store->dex_signal_devices(obs_type, since, 15, plat);
+    const auto by_day = store->dex_signal_by_day(obs_type, since, plat);
 
+    // Headline totals follow the same lens as the detail lists: sum the whole
+    // cross-OS split for "all", or just the selected OS's row otherwise — so the
+    // "Events"/"Devices" tiles never disagree with the (now OS-scoped) lists.
     int64_t events = 0, devs = 0;
     for (const auto& o : by_os) {
+        if (!plat.empty() && o.platform != plat)
+            continue;
         events += o.crashes; // generic event count
         devs += o.distinct_devices;
     }
@@ -1136,14 +1188,9 @@ double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset) {
 // The composite-health computation, shared by the Health page and the Overview
 // hub's health teaser. score = 100 − Σ deductions; -1 when N<=0 (suppressed, no
 // reporting agents → no fabricated 100).
-struct DexHealthResult {
-    double score = -1.0;
-    struct Ded {
-        std::string name, sev;
-        double deduction = 0.0;
-    };
-    std::vector<Ded> deds;
-};
+// #4035: DexHealthResult moved to dex_routes.hpp (same rationale as
+// DexFamilyRollup above) so dex_read_model.cpp's health-score builder shares
+// this exact computation instead of a second copy (Rule 1).
 DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
                                    const std::string& preset) {
     DexHealthResult r;
@@ -1235,7 +1282,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
             : "default";
 
     const auto signals = store->dex_signal_summary(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free headline is denominated over
+    // reporting Windows agents (N below), so the numerator must be Windows
+    // crashes only — otherwise macOS process.crashed events (now emitted) would
+    // inflate the rate against the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t N = fleet.windows_online; // scored over reporting Windows agents
 
     std::string h;
@@ -1417,7 +1468,9 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
         return placeholder("Trends unavailable", "The signal observation store is not open.");
     const auto scope = store->dex_os_signal_scope(since);
     const auto matrix = store->dex_signal_day_matrix(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free number below is capped at and
+    // divided by fleet.windows_online, so the crash numerator is Windows-only.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t total_types = static_cast<int64_t>(dex_catalogued_type_count());
 
     auto scope_of = [&](const char* p) -> const DexOsScope* {
@@ -1574,7 +1627,11 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // not (zero counts are real data: "monitored, nothing happened").
     const auto signals = store->dex_signal_summary(since);
 
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): every tile below (crash-free %, crashes/1k,
+    // devices impacted) and the per-OS table's Windows row are denominated over
+    // reporting Windows agents, so the crash counts must be Windows-only — the
+    // all-OS summary would divide macOS crashes into the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const auto apps = store->dex_top_apps(since, 8);
     const auto devices = store->dex_top_devices(since, 8);
     const auto by_day = store->dex_crashes_by_day(since);
@@ -1732,8 +1789,16 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                         ? static_cast<int>(static_cast<double>(seg_sum[i]) / seg_n[i] + 0.5)
                         : -1;
                 const char* ft = avg < 0 ? "" : (avg >= 90 ? "ok" : (avg >= 75 ? "warn" : "bad"));
-                h += "<a class=\"gp-fcard\" hx-get=\"/fragments/devices/list?os=" +
-                     url_encode(seg_os[i]) +
+                // Segment os is the raw agent-reported string ("darwin"/"linux"/
+                // "windows"/…); the Hardware list's os filter only knows
+                // "windows"/"linux"/"macos"/"all" (hardware_list_model.cpp).
+                const std::string hw_os = seg_os[i] == "darwin"   ? "macos"
+                                           : seg_os[i] == "windows" ? "windows"
+                                           : seg_os[i] == "linux"   ? "linux"
+                                           : seg_os[i] == "macos"   ? "macos"
+                                                                    : "all";
+                h += "<a class=\"gp-fcard\" hx-get=\"/fragments/hardware/list?os=" +
+                     url_encode(hw_os) +
                      "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
                 h += "<div class=\"fn\">" + oslbl(seg_os[i]) + "<span class=\"cnt\">" +
                      num(seg_n[i]) + " device(s)</span></div>";
@@ -2011,6 +2076,18 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(process_name) +
          "</h1></div><div class=\"gp-sub\">Crash &amp; hang blast radius across the "
          "fleet.</div></div></div>";
+    // Cross-link to the per-version performance trend — same process-image key
+    // (process_name), no normalization: Windows/Linux crash + perf identity are
+    // already the same canonicalized key at the agent (dex_signal_catalog.cpp),
+    // so this is an exact-key join, never a display-name/fuzzy match. Shown
+    // regardless of crash history — a quiet app can still have perf history.
+    h += "<div class=\"gp-note\">" +
+         drill_link("/fragments/dex/perf/app",
+                    "app=" + url_encode(process_name) + "&window=" + window,
+                    "Performance by version &rarr;") +
+         " &mdash; same process image, retained daily summaries. Per-app sampling is "
+         "opt-in where available.</div>"; // macOS has no procperf collector (or toggle)
+                                           // yet — "where available" avoids implying one
     if (s.signals == 0)
         return h + placeholder("No crashes", "No crashes or hangs recorded for this application.");
 
@@ -2233,9 +2310,10 @@ std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const st
     }
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Stability by application (crashes + hangs). Devices = blast radius "
-         "(distinct devices); row &rarr; app detail. Repository / install / other reliability "
-         "signals attribute to an app once per-event app capture lands (Option&nbsp;D); per-app "
-         "performance and version are follow-on slices.</div>";
+         "(distinct devices); row &rarr; app detail, which cross-links to per-version CPU &amp; "
+         "memory performance. Repository / install / other reliability signals attribute to an app "
+         "once per-event app capture lands (Option&nbsp;D); per-version crash/hang counts on the "
+         "performance page remain a follow-on slice.</div>";
     return h;
 }
 
@@ -2536,25 +2614,53 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
     return h;
 }
 
+bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                     const std::string& action, const std::string& audit_detail,
+                                     const std::string& target_type) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote the response (401/etc).
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after (mirrors GuardianRoutes::deny_service_scoped_):
+    // a throwing audit_fn_ must not be able to suppress the 403.
+    res.status = 403;
+    // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty, so
+    // no grant admits a service-scoped caller here (gov-fix, Gate 8, #2298
+    // PR 3 hardening round — routed-concern MUST clause). `a4_denial` also
+    // fixes a second bug found in the same pass: the hand-built cid never
+    // reached the X-Correlation-Id header.
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide DEX view"),
+        "application/json");
+    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
+                                    audit_detail);
+    return true;
+}
+
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
                     std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(app_perf_providers), std::move(group_list_fn));
+                    std::move(app_perf_providers), std::move(group_list_fn),
+                    std::move(fleet_read_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2566,6 +2672,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     responses_fn_ = std::move(responses_fn);
     perf_fn_ = std::move(perf_fn);
     app_perf_providers_ = std::move(app_perf_providers);
+    fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
@@ -2612,6 +2719,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // -- Overview fragment (gates on GuaranteedState:Read, like the Guardian reads) --
     sink.Get("/fragments/dex/overview", [this, resolve_visible](const httplib::Request& req,
                                                                 httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed (VisibleSetFn)
+        // and does not confine a service-scoped API token whose principal
+        // resolves to an unscoped grant — the top-devices list would still be
+        // fleet-wide. Denied here, ahead of/independent from perm_fn_.
+        if (deny_service_scoped_(req, res, "dex.overview.view",
+                                 "fleet-wide DEX overview top-devices list denied to a "
+                                 "service-scoped token"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -2664,6 +2780,19 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
     sink.Get("/fragments/dex/catalogue/signal",
              [this, resolve_visible](const httplib::Request& req, httplib::Response& res) {
+                 // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found
+                 // during a docs sweep): resolve_visible below is username-keyed
+                 // and does not confine a service-scoped API token whose
+                 // principal resolves to an unscoped grant. Same verb as the
+                 // REST/MCP dex.signal.view emitters — this is a third emitter of
+                 // the same view. target_id left empty: the raw `type` param has
+                 // not been validated yet.
+                 if (deny_service_scoped_(req, res, "dex.signal.view",
+                                          "fleet-wide DEX signal most-affected-devices list "
+                                          "denied to a service-scoped token (dashboard "
+                                          "fragment)",
+                                          "ObsType"))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
                  const int window_days =
@@ -2693,6 +2822,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
 
     // -- Health score: derived/secondary composite (?weighting=<preset>) --
+    // No service-scoped deny (external review, PR #3156): this is a
+    // fleet-wide COMPOSITE SCORE with no per-agent_id row, the same
+    // aggregate-no-identity shape /fragments/guardian/status already
+    // documents as exempt from this confinement class - confining it is a
+    // correctness question (should the displayed score reflect only the
+    // caller's own scope) separate from the disclosure this branch fixes.
     sink.Get("/fragments/dex/health", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
@@ -2708,6 +2843,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Trends: cross-OS comparison + per-family small-multiples + heatmap --
+    // Same aggregate-no-identity exemption as /fragments/dex/health above -
+    // no service-scoped deny (external review, PR #3156).
     sink.Get("/fragments/dex/trends", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
@@ -2722,6 +2859,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // -- Per-app drill-down (blast radius). ?name=<process_name> --
     sink.Get("/fragments/dex/app", [this, resolve_visible](const httplib::Request& req,
                                                            httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed and does not
+        // confine a service-scoped API token whose principal resolves to an
+        // unscoped grant — the affected-devices list would still be fleet-wide.
+        if (deny_service_scoped_(req, res, "dex.app.view",
+                                 "fleet-wide DEX app affected-devices list denied to a "
+                                 "service-scoped token"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
@@ -2871,6 +3016,16 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
 
     sink.Get("/fragments/dex/perf/devices", [this, resolve_visible](const httplib::Request& req,
                                                                     httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed and does not
+        // confine a service-scoped API token whose principal resolves to an
+        // unscoped grant. Same verb as the REST/MCP dex.perf.device.view
+        // emitters — this is a third emitter of the same view (parity with
+        // /fragments/network/devices' identical twin treatment).
+        if (deny_service_scoped_(req, res, "dex.perf.device.view",
+                                 "fleet-wide DEX perf device list denied to a service-scoped "
+                                 "token (dashboard fragment)"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const int window_days =
@@ -2905,6 +3060,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             } catch (...) {}
         }
         const auto vis = resolve_visible(req); // scope the per-device perf list
+        // Behavioral-PII access audit — same verb/target as the REST and MCP
+        // siblings. Set-and-proceed (HTML dashboard fragment, not REST's
+        // fail-closed): a transient audit hiccup must not blank this
+        // operator's view.
+        (void)detail::try_persist_audit(audit_fn_, req, "dex.perf.device.view", "success",
+                                        "GuaranteedState", "",
+                                        "fleet-wide DEX perf device list via dashboard fragment");
         res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
                                                          not_reporting, cohort_filter, limit,
                                                          window_days, vis ? &*vis : nullptr),
@@ -2944,7 +3106,17 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                      "text/html; charset=utf-8");
                      return;
                  }
-                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days),
+                 // Search/platform/sort are RAW here (same posture as the Catalogue
+                 // os= param) — render_dex_app_perf_picker normalizes/validates and
+                 // filters/sorts in-memory over the fetched universe; an unrecognized
+                 // platform/sort token falls back to "all"/"last_seen" there.
+                 const std::string q = req.has_param("q") ? req.get_param_value("q") : "";
+                 const std::string platform_filter =
+                     req.has_param("platform") ? req.get_param_value("platform") : "";
+                 const std::string sort =
+                     req.has_param("sort") ? req.get_param_value("sort") : "";
+                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days, q,
+                                                            platform_filter, sort),
                                  "text/html; charset=utf-8");
              });
 
@@ -2956,11 +3128,22 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
         const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
+        // Device-model cohort filter (F2c) — a SECOND, mutually-exclusive named
+        // scope alongside `group`; `group` wins if a caller (or a hand-edited
+        // URL) supplies both, matching render_dex_app_perf_trend's own
+        // precedence comment. Same tag key every existing cohort picker on the
+        // live Fleet Performance page defaults to (kDexDefaultCohortKey).
+        const std::string model = req.has_param("model") ? req.get_param_value("model") : "";
+        const std::string raw_version =
+            req.has_param("version") ? req.get_param_value("version") : "";
         // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
         // re-floor the REST and MCP app-perf surfaces apply, so the three agree (a
         // NUL would truncate the bound libpq text param). `app` must be non-empty.
+        // `version` empty = all versions (unfiltered), same convention as REST.
         if (app.empty() || !app_perf_param_valid(app) ||
-            (!group.empty() && !app_perf_param_valid(group))) {
+            (!group.empty() && !app_perf_param_valid(group)) ||
+            (!model.empty() && !app_perf_param_valid(model)) ||
+            (!raw_version.empty() && !app_perf_param_valid(raw_version))) {
             res.status = 400;
             res.set_content(placeholder("Pick an application",
                                         "Choose an application from the list to see its "
@@ -2968,39 +3151,40 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             "text/html; charset=utf-8");
             return;
         }
+        // Canonicalize ONCE, here, and use this single value for both the store
+        // filter and the rendered "filtered to version X" state — never the raw
+        // string for one and the canonical form for the other. `app_perf_param_valid`
+        // only bounds length/control-chars; it does NOT reject a non-canonicalizable
+        // value (e.g. "latest", "1.2" short-form, "0.0.0.0"), which `canon_version`
+        // would otherwise silently fold to the SAME "" all-versions sentinel the
+        // store treats as unfiltered — a raw/canonical split here previously let the
+        // page claim "Filtered to version latest" while the store applied no filter
+        // at all, and independently let a short-form/leading-zero value (e.g. "1.2")
+        // filter correctly while the banner/drill-links echoed the un-normalized
+        // input instead of the "1.2.0.0" the store actually matched on.
+        const std::string version = yuzu::util::canon_version(raw_version);
         const std::vector<DexGroupOption> groups =
             group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
 
-        // group empty → fleet B2 (app_perf_fleet_trend); group set → the named-
-        // group on-the-fly B1 aggregate (app_perf_group_trend, sub-floor
-        // suppression at the SAME kDexCohortFloor the REST group endpoint uses).
+        // group set → the named-group on-the-fly B1 aggregate
+        // (app_perf_group_trend, sub-floor suppression at the SAME
+        // kDexCohortFloor the REST group endpoint uses); else model set → the
+        // SAME B1-aggregate shape via the device-model tag cohort (identical
+        // floor treatment — it is the same "named set of specific devices"
+        // case the floor exists for, see AppPerfTagCohortFn's own doc comment);
+        // else fleet B2 (app_perf_fleet_trend). group and model are mutually
+        // exclusive — group wins if a caller supplies both (matches
+        // render_dex_app_perf_trend's own precedence comment).
         std::optional<std::vector<AppPerfFleetRow>> rows;
         std::vector<AppPerfVersionSummary> versions;
-        if (group.empty()) {
-            if (!app_perf_providers_.fleet) {
-                res.set_content(placeholder("Application performance unavailable",
-                                            "This server has no fleet app-perf store wired."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            rows = app_perf_providers_.fleet(app, "");
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
-                // already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Application performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
-        } else {
+        if (!group.empty()) {
             if (!app_perf_providers_.group) {
                 res.set_content(placeholder("Group performance unavailable",
                                             "This server has no group app-perf reader wired."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.group(group, app, "");
+            rows = app_perf_providers_.group(group, app, version);
             if (!rows) {
                 // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
                 // reader already counted the degrade. (REST twin stays fail-closed.)
@@ -3010,9 +3194,163 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 return;
             }
             versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        } else if (!model.empty()) {
+            if (!app_perf_providers_.tag_cohort) {
+                res.set_content(placeholder("Model performance unavailable",
+                                            "This server has no device-model cohort reader wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.tag_cohort(kDexDefaultCohortKey, model, app, version);
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the tag
+                // cohort provider already counted the degrade (a failed
+                // TagStore read fails the whole lookup closed).
+                res.set_content(placeholder("Model performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        } else {
+            if (!app_perf_providers_.fleet) {
+                res.set_content(placeholder("Application performance unavailable",
+                                            "This server has no fleet app-perf store wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.fleet(app, version);
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
+                // already counted the degrade. (REST twin stays fail-closed.)
+                res.set_content(placeholder("Application performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
         }
+        // Model-selector values — best-effort: an unwired/degraded tag_values
+        // provider just hides the selector (empty vector), same convention as
+        // an empty `groups` list above; it never blocks the page render.
+        const std::vector<std::string> model_values =
+            app_perf_providers_.tag_values
+                ? app_perf_providers_.tag_values(kDexDefaultCohortKey).value_or(
+                      std::vector<std::string>{})
+                : std::vector<std::string>{};
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
-                                                  window_days),
+                                                  window_days, version, model_values, model),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- F2b version-drill: "which devices" (#4250-family follow-on) -----------
+    //
+    // The click-to-expand companion to the trend table above: one version row
+    // names the devices that reported it among their top-N resource consumers.
+    // Unlike the picker/trend routes just above, this route's rows carry
+    // agent_id — an identified, fleet-wide fan-out read — so the bare
+    // `perm_fn_("GuaranteedState","Read")` those routes use is WRONG here (no
+    // service-scope confinement, no per-agent visible-set narrowing). This route
+    // uses `fleet_read_fn_` (AuthRoutes::require_fleet_read, ADR-0017) as its
+    // SOLE gate instead — never stacked with perm_fn_ (the identical BLOCKING
+    // defect require_fleet_read's own doc comment warns against) — and pushes
+    // the gate's resolved VisibleSet into the STORE QUERY (AppPerfDailyStore::
+    // list_devices_for_version), never a post-fetch filter, so a present-empty
+    // scope yields zero rows rather than an unfiltered page. Deliberately does
+    // NOT use `resolve_visible` (this file's pre-existing username-keyed
+    // VisibleSetFn) — that seam is keyed on Infrastructure:Read and resolves to
+    // nullopt (unfiltered) when unwired, the exact anti-pattern this route must
+    // avoid.
+    //
+    // No statistical floor (kDexCohortFloor does not apply): every row already
+    // names an agent_id, so a named-group-sized list protects nothing a floor
+    // would add (precedent: the per-device drill above and VERIFY's compare are
+    // both floor-free for the identical reason). The audited access IS the
+    // control instead.
+    //
+    // Fleet-wide only in this slice: a group-scoped trend's version rows do NOT
+    // render this affordance (see render_dex_app_perf_trend's own comment) —
+    // narrowing this drill to a named group's members needs its own provider
+    // composition (member resolution + this query) and is deferred, not an
+    // oversight.
+    sink.Get("/fragments/dex/perf/app/devices", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        // The trigger link (below, render_dex_app_perf_trend) uses
+        // `hx-target="closest tr" hx-swap="afterend"`, so EVERY response here —
+        // including every error/empty note — must be a well-formed `<tr>` to
+        // insert as a table row; colspan=6 matches the trend table's own column
+        // count (Version/Avg CPU/p95 CPU/CPU trend/Avg working set/Devices).
+        auto row = [](const std::string& inner) {
+            return "<tr><td colspan=\"6\">" + inner + "</td></tr>";
+        };
+        const auto cid = detail::make_correlation_id();
+        // No `window` param: this drill reads each device's MOST RECENT
+        // reporting day for the exact version, independent of the trend's
+        // display window — see the route comment above and the store method's
+        // own doc comment (app_perf_daily_store.hpp).
+        const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+        // `version` is REQUIRED-PRESENT here (unlike the trend route's "" =
+        // all-versions convention): this drill is always scoped to ONE exact
+        // version, and Linux's procperf emits "" for EVERY app
+        // (tar_proc_perf.cpp) — treating a missing `version` as "all versions"
+        // would silently collapse to the single Linux bucket instead of
+        // surfacing a genuine parameter error.
+        if (!req.has_param("version") || app.empty() || !app_perf_param_valid(app) ||
+            !app_perf_param_valid(req.get_param_value("version"))) {
+            res.set_content(row("<div class=\"gp-note\">Missing or invalid app/version.</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::string version = yuzu::util::canon_version(req.get_param_value("version"));
+        if (!fleet_read_fn_) {
+            // Unwired gate = misconfiguration, never "no filter" — but a
+            // fragment stays at 200 (htmx drops 4xx/5xx bodies) and says so
+            // plainly rather than silently falling back to a weaker check.
+            res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
+                                "(authorization gate not configured).</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+        if (!gate.admitted)
+            return; // the gate already wrote 401/403/503 (not a <tr> — the accepted
+                    // denial shape for this gate everywhere else it's used)
+        if (!app_perf_providers_.version_devices) {
+            res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
+                                "(no app-perf device provider wired).</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // gate.scope: nullopt = unfiltered; engaged (incl. empty) = restrict to
+        // exactly these agent_ids. Converted to the provider's vector shape —
+        // still pushed into the STORE query by the provider, never post-filtered
+        // here.
+        std::optional<std::vector<std::string>> visible_ids;
+        if (gate.scope)
+            visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+        bool truncated = false;
+        auto rows = app_perf_providers_.version_devices(app, version, visible_ids, truncated);
+        if (!rows) {
+            // Store degrade — audit the attempted access (CC7.2), set-and-proceed
+            // (this fragment is not the fail-closed surface; the REST twin is).
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
+                "app=" + app + " version=" + version + " store degraded; cid=" + cid);
+            res.set_content(row("<div class=\"gp-note\">The app-perf store could not be read "
+                                "right now. Retry shortly.</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Audit AFTER the read (so the detail carries the real device count) but
+        // BEFORE rendering — set-and-proceed: a persist failure only flags the
+        // gap (Sec-Audit-Failed is a REST-only header; the dashboard has no
+        // equivalent signal short of the note itself), it never blanks the
+        // dashboard.
+        (void)detail::try_persist_audit(
+            audit_fn_, req, "dex.app_perf.devices.view", "success", "GuaranteedState", "",
+            "app=" + app + " version=" + version + " devices=" + std::to_string(rows->size()) +
+                " cid=" + cid);
+        res.set_content(row(render_dex_app_perf_version_devices(*rows, truncated)),
                         "text/html; charset=utf-8");
     });
 
@@ -3062,7 +3400,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
-        const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+        const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+        const auto& command_id = dispatch_outcome.command_id;
+        const auto sent = dispatch_outcome.sent;
         // Surface a dropped evidence row on this usage-class dispatch via
         // Sec-Audit-Failed; HTML surface still renders. Shared #1647 chokepoint so a
         // throwing audit_fn is caught here too (catch-arm parity), not just returns-false.
@@ -3130,6 +3470,20 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                               esc(with_output->output.substr(6, 200)));
                 return;
             }
+            // #4035: the poll route is where the parsed perf history actually
+            // reaches the operator — the /perf dispatch above audits the
+            // REQUEST, but only THIS route renders the output, so the access
+            // must be audited here too (mirrors device_routes.cpp's
+            // audit_live_result: fires ONLY on a branch that actually serves
+            // rendered data, never on the pending/error/failed/timeout notes,
+            // so a 700ms poll loop doesn't spam one audit row per attempt).
+            // Same verb as the dispatch half (dex.device.perf.query) so the
+            // audit trail reads as one capability regardless of which half of
+            // the dispatch/poll pair produced the row. Set-and-proceed HTML
+            // posture, same #1647 chokepoint as every other dashboard fragment.
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "dex.device.perf.query", "rendered", "Agent", id,
+                "poll result rendered for command_id=" + command_id);
             res.set_content(render_dex_perf_panel(parse_dex_perf_output(with_output->output)),
                             "text/html; charset=utf-8");
             return;
@@ -3188,7 +3542,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string w = window_token(window_to_days(
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
-                 const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+                 const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+                 const auto& command_id = dispatch_outcome.command_id;
+                 const auto sent = dispatch_outcome.sent;
                  // The procperf probe is usage-class (works-council-relevant); surface a
                  // dropped evidence row via Sec-Audit-Failed; HTML surface still renders.
                  // Shared #1647 chokepoint adds catch-arm parity for a throwing audit_fn.
@@ -3256,6 +3612,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                        esc(with_output->output.substr(6, 200)));
                          return;
                      }
+                     // #4035: same audit-gap fix as the sibling /device/perf/result
+                     // route — the poll is where the per-app output actually
+                     // reaches the operator, so it needs its own audit row
+                     // (usage-class, dex.device.procperf.query, matching the
+                     // dispatch half's verb). Fires only on the branch that
+                     // actually serves data, never on pending/error/failed/timeout.
+                     (void)detail::emit_behavioral_audit(
+                         audit_fn_, req, res, "dex.device.procperf.query", "rendered", "Agent", id,
+                         "poll result rendered for command_id=" + command_id);
                      res.set_content(render_dex_procperf_panel(
                                          parse_dex_procperf_output(with_output->output), w),
                                      "text/html; charset=utf-8");

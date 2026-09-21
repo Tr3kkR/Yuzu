@@ -1,0 +1,8 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 8aea1a515344
+== action=printers
+printer|none
+[result_status] OK / FULL / 
+
+== action=jobs
+job|none
+[result_status] OK / FULL /

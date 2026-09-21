@@ -1,15 +1,23 @@
 %%%-------------------------------------------------------------------
 %%% @doc Operator-facing gRPC service — implements ManagementService.
 %%%
-%%% Serves commands from dashboards and CLI tools. Most operations are
-%%% handled entirely by the gateway (which knows connected agents);
-%%% only QueryInventory is proxied to the C++ server.
+%%% Serves commands from dashboards and CLI tools. Every operation is
+%%% handled entirely by the gateway (which knows connected agents) —
+%%% nothing on this plane reaches the upstream C++ server or its RBAC.
 %%%
 %%% - SendCommand: fans out via yuzu_gw_router
 %%% - ListAgents:  answered from ETS routing table
 %%% - GetAgent:    answered from agent process state
 %%% - WatchEvents: gateway-native lifecycle event stream
-%%% - QueryInventory: proxied to C++ server
+%%% - QueryInventory: answered from the local registry
+%%%
+%%% AUTHORIZATION lives at the listener, not here: none of these handlers
+%%% inspects the caller (grpcbox hands unary handlers no socket/peer-cert
+%%% access), so the :50063 listener's grpcbox auth_fun
+%%% (yuzu_gw_authz:check_mgmt_peer/1, #1422) is the ONLY gate between an
+%%% mTLS-admitted peer and fleet-wide command fan-out. A new listener
+%%% serving this module MUST wire that auth_fun; the yuzu_gw_app boot
+%%% guard refuses a non-loopback management_pb listener without it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_service).
@@ -85,7 +93,21 @@ get_agent(Request, Ctx) ->
 
     case yuzu_gw_registry:lookup(AgentId) of
         {ok, Pid} ->
-            case yuzu_gw_agent:get_info(Pid) of
+            %% GOVERNANCE FINDING (external PR review): `lookup/1`'s cross-node
+            %% `pg` fallback (`lookup_remote/1`, HA WS-4 4.3a) never verifies a
+            %% REMOTE member's liveness — it trusts `pg`'s own asynchronous
+            %% cleanup (see that function's doc comment). A stale pid reaching
+            %% here therefore makes `gen_statem:call/3` below raise
+            %% `exit({noproc, _})` (dead process) or `exit({nodedown, _})` /
+            %% `exit({noconnection, _})` (node genuinely disconnected) instead
+            %% of returning `{error, _}` — uncaught, that would crash this
+            %% grpcbox request handler instead of reaching either `case`
+            %% branch below. The router's fire-and-forget dispatch path
+            %% self-heals the same staleness via the 300s `fanout_timeout`;
+            %% this synchronous RPC has no such fallback and must map it to
+            %% the same NOT_FOUND response the `error` branch already
+            %% produces for "never was connected".
+            try yuzu_gw_agent:get_info(Pid) of
                 {ok, Info} ->
                     Plugins = [#{name => P} || P <- maps:get(plugins, Info, [])],
                     Response = #{
@@ -101,6 +123,13 @@ get_agent(Request, Ctx) ->
                     {error, #{status => 13,
                               message => iolist_to_binary(
                                   io_lib:format("Agent query failed: ~p", [Reason]))}}
+            catch
+                exit:{noproc, _} ->
+                    {error, #{status => 5,  %% NOT_FOUND
+                              message => <<"Agent not connected">>}};
+                exit:{Reason, _} when Reason =:= nodedown; Reason =:= noconnection ->
+                    {error, #{status => 5,  %% NOT_FOUND
+                              message => <<"Agent not connected">>}}
             end;
         error ->
             {error, #{status => 5,  %% NOT_FOUND

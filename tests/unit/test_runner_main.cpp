@@ -1,7 +1,8 @@
-// Custom Catch2 entry point for yuzu_agent_tests — deliberately NOT
-// Catch2WithMain (see tests/meson.build: agent_test_exe links catch2_nomain_dep).
+// Custom Catch2 entry point for yuzu_agent_tests AND yuzu_server_tests —
+// deliberately NOT Catch2WithMain (see tests/meson.build: both exes link
+// catch2_nomain_dep).
 //
-// #1648: the Windows debug agent-test binary has, on rare CI runs, printed a
+// #1648: the Windows debug test binaries have, on rare CI runs, printed a
 // clean Catch2 summary (e.g. "1 failed") and then had the OS report an
 // unrelated process exit code (42), which defeats scripts/ci/flake-retry.py's
 // classification (catch2_failed_cases() treats an abnormal exit as
@@ -15,9 +16,129 @@
 //     fprintf, so the corruption happened DURING session.run() itself (e.g.
 //     a RegistryGuard watch thread crashing mid-suite), which also explains
 //     why catch2_failed_cases()'s junit re-run comes back empty/unparseable.
+//
+// #3507 AC1: printing the diagnostic was never enough to stop the strand -
+// once a teardown-thread crash happens AFTER a green (or honestly red)
+// summary, nothing in this file's control can stop the OS from reporting a
+// corrupted exit code, because the corruption happens in code this file does
+// not own (global/static destructors, DLL unload, a still-running detached
+// worker). The fix is to never reach that code on Windows: leave immediately
+// after Session::run() returns, via the same hard_exit() primitive
+// main.cpp/service_win.cpp already use for the identical class of hazard
+// (agents/core/src/hard_exit.hpp, ADR-0021 rung 7.6 / the F3 orphan-exit
+// obligation). This is REUSE of that primitive, not a new copy — both test
+// binaries already carry agents/core/src on their include path (see the
+// CONSTRAINT comment on yuzu_server_tests's target in tests/meson.build), so
+// server/core/src/main.cpp's "hoist to common/ on a third call site" rule is
+// not triggered by this include.
+//
+// hard_exit.hpp documents that its `code` "should be nonzero for every
+// F3/orphan-triggered call ... must never look like EXIT_SUCCESS" — that
+// sentence is scoped to the F3/orphan-drain use it was written for. THIS
+// call site is a different, deliberately reviewed use: a passing test run
+// (result == 0) is exactly the case #3507 exists to protect, since the
+// crash this bug describes happens strictly after a GREEN summary. Calling
+// hard_exit(0) here on Windows is intentional, not an oversight — do not
+// "fix" it to skip hard_exit on a zero result.
+//
+// Windows-only (#ifdef _WIN32, not a runtime check): nightly's coverage
+// (-Db_coverage) and Linux ASan/UBSan/TSan legs need a normal process exit
+// for their atexit dumps (gcov's .gcda write, LSan's leak report) —
+// hard_exit() skips atexit entirely by design. The exit-42 hazard is a
+// Windows-debug-CI phenomenon (#1648); lifting this guard to other
+// platforms would silently break those legs' own instrumentation.
+//
+// ALSO excluded from hard_exit on Windows (governance Gate 2/3, 2026-08-28):
+// nightly.yml's windows-asan leg, which DOES build and run this exact binary
+// (tests/yuzu_agent_tests, -Db_sanitize=address) — an unconditional #ifdef
+// _WIN32 guard would fire there too, TerminateProcess-ing before any
+// static/global destructor runs and removing ASan's one window to catch a
+// UAF-class race between a still-running detached worker (the exact F3
+// scenario this hard_exit call exists to guard test-harness exit against)
+// and normal teardown — precisely the "whole UAF class this batch targets"
+// windows-asan's own job comment describes. Verified this exclusion is safe
+// to make, not merely convenient: windows-asan runs `meson test` directly,
+// never through flake-retry.py, so the #1648 exit-42 misclassification this
+// hard_exit call exists to prevent cannot occur on that leg — excluding it
+// costs this file's own stated purpose nothing. __SANITIZE_ADDRESS__ is a
+// real macro GCC and MSVC both define directly under their ASan flag
+// (Clang instead answers __has_feature(address_sanitizer) - irrelevant
+// here since Windows never uses Clang, docs/windows-build.md's standing
+// rule, and windows-asan's toolchain is confirmed cl.exe). This is not a
+// new, untested pattern: the identical cross-toolchain sanitizer-detect
+// need already lives in this exact codebase at
+// tests/unit/test_helpers.hpp's kSpinScale and
+// agents/core/include/yuzu/agent/guardian_engine.hpp's
+// YUZU_WORKER_MUTEX_GUARD (both OR in the __has_feature branch too, since
+// they also compile on Linux/macOS Clang; this Windows-only call site
+// doesn't need to).
+//
+// Session's own destructor (and any Catch2/system atexit handler) never
+// runs on this path. Verified empirically (2026-08-27, scratch experiment
+// against the vendored Catch2 3.13.0) that this is safe for what
+// flake-retry.py needs: a `--reporter junit --out` file is fully written
+// and well-formed, WITH the correct process exit code preserved, when the
+// process calls _exit()/TerminateProcess() immediately after
+// Session::run() returns — junit finalization and the PG cleanup listener's
+// testRunEnded both fire INSIDE run(), not in Session's destructor.
+#include "hard_exit.hpp"
+
 #include <catch2/catch_session.hpp>
 
 #include <cstdio>
+
+// #1611: TSan suppression for libpq's two connect-time process globals.
+//
+// libpq (vcpkg libpq 16.9, src/interfaces/libpq/fe-exec.c, pqSaveParameterStatus)
+// copies EVERY new connection's client_encoding and standard_conforming_strings
+// ParameterStatus into two file-scope statics, static_client_encoding and
+// static_std_strings. Upstream's own comment says why: "so that PQescapeString and
+// PQescapeBytea can behave somewhat sanely (at least in single-connection-using
+// programs)". Any two threads establishing Postgres connections concurrently (two
+// PgPool::connect_one() calls, or a pool connect racing a test fixture's direct
+// PQconnectdb) are a write-write race on those statics; TSan sees it because the
+// TSan triplet instruments libpq itself.
+//
+// Benign HERE and only here: the statics are read solely by the conn-less
+// PQescapeString / PQescapeBytea (no `Conn` suffix), which no first-party code
+// calls — every Yuzu query goes through pg::exec_params
+// (docs/postgres-store-playbook.md). tests/test_no_connless_pq_escape.py is the
+// tripwire that keeps that true; the suppression and the tripwire ship together
+// and must not be separated. Anchored to the two GLOBALS by name, not the
+// enclosing function, so a race on a shared PGconn inside the same call frame (a
+// real first-party bug) still fires.
+//
+// Do not "fix" this race instead with a process-wide connect mutex: libpq also
+// delivers ParameterStatus asynchronously outside connect (any later SET/GUC
+// notice), which a connect-time mutex can't cover, and serializing every
+// PgPool's connect against the LeaderElector's own dedicated connection
+// (server/core/src/leader_elector.cpp) adds cross-component latency coupling for
+// no correctness gain here.
+//
+// Compiled in (not TSAN_OPTIONS=suppressions=<file>) so this one definition
+// covers every invocation of these binaries: nightly, on-demand sanitizer runs,
+// scripts/ci/tsan-gdb-capture.py re-runs, local runs. This project compiles with
+// -fvisibility=hidden globally (meson.build); a bare extern "C" definition of
+// this hook would therefore never reach the binary's dynamic symbol table and
+// the TSan runtime would silently keep its built-in empty suppression list
+// instead — the explicit `visibility("default")` below is load-bearing, not
+// decorative. Verify with `nm -D <binary> | grep __tsan_default_suppressions`
+// after building (must show a defined, GLOBAL/default-bound symbol, not
+// missing/local) — see this PR's own verification notes for the exact command.
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TEST_TSAN 1
+#endif
+#endif
+#ifdef YUZU_TEST_TSAN
+extern "C" __attribute__((visibility("default"), used)) const char*
+__tsan_default_suppressions() {
+    return "race:^static_std_strings$\n"
+           "race:^static_client_encoding$\n";
+}
+#endif
 
 int main(int argc, char* argv[]) {
     Catch::Session session;
@@ -31,5 +152,9 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "[DIAG] Catch2 Session::run() returned %d (main about to return)\n",
                  result);
     std::fflush(stderr);
+    std::fflush(stdout);
+#if defined(_WIN32) && !defined(__SANITIZE_ADDRESS__)
+    yuzu::agent::hard_exit(result); // see the #3507 AC1 comment above
+#endif
     return result;
 }

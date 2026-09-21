@@ -10,6 +10,8 @@
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -150,7 +152,15 @@ TEST_CASE("validate_pem_pair: binary garbage", "[cert-reload][pem]") {
 // ── File change detection ──────────────────────────────────────────────────
 
 TEST_CASE("CertReloader: construction records mtimes", "[cert-reload][mtime]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_cert_reload_test_mtime";
+    // Process-salted scratch dirs (here and in every test below): the previous
+    // fixed dir names were cross-JOB shared resources on the shared-identity
+    // CI pools — one job's trailing remove_all deleted another job's live
+    // test.pem/test-key.pem mid-test (#1883). TempDir's dtor also makes the
+    // cleanup exception-safe (the old trailing remove_all was skipped whenever
+    // a CHECK/REQUIRE threw). Declared FIRST so it destructs after the
+    // reloader (thread joined before the dir goes away).
+    yuzu::test::TempDir tmp_dir{"yuzu_cert_reload_mtime-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto cert_path = tmp / "test.pem";
     auto key_path = tmp / "test-key.pem";
@@ -173,14 +183,13 @@ TEST_CASE("CertReloader: construction records mtimes", "[cert-reload][mtime]") {
     CertReloader reloader(params);
     CHECK(reloader.reload_count() == 0);
     CHECK(reloader.failure_count() == 0);
-
-    std::filesystem::remove_all(tmp);
 }
 
 // ── try_reload failure paths ────────────────────────────────────────────────
 
 TEST_CASE("CertReloader: try_reload fails with null web_server", "[cert-reload][reload]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_cert_reload_test_null";
+    yuzu::test::TempDir tmp_dir{"yuzu_cert_reload_null-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto cert_path = tmp / "test.pem";
     auto key_path = tmp / "test-key.pem";
@@ -208,12 +217,11 @@ TEST_CASE("CertReloader: try_reload fails with null web_server", "[cert-reload][
     CHECK_FALSE(result);
     CHECK(reloader.failure_count() > 0);
     CHECK(reloader.reload_count() == 0);
-
-    std::filesystem::remove_all(tmp);
 }
 
 TEST_CASE("CertReloader: try_reload fails with empty files", "[cert-reload][reload]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_cert_reload_test_empty";
+    yuzu::test::TempDir tmp_dir{"yuzu_cert_reload_empty-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto cert_path = tmp / "test.pem";
     auto key_path = tmp / "test-key.pem";
@@ -239,14 +247,13 @@ TEST_CASE("CertReloader: try_reload fails with empty files", "[cert-reload][relo
     bool result = reloader.try_reload();
     CHECK_FALSE(result);
     CHECK(reloader.failure_count() > 0);
-
-    std::filesystem::remove_all(tmp);
 }
 
 // ── Start / stop lifecycle ──────────────────────────────────────────────────
 
 TEST_CASE("CertReloader: start and stop without crash", "[cert-reload][lifecycle]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_cert_reload_test_lifecycle";
+    yuzu::test::TempDir tmp_dir{"yuzu_cert_reload_lifecycle-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto cert_path = tmp / "test.pem";
     auto key_path = tmp / "test-key.pem";
@@ -273,12 +280,11 @@ TEST_CASE("CertReloader: start and stop without crash", "[cert-reload][lifecycle
     reloader.stop();
     // No crash, no hang
     CHECK(true);
-
-    std::filesystem::remove_all(tmp);
 }
 
 TEST_CASE("CertReloader: destructor stops cleanly", "[cert-reload][lifecycle]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_cert_reload_test_dtor";
+    yuzu::test::TempDir tmp_dir{"yuzu_cert_reload_dtor-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto cert_path = tmp / "test.pem";
     auto key_path = tmp / "test-key.pem";
@@ -305,15 +311,17 @@ TEST_CASE("CertReloader: destructor stops cleanly", "[cert-reload][lifecycle]") 
         // Destructor should call stop() and join the thread
     }
     CHECK(true);
-
-    std::filesystem::remove_all(tmp);
 }
 
 // ── Permission validation (Unix only) ──────────────────────────────────────
 
 #ifndef _WIN32
 TEST_CASE("validate_key_file_permissions: rejects group-readable", "[cert-reload][perms]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_perm_test_grp";
+    // These two Unix-only tests run on the Linux pool (Big Tam), where all 4
+    // runner agents share one /tmp — under the old fixed dir a concurrent job
+    // flipping permissions on the SAME key file inverted the expected result.
+    yuzu::test::TempDir tmp_dir{"yuzu_perm_grp-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto key_path = tmp / "test-key.pem";
 
@@ -327,12 +335,11 @@ TEST_CASE("validate_key_file_permissions: rejects group-readable", "[cert-reload
     std::filesystem::permissions(key_path, std::filesystem::perms::owner_read |
                                                 std::filesystem::perms::owner_write);
     CHECK(detail::validate_key_file_permissions(key_path, "test"));
-
-    std::filesystem::remove_all(tmp);
 }
 
 TEST_CASE("validate_key_file_permissions: rejects others-readable", "[cert-reload][perms]") {
-    auto tmp = std::filesystem::temp_directory_path() / "yuzu_perm_test_oth";
+    yuzu::test::TempDir tmp_dir{"yuzu_perm_oth-"};
+    const auto& tmp = tmp_dir.path;
     std::filesystem::create_directories(tmp);
     auto key_path = tmp / "test-key.pem";
 
@@ -342,7 +349,5 @@ TEST_CASE("validate_key_file_permissions: rejects others-readable", "[cert-reloa
                                                 std::filesystem::perms::owner_write |
                                                 std::filesystem::perms::others_read);
     CHECK_FALSE(detail::validate_key_file_permissions(key_path, "test"));
-
-    std::filesystem::remove_all(tmp);
 }
 #endif

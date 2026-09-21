@@ -25,10 +25,12 @@
 
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstdlib>
 #include <filesystem>
@@ -129,9 +131,336 @@ struct GuardianFixture {
         (*a->mutable_params())["service_name"] = "Spooler";
         return r;
     }
+
+    // #4021: a file-change/file-hash-equals rule. FileGuard is Windows-only for
+    // the MVP (start() no-ops elsewhere), so this never actually arms a running
+    // guard off Windows — what IS testable everywhere is start_guard_for_rule_locked's
+    // config-build step (path/expected_hash/baseline-seed), observed via
+    // last_file_expected_hash_for_test(). `expected_hash` empty means author it
+    // as baseline-on-arm (the case this issue is about).
+    static gpb::GuaranteedStateRule make_file_hash_rule(const std::string& id,
+                                                        const std::string& path,
+                                                        const std::string& expected_hash = "") {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.mutable_spark()->set_type("file-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("file-hash-equals");
+        (*a->mutable_params())["path"] = path;
+        if (!expected_hash.empty())
+            (*a->mutable_params())["expected_hash"] = expected_hash;
+        return r;
+    }
+
+    static gpb::GuaranteedStatePush make_push(std::vector<gpb::GuaranteedStateRule> rules,
+                                              bool full_sync) {
+        gpb::GuaranteedStatePush push;
+        push.set_full_sync(full_sync);
+        for (auto& r : rules)
+            *push.add_rules() = std::move(r);
+        return push;
+    }
 };
 
 } // namespace
+
+// ── #4021: persisted baseline survives full_sync / seeds a re-arm ──────────
+//
+// full_sync (any unrelated fleet rule mutation, or an agent restart) used to tear
+// down every guard and re-arm fresh, with no memory of a baseline a rule had
+// already captured — a `file-hash-equals` rule authored with no `expected_hash`
+// would silently re-capture "whatever's on disk right now" as its new baseline,
+// laundering genuine drift into a false compliant with no remediation. These
+// tests exercise the KV-persisted-baseline substrate + the seed-lookup that now
+// runs at legacy arm time (start_guard_for_rule_locked) — the config-build step
+// runs identically on every OS; only the running FileGuard itself is
+// Windows-only, so last_file_expected_hash_for_test() is what's observable here.
+
+TEST_CASE("a file-hash-equals rule with no persisted baseline arms with no seed",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // Serialize-then-dispatch so the params Map is parsed INSIDE the agent DLL
+    // (#501 cross-image hash-seed) - a direct apply_rules(p) call here builds
+    // the rule's params Map in the TEST EXE, which a DLL-side .find() (in
+    // spark_spec_from_rule/start_guard_for_rule_locked) can spuriously miss.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_expected_hash_for_test().empty()); // first-ever arm: nothing to seed
+}
+
+TEST_CASE("a persisted baseline matching this rule's fingerprint seeds the arm",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    const std::string hash(64, 'a');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
+    j["hash"] = hash;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch, see the comment on the test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_expected_hash_for_test() == hash);
+}
+
+TEST_CASE("a persisted baseline for a DIFFERENT target does not seed (fingerprint mismatch)",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/some-other-path";
+    j["hash"] = std::string(64, 'b');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch, see the comment on the first test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_expected_hash_for_test().empty()); // genuinely different target
+}
+
+TEST_CASE("an authored expected_hash always wins over any persisted baseline",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
+    j["hash"] = std::string(64, 'c');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    const std::string authored(64, 'd');
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x", authored);
+    // #501: serialize-then-dispatch, see the comment on the first test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_expected_hash_for_test() == authored);
+}
+
+TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baseline",
+          "[guardian][engine][baseline][full_sync]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
+    j["hash"] = std::string(64, 'e');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // r1 must be a REAL pushed rule first (Gate 3 quality-engineer follow-up:
+    // otherwise the closing CHECK_FALSE below is vacuously true regardless of
+    // whether the scoped-delete fix works, since rule:r1 was never written in
+    // the first place).
+    //
+    // Direct apply_rules() call is safe here (unlike the [baseline] tests
+    // above/below, which route through guardian_dispatch_push_bytes_for_test
+    // for #501) ONLY because make_rule() populates no assertion params() Map
+    // at all - swap either make_rule() call in this test for
+    // make_file_hash_rule() and it needs the same serialize-then-dispatch
+    // migration, or the #501 cross-image hash-seed flake reopens.
+    f.engine->apply_rules(
+        GuardianFixture::make_push({GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+
+    // r1's baseline was captured BEFORE this push; the new full_sync push doesn't
+    // even name r1 (an unrelated rule's fleet edit, mirroring #3990's amplifier) —
+    // r1 is genuinely gone from this push, same as the server omitting a
+    // disabled/out-of-scope rule (guardian_push_builder.cpp). The baseline record
+    // must survive regardless: the agent cannot distinguish "r1 was deleted" from
+    // "r1 is temporarily out of scope for this push", and sweeping on absence
+    // would reintroduce this issue's exact laundering the next time r1 reappears.
+    f.engine->apply_rules(
+        GuardianFixture::make_push({GuardianFixture::make_rule("other", "other")}, /*full_sync=*/true));
+
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    auto parsed = nlohmann::json::parse(*raw);
+    CHECK(parsed.value("hash", std::string{}) == std::string(64, 'e'));
+
+    // The rule cache itself IS cleared by full_sync, unaffected by this change —
+    // only baseline: keys are exempted from the sweep.
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+}
+
+TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the persisted "
+          "record, not from current disk content",
+          "[guardian][engine][baseline][full_sync]") {
+    GuardianFixture f;
+    const std::string original_hash(64, 'f');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
+    j["hash"] = original_hash;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // Simulates the exact bug scenario: r1 was baselined at `original_hash` some
+    // time ago (possibly now genuinely drifted on disk — this test doesn't need a
+    // real file since FileGuard doesn't run off Windows); an UNRELATED fleet edit
+    // now triggers a full_sync that also re-includes r1 unchanged.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch - see the comment on the first [baseline]
+    // test above for the full cross-image hash-seed rationale.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_expected_hash_for_test() == original_hash);
+
+    // The persisted record itself is unchanged — this arm attempt (whether or not
+    // a real guard ever runs to re-confirm it) did not silently recapture.
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    CHECK(nlohmann::json::parse(*raw).value("hash", std::string{}) == original_hash);
+}
+
+// ── guardian_persist_baseline's overwrite guard (adversarial-review K1/C2-1) ──
+//
+// A TRANSIENT seed-lookup failure (or, equivalently for this guard's purposes,
+// any reason a capture fires despite a good record already being on file) must
+// never let the resulting fresh capture overwrite that good record — on the
+// happy path a matching well-formed record means guardian_seed_baseline would
+// have seeded expected_hash and the capture branch would never fire at all, so
+// reaching persist with a same-fingerprint record already present is only
+// reachable via a failed seed lookup. Exercised directly via the
+// `_for_test` forwarders since the real call site (FileGuard::Config::
+// on_baseline) only fires from a Windows-only guard worker this platform's
+// tests cannot run end-to-end.
+
+TEST_CASE("persist refuses to overwrite an existing SAME-fingerprint baseline",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    const std::string good(64, 'a');
+    const std::string drifted(64, 'b');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = fp;
+    j["hash"] = good;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // Simulates a fresh capture reaching persist despite a good record already
+    // on file (the only reachable cause: the seed lookup that should have
+    // prevented this capture in the first place failed transiently).
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, drifted);
+
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    CHECK(nlohmann::json::parse(*raw).value("hash", std::string{}) == good); // NOT overwritten
+}
+
+TEST_CASE("persist writes normally when no baseline exists yet",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    const std::string hash(64, 'c');
+
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == hash);
+}
+
+TEST_CASE("persist writes normally for a genuine retarget (different fingerprint)",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "file-hash-equals|/tmp/old-path";
+    j["hash"] = std::string(64, 'd');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    const std::string new_fp = "file-hash-equals|/tmp/new-path";
+    const std::string new_hash(64, 'e');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", new_fp, new_hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", new_fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == new_hash); // the retarget's own capture DID write
+}
+
+TEST_CASE("persist writes normally over a malformed existing record (self-heals)",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", "not valid json"));
+
+    const std::string hash(64, 'f');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == hash);
+}
+
+// ── schema-version mismatch (Gate 3 quality-engineer follow-up) ────────────
+//
+// Pins the exact scenario the 7451b67df fingerprint/schema-version-separation
+// fix was written for: a record from a future/incompatible schema must be
+// treated as Malformed (recapture/rewrite, self-heals), never silently
+// matched as-is or misread as "a different target" — deleting the schema
+// check in read_baseline_record should flip both of these red.
+
+TEST_CASE("seed does not match a record with a mismatched schema version",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    nlohmann::json j;
+    j["schema"] = 2; // future/incompatible - kBaselineSchemaVersion is 1
+    j["fingerprint"] = fp;
+    j["hash"] = std::string(64, 'a');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    CHECK_FALSE(seeded.has_value()); // Malformed, not a false match
+}
+
+TEST_CASE("persist overwrites a record with a mismatched schema version",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    nlohmann::json j;
+    j["schema"] = 2;
+    j["fingerprint"] = fp; // matching fingerprint - only the schema differs
+    j["hash"] = std::string(64, 'a');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // A schema mismatch must be read as Malformed, NOT as a same-fingerprint
+    // match — otherwise the persist-side overwrite guard would (wrongly)
+    // refuse this write, permanently wedging the record at the old schema.
+    const std::string mismatch_hash(64, 'b');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, mismatch_hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == mismatch_hash); // the write landed, not refused
+}
+
+TEST_CASE("arming a file-hash-equals rule wires the on_baseline capture callback",
+          "[guardian][engine][baseline]") {
+    // Gate 3 quality-engineer follow-up: distinct from
+    // last_file_expected_hash_for_test (which only proves the seed lookup
+    // ran) - this proves the CAPTURE callback was actually attached, since a
+    // seeded rule never re-enters the branch that would exercise it.
+    GuardianFixture f;
+    CHECK_FALSE(f.engine->last_file_on_baseline_wired_for_test()); // nothing armed yet
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch - see the comment on the first [baseline]
+    // test above for the full cross-image hash-seed rationale.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    CHECK(f.engine->last_file_on_baseline_wired_for_test());
+}
 
 TEST_CASE("GuardianEngine: start_local on fresh KV reports zero rules",
           "[guardian][engine][start]") {
@@ -326,6 +655,156 @@ TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-c
     CHECK(status.errored_rules() == 1);
 }
 
+// ── rung 6: apply_rules must honor enabled() the same way start_local does ──
+// Previously apply_rules called start_guard_for_rule_locked for EVERY pushed
+// rule regardless of enabled() (unlike start_local, which already skipped
+// disabled cached rules on restart), so a disabled rule still armed a guard,
+// and pushing an already-armed rule as disabled never stopped it. These use
+// make_service_rule because it is the one fixture that arms a REAL guard
+// cross-platform (SystemdServiceGuard on Linux+systemd, ServiceGuard on
+// Windows) without depending on the target unit/service existing (R5) - a
+// SKIP mirrors the existing [statereader] "no reachable system bus" precedent
+// for environments where arming genuinely cannot happen.
+//
+// Every push here goes through guardian_dispatch_push_bytes_for_test (byte-
+// serialize then parse INSIDE the DLL) rather than calling apply_rules()
+// directly on a proto built in the test EXE - the #501 rationale above
+// (GuardianFixture::make_rule) applies to any rule carrying a params Map, and
+// make_service_rule's assertion().params() is exactly that. Calling
+// apply_rules() directly on such a rule hits the cross-image hash-seed split
+// on Windows MSVC debug builds: the DLL-side find() can miss the EXE-side-
+// inserted "service_name" entry, arming with an empty service name instead of
+// "Spooler" (caught on DGRHP: [guardian][engine] Windows run, 2026-07-16).
+
+TEST_CASE("GuardianEngine: apply_rules never arms a guard for a disabled rule",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-disabled", "audit");
+    p.mutable_rules(0)->set_enabled(false);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(f.engine->rule_count() == 1);       // still persisted...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but never armed
+}
+
+TEST_CASE("GuardianEngine: full_sync does not arm a disabled rule alongside an enabled one",
+          "[guardian][engine][enabled][full_sync]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-on", "audit");
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-off", "audit");
+    p.mutable_rules(1)->set_enabled(false);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->rule_count() == 2);
+    CHECK(f.engine->armed_guard_count() == 1); // only svc-on
+}
+
+TEST_CASE("GuardianEngine: disabling a previously-armed rule stops it; re-enabling re-arms it",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, now disabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        p.mutable_rules(0)->set_enabled(false);
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);       // the rule is still tracked (disabled, not deleted)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but its guard was stopped
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same rule_id, re-enabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-toggle", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->armed_guard_count() == 1); // re-armed
+}
+
+TEST_CASE("GuardianEngine: re-pushing an enabled rule with the same id replaces its guard, "
+          "never double-arms",
+          "[guardian][engine][enabled]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-replace", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, changed content, still enabled
+        p.set_full_sync(false);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-replace", "enforce");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->armed_guard_count() == 1); // swapped, not accumulated to 2
+}
+
+TEST_CASE("GuardianEngine: a same-id replacement with an invalid new assertion retires the prior "
+          "guard instead of leaving it enforcing stale policy",
+          "[guardian][engine][enabled]") {
+    // Regression for a bug found reviewing the enabled()/replace contract:
+    // start_guard_for_rule_locked's per-branch "stop the existing guard for this
+    // rule_id" step ran only on the happy path, AFTER validating the new rule's
+    // assertion type - so a same-id re-push whose new assertion failed validation
+    // returned false early and left the PRIOR guard armed, silently enforcing a
+    // stale definition even though apply_rules had already persisted (and reported
+    // success for) the new one. The retire-existing-guard step is now hoisted to
+    // the top of start_guard_for_rule_locked so every return path starts clean.
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    if (f.engine->armed_guard_count() == 0)
+        SKIP("no reachable system bus in this environment");
+    CHECK(f.engine->armed_guard_count() == 1);
+
+    {
+        gpb::GuaranteedStatePush p; // delta push: same id, still enabled, INVALID assertion type
+        p.set_full_sync(false);
+        auto rule = GuardianFixture::make_service_rule("svc-invalidate", "audit");
+        rule.mutable_assertion()->set_type("service-frobnicate"); // not a recognized assertion kind
+        *p.add_rules() = rule;
+        // persistence succeeds regardless of arm outcome
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    }
+    CHECK(f.engine->rule_count() == 1);       // still persisted (as the new, invalid definition)...
+    CHECK(f.engine->armed_guard_count() == 0); // ...but the OLD guard was retired, not left running
+}
+
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;
@@ -512,5 +991,59 @@ TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
     *p.add_rules() = GuardianFixture::make_rule("r-1", "after-stop");
     auto applied = f.engine->apply_rules(p);
     CHECK_FALSE(applied.has_value());
-    CHECK(applied.error().find("stopped") != std::string::npos);
+    CHECK(applied.error() == "guardian engine stopped");
+}
+
+TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not resurrect the engine",
+          "[guardian][engine][lifecycle]") {
+    // rung 7.7a reordered start_local() to run AFTER SparkEngine start + wire_spark_engine.
+    // If a stop() lands during boot (a SIGTERM / service-stop mid-startup), the later
+    // start_local() must NOT bring the engine back to life - otherwise stop() was not
+    // truthful (and at rung 7.7b, detection + buffered sends could resume post-stop).
+    GuardianFixture f;
+    f.engine->stop();
+    // start_local() returns cleanly but is a no-op: it must not clear the stopped state.
+    REQUIRE(f.engine->start_local().has_value());
+    // Proof the engine stayed stopped: apply_rules still fails with "stopped". Without
+    // the sticky guard, start_local() would have set stopped_=false and this would
+    // succeed - i.e. the engine would have silently resurrected after stop() returned.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "after-stop-then-startlocal");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(applied.error() == "guardian engine stopped");
+}
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-3, Check A (~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md):
+// GuardianEngine::apply_rules() calls GuardianArmAckLedger::begin_application()
+// UNCONDITIONALLY, regardless of prefer_spark_ - so a naive arm_stats() gated
+// only on "is there a current application" would read every default
+// (prefer_spark_=false) agent as a live, empty {pending:0, failed:0} snapshot,
+// i.e. false-present-healthy on a fleet not running spark at all. This pins the
+// fix: GuardianEngine::arm_stats() must gate on prefer_spark_ explicitly.
+// ---------------------------------------------------------------------------
+TEST_CASE("GuardianEngine::arm_stats(): default prefer_spark_=false stays "
+          "ABSENT (nullopt) even after a real push opens an application",
+          "[guardian][engine][arm_stats]") {
+    GuardianFixture f; // GuardianFixture default-constructs prefer_spark_=false
+    REQUIRE_FALSE(f.engine->prefer_spark());
+
+    // BEFORE any push: no current application at all.
+    CHECK_FALSE(f.engine->arm_stats().has_value());
+
+    // A real push runs apply_rules(), which calls begin_application()
+    // unconditionally - the exact trap Check A names. If arm_stats() were
+    // gated on "current application exists" alone, this would now read
+    // present {0, 0} instead of nullopt.
+    REQUIRE(f.engine
+                ->apply_rules(GuardianFixture::make_push(
+                    {GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true))
+                .has_value());
+    CHECK_FALSE(f.engine->arm_stats().has_value());
+
+    // The io-ceiling counter is unaffected by this trap (see its own doc
+    // comment for why) and reads a plain 0 either way.
+    CHECK(f.engine->io_ceiling_rejections() == 0);
 }

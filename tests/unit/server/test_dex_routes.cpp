@@ -11,7 +11,10 @@
  */
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,11 +26,23 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 void seed_signal(GuaranteedStateStore& store, const std::string& id, const std::string& agent,
                  const std::string& type, const std::string& detail_json, const std::string& ts) {
     GuaranteedStateEventRow e;
@@ -67,6 +82,42 @@ void seed_boot(GuaranteedStateStore& store, const std::string& id, const std::st
                 ts);
 }
 
+// Extracts one family's rendered health score from a Catalogue View-1 grid
+// (render_dex_catalogue_fragment output) — nullopt when the card shows the
+// suppressed "&mdash;" marker instead of a number. Anchors on the family name
+// inside its own "fn" div so distinct cards never collide.
+std::optional<int> family_score(const std::string& html, const std::string& family) {
+    const auto name_pos = html.find("<div class=\"fn\">" + family + "<span");
+    if (name_pos == std::string::npos)
+        return std::nullopt;
+    const auto fev_pos = html.find("<div class=\"fev", name_pos);
+    if (fev_pos == std::string::npos)
+        return std::nullopt;
+    const auto gt = html.find('>', fev_pos);
+    const auto lt = html.find('<', gt);
+    const std::string inner = html.substr(gt + 1, lt - gt - 1);
+    if (inner.find("mdash") != std::string::npos)
+        return std::nullopt;
+    return std::stoi(inner);
+}
+
+// Extracts the family drill-down's Health-score tile (render_dex_catalogue_group_fragment
+// output, View 2) — nullopt when no Health-score tile rendered at all (mon==0 or the
+// denominator is 0, so the score is suppressed rather than shown as a number).
+std::optional<int> group_score(const std::string& html) {
+    // Anchor on the tile's LABEL div — the drill-down's subnav also contains a
+    // bare "Health score" link text, which must not match.
+    const auto lbl_pos = html.find("<div class=\"l\">Health score");
+    if (lbl_pos == std::string::npos)
+        return std::nullopt;
+    const auto n_pos = html.rfind("<div class=\"n ", lbl_pos);
+    if (n_pos == std::string::npos)
+        return std::nullopt;
+    const auto gt = html.find('>', n_pos);
+    const auto lt = html.find('<', gt);
+    return std::stoi(html.substr(gt + 1, lt - gt - 1));
+}
+
 // Route fragments filter signals by a now()-relative window (the handler computes
 // `dex_iso_since(window_to_days)` as the cutoff), so seeds with hardcoded calendar
 // dates age out of the window and the route tests start failing once the wall
@@ -86,7 +137,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
 }
 
 TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quiet ones too",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
     // its family, quiet ones as muted real-zero rows. Zeros are facts, not mock
@@ -94,7 +145,9 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quie
     // retired), so the contract now lives on the Catalogue: rendering all 12
     // family fragments must surface every label. This list mirrors kAllObsTypes
     // in test_dex_signals.cpp — the two-sided drift net for catalogue additions.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Raw family names (literal '&') match dex_signal_groups(); a wrong name
     // would render "Unknown family" and its labels would go missing below.
     std::string html;
@@ -160,8 +213,10 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quie
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // windows connected → all 114 catalogue types are monitored (coverage-first).
     const auto html =
         render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
@@ -178,9 +233,245 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
     CHECK(html.find("/fragments/dex/catalogue/group?name=") != std::string::npos);
 }
 
+TEST_CASE("DEX catalogue: single-OS filter scores its OWN denominator + signals, "
+          "no cross-OS bleed (#1746)",
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    // network.wifi_drop (Network family) is monitored on both windows+macos
+    // (dex_obs_platforms); seed it macOS-only so the family's macOS-scoped rollup
+    // has exactly one signal, with a KNOWN max_signal_devices.
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 10;
+    fleet.windows_online = 7;
+    fleet.macos_online = 3;
+
+    const auto html_before = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    const auto score_before = family_score(html_before, "Network");
+    REQUIRE(score_before.has_value()); // (b) numeric — never suppressed once macos_online > 0
+
+    // Hand-computed against the SAME macOS-scoped signal: "Network" is "med"
+    // severity (6 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both MAC-1/MAC-2 hit); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected_macos =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+    CHECK(*score_before == expected_macos);
+
+    // (a) Differential: had the route kept borrowing fleet.windows_online as the
+    // denominator (the #1746 bug) for this SAME macOS signal, the score would be
+    // different — proves macos_online, not windows_online, actually drives the
+    // number.
+    const double impact_if_windows_online = 2.0 / 7.0;
+    const int score_if_windows_online =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_if_windows_online, 0.0, 100.0) + 0.5);
+    CHECK(*score_before != score_if_windows_online);
+
+    // Now add a Windows-only signal in the SAME family, on MORE devices than the
+    // macOS one — if signals_scoped were still the all-OS aggregate (the bug),
+    // this would dominate max_signal_devices and move the macOS card's score.
+    seed_signal(store, "w1", "WIN-1", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "w2", "WIN-2", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "w3", "WIN-3", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:20:00Z");
+    const auto html_after = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    const auto score_after = family_score(html_after, "Network");
+    REQUIRE(score_after.has_value());
+    CHECK(*score_after == *score_before); // no cross-OS contamination
+
+    // The Windows lens scores off windows_online + the Windows-only signal.
+    const auto html_win = render_dex_catalogue_fragment(&store, "", 7, fleet, "windows");
+    const auto score_win = family_score(html_win, "Network");
+    REQUIRE(score_win.has_value());
+    const double impact_win = 3.0 / 7.0; // 3 devices / windows_online(7)
+    const int expected_win =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_win, 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected_win);
+}
+
+TEST_CASE("DEX catalogue: os=windows lens matches the unchanged 'all' composite "
+          "(no regression, #1746)",
+          "[pg][dex][routes][catalogue]") {
+    // A Windows-only fleet reporting Windows-only signals: the "all" lens (kept
+    // byte-unchanged by #1746) and the "windows" lens now compute off the SAME
+    // denominator (windows_online) and the SAME signals (nothing else to scope
+    // away), so they must render the identical score — proving the per-OS
+    // refactor didn't regress the pre-existing Windows-denominated composite.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_crash(store, "c1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:00:00Z");
+    seed_crash(store, "c2", "WS-2", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:05:00Z");
+    seed_hang(store, "h1", "WS-3", "chrome.exe", kDayB + "T10:10:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 5;
+    fleet.windows_online = 5;
+    fleet.connected_os = {"windows"};
+
+    const auto html_all = render_dex_catalogue_fragment(&store, "", 7, fleet, "all");
+    const auto html_win = render_dex_catalogue_fragment(&store, "", 7, fleet, "windows");
+    const auto score_all = family_score(html_all, "App reliability");
+    const auto score_win = family_score(html_win, "App reliability");
+    REQUIRE(score_all.has_value());
+    REQUIRE(score_win.has_value());
+    CHECK(*score_all == *score_win);
+    // Exact value: "App reliability" is "high" severity (12 pts); max_signal_devices
+    // = 2 (process.crashed on WS-1+WS-2 beats process.hung's 1); N=windows_online=5.
+    const int expected = static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 5.0), 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected);
+}
+
+TEST_CASE("DEX catalogue grid: linux lens scores off linux_online, not macos/windows_online "
+          "(differential, #1746 follow-up QE-a)",
+          "[pg][dex][routes][catalogue]") {
+    // A fleet with three DISTINCT positive per-OS online counts, so a regression
+    // that borrowed macos_online or windows_online instead of linux_online can't
+    // hide behind an accidental equal denominator.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_signal(store, "l1", "LNX-1", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "l2", "LNX-2", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 14;
+    fleet.windows_online = 7;
+    fleet.linux_online = 4;
+    fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "linux", "darwin"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "linux");
+    const auto score = family_score(html, "App reliability");
+    REQUIRE(score.has_value());
+
+    // Hand-computed against the linux-scoped signal alone: "App reliability" is
+    // "high" severity (12 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both LNX-1/LNX-2 hit); N=linux_online=4.
+    const double impact_linux = 2.0 / 4.0;
+    const int expected_linux =
+        static_cast<int>(std::clamp(100.0 - 12.0 * impact_linux, 0.0, 100.0) + 0.5);
+    CHECK(*score == expected_linux);
+
+    // Differential: had the denominator been macos_online(3) or windows_online(7)
+    // instead of linux_online(4), the score would be a DIFFERENT number — proves
+    // linux_online, not a borrowed neighbor, actually drives this lens.
+    const int score_if_macos_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 3.0), 0.0, 100.0) + 0.5);
+    const int score_if_windows_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (2.0 / 7.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_macos_online);
+    CHECK(*score != score_if_windows_online);
+}
+
+TEST_CASE("DEX catalogue grid: macos_online=0 suppresses the score even with macOS "
+          "signals seeded (divide-by-zero guard, QE-b)",
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    // network.wifi_drop (Network family) IS macOS-collected (dex_obs_platforms),
+    // so this family is MONITORED under the macos lens — the suppression below
+    // must come from the N==0 guard, not from "nothing collects this".
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 7;
+    fleet.windows_online = 7;
+    fleet.macos_online = 0; // no macOS agents online right now
+    fleet.connected_os = {"windows", "darwin"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "macos");
+    CHECK(family_score(html, "Network") == std::nullopt); // suppressed, never a fabricated number
+
+    // Confirm the suppression is the N==0 guard, not the "dark / not collected"
+    // path. The family IS monitored (mon>0) but has no online macOS agent, so
+    // the card shows the distinct "no online agents reporting" affordance
+    // (UP-8) — NOT the dark "not collected on your fleet" text, and NOT a
+    // fabricated "health score" number. The rendered marker is the suppressed
+    // em-dash.
+    const auto name_pos = html.find("<div class=\"fn\">Network<span");
+    REQUIRE(name_pos != std::string::npos);
+    const auto next_card = html.find("<a class=\"gp-fcard", name_pos);
+    const std::string card = html.substr(
+        name_pos, next_card == std::string::npos ? std::string::npos : next_card - name_pos);
+    CHECK(card.find("&mdash;") != std::string::npos);                  // suppressed marker
+    CHECK(card.find("no online agents reporting") != std::string::npos); // mon>0, N==0 (not dark)
+    CHECK(card.find("not collected on your fleet") == std::string::npos); // NOT the dark case
+}
+
+TEST_CASE("DEX catalogue grid: \"all\" lens pins to windows_online + the COMBINED "
+          "all-OS signal set on a differentiating fleet (QE-d)",
+          "[pg][dex][routes][catalogue]") {
+    // windows_online(7) != total_online(14) so a regression to total_online can't
+    // hide behind an accidental equality; the seeded signal spans THREE distinct
+    // windows agents + TWO distinct linux agents so a regression that scoped the
+    // "all" lens down to windows-only signals (instead of the combined all-OS
+    // set) produces a different max_signal_devices too.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_signal(store, "w1", "WIN-1", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "w2", "WIN-2", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:05:00Z");
+    seed_signal(store, "w3", "WIN-3", "process.crashed",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "l1", "LNX-1", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "l2", "LNX-2", "process.crashed",
+                R"({"subject":"x","platform":"linux"})", kDayB + "T10:20:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 14;
+    fleet.windows_online = 7;
+    fleet.linux_online = 4;
+    fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "linux", "macos"};
+
+    const auto html = render_dex_catalogue_fragment(&store, "", 7, fleet, "all");
+    const auto score = family_score(html, "App reliability");
+    REQUIRE(score.has_value());
+
+    // Hand-computed: "App reliability" is "high" severity (12 pts) with default
+    // mult 1.0; max_signal_devices=5 (the COMBINED process.crashed set: 3 windows
+    // + 2 linux agents, ONE signal type under the unscoped rollup);
+    // N=windows_online=7 (the established "all"-lens denominator, byte-unchanged
+    // by #1746).
+    const double impact_all = 5.0 / 7.0;
+    const int expected_all =
+        static_cast<int>(std::clamp(100.0 - 12.0 * impact_all, 0.0, 100.0) + 0.5);
+    CHECK(*score == expected_all);
+
+    // (a) Regression to total_online(14) as the denominator, same combined
+    // signal set — a DIFFERENT number.
+    const int score_if_total_online =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (5.0 / 14.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_total_online);
+
+    // (b) Regression to a windows-only signal set (3 devices, not the combined 5)
+    // under windows_online(7) — also a DIFFERENT number.
+    const int score_if_windows_only_signals =
+        static_cast<int>(std::clamp(100.0 - 12.0 * (3.0 / 7.0), 0.0, 100.0) + 0.5);
+    CHECK(*score != score_if_windows_only_signals);
+}
+
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Windows connected → the Windows-collected Network types are MONITORED.
     const DexFleet win{1, 1, {"windows"}};
     const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network", win);
@@ -203,9 +494,146 @@ TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
     CHECK(lin.find("not collected") != std::string::npos);
 }
 
+TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator + "
+          "signals, no cross-OS bleed (BR-001, #1746 follow-up)",
+          "[pg][dex][routes][catalogue]") {
+    // BR-001 (Codex branch review, Architect-confirmed): the grid (View 1) scores
+    // per-OS under a single-OS filter (see the "#1746" test above), but the family
+    // drill-down (View 2) still read the all-OS signal set and scored with
+    // fleet.windows_online — so clicking into a family silently reverted to a
+    // Windows-denominated all-OS score under the same os= label. Same signal
+    // shape as the grid's #1746 test, replayed against
+    // render_dex_catalogue_group_fragment.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    DexFleet fleet;
+    fleet.total_online = 10;
+    fleet.windows_online = 7;
+    fleet.macos_online = 3;
+    fleet.connected_os = {"windows", "darwin"};
+
+    const auto html_before =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "macos");
+    const auto score_before = group_score(html_before);
+    REQUIRE(score_before.has_value()); // (c) numeric — never the suppressed marker
+
+    // Hand-computed against the macOS-scoped signal alone: "Network" is "med"
+    // severity (6 pts, dex_family_weights) with default-preset mult 1.0;
+    // max_signal_devices=2 (both MAC-1/MAC-2 hit); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected_macos =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+    CHECK(*score_before == expected_macos);
+
+    // (a) Differential: had BR-001 persisted, this SAME macOS card would instead
+    // read the all-OS signal set scored against windows_online — a provably
+    // different number (same 2 devices, wrong denominator).
+    const double impact_if_buggy = 2.0 / 7.0; // 2 devices / windows_online(7)
+    const int score_if_buggy =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_if_buggy, 0.0, 100.0) + 0.5);
+    CHECK(*score_before != score_if_buggy);
+
+    // Now add a Windows-only signal in the SAME family, on MORE devices than the
+    // macOS one — under BR-001 this all-OS signal would dominate
+    // max_signal_devices and move the macOS card's score.
+    seed_signal(store, "w1", "WIN-1", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:10:00Z");
+    seed_signal(store, "w2", "WIN-2", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:15:00Z");
+    seed_signal(store, "w3", "WIN-3", "network.dns_timeout",
+                R"({"subject":"x","platform":"windows"})", kDayB + "T10:20:00Z");
+    const auto html_after =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "macos");
+    const auto score_after = group_score(html_after);
+    REQUIRE(score_after.has_value());
+    CHECK(*score_after == *score_before); // (b) no cross-OS contamination
+
+    // The Windows lens, by contrast, DOES pick up dns_timeout scored against
+    // windows_online — the number BR-001 was wrongly giving the macOS card.
+    const auto html_win =
+        render_dex_catalogue_group_fragment(&store, "", 7, "Network", fleet, "windows");
+    const auto score_win = group_score(html_win);
+    REQUIRE(score_win.has_value());
+    const double impact_win = 3.0 / 7.0; // 3 devices / windows_online(7)
+    const int expected_win =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_win, 0.0, 100.0) + 0.5);
+    CHECK(*score_win == expected_win);
+}
+
+TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into both the "
+          "grid and drill-down renderers (QE-handler)",
+          "[pg][dex][routes][catalogue]") {
+    // The #1746/BR-001 tests above prove the RENDER fns are per-OS-honest when
+    // called directly; this exercises the actual ROUTE handlers (query-string
+    // parsing → fleet_fn → render) so a regression that dropped `os=` on the way
+    // in — e.g. a route that stopped reading req.get_param_value("os") — would
+    // fail here even though the render fns themselves are still correct.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
+    seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
+                R"({"subject":"x","platform":"macos"})", kDayB + "T10:05:00Z");
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() {
+        DexFleet f;
+        f.total_online = 10;
+        f.windows_online = 7;
+        f.macos_online = 3;
+        f.connected_os = {"windows", "darwin"};
+        return f;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, /*audit_fn=*/{});
+
+    // Same hand-computed score as the #1746/BR-001 tests: "Network" is "med"
+    // severity (6 pts) with default-preset mult 1.0; max_signal_devices=2
+    // (MAC-1/MAC-2); N=macos_online=3.
+    const double impact_macos = 2.0 / 3.0;
+    const int expected =
+        static_cast<int>(std::clamp(100.0 - 6.0 * impact_macos, 0.0, 100.0) + 0.5);
+
+    // (1) Grid: GET the query-string form the "OS" chips actually emit
+    // (?window=7d&os=macos, no encoding needed — "macos" has no reserved chars,
+    // matching how the existing chip/back-link tests above call the harness).
+    auto grid = sink.Get("/fragments/dex/catalogue?window=7d&os=macos");
+    REQUIRE(grid);
+    CHECK(grid->status == 200);
+    // The macOS chip renders as the ACTIVE chip (proves the route read os=macos,
+    // not just defaulted to "all").
+    CHECK(grid->body.find(
+              "<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
+          std::string::npos);
+    CHECK(family_score(grid->body, "Network") == expected); // macOS-scoped score, route → renderer
+
+    // (2) Drill-down: same lens, one level down.
+    auto group = sink.Get("/fragments/dex/catalogue/group?name=Network&window=7d&os=macos");
+    REQUIRE(group);
+    CHECK(group->status == 200);
+    CHECK(group->body.find("<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue/group?"
+                           "name=Network&window=7d&os=macos\"") != std::string::npos);
+    CHECK(group_score(group->body) == expected);
+}
+
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
                    const std::string& plat) {
         GuaranteedStateEventRow r;
@@ -237,9 +665,68 @@ TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escap
     CHECK(bad.find("<img src=x") == std::string::npos); // escaped, no XSS
 }
 
+TEST_CASE("dex_normalize_os_filter maps a caller os param to a store-ready platform token",
+          "[dex][routes]") {
+    // The single source of truth shared by the dashboard, REST and MCP surfaces.
+    CHECK(dex_normalize_os_filter("windows") == "windows");
+    CHECK(dex_normalize_os_filter("linux") == "linux");
+    CHECK(dex_normalize_os_filter("macos") == "macos");
+    CHECK(dex_normalize_os_filter("all").empty());     // sentinel → all-OS
+    CHECK(dex_normalize_os_filter("").empty());        // omitted → all-OS
+    CHECK(dex_normalize_os_filter("Windows").empty()); // not canonical (case-sensitive)
+    CHECK(dex_normalize_os_filter("darwin").empty());  // not a caller token
+    CHECK(dex_normalize_os_filter("' OR 1=1").empty()); // junk → all-OS (never reaches SQL raw)
+}
+
+TEST_CASE("DEX catalogue signal drill-down: single-OS lens scopes the subject list (C-DEX-1)",
+          "[pg][dex][routes][catalogue]") {
+    // A single-OS Catalogue filter must scope the drilldown's subject/device/day
+    // lists to that OS — no cross-OS bleed. (by_os stays cross-OS; that's the
+    // split chart, exercised elsewhere.)
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
+                   const std::string& plat) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = "network.wifi_drop";
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = kDayB + "T10:00:00Z";
+        REQUIRE(store.insert_event(r));
+    };
+    obs("a", "agent-A", "CorpNet", "windows");
+    obs("b", "agent-B", "CorpNet", "windows");
+    obs("c", "mac-1", "AirportWiFi", "macos");
+
+    SECTION("macOS lens hides the Windows-only subject") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "macos");
+        CHECK(html.find("AirportWiFi") != std::string::npos); // the macOS subject shows
+        CHECK(html.find("CorpNet") == std::string::npos);     // the Windows subject is scoped out
+    }
+    SECTION("Windows lens hides the macOS-only subject") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "windows");
+        CHECK(html.find("CorpNet") != std::string::npos);
+        CHECK(html.find("AirportWiFi") == std::string::npos);
+    }
+    SECTION("the all-OS lens shows both subjects") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "all");
+        CHECK(html.find("CorpNet") != std::string::npos);
+        CHECK(html.find("AirportWiFi") != std::string::npos);
+    }
+}
+
 TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
-          "[dex][routes][health]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][health]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& plat) {
         GuaranteedStateEventRow r;
@@ -278,8 +765,10 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
 }
 
 TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
-          "[dex][routes][trends]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][trends]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& plat, const std::string& day) {
         GuaranteedStateEventRow r;
@@ -312,8 +801,10 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
-          "[dex][routes][hub]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][hub]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     DexFleet fleet;
     fleet.windows_online = 5;
     const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
@@ -333,8 +824,10 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
     CHECK(sup.find("suppressed") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX overview: renders real multi-signal aggregations", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "e2", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
     seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T09:00:00Z");
@@ -365,11 +858,13 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]
 }
 
 TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Other'",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // Forward-compat: a signal added agent-side renders with NO server change.
     // The slimmed hub no longer carries the per-type rollup, so the "Other"
     // (uncatalogued) fallback now surfaces on the Catalogue.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", kDayB + "T10:00:00Z");
     auto html = render_dex_catalogue_fragment(&store, "", 7, DexFleet{}, "all");
@@ -378,8 +873,10 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
 }
 
 TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=-1",
-          "[dex][score]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][score]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Null store → n/a sentinel.
     CHECK(dex_device_score(nullptr, "WS-1", "") == -1);
     // A device with no observations is a clean 100.
@@ -404,8 +901,10 @@ TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=
 }
 
 TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "e1", "WS-1", "process.crashed",
                 R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
     // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
@@ -419,8 +918,10 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
 }
 
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     // 1 device impacted of 4 reporting Windows agents → crash-free 75.0%.
@@ -435,18 +936,40 @@ TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest
     CHECK(html2.find("no reporting agents") != std::string::npos);
 }
 
+TEST_CASE("DEX overview: crash-free rate is Windows-scoped — a macOS crash can't move it (C-DEX-1)",
+          "[pg][dex][routes]") {
+    // process.crashed now arrives from macOS agents too. The crash-free tile is
+    // denominated over reporting WINDOWS agents, so a macOS crash must NOT lower
+    // it. This guards a future edit that drops the "windows" scope from
+    // dex_crash_summary in render_dex_overview_fragment — that regression would
+    // count MAC-1 as impacted (2 of 4 → 50.0%) instead of the correct 75.0%.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_crash(store, "w1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "m1", "MAC-1", "Safari", "", "macos", kDayA + "T11:00:00Z");
+
+    auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
+    CHECK(html.find("75.0%") != std::string::npos); // 1 Windows device of 4 — unchanged by macOS
+    CHECK(html.find("50.0%") == std::string::npos); // NOT 2 of 4 (the macOS crash is excluded)
+}
+
 TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",
-          "[dex][routes]") {
+          "[pg][dex][routes]") {
     // A hang is not a crash: the headline crash-free rate must stay crash-scoped.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_hang(store, "e1", "WS-1", "Teams.exe", kDayB + "T09:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
     CHECK(html.find("100.0%") != std::string::npos);    // 0 crash-impacted of 4
     CHECK(html.find("Teams.exe") != std::string::npos); // the hung app still surfaces (Hangs col)
 }
 
-TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "<img src=x onerror=alert(1)>", "ntdll.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
@@ -455,8 +978,10 @@ TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][securi
 }
 
 TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + devices",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "e2", "WS-2", "chrome.exe", "chrome.dll", "windows", kDayB + "T10:00:00Z");
     seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T11:00:00Z");
@@ -473,15 +998,32 @@ TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + dev
     CHECK(html.find("/fragments/dex/device?id=WS-1") != std::string::npos); // drill to device
 }
 
-TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto html = render_dex_app_fragment(&store, "nope.exe", "all");
     CHECK(html.find("No crashes") != std::string::npos);
 }
 
+TEST_CASE("DEX app drill-down: performance cross-link uses the EXACT process-name "
+          "key, never normalized (no case-fold, no .exe strip) — shown even with no "
+          "crash history",
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto html = render_dex_app_fragment(&store, "MyApp.EXE", "7d");
+    CHECK(html.find("/fragments/dex/perf/app?app=MyApp.EXE&window=7d") != std::string::npos);
+    CHECK(html.find("myapp.exe") == std::string::npos);    // no case-fold
+    CHECK(html.find("app=MyApp&window=") == std::string::npos); // no .EXE stripping
+}
+
 TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
                kDayA + "T10:00:00Z");
     seed_signal(store, "e2", "WS-7", "service.crashed",
@@ -503,8 +1045,10 @@ TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
 }
 
 TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
-          "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "<b>evil</b>", "<img src=x>", "ntdll.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_device_fragment(&store, "<b>evil</b>", "all");
@@ -512,8 +1056,10 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
 
-TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX single-observation detail: store lookup + render", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "ev-100", "WS-7", "app.staterepo_error",
                 R"({"subject":"app state repository","reason":"sr-100",)"
                 R"("symbolic":"STATEREPO_ERROR","platform":"windows"})",
@@ -539,8 +1085,10 @@ TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]
 }
 
 TEST_CASE("DEX single-observation detail: escapes fields (no XSS)",
-          "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "ev-x", "WS-7", "process.crashed",
                 R"({"subject":"<img src=x>","reason":"0x1",)"
                 R"("symbolic":"<b>evil</b>","platform":"windows"})",
@@ -633,8 +1181,10 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
     CHECK(render("os.boot", 1e300).find("Metric</span><code>&mdash;</code>") != std::string::npos);
 }
 
-TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX device history rows drill to the observation detail", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_device_fragment(&store, "WS-7", "all");
@@ -644,8 +1194,10 @@ TEST_CASE("DEX device history rows drill to the observation detail", "[dex][rout
     CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
     seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
@@ -659,14 +1211,18 @@ TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes
     CHECK(html.find("/fragments/dex/apps") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: empty store → no-data placeholder", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto html = render_dex_apps_fragment(&store, "", 7);
     CHECK(html.find("No data") != std::string::npos);
 }
 
-TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -1023,6 +1579,118 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
     }
 }
 
+// SEC-2/SEC-3 sibling class (found during a docs sweep): /fragments/dex/overview,
+// /fragments/dex/catalogue/signal, /fragments/dex/app, and /fragments/dex/perf/devices
+// each render more than one agent_id fleet-wide. Their resolve_visible() narrowing
+// is username-keyed (VisibleSetFn) and does not confine a service-scoped API
+// token — the same gap already closed on the REST/MCP/Guardian/network surfaces.
+TEST_CASE("DEX routes: service-scoped token denied on every fleet-wide device-list "
+          "fragment, denial audited",
+          "[pg][dex][routes][rbac][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{4, 5}; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+        yuzu::server::DexPerfSnapshot snap;
+        yuzu::server::DexPerfDevice d;
+        d.agent_id = "WS-1";
+        d.cpu_pct = 50.0;
+        snap.devices.push_back(d);
+        return snap;
+    };
+
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, perf_fn);
+
+    auto ov = sink.Get("/fragments/dex/overview?window=7d");
+    REQUIRE(ov);
+    CHECK(ov->status == 403);
+    CHECK(ov->body.find("WS-1") == std::string::npos);
+
+    auto sig = sink.Get("/fragments/dex/catalogue/signal?type=process.crashed");
+    REQUIRE(sig);
+    CHECK(sig->status == 403);
+    CHECK(sig->body.find("WS-1") == std::string::npos);
+
+    auto app = sink.Get("/fragments/dex/app?name=chrome.exe");
+    REQUIRE(app);
+    CHECK(app->status == 403);
+    CHECK(app->body.find("WS-1") == std::string::npos);
+
+    auto perf = sink.Get("/fragments/dex/perf/devices");
+    REQUIRE(perf);
+    CHECK(perf->status == 403);
+    CHECK(perf->body.find("WS-1") == std::string::npos);
+
+    REQUIRE(audit_log.size() == 4);
+    CHECK(audit_log[0] == "dex.overview.view|denied");
+    CHECK(audit_log[1] == "dex.signal.view|denied");
+    CHECK(audit_log[2] == "dex.app.view|denied");
+    CHECK(audit_log[3] == "dex.perf.device.view|denied");
+}
+
+TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
+          "dedicated success audit fires",
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{4, 5}; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+        yuzu::server::DexPerfSnapshot snap;
+        yuzu::server::DexPerfDevice d;
+        d.agent_id = "WS-1";
+        d.cpu_pct = 50.0;
+        snap.devices.push_back(d);
+        return snap;
+    };
+
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                           /*responses_fn=*/{}, perf_fn);
+
+    auto perf = sink.Get("/fragments/dex/perf/devices");
+    REQUIRE(perf);
+    CHECK(perf->status == 200);
+    CHECK(perf->body.find("WS-1") != std::string::npos);
+    bool saw_success = false;
+    for (const auto& a : audit_log)
+        if (a == "dex.perf.device.view|success")
+            saw_success = true;
+    CHECK(saw_success);
+}
+
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
 TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",
@@ -1107,8 +1775,10 @@ TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
     CHECK(html.find("hx-on") == std::string::npos); // CSP rule: never hx-on
 }
 
-TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf][render]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[pg][dex][perf][render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // With signals AND without - a quiet device still has perf history.
     const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
     CHECK(quiet.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
@@ -1125,8 +1795,10 @@ TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf
 }
 
 TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
-          "[dex][perf][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][perf][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -1151,13 +1823,13 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
         CHECK(plugin == "tar");
         CHECK(action == "sql");
         REQUIRE(ids.size() == 1);
         seen_sql = params.count("sql") ? params.at("sql") : "";
-        return {"tar-deadbeef", fake_sent};
+        return {.sent = fake_sent, .command_id = "tar-deadbeef"};
     };
     std::vector<DexAgentResponse> fake_rows;
     auto responses = [&](const std::string& command_id, const std::string& /*agent_id*/) {
@@ -1203,13 +1875,19 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(done);
         CHECK(done->body.find("<svg") != std::string::npos);
         CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
+        // #4035: the poll route is where the parsed data actually reaches the
+        // operator, so it must carry its own audit row (the dispatch's
+        // "success" audit above is a SEPARATE row for the request, not the read).
+        CHECK(audited == "dex.device.perf.query|rendered|WS-1");
 
+        audited.clear();
         fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
         auto err =
             sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(err);
         CHECK(err->body.find("reported an error") != std::string::npos);
         CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+        CHECK(audited.empty()); // an agent-reported error is not an audited data access
     }
 
     SECTION("result poll: a valid-but-empty result renders 'no history', stops polling (gov S3)") {
@@ -1331,6 +2009,28 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(dispatched == 1);
         CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
     }
+    // #4035: both /result poll routes previously had NO audit call at all — only
+    // the dispatch half was audited. The poll is where the parsed data actually
+    // reaches the operator, so it needs its own row (fires only when data is
+    // actually rendered, never on a still-pending re-poll).
+    SECTION("procperf result poll: rendered data is audited under its own verb") {
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+                      "chrome.exe|10|3|25.5|40.0|1000000|2000000|5\n",
+                      ""}};
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(audited == "dex.device.procperf.query|rendered|WS-1");
+    }
+    SECTION("procperf result poll: still pending is NOT audited (no per-attempt spam)") {
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("hx-trigger") != std::string::npos); // re-polling
+        CHECK(audited.empty());
+    }
     SECTION("perf clean path sets NO Sec-Audit-Failed header") {
         auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");
         REQUIRE(r);
@@ -1419,8 +2119,10 @@ TEST_CASE("dex coverage map matches the emitted signal set (Linux + macOS)",
 }
 
 TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states",
-          "[dex][app_perf][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][app_perf][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -1535,5 +2237,462 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         REQUIRE(r);
         CHECK(audited.empty()); // denied before the behavioural-PII audit fires
         CHECK(r->body.find("chrome.exe") == std::string::npos);
+    }
+}
+
+TEST_CASE("DEX version-devices drill fragment: gate, param validation, audit, "
+          "visible-set threading",
+          "[dex][app_perf][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    std::string audited_result;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string& ttype, const std::string& tid, const std::string& d) -> bool {
+        audited = a + "|" + r + "|" + ttype + "|" + tid + "|" + d;
+        audited_result = r;
+        return true;
+    };
+
+    std::optional<std::vector<std::string>> seen_visible_ids;
+    bool seen_visible_ids_set = false;
+    bool degrade = false;
+    AppPerfProviders providers;
+    providers.version_devices =
+        [&](std::string_view app, std::string_view version,
+            const std::optional<std::vector<std::string>>& visible_ids,
+            bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+        CHECK(app == "chrome.exe");
+        seen_visible_ids = visible_ids;
+        seen_visible_ids_set = true;
+        truncated = false;
+        if (degrade)
+            return std::nullopt;
+        (void)version;
+        AppPerfVersionDeviceRow r;
+        r.agent_id = "WS-1";
+        r.last_day = 1'700'000'000;
+        r.samples = 5;
+        r.cpu_avg = 42.0;
+        r.ws_avg_bytes = 100;
+        return std::vector<AppPerfVersionDeviceRow>{r};
+    };
+
+    auto admit_unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) {
+        return authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    };
+    auto admit_scoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                           const std::string&) {
+        return authz::FleetReadGate{
+            .admitted = true,
+            .scope = authz::VisibleSet{std::unordered_set<std::string>{"WS-1"}}};
+    };
+    auto deny = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) {
+        res.status = 403;
+        return authz::FleetReadGate{.admitted = false};
+    };
+
+    SECTION("gate unwired -> 200 note, no read, no audit (fails closed, never falls back)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}); // fleet_read_fn = {} (unwired)
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("authorization gate not configured") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set); // provider never called
+        CHECK(audited.empty());
+    }
+
+    SECTION("gate denies -> the gate's own status stands, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, deny);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK_FALSE(seen_visible_ids_set);
+        CHECK(audited.empty());
+    }
+
+    SECTION("missing app -> 200 note, gate never called, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("missing version (absent, not empty) -> 200 note -- omission is NOT "
+            "'all versions' on this route") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("EMPTY version (present, explicit) IS accepted -- the unknown-version bucket") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_visible_ids_set); // reached the provider — "" was accepted
+        CHECK(r->body.find("WS-1") != std::string::npos);
+    }
+
+    SECTION("nullopt gate scope (unfiltered) threads through as nullopt, not an empty vector") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        CHECK_FALSE(seen_visible_ids.has_value()); // unfiltered, not deny-all
+        CHECK(r->body.find("WS-1") != std::string::npos);
+        CHECK(r->body.find("42.0%") != std::string::npos);
+        // Audit fires AFTER the read with the real device count.
+        CHECK(audited.find("dex.app_perf.devices.view|success|GuaranteedState|") == 0);
+        CHECK(audited.find("devices=1") != std::string::npos);
+    }
+
+    SECTION("engaged gate scope threads through the EXACT set (ADR-0017 push-into-query)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_scoped);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        REQUIRE(seen_visible_ids.has_value());
+        REQUIRE(seen_visible_ids->size() == 1);
+        CHECK((*seen_visible_ids)[0] == "WS-1");
+    }
+
+    SECTION("store degrade -> 200 honest note, audit fires with result=failure") {
+        degrade = true;
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read") != std::string::npos);
+        CHECK(audited_result == "failure");
+    }
+
+    SECTION("no provider wired -> graceful note, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               {}, {}, admit_unfiltered); // app_perf_providers = {}
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no app-perf device provider wired") != std::string::npos);
+        CHECK(audited.empty());
+    }
+}
+
+// Regression pin for a raw/canonical `version` split at the route seam: the
+// handler used to thread the RAW query value to the provider call while ALSO
+// passing it as `render_dex_app_perf_trend`'s `active_version` label — since the
+// store canonicalizes via `canon_version` before filtering (empty OR
+// non-numeric -> "", a short/leading-zero form -> its 4-group canonical form),
+// a mismatched pair let the page claim "Filtered to version X" over data the
+// store never actually filtered (X non-canonicalizable -> store applied NO
+// filter), or echo the wrong string for a value that WAS correctly filtered
+// (X short-form -> store filtered on the canonical form, banner showed the
+// raw one). The fix canonicalizes ONCE in the handler and reuses that single
+// value for both the provider call and the render call — these tests assert
+// the provider and the rendered banner agree, not just that each looks right
+// in isolation.
+TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
+          "rendered banner never disagree",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("short-form version canonicalizes before reaching the fleet provider AND the banner") {
+        std::string seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{}; // empty rows: banner still renders pre-empty-state
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=1.2");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // provider got the canonical form, not raw "1.2"
+        // Exact tag-boundary check (not a bare substring) — "1.2.0.0" contains
+        // "1.2" as a substring, so a loose check would pass even if the banner
+        // still echoed the raw value.
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+        CHECK(r->body.find(">1.2</span>") == std::string::npos);
+        CHECK(r->body.find("Filtered to version") != std::string::npos);
+    }
+
+    SECTION("non-canonicalizable version folds to unfiltered -- never rendered as \"filtered\"") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=latest");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty()); // "latest" canonicalizes to "" -> the store's own
+                                     // all-versions sentinel, same as if version were omitted
+        // The page must not claim a filter is active when none was applied.
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    // `canon_version` folds an all-zero quad to "" via a DIFFERENT predicate
+    // (`all_zero`) than a non-numeric string ("latest" above, `ngroups==0`) —
+    // distinct branches that happen to share an outcome, so covering one at
+    // this (route) level doesn't exercise the other.
+    SECTION("all-zero version (\"0.0.0.0\") also folds to unfiltered") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=0.0.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty());
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    SECTION("group path threads the SAME canonical version as the fleet path") {
+        std::string seen_group, seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view group, std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_group = std::string(group);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_group == "G1");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // leading-zero form canonicalized, matching the fleet path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("model path fires tag_cohort with the SAME canonical version as the fleet path") {
+        std::string seen_key, seen_value, seen_app, seen_version;
+        bool group_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view key, std::string_view value,
+                                   std::string_view app,
+                                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_key = std::string(key);
+            seen_value = std::string(value);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(group_called); // model= alone must dispatch tag_cohort, not group
+        CHECK(seen_key == "model"); // default key
+        CHECK(seen_value == "Latitude 5420");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // canonicalized, matching every other scope path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("group wins when both group= and model= are present") {
+        bool group_called = false, tag_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view, std::string_view, std::string_view,
+                                   std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            tag_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(group_called);
+        CHECK_FALSE(tag_called);
+    }
+
+    SECTION("model path: unwired tag_cohort reader -> honest placeholder, never a crash") {
+        AppPerfProviders providers; // .tag_cohort left null
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200); // dashboard htmx drops 4xx/5xx bodies -- always 200 + a note
+        CHECK(r->body.find("no device-model cohort reader wired") != std::string::npos);
+    }
+
+    SECTION("model path: store degrade (tag_cohort returns nullopt) -> honest placeholder") {
+        AppPerfProviders providers;
+        providers.tag_cohort = [](std::string_view, std::string_view, std::string_view,
+                                  std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read right now") != std::string::npos);
+    }
+
+    SECTION("tag_values populates the Model selector regardless of active scope branch") {
+        AppPerfProviders providers;
+        providers.fleet = [](std::string_view,
+                             std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_values = [](std::string_view key) -> std::optional<std::vector<std::string>> {
+            CHECK(key == "model");
+            return std::vector<std::string>{"Latitude 5420", "OptiPlex 7090"};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo"); // fleet-wide, no scope selected
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Latitude 5420") != std::string::npos);
+        CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
+    }
+}
+
+TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
+          "function raw (normalization/filtering happens there)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+
+    AppPerfProviders providers;
+    providers.apps = [](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 3, .last_day = 200},
+            {.app_name = "sshd", .versions = 1, .last_day = 100},
+        };
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {}, {}, providers,
+                           {});
+
+    SECTION("no params: both apps render, unfiltered") {
+        auto r = sink.Get("/fragments/dex/perf/apps");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find("sshd") != std::string::npos);
+    }
+
+    SECTION("q= substring-filters by name") {
+        auto r = sink.Get("/fragments/dex/perf/apps?q=chrome");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("platform=windows keeps only the .exe-suffixed row") {
+        auto r = sink.Get("/fragments/dex/perf/apps?platform=windows");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("sort=name orders alphabetically") {
+        auto r = sink.Get("/fragments/dex/perf/apps?sort=name");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
 }
