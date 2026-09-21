@@ -952,6 +952,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
         {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
+        // platform_security
+        {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
+        {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // storage
