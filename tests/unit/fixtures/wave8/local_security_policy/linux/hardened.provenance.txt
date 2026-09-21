@@ -1,0 +1,11 @@
+REAL CAPTURE after real changes, fedora:40 (Fedora Linux 40 Container Image), 2026-09-21. Files: linux/hardened/*.
+Commands (docker run --rm --user 0 fedora:40 bash script):
+  dnf install -y sudo authselect libpwquality audit pam
+  authselect select local with-faillock --force          (real authselect; pam.d/*-auth become symlinks into /etc/authselect)
+  sed edits: pwquality.conf minlen=14 minclass=3 dcredit=-1 retry=3; faillock.conf deny=3 unlock_time=900 fail_interval=900;
+             login.defs PASS_MAX_DAYS 60, PASS_MIN_DAYS 1
+  /etc/sudoers.d/10-ops written (chmod 0440), checked with `visudo -c` (both files "parsed OK")
+  cat >> /etc/audit/rules.d/audit.rules (2 watches, 2 syscall rules, -e 2) then `augenrules` -> /etc/audit/audit.rules
+  (augenrules exit 0; it also printed "You must be root to run this program" -- no kernel load was attempted)
+Trim: same comment/blank strip and login.defs key filter as default.provenance.txt; system-auth omitted
+  (same content as password-auth); password-auth's 5 `session` lines dropped (not read). Line budget: 53 fixture lines.

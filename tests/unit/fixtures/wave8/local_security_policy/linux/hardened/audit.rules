@@ -1,0 +1,7 @@
+-D
+-a task,never
+-w /etc/sudoers -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-a always,exit -F arch=b64 -S execve -k exec
+-a always,exit -F arch=b64 -S unlink -S rename -F auid>=1000 -F auid!=-1 -k delete
+-e 2

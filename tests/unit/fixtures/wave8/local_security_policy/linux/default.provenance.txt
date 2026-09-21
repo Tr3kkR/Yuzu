@@ -1,0 +1,9 @@
+REAL CAPTURE, debian:12 (Debian GNU/Linux 12 bookworm), 2026-09-21. Files: linux/default/*.
+Commands (docker run --rm --user 0 debian:12 bash script):
+  DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get install -y sudo libpam-pwquality auditd
+  comment/blank stripping (keeps #include*):  grep -E '^[[:space:]]*[^#[:space:]]|^#include' <file>
+  login.defs kept only:  grep -E '^(PASS_|ENCRYPT_METHOD|LOGIN_|FAILLOG_ENAB|UMASK|MAIL_DIR|SHA_CRYPT)'
+Sources: /etc/login.defs /etc/security/pwquality.conf /etc/security/faillock.conf /etc/pam.d/common-password
+  /etc/pam.d/common-auth /etc/sudoers /etc/audit/audit.rules. pwquality.conf and faillock.conf are
+  0 bytes because the shipped files are comment-only (stripped): that is the real default shape.
+Trim: comments/blank lines removed (parsers ignore them anyway). Line budget: 27 fixture lines.
