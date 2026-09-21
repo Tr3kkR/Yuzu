@@ -466,9 +466,9 @@ struct ScopedKeyZero {
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
 // #1290 adds (field confusion), and a CRLF could split the audit line. The
-// canonical implementation now lives in web_utils.hpp so the same neutralizer
-// guards every structured-audit call site (here + tar_tree_routes.cpp) without
-// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// shared mapping is yuzu::log_token (common/include/yuzu/log_token.hpp) and
+// web_utils.hpp's audit_token forwards to it, so the same neutralizer guards every
+// structured-audit call site (here + tar_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
 // spellings below resolving unchanged.
 using yuzu::server::audit_token;
 
