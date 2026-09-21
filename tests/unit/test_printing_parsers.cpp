@@ -526,10 +526,6 @@ TEST_CASE("format_clear_queue_row: an empty printer (the missing_printer row) is
 // Status values are RFC 8010 §3.1.6.1 / RFC 8011 §4.1.6, not captures: the
 // only real-capture statuses in the tree are 0x0000 and 0x0406 (asserted
 // against the decoded fixtures above); the rest are protocol constants.
-// Win32 values (winerror.h) are likewise constants: 1801 was ALSO observed
-// live on the-rig (OpenPrinterW on a nonexistent printer, and on an
-// unreachable UNC server); 5 (ERROR_ACCESS_DENIED) was never provoked on real
-// hardware, and 87/1722 are taken from winerror.h alone.
 TEST_CASE("classify_cancel_job_status: successful-* (0x0000-0x00FF) is canceled",
           "[printing][classify]") {
     CHECK(classify_cancel_job_status(0x0000) == CancelStatusClass::canceled);
@@ -556,6 +552,11 @@ TEST_CASE("classify_cancel_job_status: bad-request is a protocol fault, never a 
     CHECK(classify_cancel_job_status(0xFFFF) == CancelStatusClass::error);
 }
 
+// Win32 values (winerror.h) are likewise constants. 1801 was ALSO observed
+// live on the-rig (OpenPrinterW on a nonexistent printer, and on an
+// unreachable UNC server); 5 (ERROR_ACCESS_DENIED) was never provoked on real
+// hardware; 87 and 1722 are unobserved as OpenPrinterW results (87 was seen
+// live from GetJobW/SetJobW on a nonexistent job, a different call).
 TEST_CASE("classify_open_printer_error: access-denied and invalid-printer-name are distinguished",
           "[printing][classify]") {
     CHECK(classify_open_printer_error(5) == OpenPrinterFailure::refused);      // ERROR_ACCESS_DENIED
@@ -573,14 +574,25 @@ TEST_CASE("classify_open_printer_error: every other failure is an error, never a
     CHECK(classify_open_printer_error(6) == OpenPrinterFailure::error);
 }
 
-TEST_CASE("is_unc_printer_name: UNC-shaped names (backslash or the // form the rows render) only",
+TEST_CASE("printer_name_is_plain_local: only names with none of backslash, slash or colon",
           "[printing][classify]") {
-    CHECK(is_unc_printer_name("\\\\server\\queue"));
-    CHECK(is_unc_printer_name("//server/queue"));
-    CHECK_FALSE(is_unc_printer_name("Microsoft Print to PDF"));
-    CHECK_FALSE(is_unc_printer_name("\\queue"));    // a single leading backslash
-    CHECK_FALSE(is_unc_printer_name("/queue"));       // a single leading slash
-    CHECK_FALSE(is_unc_printer_name("Office/Floor2")); // an interior slash
-    CHECK_FALSE(is_unc_printer_name(""));
+    CHECK(printer_name_is_plain_local("Microsoft Print to PDF"));
+    CHECK(printer_name_is_plain_local("HP LaserJet 4"));
+    CHECK(printer_name_is_plain_local("Office-Floor_2"));
 }
 
+TEST_CASE("printer_name_is_plain_local: every remote-capable shape is not plain",
+          "[printing][classify]") {
+    CHECK_FALSE(printer_name_is_plain_local("\\\\server\\queue"));          // UNC
+    CHECK_FALSE(printer_name_is_plain_local("//server/queue"));              // the form the rows render
+    CHECK_FALSE(printer_name_is_plain_local("\\/server/queue"));            // mixed prefixes
+    CHECK_FALSE(printer_name_is_plain_local("/\\server/queue"));
+    CHECK_FALSE(printer_name_is_plain_local("\\\\"));                      // bare separators
+    CHECK_FALSE(printer_name_is_plain_local("//"));
+    CHECK_FALSE(printer_name_is_plain_local("\\\\?\\UNC\\server\\queue")); // extended-length UNC
+    CHECK_FALSE(printer_name_is_plain_local("http://host/printers/x/.printer")); // URL form
+    CHECK_FALSE(printer_name_is_plain_local("\\queue"));                    // a single backslash
+    CHECK_FALSE(printer_name_is_plain_local("/queue"));                     // a single slash
+    CHECK_FALSE(printer_name_is_plain_local("Office/Floor2"));              // an interior slash
+    CHECK_FALSE(printer_name_is_plain_local("HP: Floor 2"));                // a colon
+}

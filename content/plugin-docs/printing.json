@@ -19,7 +19,7 @@
           "support": "constrained"
         },
         "windows": {
-          "fallback": "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling a job it does not own is unmeasured (PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md",
+          "fallback": "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see docs/agent-privilege-model.md",
           "mechanism": "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
           "rung": "1",
           "support": "supported"
@@ -220,7 +220,7 @@
           "values": null
         },
         {
-          "description": "Values: canceled, not_found, refused, error.",
+          "description": "Values: canceled, not_found, refused, error. `canceled` means the spooler/cupsd ACCEPTED the cancel request, not that the job has already left the queue: an actively printing job can take a moment to clear, so confirm with `jobs`.",
           "example": "canceled",
           "name": "outcome",
           "platforms": [
@@ -433,7 +433,7 @@
   },
   "privileges": [
     {
-      "grant": "None for reads — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right (measured under `SYSTEM` only). `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM` (both already elevated), and a least-privileged identity cancelling a job it does not own is **not** measured — see `docs/agent-privilege-model.md`. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
+      "grant": "None for reads — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right (measured under admin and `SYSTEM` only). `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM` (both already elevated), and a least-privileged identity cancelling any job (its own or another user's) is **not** measured — see `docs/agent-privilege-model.md`. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
       "if_refused": "n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error. `clear_queue` is different: `ERROR_ACCESS_DENIED` from `OpenPrinterW` or `SetJobW` reports `PERMISSION_DENIED` (`refused`)",
       "measured": "the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`); `clear_queue` cancel also under the admin SSH identity",
       "os": "Windows",
@@ -470,21 +470,21 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`missing_printer` / `invalid_job_id` — `windows:winspool:open_printer_failed` / `windows:winspool:printer_not_found` (UNC names only) / `windows:winspool:job_not_found` / `windows:winspool:set_job_failed` — `linux:cups:connect_failed` / `macos:cups:connect_failed` — `linux:cups:decode_failed` / `macos:cups:decode_failed` — `\"Cancel-Job: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
+      "provenance": "`missing_printer` / `invalid_job_id` — `windows:winspool:open_printer_failed` / `windows:winspool:printer_not_found` (names with a path separator or colon) / `windows:winspool:job_not_found` / `windows:winspool:set_job_failed` — `linux:cups:connect_failed` / `macos:cups:connect_failed` — `linux:cups:decode_failed` / `macos:cups:decode_failed` — `linux:cups:no_identity` / `macos:cups:no_identity` — `\"Cancel-Job: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
       "status": "`UNAVAILABLE`",
-      "when": "`clear_queue` parameter validation failed (`printer` empty or `job_id` unparseable — a fully-refused request, no OS call made), or the cancel itself could not complete: Windows `OpenPrinterW` failed for a reason other than not-found or access-denied (spooler stopped, RPC unavailable — the Win32 error is in the status detail); Windows reported a nonexistent job (`GetJobW`, or `SetJobW` if the job finished in between — `ERROR_INVALID_PARAMETER`), which is `PARTIAL` rather than `FULL` because that code was measured only under elevated identities; Windows `OpenPrinterW` returned `ERROR_INVALID_PRINTER_NAME` for a UNC-shaped name (`\\\\server\\queue` or the `//server/queue` form the `printers`/`jobs` rows render), which the OS also returns for an unreachable server, so it is reported as `printer_not_found` but not as definitive; or `SetJobW` failed for another reason other than access (the Win32 error is in the status detail); macOS/Linux the IPP Cancel-Job round trip failed at the transport/decode step, or cupsd returned a status this plugin doesn't otherwise classify"
+      "when": "`clear_queue` parameter validation failed (`printer` empty or `job_id` unparseable — a fully-refused request, no OS call made), or the cancel itself could not complete: Windows `OpenPrinterW` failed for a reason other than not-found or access-denied (spooler stopped, RPC unavailable — the Win32 error is in the status detail); Windows reported a nonexistent job (`GetJobW`, or `SetJobW` if the job finished in between — `ERROR_INVALID_PARAMETER`), which is `PARTIAL` rather than `FULL` because that code was measured only under elevated identities; Windows `OpenPrinterW` returned `ERROR_INVALID_PRINTER_NAME` for a name containing a path separator or colon (`\\\\server\\queue`, the `//server/queue` form the `printers`/`jobs` rows render, `http://…`), which the OS also returns for an unreachable server, so it is reported as `printer_not_found` but not as definitive; macOS/Linux could not resolve the agent's effective-user identity (an `error`, not a denial: the request is not sent and cupsd is never asked); or `SetJobW` failed for a reason other than access-denied or a vanished job (the Win32 error is in the status detail); macOS/Linux the IPP Cancel-Job round trip failed at the transport/decode step, or cupsd returned a status this plugin doesn't otherwise classify"
     },
     {
       "completeness": "full",
-      "provenance": "`windows:winspool:printer_not_found` (local names) — `linux:cups:not_found` / `macos:cups:not_found`",
+      "provenance": "`windows:winspool:printer_not_found` (plain local names) — `linux:cups:not_found` / `macos:cups:not_found`",
       "status": "`UNAVAILABLE`",
-      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a local, non-UNC printer name; macOS/Linux cupsd's own `client-error-not-found` (IPP `0x0406`) response"
+      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a plain local printer name (no path separator or colon); macOS/Linux cupsd's own `client-error-not-found` (IPP `0x0406`) response"
     },
     {
       "completeness": "full",
-      "provenance": "`linux:cups:socket_unavailable` / `macos:cups:socket_unavailable` — `linux:cups:no_identity` / `macos:cups:no_identity` — `windows:winspool:access_denied` — `linux:cups:access_denied` / `macos:cups:access_denied`",
+      "provenance": "`linux:cups:socket_unavailable` / `macos:cups:socket_unavailable` — `windows:winspool:access_denied` — `linux:cups:access_denied` / `macos:cups:access_denied`",
       "status": "`PERMISSION_DENIED`",
-      "when": "`clear_queue` refused before or after attempting the cancel: macOS/Linux found no CUPS Unix socket at all (refuses outright rather than falling back to the `localhost:631` TCP path `printers`/`jobs` use for reads — a mutating action never takes that fallback), or could not resolve the agent's effective-user identity (refused locally, no request sent); or the cancel was authorized-denied — Windows `OpenPrinterW` or `SetJobW` returned `ERROR_ACCESS_DENIED`, macOS/Linux cupsd's HTTP layer (401/403) or IPP response (`client-error-forbidden`/`not-authenticated`/`not-authorized`, `0x0401`/`0x0402`/`0x0403`) refused the caller. A `client-error-bad-request` (`0x0400`) is a protocol fault, not an authorization decision, and surfaces as `unexpected_status` — see Privileges and prerequisites for who is actually authorized to cancel whose job on each platform"
+      "when": "`clear_queue` refused before or after attempting the cancel: macOS/Linux found no CUPS Unix socket at all (refuses outright rather than falling back to the `localhost:631` TCP path `printers`/`jobs` use for reads — a mutating action never takes that fallback); or the cancel was authorized-denied — Windows `OpenPrinterW` or `SetJobW` returned `ERROR_ACCESS_DENIED`, macOS/Linux cupsd's HTTP layer (401/403) or IPP response (`client-error-forbidden`/`not-authenticated`/`not-authorized`, `0x0401`/`0x0402`/`0x0403`) refused the caller. A `client-error-bad-request` (`0x0400`) is a protocol fault, not an authorization decision, and surfaces as `unexpected_status` — see Privileges and prerequisites for who is actually authorized to cancel whose job on each platform"
     }
   ],
   "samples": {

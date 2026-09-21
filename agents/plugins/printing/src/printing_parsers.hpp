@@ -377,9 +377,9 @@ enum class OpenPrinterFailure { not_found, refused, error };
 /// Win32 values are stable ABI, restated here (winerror.h) so the mapping
 /// stays in the pure header: 5 ERROR_ACCESS_DENIED -> refused (the printer
 /// exists but the caller may not open its queue), 1801
-/// ERROR_INVALID_PRINTER_NAME -> not_found. Every other failure (spooler stopped, RPC unavailable, ...) is
-/// `error`: reporting it as not_found would tell an operator a printer is
-/// gone when the spooler is merely down.
+/// ERROR_INVALID_PRINTER_NAME -> not_found. Every other failure (spooler
+/// stopped, RPC unavailable, ...) is `error`: reporting it as not_found would
+/// tell an operator a printer is gone when the spooler is merely down.
 [[nodiscard]] inline OpenPrinterFailure classify_open_printer_error(uint32_t last_error) noexcept {
     constexpr uint32_t kErrorAccessDenied = 5;
     constexpr uint32_t kErrorInvalidPrinterName = 1801;
@@ -390,12 +390,15 @@ enum class OpenPrinterFailure { not_found, refused, error };
     return OpenPrinterFailure::error;
 }
 
-/// True for a UNC-shaped printer name (`\\server\queue`, or the `//server/queue`
-/// form `safe_output_field` renders it as in the `printers`/`jobs` rows).
-/// OpenPrinterW returns the same 1801 for an unreachable UNC server as for a
-/// missing local printer, so a not-found for such a name is never definitive.
-[[nodiscard]] inline bool is_unc_printer_name(std::string_view name) noexcept {
-    return name.starts_with("\\\\") || name.starts_with("//");
+/// True only for a plain local printer name: none of `\`, `/` or `:`. Those
+/// characters can make OpenPrinterW reach a remote server (`\\server\queue`,
+/// the `//server/queue` form `safe_output_field` renders it as in the
+/// `printers`/`jobs` rows, `http://host/printers/x/.printer`, ...), and
+/// OpenPrinterW returns the SAME 1801 for an unreachable server as for a missing
+/// local printer, so a not-found is definitive only for a plain name. An
+/// allowlist on purpose: enumerating remote-capable name shapes is open-ended.
+[[nodiscard]] inline bool printer_name_is_plain_local(std::string_view name) noexcept {
+    return name.find_first_of("\\/:") == std::string_view::npos;
 }
 
 /// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never

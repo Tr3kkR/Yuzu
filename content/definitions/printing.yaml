@@ -261,7 +261,10 @@ spec:
       - name: outcome
         type: string
         description: >-
-          Values: canceled, not_found, refused, error.
+          Values: canceled, not_found, refused, error. `canceled` means the
+          spooler/cupsd ACCEPTED the cancel request, not that the job has already
+          left the queue: an actively printing job can take a moment to clear, so
+          confirm with `jobs`.
         example: canceled
         platforms: [windows, linux, darwin]
       - name: detail

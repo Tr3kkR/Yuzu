@@ -135,9 +135,10 @@ constexpr std::string_view kTokEnumPrintersFailed = "windows:winspool:enum_print
 constexpr std::string_view kTokJobEnumFailed = "windows:winspool:enum_jobs_failed";
 // Round-4 review minor: a denied/failed OpenPrinterW is a different failure
 // point than EnumJobsW itself failing -- folding both under the enum token
-// mislabels the actual failing call for triage. Used only when every
+// mislabels the actual failing call for triage. do_jobs uses it when every
 // per-printer job-read problem in one dispatch was an open failure, never an
-// enum one (see do_jobs's token-selection comment).
+// enum one (see do_jobs's token-selection comment); do_clear_queue uses it
+// for an open failure that is neither not-found nor access-denied.
 constexpr std::string_view kTokOpenPrinterFailed = "windows:winspool:open_printer_failed";
 
 // Round-3 review Should-fix: EnumPrintersW/EnumJobsW are plain synchronous
@@ -191,11 +192,12 @@ auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
 // cancelled a real job on `Microsoft Print to PDF` under BOTH
 // BUILTIN\Administrators and NT AUTHORITY\SYSTEM (GetLastError()==0) -- see
 // tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
-// Job ACLs are judged against the caller's token, not the handle's access
-// mask, and both measured tokens are already elevated, so the outcome for a
-// least-privileged identity (cancelling its own job, or another user's) was
-// NOT measured (docs/agent-privilege-model.md); "USE is enough" must not be
-// read as "no administer right is ever needed". Kept narrower than
+// Both measured tokens are already elevated, so the outcome for a
+// least-privileged identity cancelling ANY job (its own or another user's)
+// was NOT measured (docs/agent-privilege-model.md); nor is it measured
+// whether job access is judged against the caller's token or the handle's
+// access mask. "USE is enough" must not be read as "no administer right is
+// ever needed". Kept narrower than
 // PRINTER_ALL_ACCESS/JOB_ACCESS_ADMINISTER on purpose: clear_queue cancels
 // exactly one job id and needs no broader grant than that.
 constexpr DWORD kCancelDesiredAccess = PRINTER_ACCESS_USE;
@@ -586,15 +588,17 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
             return 1;
         }
         if (failure == OpenPrinterFailure::not_found) {
-            // 1801 is definitive for a local name, but OpenPrinterW returns the
-            // SAME 1801 for a UNC name whose server is unreachable (observed on
-            // real Windows), so a UNC-shaped name cannot claim the printer is
+            // 1801 is definitive for a plain local name, but OpenPrinterW returns
+            // the SAME 1801 for a UNC name whose server is unreachable (observed
+            // on real Windows). A name with a path separator or colon may name a
+            // remote server (UNC, URL forms), so it cannot claim the printer is
             // gone: report it, but PARTIAL.
-            const bool unc = is_unc_printer_name(printer);
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
-                                   unc ? YUZU_RESULT_COMPLETENESS_PARTIAL : YUZU_RESULT_COMPLETENESS_FULL,
-                                   unc ? "OpenPrinterW: printer not found (UNC name; the server may be unreachable)"
-                                       : "OpenPrinterW: printer not found");
+            const bool plain = printer_name_is_plain_local(printer);
+            ctx.set_result_status(
+                YUZU_RESULT_STATUS_UNAVAILABLE,
+                plain ? YUZU_RESULT_COMPLETENESS_FULL : YUZU_RESULT_COMPLETENESS_PARTIAL,
+                plain ? "OpenPrinterW: printer not found"
+                      : "OpenPrinterW: printer not found (name may be remote; the server may be unreachable)");
             ctx.write_output(
                 format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
             return 1;
@@ -637,7 +641,8 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
         }
         if (set_error == ERROR_INVALID_PARAMETER) {
             // The job finished between the GetJobW check above and this call
-            // (SetJobW documents 87 for a JobId that does not exist).
+            // (SetJobW returned 87 for a nonexistent JobId when measured on
+            // real hardware, under elevated identities only).
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                    "SetJobW: job not found");
             ctx.write_output(
@@ -703,8 +708,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
          "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
-         "a least-privileged identity cancelling a job it does not own is unmeasured "
-         "(PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md"},
+         "a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and "
+         "that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see "
+         "docs/agent-privilege-model.md"},
     },
 };
 
@@ -968,14 +974,17 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
         return 1;
     }
 
-    // No resolvable effective-user identity -> refuse locally. Sending an
-    // empty requesting-user-name and a malformed `Authorization: PeerCred `
-    // header would make cupsd's answer about a request we never meant to send.
+    // No resolvable effective-user identity -> do not send. Sending an empty
+    // requesting-user-name and a malformed `Authorization: PeerCred ` header
+    // would make cupsd's answer about a request we never meant to send. This is
+    // a local precondition failure, NOT an authorization decision (cupsd was
+    // never asked), so it reports `error`, not `refused`: a transient NSS
+    // failure must not read as a final denial.
     const std::string user = current_username();
     if (user.empty()) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
-                               "no resolvable effective-user identity; refusing to cancel");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokNoIdentity));
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "no resolvable effective-user identity; not sending the cancel");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokNoIdentity));
         return 1;
     }
 
@@ -1077,8 +1086,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
          "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
-         "a least-privileged identity cancelling a job it does not own is unmeasured "
-         "(PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md"},
+         "a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and "
+         "that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see "
+         "docs/agent-privilege-model.md"},
     },
 };
 
