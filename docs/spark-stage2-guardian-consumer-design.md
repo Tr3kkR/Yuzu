@@ -1341,9 +1341,9 @@ cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive
 clearing on the next success. Two residuals remain: a real directory notification during an
 episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
 rather than the backoff; and a single poison obligation fails the whole pass, starving the others
-until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open; it,
-the contract a consumer of `inert` needs and two further recorded limits are set out in the list
-below.
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open. The
+list below sets out that gap, the contract a consumer of `inert` needs and two further recorded
+limits.
 
 **R5.7 (g), continued: the File worker-failure contract (#4658).**
 
