@@ -1574,7 +1574,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     ```
 
     The Registry form is a separate query with `mechanism="registry"` in both selectors. Both
-    were checked with promtool against synthetic series only. Blind spot: the query needs the
+    were checked with promtool against synthetic series only. Unlike the mechanism-gap recipe in
+    `docs/user-manual/metrics.md`, this query is deliberately silent when the mechanism series is
+    absent (an absent mechanism is not functional, so there is nothing recovered to be stuck).
+    Blind spot: the query needs the
     two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
     agent, or an unrelated concurrent episode) silences it fleet-wide; silence proves nothing
     while any agent lacks the mechanism. Only a sustained hold is a hint: the gauges trail the
@@ -1808,7 +1811,9 @@ the driver.
 
 **NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
 #4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
-not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry.**
+not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry. The
+per-mechanism fleet alert it relies on for detection is tracked in #2084 and must ship before the
+flip as well.**
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
