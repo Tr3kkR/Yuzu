@@ -50,12 +50,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs)",
          nullptr},
         /* .windows_leg = */
-        // INTEGRATOR: the 4th (notes) field is filled from P81b-2's rig-probe
-        // banner in system_hardening_win.cpp; nullptr until then.
+        // 4th field (`fallback`) = the rig-verified behaviour recorded in the banner of
+        // system_hardening_win.cpp (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200).
         {YUZU_SUPPORT_SUPPORTED, 1,
          "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel mitigation "
          "registry + GetProcessMitigationPolicy (agent process)",
-         nullptr},
+         "Rig-verified 2026-09-21: MitigationOptions/MitigationAuditOptions are ABSENT on a default "
+         "Windows 11 install (rows read `absent`, not a failure); a present value decodes as 16 "
+         "two-bit nibbles (dep, sehop, aslr_bottom_up, aslr_high_entropy and cfg confirmed on "
+         "hardware); GetProcessMitigationPolicy succeeds for DEP/ASLR/CFG on x64."},
     },
 };
 

@@ -22,17 +22,32 @@
  * unreadable key never yields a non-zero exit: return 0 for every data-level
  * outcome, 1 only for an internal exception (constrained|internal_error).
  *
- * THE-RIG PROBE (acceptance item 1) -- PENDING. Static verification only here;
- * the orchestrator's rig session must paste its verbatim output below before
- * the PR is raised (and hand it to the integrator for the Windows descriptor
- * notes): `whoami` under the S4U/RunLevel-Highest task (NT AUTHORITY\SYSTEM)
- * + date; `reg query` of both values (present?, REG_BINARY byte size, hex);
- * `Get-ProcessMitigation -System`; GetProcessMitigationPolicy BOOL +
- * GetLastError for ProcessDEPPolicy/ProcessASLRPolicy/
- * ProcessControlFlowGuardPolicy from a 64-bit LocalSystem process
- * (ProcessDEPPolicy is documented for 32-bit processes only; that outcome
- * decides whether `self.dep` reads `absent` via the branch below).
- * PROBE RESULT: <pending -- paste verbatim from the-rig session>
+ * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64) -- COMPLETE.
+ * Run as NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest). Fixture + provenance:
+ * tests/unit/fixtures/wave8/system_hardening/windows/mitigation_options.hex[.provenance.txt].
+ *   whoami                  : nt authority\system
+ *   date                    : 2026-09-21T15:29:55+01:00
+ *   reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" /v MitigationOptions
+ *                           : ERROR: The system was unable to find the specified registry key or value.
+ *                             (ABSENT on this fresh install; MitigationAuditOptions likewise ABSENT)
+ *   Get-ProcessMitigation -System, before: every policy NOTSET (DEP.Enable, SEHOP.Enable,
+ *                             ASLR.BottomUp, ASLR.HighEntropy, CFG.Enable ... all NOTSET)
+ *   After a TEMPORARY `Set-ProcessMitigation -System -Enable DEP,SEHOP,BottomUp,HighEntropy,CFG`
+ *   (state then restored and verified identical: kernel + Memory Management keys, both values,
+ *   bcdedit, Get-ProcessMitigation -System):
+ *                             MitigationOptions REG_BINARY
+ *                             110011000001000000000000000000000000000000000000 (24 bytes);
+ *                             Get-ProcessMitigation -System: DEP.Enable ON, SEHOP.Enable ON,
+ *                             ASLR.BottomUp ON, ASLR.HighEntropy ON, CFG.Enable ON.
+ *   The five enabled options are exactly the set nibbles {0,1,4,5,10} of QWORD 0 -- this REFUTED
+ *   the <winbase.h> flag layout the first decoder assumed (see system_hardening_win_parsers.hpp).
+ *   GetProcessMitigationPolicy from a 64-bit SYSTEM process (throwaway MSVC probe, not committed):
+ *                             ProcessDEPPolicy              BOOL=1 GetLastError=0 Flags=0x00000003
+ *                             ProcessASLRPolicy             BOOL=1 GetLastError=0 Flags=0x00000005
+ *                             ProcessControlFlowGuardPolicy BOOL=1 GetLastError=0 Flags=0x00000000
+ *   => ProcessDEPPolicy SUCCEEDS on x64, so `self.dep` is a real row there; the
+ *      ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED -> `absent` (`:unsupported`) branch below is
+ *      kept for 32-bit hosts and older builds and was not exercised on this rig.
  */
 
 #if defined(_WIN32)
