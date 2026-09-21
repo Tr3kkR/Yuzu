@@ -1314,13 +1314,29 @@ Fault callback, or the engine's own pre-start replay failure), so
 once a deleted target's re-arm has resolved to the ancestor the watch is Healthy, `inert` is
 false, and the cache can still read `Notification` if the `None` report was dropped (the
 Registry test that characterises exactly this drops every `None` and deletes the target). A
-Registry sweeper or File worker in persistent failure also leaves a stale `Notification`, unflagged
-until it flips `inert` after three consecutive failed passes. Checking
-`!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows the Registry
-sweeper-failure and File worker-failure cases, and only once the flag has flipped (three
-consecutive failed passes for either, `kSweeperInertAfterFailures` /
-`kFileWorkerInertAfterFailures`); it does not cover a dropped report.
-(c) `Notification` means the mechanism holds the
+Registry sweeper in persistent failure also leaves a stale `Notification`, unflagged until it
+flips `inert` after `kSweeperInertAfterFailures` (3) consecutive failed passes. Checking
+`!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows ONLY that
+Registry sweeper-failure case, and only once the flag has flipped; it does not cover a dropped
+report, and it does not cover File (see (g)). `subscription_establishment()` itself reports
+`coverage = None` while the type's mechanism `stats().inert` is true; `established_at` is left
+untouched. That overlay is a conservative snapshot, not a coherent one: `inert` is read beside the
+cached value, so `None` can coexist with a newer staged `Notification`, and a stale `Notification`
+can be read once `inert` has cleared. It leaves two windows open. Before the flip, at the default
+50 ms sweep cadence, Registry retries back off 50 ms then 100 ms and `inert` flips on the third
+consecutive failed pass, so a stale `Notification` can be read for that long plus the pass
+durations. After recovery, `inert` clears on the first good pass but each sweep pass visits a
+bounded subset of watches, so a cached value can stay stale until its watch is next visited. The
+first reader closes both with a counter rule (decided 2026-09-21): it snapshots the mechanism's
+debug counters (`sweep_pass_failed` and `established_failed` for Registry, `established_failed`
+for File) and `stats().inert` before arming, requires `inert` to be false, and re-reads them when the
+measurement ends (any movement, or `inert`, invalidates the sample, recorded as a per-attempt
+reliability failure and never silently excluded); it uses fresh keys
+in isolated directories (no adopted or joined keys, no writes to a File watch's directory during
+an episode); it censors Ancestor-mode subscriptions; it reads only while `is_running()`; and it
+runs in-process, because the counters are `_for_test` accessors that exist on Windows only
+(`nullopt` elsewhere). Log lines are diagnostic only, never the closure. (c) `Notification`
+means the mechanism holds the
 watch and issued the read (Registry: the key exists and the notify is armed; File: the parent
 directory handle is watched, even when the file itself is absent). It is a probe result, NOT an
 end-to-end detection guarantee. A standalone probe that opens the directory as File does measured
