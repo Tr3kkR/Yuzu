@@ -7100,8 +7100,8 @@ TEST_CASE("File worker (direct): a worker that never fails keeps every pass-fail
     mech->stop();
 }
 
-TEST_CASE("File worker (direct): a throw after dispatched == true is counted, backed off and "
-          "recovered with no external wake (#4658 PF-15)",
+TEST_CASE("File worker (direct): a throw after dispatched == true is counted and the episode "
+          "closes with no external wake (#4658 PF-15)",
           "[spark][mechanism][windows][passfail]") {
     // Every other PF case throws from pass_fail_hook, which fires BEFORE run() sets `dispatched`.
     // This one throws AFTER it: emit_bookkeeping_hook fires inside run_off_lock() once the pass
@@ -7112,6 +7112,7 @@ TEST_CASE("File worker (direct): a throw after dispatched == true is counted, ba
     // failure (real_rearm_fail_hook) stages a probe launch in the same real-completion pass, and
     // the launch fires the bookkeeping hook.
     ScratchDir b("pf_after_dispatch");
+    EstLog log;
     std::atomic<bool> rearm_armed{false};
     std::atomic<int> rearm_hits{0};
     std::atomic<bool> hook_armed{false};
@@ -7141,14 +7142,18 @@ TEST_CASE("File worker (direct): a throw after dispatched == true is counted, ba
         };
         REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
     }
+    REQUIRE(mech->set_established_sink(log.sink()));
     mech->start(
         [&](const std::string& key, SparkData) {
             if (key == "B")
                 b_delivered.fetch_add(1, std::memory_order_acq_rel);
         },
         pf_noop_fault);
-    REQUIRE(mech->watch("B", file_spec(b.file.string()).params).has_value());
-    REQUIRE(pf_wait_no_passes(passes, 200ms)); // B established, its read armed, nothing due
+    REQUIRE(mech->watch_incarnation("B", file_spec(b.file.string()).params, 1).has_value());
+    // Tied to B's actual establishment (its coverage was reported), so a worker starved before
+    // its first pass cannot let the arm below precede it; then nothing else is due.
+    REQUIRE(eventually([&] { return log.has("B", 1, SparkCoverage::Notification); }, 5000ms));
+    REQUIRE(pf_wait_no_passes(passes, 200ms));
     const int hook_before = hook_hits.load(std::memory_order_acquire);
     rearm_armed.store(true, std::memory_order_release);
     hook_armed.store(true, std::memory_order_release);
@@ -7175,6 +7180,76 @@ TEST_CASE("File worker (direct): a throw after dispatched == true is counted, ba
         },
         2000ms));
     CHECK(eventually([&] { return b_delivered.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " consecutive=" << d->pass_failures_consecutive);
+    CHECK(d->pass_failed == 1); // the one injected throw, counted once
+    CHECK(d->pass_failures_consecutive == 0);
+}
+
+TEST_CASE("File worker (direct): a throw after dispatched == true in a timer-driven pass is "
+          "counted and the episode closes with no external wake (#4658 PF-15b)",
+          "[spark][mechanism][windows][passfail]") {
+    // PF-15 reaches run()'s real-completion catch; this reaches the OTHER one, in the
+    // control-wake/timeout branch, which has its own `ok = false;`. B's first attach is failed
+    // (attach_fail_hook), which leaves it Deferred on the backend retry (100 ms). The retry is
+    // due in a timer-driven pass (no completion is involved: B's read was never attached), whose
+    // sweep stages a probe launch; run_off_lock() launches it and fires emit_bookkeeping_hook,
+    // armed BEFORE the watch so that launch is the first the hook ever sees. That throw is after
+    // `dispatched = true`. The unwind keeps the launched probe, which then resolves, attaches
+    // (the hook fails only the first attach) and establishes B.
+    ScratchDir b("pf_after_dispatch_timer");
+    EstLog log;
+    std::atomic<bool> attach_armed{true};
+    std::atomic<int> attach_hits{0};
+    std::atomic<bool> hook_armed{true};
+    std::atomic<int> hook_hits{0};
+    const std::wstring b_dir_w = b.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the first probe resolves inside watch(), not in a pass
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 10ms; // keeps the retry after the injected failure prompt
+        ctl.attach_fail_hook = [&](std::wstring_view dir) {
+            if (dir == b_dir_w && attach_armed.exchange(false, std::memory_order_acq_rel)) {
+                attach_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            hook_hits.fetch_add(1, std::memory_order_acq_rel);
+            if (hook_armed.exchange(false, std::memory_order_acq_rel))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(pf_noop_emit, pf_noop_fault);
+    REQUIRE(mech->watch_incarnation("B", file_spec(b.file.string()).params, 1).has_value());
+    // The attach failed and the Deferred retry's launch then reached the hook and consumed it.
+    REQUIRE(eventually(
+        [&] {
+            return attach_hits.load(std::memory_order_acquire) >= 1 &&
+                   hook_hits.load(std::memory_order_acquire) >= 1 &&
+                   !hook_armed.load(std::memory_order_acquire);
+        },
+        5000ms));
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                     2000ms));
+    // No watch()/apply_test_controls() from here: the episode closes by itself.
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0 &&
+                   !mech->stats().inert;
+        },
+        2000ms));
+    // The probe launched by the failed pass survived its unwind and B ended up established.
+    CHECK(eventually([&] { return log.has("B", 1, SparkCoverage::Notification); }, 3000ms));
     mech->stop(); // joins the worker: the counters below are then exact
     const auto d = file_debug_counters_for_test(*mech);
     REQUIRE(d.has_value());
