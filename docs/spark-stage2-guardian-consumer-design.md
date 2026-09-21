@@ -1331,8 +1331,8 @@ re-derive the stale-cache severity and cover these residuals itself: the check i
 the Registry and File worker-failure cases, so there is no complete guard to copy. (f) There is no
 operator surface: a dropped report is counted in the `established_failed` debug counter (a test
 seam) and logged once (the first drop only). (g) File now has (b)'s narrowing (#4658): its
-worker counts, backs off (doubling from `sweep_cadence`, 30 s cap) and flips `inert` after three
-consecutive failed passes, clearing on the next success. Two residuals remain: a real directory
+worker counts, backs off (doubling from `sweep_cadence`, 30 s cap), logs at failures 1, 2, 4, 8, ...
+and flips `inert` after three consecutive failed passes, clearing on the next success. Two residuals remain: a real directory
 notification during an episode still runs a (failing) pass, so the pass rate is bounded by the
 kernel's notification rate rather than the backoff; and a single poison obligation fails the whole
 pass, starving the others until it clears (same as Registry).
