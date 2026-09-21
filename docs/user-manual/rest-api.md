@@ -5479,6 +5479,38 @@ route's parsing, where any presence of `enabled_only` is treated as true regardl
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
 
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "sched-1", "name": "nightly-scan", "frequency_type": "interval", "enabled": true }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The underlying query is hard-capped at `kScheduleListCap` (100) rows with no `limit`/cursor
+parameter on this route (ADR-0031 WS-A4 schedule seam). When the cap drops rows,
+`pagination.result_truncated_by_cap` is added (`true`) — note this sits under `pagination`, **not**
+nested inside `data` the way the `/executions/{id}/children` cap flag above does; the two routes
+chose different envelope placements and a caller should not assume one shape from the other:
+
+```json
+{
+  "data": [ { "id": "sched-1", "name": "nightly-scan", "frequency_type": "interval", "enabled": true } ],
+  "pagination": { "total": 100, "start": 0, "page_size": 50, "result_truncated_by_cap": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The dashboard fragment (`GET /fragments/schedules`) and the MCP twin (`list_schedules`) share this
+same cap and the same underlying query, and each surfaces the truncation in its own shape: the
+fragment renders a partial-list HTML notice, MCP's `structuredContent` carries its own
+`result_truncated_by_cap` field. See [Dashboard UI — Schedules
+tab](instructions.md#13-dashboard-ui) for the fragment's rendered behaviour.
+
 ---
 
 ### Command/Instruction Responses — v1 read twins (#2146 A2-R2)
