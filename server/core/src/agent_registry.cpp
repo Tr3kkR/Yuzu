@@ -947,6 +947,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // windows_optional_features
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
+        // system_hardening
+        {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},

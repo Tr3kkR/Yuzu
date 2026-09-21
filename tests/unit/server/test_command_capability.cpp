@@ -20,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using namespace yuzu::server;
 
@@ -148,21 +149,29 @@ TEST_CASE("CommandCapabilityRegistry: classify is case-insensitive on both plugi
     CHECK(upper->dispatch_class == lower->dispatch_class);
 }
 
+namespace {
+// std::initializer_list cannot be built at runtime (no (count, value)
+// constructor like std::vector); it only exists as a brace-enclosed list at
+// the call site. Expanding an index_sequence pack inside the braces derives
+// the element count from a constant, so the ceiling test never needs a
+// literal list that must be kept in step with kMaxSources.
+template <std::size_t... I>
+CommandCapabilityRegistry registry_with_n_sources(std::span<const CommandCapability> s,
+                                                  std::index_sequence<I...>) {
+    return CommandCapabilityRegistry{(static_cast<void>(I), s)...};
+}
+} // namespace
+
 TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silently dropping "
           "one",
           "[server][dispatch][capability]") {
-    // std::initializer_list cannot be built programmatically (no (count,
-    // value) constructor like std::vector) — it only exists as a brace-enclosed
-    // literal at the call site, so exceeding kMaxSources means literally
-    // writing kMaxSources + 1 elements. The static_assert keeps that literal
-    // count honest if kMaxSources ever changes.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 16,
-                 "this test hardcodes 17 literal sources (kMaxSources + 1); update the "
-                 "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
-    CHECK_THROWS_AS(
-        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s}),
-        std::invalid_argument);
+    // Exactly kMaxSources fits; kMaxSources + 1 throws — derived from the constant, never a literal.
+    CHECK_NOTHROW(registry_with_n_sources(
+        s, std::make_index_sequence<CommandCapabilityRegistry::kMaxSources>{}));
+    CHECK_THROWS_AS(registry_with_n_sources(
+                        s, std::make_index_sequence<CommandCapabilityRegistry::kMaxSources + 1>{}),
+                    std::invalid_argument);
 }
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────

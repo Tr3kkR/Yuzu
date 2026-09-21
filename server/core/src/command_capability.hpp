@@ -146,14 +146,15 @@ enum class ClassificationError : uint8_t {
 /// `std::string` materialization.
 class CommandCapabilityRegistry {
 public:
-    /// A handful of fragments compose here (five per-group headers plus this
-    /// package's own `core_dispatch_capabilities()`); `kMaxSources` is a
-    /// generous ceiling, not a tight fit, so an additional fragment group
-    /// does not silently overflow it. Exceeding it is a construction-time
-    /// programmer error — fail loud via an exception, never silently drop a
-    /// fragment (a dropped fragment would make every one of its rows
-    /// `Unclassified`, indistinguishable from an honest miss).
-    static constexpr std::size_t kMaxSources = 16;
+    /// One fragment per plugin family plus this package's own
+    /// `core_dispatch_capabilities()` compose here: 15 sources at the start
+    /// of Wave 8, 22 by its end. `kMaxSources` is a generous ceiling, not a
+    /// tight fit, so an additional fragment does not silently overflow it.
+    /// Exceeding it is a construction-time programmer error — fail loud via
+    /// an exception, never silently drop a fragment (a dropped fragment
+    /// would make every one of its rows `Unclassified`, indistinguishable
+    /// from an honest miss).
+    static constexpr std::size_t kMaxSources = 32;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {
