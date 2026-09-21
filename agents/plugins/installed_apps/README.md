@@ -4,7 +4,7 @@
 | | |
 |---|---|
 | **What it does** | Inventories installed applications and queries by name |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.software.inventory, crossplatform.software.query, crossplatform.software.per_user_inventory) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `list` (definition `crossplatform.software.inventory`) · `list_inventory` · `list_per_user` (definition `crossplatform.software.per_user_inventory`) · `query` (definition `crossplatform.software.query`) |
@@ -14,7 +14,7 @@
 
 ## How it works
 
-`list`/`query` read the OS's native application registry: Windows enumerates the Uninstall keys (64-bit HKLM, WoW64 HKLM, and the agent's own HKCU) natively via `Reg*W`; Linux auto-detects dpkg/rpm/pacman; macOS shells out to `system_profiler SPApplicationsDataType`, and `list` additionally reads each listed bundle's `CFBundleIdentifier` in-process (CFBundle, no subprocess, same 5000/120 s cap as the inventory enrichment) for its `bundle_id` column; on Windows `list` also reads the Uninstall key's `InstallLocation`. `query` never re-acquires — it filters the same collection with a case-insensitive substring match and emits a `found|true`/`found|false` discriminator. `list_per_user` is the real per-user surface: on Windows it walks every local profile's registry hive via the shared `win_profiles.hpp` ladder, mounting `NTUSER.DAT` offline when a profile isn't already loaded; Linux/macOS instead report the same system-wide set tagged `username=system`, and macOS additionally runs `brew list --versions` under the calling account. `list_inventory` is a separate acquisition — the ADR-0016 daily-sync collector — emitting an extended 12-field row where a field an ecosystem doesn't store stays honestly empty (never a `-` placeholder), and on macOS it additionally performs a native, budget-capped CFBundle/SecStaticCode enrichment per app for publisher and signature *presence*. The plugin is read-only throughout: it never installs, removes, or verifies a package's cryptographic validity.
+`list`/`query` read the OS's native application registry: Windows enumerates the Uninstall keys (64-bit HKLM, WoW64 HKLM, and the agent's own HKCU) natively via `Reg*W`; Linux auto-detects dpkg/rpm/pacman; macOS shells out to `system_profiler SPApplicationsDataType`, and `list` additionally reads each listed bundle's `CFBundleIdentifier` in-process (CFBundle, no subprocess, same 5000/120 s cap as the inventory enrichment) for its `bundle_id` column; on Windows the shared Uninstall-key enumerator reads `InstallLocation` for every action and only `list` emits it. `query` never re-acquires — it filters the same collection with a case-insensitive substring match and emits a `found|true`/`found|false` discriminator. `list_per_user` is the real per-user surface: on Windows it walks every local profile's registry hive via the shared `win_profiles.hpp` ladder, mounting `NTUSER.DAT` offline when a profile isn't already loaded; Linux/macOS instead report the same system-wide set tagged `username=system`, and macOS additionally runs `brew list --versions` under the calling account. `list_inventory` is a separate acquisition — the ADR-0016 daily-sync collector — emitting an extended 12-field row where a field an ecosystem doesn't store stays honestly empty (never a `-` placeholder), and on macOS it additionally performs a native, budget-capped CFBundle/SecStaticCode enrichment per app for publisher and signature *presence*. The plugin is read-only throughout: it never installs, removes, or verifies a package's cryptographic validity.
 
 ```mermaid
 flowchart LR
@@ -71,8 +71,8 @@ Pipe-delimited rows, one per application, written via `write_output()`. `list`/`
 | `version` | string | - | Windows, Linux, macOS | `26.02` | The installed version string, or "-" when the source reports none. Values: free text or "-". |
 | `publisher` | string | - | Windows, Linux | `Igor Pavlov` | The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or "-". |
 | `install_date` | string | - | Windows, macOS | `20260617` | Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); "-" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or "-". |
-| `install_location` | string | - | Windows, macOS | `C:\Program Files\7-Zip\` | Where the application is installed: the Uninstall key's InstallLocation value on Windows ("-" when the installer wrote none, as NSIS and portable installers often do), and the .app bundle path on macOS. Always "-" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or "-". |
-| `bundle_id` | string | - | macOS | `com.apple.Safari` | The macOS CFBundleIdentifier read from the app bundle's Info.plist (reverse-DNS form). Always "-" on Windows and Linux, which have no bundle identifier concept, and "-" on macOS when the bundle carries none. Values: bundle identifier or "-". |
+| `install_location` | string | - | Windows, macOS | `C:/Program Files/7-Zip/` | Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\Vendor is NOT expanded — or "-" when the installer wrote none (NSIS and portable installers often do not). macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always "-" on Linux by design: a package installs files to many prefixes, so there is no single install location. Backslashes are emitted as "/" and a literal "\|" as "\\|" (safe_output_field: the wire grammar cannot carry "\" before a delimiter), so C:\Program Files\7-Zip\ reads C:/Program Files/7-Zip/. Values: path or "-". |
+| `bundle_id` | string | - | macOS | `com.apple.ActivityMonitor` | The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always "-" on Windows and Linux, which have no bundle identifier concept; "-" on macOS when the location is not a bundle or carries no identifier, and for rows beyond the per-run enrichment cap (5000 applications / 120 s), which is not reported as degraded. Values: bundle identifier or "-". |
 
 **`crossplatform.software.per_user_inventory` — `username|name|version|publisher|install_date`**
 
@@ -116,18 +116,18 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 ```
 == action=list
-app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:\Program Files\7-Zip\|-
-app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-|D:\SteamLibrary\steamapps\common\AoE2DE|-
+app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-
+app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-|D:/SteamLibrary/steamapps/common/AoE2DE|-
 app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|-|-
 app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|-|-
 app|BCD and Boot|10.1.22621.5337|Microsoft|20260908|-|-
-app|Baldur's Gate 3|-|Larian Studios|-|D:\SteamLibrary\steamapps\common\Baldurs Gate 3|-
-app|Battle.net|-|Blizzard Entertainment|-|C:\Program Files (x86)\Battle.net|-
-app|CCleaner 7|7.11.1522.1958|Piriform|-|C:\Program Files\Piriform\CCleaner 7|-
-app|CMake|4.3.3|Kitware|20260617|C:\Program Files\CMake\|-
-app|Cities: Skylines II|-|Colossal Order Ltd.|-|D:\SteamLibrary\steamapps\common\Cities Skylines II|-
-app|Crusader Kings III|-|Paradox Development Studio|-|D:\SteamLibrary\steamapps\common\Crusader Kings III|-
-app|DayZ|-|Bohemia Interactive|-|D:\SteamLibrary\steamapps\common\DayZ|-
+app|Baldur's Gate 3|-|Larian Studios|-|D:/SteamLibrary/steamapps/common/Baldurs Gate 3|-
+app|Battle.net|-|Blizzard Entertainment|-|C:/Program Files (x86)/Battle.net|-
+app|CCleaner 7|7.11.1522.1958|Piriform|-|C:/Program Files/Piriform/CCleaner 7|-
+app|CMake|4.3.3|Kitware|20260617|C:/Program Files/CMake/|-
+app|Cities: Skylines II|-|Colossal Order Ltd.|-|D:/SteamLibrary/steamapps/common/Cities Skylines II|-
+app|Crusader Kings III|-|Paradox Development Studio|-|D:/SteamLibrary/steamapps/common/Crusader Kings III|-
+app|DayZ|-|Bohemia Interactive|-|D:/SteamLibrary/steamapps/common/DayZ|-
 … 12 of 241 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
