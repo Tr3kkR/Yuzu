@@ -82,10 +82,10 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 /// heartbeat egress" in test_spark_mechanism.cpp.
 ///
 /// The `yuzu.spark_mechs` CSV lists only mechanisms that are registered AND FUNCTIONAL.
-/// An inert mechanism — one that started but could not bind its OS facility (no systemd
+/// An inert mechanism, one that started but could not bind its OS facility (no systemd
 /// system bus in a container, OpenSCManager denied, IOCP creation failed), or whose worker
 /// is in persistent pass failure (Registry and File; three consecutive failed passes,
-/// cleared on the next success) — is EXCLUDED, because every watch() on it will be refused
+/// cleared on the next success), is EXCLUDED, because every watch() on it will be refused
 /// or cannot be served. Listing it would advertise a capability the agent cannot honour:
 /// "looks healthy, can detect nothing" (governance Gate-3 cross-platform + Gate-6 sre,
 /// reached independently).

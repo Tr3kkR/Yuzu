@@ -3188,7 +3188,7 @@ private:
                 auto* w = reinterpret_cast<DirWatch*>(ckey);
                 w->io_pending = false;
                 if (notify_fail_hook_ && notify_fail_hook_(w->dir))
-                    gqcs_ok = FALSE; // test seam: override the kernel's own result — see
+                    gqcs_ok = FALSE; // test seam: override the kernel's own result; see
                                      // FileMechanismTestControls::notify_fail_hook's doc comment
                 if (stop_.load(std::memory_order_acquire)) {
                     if (w->removing)
