@@ -3438,6 +3438,7 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 
 #include <sddl.h> // ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW (UP-2 closure test)
 
+#include <cmath> // std::floor / std::log2 - the #4658 pass-count bound
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -6253,6 +6254,429 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
     INFO("delivered_a=" << delivered_a.load()
                         << " (expected >= 1; if this is 0, see the KNOWN SUSPECT note above)");
     CHECK(a_recovered);
+    mech->stop();
+}
+
+// ── File worker pass-failure backoff / counter / inert (#4658) ──────────────
+// A worker pass that throws (modelled by FileMechanismTestControls::pass_fail_hook)
+// must back off on a doubling schedule, be counted, and flip `inert` after three
+// consecutive failures instead of spinning the worker. Windows-only: spark_file.cpp
+// is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time only;
+// an upper bound only where the wrong implementation differs by seconds; a "window
+// missed on a loaded runner" degrades to SUCCEED(), never to a false red. Every
+// captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
+// destroys (and joins) the mechanism before the state its hooks capture.
+namespace {
+
+using PfClock = std::chrono::steady_clock;
+
+long long pf_ms(PfClock::duration d) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+}
+long long pf_ms_since(PfClock::time_point t0) { return pf_ms(PfClock::now() - t0); }
+
+// Local copy of spark_file.cpp's doubled() (anonymous namespace there).
+std::chrono::milliseconds pf_doubled_ms(std::chrono::milliseconds base, unsigned k,
+                                        std::chrono::milliseconds cap) {
+    auto d = base;
+    for (unsigned i = 1; i < k && d < cap; ++i)
+        d *= 2;
+    return std::min(d, cap);
+}
+
+// Upper bound on failed passes in `elapsed_ms` of a 50 ms-base doubling backoff: at most
+// floor(log2(elapsed/50)) retries after the first pass, plus caller-chosen slack.
+int pf_pass_bound(long long elapsed_ms, int slack) {
+    const double ratio = std::max(static_cast<double>(elapsed_ms), 50.0) / 50.0;
+    return static_cast<int>(std::floor(std::log2(ratio))) + slack;
+}
+
+// Total CPU (user + kernel) this process has consumed, or -1 if it cannot be read. Used ONLY as
+// an UPPER bound on the worker's burn during a backoff: a worker that busy-loops (a zero-length
+// wait absorbed and re-entered) burns a core, a backed-off one burns ~nothing. Such a loop is
+// invisible to the pass-count bound, because the absorb check keeps the PASSES on schedule.
+// Machine load can only lower what a spinning worker gets, so it can hide a mutant, never cause
+// a false red.
+long long pf_process_cpu_ms() {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user))
+        return -1;
+    const auto to_ms = [](const FILETIME& ft) {
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        return static_cast<long long>(u.QuadPart / 10000ULL); // 100 ns units
+    };
+    return to_ms(kernel) + to_ms(user);
+}
+
+void pf_noop_emit(const std::string&, SparkData) {}
+void pf_noop_fault(const std::string&, bool, std::string_view) {}
+
+} // namespace
+
+TEST_CASE("File worker (direct): a persistently throwing pass does not spin - the pass count is "
+          "log-bounded by the backoff (#4658 PF-1)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_storm");
+    std::atomic<int> passes{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    const auto t0 = PfClock::now();
+    const long long cpu0 = pf_process_cpu_ms();
+    // The directory exists, so the watch establishes inside watch(), marks its coverage report
+    // due and nudges run(). Every pass throws before it can drain that marker: the
+    // self-sustaining wake the backoff has to floor.
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    std::this_thread::sleep_for(1500ms); // a LOWER bound on the window only
+    const auto elapsed_ms = pf_ms_since(t0);
+    const long long cpu_ms = pf_process_cpu_ms() - cpu0;
+    const int n = passes.load();
+    // Base 50 ms doubling: passes at ~0/50/150/350/750/1550 ms. +4 slack (the first pass, ms
+    // truncation, a tick-early timeout).
+    const int bound = pf_pass_bound(elapsed_ms, 4);
+    INFO("passes=" << n << " elapsed_ms=" << elapsed_ms << " bound=" << bound);
+    CHECK(n >= 2);     // it IS retrying
+    CHECK(n <= bound); // unbacked-off: thousands
+    CHECK(mech->stats().inert); // n >= 3 failed passes by now
+    // The worker is idle between the backed-off passes: no busy loop (a spinning one burns ~a
+    // core, i.e. ~elapsed_ms).
+    INFO("cpu_ms=" << cpu_ms << " over elapsed_ms=" << elapsed_ms);
+    if (cpu0 >= 0 && cpu_ms >= 0)
+        CHECK(cpu_ms < elapsed_ms / 3);
+    mech->stop();       // joins the worker: the counters below are then exact, not a racing read
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->pass_failed == static_cast<std::uint64_t>(passes.load()));
+    CHECK(d->pass_failures_consecutive == d->pass_failed);
+}
+
+TEST_CASE("File worker (direct): the k-th consecutive failure waits doubled(sweep_cadence, k, cap) "
+          "(#4658 PF-2)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_growth");
+    std::mutex tm;
+    std::vector<PfClock::time_point> ts;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 100ms; // a 100 ms base keeps timer-tick slack small against it
+        ctl.pass_fail_hook = [&] {
+            {
+                std::lock_guard lk(tm);
+                ts.push_back(PfClock::now());
+            }
+            throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    // 100 + 200 + 400 + 800 + 1600 ms = 3.1 s to the sixth pass.
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(tm);
+            return ts.size() >= 6;
+        },
+        15000ms));
+    std::vector<PfClock::time_point> snap;
+    {
+        std::lock_guard lk(tm);
+        snap = ts;
+    }
+    for (unsigned k = 1; k <= 5; ++k) {
+        const auto gap = snap[k] - snap[k - 1];
+        const auto want = pf_doubled_ms(100ms, k, 30000ms);
+        INFO("k=" << k << " gap_ms=" << pf_ms(gap) << " want_ms=" << want.count());
+        CHECK(gap >= want - 20ms); // LOWER bound only (timer tick slack)
+    }
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    // The computed schedule, pinned independently of timing.
+    CHECK(d->pass_backoff_ms ==
+          pf_doubled_ms(100ms, static_cast<unsigned>(d->pass_failures_consecutive), 30000ms)
+              .count());
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): inert flips after exactly 3 consecutive failures and clears on "
+          "the first success with no external wake (#4658 PF-3)",
+          "[spark][mechanism][windows][passfail]") {
+    // Template: the Registry sweeper's sre6-1 inert test.
+    ScratchDir a("pf_inert");
+    std::atomic<bool> failing{true};
+    std::atomic<int> throws{0};
+    std::atomic<int> fired{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        // Failures at ~0, +0.5 s, +1.5 s: wide gaps make the exact-N read robust.
+        ctl.sweep_cadence = 500ms;
+        ctl.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1); }, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    CHECK_FALSE(mech->stats().inert); // one failure at most: 3 need >= 1.5 s
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms));
+    {
+        const auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        INFO("pass_failed=" << d->pass_failed);
+        CHECK(d->pass_failed >= 3); // exact N: the next pass is ~2 s away
+        CHECK(d->pass_failed <= 4);
+        CHECK(d->pass_failures_consecutive == d->pass_failed);
+        CHECK(d->pass_backoff_ms ==
+              pf_doubled_ms(500ms, static_cast<unsigned>(d->pass_failures_consecutive), 30000ms)
+                  .count());
+    }
+    failing.store(false, std::memory_order_release);
+    // NO nudge, NO write from here: recovery has to come from the retry the backoff floor itself
+    // schedules at the deadline (the coverage marker is still due).
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 15000ms));
+    {
+        const auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->pass_failures_consecutive == 0);
+        CHECK(d->pass_backoff_ms == 0);
+        CHECK(d->pass_failed >= 3);
+    }
+    const int before = fired.load();
+    a.write("after recovery");
+    CHECK(eventually([&] { return fired.load() > before; }, 8000ms)); // the watch is live
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): a real completion recovering a pass mid-backoff resets the "
+          "deadline, so the next nudge is served promptly (#4658 PF-4)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_reset");
+    EstLog log;
+    std::atomic<bool> failing{true};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms; // one failure => a 5 s deadline
+        ctl.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    const std::string key_a = spark_key(spec_a);
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, 1).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t_fail = PfClock::now(); // the deadline is ~t_fail + 5 s
+    failing.store(false, std::memory_order_release);
+    a.write("real completion during backoff"); // NOT absorbed: a full pass, and it succeeds
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->pass_failures_consecutive == 0; },
+        5000ms));
+    // Now a nudge plus a report: a second key joining the same directory.
+    const auto spec_b = file_spec((a.dir / "other.txt").string());
+    const std::string key_b = spark_key(spec_b);
+    const auto t_join = PfClock::now();
+    const auto join_offset_ms = pf_ms(t_join - t_fail);
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, 2).has_value());
+    const bool prompt =
+        eventually([&] { return log.has(key_b, 2, SparkCoverage::Notification); }, 2000ms);
+    INFO("join report after " << pf_ms_since(t_join) << " ms; join at t_fail+" << join_offset_ms
+                              << " ms, a stale deadline would be at t_fail+5000 ms");
+    if (join_offset_ms < 2500)
+        CHECK(prompt); // a stale deadline is >= 2.5 s away: it cannot be served in 2 s
+    else
+        SUCCEED("window missed on a loaded runner; the assertion cannot distinguish a stale "
+                "deadline here");
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): control wakes during a backoff are absorbed - nudges do not run "
+          "passes (#4658 PF-5)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_absorb");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t_fail = PfClock::now();
+    const auto before = file_debug_counters_for_test(*mech)->pass_failed;
+    for (int i = 0; i < 5; ++i) { // five joins in the same directory: five nudges
+        const auto spec_i = file_spec((a.dir / ("k" + std::to_string(i) + ".txt")).string());
+        REQUIRE(mech->watch(spark_key(spec_i), spec_i.params).has_value());
+    }
+    std::this_thread::sleep_for(200ms); // time for an un-absorbed nudge to run a pass
+    const auto after = file_debug_counters_for_test(*mech)->pass_failed;
+    INFO("pass_failed before=" << before << " after=" << after);
+    if (pf_ms_since(t_fail) < 4000)
+        CHECK(after == before); // no absorb: +5
+    else
+        SUCCEED("window missed on a loaded runner");
+    mech->stop(); // also exercises a prompt stop during the backoff
+}
+
+TEST_CASE("File worker (direct): stop() during a backoff returns promptly (#4658 PF-6)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_stop");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t = PfClock::now();
+    mech->stop();
+    const auto took = pf_ms_since(t);
+    INFO("stop() took " << took << " ms during a 5 s backoff");
+    CHECK(took < 2000); // a Sleep-based backoff would take >= 4.8 s
+}
+
+TEST_CASE("File worker (direct): a single transient failure with nothing else due still retries "
+          "at the deadline and recovers (#4658 PF-7)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_idle_retry");
+    std::atomic<int> throws_left{1};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    // Let the establishment pass run and drain the coverage marker so NOTHING is due.
+    std::this_thread::sleep_for(300ms);
+    {
+        FileMechanismTestControls ctl; // apply_test_controls nudges run(): that pass throws once
+        ctl.pass_fail_hook = [&] {
+            if (throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
+                       5000ms));
+    // No nudge, no write, no marker: the ONLY thing that can run the recovery pass is the backoff
+    // floor scheduling its own retry.
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0;
+        },
+        5000ms));
+    CHECK_FALSE(mech->stats().inert);
+    CHECK(file_debug_counters_for_test(*mech)->pass_failed == 1);
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): watch() of a second directory returns within budget while the "
+          "worker is in a failure episode (#4658 PF-8)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_lat_a"), b("pf_lat_b");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms)); // >= 3 failures
+    const auto spec_b = file_spec(b.file.string());
+    const auto t = PfClock::now();
+    REQUIRE(mech->watch(spark_key(spec_b), spec_b.params).has_value());
+    const auto took = pf_ms_since(t);
+    INFO("watch(B) took " << took << " ms during the failure episode");
+    CHECK(took < 2000);
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): a real completion during a failure episode keeps the watch "
+          "armed and the pass rate stays bounded (#4658 PF-9)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_completion");
+    std::atomic<bool> failing{true};
+    std::atomic<int> passes{0};
+    std::atomic<int> fired{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1);
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1); }, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms));
+    const auto t0 = PfClock::now();
+    const long long cpu0 = pf_process_cpu_ms();
+    const int p0 = passes.load();
+    // A real completion: a full pass that throws; the unwind reissues the read and re-marks the
+    // directory needs_resync, a due-now clause the backoff floor must cover too.
+    a.write("change during the episode");
+    std::this_thread::sleep_for(1500ms);
+    const int p1 = passes.load();
+    const auto el = pf_ms_since(t0);
+    const long long cpu_ms = pf_process_cpu_ms() - cpu0;
+    // One pass for the completion plus log-bounded retries.
+    const int bound = pf_pass_bound(el, 5);
+    INFO("passes during " << el << " ms after the write: " << (p1 - p0) << " bound=" << bound);
+    CHECK(p1 - p0 <= bound);
+    // No busy loop on the needs_resync clause either (a due-now wake left ungated would spin the
+    // worker on zero-length waits without running a single extra pass).
+    INFO("cpu_ms=" << cpu_ms << " over el=" << el);
+    if (cpu0 >= 0 && cpu_ms >= 0)
+        CHECK(cpu_ms < el / 3);
+    failing.store(false, std::memory_order_release);
+    // The backoff may have grown to several seconds by now.
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 40000ms));
+    std::this_thread::sleep_for(300ms); // let any recovery-time resync fire land before sampling
+    const int before = fired.load();
+    a.write("after recovery");
+    CHECK(eventually([&] { return fired.load() > before; }, 8000ms)); // the read was reissued
     mech->stop();
 }
 
