@@ -1,0 +1,1 @@
+- system_hardening plugin: read-only exploit-mitigation and kernel-hardening posture (Windows mitigation policy registry, Linux allowlisted /proc/sys keys, macOS allowlisted sysctls).
