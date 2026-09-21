@@ -342,64 +342,95 @@
       "actions": [
         {
           "action": "managers",
-          "not_captured": "agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration",
+          "not_captured": null,
           "params": "",
           "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|managers|supported|-",
+            "manager|dpkg|present|-|/var/lib/dpkg|-|-",
+            "manager|apt|present|-|/etc/apt|sources_list_lines=0;sources_d_files=1|-"
+          ],
           "truncated": false
         },
         {
           "action": "packages",
-          "not_captured": "agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration",
+          "not_captured": null,
           "params": "",
           "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "linux:owned_by_installed_apps",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|packages|unsupported|linux:owned_by_installed_apps"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "pending",
+        "leg_hash": "504f046cb56e",
         "os": "linux",
-        "os_version": "placeholder",
-        "privilege": "placeholder"
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
       }
     },
     "macos": {
       "actions": [
         {
           "action": "managers",
-          "not_captured": "agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real macOS host after integration",
+          "not_captured": null,
           "params": "",
           "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|managers|supported|-",
+            "manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=66;casks=0|-"
+          ],
           "truncated": false
         },
         {
           "action": "packages",
-          "not_captured": "agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real macOS host after integration",
+          "not_captured": null,
           "params": "",
           "rc": 0,
-          "result_status": null,
-          "row_count": 0,
-          "rows": [],
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 67,
+          "rows": [
+            "status|packages|supported|-",
+            "package|homebrew|actionlint|1.7.12|formula",
+            "package|homebrew|ada-url|4.0.0|formula",
+            "package|homebrew|autoconf|2.73|formula",
+            "package|homebrew|automake|1.18.1_1|formula"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-21",
-        "host_class": "container",
-        "leg_hash": "pending",
+        "host_class": "bare-metal",
+        "leg_hash": "504f046cb56e",
         "os": "macos",
-        "os_version": "placeholder",
-        "privilege": "placeholder"
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
       }
     }
   },

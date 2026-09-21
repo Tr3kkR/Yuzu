@@ -1,5 +1,11 @@
-captured: linux placeholder · container · 2026-09-21 · placeholder · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 504f046cb56e
 == action=managers
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration
+status|managers|supported|-
+manager|dpkg|present|-|/var/lib/dpkg|-|-
+manager|apt|present|-|/etc/apt|sources_list_lines=0;sources_d_files=1|-
+[result_status] OK / FULL / 
+
 == action=packages
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration
+status|packages|unsupported|linux:owned_by_installed_apps
+[result_status] UNAVAILABLE / PARTIAL / linux:owned_by_installed_apps
+

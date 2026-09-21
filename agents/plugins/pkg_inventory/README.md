@@ -106,24 +106,43 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos placeholder · container · 2026-09-21 · placeholder · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 504f046cb56e
 
 ```
 == action=managers
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real macOS host after integration
+status|managers|supported|-
+manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=66;casks=0|-
+[result_status] OK / FULL
 
 == action=packages
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real macOS host after integration
+status|packages|supported|-
+package|homebrew|actionlint|1.7.12|formula
+package|homebrew|ada-url|4.0.0|formula
+package|homebrew|autoconf|2.73|formula
+package|homebrew|automake|1.18.1_1|formula
+package|homebrew|bash|5.3.15|formula
+package|homebrew|blake3|1.8.7|formula
+package|homebrew|brotli|1.2.0|formula
+package|homebrew|c-ares|1.34.8|formula
+package|homebrew|ca-certificates|2026-08-13|formula
+package|homebrew|ccache|4.13.6_1|formula
+package|homebrew|cmake|4.4.2|formula
+… 12 of 67 rows shown
+[result_status] OK / FULL
 ```
 
-**Linux** — captured: linux placeholder · container · 2026-09-21 · placeholder · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 504f046cb56e
 
 ```
 == action=managers
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration
+status|managers|supported|-
+manager|dpkg|present|-|/var/lib/dpkg|-|-
+manager|apt|present|-|/etc/apt|sources_list_lines=0;sources_d_files=1|-
+[result_status] OK / FULL
 
 == action=packages
-[not captured] agent-context: PLACEHOLDER, no real capture yet; the orchestrator replaces this file with a plugin-capture run on a real linux host after integration
+status|packages|unsupported|linux:owned_by_installed_apps
+[result_status] UNAVAILABLE / PARTIAL / linux:owned_by_installed_apps
 ```
 <!-- END GENERATED -->
 
