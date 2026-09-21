@@ -329,6 +329,8 @@ TEST_CASE("printing plugin: clear_queue — missing printer is rc 1 error|missin
     CHECK(f[1] == "-");
     CHECK(f[3] == "error");
     CHECK(f[4] == "missing_printer");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
 }
 
 TEST_CASE("printing plugin: clear_queue — job_id=\"all\" is rc 1, never a purge-all path",

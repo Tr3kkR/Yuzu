@@ -187,15 +187,15 @@ auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
     return yuzu::shared::bounded_call(kSpoolerCallTimeout, std::move(fn));
 }
 
-// SetJobW(JOB_CONTROL_CANCEL) does NOT require administer rights against
-// `Microsoft Print to PDF`: P93-2 measured a PRINTER_ACCESS_USE-only handle
-// cancelling a real job successfully under BOTH admin and SYSTEM
-// (GetLastError()==0), matching the winspool "manage your own submission"
-// semantics rather than JOB_ACCESS_ADMINISTER's admin-any-job scope — see
+// SetJobW(JOB_CONTROL_CANCEL) through a PRINTER_ACCESS_USE-only handle
+// cancelled a real job on `Microsoft Print to PDF` under BOTH
+// BUILTIN\Administrators and NT AUTHORITY\SYSTEM (GetLastError()==0) -- see
 // tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
-// Both measured identities (BUILTIN\Administrators, NT AUTHORITY\SYSTEM) are
-// already elevated; a least-privileged identity cancelling a job it does not
-// own was NOT measured (docs/agent-privilege-model.md). Kept narrower than
+// Job ACLs are judged against the caller's token, not the handle's access
+// mask, and both measured tokens are already elevated, so the outcome for a
+// least-privileged identity (cancelling its own job, or another user's) was
+// NOT measured (docs/agent-privilege-model.md); "USE is enough" must not be
+// read as "no administer right is ever needed". Kept narrower than
 // PRINTER_ALL_ACCESS/JOB_ACCESS_ADMINISTER on purpose: clear_queue cancels
 // exactly one job id and needs no broader grant than that.
 constexpr DWORD kCancelDesiredAccess = PRINTER_ACCESS_USE;
@@ -233,7 +233,11 @@ private:
 
 // `last_error`, when non-null, receives GetLastError() read immediately after
 // a failed OpenPrinterW -- before anything else can overwrite it -- so a
-// caller can tell access-denied from a nonexistent printer.
+// caller can tell access-denied from a nonexistent printer. It is a plain
+// caller-stack pointer written synchronously: do NOT run this under
+// bounded_call_tracked (an abandoned worker would write into a dead frame).
+// A TRUE return with a null handle is not known to occur; if it did, the
+// code read here would be stale and meaningless.
 [[nodiscard]] std::optional<PrinterHandle> open_printer(const std::wstring& name, DWORD access,
                                                          DWORD* last_error = nullptr) {
     PRINTER_DEFAULTSW defaults{};
@@ -573,25 +577,34 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     DWORD open_error = 0;
     auto handle = open_printer(wprinter, kCancelDesiredAccess, &open_error);
     if (!handle) {
-        switch (classify_open_printer_error(static_cast<uint32_t>(open_error))) {
-        case OpenPrinterFailure::not_found:
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
-                                   "OpenPrinterW: printer not found");
-            ctx.write_output(
-                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
-            break;
-        case OpenPrinterFailure::refused:
+        const OpenPrinterFailure failure = classify_open_printer_error(static_cast<uint32_t>(open_error));
+        if (failure == OpenPrinterFailure::refused) {
             ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
                                    "OpenPrinterW: access denied");
             ctx.write_output(
                 format_clear_queue_row(printer, *job_id, "refused", "windows:winspool:access_denied"));
-            break;
-        case OpenPrinterFailure::error:
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                   std::format("OpenPrinterW failed (Win32 error {})", open_error));
-            ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokOpenPrinterFailed));
-            break;
+            return 1;
         }
+        if (failure == OpenPrinterFailure::not_found) {
+            // 1801 is definitive for a local name, but OpenPrinterW returns the
+            // SAME 1801 for a UNC name whose server is unreachable (observed on
+            // real Windows), so a UNC-shaped name cannot claim the printer is
+            // gone: report it, but PARTIAL.
+            const bool unc = is_unc_printer_name(printer);
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                   unc ? YUZU_RESULT_COMPLETENESS_PARTIAL : YUZU_RESULT_COMPLETENESS_FULL,
+                                   unc ? "OpenPrinterW: printer not found (UNC name; the server may be unreachable)"
+                                       : "OpenPrinterW: printer not found");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
+            return 1;
+        }
+        // Every other failure (spooler stopped, RPC unavailable, ...): always
+        // reported, so a future OpenPrinterFailure enumerator cannot fall out
+        // of a switch silently on MSVC (where -Wswitch is not enabled).
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("OpenPrinterW failed (Win32 error {})", open_error));
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokOpenPrinterFailed));
         return 1;
     }
 
@@ -599,22 +612,40 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     DWORD needed = 0;
     GetJobW(handle->get(), static_cast<DWORD>(*job_id), 1, nullptr, 0, &needed);
     if (GetLastError() == ERROR_INVALID_PARAMETER) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
+        // PARTIAL, not FULL: 87 for a nonexistent job was measured only under
+        // elevated identities, and what GetJobW returns for an EXISTING job the
+        // caller may not read is unmeasured -- a FULL not_found could hide a
+        // denial. Upgrade only once a non-elevated identity has been measured.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "GetJobW: job not found");
         ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:job_not_found"));
         return 1;
     }
 
+    // Microsoft documents JOB_CONTROL_CANCEL as "do not use" in favour of
+    // JOB_CONTROL_DELETE; cancel was nonetheless measured working on real
+    // hardware (setjob_cancel.txt.provenance.txt), which is what this leg is
+    // reconciled against.
     if (!SetJobW(handle->get(), static_cast<DWORD>(*job_id), 0, nullptr, JOB_CONTROL_CANCEL)) {
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
+        const DWORD set_error = GetLastError();
+        if (set_error == ERROR_ACCESS_DENIED) {
             ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
                                    "SetJobW: access denied");
             ctx.write_output(
                 format_clear_queue_row(printer, *job_id, "refused", "windows:winspool:access_denied"));
             return 1;
         }
+        if (set_error == ERROR_INVALID_PARAMETER) {
+            // The job finished between the GetJobW check above and this call
+            // (SetJobW documents 87 for a JobId that does not exist).
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   "SetJobW: job not found");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:job_not_found"));
+            return 1;
+        }
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               "SetJobW failed");
+                               std::format("SetJobW failed (Win32 error {})", set_error));
         ctx.write_output(format_clear_queue_row(printer, *job_id, "error", "windows:winspool:set_job_failed"));
         return 1;
     }
@@ -670,7 +701,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by "
          "cupsd, authorisation outcome for a non-owned job UNMEASURED"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
+         "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
+         "a least-privileged identity cancelling a job it does not own is unmeasured "
+         "(PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md"},
     },
 };
 
@@ -1041,7 +1075,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by "
          "cupsd, authorisation outcome for a non-owned job UNMEASURED"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
+         "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
+         "a least-privileged identity cancelling a job it does not own is unmeasured "
+         "(PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md"},
     },
 };
 

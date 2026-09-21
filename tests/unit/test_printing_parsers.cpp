@@ -526,6 +526,10 @@ TEST_CASE("format_clear_queue_row: an empty printer (the missing_printer row) is
 // Status values are RFC 8010 §3.1.6.1 / RFC 8011 §4.1.6, not captures: the
 // only real-capture statuses in the tree are 0x0000 and 0x0406 (asserted
 // against the decoded fixtures above); the rest are protocol constants.
+// Win32 values (winerror.h) are likewise constants: 1801 was ALSO observed
+// live on the-rig (OpenPrinterW on a nonexistent printer, and on an
+// unreachable UNC server); 5 (ERROR_ACCESS_DENIED) was never provoked on real
+// hardware, and 87/1722 are taken from winerror.h alone.
 TEST_CASE("classify_cancel_job_status: successful-* (0x0000-0x00FF) is canceled",
           "[printing][classify]") {
     CHECK(classify_cancel_job_status(0x0000) == CancelStatusClass::canceled);
@@ -547,6 +551,9 @@ TEST_CASE("classify_cancel_job_status: bad-request is a protocol fault, never a 
     CHECK(classify_cancel_job_status(0x0404) == CancelStatusClass::error); // not-possible
     CHECK(classify_cancel_job_status(0x0500) == CancelStatusClass::error); // server-error-*
     CHECK(classify_cancel_job_status(0x0100) == CancelStatusClass::error); // just past successful-*
+    CHECK(classify_cancel_job_status(0x0405) == CancelStatusClass::error); // neighbours of the
+    CHECK(classify_cancel_job_status(0x0407) == CancelStatusClass::error); // 0x0406 not-found
+    CHECK(classify_cancel_job_status(0xFFFF) == CancelStatusClass::error);
 }
 
 TEST_CASE("classify_open_printer_error: access-denied and invalid-printer-name are distinguished",
@@ -560,4 +567,20 @@ TEST_CASE("classify_open_printer_error: every other failure is an error, never a
     CHECK(classify_open_printer_error(0) == OpenPrinterFailure::error);
     CHECK(classify_open_printer_error(87) == OpenPrinterFailure::error);   // ERROR_INVALID_PARAMETER
     CHECK(classify_open_printer_error(1722) == OpenPrinterFailure::error); // RPC_S_SERVER_UNAVAILABLE
+    CHECK(classify_open_printer_error(1800) == OpenPrinterFailure::error); // neighbours of 1801
+    CHECK(classify_open_printer_error(1802) == OpenPrinterFailure::error);
+    CHECK(classify_open_printer_error(4) == OpenPrinterFailure::error);    // neighbours of 5
+    CHECK(classify_open_printer_error(6) == OpenPrinterFailure::error);
 }
+
+TEST_CASE("is_unc_printer_name: UNC-shaped names (backslash or the // form the rows render) only",
+          "[printing][classify]") {
+    CHECK(is_unc_printer_name("\\\\server\\queue"));
+    CHECK(is_unc_printer_name("//server/queue"));
+    CHECK_FALSE(is_unc_printer_name("Microsoft Print to PDF"));
+    CHECK_FALSE(is_unc_printer_name("\\queue"));    // a single leading backslash
+    CHECK_FALSE(is_unc_printer_name("/queue"));       // a single leading slash
+    CHECK_FALSE(is_unc_printer_name("Office/Floor2")); // an interior slash
+    CHECK_FALSE(is_unc_printer_name(""));
+}
+

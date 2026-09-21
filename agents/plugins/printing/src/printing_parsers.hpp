@@ -375,9 +375,9 @@ enum class OpenPrinterFailure { not_found, refused, error };
 
 /// `last_error` is `GetLastError()` read immediately after the failed call.
 /// Win32 values are stable ABI, restated here (winerror.h) so the mapping
-/// stays in the pure header: 5 ERROR_ACCESS_DENIED -> refused (the caller
-/// exists but may not open the queue), 1801 ERROR_INVALID_PRINTER_NAME ->
-/// not_found. Every other failure (spooler stopped, RPC unavailable, ...) is
+/// stays in the pure header: 5 ERROR_ACCESS_DENIED -> refused (the printer
+/// exists but the caller may not open its queue), 1801
+/// ERROR_INVALID_PRINTER_NAME -> not_found. Every other failure (spooler stopped, RPC unavailable, ...) is
 /// `error`: reporting it as not_found would tell an operator a printer is
 /// gone when the spooler is merely down.
 [[nodiscard]] inline OpenPrinterFailure classify_open_printer_error(uint32_t last_error) noexcept {
@@ -390,10 +390,20 @@ enum class OpenPrinterFailure { not_found, refused, error };
     return OpenPrinterFailure::error;
 }
 
+/// True for a UNC-shaped printer name (`\\server\queue`, or the `//server/queue`
+/// form `safe_output_field` renders it as in the `printers`/`jobs` rows).
+/// OpenPrinterW returns the same 1801 for an unreachable UNC server as for a
+/// missing local printer, so a not-found for such a name is never definitive.
+[[nodiscard]] inline bool is_unc_printer_name(std::string_view name) noexcept {
+    return name.starts_with("\\\\") || name.starts_with("//");
+}
+
 /// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never
 /// negative, never zero, never hex/scientific notation, and a 10+-digit
 /// string is refused outright rather than risking a silent 64-bit wrap on a
-/// platform where `int64_t` parsing of a huge digit run could overflow.
+/// platform where `int64_t` parsing of a huge digit run could overflow. The
+/// PUBLISHED definition pattern `^[1-9][0-9]{0,8}$` is deliberately stricter
+/// (no leading zeros): the agent still accepts "007" as job 7, which is safe.
 [[nodiscard]] inline std::optional<int64_t> parse_job_id(std::string_view s) {
     if (s.empty() || s.size() > 9)
         return std::nullopt;

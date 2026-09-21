@@ -527,7 +527,8 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // (mirrors test_capability_catalogue.cpp's own `build_registry`) and pins
 // the live Destructive row count. #3685's design doc claimed 14 Destructive
 // rows; counting the actual capability_decls/*.hpp fragments during this
-// checkpoint found 17 (verified via `git grep -c ".dispatch_class =
+// checkpoint found 17 (19 once power_health's and printing's rows landed;
+// verified at the time via `git grep -c ".dispatch_class =
 // DispatchClass::Destructive" capability_decls/*.hpp`) — the "four
 // Execution:Execute rows" sub-claim (script_exec.{exec,powershell,bash} +
 // content_dist.execute_staged) IS accurate, but the total is not. This case

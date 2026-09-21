@@ -19,7 +19,7 @@
           "support": "constrained"
         },
         "windows": {
-          "fallback": "",
+          "fallback": "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling a job it does not own is unmeasured (PRINTER_ACCESS_USE is a projection) - see docs/agent-privilege-model.md",
           "mechanism": "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
           "rung": "1",
           "support": "supported"
@@ -433,9 +433,9 @@
   },
   "privileges": [
     {
-      "grant": "None — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
-      "if_refused": "n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error",
-      "measured": "the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`)",
+      "grant": "None for reads — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right (measured under `SYSTEM` only). `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM` (both already elevated), and a least-privileged identity cancelling a job it does not own is **not** measured — see `docs/agent-privilege-model.md`. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
+      "if_refused": "n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error. `clear_queue` is different: `ERROR_ACCESS_DENIED` from `OpenPrinterW` or `SetJobW` reports `PERMISSION_DENIED` (`refused`)",
+      "measured": "the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`); `clear_queue` cancel also under the admin SSH identity",
       "os": "Windows",
       "runs_as": "agent service account"
     },
@@ -470,15 +470,15 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`missing_printer` / `invalid_job_id` — `windows:winspool:open_printer_failed` / `windows:winspool:set_job_failed` — `linux:cups:connect_failed` / `macos:cups:connect_failed` — `linux:cups:decode_failed` / `macos:cups:decode_failed` — `\"Cancel-Job: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
+      "provenance": "`missing_printer` / `invalid_job_id` — `windows:winspool:open_printer_failed` / `windows:winspool:printer_not_found` (UNC names only) / `windows:winspool:job_not_found` / `windows:winspool:set_job_failed` — `linux:cups:connect_failed` / `macos:cups:connect_failed` — `linux:cups:decode_failed` / `macos:cups:decode_failed` — `\"Cancel-Job: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
       "status": "`UNAVAILABLE`",
-      "when": "`clear_queue` parameter validation failed (`printer` empty or `job_id` unparseable — a fully-refused request, no OS call made), or the cancel itself could not complete: Windows `OpenPrinterW` failed for a reason other than not-found or access-denied (spooler stopped, RPC unavailable — the Win32 error is in the status detail), or `SetJobW` failed for a reason other than access; macOS/Linux the IPP Cancel-Job round trip failed at the transport/decode step, or cupsd returned a status this plugin doesn't otherwise classify"
+      "when": "`clear_queue` parameter validation failed (`printer` empty or `job_id` unparseable — a fully-refused request, no OS call made), or the cancel itself could not complete: Windows `OpenPrinterW` failed for a reason other than not-found or access-denied (spooler stopped, RPC unavailable — the Win32 error is in the status detail); Windows reported a nonexistent job (`GetJobW`, or `SetJobW` if the job finished in between — `ERROR_INVALID_PARAMETER`), which is `PARTIAL` rather than `FULL` because that code was measured only under elevated identities; Windows `OpenPrinterW` returned `ERROR_INVALID_PRINTER_NAME` for a UNC-shaped name (`\\\\server\\queue` or the `//server/queue` form the `printers`/`jobs` rows render), which the OS also returns for an unreachable server, so it is reported as `printer_not_found` but not as definitive; or `SetJobW` failed for another reason other than access (the Win32 error is in the status detail); macOS/Linux the IPP Cancel-Job round trip failed at the transport/decode step, or cupsd returned a status this plugin doesn't otherwise classify"
     },
     {
       "completeness": "full",
-      "provenance": "`windows:winspool:printer_not_found` / `windows:winspool:job_not_found` — `linux:cups:not_found` / `macos:cups:not_found`",
+      "provenance": "`windows:winspool:printer_not_found` (local names) — `linux:cups:not_found` / `macos:cups:not_found`",
       "status": "`UNAVAILABLE`",
-      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) or `GetJobW` confirms this before attempting `SetJobW`; macOS/Linux cupsd's own `client-error-not-found` (IPP `0x0406`) response"
+      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a local, non-UNC printer name; macOS/Linux cupsd's own `client-error-not-found` (IPP `0x0406`) response"
     },
     {
       "completeness": "full",
