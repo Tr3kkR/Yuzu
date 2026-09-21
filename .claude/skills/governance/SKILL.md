@@ -119,7 +119,7 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
-### Load and MATCH both routed-concern tables — do not rely on memory
+### Load and MATCH all three routed-concern tables — do not rely on memory
 
 ```bash
 # Every changed path, against every routed-concern row.

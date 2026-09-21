@@ -78,7 +78,7 @@ addressed → iterate.
 merely POINT at them are defined ONCE — in `.claude/skills/governance/SKILL.md`.** This file loses on
 conflict, and so does `.codex/skills/governance/SKILL.md`, which defers there for severity and the
 ledger. That runner does carry its own text for rules 1 and 4: it performs **no routed-concerns walk
-at all** (tracked as **#2684** — which is why the instruction above to open both tables by hand is
+at all** (tracked as **#2684** — which is why the instruction above to open all three tables by hand is
 load-bearing on this leg), and its Gate 8 phrasing is the weaker "affected gates" wording that
 shipped a broken macOS leg on #2580. The skill is read from your **working tree**, so a branch predating a change to it, or to
 the routed-concern tables, silently runs the old pipeline; Step 0 opens with a per-file currency
