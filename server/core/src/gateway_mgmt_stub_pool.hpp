@@ -297,4 +297,28 @@ classify_gateway_forward_response(const ::yuzu::server::v1::SendCommandResponse&
     return GatewayForwardOutcome::kApply;
 }
 
+/// #4672: pure builder for the synthetic terminal FAILURE `CommandResponse`
+/// `forward_gateway_pending` applies (via `process_gateway_response`) on each
+/// of its terminal-failure branches (`unauthenticated`, exhausted
+/// `unavailable`, `unknown_cluster`, a stream that produced no legitimate
+/// resolution for the targeted agent) — extracted here, alongside
+/// `classify_gateway_forward_response`, for the SAME reason that function's
+/// own doc comment gives: unit-testable without a live gRPC connection or a
+/// running server. `exit_code` is fixed at -1, matching the `not_connected`
+/// sentinel shape `classify_gateway_forward_response` above already
+/// recognizes elsewhere in this forwarding path (a synthetic, non-agent-
+/// reported terminal status).
+[[nodiscard]] inline ::yuzu::agent::v1::CommandResponse
+build_gateway_forward_terminal_failure(const std::string& command_id,
+                                       const std::string& reason_code,
+                                       const std::string& detail) {
+    ::yuzu::agent::v1::CommandResponse synth;
+    synth.set_command_id(command_id);
+    synth.set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    synth.set_exit_code(-1);
+    synth.mutable_error()->set_code(reason_code);
+    synth.mutable_error()->set_message(detail);
+    return synth;
+}
+
 } // namespace yuzu::server
