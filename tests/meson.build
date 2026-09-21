@@ -1082,6 +1082,7 @@ if build_server
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
+      'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',

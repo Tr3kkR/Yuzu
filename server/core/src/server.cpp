@@ -251,6 +251,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
 #include "gateway_service_impl.hpp"
 
@@ -1636,15 +1637,47 @@ public:
         // healthy). "unauthenticated" = the gateway's mgmt-plane peer pin
         // rejected this server's cert - fleet forwarding is down until the pin
         // and the server leaf agree.
+        //
+        // HA WS-4 4.3: added the `cluster_id` label (resolved config key, or
+        // "unknown" for an unmapped cluster — NEVER the raw gateway-asserted
+        // wire value, a cardinality risk even after ingest clamping) and
+        // three outcomes: "unknown_cluster" (no configured mgmt address for
+        // a command's resolved cluster), "not_connected" (the gateway-side
+        // "agent not connected on this cluster" error, folded into "ok"
+        // before this slice — see forward_gateway_pending's comment), and
+        // "agent_mismatch" (a response naming a different agent than the
+        // one this request targeted — refused, not applied; Fable
+        // pre-implementation review finding 6a). The label SET is derived
+        // from `cfg_` here (not `gw_mgmt_pool_`, which is built later in
+        // run(), post-bootstrap) — "default" always, plus every configured
+        // `--gateway-cluster-addr` key, matching the pool's own resolution
+        // rule exactly (GatewayMgmtStubPool's file header comment).
         metrics_.describe("yuzu_server_gateway_forward_total",
                           "Gateway SendCommand forwards by terminal outcome (ok / "
                           "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
-                          "peer pin / unavailable = dropped after 3 attempts / other). "
-                          "Any non-ok movement means commands to gateway-connected "
+                          "peer pin / unavailable = dropped after 3 attempts / "
+                          "unknown_cluster = no configured address for the resolved "
+                          "cluster / not_connected = agent not connected on the dialed "
+                          "cluster / agent_mismatch = response named a different agent, "
+                          "refused / other), labelled by the resolved cluster_id "
+                          "(config key, or 'unknown' — never the raw gateway-asserted "
+                          "value). Any non-ok movement means commands to gateway-connected "
                           "agents are being lost.",
                           "counter");
-        for (const char* st : {"ok", "unauthenticated", "unavailable", "other"}) {
-            metrics_.counter("yuzu_server_gateway_forward_total", {{"status", st}});
+        {
+            std::unordered_set<std::string> cluster_labels{
+                std::string(yuzu::server::kDefaultGatewayClusterKey)};
+            for (const auto& id : cfg_.gateway_cluster_addresses | std::views::keys)
+                cluster_labels.insert(id);
+            if (!cfg_.gateway_cluster_addresses.empty())
+                cluster_labels.insert(std::string(yuzu::server::kUnknownGatewayClusterLabel));
+            for (const auto& cl : cluster_labels) {
+                for (const char* st : {"ok", "unauthenticated", "unavailable", "other",
+                                       "unknown_cluster", "not_connected", "agent_mismatch"}) {
+                    metrics_.counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cl}, {"status", st}});
+                }
+            }
         }
 
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
@@ -3804,7 +3837,7 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // Gateway command-forwarding client (gw_mgmt_pool_, HA WS-4 4.3) is
         // built in run(), AFTER bootstrap_default_certs() — for a default-cert
         // install the client cert/key paths are empty here and only populated by
         // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
@@ -7270,27 +7303,48 @@ public:
         // unauthenticated container — including a compromised agent with no
         // CA-issued cert — can no longer push commands to the fleet. Only a
         // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
-        if (!cfg_.gateway_command_address.empty()) {
+        //
+        // HA WS-4 4.3: gw_mgmt_pool_ replaces the pre-4.3 single
+        // gw_mgmt_channel_/gw_mgmt_stub_ pair — one shared credentials object
+        // (built once, below), reused across every cluster's channel
+        // (GatewayMgmtStubPool's contract; the mgmt-plane peer pin, #1422,
+        // lives per-cluster on the GATEWAY side, not something core varies
+        // its own identity for). Built whenever EITHER
+        // --gateway-command-addr OR --gateway-cluster-addr is set — the
+        // latter alone is a valid multi-cluster-only configuration with no
+        // default/legacy address (GatewayMgmtStubPool handles an empty
+        // default_address correctly, see its constructor).
+        if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
             std::shared_ptr<grpc::ChannelCredentials> gw_creds;
             if (cfg_.tls_enabled) {
                 gw_creds = build_gateway_command_credentials();
                 if (!gw_creds)
-                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
-                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
-                                  "build mutual-TLS credentials.",
-                                  cfg_.gateway_command_address);
+                    // fail-closed: leave gw_mgmt_pool_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled — could not build "
+                                  "mutual-TLS credentials.");
             } else {
-                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
-                             "fan-out plane is unauthenticated — keep it on a trusted network.",
-                             cfg_.gateway_command_address);
+                spdlog::warn("Gateway command plane is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.");
                 gw_creds = grpc::InsecureChannelCredentials();
             }
             if (gw_creds) {
-                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
-                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-                spdlog::info("Gateway command forwarding enabled: {} ({})",
-                             cfg_.gateway_command_address,
-                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                gw_mgmt_pool_ = std::make_unique<yuzu::server::GatewayMgmtStubPool>(
+                    cfg_.gateway_command_address, cfg_.gateway_cluster_addresses, gw_creds);
+                if (gw_mgmt_pool_->multi_cluster_mode()) {
+                    spdlog::info(
+                        "Gateway command forwarding enabled: multi-cluster mode, {} cluster(s) "
+                        "configured via --gateway-cluster-addr ({})",
+                        gw_mgmt_pool_->known_clusters().size(),
+                        cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                    if (gateway_service_) {
+                        gateway_service_->set_known_gateway_clusters(
+                            &gw_mgmt_pool_->known_clusters());
+                    }
+                } else {
+                    spdlog::info("Gateway command forwarding enabled: {} ({})",
+                                 cfg_.gateway_command_address,
+                                 cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                }
             }
         }
 
@@ -9501,6 +9555,13 @@ public:
         if (gateway_service_)
             gateway_service_->set_gateway_route_store(nullptr);
         gateway_route_store_.reset();
+        // HA WS-4 4.3: same discipline — gateway_service_ holds a raw
+        // pointer to gw_mgmt_pool_'s known_clusters() set (CONNECTED-time
+        // unmapped-cluster warning), null it before the pool it points into
+        // is destroyed.
+        if (gateway_service_)
+            gateway_service_->set_known_gateway_clusters(nullptr);
+        gw_mgmt_pool_.reset();
         // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
         // every HTTP/MCP handler thread is already quiesced by the drain above);
@@ -12004,89 +12065,160 @@ private:
     /// Forward any commands queued for gateway-connected agents.
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (!gw_pending.empty() && gw_mgmt_stub_) {
-            for (auto& gp : gw_pending) {
-                auto* stub = gw_mgmt_stub_.get();
-                auto* svc = &agent_service_;
-                auto* metrics = &metrics_;
-                auto cmd_id = gp.cmd.command_id();
-                spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id]() {
-                    ::yuzu::server::v1::SendCommandRequest req;
-                    req.add_agent_ids(gp.agent_id);
-                    *req.mutable_command() = gp.cmd;
-                    req.set_timeout_seconds(300);
-
-                    // Retry up to 3 times on transient connection failures
-                    for (int attempt = 0; attempt < 3; ++attempt) {
-                        if (attempt > 0) {
-                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                         attempt + 1);
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
-                        }
-
-                        grpc::ClientContext ctx;
-                        ctx.set_deadline(std::chrono::system_clock::now() +
-                                         std::chrono::seconds(300));
-                        auto reader = stub->SendCommand(&ctx, req);
-
-                        ::yuzu::server::v1::SendCommandResponse resp;
-                        int resp_count = 0;
-                        while (reader->Read(&resp)) {
-                            ++resp_count;
-                            svc->process_gateway_response(resp.agent_id(), resp.response());
-                        }
-                        auto status = reader->Finish();
-                        if (status.ok()) {
-                            spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
-                                          cmd_id, resp_count);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "ok"}})
-                                .increment();
-                            return; // success — done
-                        }
-                        // #1422: the gateway's mgmt-plane peer pin rejects with
-                        // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                        // grpc-message when an auth_fun rejects) — the generic
-                        // warn below would render as "failed:  (16)", which is
-                        // invisible as the fleet-wide forwarding outage it
-                        // actually is. Name the cause and the fix.
-                        if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
-                            spdlog::error(
-                                "Gateway SendCommand for {} REJECTED by the gateway's "
-                                "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
-                                "server presents does not satisfy the gateway's "
-                                "mgmt_peer_pins posture (rotated leaf? BYO cert "
-                                "without repointing the pin, or without the "
-                                "serverAuth EKU?). The gateway log's reason atom "
-                                "names the exact cause. Command forwarding to "
-                                "gateway-connected agents is DOWN until the pin and "
-                                "the server leaf agree. Command dropped.",
-                                cmd_id);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "unauthenticated"}})
-                                .increment();
-                            return; // config defect — retry cannot help
-                        }
-                        // Only retry on UNAVAILABLE (connection refused / not ready)
-                        if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-                            spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                         status.error_message(),
-                                         static_cast<int>(status.error_code()));
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "other"}})
-                                .increment();
-                            return; // non-transient error — don't retry
-                        }
-                        spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                     cmd_id, attempt + 1, status.error_message());
-                    }
-                    spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                    metrics->counter("yuzu_server_gateway_forward_total",
-                                     {{"status", "unavailable"}})
-                        .increment();
-                }).detach();
+        if (gw_pending.empty() || !gw_mgmt_pool_ || gw_mgmt_pool_->empty())
+            return;
+        for (auto& gp : gw_pending) {
+            // HA WS-4 4.3: resolve per-command, against the eager pool built
+            // at boot — see GatewayMgmtStubPool's file header for the
+            // two-mode resolution rule (single-cluster mode ignores
+            // gp.cluster_id entirely; multi-cluster mode resolves it, with
+            // an unmapped cluster_id treated as a config defect below,
+            // mirroring the pre-existing UNAUTHENTICATED "retry cannot help"
+            // treatment).
+            auto resolution = gw_mgmt_pool_->resolve(gp.cluster_id);
+            auto cmd_id = gp.cmd.command_id();
+            if (!resolution.stub) {
+                spdlog::error(
+                    "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
+                    "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
+                    "cluster is DOWN until it is added",
+                    cmd_id, gp.cluster_id.value_or("<none>"));
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
+                    .increment();
+                continue;
             }
+            auto* stub = resolution.stub;
+            auto* svc = &agent_service_;
+            auto* metrics = &metrics_;
+            auto expected_agent_id = gp.agent_id;
+            auto cluster_label = resolution.label;
+            spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
+                         cluster_label, gp.agent_id);
+            std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id, expected_agent_id,
+                        cluster_label]() {
+                ::yuzu::server::v1::SendCommandRequest req;
+                req.add_agent_ids(gp.agent_id);
+                *req.mutable_command() = gp.cmd;
+                req.set_timeout_seconds(300);
+
+                // Retry up to 3 times on transient connection failures
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    if (attempt > 0) {
+                        spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
+                                     attempt + 1);
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                    }
+
+                    grpc::ClientContext ctx;
+                    ctx.set_deadline(std::chrono::system_clock::now() +
+                                     std::chrono::seconds(300));
+                    auto reader = stub->SendCommand(&ctx, req);
+
+                    ::yuzu::server::v1::SendCommandResponse resp;
+                    int resp_count = 0;
+                    while (reader->Read(&resp)) {
+                        ++resp_count;
+                        // HA WS-4 4.3 (Fable pre-implementation review,
+                        // finding 6a): this request names exactly ONE
+                        // agent_id — a response naming a different one is
+                        // either a gateway bug or, on a compromised
+                        // gateway, a forged terminal status for an agent
+                        // that gateway never held. ADR-2002 §7's whole
+                        // reason for per-cluster isolation is trust-zone
+                        // separation; refuse rather than apply it.
+                        if (resp.agent_id() != expected_agent_id) {
+                            spdlog::error(
+                                "Gateway SendCommand for {} received a response for agent "
+                                "'{}' but this request targeted '{}' — REFUSING to apply it "
+                                "(possible cross-cluster response forgery)",
+                                cmd_id, resp.agent_id(), expected_agent_id);
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "agent_mismatch"}})
+                                .increment();
+                            continue;
+                        }
+                        // HA WS-4 4.3 (Fable pre-implementation review,
+                        // finding 1a): a gateway-side "agent not connected
+                        // on this cluster" error (yuzu_gw_mgmt_service.erl's
+                        // stream_responses/3) is a FAILURE response with a
+                        // real command_id (as of the paired gateway fix) but
+                        // a synthetic output/exit_code — distinguish it so
+                        // it isn't silently folded into "ok" below (Finish()
+                        // still returns OK for a streamed response). This is
+                        // the PRIMARY signal of a stale/wrong cluster
+                        // resolution in a multi-cluster deployment.
+                        if (resp.response().status() ==
+                                ::yuzu::agent::v1::CommandResponse::FAILURE &&
+                            resp.response().exit_code() == -1 &&
+                            (resp.response().output() == "not_connected" ||
+                             resp.response().output() == "agent_disconnected")) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "not_connected"}})
+                                .increment();
+                        }
+                        svc->process_gateway_response(resp.agent_id(), resp.response());
+                    }
+                    auto status = reader->Finish();
+                    if (status.ok()) {
+                        spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
+                                      cmd_id, resp_count);
+                        metrics
+                            ->counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cluster_label}, {"status", "ok"}})
+                            .increment();
+                        return; // success — done
+                    }
+                    // #1422: the gateway's mgmt-plane peer pin rejects with
+                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
+                    // grpc-message when an auth_fun rejects) — the generic
+                    // warn below would render as "failed:  (16)", which is
+                    // invisible as the fleet-wide forwarding outage it
+                    // actually is. Name the cause and the fix.
+                    if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+                        spdlog::error(
+                            "Gateway SendCommand for {} REJECTED by the gateway's "
+                            "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
+                            "server presents does not satisfy the gateway's "
+                            "mgmt_peer_pins posture (rotated leaf? BYO cert "
+                            "without repointing the pin, or without the "
+                            "serverAuth EKU?). The gateway log's reason atom "
+                            "names the exact cause. Command forwarding to "
+                            "gateway-connected agents is DOWN until the pin and "
+                            "the server leaf agree. Command dropped.",
+                            cmd_id);
+                        metrics
+                            ->counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cluster_label},
+                                      {"status", "unauthenticated"}})
+                            .increment();
+                        return; // config defect — retry cannot help
+                    }
+                    // Only retry on UNAVAILABLE (connection refused / not ready)
+                    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
+                        spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
+                                     status.error_message(),
+                                     static_cast<int>(status.error_code()));
+                        metrics
+                            ->counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cluster_label}, {"status", "other"}})
+                            .increment();
+                        return; // non-transient error — don't retry
+                    }
+                    spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
+                                 cmd_id, attempt + 1, status.error_message());
+                }
+                spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
+                metrics
+                    ->counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", cluster_label}, {"status", "unavailable"}})
+                    .increment();
+            }).detach();
         }
     }
 
@@ -19160,8 +19292,9 @@ private:
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
-    std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
-    std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
+    // HA WS-4 4.3: replaces the pre-4.3 single gw_mgmt_channel_/gw_mgmt_stub_
+    // pair — see the construction site's comment.
+    std::unique_ptr<yuzu::server::GatewayMgmtStubPool> gw_mgmt_pool_;
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;
