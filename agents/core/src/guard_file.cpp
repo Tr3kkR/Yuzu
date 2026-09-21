@@ -191,8 +191,8 @@ void FileGuard::run() try {
     ChangeNotifyHandle ancestor_event; // FindFirstChangeNotificationW (normalises -1 → empty)
     bool read_pending = false;
 
-    // Parent-of-armed-directory watch (own buffer/event/OVERLAPPED; p_dir is declared last so
-    // it closes first). X = the directory armed above; its parent P is read for X's rename.
+    // Parent-of-armed-directory watch (own buffer/event/OVERLAPPED; p_dir is declared after
+    // them so it closes first). X = the directory armed above; its parent P is read for X's rename.
     alignas(8) std::byte p_buf[32 * 1024];
     EventHandle p_event(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     OVERLAPPED p_ov{};
@@ -274,9 +274,16 @@ void FileGuard::run() try {
         p_reset();
         x_leaf.clear();
         x_id.reset();
-        if (!p_event)
+        if (!p_event) {
+            if (!p_logged) {
+                p_logged = true;
+                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
+                             "(event creation failed)",
+                             cfg_.rule_id, cfg_.path);
+            }
             return;
-        if (!x.has_relative_path() || x.filename().empty()) { // a volume root has no parent
+        }
+        if (!x.has_relative_path() || x.filename().empty()) { // no parent above a root
             if (!p_logged) {
                 p_logged = true;
                 spdlog::debug("Guardian FileGuard[{}]: no parent directory to watch above {}",
@@ -458,9 +465,12 @@ void FileGuard::run() try {
             if (h_dir) {
                 x_id = dir_file_id(h_dir.get());
             } else {
+                // OPEN_REPARSE_POINT: for a mount-point or junction X the id must be the
+                // directory entry's own, which is what P's record carries.
                 DirHandle xh(CreateFileW(x.wstring().c_str(), FILE_READ_ATTRIBUTES,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                                         nullptr, OPEN_EXISTING,
+                                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                          nullptr));
                 if (xh)
                     x_id = dir_file_id(xh.get());
@@ -472,11 +482,16 @@ void FileGuard::run() try {
     // Re-resolve the watch from scratch (no eval): arm the parent-dir watch if the
     // parent exists, else the nearest-ancestor watch for its (re)creation, plus the watch
     // on X's parent. Sets arm_retry when NEITHER could be armed so the wait loop self-heals.
-    // X can change between resolving it and arming (a rename in that window): re-check, bounded.
+    // X can change between resolving it and arming (a rename in that window): re-check, bounded;
+    // if it keeps changing, the parent watch may be armed for a stale X, so schedule a re-arm.
     auto arm_watch = [&] {
         for (int attempt = 0; attempt < 3; ++attempt)
             if (arm_watch_once() == nearest_existing_dir())
-                break;
+                return;
+        spdlog::warn("Guardian FileGuard[{}]: watched directory kept changing while arming {} - "
+                     "degraded re-arm in {}ms",
+                     cfg_.rule_id, cfg_.path, kArmFailRetryMs);
+        arm_retry = true;
     };
 
     auto eval_now = [&] {
@@ -628,11 +643,16 @@ void FileGuard::run() try {
         } else if (idx_p != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_p) {
             DWORD bytes = 0;
             const BOOL got = GetOverlappedResult(p_dir.get(), &p_ov, &bytes, FALSE);
-            if (got == FALSE && GetLastError() == ERROR_IO_INCOMPLETE)
+            const DWORD p_err = got ? ERROR_SUCCESS : GetLastError();
+            if (got == FALSE && p_err == ERROR_IO_INCOMPLETE)
                 continue; // spurious signal: the read is still in flight
             p_pending = false;
             p_failures = got ? 0 : p_failures + 1;
             if (p_failures > kParentFailureLimit) {
+                if (p_failures == kParentFailureLimit + 1) // once per entry into this state
+                    spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} failing "
+                                 "repeatedly (err={}) - degraded re-arm in {}ms",
+                                 cfg_.rule_id, cfg_.path, p_err, kArmFailRetryMs);
                 p_reset();
                 arm_retry = true; // repeated failures: bounded degraded re-arm, not a rebuild loop
             } else if (got == FALSE || parent_change_is_ours(bytes)) {
