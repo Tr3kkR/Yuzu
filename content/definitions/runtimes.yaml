@@ -1,14 +1,12 @@
 ## Runtimes Definitions
-## Reports installed .NET (Core/5+), JVM and Python runtimes. Read-only, zero subprocess.
-## Plugin: runtimes | Actions: dotnet, jvm, python
+## Reports installed .NET (Core/5+) and JVM runtimes. Read-only, zero subprocess.
+## Plugin: runtimes | Actions: dotnet, jvm
 ##
 ## SHIPPED LEG: Linux only, rung 1 (directory names and metadata-file reads;
-## no `java`, `dotnet` or `python3` process is ever started).
+## no `java` or `dotnet` process is ever started).
 ##   Linux:   /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version>
 ##            and sdk/<version> directory walk (dotnet);
-##            /usr/lib/jvm/*/release + /opt/java/*/release file reads (jvm);
-##            /usr/bin/python3* names + /usr/lib/python3*, /usr/local/lib/python3* directory
-##            walk (python).
+##            /usr/lib/jvm/*/release + /opt/java/*/release file reads (jvm).
 ##
 ## macOS AND WINDOWS: planned — follows as its own PR (peripherals PR9.1a2 precedent).
 ## Until then every action on those hosts answers a single
@@ -16,12 +14,9 @@
 ## are declared in the plugin descriptor (runtimes_plugin.cpp):
 ##   macOS:   /usr/local/share/dotnet/shared walk (dotnet);
 ##            /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict +
-##            Contents/Home/release (jvm);
-##            /Library/Frameworks + CommandLineTools Python3.framework Versions +
-##            Cellar/python@3.* (python).
+##            Contents/Home/release (jvm).
 ##   Windows: NDP release-key table + dotnet InstalledVersions + Program Files walk (dotnet);
-##            JavaSoft keys + Program Files\Java walk (jvm);
-##            PEP 514 PythonCore keys (python).
+##            JavaSoft keys + Program Files\Java walk (jvm).
 ##
 ## Every action's output is: one `status|<action>|<level>|<reason>` row FIRST, then zero or
 ## more `<action>|<flavour>|<version>|<install_path>|<vendor>` rows. A `supported` status
@@ -176,91 +171,6 @@ spec:
         platforms: [linux]
 
   readablePayload: "List installed JVMs"
-
-  gather:
-    ttlSeconds: 300
-
-  approval:
-    mode: auto
-
-  permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
-    authorRoles: [content-author]
-
-  compatibility:
-    minAgentVersion: 1.0.0
-    requiredPlugins: [runtimes]
-
-status:
-  phase: active
-
----
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: crossplatform.runtimes.python
-  displayName: Python Interpreter Inventory
-  version: 1.0.0
-  description: >
-    Reports installed CPython interpreters on Linux: one row per python3 /
-    python3.<minor> name in /usr/bin (a symlink is reported as the path it
-    points at) and one per python3.<minor> library directory under /usr/lib and
-    /usr/local/lib — flavour (cpython, unmodelled), version, install path. One
-    interpreter can therefore appear as more than one row (binary and library
-    directory), each with its own install path. No `python3` process is
-    started. A `supported` status with no rows means none is installed; a
-    `constrained` status means a read failed and the list may be incomplete.
-    macOS and Windows: planned — follows as its own PR (peripherals PR9.1a2
-    precedent); those hosts answer a single
-    `status|python|unsupported|<macos|windows>:planned` row.
-  tags: [runtimes, python, inventory]
-
-spec:
-  type: question
-  platforms: [windows, linux, darwin]
-
-  execution:
-    plugin: runtimes
-    action: python
-    concurrency: per-device
-
-  parameters:
-    type: object
-    properties: {}
-
-  result:
-    # status|python|<level>|<reason>   (always first)
-    # python|<flavour>|<version>|<install_path>|<vendor or ->
-    columns:
-      - name: row_kind
-        type: string
-        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), python (one per runtime found).'
-        values: [status, python]
-        example: python
-        platforms: [linux]
-      - name: flavour
-        type: string
-        description: 'Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython). Status rows: the action name.'
-        values: [cpython, unmodelled]
-        example: cpython
-        platforms: [linux]
-      - name: version
-        type: string
-        description: 'Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter. Status rows: the level (supported, constrained or unsupported).'
-        example: "3.11"
-        platforms: [linux]
-      - name: install_path
-        type: string
-        description: 'Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path. Status rows: the comma-joined failure tokens, or -.'
-        example: /usr/bin/python3.11
-        platforms: [linux]
-      - name: vendor
-        type: string
-        description: 'Always "-" for python: the interpreter name carries no vendor.'
-        example: "-"
-        platforms: [linux]
-
-  readablePayload: "List installed Python interpreters"
 
   gather:
     ttlSeconds: 300

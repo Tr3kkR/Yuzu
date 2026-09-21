@@ -1,6 +1,6 @@
 /**
  * runtimes_parsers.hpp -- the PURE parsing / row-formatting layer for the
- * runtimes plugin (installed .NET, JVM and Python runtimes).
+ * runtimes plugin (installed .NET and JVM runtimes).
  *
  * Everything here is a free function over plain data: no OS call, no I/O, no
  * logging, no platform header (the repo's pure-core / thin-shell discipline;
@@ -8,9 +8,9 @@
  * compiles and is unit-tested on EVERY OS (tests/unit/test_runtimes_parsers.cpp,
  * unguarded); the OS-reading legs live in runtimes_{linux,macos,win}.cpp.
  *
- * ZERO SUBPROCESS. The plugin never runs `java -version`, `dotnet
- * --list-runtimes` or `python3 --version`: every fact comes from a directory
- * name or a metadata file the runtime's installer laid down.
+ * ZERO SUBPROCESS. The plugin never runs `java -version` or `dotnet
+ * --list-runtimes`: every fact comes from a directory name or a metadata file
+ * the runtime's installer laid down.
  *
  * WIRE GRAMMAR. Every action emits, in this order:
  *
@@ -29,10 +29,9 @@
  * from "no data" (which is an empty optional / no row):
  *   dotnet  core | sdk | unmodelled
  *   jvm     jdk | jre | unmodelled
- *   python  cpython | unmodelled
  * This PR ships only the Linux legs, so the vocabulary is the Linux subset;
  * the macOS and Windows legs (each its own PR) add their own flavours
- * (.NET Framework, Homebrew/CLT/Framework Python) with those legs.
+ * (.NET Framework) with those legs.
  *
  * Free-text fields (version, path, vendor) are untrusted OS-supplied text and
  * go through yuzu::util::safe_output_field, so a value containing '|' or
@@ -70,7 +69,6 @@ enum class StatusLevel { supported, constrained, unsupported };
 
 enum class DotnetFlavour { core, sdk, unmodelled };
 enum class JvmFlavour { jdk, jre, unmodelled };
-enum class PythonFlavour { cpython, unmodelled };
 
 [[nodiscard]] constexpr std::string_view flavour_token(DotnetFlavour f) noexcept {
     switch (f) {
@@ -85,13 +83,6 @@ enum class PythonFlavour { cpython, unmodelled };
     case JvmFlavour::jdk:        return "jdk";
     case JvmFlavour::jre:        return "jre";
     case JvmFlavour::unmodelled: return "unmodelled";
-    }
-    return "unmodelled";
-}
-[[nodiscard]] constexpr std::string_view flavour_token(PythonFlavour f) noexcept {
-    switch (f) {
-    case PythonFlavour::cpython:    return "cpython";
-    case PythonFlavour::unmodelled: return "unmodelled";
     }
     return "unmodelled";
 }
@@ -230,39 +221,6 @@ struct DotnetEntry {
     return e;
 }
 
-// -- Python names -------------------------------------------------------------
-
-/// Linux name shapes: `python3.12` -> "3.12", `3.12` -> "3.12",
-/// `3.12.4` -> "3.12.4", `python3` -> "3". A dotted-numeric version of 1-3
-/// components, optionally prefixed by exactly "python". nullopt for anything
-/// else (`python3.12-config`, `python3.11d`, `pypy3`, ``). The macOS Cellar
-/// shape (`3.12.4_1`) is added with the macOS leg.
-[[nodiscard]] inline std::optional<std::string> python_version_from_name(std::string_view name) {
-    constexpr std::string_view prefix = "python";
-    if (name.substr(0, prefix.size()) == prefix) name.remove_prefix(prefix.size());
-    if (name.empty()) return std::nullopt;
-    std::size_t components = 1;
-    bool prev_dot = true; // a leading '.' is malformed
-    for (char c : name) {
-        if (detail::is_digit(c)) {
-            prev_dot = false;
-        } else if (c == '.' && !prev_dot) {
-            prev_dot = true;
-            ++components;
-        } else {
-            return std::nullopt;
-        }
-    }
-    if (prev_dot || components > 3) return std::nullopt; // trailing '.' / too many parts
-    return std::string{name};
-}
-
-/// `cpython` when the name parses as a CPython interpreter name/version;
-/// `unmodelled` otherwise (e.g. `pypy3`, `python3.12-config`).
-[[nodiscard]] inline PythonFlavour python_flavour_from_name(std::string_view name) {
-    return python_version_from_name(name) ? PythonFlavour::cpython : PythonFlavour::unmodelled;
-}
-
 // -- row formatters -------------------------------------------------------------
 //
 // Return the row WITHOUT a trailing newline (write_output/append_output insert
@@ -364,16 +322,6 @@ struct StatusOutcome {
     const auto e = dotnet_entry_from_dir(framework_dir, version_dir);
     if (!e) return std::nullopt;
     return format_runtime_row("dotnet", flavour_token(e->flavour), e->version, install_path, "");
-}
-
-/// python row for one interpreter name (`python3.11`) at `install_path`.
-/// nullopt when the name is not a CPython interpreter name.
-[[nodiscard]] inline std::optional<std::string> python_row(std::string_view name,
-                                                           std::string_view install_path) {
-    const auto v = python_version_from_name(name);
-    if (!v) return std::nullopt;
-    return format_runtime_row("python", flavour_token(python_flavour_from_name(name)), *v,
-                              install_path, "");
 }
 
 } // namespace yuzu::runtimes

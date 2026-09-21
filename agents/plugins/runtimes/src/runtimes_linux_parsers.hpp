@@ -3,19 +3,16 @@
  * runtimes plugin, over an INJECTED ROOT (peripherals_linux_parsers.hpp shape:
  * production passes "/", the unit suite a materialized fixture tree).
  *
- * Two halves: a PORTABLE pure layer (failure tokens, errno -> token maps,
- * Python name predicates, link-target handling, the python row builder) that
- * compiles on every OS, and a WALK SHELL (`#if !defined(_WIN32)`, because
- * agents/shared/posix_dir_walk.hpp is POSIX-only) holding `dotnet_rows_at` /
- * `jvm_rows_at` / `python_rows_at`.
+ * Two halves: a PORTABLE pure layer (failure tokens, errno -> token maps, path
+ * helpers) that compiles on every OS, and a WALK SHELL (`#if !defined(_WIN32)`,
+ * because agents/shared/posix_dir_walk.hpp is POSIX-only) holding
+ * `dotnet_rows_at` / `jvm_rows_at` and the injected-root leg body
+ * `run_linux_at`.
  *
  * WHAT IS READ (<root> + a literal, rung 1, zero subprocess):
  *   dotnet  usr/share/dotnet, usr/lib/dotnet, usr/lib64/dotnet:
  *           shared/<framework>/<version> and sdk/<version> directory names.
  *   jvm     usr/lib/jvm/<d>/release and opt/java/<d>/release (parse_release_file).
- *   python  python3 / python3.<minor> names in usr/bin (a symlink's link target
- *           is recorded as install_path) plus python3.<minor> directories under
- *           usr/lib and usr/local/lib.
  *
  * SYMLINK SAFETY. Every directory is opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW
  * (private copy of autoruns_macos.cpp's open_dir_no_follow_checked /
@@ -35,8 +32,8 @@
  * symlink swapped in between listing and open (ELOOP) and a symlinked
  * `release` file.
  *
- * ENUMERATED ENTRY SYMLINKS ARE SKIPPED SILENTLY (a framework, version, JVM
- * home or python lib dir that is itself a symlink): distribution alias entries
+ * ENUMERATED ENTRY SYMLINKS ARE SKIPPED SILENTLY (a framework, version or JVM
+ * home that is itself a symlink): distribution alias entries
  * (Debian default-java and java-1.17.0-openjdk-*, Fedora java -> /etc/alternatives)
  * are pervasive and their real directory is a sibling entry. Documented gap: a
  * runtime reachable ONLY through such an entry symlink is not inventoried.
@@ -138,34 +135,6 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
     }
 }
 
-/// `python3` or `python3.<minor>` (minor = one or more digits): the interpreter
-/// names read under <root>/usr/bin. Rejects python3.11-config, python3.11d,
-/// python2.7, python3. and the bare `python`.
-[[nodiscard]] inline bool is_python3_bin_name(std::string_view n) noexcept {
-    constexpr std::string_view p = "python3";
-    if (n.substr(0, p.size()) != p) return false;
-    n.remove_prefix(p.size());
-    if (n.empty()) return true;
-    if (n.front() != '.' || n.size() < 2) return false;
-    for (char c : n.substr(1))
-        if (!detail::is_digit(c)) return false;
-    return true;
-}
-
-/// `python3.<minor>` only (a directory under <root>/usr/lib or /usr/local/lib):
-/// unlike a bin name, bare `python3` is rejected -- /usr/lib/python3 is Debian's
-/// dist-packages holder, not an interpreter's library.
-[[nodiscard]] inline bool is_python3_lib_dir_name(std::string_view n) noexcept {
-    return n.size() > 8 && n.substr(0, 8) == "python3." && is_python3_bin_name(n);
-}
-
-/// Last path component of `p` (no trailing-slash handling: link targets are
-/// not directories here).
-[[nodiscard]] inline std::string_view path_basename(std::string_view p) noexcept {
-    const auto sl = p.rfind('/');
-    return sl == std::string_view::npos ? p : p.substr(sl + 1);
-}
-
 /// `dir` + "/" + `name`, avoiding a doubled slash when dir is "/".
 [[nodiscard]] inline std::string join_logical(std::string_view dir, std::string_view name) {
     std::string out{dir};
@@ -174,39 +143,11 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
     return out;
 }
 
-/// The install path recorded for a symlinked interpreter: an absolute link
-/// target as-is; a relative one lexically joined onto the directory holding
-/// the link (`python3.11` in /usr/bin -> /usr/bin/python3.11). Never resolved,
-/// never normalised -- the target is untrusted text the walk did not follow.
-[[nodiscard]] inline std::string logical_link_target(std::string_view dir,
-                                                     std::string_view target) {
-    if (!target.empty() && target.front() == '/') return std::string{target};
-    return join_logical(dir, target);
-}
-
-/// The python row for one interpreter name under `dir_logical` (e.g. "/usr/bin").
-/// `link_target` is nullopt for a regular file, the readlink text for a
-/// symlink. A symlink whose target's basename is a CPython name is reported as
-/// that target (so `python3 -> python3.11` and `python3.11` collapse to one
-/// row after the caller's exact-row dedupe); a symlink to anything else (e.g.
-/// `pypy3`) is `unmodelled` with version `-` -- never guessed to be CPython.
-[[nodiscard]] inline std::optional<std::string> python_bin_row(
-    std::string_view dir_logical, std::string_view name,
-    const std::optional<std::string>& link_target) {
-    if (!link_target) return python_row(name, join_logical(dir_logical, name));
-    const std::string target = logical_link_target(dir_logical, *link_target);
-    const std::string_view base = path_basename(target);
-    if (python_version_from_name(base)) return python_row(base, target);
-    return format_runtime_row("python", flavour_token(PythonFlavour::unmodelled), "", target, "");
-}
-
 /// Candidate roots (root-relative, normalised), grouped by what they hold. A
 /// symlinked candidate is an alias only of another candidate in ITS group.
 inline constexpr std::array<std::string_view, 3> kDotnetRoots{"usr/share/dotnet", "usr/lib/dotnet",
                                                               "usr/lib64/dotnet"};
 inline constexpr std::array<std::string_view, 2> kJvmRoots{"usr/lib/jvm", "opt/java"};
-inline constexpr std::array<std::string_view, 1> kPythonBinRoots{"usr/bin"};
-inline constexpr std::array<std::string_view, 2> kPythonLibRoots{"usr/lib", "usr/local/lib"};
 
 /// Lexically normalises a root-relative path: empty and `.` components dropped,
 /// `..` pops one. nullopt when a `..` would climb above the root. Pure text --
@@ -464,7 +405,7 @@ struct EntryInfo {
 /// unspecified, and rows must be deterministic), reading at most `max_entries`
 /// real entries (production: kMaxDirEntries; a parameter so the cap and its
 /// `truncated` propagation are testable without 16k files). `keep(name)` filters BEFORE
-/// the per-entry fstatat, so a large /usr/bin costs one stat per candidate
+/// the per-entry fstatat, so a large directory costs one stat per candidate
 /// name, not per file. A vanished entry (ENOENT) is skipped; any other stat
 /// failure, a hit cap and a readdir I/O error are recorded.
 template <typename Keep>
@@ -643,65 +584,30 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
     return rows;
 }
 
-/// python: python3 / python3.<minor> names in <root>/usr/bin (a symlink's
-/// target recorded as install_path), then python3.<minor> directories under
-/// <root>/usr/lib and <root>/usr/local/lib.
-[[nodiscard]] inline std::vector<std::string> python_rows_at(
-    const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
-    std::size_t max_entries = kMaxDirEntries) {
-    using namespace walk;
-    std::vector<std::string> rows;
-    const std::string root_s = root.string();
-
-    for (const std::string_view rel : kPythonBinRoots) {
-        const DirHandle bin = open_path(root_s, rel, kPythonBinRoots, acc);
-        if (!bin) continue;
-        for (const auto& e : list_entries(bin.get(), acc, max_entries, is_python3_bin_name)) {
-            if (e.type == EntryType::directory) continue;
-            std::optional<std::string> link;
-            if (e.type == EntryType::symlink) {
-                char buf[4096];
-                const ssize_t n = ::readlinkat(::dirfd(bin.get()), e.name.c_str(), buf, sizeof buf);
-                if (n < 0) {
-                    if (errno != ENOENT) acc.add_failure(kTokReadFailed);
-                    continue;
-                }
-                if (static_cast<std::size_t>(n) == sizeof buf) { // possibly truncated target
-                    acc.add_failure(kTokReadFailed);
-                    continue;
-                }
-                link = std::string(buf, static_cast<std::size_t>(n));
-            }
-            if (auto row = python_bin_row("/" + std::string{rel}, e.name, link))
-                push_unique(rows, std::move(*row));
-        }
-    }
-
-    for (const std::string_view rel : kPythonLibRoots) {
-        const DirHandle lib = open_path(root_s, rel, kPythonLibRoots, acc);
-        if (!lib) continue;
-        const std::string logical = "/" + std::string{rel};
-        for (const auto& e : list_entries(lib.get(), acc, max_entries, is_python3_lib_dir_name)) {
-            if (e.type != EntryType::directory) continue;
-            if (auto row = python_row(e.name, join_logical(logical, e.name)))
-                push_unique(rows, std::move(*row));
-        }
-    }
-    return rows;
-}
-
 /// The Linux leg's dispatch: the rows for action `a` under `root`, failures
-/// recorded in `acc`. run_linux_at (runtimes_linux.cpp) is this plus emit_read;
-/// it lives here so the action -> walk wiring is unit-testable without linking
-/// the plugin TU.
+/// recorded in `acc`. run_linux_at is this plus emit_read; both live here so the
+/// action -> walk -> emit wiring is unit-testable without linking the plugin TU.
 [[nodiscard]] inline std::vector<std::string> action_rows_at(
     Action a, const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
     switch (a) {
     case Action::dotnet: return dotnet_rows_at(root, acc);
     case Action::jvm:    return jvm_rows_at(root, acc);
-    case Action::python: return python_rows_at(root, acc);
     }
     return {};
+}
+
+/// The Linux leg body with the filesystem root injected: `action_rows_at` plus
+/// `emit_read` (status row first, then every data row, then the typed result
+/// status). runtimes_linux.cpp's `run_linux` calls it with "/"; the unit suite
+/// drives it over a materialized fixture tree through a real CommandContext
+/// (LocalDispatcher), so what is asserted is the rows AND the status the command
+/// actually reports. Returns 0 unconditionally: a degraded read is not a failed
+/// command; the degradation rides the status row and set_result_status.
+inline int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root) {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto rows = action_rows_at(a, root, acc);
+    emit_read(ctx, a, rows, acc);
+    return 0;
 }
 
 #endif // !defined(_WIN32)

@@ -1,20 +1,19 @@
 /**
  * runtimes_plugin.cpp -- installed language-runtime inventory for Yuzu:
- * .NET, JVM and Python. A software-inventory fact distinct from
- * installed_apps' packaged-application view: a .NET runtime, a JDK and a
- * system Python are not discrete application entries.
+ * .NET and JVM. A software-inventory fact distinct from installed_apps'
+ * packaged-application view: a .NET runtime and a JDK are not discrete
+ * application entries.
  *
  * Actions:
  *   "dotnet" -- installed .NET (Core/5+) runtimes and SDKs.
  *   "jvm"    -- installed JVMs: version, JDK/JRE image type, vendor
  *               (e.g. Eclipse Adoptium vs Debian OpenJDK vs Oracle).
- *   "python" -- installed CPython interpreters.
  *
  * Wire rows (runtimes_parsers.hpp): a `status|<action>|...` row first, then
  * `<action>|<flavour>|<version>|<install_path>|<vendor or ->` data rows.
  *
  * ZERO SUBPROCESS. Every fact is a directory name or a metadata file read
- * (rung 1); no `java`, `dotnet` or `python3` process is ever started.
+ * (rung 1); no `java` or `dotnet` process is ever started.
  *
  * SHIPPED LEGS. Linux only. The macOS and Windows legs are declared PLANNED
  * in the table below (mechanism names the plan) and each follows as its own
@@ -23,7 +22,7 @@
  *
  * This TU is portable except for its single dispatch #if, which selects the
  * one host leg to call -- so a single-OS build never links the other two
- * legs' symbols. All nine descriptor legs are declared unconditionally so
+ * legs' symbols. All six descriptor legs are declared unconditionally so
  * the capability-matrix generator (#2204) sees a complete, stable shape.
  *
  * Read-only: no action here mutates host state.
@@ -40,7 +39,7 @@
 
 namespace {
 
-// The nine per-action per-OS legs (three actions x three OSes) are FIXED and
+// The six per-action per-OS legs (two actions x three OSes) are FIXED and
 // never wrapped in a preprocessor conditional.
 constexpr const char* kPlannedNote = "follows as its own PR (peripherals PR9.1a2 precedent)";
 
@@ -71,19 +70,6 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1, "JavaSoft keys + Program Files\\Java walk", kPlannedNote},
     },
-    {
-        /* .action      = */ "python",
-        /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1,
-         "/usr/bin/python3* names + /usr/lib/python3*, /usr/local/lib/python3* directory walk",
-         nullptr},
-        /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "/Library/Frameworks + CommandLineTools Python3.framework Versions + Cellar/python@3.*",
-         kPlannedNote},
-        /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "PEP 514 PythonCore keys", kPlannedNote},
-    },
 };
 
 } // namespace
@@ -93,11 +79,11 @@ public:
     std::string_view name() const noexcept override { return "runtimes"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Installed .NET, JVM and Python runtime inventory";
+        return "Installed .NET and JVM runtime inventory";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"dotnet", "jvm", "python", nullptr};
+        static const char* acts[] = {"dotnet", "jvm", nullptr};
         return acts;
     }
 

@@ -1,6 +1,6 @@
 Directory: tests/unit/fixtures/wave10/runtimes/linux/
 Package: P1b-1 (runtimes pure parsers). One directory-level provenance file; every
-fixture below is labelled. All four are REAL CAPTURE from command-only Docker
+fixture below is labelled. All three are REAL CAPTURE from command-only Docker
 containers (no long-running service, nothing installed beyond the stated apt packages);
 none is invented or reconstructed.
 
@@ -32,10 +32,3 @@ command:   cd /usr/share/dotnet && find shared -mindepth 2 -maxdepth 2 | sort
 note:      the runtime image has no sdk/ directory; the `sdk/<version>` shape is covered
            by inline strings in the test, not by a capture.
 lines:     1 (budget 5)
-
--- python_usr_bin_listing.txt --
-status:    REAL CAPTURE
-image:     debian:bookworm, after `apt-get install -y python3-minimal` (3.11.2-1+b1)
-command:   ls -1 /usr/bin | grep '^python'
-note:      /usr/bin/python3 is a symlink to python3.11 in this image.
-lines:     2 (budget 10)

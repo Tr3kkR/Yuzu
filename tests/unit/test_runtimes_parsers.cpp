@@ -219,40 +219,6 @@ TEST_CASE("runtimes: dotnet_entry_from_dir maps frameworks, sdk, unmodelled and 
     CHECK_FALSE(rt::dotnet_entry_from_dir("Microsoft.NETCore.App", "8/../x").has_value());
 }
 
-// -- python ---------------------------------------------------------------------------
-
-TEST_CASE("runtimes: python_version_from_name covers the Linux name shapes", "[runtimes]") {
-    CHECK(rt::python_version_from_name("python3.12") == std::optional<std::string>{"3.12"});
-    CHECK(rt::python_version_from_name("3.12") == std::optional<std::string>{"3.12"});
-    CHECK(rt::python_version_from_name("3.12.4") == std::optional<std::string>{"3.12.4"});
-    CHECK(rt::python_version_from_name("python3") == std::optional<std::string>{"3"});
-    for (const char* bad : {"", "python", "pypy3", "python3.12-config", "python3.11d", "3.",
-                            ".3", "3..12", "python3.12.4.1", "python 3.12", "python3.x"}) {
-        INFO("name: " << bad);
-        CHECK_FALSE(rt::python_version_from_name(bad).has_value());
-    }
-}
-
-TEST_CASE("runtimes: python names from the real debian:bookworm /usr/bin listing", "[runtimes]") {
-    const auto names = lines_of(read_fixture("python_usr_bin_listing.txt"));
-    REQUIRE(names.size() == 2);
-    std::vector<std::string> rows;
-    for (const auto& n : names) {
-        const auto row = rt::python_row(n, "/usr/bin/" + n);
-        REQUIRE(row.has_value());
-        rows.push_back(*row);
-    }
-    CHECK(rows[0] == "python|cpython|3|/usr/bin/python3|-");
-    CHECK(rows[1] == "python|cpython|3.11|/usr/bin/python3.11|-");
-}
-
-TEST_CASE("runtimes: python flavour mapper has an unmodelled outcome", "[runtimes]") {
-    CHECK(rt::python_flavour_from_name("python3.12") == rt::PythonFlavour::cpython);
-    CHECK(rt::python_flavour_from_name("pypy3") == rt::PythonFlavour::unmodelled);
-    CHECK(rt::flavour_token(rt::PythonFlavour::unmodelled) == "unmodelled");
-    CHECK_FALSE(rt::python_row("pypy3", "/usr/bin/pypy3").has_value());
-}
-
 // -- status rows and composition ---------------------------------------------------------
 
 TEST_CASE("runtimes: an absent family is supported with zero data rows", "[runtimes]") {
@@ -264,11 +230,12 @@ TEST_CASE("runtimes: an absent family is supported with zero data rows", "[runti
 
 TEST_CASE("runtimes: the status row precedes every data row", "[runtimes]") {
     yuzu::shared::ConstraintAccumulator acc;
-    const std::vector<std::string> data = {"python|cpython|3.11|/usr/bin/python3.11|-",
-                                           "python|cpython|3|/usr/bin/python3|-"};
-    const auto out = rt::compose_output("python", data, acc);
+    const std::vector<std::string> data = {
+        "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
+        "jvm|unmodelled|17.0.20.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian"};
+    const auto out = rt::compose_output("jvm", data, acc);
     REQUIRE(out.size() == 3);
-    CHECK(out[0] == "status|python|supported|-");
+    CHECK(out[0] == "status|jvm|supported|-");
     CHECK(out[1] == data[0]);
     CHECK(out[2] == data[1]);
 }
@@ -310,7 +277,7 @@ TEST_CASE("runtimes: a trailing backslash or embedded pipe cannot shift the fiel
     REQUIRE(f1.size() == 5);
     CHECK(f1[4] == "V");
 
-    const auto piped = rt::format_runtime_row("python", "cpython", "3.11", "/opt/we|ird/", "a|b");
+    const auto piped = rt::format_runtime_row("dotnet", "core", "8.0.31", "/opt/we|ird/", "a|b");
     const auto f2 = split_fields_escape_aware(piped);
     REQUIRE(f2.size() == 5);
     CHECK(f2[3] == "/opt/we|ird/");
@@ -328,7 +295,7 @@ TEST_CASE("runtimes: empty free-text fields render as a dash", "[runtimes]") {
 // -- action mapping ---------------------------------------------------------------------------
 
 TEST_CASE("runtimes: action names round-trip and unknown names are rejected", "[runtimes]") {
-    for (auto a : {rt::Action::dotnet, rt::Action::jvm, rt::Action::python}) {
+    for (auto a : {rt::Action::dotnet, rt::Action::jvm}) {
         CHECK(rt::parse_action(rt::action_name(a)) == std::optional<rt::Action>{a});
     }
     CHECK_FALSE(rt::parse_action("java").has_value());

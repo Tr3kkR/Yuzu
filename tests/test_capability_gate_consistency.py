@@ -120,10 +120,10 @@ FRAGMENT_FILES = [
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) = 209.
-# Wave 10 PR10.1-b: + runtimes (dotnet, jvm, python) = 212. (The integrator
+# Wave 10 PR10.1-b: + runtimes (dotnet, jvm) = 211. (The integrator
 # re-sums against origin/dev at merge time — other in-flight plugin PRs add
 # their own rows to this same counter.)
-EXPECTED_TOTAL_ROWS = 212
+EXPECTED_TOTAL_ROWS = 211
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

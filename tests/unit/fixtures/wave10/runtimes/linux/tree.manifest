@@ -33,17 +33,3 @@ usr/lib/jvm/java-1.17.0-openjdk-arm64	L:java-17-openjdk-arm64
 #   under /usr/share/dotnet (a runtime image: no sdk/). The version directory's own contents
 #   were not captured, so it is an empty directory here (RECONSTRUCTION of its contents only).
 usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31	D:
-# -- Python -------------------------------------------------------------------------
-# REAL CAPTURE: debian:12 aarch64 container after `apt-get install -y python3-minimal`
-#   (2026-09-21): `ls -l /usr/bin | grep python` and
-#   `ls -1d /usr/lib/python3* /usr/local/lib/python3*`
-#   (-> /usr/lib/python3, /usr/lib/python3.11, /usr/local/lib/python3.11).
-#   Non-interpreter symlinks (pdb3.11, py3versions) are kept: they must NOT become rows.
-#   The python3.11 binary's content is irrelevant to the walk (empty placeholder file).
-usr/bin/pdb3.11	L:../lib/python3.11/pdb.py
-usr/bin/py3versions	L:../share/python3/py3versions.py
-usr/bin/python3	L:python3.11
-usr/bin/python3.11	T:
-usr/lib/python3	D:
-usr/lib/python3.11	D:
-usr/local/lib/python3.11	D:

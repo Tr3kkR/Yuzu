@@ -1,5 +1,4 @@
-# runtimes -- installed .NET / JVM / Python runtime inventory (read-only,
-# zero subprocess).
+# runtimes -- installed .NET / JVM runtime inventory (read-only, zero subprocess).
 # Multi-TU shape follows agents/plugins/peripherals/meson.build: one portable
 # plugin TU plus three per-OS leg TUs, each #if-gated internally for its own
 # target so all four are listed unconditionally. No platform frameworks or

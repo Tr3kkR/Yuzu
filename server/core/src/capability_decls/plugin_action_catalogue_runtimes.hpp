@@ -7,11 +7,11 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_runtimes.hpp
-/// One fragment of the command capability catalogue: `runtimes`'s three
+/// One fragment of the command capability catalogue: `runtimes`'s two
 /// read-only actions (`agents/plugins/runtimes/src/runtimes_plugin.cpp`).
 /// Classified by READING the implementation, per this package's spec.
 ///
-/// `dotnet`/`jvm`/`python` are ReadOnly/None on every leg: each is a
+/// `dotnet`/`jvm` are ReadOnly/None on every leg: each is a
 /// directory-name or metadata-file read (rung 1, zero subprocess) that
 /// mutates nothing. Grouped under the existing `Inventory` securable, the
 /// same read-only-fact-collection precedent `printing`, `peripherals` and
@@ -24,7 +24,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueRuntimes{{
+inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueRuntimes{{
     {
         .plugin = "runtimes",
         .action = "dotnet",
@@ -39,17 +39,6 @@ inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueRuntimes
     {
         .plugin = "runtimes",
         .action = "jvm",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Inventory",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "runtimes",
-        .action = "python",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

@@ -6,8 +6,8 @@
  * SCOPED GUARD (reasoned exception to the never-guard-a-test-TU rule): the walk
  * shell is built on agents/shared/posix_dir_walk.hpp, which does not exist on
  * Windows, so the tree walk tests sit in one `#if !defined(_WIN32)` region.
- * Everything else (manifest decoder, name predicates, errno maps, python row
- * builder, wire-grammar checks) is unguarded. The dispatcher TU is never guarded.
+ * Everything else (manifest decoder, errno maps, wire-grammar checks) is
+ * unguarded. The dispatcher TU is never guarded.
  *
  * FIXTURE TREE. tests/unit/fixtures/wave10/runtimes/linux/tree.manifest
  * describes a root subtree (REAL CAPTURE structure: eclipse-temurin:17,
@@ -23,7 +23,9 @@
  * resetting the accumulator per root turns the "later root never hides an
  * earlier failure" case red; dropping O_NOFOLLOW on `release` surfaces the
  * planted target as a row; following symlinked entries duplicates rows; dropping
- * the 64 KiB bound or the nullopt-row check loses the oversize/unparsable tokens.
+ * the 64 KiB bound or the nullopt-row check loses the oversize/unparsable tokens;
+ * discarding the rows before emit_read in run_linux_at (or reporting OK/FULL
+ * regardless of the accumulator) turns the run_linux_at CommandContext case red.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -37,12 +39,17 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
 
 #if !defined(_WIN32)
+#include "local_dispatcher.hpp" // yuzu::agent::LocalDispatcher (a real CommandContext)
+
+#include <yuzu/plugin.h>
+
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -129,25 +136,6 @@ ParsedLine parse_manifest_line(std::string line) {
     return r;
 }
 
-/// Escape-aware field split (safe_output_field writes a literal '|' as "\|").
-std::vector<std::string> split_fields_escape_aware(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
-
 bool token_matches_leg_grammar(std::string_view t) {
     // ^linux:[a-z0-9_]+(:[a-z0-9_]+)*$
     constexpr std::string_view p = "linux:";
@@ -192,12 +180,12 @@ TEST_CASE("runtimes linux: manifest line decoder handles every payload kind",
     CHECK(crlf.entry.kind == ManifestKind::text);
     CHECK(crlf.entry.payload == "JAVA_VERSION=\"17\"\n");
 
-    auto l = parse_manifest_line("usr/bin/python3\tL:python3.11");
+    auto l = parse_manifest_line("usr/lib/jvm/java-1.17.0-openjdk-arm64\tL:java-17-openjdk-arm64");
     REQUIRE(l.outcome == LineOutcome::entry);
     CHECK(l.entry.kind == ManifestKind::symlink);
-    CHECK(l.entry.payload == "python3.11");
+    CHECK(l.entry.payload == "java-17-openjdk-arm64");
 
-    auto d = parse_manifest_line("usr/lib/python3.11\tD:");
+    auto d = parse_manifest_line("usr/share/dotnet/sdk\tD:");
     REQUIRE(d.outcome == LineOutcome::entry);
     CHECK(d.entry.kind == ManifestKind::directory);
 }
@@ -210,20 +198,6 @@ TEST_CASE("runtimes linux: manifest line decoder rejects malformed lines, never 
         INFO("line: " << bad);
         CHECK(parse_manifest_line(bad).outcome == LineOutcome::malformed);
     }
-}
-
-TEST_CASE("runtimes linux: python bin and lib-dir name predicates",
-          "[runtimes][linux][parsers]") {
-    for (const char* ok : {"python3", "python3.11", "python3.9", "python3.123"})
-        CHECK(lnx::is_python3_bin_name(ok));
-    for (const char* no : {"python", "python2.7", "python3.", "python3.11-config", "python3.11d",
-                           "python3x", "pypy3", "", "Python3", "python3.1.1", "python33"})
-        CHECK_FALSE(lnx::is_python3_bin_name(no));
-
-    CHECK(lnx::is_python3_lib_dir_name("python3.11"));
-    CHECK_FALSE(lnx::is_python3_lib_dir_name("python3")); // Debian dist-packages holder
-    CHECK_FALSE(lnx::is_python3_lib_dir_name("python3.11-config"));
-    CHECK_FALSE(lnx::is_python3_lib_dir_name("python3."));
 }
 
 TEST_CASE("runtimes linux: errno maps separate absent from failure",
@@ -255,41 +229,10 @@ TEST_CASE("runtimes linux: every failure token matches the leg-token grammar",
     }
 }
 
-TEST_CASE("runtimes linux: python_bin_row resolves symlink targets without following them",
+TEST_CASE("runtimes linux: join_logical avoids a doubled slash",
           "[runtimes][linux][parsers]") {
-    // A regular file: version from its own name, path = dir + name.
-    CHECK(lnx::python_bin_row("/usr/bin", "python3.11", std::nullopt) ==
-          "python|cpython|3.11|/usr/bin/python3.11|-");
-    // Relative link (the debian:12 capture: python3 -> python3.11): reported as its target,
-    // so the alias and the target collapse to one row.
-    CHECK(lnx::python_bin_row("/usr/bin", "python3", std::string{"python3.11"}) ==
-          "python|cpython|3.11|/usr/bin/python3.11|-");
-    // Absolute link target kept as-is.
-    CHECK(lnx::python_bin_row("/usr/bin", "python3", std::string{"/opt/py/bin/python3.12"}) ==
-          "python|cpython|3.12|/opt/py/bin/python3.12|-");
-    // A link to a non-CPython interpreter is `unmodelled`, never guessed to be CPython.
-    CHECK(lnx::python_bin_row("/usr/bin", "python3", std::string{"pypy3"}) ==
-          "python|unmodelled|-|/usr/bin/pypy3|-");
-    // dir "/" does not double the slash.
     CHECK(lnx::join_logical("/", "usr") == "/usr");
     CHECK(lnx::join_logical("/usr", "bin") == "/usr/bin");
-}
-
-TEST_CASE("runtimes linux: python_bin_row keeps the wire field count on hostile link targets",
-          "[runtimes][linux][parsers][wire]") {
-    // X12: a link target is untrusted text that can carry a pipe or end in a backslash; the
-    // escape-aware split must still see exactly five fields (mutation: bypassing
-    // safe_output_field fails both).
-    const auto piped = lnx::python_bin_row("/usr/bin", "python3", std::string{"a|b|c"});
-    REQUIRE(piped.has_value());
-    CHECK(split_fields_escape_aware(*piped).size() == 5);
-
-    const auto trailing = lnx::python_bin_row("/usr/bin", "python3", std::string{"evil\\"});
-    REQUIRE(trailing.has_value());
-    const auto f = split_fields_escape_aware(*trailing);
-    CHECK(f.size() == 5);
-    CHECK(f[0] == "python");
-    CHECK(f[1] == "unmodelled");
 }
 
 TEST_CASE("runtimes linux: push_unique collapses identical rows only",
@@ -396,6 +339,50 @@ const char* kDebianRow = "jvm|unmodelled|17.0.20.1|/usr/lib/jvm/java-17-openjdk-
 const char* kDotnetRow =
     "dotnet|core|8.0.31|/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31|-";
 
+// -- CommandContext-level harness --------------------------------------------------------
+// Drives the PRODUCTION leg body (lnx::run_linux_at) through a real CommandContext via
+// LocalDispatcher (the test_filesystem_posture_local_dispatcher.cpp precedent: a synthetic
+// descriptor whose execute() calls the code under test), so what is asserted is the rows the
+// command actually emits AND the typed result status it reports -- not only the walk's return
+// values.
+
+struct LegRun {
+    int rc = -1;
+    std::vector<std::string> rows;
+    YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
+    YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+    std::string provenance;
+};
+
+const fs::path* g_leg_root = nullptr;
+
+int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
+                std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    const auto a = rt::parse_action(action);
+    if (!a) return 1;
+    return lnx::run_linux_at(ctx, *a, *g_leg_root);
+}
+
+LegRun run_leg(rt::Action action, const fs::path& root) {
+    g_leg_root = &root;
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &leg_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, rt::action_name(action));
+    g_leg_root = nullptr;
+
+    LegRun out;
+    out.rc = result.rc;
+    out.status = result.result_status;
+    out.completeness = result.result_completeness;
+    out.provenance = result.result_provenance;
+    std::istringstream lines(result.captured);
+    for (std::string line; std::getline(lines, line);)
+        if (!line.empty()) out.rows.push_back(line);
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("runtimes linux: jvm_rows_at reads both roots' release files, skips the alias symlink",
@@ -423,22 +410,6 @@ TEST_CASE("runtimes linux: dotnet_rows_at reads the captured runtime tree",
     CHECK_FALSE(acc.any_failure());
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == kDotnetRow);
-}
-
-TEST_CASE("runtimes linux: python_rows_at reads /usr/bin names and lib dirs, dedupes the alias",
-          "[runtimes][linux][walk]") {
-    yuzu::test::TempDir dir{"yuzu_test_runtimes_python_"};
-    std::string err;
-    REQUIRE(materialize_manifest(dir.path, err));
-    Acc acc;
-    const auto rows = lnx::python_rows_at(dir.path, acc);
-    CHECK_FALSE(acc.any_failure());
-    // python3 -> python3.11 and python3.11 are one row; pdb3.11 / py3versions (non-interpreter
-    // symlinks) and the version-less /usr/lib/python3 are not rows.
-    REQUIRE(rows.size() == 3);
-    CHECK(rows[0] == "python|cpython|3.11|/usr/bin/python3.11|-");
-    CHECK(rows[1] == "python|cpython|3.11|/usr/lib/python3.11|-");
-    CHECK(rows[2] == "python|cpython|3.11|/usr/local/lib/python3.11|-");
 }
 
 TEST_CASE("runtimes linux: dotnet sdk, unmodelled framework and non-version entries (SYNTHETIC)",
@@ -471,7 +442,6 @@ TEST_CASE("runtimes linux: an absent root is supported with zero rows, not const
         Acc acc;
         CHECK(lnx::dotnet_rows_at(root, acc).empty());
         CHECK(lnx::jvm_rows_at(root, acc).empty());
-        CHECK(lnx::python_rows_at(root, acc).empty());
         CHECK_FALSE(acc.any_failure());
         const auto out = rt::compose_output("jvm", {}, acc);
         REQUIRE(out.size() == 1);
@@ -654,8 +624,7 @@ TEST_CASE("runtimes linux: a symlinked shared/ or sdk/ subdirectory is refused (
     CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
 }
 
-TEST_CASE("runtimes linux: a symlinked jvm or python root with no alternative is refused "
-          "(SYNTHETIC)",
+TEST_CASE("runtimes linux: a symlinked jvm root with no alternative is refused (SYNTHETIC)",
           "[runtimes][linux][walk]") {
     yuzu::test::TempDir dir{"yuzu_test_runtimes_refused_jvm_"};
     make_dir(dir.path / "srv/jvm/jdk/");
@@ -664,19 +633,11 @@ TEST_CASE("runtimes linux: a symlinked jvm or python root with no alternative is
     std::error_code ec;
     fs::create_symlink("../../srv/jvm", dir.path / "usr/lib/jvm", ec);
     REQUIRE_FALSE(ec);
-    make_dir(dir.path / "srv/bin");
-    fs::create_symlink("../srv/bin", dir.path / "usr/bin", ec);
-    REQUIRE_FALSE(ec);
 
     Acc jvm_acc;
     CHECK(lnx::jvm_rows_at(dir.path, jvm_acc).empty());
     REQUIRE(jvm_acc.any_failure());
     CHECK(jvm_acc.reason() == std::string{lnx::kTokSymlinkRefused});
-
-    Acc py_acc;
-    CHECK(lnx::python_rows_at(dir.path, py_acc).empty());
-    REQUIRE(py_acc.any_failure());
-    CHECK(py_acc.reason() == std::string{lnx::kTokSymlinkRefused});
 }
 
 TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `truncated` "
@@ -691,8 +652,6 @@ TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `tr
         make_dir(dir.path / "usr/lib/dotnet/sdk" / v);
     for (const char* h : {"a", "b", "c", "d", "e"})
         write_text(dir.path / "usr/lib/jvm" / h / "release", "JAVA_VERSION=\"17.0.1\"\n");
-    for (const char* n : {"python3.5", "python3.6", "python3.7", "python3.8", "python3.9"})
-        write_text(dir.path / "usr/bin" / n, "");
 
     const auto check_truncated = [](const std::vector<std::string>& rows, const Acc& acc) {
         CHECK(rows.size() == kCap); // bounded, not all 5
@@ -706,10 +665,6 @@ TEST_CASE("runtimes linux: the per-directory cap bounds the rows and becomes `tr
     {
         Acc acc;
         check_truncated(lnx::jvm_rows_at(dir.path, acc, kCap), acc);
-    }
-    {
-        Acc acc;
-        check_truncated(lnx::python_rows_at(dir.path, acc, kCap), acc);
     }
     // Boundary: a directory holding exactly `cap` entries is complete, not truncated.
     {
@@ -753,20 +708,6 @@ TEST_CASE("runtimes linux: a version-less release is constrained; a home without
     CHECK(acc.reason() == std::string{lnx::kTokReleaseUnparsable}); // only the garbled one
 }
 
-TEST_CASE("runtimes linux: a non-CPython python3 symlink is unmodelled (SYNTHETIC)",
-          "[runtimes][linux][walk]") {
-    yuzu::test::TempDir dir{"yuzu_test_runtimes_pypy_"};
-    make_dir(dir.path / "usr/bin");
-    std::error_code ec;
-    fs::create_symlink("pypy3", dir.path / "usr/bin/python3", ec);
-    REQUIRE_FALSE(ec);
-    Acc acc;
-    const auto rows = lnx::python_rows_at(dir.path, acc);
-    CHECK_FALSE(acc.any_failure());
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "python|unmodelled|-|/usr/bin/pypy3|-");
-}
-
 TEST_CASE("runtimes linux: action_rows_at routes each action to its own walk",
           "[runtimes][linux][walk][wire]") {
     // The injected entry point run_linux_at is `action_rows_at` + emit_read. Exact-row
@@ -786,17 +727,10 @@ TEST_CASE("runtimes linux: action_rows_at routes each action to its own walk",
     CHECK_FALSE(dn_acc.any_failure());
     CHECK(dn == std::vector<std::string>{kDotnetRow});
 
-    Acc py_acc;
-    const auto py = lnx::action_rows_at(rt::Action::python, dir.path, py_acc);
-    CHECK_FALSE(py_acc.any_failure());
-    CHECK(py == std::vector<std::string>{"python|cpython|3.11|/usr/bin/python3.11|-",
-                                         "python|cpython|3.11|/usr/lib/python3.11|-",
-                                         "python|cpython|3.11|/usr/local/lib/python3.11|-"});
-
     // The composed output a consumer sees: status row first, then the rows, per action.
     for (const auto& [action, rows, acc] :
-         {std::tuple{rt::Action::jvm, &jvm, &jvm_acc}, std::tuple{rt::Action::dotnet, &dn, &dn_acc},
-          std::tuple{rt::Action::python, &py, &py_acc}}) {
+         {std::tuple{rt::Action::jvm, &jvm, &jvm_acc},
+          std::tuple{rt::Action::dotnet, &dn, &dn_acc}}) {
         const auto out = rt::compose_output(rt::action_name(action), *rows, *acc);
         REQUIRE(out.size() == rows->size() + 1);
         CHECK(out[0] == std::string{"status|"} + std::string{rt::action_name(action)} +
@@ -817,15 +751,42 @@ TEST_CASE("runtimes linux: action_rows_at carries a failure through for every ac
     REQUIRE_FALSE(ec);
     fs::create_symlink("../../srv", dir.path / "usr/lib/jvm", ec);
     REQUIRE_FALSE(ec);
-    fs::create_symlink("../srv", dir.path / "usr/bin", ec);
-    REQUIRE_FALSE(ec);
-    for (const auto action : {rt::Action::dotnet, rt::Action::jvm, rt::Action::python}) {
+    for (const auto action : {rt::Action::dotnet, rt::Action::jvm}) {
         INFO("action: " << rt::action_name(action));
         Acc acc;
         CHECK(lnx::action_rows_at(action, dir.path, acc).empty());
         REQUIRE(acc.any_failure());
         CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
     }
+}
+
+TEST_CASE("runtimes linux: run_linux_at emits the populated rows and OK/FULL through a real "
+          "CommandContext",
+          "[runtimes][linux][walk][wire]") {
+    // The populated jvm and dotnet rows are asserted here at the command level, not just below
+    // the emission seam (action_rows_at): the host-independent replacement for a host-guaranteed
+    // populated-row assertion (a CI runner may have no JVM or .NET installed).
+    // MUTATION: discarding the rows before emit_read in run_linux_at (`emit_read(ctx, a, {}, acc)`)
+    // leaves only the status row and fails the exact-row assertions below; reporting OK/FULL
+    // regardless of the accumulator or dropping the status row fails the status assertions.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_leg_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+
+    const auto jvm = run_leg(rt::Action::jvm, dir.path);
+    CHECK(jvm.rc == 0);
+    // status row first, then the two captured homes in root order (the alias symlink is no row).
+    CHECK(jvm.rows == std::vector<std::string>{"status|jvm|supported|-", kDebianRow, kTemurinRow});
+    CHECK(jvm.status == YUZU_RESULT_STATUS_OK);
+    CHECK(jvm.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(jvm.provenance.empty());
+
+    const auto dn = run_leg(rt::Action::dotnet, dir.path);
+    CHECK(dn.rc == 0);
+    CHECK(dn.rows == std::vector<std::string>{"status|dotnet|supported|-", kDotnetRow});
+    CHECK(dn.status == YUZU_RESULT_STATUS_OK);
+    CHECK(dn.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(dn.provenance.empty());
 }
 
 #endif // !defined(_WIN32)

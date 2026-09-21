@@ -24,13 +24,12 @@
 namespace yuzu::runtimes {
 
 /// One value per `actions()` entry (runtimes_plugin.cpp).
-enum class Action { dotnet, jvm, python };
+enum class Action { dotnet, jvm };
 
 [[nodiscard]] constexpr std::string_view action_name(Action a) noexcept {
     switch (a) {
     case Action::dotnet: return "dotnet";
     case Action::jvm:    return "jvm";
-    case Action::python: return "python";
     }
     return "dotnet";
 }
@@ -40,7 +39,6 @@ enum class Action { dotnet, jvm, python };
 [[nodiscard]] constexpr std::optional<Action> parse_action(std::string_view s) noexcept {
     if (s == "dotnet") return Action::dotnet;
     if (s == "jvm") return Action::jvm;
-    if (s == "python") return Action::python;
     return std::nullopt;
 }
 

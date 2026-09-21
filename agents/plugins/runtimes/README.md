@@ -14,9 +14,9 @@
 
 ## How it works
 
-`dotnet`, `jvm` and `python` each answer one software-inventory question: which language runtimes are installed on this host. The Linux leg walks the standard install roots with no-follow directory opens and reads metadata files only: `dotnet` lists `shared/<framework>/<version>` and `sdk/<version>` directory names under `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads the `release` file of every home under `/usr/lib/jvm` and `/opt/java`; `python` lists `python3` / `python3.<minor>` names in `/usr/bin` and `python3.<minor>` library directories under `/usr/lib` and `/usr/local/lib`. The plugin is zero-subprocess: no `java`, `dotnet` or `python3` process is ever run, and every fact is a directory name or a file the runtime's installer laid down. Every action writes one `status` row first, then zero or more runtime rows, so an empty list is never inferred from silence. The plugin is read-only and is a different view from `installed_apps`: a .NET runtime, a JDK and a system Python are not discrete packaged-application entries.
+`dotnet` and `jvm` each answer one software-inventory question: which language runtimes are installed on this host. The Linux leg walks the standard install roots with no-follow directory opens and reads metadata files only: `dotnet` lists `shared/<framework>/<version>` and `sdk/<version>` directory names under `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads the `release` file of every home under `/usr/lib/jvm` and `/opt/java`. The plugin is zero-subprocess: no `java` or `dotnet` process is ever run, and every fact is a directory name or a file the runtime's installer laid down. Every action writes one `status` row first, then zero or more runtime rows, so an empty list is never inferred from silence. The plugin is read-only and is a different view from `installed_apps`: a .NET runtime and a JDK are not discrete packaged-application entries.
 
-Two drivers stand behind the plugin, quoted from the repository's own decision records. ADR-0028 (agent component inventory), Decision 1(b): *"Embedded-runtime (Electron/Chromium/Node) detection... This is the single largest silent-false-negative class on a corporate fleet (Slack, Teams, Discord, VS Code) — the parent app's own version reflects none of the embedded runtime's CVE surface."* ADR-0024 (software licensing and entitlements), independently: *"runtimes — vendor/distribution/version, Oracle JDK vs the OpenJDK builds..."* Read plainly: this plugin inventories installed .NET, JVM and CPython runtimes; it does not detect Electron, Chromium or Node runtimes embedded inside applications, which is the ADR-0028 case that shares its ancestry. The `vendor` field of `jvm` is the licensing-audit fact.
+Two drivers stand behind the plugin, quoted from the repository's own decision records. ADR-0028 (agent component inventory), Decision 1(b): *"Embedded-runtime (Electron/Chromium/Node) detection... This is the single largest silent-false-negative class on a corporate fleet (Slack, Teams, Discord, VS Code) — the parent app's own version reflects none of the embedded runtime's CVE surface."* ADR-0024 (software licensing and entitlements), independently: *"runtimes — vendor/distribution/version, Oracle JDK vs the OpenJDK builds..."* Read plainly: this plugin inventories installed .NET and JVM runtimes; it does not detect Electron, Chromium or Node runtimes embedded inside applications, which is the ADR-0028 case that shares its ancestry. The `vendor` field of `jvm` is the licensing-audit fact.
 
 ```mermaid
 flowchart LR
@@ -115,7 +115,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 - **Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.
 - **Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin runs only on an explicit instruction dispatch and there is no agent daily-sync source for runtimes.
 - **Sensitivity.** Rows name installed runtimes with their exact version, install path and vendor, which is a patch-level and licensing-relevant software inventory for the device. The Linux leg reads only fixed system roots (`/usr`, `/opt`), so no user-profile path or account name appears in a row.
-- **Siblings:** `crossplatform.runtimes.dotnet`, `crossplatform.runtimes.jvm`, `crossplatform.runtimes.python`.
+- **Siblings:** `crossplatform.runtimes.dotnet`, `crossplatform.runtimes.jvm`.
 
 ## Sample output
 
@@ -142,10 +142,9 @@ python|cpython|3.13|/usr/local/lib/python3.13|-
 
 ## Caveats and known gaps
 
-1. **macOS and Windows legs planned — each follows as its own PR.** Only the Linux leg ships here; on macOS and Windows every action answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) and Homebrew or Framework Pythons arrive with those legs, and the flavour vocabulary above is the Linux subset until then.
-2. **Runtimes reachable only through an alias entry are not listed.** A framework, version, JVM home or Python library entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
-3. **One Python install can yield several rows.** The interpreter name in `/usr/bin` and each `python3.<minor>` library directory are separate rows with their own install path; nothing merges them beyond exact-row duplicates.
-4. **Only standard locations are walked.** A runtime installed elsewhere (a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles.
+1. **macOS and Windows legs planned — each follows as its own PR.** Only the Linux leg ships here; on macOS and Windows every action answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with those legs, and the flavour vocabulary above is the Linux subset until then.
+2. **Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
+3. **Only standard locations are walked.** A runtime installed elsewhere (a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles.
 
 ## Source and tests
 

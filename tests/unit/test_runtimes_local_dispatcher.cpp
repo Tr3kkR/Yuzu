@@ -8,12 +8,14 @@
  * Windows leg and stayed green). Only the EXPECTATIONS differ per host, selected
  * with `#if` on the expectation, never on the test:
  *   Linux   -- status row first (supported or constrained, never unsupported),
- *              following rows five escape-aware fields, `python` >= 1 data row.
- *              Mutation: removing the run_linux -> *_rows_at wiring leaves the
- *              stub `unsupported` row and fails the python case.
+ *              following rows five escape-aware fields. Mutation: removing the
+ *              run_linux -> run_linux_at wiring leaves the stub `unsupported` row
+ *              and fails the never-unsupported status assertion.
  *   macOS / Windows -- exactly `status|<action>|unsupported|<os>:planned`.
  * No host-specific count or name assertion for dotnet or jvm: CI runners are
- * unknown hosts where those runtimes may legitimately be absent.
+ * unknown hosts where those runtimes may legitimately be absent. The populated
+ * rows are asserted host-independently in test_runtimes_linux_parsers.cpp
+ * (run_linux_at through a real CommandContext over the REAL CAPTURE fixture tree).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -133,7 +135,7 @@ std::optional<LoadedPlugin> load_runtimes_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-constexpr const char* kActions[] = {"dotnet", "jvm", "python"};
+constexpr const char* kActions[] = {"dotnet", "jvm"};
 
 #if defined(_WIN32)
 constexpr const char* kPlannedToken = "windows:planned";
@@ -146,7 +148,7 @@ constexpr const char* kPlannedToken = "macos:planned";
 bool is_flavour(const std::string& action, const std::string& f) {
     if (action == "dotnet") return f == "core" || f == "sdk" || f == "unmodelled";
     if (action == "jvm") return f == "jdk" || f == "jre" || f == "unmodelled";
-    return f == "cpython" || f == "unmodelled"; // python
+    return false;
 }
 #endif
 
@@ -244,25 +246,6 @@ TEST_CASE("runtimes plugin: the Linux leg reads the host and never reports unsup
             CHECK(is_flavour(a, f[1]));
         }
     }
-}
-
-TEST_CASE("runtimes plugin: python reports at least one interpreter row on Linux",
-          "[runtimes][actions]") {
-    auto plugin = load_runtimes_plugin();
-    if (!plugin) {
-        require_plugin_or_skip();
-        return;
-    }
-    yuzu::agent::LocalDispatcher dispatcher;
-    auto result = dispatcher.run(plugin->descriptor, "python");
-    const auto rows = captured_rows(result.captured);
-    // status row + >= 1 data row: this is the assertion that FAILS if the run_linux wiring (or
-    // the /usr/bin walk) is removed -- the stub emitted only an `unsupported` status row.
-    REQUIRE(rows.size() >= 2);
-    const auto f = split_fields_escape_aware(rows[1]);
-    REQUIRE(f.size() == 5);
-    CHECK(f[0] == "python");
-    CHECK(is_flavour("python", f[1]));
 }
 
 #endif

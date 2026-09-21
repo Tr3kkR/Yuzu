@@ -3,8 +3,7 @@
  *
  * The macOS reads (/usr/local/share/dotnet/shared walk; the
  * /Library/Java/JavaVirtualMachines Info.plist JavaVM dictionary +
- * Contents/Home/release; the Python.framework / CommandLineTools / Homebrew
- * Cellar Python roots) follow as their own PR (peripherals PR9.1a2
+ * Contents/Home/release) follow as their own PR (peripherals PR9.1a2
  * precedent). Until then every action reports
  * `status|<action>|unsupported|macos:planned`, matching the PLANNED macOS
  * legs the descriptor table in runtimes_plugin.cpp declares.
