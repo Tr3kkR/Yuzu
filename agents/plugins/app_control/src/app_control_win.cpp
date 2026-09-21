@@ -65,7 +65,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <format>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -85,35 +84,36 @@ constexpr wchar_t kCipActiveSubdir[] = L"\\System32\\CodeIntegrity\\CiPolicies\\
 constexpr DWORD kMaxValueBytes = 4096;      // per-value data cap (CI\Policy values are tiny)
 constexpr DWORD kMaxValueNameChars = 16384; // registry's documented maximum value-name length
 constexpr DWORD kMaxValues = 256;
+
+// The pure classifier (app_control_parsers.hpp) carries these as plain integers.
+static_assert(kErrorSuccess == static_cast<std::uint32_t>(ERROR_SUCCESS));
+static_assert(kErrorFileNotFound == static_cast<std::uint32_t>(ERROR_FILE_NOT_FOUND));
+static_assert(kErrorPathNotFound == static_cast<std::uint32_t>(ERROR_PATH_NOT_FOUND));
+static_assert(kErrorAccessDenied == static_cast<std::uint32_t>(ERROR_ACCESS_DENIED));
+
 struct Outcome {
     yuzu::shared::ConstraintAccumulator acc;
     bool denied = false;
 
-    void fail_rc(const char* what, LONG rc) {
-        if (rc == ERROR_ACCESS_DENIED) {
+    /// Classifies one Win32 read result, records its failure token (an absence carries none) and
+    /// returns the state; the decision is the pure classify_win32_read.
+    RegRead note(std::string_view what, LONG rc, ReadKind kind) {
+        const auto f = classify_win32_read(what, static_cast<std::uint32_t>(rc), kind);
+        if (f.access_denied)
             denied = true;
-            acc.add_failure("permission_denied");
-        } else {
-            acc.add_failure(std::format("{}_{:#x}", what, static_cast<std::uint32_t>(rc)));
-        }
+        if (!f.token.empty())
+            acc.add_failure(f.token);
+        return f.state;
     }
 };
 
 /// Emits the constrained row on any failure, sets the typed status; exit 0 only when OK.
 int finish(yuzu::CommandContext& ctx, const Outcome& o, std::string_view source) {
-    if (!o.acc.any_failure()) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, source);
-        return 0;
-    }
-    ctx.write_output(format_constrained_row(o.acc.reason()));
-    ctx.set_result_status(o.denied ? YUZU_RESULT_STATUS_PERMISSION_DENIED
-                                   : YUZU_RESULT_STATUS_CONSTRAINED,
-                          YUZU_RESULT_COMPLETENESS_PARTIAL, o.acc.reason());
-    return 1;
-}
-
-bool is_absent_rc(LONG rc) {
-    return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
+    const auto v = select_verdict(o.acc, o.denied, source);
+    if (v.constrained_row_due)
+        ctx.write_output(format_constrained_row(o.acc.reason()));
+    ctx.set_result_status(v.status, v.completeness, v.provenance);
+    return v.rc;
 }
 
 /// One REG_DWORD: ERROR_SUCCESS, the query error, or ERROR_INVALID_DATA (wrong type/size).
@@ -130,14 +130,13 @@ void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
     yuzu::win::RegKey key;
     const LONG open_rc =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, kCiPolicyKey, 0, KEY_READ | KEY_WOW64_64KEY, key.put());
-    if (is_absent_rc(open_rc)) {
+    const auto open = o.note("ci_policy_open", open_rc, ReadKind::open_or_query);
+    if (open == RegRead::absent) {
         ctx.write_output(format_wdac_key_absent_row());
         return;
     }
-    if (open_rc != ERROR_SUCCESS) {
-        o.fail_rc("ci_policy_open", open_rc);
+    if (open != RegRead::ok)
         return;
-    }
 
     std::vector<wchar_t> name(kMaxValueNameChars);
     std::vector<wchar_t> data(kMaxValueBytes / sizeof(wchar_t)); // aligned for reg_sz_to_utf8
@@ -157,10 +156,8 @@ void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
             o.acc.add_failure("value_too_large"); // skipped; enumeration continues
             continue;
         }
-        if (rc != ERROR_SUCCESS) {
-            o.fail_rc("ci_policy_enum", rc);
+        if (o.note("ci_policy_enum", rc, ReadKind::enumerate) != RegRead::ok)
             break;
-        }
 
         RegValueView v;
         v.name = yuzu::win::from_wide(name.data(), static_cast<int>(name_len));
@@ -225,43 +222,32 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
     yuzu::win::RegKey root;
     const LONG root_rc =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSrpV2Key, 0, KEY_READ | KEY_WOW64_64KEY, root.put());
-    if (is_absent_rc(root_rc))
+    if (o.note("srpv2_open", root_rc, ReadKind::open_or_query) != RegRead::ok)
         return 0;
-    if (root_rc != ERROR_SUCCESS) {
-        o.fail_rc("srpv2_open", root_rc);
-        return 0;
-    }
 
     std::size_t written = 0;
     for (const auto collection : kApplockerCollections) {
         yuzu::win::RegKey sub;
         const LONG sub_rc = RegOpenKeyExW(root.get(), yuzu::win::to_wide(collection).c_str(), 0,
                                           KEY_READ | KEY_WOW64_64KEY, sub.put());
-        if (is_absent_rc(sub_rc))
-            continue; // collection not configured
-        if (sub_rc != ERROR_SUCCESS) {
-            o.fail_rc("srpv2_collection_open", sub_rc);
-            continue;
-        }
+        if (o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query) != RegRead::ok)
+            continue; // absent = collection not configured; unreadable = recorded, never absent
 
         std::optional<std::uint32_t> mode;
         std::uint32_t raw_mode = 0;
         const LONG mode_rc = read_u32(sub.get(), L"EnforcementMode", raw_mode);
-        if (mode_rc == ERROR_SUCCESS)
-            mode = raw_mode;
-        else if (!is_absent_rc(mode_rc)) {
-            o.fail_rc("enforcement_mode_read", mode_rc); // wrong type / denied: never rendered as absent
-            continue;
-        }
+        const auto mode_read = o.note("enforcement_mode_read", mode_rc, ReadKind::open_or_query);
+        if (mode_read == RegRead::unreadable)
+            continue; // wrong type / denied: never rendered as absent
+        if (mode_read == RegRead::ok)
+            mode = raw_mode; // absent leaves it nullopt
 
         DWORD rule_subkeys = 0;
         const LONG info_rc = RegQueryInfoKeyW(sub.get(), nullptr, nullptr, nullptr, &rule_subkeys,
                                               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                               nullptr);
-        if (info_rc != ERROR_SUCCESS) {
-            o.fail_rc("srpv2_rule_count", info_rc);
+        if (o.note("srpv2_rule_count", info_rc, ReadKind::enumerate) != RegRead::ok)
             continue;
-        }
         ctx.write_output(format_applocker_row(collection, mode, rule_subkeys));
         ++written;
     }
@@ -279,43 +265,20 @@ int collect_wdac(yuzu::CommandContext& ctx) {
 
 int collect_applocker(yuzu::CommandContext& ctx) {
     Outcome o;
-    std::string_view source = "registry_srpv2";
 
+    // The shell only performs the query; plan_cim decides what its result means.
     const auto q = bounded_cim_query(kCimNamespace, kCimApplockerWql);
-    bool cim_rows_emitted = false;
-    switch (classify_cim_error(q.error)) {
-    case CimOutcome::ok:
-        for (const auto& row : q.rows) {
-            const auto parsed = parse_cim_applocker_row(row);
-            if (!parsed) {
-                o.acc.add_failure("cim_row_unrecognised");
-                continue;
-            }
-            ctx.write_output(format_applocker_row(parsed->collection, parsed->mode, parsed->rules));
-            cim_rows_emitted = true;
-        }
-        if (q.truncated)
-            o.acc.add_failure("row_cap");
-        source = "cim_msft_applockerpolicy";
-        break;
-    case CimOutcome::class_absent:
-        break; // expected on hosts without the class: not a failure
-    case CimOutcome::permission_denied:
-        o.denied = true;
-        o.acc.add_failure("permission_denied");
-        break;
-    case CimOutcome::failed:
-        o.acc.add_failure(*q.error); // stable wmi_bounded.hpp token
-        break;
-    }
+    const auto plan = plan_cim(q.error, q.rows, q.truncated);
+    for (const auto& r : plan.rows)
+        ctx.write_output(format_applocker_row(r.collection, r.mode, r.rules));
+    for (const auto& token : plan.failures)
+        o.acc.add_failure(token);
+    o.denied |= plan.denied;
 
     // No usable CIM rows (class absent / empty / failed): registry walk; CIM failures stay on `o`.
-    if (!cim_rows_emitted) {
-        source = "registry_srpv2";
-        if (walk_srpv2(ctx, o) == 0 && !o.acc.any_failure())
-            ctx.write_output(format_applocker_none_row());
-    }
-    return finish(ctx, o, source);
+    if (!plan.use_cim && walk_srpv2(ctx, o) == 0 && !o.acc.any_failure())
+        ctx.write_output(format_applocker_none_row());
+    return finish(ctx, o, plan.use_cim ? "cim_msft_applockerpolicy" : "registry_srpv2");
 }
 
 } // namespace yuzu::app_control

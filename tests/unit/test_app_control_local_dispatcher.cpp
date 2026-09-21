@@ -16,11 +16,13 @@
 
 #include "local_dispatcher.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -46,6 +48,11 @@ std::vector<std::string> captured_rows(const std::string& captured) {
             out.push_back(line);
     }
     return out;
+}
+
+std::size_t count_prefix(const std::vector<std::string>& rows, std::string_view prefix) {
+    return static_cast<std::size_t>(std::count_if(
+        rows.begin(), rows.end(), [&](const std::string& r) { return r.rfind(prefix, 0) == 0; }));
 }
 
 // Under `meson test` a missing plugin means the build is broken -- never "All tests passed".
@@ -104,7 +111,11 @@ TEST_CASE("app_control plugin: all three OS legs declared; Linux/macOS unsupport
         CHECK(d.macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
         CHECK(d.linux_leg.fallback != nullptr);
         CHECK(d.macos_leg.fallback != nullptr);
-        CHECK(d.windows_leg.support != YUZU_SUPPORT_UNDECLARED);
+        // wdac_policy is fully observed on the rig; applocker_policy's CIM property names and
+        // SrpV2 layout never were, so its Windows leg is declared CONSTRAINED.
+        CHECK(d.windows_leg.support == (std::string_view{d.action} == "wdac_policy"
+                                            ? YUZU_SUPPORT_SUPPORTED
+                                            : YUZU_SUPPORT_CONSTRAINED));
         CHECK(d.windows_leg.rung == 1);
     }
     CHECK(seen == std::unordered_set<std::string>{"wdac_policy", "applocker_policy"});
@@ -145,5 +156,35 @@ TEST_CASE("app_control plugin: each action -- exact unsupported row + UNAVAILABL
                 CHECK((result.result_status == YUZU_RESULT_STATUS_CONSTRAINED ||
                        result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED));
         }
+
+        // Each action answers with its OWN row family, whatever this host holds: a wdac_policy
+        // that returned applocker rows (or a lone stub row) fails here.
+        if (result.rc != 0) {
+            CHECK(count_prefix(rows, "constrained|") == 1);
+        } else if (action == "wdac_policy") {
+            CHECK(count_prefix(rows, "wdac|") >= 1);
+            CHECK(count_prefix(rows, "wdac_cip|") >= 1);
+            CHECK(count_prefix(rows, "applocker|") == 0);
+        } else {
+            CHECK(count_prefix(rows, "applocker|") >= 1);
+            CHECK(count_prefix(rows, "wdac") == 0);
+        }
     }
+}
+
+TEST_CASE("app_control plugin: an unknown action is refused with an escaped row, never ignored",
+          "[app_control][actions]") {
+    auto plugin = load_app_control_plugin();
+    if (!plugin)
+        return require_plugin_or_skip();
+
+    // The request-supplied name lands in a pipe-delimited stream: `|` is escaped and a newline
+    // folds to a space (yuzu::util::safe_output_field), so one bad name is exactly one row.
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "no|such\naction");
+    const auto rows = captured_rows(result.captured);
+    CHECK(result.rc == 1);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "unknown action: no\\|such action");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED); // never reported a typed status
 }

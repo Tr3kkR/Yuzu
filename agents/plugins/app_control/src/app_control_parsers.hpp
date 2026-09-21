@@ -3,7 +3,9 @@
  * parsers for the app_control plugin (read-only WDAC / AppLocker posture).
  *
  * Free of the Win32 headers: plain string/integer transforms, testable on every OS
- * (tests/unit/test_app_control_parsers.cpp). Registry types, HRESULTs and wide
+ * (tests/unit/test_app_control_parsers.cpp). It also owns every decision the Windows shell
+ * takes (Win32 read classification, verdict selection, the CIM plan), so the shell only
+ * performs I/O. Registry types, HRESULTs and wide
  * strings never cross this header -- app_control_win.cpp casts at the boundary and
  * hands over RegValueView / plain strings / WmiRow maps (an independent alias of
  * yuzu::shared::wmi::WmiRow so this compiles everywhere; bitlocker precedent).
@@ -25,6 +27,7 @@
  */
 #pragma once
 
+#include <yuzu/plugin.h>         // YuzuResultStatus / Completeness (C ABI: no Windows types)
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <constraint_accumulator.hpp>
@@ -100,18 +103,20 @@ inline std::string format_wdac_row(const RegValueView& v) {
 /// The CI\Policy key does not exist: a genuine "nothing configured", never a failed read.
 inline std::string format_wdac_key_absent_row() { return "wdac|policy_key|-|absent"; }
 
+inline constexpr std::string_view kCipExt = ".cip";
+
 inline bool is_cip_filename(std::string_view name) noexcept {
-    constexpr std::string_view ext = ".cip";
-    if (name.size() <= ext.size())
+    if (name.size() <= kCipExt.size())
         return false;
-    const auto tail = name.substr(name.size() - ext.size());
-    return std::equal(tail.begin(), tail.end(), ext.begin(), [](char a, char b) {
+    const auto tail = name.substr(name.size() - kCipExt.size());
+    return std::equal(tail.begin(), tail.end(), kCipExt.begin(), [](char a, char b) {
         return std::tolower(static_cast<unsigned char>(a)) == b;
     });
 }
 
 inline std::string format_cip_row(std::string_view filename) {
-    const auto stem = filename.substr(0, filename.size() - 4); // caller checked is_cip_filename
+    // caller checked is_cip_filename
+    const auto stem = filename.substr(0, filename.size() - kCipExt.size());
     return "wdac_cip|" + yuzu::util::safe_output_field(stem) + "|present";
 }
 
@@ -205,6 +210,59 @@ inline std::string format_unsupported_row(std::string_view action) {
     return std::string{action} + "|unsupported|" + std::string{kUnsupportedWindowsOnly};
 }
 
+// ── Win32 read classification (pure; app_control_win.cpp static_asserts the numbers) ──
+
+/// Plain integers so this header stays free of <windows.h>.
+inline constexpr std::uint32_t kErrorSuccess = 0;
+inline constexpr std::uint32_t kErrorFileNotFound = 2;
+inline constexpr std::uint32_t kErrorPathNotFound = 3;
+inline constexpr std::uint32_t kErrorAccessDenied = 5;
+
+/// open_or_query: NOT_FOUND means the key/value definitively does not exist (absent).
+/// enumerate: a RegEnumValueW / RegQueryInfoKeyW error is never an absence.
+enum class ReadKind { open_or_query, enumerate };
+enum class RegRead { ok, absent, unreadable };
+
+/// `absent` carries NO token (no failure, status unaffected). `unreadable` carries exactly one:
+/// `permission_denied` (+access_denied) for ERROR_ACCESS_DENIED, else `<what>_0x<hex>`.
+struct ReadFailure {
+    RegRead state;
+    std::string token;
+    bool access_denied{false};
+};
+
+inline ReadFailure classify_win32_read(std::string_view what, std::uint32_t err, ReadKind kind) {
+    if (err == kErrorSuccess)
+        return {RegRead::ok, {}, false};
+    if (kind == ReadKind::open_or_query && (err == kErrorFileNotFound || err == kErrorPathNotFound))
+        return {RegRead::absent, {}, false};
+    if (err == kErrorAccessDenied)
+        return {RegRead::unreadable, "permission_denied", true};
+    char hex[9]; // lowercase, unpadded: ci_policy_enum_0xea for 234
+    const auto [end, ec] = std::to_chars(hex, hex + sizeof hex, err, 16);
+    return {RegRead::unreadable, std::string{what} + "_0x" + std::string{hex, end}, false};
+}
+
+/// Status / completeness / provenance / exit code from the accumulated failures.
+struct ActionVerdict {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    std::string provenance;
+    int rc;
+    bool constrained_row_due;
+};
+
+/// No failure: OK / FULL / `source` / rc 0. Any failure: CONSTRAINED (PERMISSION_DENIED when
+/// `denied`) / PARTIAL / the joined reasons / rc 1, and the `constrained|` row is due.
+inline ActionVerdict select_verdict(const yuzu::shared::ConstraintAccumulator& acc, bool denied,
+                                    std::string_view source) {
+    if (!acc.any_failure())
+        return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, std::string{source}, 0,
+                false};
+    return {denied ? YUZU_RESULT_STATUS_PERMISSION_DENIED : YUZU_RESULT_STATUS_CONSTRAINED,
+            YUZU_RESULT_COMPLETENESS_PARTIAL, acc.reason(), 1, true};
+}
+
 // ── CIM leg: namespace floor, outcome classification, row mapping ───────────
 
 /// wmi_bounded.hpp does NO namespace allowlisting: this plus is_allowed_cim_namespace()
@@ -286,6 +344,45 @@ inline std::optional<ApplockerRowData> parse_cim_applocker_row(const WmiRow& row
     if (!m || !r)
         return std::nullopt;
     return ApplockerRowData{*coll, *m, static_cast<std::size_t>(*r)};
+}
+
+/// The whole classify -> map -> fallback decision over one bounded CIM result, so the Windows
+/// shell only performs the query and writes what this returns. `use_cim` is true only when the
+/// class answered AND at least one row mapped; otherwise the caller walks SrpV2. A class that is
+/// merely absent is expected and records nothing; every other failure lands in `failures`.
+struct CimPlan {
+    std::vector<ApplockerRowData> rows;
+    std::vector<std::string> failures;
+    bool denied{false};
+    bool use_cim{false};
+};
+
+inline CimPlan plan_cim(const std::optional<std::string>& error, const std::vector<WmiRow>& rows,
+                        bool truncated) {
+    CimPlan plan;
+    switch (classify_cim_error(error)) {
+    case CimOutcome::ok:
+        for (const auto& row : rows) {
+            if (auto parsed = parse_cim_applocker_row(row))
+                plan.rows.push_back(std::move(*parsed));
+            else
+                plan.failures.emplace_back("cim_row_unrecognised");
+        }
+        if (truncated)
+            plan.failures.emplace_back("row_cap");
+        plan.use_cim = !plan.rows.empty();
+        break;
+    case CimOutcome::class_absent:
+        break; // expected on hosts without the class: not a failure
+    case CimOutcome::permission_denied:
+        plan.denied = true;
+        plan.failures.emplace_back("permission_denied");
+        break;
+    case CimOutcome::failed:
+        plan.failures.push_back(*error); // stable wmi_bounded.hpp token
+        break;
+    }
+    return plan;
 }
 
 // ── Fixture-dump parsers (formats in the file header) ───────────────────────
