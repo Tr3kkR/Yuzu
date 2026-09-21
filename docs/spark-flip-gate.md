@@ -1682,12 +1682,15 @@ on the detached send worker of its lane. The Spark runtime's own log lines are a
 made while holding `registry_mu_` (for example the arm-committed line at every arm commit, and the
 late-arm, sweep-residue, #4508, lifecycle-capacity and subscription-lost lines). They predate #4606 and
 are not benchmark lines, so the same non-blocking requirement applies to them as a bounded hand-off,
-not as retirement: the arm-committed line is the #3990 driver's measured contract and must stay. Once
-Spark is live, a blocked log sink stalls whichever of those is writing. The Gate 8 review of #4606 traced consequences that include a full consumer queue
-dropping `SparkEvent`s and delayed subscription recovery (read from the code, not reproduced), and the
-convergence lanes have no queue, drop or detach containment, so a fix has to cover them and not only
-the consumer and send worker. Criterion: before the flip, retire the lines, or move their emission
-behind a bounded non-blocking hand-off. A default-off runtime flag is not sufficient by itself,
+not as retirement: the arm-committed line is the #3990 driver's measured contract and must stay. (The
+architect adjudication below covered the `T_*` lines; the runtime lines are recorded here as the same
+requirement and were not separately adjudicated.) Once Spark is live, a blocked log sink stalls
+whichever of those is writing. The Gate 8 review of #4606 traced consequences that include a full
+consumer queue dropping `SparkEvent`s and delayed subscription recovery (read from the code, not
+reproduced), and the convergence lanes have no queue, drop or detach containment, so a fix has to cover
+them and not only the consumer and send worker. Criterion: before the flip, retire the benchmark lines,
+or move their emission (and that of the Spark runtime's own lines above) behind a bounded non-blocking
+hand-off; the arm-committed line is never retired. A default-off runtime flag is not sufficient by itself,
 because the write is still synchronous whenever the flag is on. On the live legacy path the same
 exposure is not new for `T_wire` on the guard worker (other `info` lines are already written on it),
 but per the adjudication `T_server` is, at thread level: for a guardian-only agent stream it is the
