@@ -9544,6 +9544,175 @@ TEST_CASE("File mechanism (Windows, direct): stop() with a staged but unserved j
                      5000ms));
 }
 
+TEST_CASE("File mechanism (Windows, direct): a join storm on one directory while the "
+          "establishment sink is parked never blocks a joiner, and once released every joined "
+          "key is reported once against the directory's latest stamp, then the mechanism is "
+          "idle and stop() returns (CH-6, characterisation)",
+          "[spark][established][windows]") {
+    constexpr std::size_t kJoiners = 64;
+    constexpr SparkIncarnation kInc1 = 81, kJoinerIncBase = 1000;
+    struct Ch6 {
+        std::atomic<std::size_t> finished{0};
+        std::atomic<std::size_t> refused{0};
+        std::atomic<bool> stop_returned{false};
+        std::vector<std::string> keys;
+        std::vector<SparkSpec> specs;
+        std::vector<SparkIncarnation> incs;
+        std::vector<std::chrono::steady_clock::time_point> started; // slot i: joiner thread only
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchDir scratch("est_ch6");
+    const auto st = std::make_shared<Ch6>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the worker inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_file_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread joiner;  // not joinable until the storm starts
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after both threads: the gate opens BEFORE either join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& a;
+        std::jthread& b;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a call that never returns can never be joined
+                if (a.joinable())
+                    a.detach();
+                if (b.joinable())
+                    b.detach();
+            }
+        }
+    } leak_if_wedged{mech, joiner, stopper, wedged};
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    const auto spec1 = file_spec(scratch.file.string());
+    const std::string key1 = spark_key(spec1);
+    for (std::size_t i = 0; i < kJoiners; ++i) {
+        st->specs.push_back(
+            file_spec((scratch.dir / ("join" + std::to_string(i) + ".txt")).string()));
+        st->keys.push_back(spark_key(st->specs.back()));
+        st->incs.push_back(kJoinerIncBase + i);
+    }
+    st->started.resize(kJoiners);
+
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, kInc1).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the worker is parked INSIDE the sink, off-lock
+    REQUIRE(log.calls_made() == 1);
+    const auto before = file_debug_counters_for_test(*mech);
+    REQUIRE(before.has_value());
+    const auto storm_begin = std::chrono::steady_clock::now();
+
+    // On its own thread so a joiner wedged behind the parked sink fails a deadline, not hangs.
+    joiner = std::jthread([st, mp] {
+        for (std::size_t i = 0; i < st->keys.size(); ++i) {
+            st->started[i] = std::chrono::steady_clock::now();
+            if (!mp->watch_incarnation(st->keys[i], st->specs[i].params, st->incs[i]).has_value())
+                st->refused.fetch_add(1, std::memory_order_relaxed);
+            st->finished.fetch_add(1, std::memory_order_release);
+        }
+    });
+    const auto storm_over = [&] {
+        return st->finished.load(std::memory_order_acquire) == kJoiners;
+    };
+    if (!eventually(storm_over, 10000ms)) {
+        gate.release(); // a joiner queued behind the sink would resume now
+        wedged = !eventually(storm_over, 5000ms);
+        FAIL("the join storm did not finish within 10 s while the sink was parked");
+    }
+    joiner.join();
+    CHECK(st->refused.load() == 0);
+
+    // Parked: nothing more was delivered, and the directory was joined, not re-armed.
+    CHECK(log.calls_made() == 1);
+    const auto during = file_debug_counters_for_test(*mech);
+    REQUIRE(during.has_value());
+    CHECK(during->live_dirs == 1);
+    CHECK(during->probe_launched == before->probe_launched);
+
+    gate.release();
+    const auto all_reported = [&] {
+        std::set<std::string> seen;
+        for (const auto& e : log.established())
+            if (e.coverage == SparkCoverage::Notification)
+                seen.insert(e.key);
+        return std::ranges::all_of(st->keys,
+                                   [&](const std::string& k) { return seen.contains(k); });
+    };
+    REQUIRE(eventually(all_reported, 8000ms));
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 300ms, 5000ms));
+
+    // One post-release batch reports every key on the directory, all at its latest stamp.
+    const auto all = log.established();
+    CHECK(all.size() == kJoiners + 2);
+    CHECK(log.calls_made() == all.size()); // nothing was dropped
+    const auto seq1 = log.for_key(key1);
+    REQUIRE(seq1.size() == 2);
+    CHECK(seq1[0].incarnation == kInc1);
+    CHECK(seq1[1].incarnation == kInc1);
+    CHECK(seq1[0].coverage == SparkCoverage::Notification);
+    CHECK(seq1[1].coverage == SparkCoverage::Notification);
+    CHECK(seq1[1].at >= storm_begin);
+    const auto batch_at = seq1[1].at;
+    std::size_t accounted = seq1.size();
+    for (std::size_t i = 0; i < kJoiners; ++i) {
+        INFO("joiner " << i);
+        const auto seq = log.for_key(st->keys[i]);
+        accounted += seq.size();
+        REQUIRE(!seq.empty());
+        CHECK(seq.size() == 1);
+        CHECK(seq[0].incarnation == st->incs[i]);
+        CHECK(seq[0].coverage == SparkCoverage::Notification);
+        CHECK(seq[0].at >= st->started[i]); // never earlier than the join it answers
+        CHECK(seq[0].at == batch_at);
+    }
+    CHECK(accounted == all.size()); // no report for any key outside the storm
+
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+    const auto after = file_debug_counters_for_test(*mech);
+    REQUIRE(after.has_value());
+    CHECK(after->live_dirs == 1);
+    CHECK(after->live_ancestors == 0);
+    CHECK(after->retiring == 0);
+    CHECK(after->probe_launched == before->probe_launched);
+    CHECK(after->synthetic_fires == before->synthetic_fires);
+    CHECK(after->established_failed == before->established_failed);
+    CHECK(after->emit_failed == before->emit_failed);
+
+    stopper = std::jthread([st, mp] {
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the joined keys being reported");
+    }
+    stopper.join();
+    CHECK(log.calls_made() == kJoiners + 2); // an orderly stop() dispatches nothing
+    const auto stopped = file_debug_counters_for_test(*mech);
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->live_dirs == 0);
+    CHECK(stopped->live_ancestors == 0);
+    CHECK(stopped->retiring == 0);
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
 TEST_CASE("File mechanism (Windows, direct): unwatch() and an orderly stop() report nothing "
           "(#4340 FF-15)",
           "[spark][established][windows]") {
