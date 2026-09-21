@@ -2500,19 +2500,20 @@ private:
                 any = true;
             }
         }
-        // Pass-failure backoff floor (#4658): while a failed pass is backing
-        // off, EVERY deadline computed above is clamped to the backoff
-        // deadline, and the retry itself is an obligation (`any = true`) so
-        // an otherwise idle worker still retries and `inert` can clear with
-        // no external wake. `wake` is only a real deadline once `any` is set
-        // (it starts at now + 1h), so an idle worker takes the backoff
-        // deadline itself, never max() against that placeholder. One clamp on
-        // the FINAL value, never per clause: seven producers above can yield
+        // Pass-failure backoff (#4658): while a failed pass is backing off, no
+        // timer-driven pass runs before its deadline (a real completion still
+        // does, see run()), and the retry itself is due AT the deadline even
+        // when every other obligation is later (a Deferred watch's 30 s backend
+        // retry, say), so the wake IS the deadline and `any` is set: an
+        // otherwise idle worker still retries and `inert` can clear with no
+        // external wake. Obligations later than the deadline are recomputed by
+        // the first wait after the backoff ends. One assignment on the FINAL
+        // value, never per clause: the seven producers above that can yield
         // `now` (health edge, coverage marker, confirmation, dead ancestor, a
-        // past Deferred/resync/grace deadline), and the unwind itself
-        // re-creates one of them.
+        // past Deferred/resync/grace deadline) all still floor to it, and the
+        // unwind itself re-creates one of them.
         if (pass_backoff_until_ > now) {
-            wake = any ? std::max(wake, pass_backoff_until_) : pass_backoff_until_;
+            wake = pass_backoff_until_;
             any = true;
         }
         if (!any)
@@ -2854,8 +2855,8 @@ private:
 
     /// Per-pass outcome bookkeeping (#4658), under mu_, noexcept. Mirrors
     /// spark_registry.cpp's sweeper_main() success/failure arms, with one
-    /// deliberate difference: the retry deadline is a floor consulted by
-    /// wait_timeout_locked() (this mechanism's only timer) rather than a
+    /// deliberate difference: the retry deadline is the wake wait_timeout_locked()
+    /// returns while backing off (this mechanism's only timer) rather than a
     /// separate stop-only wait, because run() is also the IOCP consumer.
     [[nodiscard]] PassOutcome note_pass_outcome_locked(bool ok) noexcept {
         PassOutcome out;
@@ -2864,7 +2865,7 @@ private:
                 out.recovered = true;
                 out.failures = pass_failures_;
                 pass_failures_ = 0;
-                pass_backoff_until_ = {}; // MUST reset: a stale deadline would floor the next
+                pass_backoff_until_ = {}; // MUST reset: a stale deadline would pin the next
                 pass_backoff_ = {};       // wake and absorb the next nudge
                 inert_.store(false, std::memory_order_release);
             }
@@ -3364,9 +3365,10 @@ private:
 
     /// Pass-failure episode (#4658). Written only by run() (the sole worker),
     /// under mu_; read under mu_ by wait_timeout_locked() and debug_counters().
-    /// pass_backoff_until_ is the floor every wake deadline is clamped to while a
-    /// failed pass is backing off (epoch = no episode). Not atomic: every reader
-    /// holds mu_. inert_ (below) gains a runtime writer from this state: while
+    /// pass_backoff_until_ is the wake wait_timeout_locked() returns while a
+    /// failed pass is backing off: no timer-driven pass runs before it and the
+    /// retry is due at it (epoch = no episode). Not atomic: every reader holds
+    /// mu_. inert_ (below) gains a runtime writer from this state: while
     /// run() executes it is the ONLY writer (start()'s two `true` stores sit on
     /// paths where the worker never runs, its `false` store precedes the spawn),
     /// so no start-time/runtime distinction is needed and a recovery can never
