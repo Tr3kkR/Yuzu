@@ -485,9 +485,11 @@ void FileGuard::run() try {
     // X can change between resolving it and arming (a rename in that window): re-check, bounded;
     // if it keeps changing, the parent watch may be armed for a stale X, so schedule a re-arm.
     auto arm_watch = [&] {
-        for (int attempt = 0; attempt < 3; ++attempt)
-            if (arm_watch_once() == nearest_existing_dir())
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const fs::path armed_for = arm_watch_once(); // arm first: the re-check must see the state after it
+            if (armed_for == nearest_existing_dir())
                 return;
+        }
         spdlog::warn("Guardian FileGuard[{}]: watched directory kept changing while arming {} - "
                      "degraded re-arm in {}ms",
                      cfg_.rule_id, cfg_.path, kArmFailRetryMs);
