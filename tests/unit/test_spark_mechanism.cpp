@@ -6605,6 +6605,82 @@ TEST_CASE("File worker (direct): a single transient failure with nothing else du
     mech->stop();
 }
 
+TEST_CASE("File worker (direct): the retry after a failed pass runs at the backoff deadline even "
+          "when the only other obligation is much later (#4658 PF-10)",
+          "[spark][mechanism][windows][passfail]") {
+    // A watch whose attach fails is Deferred with next_retry_at ~30 s away (the default
+    // backend_retry_base, first attempt), and once its health fault is reported that is the ONLY
+    // obligation the worker has. A transient failed pass then owes a retry at its own ~100 ms
+    // backoff deadline. wait_timeout_locked() combines producers with min(), so a floor that
+    // max()es against that later Deferred deadline retries at ~30 s instead: the log promises
+    // "retrying in 100 ms" while the retry, and with it any further failure count and the inert
+    // flip, waits for the unrelated obligation. Correct ~100-200 ms, the bug ~30 s.
+    ScratchDir a("pf_later_deadline");
+    std::atomic<int> faults{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> throws_left{0};
+    const std::wstring target_dir_w = a.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the same set.
+    const auto controls = [&] {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the probe resolves in microseconds; be generous
+        ctl.sweep_cadence = 100ms;
+        ctl.attach_fail_hook = [&](std::wstring_view dir) { return dir == target_dir_w; };
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_acq_rel);
+            if (throws_left.load(std::memory_order_acquire) > 0 &&
+                throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    mech->start(pf_noop_emit, [&](const std::string&, bool, std::string_view) {
+        faults.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    // The health grace reports the deaf watch once; after that only the Deferred retry remains.
+    REQUIRE(eventually([&] { return faults.load(std::memory_order_acquire) >= 1; }, 4000ms));
+    {
+        int last = -1;
+        auto stable_since = PfClock::now();
+        REQUIRE(eventually(
+            [&] {
+                const int p = passes.load(std::memory_order_acquire);
+                if (p != last) {
+                    last = p;
+                    stable_since = PfClock::now();
+                    return false;
+                }
+                return PfClock::now() - stable_since >= 400ms;
+            },
+            5000ms)); // no pass for 400 ms: nothing is due but the ~30 s retry
+    }
+    REQUIRE(file_debug_counters_for_test(*mech)->probe_backend_failed >= 1);
+    throws_left.store(1, std::memory_order_release);
+    const auto t_throw = PfClock::now();
+    // apply_test_controls nudges run(): that pass throws once.
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
+                       5000ms));
+    // Nothing else is due until ~30 s, so only the floor can run the recovery pass.
+    const bool recovered = eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0;
+        },
+        10000ms);
+    INFO("recovery after " << pf_ms_since(t_throw)
+                           << " ms (retry deadline ~100 ms, Deferred deadline ~30000 ms)");
+    CHECK(recovered);
+    CHECK_FALSE(mech->stats().inert);
+    CHECK(file_debug_counters_for_test(*mech)->pass_failed == 1);
+    mech->stop();
+}
+
 TEST_CASE("File worker (direct): watch() of a second directory returns within budget while the "
           "worker is in a failure episode (#4658 PF-8)",
           "[spark][mechanism][windows][passfail]") {
