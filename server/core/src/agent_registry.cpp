@@ -954,6 +954,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
+        // firmware_posture
+        {"firmware_posture.firmware", "Report BIOS/firmware vendor, version, release date and update-pending posture"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

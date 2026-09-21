@@ -429,3 +429,47 @@ TEST_CASE("select_macos_firmware: Intel /rom wins; undecodable and missing are d
     CHECK((*s.version.value == "mBoot-2" && !s.version.unreadable));
     CHECK(s.version_source == "IODeviceTree:/chosen#firmware-version");
 }
+
+// Definition contract: a REAL captured row splits into exactly the declared columns.
+// The column order below is the spec.result.columns order in content/definitions/firmware_posture.yaml.
+// The row literal is verbatim from agents/plugins/firmware_posture/docs/samples/macos.txt (this Mac,
+// euid 501, 2026-09-21). Literal pins only: nothing is derived from format_row, the column list or
+// the sample file at run time.
+// Fails under: format_row gaining, losing or reordering a field; the leading tag changing; the
+// catch-all row growing to four fields without the definition following.
+TEST_CASE("firmware rows map onto the definition's declared columns", "[firmware_posture][definition]") {
+    const std::vector<std::string> columns = {"row_kind", "field", "value", "source"};
+
+    // Splits on unescaped '|'; a backslash keeps the next character in the field (the escape
+    // safe_output_field emits). The sample row contains none.
+    const auto split = [](const std::string& row) {
+        std::vector<std::string> out{std::string{}};
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            if (row[i] == '\\' && i + 1 < row.size()) {
+                out.back() += row[i];
+                out.back() += row[++i];
+            } else if (row[i] == '|') {
+                out.emplace_back();
+            } else {
+                out.back() += row[i];
+            }
+        }
+        return out;
+    };
+
+    const std::string real_row = "firmware|version_source|IODeviceTree:/chosen#system-firmware-version|iokit";
+    REQUIRE(format_row(FirmwareRow{"version_source", "IODeviceTree:/chosen#system-firmware-version", "iokit"}) ==
+            real_row);
+    const auto f = split(real_row);
+    REQUIRE(f.size() == columns.size());
+    CHECK(f[0] == "firmware");                                               // row_kind value
+    CHECK(f[1] == "version_source");                                         // field value
+    CHECK(f[2] == "IODeviceTree:/chosen#system-firmware-version");           // version-source text
+    CHECK(f[3] == "iokit");                                                  // source value
+
+    // The one mixed shape the columns describe: the catch-all row carries only row_kind + reason.
+    const auto c = split(format_internal_error_row());
+    REQUIRE(c.size() == 2);
+    CHECK(c[0] == "constrained");     // row_kind value
+    CHECK(c[1] == "internal_error");  // field value
+}

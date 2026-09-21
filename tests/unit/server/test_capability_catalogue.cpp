@@ -32,6 +32,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -140,6 +141,7 @@ struct LabeledSpan {
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
+        {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -148,7 +150,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, fifteen sources exactly as a live composition site would use.
+    // literally, sixteen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -164,6 +166,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -328,4 +331,35 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
     auto other = registry.classify("content_dist", "list_staged");
     REQUIRE(other.has_value());
     CHECK(other->dispatch_class == DispatchClass::ReadOnly);
+}
+
+/// Exact-row pin for `firmware_posture.firmware` (Wave 8), the only row of its fragment.
+/// `Security`, the antivirus/bitlocker/firewall class: a read-only security posture plugin.
+TEST_CASE("capability catalogue: firmware_posture.firmware pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_firmware_posture();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "firmware_posture");
+    CHECK(row.action == "firmware");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK_FALSE(row.system_reserved);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+// The composed registry resolves the declared action and refuses an undeclared one: a second,
+// unreviewed `firmware_posture` action must be classified by its own row, never inherited.
+TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refuses an unknown action",
+          "[server][dispatch][capability]") {
+    const auto registry = build_registry(all_labeled_sources());
+    auto known = registry.classify("firmware_posture", "firmware");
+    REQUIRE(known.has_value());
+    CHECK(known->securable == "Security");
+    auto unknown = registry.classify("firmware_posture", "unknown");
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error() == ClassificationError::Unclassified);
 }

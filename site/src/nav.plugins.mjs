@@ -22,6 +22,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/filesystem/README', slug: 'plugins/filesystem', title: 'filesystem' },
   { file: 'agents/plugins/filesystem_posture/README', slug: 'plugins/filesystem_posture', title: 'filesystem_posture' },
   { file: 'agents/plugins/firewall/README', slug: 'plugins/firewall', title: 'firewall' },
+  { file: 'agents/plugins/firmware_posture/README', slug: 'plugins/firmware_posture', title: 'firmware_posture' },
   { file: 'agents/plugins/hardware/README', slug: 'plugins/hardware', title: 'hardware' },
   { file: 'agents/plugins/http_client/README', slug: 'plugins/http_client', title: 'http_client' },
   { file: 'agents/plugins/installed_apps/README', slug: 'plugins/installed_apps', title: 'installed_apps' },
