@@ -6267,11 +6267,14 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
 // is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time wherever
 // possible; an upper bound only where the wrong implementation differs by seconds. Where a
 // stalled runner could cross the window an assertion depends on (PF-3's exact-N read, PF-4,
-// PF-5) it degrades to SUCCEED(). The ungated wall-clock upper bounds that remain are PF-1's
-// pass count, PF-3's `CHECK_FALSE(inert)` right after watch(), the 2000 ms `recovered` windows
-// in PF-11/PF-12 and the `took < 2000` checks in PF-6/PF-8/PF-13: each is wide against the
-// correct behaviour (milliseconds), so a stall of about 1.5-2 s on the test thread is needed
-// to false-red any of them.
+// PF-5) it degrades to SUCCEED(). The ungated bounds that remain are PF-1's and PF-9's pass
+// counts, their process CPU-time checks (skipped, with a SUCCEED, only when CPU time is
+// unreadable), PF-3's `CHECK_FALSE(inert)` right after watch(), the 2000 ms `recovered` windows
+// in PF-11/PF-12 and the `took < 2000` checks in PF-6/PF-8/PF-13. Each is wide against the
+// correct behaviour (milliseconds to a few hundred ms), so it takes a stall of about 1.5-2 s to
+// false-red one: on the test thread for the checks that read a clock, or starvation of the
+// worker or the whole process for the `recovered` windows (eventually() re-evaluates at its
+// deadline).
 // Every captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
 // destroys (and joins) the mechanism before the state its hooks capture.
 namespace {
@@ -6352,6 +6355,12 @@ bool pf_wait_no_passes(const std::atomic<int>& passes,
 // every user MUST assert hits() > 0 or a test built on it can pass vacuously.
 // Declare it BEFORE the mechanism: the worker logs through the default logger, so the mechanism
 // has to be destroyed (its worker joined) before this restores the previous logger.
+// PRECONDITION: no thread other than the mechanism's own worker may log through spdlog's free
+// functions while an instance is alive. spdlog documents set_default_logger() as unsafe against
+// concurrent free-function calls (they read the default logger through a raw pointer), and the
+// destructor's drop() below frees the logger, so a stray logging thread would be a
+// use-after-free rather than only a data race. Nothing in the tests that use this class starts
+// one (the detached probe workers never log).
 class PfStallLogger {
 public:
     static constexpr const char* kName = "pf_stall";
@@ -6369,6 +6378,8 @@ public:
         spdlog::set_default_logger(prev_);
         // set_default_logger() also REGISTERS the logger under its name; drop it so the registry
         // does not keep it (and its sink, whose on_hit captures test locals by reference) alive.
+        // Erases by NAME: two instances alive at once would leave the default logger null, so use
+        // one at a time (the tests do).
         spdlog::drop(kName);
     }
     PfStallLogger(const PfStallLogger&) = delete;
@@ -6386,8 +6397,8 @@ private:
             const std::string_view payload(msg.payload.data(), msg.payload.size());
             if (payload.find(target) == std::string_view::npos)
                 return;
-            // on_hit BEFORE the count: a test that sees hits() >= 1 has then always seen its
-            // snapshots written (the poll runs on another thread).
+            // on_hit BEFORE the count: a test that polls hits() >= 1 on another thread can then
+            // always read the snapshots on_hit stored.
             if (on_hit)
                 on_hit();
             hits.fetch_add(1, std::memory_order_acq_rel);
