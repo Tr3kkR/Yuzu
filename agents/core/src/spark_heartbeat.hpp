@@ -83,8 +83,8 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 ///
 /// The `yuzu.spark_mechs` CSV lists only mechanisms that are registered AND FUNCTIONAL.
 /// An inert mechanism, one that started but could not bind its OS facility (no systemd
-/// system bus in a container, OpenSCManager denied, IOCP creation failed), or whose worker
-/// is in persistent pass failure (Registry and File; three consecutive failed passes,
+/// system bus in a container, OpenSCManager denied, IOCP creation failed), or one whose
+/// worker is in persistent pass failure (Registry and File; three consecutive failed passes,
 /// cleared on the next success), is EXCLUDED, because it is not currently serviceable:
 /// the first kind refuses every watch(), the second accepts it but cannot serve it until a
 /// pass succeeds. Listing it would advertise a capability the agent cannot honour:
@@ -93,16 +93,19 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 ///
 /// HOW AN INERT MECHANISM IS OBSERVED, precisely. Inertness suppresses the CAPABILITY CLAIM
 /// (the CSV above), not the telemetry: the per-type counter loop below does NOT skip inert
-/// mechanisms, so a non-zero counter on one WOULD be reported. In practice none ever is —
-/// the Registry and Service mechanisms track none of those counters (they are File-mechanism
-/// concepts, #1979/#1980/#1982), so their stats are all-zero and the sparse rule drops every
-/// tag. So TODAY an inert mechanism emits nothing of its own, but that is a property of which
-/// counters exist, NOT a rule the code enforces — do not rely on it.
+/// mechanisms, so a non-zero counter on one IS reported. The Registry and Service mechanisms
+/// track none of those counters (they are File-mechanism concepts, #1979/#1980/#1982), so
+/// their stats are all-zero and the sparse rule drops every tag. File does track them
+/// (slow_op, watch_rejected, quarantined), so a File runtime-inert episode can carry
+/// non-zero cumulative counters. That is a property of which counters exist, NOT a rule the
+/// code enforces: do not rely on an inert mechanism emitting nothing.
 ///
-/// An inert mechanism is therefore visible as a CAPABILITY GAP on the server:
-/// `yuzu_fleet_spark_reporting{os}` exceeds the sum of
-/// `yuzu_fleet_spark_mechanisms{os,mechanism}` for that OS. That is the query to reach for;
-/// it is documented in `docs/user-manual/metrics.md`.
+/// An inert mechanism is therefore visible as a CAPABILITY GAP on the server, per mechanism:
+/// `yuzu_fleet_spark_reporting{os="windows"} - on(os)
+/// yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} > 0`. That form is only valid
+/// where the mechanism is expected on every agent of that OS; an OS reports several mechanism
+/// series per agent, so comparing `reporting` with their SUM never fires. The queries are
+/// documented in `docs/user-manual/metrics.md`.
 ///
 /// (Two earlier versions of this comment contradicted each other here — one claimed inert
 /// mechanisms "still report their counters", the next that they "emit NOTHING of their own"
@@ -165,9 +168,10 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
         tags["yuzu.spark_consumer_errors"] = std::to_string(ss.consumer_errors_total);
     // Per-mechanism-type health counters (sparse). Key = "yuzu.spark_<type>_<metric>",
     // composed identically to spark_type_metric_tag() in spark_fleet_tags.hpp.
-    // Deliberately NOT skipped for inert mechanisms — inertness suppresses the capability
-    // claim (the CSV above), not the telemetry. See the header note: today every inert
-    // mechanism's counters happen to be zero, so the sparse rule drops them anyway.
+    // Deliberately NOT skipped for inert mechanisms; inertness suppresses the capability
+    // claim (the CSV above), not the telemetry. See the header note: Registry and Service
+    // track none of these counters, but File does, so a File runtime-inert episode can
+    // report non-zero cumulative values here.
     for (const auto& [type, ms] : by_type) {
         if (ms.watch_rejected_total == 0 && ms.quarantined_total == 0 && ms.slow_op_total == 0)
             continue; // nothing to say — don't build the key prefix (all-zero at rung 1)

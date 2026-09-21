@@ -191,8 +191,11 @@ constexpr std::chrono::milliseconds kFileBackendRetryCap{300'000};
 /// inert on the heartbeat (the existing capability-gap signal, see
 /// SparkMechanismStats::inert). Mirrors spark_registry.cpp's
 /// kSweeperInertAfterFailures (an anonymous-namespace constant there, so it
-/// cannot be shared). A dark worker must never read as a healthy idle one
-/// (#4658; governance sre6-1's rule for Registry, applied to File).
+/// cannot be shared). The intent (#4658; governance sre6-1's rule for
+/// Registry, applied to File): a worker whose passes keep failing must not
+/// read as a healthy idle one. Only a pass that THROWS counts: a worker wedged
+/// inside a callback still reads healthy (#2084's armed-but-deaf liveness), and
+/// a failure a pass catches itself becomes state and counts as a success.
 constexpr unsigned kFileWorkerInertAfterFailures = 3;
 
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached discovery-probe workers
@@ -2500,20 +2503,25 @@ private:
                 any = true;
             }
         }
-        // Pass-failure backoff (#4658): while a failed pass is backing off, no
-        // timer-driven pass runs before its deadline (a real completion still
-        // does, see run()), and the retry itself is due AT the deadline even
-        // when every other obligation is later (a Deferred watch's 30 s backend
-        // retry, say), so the wake IS the deadline and `any` is set: an
+        // Pass-failure backoff (#4658): an open failure episode always has a
+        // retry scheduled, and the wake IS that retry, so `any` is set: an
         // otherwise idle worker still retries and `inert` can clear with no
-        // external wake. Obligations later than the deadline are recomputed by
-        // the first wait after the backoff ends. One assignment on the FINAL
-        // value, never per clause: the seven producers above that can yield
-        // `now` (health edge, coverage marker, confirmation, dead ancestor, a
-        // past Deferred/resync/grace deadline) all still floor to it, and the
-        // unwind itself re-creates one of them.
-        if (pass_backoff_until_ > now) {
-            wake = pass_backoff_until_;
+        // external wake. The retry is scheduled for the backoff deadline, even
+        // when every other obligation is later (a Deferred watch's 30 s backend
+        // retry, say), or immediately when that deadline has already passed:
+        // the deadline is stamped in note_pass_outcome_locked(), before the
+        // failed pass's off-lock tail (the log line, FilePassWork destruction),
+        // which can outlast a 50 ms backoff, and run() samples the clock twice
+        // (its absorb check, then here). It cannot spin: run()'s absorb check
+        // only holds a pass back while the deadline is still in the future, every
+        // failed pass stamps a fresh future deadline and every successful pass
+        // ends the episode. Due-now producers above (health edge, coverage
+        // marker, confirmation, dead ancestor, a past Deferred/resync/grace
+        // deadline) are therefore deferred to the deadline, and obligations later
+        // than it are recomputed by the first wait after the retry pass. One
+        // assignment on the FINAL value, never per clause.
+        if (pass_failures_ != 0) {
+            wake = std::max(pass_backoff_until_, now);
             any = true;
         }
         if (!any)
@@ -2835,9 +2843,14 @@ private:
         }
     }
 
-    /// Test seam (#4658): top of EVERY worker pass, under mu_, AFTER the pass
-    /// reserved its FilePassWork containers and BEFORE it mutates any watch. A
-    /// throw here models an allocation failure at that point. One helper, two
+    /// Test seam (#4658): top of EVERY worker pass, under mu_, after the pass
+    /// reserved its FilePassWork containers and before
+    /// process_completion_locked()/sweep_probes_locked(). In the completion
+    /// branch the dequeue bookkeeping (io_pending cleared, work.consumed
+    /// stamped) precedes it: that is what unwind_pass_locked() recovers when
+    /// this throws. A throw here models an allocation failure at that point.
+    /// The hook runs under mu_, so it must not call watch()/unwatch()/
+    /// apply_test_controls()/debug_counters() (self-deadlock). One helper, two
     /// call sites (both run() branches) so they cannot drift.
     void run_pass_hook_locked() {
         if (pass_fail_hook_)
@@ -2854,10 +2867,20 @@ private:
     };
 
     /// Per-pass outcome bookkeeping (#4658), under mu_, noexcept. Mirrors
-    /// spark_registry.cpp's sweeper_main() success/failure arms, with one
-    /// deliberate difference: the retry deadline is the wake wait_timeout_locked()
-    /// returns while backing off (this mechanism's only timer) rather than a
-    /// separate stop-only wait, because run() is also the IOCP consumer.
+    /// spark_registry.cpp's sweeper_main() success/failure arms (N = 3, backoff
+    /// doubling from sweep_cadence capped at 30 s, the 1/2/4/8 log gate, cleared
+    /// by the next success). Differences from it:
+    ///  - the retry deadline is the wake wait_timeout_locked() returns (this
+    ///    mechanism's only timer), not a separate stop-only wait, because run()
+    ///    is also the IOCP consumer;
+    ///  - the deadline is stamped HERE, before the pass's off-lock tail (the
+    ///    log line, FilePassWork destruction), where Registry stamps after its
+    ///    tail; wait_timeout_locked() therefore treats a deadline that has
+    ///    already passed as "retry due now";
+    ///  - logging happens off-lock, after this returns;
+    ///  - a real completion's pass counts toward the three like any other pass;
+    ///  - clearing inert_ has no `if (core_)` guard: run() is the only writer
+    ///    while it executes (see the pass-failure member comment).
     [[nodiscard]] PassOutcome note_pass_outcome_locked(bool ok) noexcept {
         PassOutcome out;
         if (ok) {
@@ -2865,8 +2888,10 @@ private:
                 out.recovered = true;
                 out.failures = pass_failures_;
                 pass_failures_ = 0;
-                pass_backoff_until_ = {}; // MUST reset: a stale deadline would pin the next
-                pass_backoff_ = {};       // wake and absorb the next nudge
+                // MUST reset the deadline: a stale one would pin the next wake and
+                // absorb the next nudge.
+                pass_backoff_until_ = {};
+                pass_backoff_ = {};
                 inert_.store(false, std::memory_order_release);
             }
             return out;
@@ -3275,7 +3300,7 @@ private:
                 break;
             // Pass-failure backoff (#4658): a control wake (watch()/unwatch()/
             // apply_test_controls() nudge, or a timeout that landed a tick
-            // early) inside an active backoff is ABSORBED, as
+            // early) while the retry deadline is still in the future is ABSORBED, as
             // spark_registry.cpp's stop-only backoff predicate absorbs
             // nudged_: what the nudge announced is durable state in dirs_/
             // ancestors_ and is served by the retry pass at the deadline. Sits
@@ -3365,10 +3390,11 @@ private:
 
     /// Pass-failure episode (#4658). Written only by run() (the sole worker),
     /// under mu_; read under mu_ by wait_timeout_locked() and debug_counters().
-    /// pass_backoff_until_ is the wake wait_timeout_locked() returns while a
-    /// failed pass is backing off: no timer-driven pass runs before it and the
-    /// retry is due at it (epoch = no episode). Not atomic: every reader holds
-    /// mu_. inert_ (below) gains a runtime writer from this state: while
+    /// pass_backoff_until_ is the retry deadline of the open episode
+    /// (pass_failures_ != 0; epoch = no episode): while it is in the future no
+    /// timer-driven pass runs, and wait_timeout_locked() returns it as the wake
+    /// (or "now" once it has passed). Not atomic: every reader holds mu_. inert_
+    /// (below) gains a runtime writer from this state: while
     /// run() executes it is the ONLY writer (start()'s two `true` stores sit on
     /// paths where the worker never runs, its `false` store precedes the spawn),
     /// so no start-time/runtime distinction is needed and a recovery can never

@@ -6264,10 +6264,12 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
 // A worker pass that throws (modelled by FileMechanismTestControls::pass_fail_hook)
 // must back off on a doubling schedule, be counted, and flip `inert` after three
 // consecutive failures instead of spinning the worker. Windows-only: spark_file.cpp
-// is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time only;
-// an upper bound only where the wrong implementation differs by seconds; a "window
-// missed on a loaded runner" degrades to SUCCEED(), never to a false red. Every
-// captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
+// is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time wherever
+// possible; an upper bound only where the wrong implementation differs by seconds. Where a
+// stalled runner could cross the window an assertion depends on (PF-4, PF-5) it degrades to
+// SUCCEED(); the few remaining wall-clock upper bounds (PF-1's pass count, PF-3's exact-N
+// read) are wide enough that only a test-thread stall of a second or more could trip them.
+// Every captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
 // destroys (and joins) the mechanism before the state its hooks capture.
 namespace {
 
@@ -6287,8 +6289,10 @@ std::chrono::milliseconds pf_doubled_ms(std::chrono::milliseconds base, unsigned
     return std::min(d, cap);
 }
 
-// Upper bound on failed passes in `elapsed_ms` of a 50 ms-base doubling backoff: at most
-// floor(log2(elapsed/50)) retries after the first pass, plus caller-chosen slack.
+// Upper bound on failed passes in `elapsed_ms` of a 50 ms-base doubling backoff: the passes
+// land at 0, 50, 150, 350, ... ms, so the retries after the first pass number
+// floor(log2(elapsed/50 + 1)). The ratio below drops the +1; the caller-chosen slack (which
+// also covers the first pass) absorbs the difference.
 int pf_pass_bound(long long elapsed_ms, int slack) {
     const double ratio = std::max(static_cast<double>(elapsed_ms), 50.0) / 50.0;
     return static_cast<int>(std::floor(std::log2(ratio))) + slack;
@@ -6501,7 +6505,7 @@ TEST_CASE("File worker (direct): a persistently throwing pass does not spin - th
     const long long cpu0 = pf_process_cpu_ms();
     // The directory exists, so the watch establishes inside watch(), marks its coverage report
     // due and nudges run(). Every pass throws before it can drain that marker: the
-    // self-sustaining wake the backoff has to floor.
+    // self-sustaining wake the backoff has to hold back.
     REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
     std::this_thread::sleep_for(1500ms); // a LOWER bound on the window only
     const auto elapsed_ms = pf_ms_since(t0);
@@ -6615,8 +6619,8 @@ TEST_CASE("File worker (direct): inert flips after exactly 3 consecutive failure
                   .count());
     }
     failing.store(false, std::memory_order_release);
-    // NO nudge, NO write from here: recovery has to come from the retry the backoff floor itself
-    // schedules at the deadline (the coverage marker is still due).
+    // NO nudge, NO write from here: recovery has to come from the retry the open episode itself
+    // schedules for its deadline (the coverage marker is still due).
     REQUIRE(eventually([&] { return !mech->stats().inert; }, 15000ms));
     {
         const auto d = file_debug_counters_for_test(*mech);
@@ -6760,8 +6764,8 @@ TEST_CASE("File worker (direct): a single transient failure with nothing else du
     }
     REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
                        5000ms));
-    // No nudge, no write, no marker: the ONLY thing that can run the recovery pass is the backoff
-    // floor scheduling its own retry.
+    // No nudge, no write, no marker: the ONLY thing that can run the recovery pass is the open
+    // episode scheduling its own retry.
     CHECK(eventually(
         [&] {
             const auto d = file_debug_counters_for_test(*mech);
@@ -6779,10 +6783,11 @@ TEST_CASE("File worker (direct): the retry after a failed pass runs at the backo
     // A watch whose attach fails is Deferred with next_retry_at ~30 s away (the default
     // backend_retry_base, first attempt), and once its health fault is reported that is the ONLY
     // obligation the worker has. A transient failed pass then owes a retry at its own ~100 ms
-    // backoff deadline. wait_timeout_locked() combines producers with min(), so a floor that
-    // max()es against that later Deferred deadline retries at ~30 s instead: the log promises
-    // "retrying in 100 ms" while the retry, and with it any further failure count and the inert
-    // flip, waits for the unrelated obligation. Correct ~100-200 ms, the bug ~30 s.
+    // backoff deadline. wait_timeout_locked() combines producers with min(), so a retry
+    // scheduled as max(wake, deadline) would land on that later Deferred deadline (~30 s): the
+    // log promises "retrying in 100 ms" while the retry, and with it any further failure count
+    // and the inert flip, waits for the unrelated obligation. The retry is the wake itself
+    // (the deadline). Correct ~100-200 ms, the bug ~30 s.
     ScratchDir a("pf_later_deadline");
     std::atomic<int> faults{0};
     std::atomic<int> passes{0};
@@ -6834,7 +6839,7 @@ TEST_CASE("File worker (direct): the retry after a failed pass runs at the backo
     REQUIRE(set_file_test_controls_for_test(*mech, controls()));
     REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
                        5000ms));
-    // Nothing else is due until ~30 s, so only the floor can run the recovery pass.
+    // Nothing else is due until ~30 s, so only the episode's own retry can run the recovery pass.
     const bool recovered = eventually(
         [&] {
             const auto d = file_debug_counters_for_test(*mech);
@@ -6927,7 +6932,7 @@ TEST_CASE("File worker (direct): a real completion during a failure episode keep
     const long long cpu0 = pf_process_cpu_ms();
     const int p0 = passes.load();
     // A real completion: a full pass that throws; the unwind reissues the read and re-marks the
-    // directory needs_resync, a due-now clause the backoff floor must cover too.
+    // directory needs_resync, a due-now clause the backoff must defer to its deadline too.
     a.write("change during the episode");
     std::this_thread::sleep_for(1500ms);
     const int p1 = passes.load();

@@ -178,7 +178,10 @@ struct SparkMechanismStats {
     /// rejection rather than "unknown type"), which is exactly why this bit is needed:
     /// without it, `registered` and `functional` are indistinguishable on the wire, and an
     /// inert mechanism reports byte-identically to a healthy idle one: "looks healthy, can
-    /// detect nothing".
+    /// detect nothing". Not every worker failure is reported through this flag: Service
+    /// worker death deliberately is NOT (spark_service.cpp clears started_ instead, so
+    /// watches are refused and every tracked coverage is invalidated), because `inert`
+    /// publishes fleet-wide as "no system bus".
     bool inert{false};
 };
 
@@ -541,13 +544,16 @@ struct FileMechanismTestControls {
     std::function<void(std::wstring_view dir)> commit_attach_fail_hook;
     /// Runs on run()'s own worker thread at the top of EVERY pass (a real
     /// completion's pass and a control-wake/timeout sweep pass alike), under
-    /// mu_, AFTER the pass has reserved its FilePassWork containers and BEFORE
-    /// it touches any watch (#4658). Throwing here models an allocation
-    /// failure at that point: the pass is unwound (unwind_pass_locked),
-    /// counted (`pass_failed`), and retried on a doubling backoff from
-    /// `sweep_cadence` capped at 30 s; after kFileWorkerInertAfterFailures (3)
-    /// consecutive failures the mechanism reports `inert` until a pass
-    /// succeeds. Mirrors RegistryMechanismTestControls::sweep_hook. Null
+    /// mu_, after the pass has reserved its FilePassWork containers and before
+    /// process_completion_locked()/sweep_probes_locked() (#4658). In a real
+    /// completion's pass the dequeue bookkeeping precedes it; that is what
+    /// unwind_pass_locked() recovers. Throwing here models an allocation
+    /// failure at that point: the pass is unwound, counted (`pass_failed`), and
+    /// retried on a doubling backoff from `sweep_cadence` capped at 30 s; after
+    /// kFileWorkerInertAfterFailures (3) consecutive failures the mechanism
+    /// reports `inert` until a pass succeeds. The hook runs under mu_, so it must
+    /// not call watch()/unwatch()/apply_test_controls()/debug_counters()
+    /// (self-deadlock). Mirrors RegistryMechanismTestControls::sweep_hook. Null
     /// clears it.
     std::function<void()> pass_fail_hook;
     std::size_t probe_lane_cap{0};
