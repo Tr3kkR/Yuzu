@@ -1,0 +1,143 @@
+## App Control Definitions
+## Reports the effective Windows application-control posture, read-only:
+## WDAC (Code Integrity) policy state and AppLocker rule-collection
+## enforcement. Windows-only concept: Linux/macOS report an honest
+## `unsupported` row.
+## Plugin: app_control | Actions: wdac_policy, applocker_policy
+##
+## Source: registry HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy + the
+## Active\*.cip policy-file listing (wdac_policy); wmi_bounded.hpp CIM query
+## of MSFT_ApplockerPolicy with a SrpV2 registry fallback (applocker_policy).
+## No PowerShell, no raw COM, no policy mutation. Refs #282 (PARTIAL): this
+## is the read-only posture only; add_rule / remove_rule / get_blocked_events
+## and a Linux fapolicyd leg are not implemented. See
+## agents/plugins/app_control/README.md.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.app_control.wdac_policy
+  displayName: WDAC Policy Posture
+  version: 1.0.0
+  description: >
+    Reads the effective Windows Defender Application Control (Code
+    Integrity) posture: every value under
+    HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy with its raw data and a
+    named state, plus one row per active .cip policy file. A value the
+    plugin does not model is reported `unmodelled`, never coerced; a key or
+    directory the OS reports as not present is `absent`; a failed read is
+    reported as a `constrained` row with a reason, never as absent.
+    Windows-only: application control has no Linux/macOS equivalent here.
+  tags: [windows, wdac, code-integrity, application-control, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: app_control
+    action: wdac_policy
+    concurrency: per-device
+
+  result:
+    # wdac|<name>|<raw>|<state>
+    # (also: wdac_cip|<policy_stem>|present, and constrained|<reason>)
+    columns:
+      - name: name
+        type: string
+        description: 'Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row).'
+        example: VerifiedAndReputablePolicyState
+        platforms: [windows]
+      - name: raw
+        type: string
+        description: 'Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row.'
+        example: "1"
+        platforms: [windows]
+      - name: state
+        type: string
+        description: 'Named state of the value.'
+        values: [disabled, audit, enforced, unmodelled, absent]
+        example: enforced
+        platforms: [windows]
+
+  readablePayload: "Report Windows WDAC application-control policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_control]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.app_control.applocker_policy
+  displayName: AppLocker Policy Posture
+  version: 1.0.0
+  description: >
+    Reports the AppLocker enforcement mode and rule count for each rule
+    collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy
+    CIM class through a bounded query; when the class is absent or returns
+    no rows, walks HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 instead.
+    A mode the plugin does not model is `unmodelled`; no configured policy
+    is a single `none` row; a failed read is a `constrained` row with a
+    reason. Windows-only: application control has no Linux/macOS
+    equivalent here.
+  tags: [windows, applocker, application-control, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: app_control
+    action: applocker_policy
+    concurrency: per-device
+
+  result:
+    # applocker|<collection>|<mode>|<rules>
+    # (also: constrained|<reason>)
+    columns:
+      - name: collection
+        type: string
+        description: 'AppLocker rule collection; `none` when no AppLocker policy is configured.'
+        values: [Appx, Dll, Exe, Msi, Script, none]
+        example: Exe
+        platforms: [windows]
+      - name: mode
+        type: string
+        description: 'Enforcement mode of the collection.'
+        values: [audit, enforced, unmodelled, absent]
+        example: enforced
+        platforms: [windows]
+      - name: rules
+        type: int32
+        description: 'Number of rules in the collection (rule subkeys under the SrpV2 walk); 0 when none is configured.'
+        example: "12"
+        platforms: [windows]
+
+  readablePayload: "Report Windows AppLocker policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_control]
+
+status:
+  phase: active

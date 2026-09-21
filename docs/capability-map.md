@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 25 46 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `194 26 45 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -62,9 +62,9 @@ Each capability is rated on two axes:
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
 Advanced     [========================--------]  129/172 done (75%) (21 partial)
-Future       [=========-----------------------]  10/34 done  (29%) (3 partial)
+Future       [=========-----------------------]  10/34 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/265 done (73%) (25 partial)
+Overall      [=======================---------]  194/265 done (73%) (26 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -77,7 +77,7 @@ Overall      [=======================---------]  194/265 done (73%) (25 partial)
 | 6. User and Session Management | 5 | 5 | 0 | 0 |
 | 7. Software and Application Management | 6 | 4 | 1 | 1 |
 | 8. Patch and Update Management | 9 | 3 | 4 | 2 |
-| 9. Security and Compliance | 10 | 8 | 1 | 1 |
+| 9. Security and Compliance | 10 | 8 | 2 | 0 |
 | 10. File System Operations | 15 | 13 | 0 | 2 |
 | 11. Script and Command Execution | 4 | 4 | 0 | 0 |
 | 12. Registry and System Configuration | 7 | 5 | 0 | 2 |
@@ -108,7 +108,7 @@ Overall      [=======================---------]  194/265 done (73%) (25 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **194** | **25** | **46** |
+| **TOTAL** | **265** | **194** | **26** | **45** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -577,9 +577,9 @@ collisions possible; vendor precision pending ADR-0018). See
 
 `QuarantineStore` (PostgreSQL backend, schema `quarantine_store`, ADR-0047). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
 
-### 9.10 Application Whitelisting :x: `T3`
+### 9.10 Application Whitelisting :large_orange_diamond: `T3`
 
-Not implemented. Modify allow/block lists on endpoint security products.
+Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` Issue 12.11). `app_control` plugin with `wdac_policy` and `applocker_policy` actions reports the effective Windows application-control posture: WDAC via the registry (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` values plus the active `.cip` policy files) and AppLocker via a bounded CIM query of `MSFT_ApplockerPolicy` (`agents/shared/wmi_bounded.hpp`) with a `SrpV2` registry fallback. Windows-only: Linux and macOS declare `unsupported`. **Not implemented:** modifying allow/block lists (`add_rule` / `remove_rule`), `get_blocked_events`, and a Linux fapolicyd leg — #282 stays open for them. This reads an OS-native control's state; it is not EDR-class telemetry (`docs/roadmap.md` Phase 18 "Out of scope").
 
 ---
 
@@ -1586,6 +1586,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | autoruns | Y | Y | Y | Security |
 | app_usage | Y | Y | Y | Security |
 | execution_artifacts | Y | - | - | Security |
+| app_control | Y | - | - | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
@@ -1607,9 +1608,8 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | example | Y | Y | Y | Test/Debug |
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
-| app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**55 plugins** (+ 2 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**56 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55; `app_control` then added by Wave 8 PR8.6 = 56). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

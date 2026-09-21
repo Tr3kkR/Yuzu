@@ -1,0 +1,365 @@
+{
+  "actions": [
+    {
+      "action": "applocker_policy",
+      "definition_ids": [
+        "windows.app_control.applocker_policy"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "Windows-only concept; Linux fapolicyd is a separate, unimplemented leg of #282",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "RIG PROBE PENDING (MSFT_ApplockerPolicy class presence + property names, SrpV2 walk): quoted verbatim from the integration rig session before merge. The CIM namespace is caller-side allowlisted",
+          "mechanism": "wmi_bounded run_bounded_wmi_query root\\\\StandardCimv2\\\\Security\\\\ApplicationControl MSFT_ApplockerPolicy; registry walk of HKLM\\\\SOFTWARE\\\\Policies\\\\Microsoft\\\\Windows\\\\SrpV2\\\\<collection> when the class is absent or empty",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "wdac_policy",
+      "definition_ids": [
+        "windows.app_control.wdac_policy"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "Windows-only concept; Linux fapolicyd is a separate, unimplemented leg of #282",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "Windows-only concept; macOS app-trust (Gatekeeper/SIP) is covered by platform_security",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "RIG PROBE PENDING (CI\\\\Policy values under LocalSystem; VerifiedAndReputablePolicyState value meanings): quoted verbatim from the integration rig session before merge. An unmodelled value is reported 'unmodelled'; an unreadable key is constrained or permission_denied, never absent",
+          "mechanism": "RegEnumValueW HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\CI\\\\Policy + std::filesystem listing of %SystemRoot%\\\\System32\\\\CodeIntegrity\\\\CiPolicies\\\\Active\\\\*.cip",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Read-only posture only; #282 stays open.** The plugin refs #282 and does not close it: the issue also asks for `add_rule`, `remove_rule` and `get_blocked_events` (`docs/enterprise-parity-plan.md` Phase 12.11) and a Linux fapolicyd leg, none of which exist. Rule changes would be Destructive-class actions in a separate change.",
+    "**Not EDR-class telemetry.** `docs/roadmap.md` Phase 18 \"Out of scope\" excludes re-implementing EDR at the agent; this plugin configures nothing and collects no detection data, it reports the state of the OS's own control. The two are not the same thing and a reviewer should not conflate them.",
+    "**The CIM property names are unverified until the rig probe lands.** `MSFT_ApplockerPolicy`'s `Collection`, `EnforcementMode` and `RuleCount` are assumed by `parse_cim_applocker_row`; a row that lacks any of them is reported `cim_row_unrecognised` rather than guessed, and the `SrpV2` registry walk is the fallback source. The rig probe outcome is recorded in the banner of `agents/plugins/app_control/src/app_control_win.cpp`.",
+    "**Unmodelled values are reported, not coerced.** Only `VerifiedAndReputablePolicyState` (0 off, 1 on, 2 evaluation) and AppLocker `EnforcementMode` (0 audit, 1 enforce) are mapped; every other value reads `unmodelled`. Multiple-policy-format `.cip` files are listed by name only — their contents are never parsed.",
+    "**Linux and macOS are placeholders by design.** Application control is a Windows-only concept here; macOS app-trust (Gatekeeper/SIP) is `platform_security`'s scope, and both legs return the honest `unsupported` row unconditionally."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports the AppLocker enforcement mode and rule count for each rule collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy CIM class through a bounded query; when the class is absent or returns no rows, walks HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2 instead. A mode the plugin does not model is `unmodelled`; no configured policy is a single `none` row; a failed read is a `constrained` row with a reason. Windows-only: application control has no Linux/macOS equivalent here.",
+      "display_name": "AppLocker Policy Posture",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.app_control.applocker_policy",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reads the effective Windows Defender Application Control (Code Integrity) posture: every value under HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy with its raw data and a named state, plus one row per active .cip policy file. A value the plugin does not model is reported `unmodelled`, never coerced; a key or directory the OS reports as not present is `absent`; a failed read is reported as a `constrained` row with a reason, never as absent. Windows-only: application control has no Linux/macOS equivalent here.",
+      "display_name": "WDAC Policy Posture",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.app_control.wdac_policy",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Read-only effective WDAC and AppLocker application-control policy posture (Windows-only)",
+  "how_it_works": "`wdac_policy` enumerates every value under `HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\\StandardCimv2\\Security\\ApplicationControl`; when the class is absent or returns no rows it walks `HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count).\n\n**Why it exists.** `docs/capability-map.md` §9.10 (Application Whitelisting, graded partial by this plugin) and `docs/roadmap.md` Issue 12.11 (#282, Open) are the tracked demand; `docs/enterprise-parity-plan.md` Phase 12.11 names the full action set (`get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`). This plugin delivers only the read-only posture; the rest is listed under Caveats.\n\n**What it is NOT.** No policy change of any kind, no PowerShell (`Get-AppLockerPolicy` is not used), no raw COM, no subprocess. It is not EDR-class telemetry: `docs/roadmap.md` Phase 18 excludes agent-side EDR replication (\"integrate via Phase 9 connectors to existing EDR ... do not re-implement at the agent\"), and this plugin reads the state of an OS-native control rather than collecting endpoint detection data.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "67940cba360f",
+  "manifest_version": 1,
+  "name": "app_control",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "AppLocker rule collection; `none` when no AppLocker policy is configured.",
+          "example": "Exe",
+          "name": "collection",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "Appx",
+            "Dll",
+            "Exe",
+            "Msi",
+            "Script",
+            "none"
+          ]
+        },
+        {
+          "description": "Enforcement mode of the collection.",
+          "example": "enforced",
+          "name": "mode",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "audit",
+            "enforced",
+            "unmodelled",
+            "absent"
+          ]
+        },
+        {
+          "description": "Number of rules in the collection (rule subkeys under the SrpV2 walk); 0 when none is configured.",
+          "example": "12",
+          "name": "rules",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.app_control.applocker_policy"
+    },
+    {
+      "columns": [
+        {
+          "description": "Registry value name under Control\\CI\\Policy (or the policy file stem on a wdac_cip row).",
+          "example": "VerifiedAndReputablePolicyState",
+          "name": "name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row.",
+          "example": "1",
+          "name": "raw",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Named state of the value.",
+          "example": "enforced",
+          "name": "state",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "disabled",
+            "audit",
+            "enforced",
+            "unmodelled",
+            "absent"
+          ]
+        }
+      ],
+      "definition_id": "windows.app_control.wdac_policy"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows via `write_output()`, the first field naming the row kind. `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file; `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. The `Field` column below maps onto the fields after the row kind. Placeholders: `wdac|policy_key|-|absent` (the CI\\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` files), `applocker|none|absent|0` (no AppLocker policy configured) — each a genuine \"nothing configured\" reported by the OS. Any failed step instead writes `constrained|<reason>` beside a non-OK result status; a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "unsupported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None expected: registry reads (`KEY_READ`), a directory listing and a WMI SELECT; no privilege is enabled",
+      "if_refused": "a `constrained|<reason>` row plus result status `PERMISSION_DENIED` (registry `ERROR_ACCESS_DENIED`, CIM `WBEM_E_ACCESS_DENIED`) or `CONSTRAINED` (any other failure)",
+      "measured": "Not yet measured under LocalSystem (the-rig probe pending; see the source banner in `app_control_win.cpp`)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "n/a — action returns the honest-unsupported sentinel unconditionally",
+      "if_refused": "n/a — no OS call is attempted",
+      "measured": "not applicable (Windows-only concept)",
+      "os": "macOS",
+      "runs_as": "agent daemon, unprivileged"
+    },
+    {
+      "grant": "n/a — action returns the honest-unsupported sentinel unconditionally",
+      "if_refused": "n/a — no OS call is attempted",
+      "measured": "not applicable (Windows-only concept)",
+      "os": "Linux",
+      "runs_as": "agent daemon, unprivileged"
+    }
+  ],
+  "readme": "agents/plugins/app_control/README.md",
+  "result_status": [
+    {
+      "completeness": "FULL",
+      "provenance": "`registry_ci_policy`",
+      "status": "`OK`",
+      "when": "`wdac_policy`: every read succeeded"
+    },
+    {
+      "completeness": "FULL",
+      "provenance": "`cim_msft_applockerpolicy`, `registry_srpv2`",
+      "status": "`OK`",
+      "when": "`applocker_policy`: every read succeeded; the token names the source that produced the rows (the CIM class, or the `SrpV2` registry walk when the class was absent or empty)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`windows_only_concept`",
+      "status": "`UNAVAILABLE`",
+      "when": "Linux/macOS: application control is a Windows-only concept here"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`row_cap`, `value_too_large`, `cim_row_unrecognised`, `ci_policy_open_<hex>`, `ci_policy_enum_<hex>`, `srpv2_open_<hex>`, `srpv2_collection_open_<hex>`, `enforcement_mode_read_<hex>`, `srpv2_rule_count_<hex>`, `cip_stat_failed`, `cip_dir_failed_<n>`, `system_directory_unresolved`, a `wmi_bounded` error token",
+      "status": "`CONSTRAINED`",
+      "when": "a bounded read hit its cap, a value or CIM row could not be interpreted, or a registry / directory / CIM step failed with a non-access-denied error; the reasons are joined in one status string"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`unhandled exception: <what>`",
+      "status": "`CONSTRAINED`",
+      "when": "an exception was caught inside `execute()`"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`permission_denied`",
+      "status": "`PERMISSION_DENIED`",
+      "when": "a registry, directory or CIM read was refused (`ERROR_ACCESS_DENIED` / `WBEM_E_ACCESS_DENIED`)"
+    }
+  ],
+  "samples": {
+    "macos": {
+      "actions": [
+        {
+          "action": "wdac_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_concept",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "wdac_policy|unsupported|windows_only_concept"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "applocker_policy",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_concept",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "applocker_policy|unsupported|windows_only_concept"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "bare-metal",
+        "leg_hash": "67940cba360f",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "wdac_policy",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "applocker_policy",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/app_control.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/app_control/src/app_control_parsers.hpp",
+      "agents/plugins/app_control/src/app_control_plugin.cpp",
+      "agents/plugins/app_control/src/app_control_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_app_control_local_dispatcher.cpp",
+      "tests/unit/test_app_control_parsers.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. `gather.ttlSeconds: 300` only caps how often a repeat dispatch is served from cache; nothing runs on a schedule.",
+    "**Sensitivity.** Rows describe the device's application-control configuration (enforcement mode, rule counts, the file stem of each active policy). No username, hostname, file path or rule content appears in any field, but the posture itself is security-relevant: it tells a reader which controls are not enforced.",
+    "**Siblings:** `antivirus` (Defender and exclusion state, not application control), `windows_optional_features` (OS feature state), `registry` / `wmi` (general-purpose reads this plugin's narrow surface deliberately does not replace) — none join with this plugin's output.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.app_control.wdac_policy\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}
