@@ -31,10 +31,13 @@
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "schedule_engine.hpp" // full ScheduleEngine definition -- this harness constructs a real one (with_schedule_engine)
 #include "test_schedule_api_double.hpp" // ADR-0031 WS-A4 (seventh family): FnScheduleApi
+#include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi
+#include "store_errors.hpp" // kDbErrorPrefix
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
+#include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
 #include "workflow_engine.hpp"
 #include "workflow_routes.hpp"
 
@@ -151,6 +154,12 @@ struct ExecHarness {
     /// file leaves it nullptr, and a fourth SQLite file per harness would be
     /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
     std::unique_ptr<WorkflowEngine> workflows;
+    /// ADR-0031 WS-A4 (eighth family): the seam wrapping `workflows` above,
+    /// wired into `wf_deps.workflow_api` below whenever `workflows` is
+    /// constructed -- mirrors the production `workflow_engine_`-gated
+    /// `workflow_api` construction in server.cpp exactly (no separate
+    /// "is_open" gate — the seam's own calls surface that degrade).
+    std::shared_ptr<WorkflowApi> workflow_api;
     /// #2146 A2-R1: opt-in real ScheduleEngine, same rationale as `workflows`
     /// above -- unpaid cost on every other test in this file, which is
     /// content with the pre-existing schedule_api==nullptr path.
@@ -306,7 +315,17 @@ struct ExecHarness {
                          // ScheduleEngine/Postgres connection. Same
                          // captured-by-value-at-construction contract as
                          // auth_override/fleet_read_override above.
-                         std::shared_ptr<ScheduleApi> schedule_api_override = {})
+                         std::shared_ptr<ScheduleApi> schedule_api_override = {},
+                         // ADR-0031 WS-A4 (eighth family): a test-supplied
+                         // WorkflowApi (typically FnWorkflowApi, see
+                         // test_workflow_api_double.hpp) -- takes precedence
+                         // over with_workflow_engine above, letting a test
+                         // inject an arbitrary list_workflows/get_workflow/
+                         // get_workflow_execution result (including a store
+                         // failure) without a real WorkflowEngine/Postgres
+                         // connection. Same captured-by-value-at-construction
+                         // contract as schedule_api_override above.
+                         std::shared_ptr<WorkflowApi> workflow_api_override = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -344,6 +363,16 @@ struct ExecHarness {
         if (with_workflow_engine) {
             workflows = std::make_unique<WorkflowEngine>(pool);
             REQUIRE(workflows->is_open());
+        }
+        // ADR-0031 WS-A4 (eighth family): an injected test double takes
+        // precedence over the seam wrapping the real engine constructed
+        // above (see workflow_api_override's own doc comment) -- the seam,
+        // not the raw engine, is what Deps actually takes now for the read
+        // triad.
+        if (workflow_api_override) {
+            workflow_api = workflow_api_override;
+        } else if (workflows) {
+            workflow_api = make_local_workflow_api(*workflows);
         }
 
         if (with_product_pack_store) {
@@ -476,6 +505,11 @@ struct ExecHarness {
         // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
+        // ADR-0031 WS-A4 (eighth family), was CDX-FV-03's raw engine — nullptr
+        // unless opted in, so /api/v1/workflows[/{id}] and
+        // /api/v1/workflow-executions/{id} keep their 503 path for every
+        // pre-existing test that leaves with_workflow_engine=false.
+        wf_deps.workflow_api = workflow_api;
         wf_deps.product_pack_store = product_pack_store.get();
         wf_deps.schedule_api = schedule_api; // ADR-0031 WS-A4 (seventh family), was #2146 A2-R1's raw engine
         // PR 3 — wire the per-execution event bus. The SSE handler at
@@ -3508,6 +3542,41 @@ TEST_CASE("GET /api/v1/workflows: 403 when Workflow:Read is denied", "[pg][workf
     auto res = h.sink.Get("/api/v1/workflows");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// ADR-0031 WS-A4 (eighth family): unlike `schedule`'s own seam, `WorkflowApi`
+// already returned a checked std::expected to its pre-seam callers, so a
+// real Postgres failure injection (DROP TABLE, see test_workflow_engine.cpp)
+// already proved this degrade path end-to-end. FnWorkflowApi (see
+// test_workflow_api_double.hpp) proves the SAME behaviour without a live
+// Postgres connection — a genuine store failure must 503 via
+// genericize_db_error, never leak the internal (`kDbErrorPrefix`-prefixed)
+// error string, and never be presented as an empty list.
+TEST_CASE("GET /api/v1/workflows: a store failure 503s via genericize_db_error, never as an "
+          "empty list",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto failing_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        [](const WorkflowQuery&) -> std::expected<std::vector<Workflow>, std::string> {
+            return std::unexpected(std::string(yuzu::server::kDbErrorPrefix) +
+                                   "pool exhausted (internal, must not render)");
+        },
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/{}, /*workflow_api_override=*/failing_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/api/v1/workflows");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(body["error"]["message"].get<std::string>().find("pool exhausted") == std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/workflow-executions/:id: confines agent_ids to the caller's fleet-read "

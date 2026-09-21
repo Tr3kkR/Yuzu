@@ -7,20 +7,23 @@
 /// functions so their JSON shapes cannot drift from each other by
 /// construction (`docs/api-twin-recipe.md` Rule 1).
 ///
-/// No `httplib.h`, no MCP-specific include. It DOES include the store header
-/// `workflow_engine.hpp` (for `Workflow`/`WorkflowExecution`) — `workflow` is
-/// not yet seamed (a future WS-A4 family), so this header is I/O-free but
-/// NOT store-free, unlike an abstract `*_api.hpp`. (An earlier version of
-/// this file claimed "pure, I/O-free" while also holding the schedule-family
-/// builder and `#include`ing `schedule_engine.hpp` too — that claim was false
-/// by the WS-A4 seam's own bar; ADR-0031 WS-A4's seventh family split the
-/// schedule builder out into the genuinely pure `schedule_model.hpp`, which
-/// this file no longer needs.)
+/// No `httplib.h`, no MCP-specific include, no store include. ADR-0031
+/// WS-A4's eighth family (`WorkflowApi`, `workflow_api.hpp`) relocated the
+/// pure `Workflow`/`WorkflowExecution`/`WorkflowStepResult` types this file
+/// needs out of the store-coupled `workflow_engine.hpp` into `workflow_
+/// types.hpp` — this file now includes only that pure header, so it is
+/// genuinely I/O-free AND store-free, unlike its earlier state. (An earlier
+/// version of this file claimed "pure, I/O-free" while also holding the
+/// schedule-family builder and `#include`ing both `schedule_engine.hpp` and
+/// `workflow_engine.hpp` — that claim was false by the WS-A4 seam's own bar;
+/// the seventh family split the schedule builder out into `schedule_model.
+/// hpp` first, and this eighth family finishes the job for `workflow`
+/// itself.)
 ///
 /// #4030: executions/workflows/schedules read-twin programme.
 
 #include "authz_model.hpp" // authz::VisibleSet / authz::in_scope
-#include "workflow_engine.hpp"
+#include "workflow_types.hpp"
 
 #include <nlohmann/json.hpp>
 

@@ -5244,6 +5244,12 @@ McpServer::HandlerFn McpServer::build_handler(
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
+    // `workflow_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, eighth family — list_workflows/get_workflow/get_workflow_
+    // execution route through the member `workflow_api_`/`set_workflow_api`
+    // instead, mcp_server.hpp's doc comment). Kept, unremoved, for
+    // constructor-signature stability across the two forwarding overloads
+    // below — a disclosed, deferred follow-up, not an oversight.
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
     std::shared_ptr<const VerifyApi> verify_api, LockoutClearFn lockout_clear_fn,
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
@@ -10982,6 +10988,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_workflows (#4030) ────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam (workflow_api_, set_workflow_api) — the SAME
+            // instance the REST v1 twin uses (server.cpp), so the two can
+            // never disagree.
             if (tool_name == "list_workflows") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -10991,7 +11001,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine || !workflow_engine->is_open()) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
@@ -10999,7 +11009,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 WorkflowQuery wq;
                 wq.name_filter = param_str(args, "name");
                 wq.limit = std::min(param_int32(args, "limit", 100), 500);
-                auto workflows_result = workflow_engine->list_workflows(wq);
+                auto workflows_result = workflow_api_->list_workflows(wq);
                 if (!workflows_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11022,6 +11032,8 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_workflow (#4030) ──────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam — see list_workflows above.
             if (tool_name == "get_workflow") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -11031,13 +11043,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto workflow_id = param_str(args, "workflow_id");
-                auto workflow_result = workflow_engine->get_workflow(workflow_id);
+                auto workflow_result = workflow_api_->get_workflow(workflow_id);
                 if (!workflow_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11066,7 +11078,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // model from get_execution_status's fan-out Execution. Confined:
             // agent_ids_json names agents directly, so this gates on
             // fleet_read_fn_ (not a plain perm_fn) and confines the emitted
-            // agent_ids to the caller's visible scope.
+            // agent_ids to the caller's visible scope. ADR-0031 WS-A4
+            // (eighth family): routed through the WorkflowApi seam — see
+            // list_workflows above.
             if (tool_name == "get_workflow_execution") {
                 if (!fleet_read_fn_) {
                     spdlog::error(
@@ -11078,13 +11092,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                auto exec_result = workflow_engine->get_execution(exec_id);
+                auto exec_result = workflow_api_->get_workflow_execution(exec_id);
                 if (!exec_result) {
                     res.set_content(
                         a4_error(kInternalError,

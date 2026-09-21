@@ -749,6 +749,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
 #include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
+#include "workflow_api_local.hpp"       // ADR-0031 WS-A4 (eighth family): wire the real WorkflowApi seam
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1599,6 +1600,20 @@ private:
         if (schedule_engine_for_test)
             mcp.set_schedule_api(
                 yuzu::server::make_local_schedule_api(*schedule_engine_for_test));
+
+        // ADR-0031 WS-A4 (eighth family): wire the REAL WorkflowApi seam
+        // over this test's workflow_engine_for_test — same setter idiom as
+        // set_schedule_api above (`build_handler`'s own `WorkflowEngine*
+        // workflow_engine` param below is now unused inside
+        // list_workflows/get_workflow/get_workflow_execution, kept for
+        // signature stability). Gated on workflow_engine_for_test's
+        // presence, mirroring production's workflow_engine_-gated
+        // construction: unwired -> null seam -> the tools' `!workflow_api_`
+        // guard answers "Workflow engine unavailable", preserving every
+        // pre-seam test's default behaviour.
+        if (workflow_engine_for_test)
+            mcp.set_workflow_api(
+                yuzu::server::make_local_workflow_api(*workflow_engine_for_test));
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),

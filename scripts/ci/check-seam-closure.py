@@ -200,6 +200,7 @@ IMPL_TUS = [
     "server/core/src/dex_api.cpp",
     "server/core/src/dex_perf_api.cpp",
     "server/core/src/schedule_api.cpp",
+    "server/core/src/workflow_api.cpp",
     # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
     # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
@@ -234,6 +235,7 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/dex_api.hpp",
     "server/core/src/dex_perf_api.hpp",
     "server/core/src/schedule_api.hpp",
+    "server/core/src/workflow_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -428,6 +430,37 @@ FAMILIES = {
             "server/core/src/schedule_model.cpp",
             "server/core/src/schedule_api.hpp",
             "server/core/src/schedule_api_local.hpp",
+        ],
+    },
+    # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
+    # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
+    # /api/v1/workflow-executions/{id}, MCP list_workflows/get_workflow/
+    # get_workflow_execution). Header-only posture, same reason as
+    # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the legacy unversioned GET routes and
+    # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and MCP ARE rewired (server.cpp / mcp_server.cpp both call the
+    # seam). `workflow_types.hpp` was relocated out of `workflow_engine.hpp`;
+    # `workflow_model.hpp` was made genuinely pure by pointing it at
+    # `workflow_types.hpp` instead of the store-coupled `workflow_engine.
+    # hpp` (it needed no further split — unlike `schedule_model.hpp`, it
+    # never bundled another family's builder). The legacy unversioned GET
+    # routes and every `POST`/`DELETE`/`.../execute` mutator
+    # (`workflow_routes.cpp`) are a SEPARATE, deliberately untouched
+    # capability with no public REST v1/MCP twin of their own (the
+    # mutators) or sharing the SAME store call as their v1 twin without
+    # themselves being the versioned resource (the legacy GETs) — nothing
+    # to carve out of this family's enforced set, unlike `compliance`'s
+    # WS-A3 mutator gap.
+    "workflow": {
+        "tus": [
+            "server/core/src/workflow_types.hpp",
+            "server/core/src/workflow_model.hpp",
+            "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_api.hpp",
+            "server/core/src/workflow_api_local.hpp",
         ],
     },
 }
