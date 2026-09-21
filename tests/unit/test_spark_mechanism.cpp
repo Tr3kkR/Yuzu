@@ -214,6 +214,10 @@ public:
         started_ = false;
         ++stop_calls_;
     }
+    // Atomic-only, like every real mechanism (stats() is called under the engine's mu_).
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = inert_for_test_.load(std::memory_order_relaxed)};
+    }
 
     // ── test drivers ──
     void fire(const std::string& key, SparkData data = SparkData{std::monostate{}}) {
@@ -318,6 +322,8 @@ public:
         std::lock_guard lk(mu_);
         fail_next_watch_ = b;
     }
+    /// Drives the mechanism-reported `inert` flag (stats() is lock-free, so no mu_).
+    void set_inert(bool b) { inert_for_test_.store(b, std::memory_order_relaxed); }
     /// True once a parked watch()/unwatch() has actually entered its park —
     /// the observable half of the park seam (E14/E15).
     [[nodiscard]] bool wait_parked(std::chrono::milliseconds timeout = 5000ms) {
@@ -359,6 +365,7 @@ private:
     bool park_next_watch_{false};
     bool park_next_unwatch_{false};
     bool fail_next_watch_{false};
+    std::atomic<bool> inert_for_test_{false};
     /// Shared by watch()/unwatch() — a given test scenario parks at most one
     /// of the two calls at a time, so one gate suffices.
     ParkGate park_gate_;
@@ -2732,6 +2739,132 @@ TEST_CASE("Establishment: after stop(), the query returns last-known values, lik
     CHECK(est->coverage == SparkCoverage::Notification);
     REQUIRE(est->established_at.has_value());
     CHECK(*est->established_at == t1);
+}
+
+TEST_CASE("Establishment: an inert mechanism overlays coverage to None and leaves "
+          "established_at alone (O-1, red-before)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+
+    fake->set_inert(true);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1); // the overlay never touches established_at
+
+    fake->set_inert(false);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification); // the cached value was never lost
+    CHECK(*est->established_at == t1);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a spark whose type has no registered mechanism is untouched by "
+          "another type's inert flag and never throws (O-2, regression guard for the "
+          "find()-not-at() shape; green on the pre-overlay engine)",
+          "[spark][established]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(1); // ms, as E8
+    FakeMechanism* file_fake = wire_fake(engine, SparkType::File);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, interval_spec(5)); // Interval has no registered mechanism
+    REQUIRE(sub.has_value());
+
+    file_fake->set_inert(true); // a DIFFERENT type's mechanism
+    std::optional<SubscriptionEstablishment> est;
+    REQUIRE_NOTHROW(est = engine.subscription_establishment(*sub));
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: after stop() an inert mechanism still overlays None while "
+          "established_at keeps its last-known value (O-3, red-before)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    fake->set_inert(true);
+
+    engine.stop();
+    CHECK_FALSE(engine.is_running());
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+}
+
+TEST_CASE("Establishment: [tsan] the inert overlay under concurrent inert flips and queries "
+          "(O-4, sanitizer exercise; cannot go red on the pre-overlay engine)",
+          "[spark][established][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false}; // set by the readers; asserted after join
+    std::thread flipper([&] {
+        bool inert = false;
+        while (!stop.load(std::memory_order_acquire)) {
+            inert = !inert;
+            fake->set_inert(inert);
+        }
+    });
+    auto reader_body = [&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            auto est = engine.subscription_establishment(*sub);
+            if (!est || !est->established_at || *est->established_at != t1 ||
+                (est->coverage != SparkCoverage::None &&
+                 est->coverage != SparkCoverage::Notification))
+                violation.store(true, std::memory_order_relaxed);
+        }
+    };
+    std::thread reader1(reader_body);
+    std::thread reader2(reader_body);
+    std::this_thread::sleep_for(200ms);
+    stop.store(true, std::memory_order_release);
+    flipper.join();
+    reader1.join();
+    reader2.join();
+    engine.stop();
+
+    CHECK_FALSE(violation.load(std::memory_order_relaxed));
 }
 
 TEST_CASE("Establishment: adoption — a disarm racing a re-arm skips the stale unwatch, and "
