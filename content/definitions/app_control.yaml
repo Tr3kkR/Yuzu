@@ -67,7 +67,7 @@ spec:
     ttlSeconds: 300
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:
@@ -132,7 +132,7 @@ spec:
     ttlSeconds: 300
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:

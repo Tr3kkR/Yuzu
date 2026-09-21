@@ -17,11 +17,10 @@
 /// `CodeIntegrity\CiPolicies\Active`, runs a bounded read-only WQL SELECT
 /// against `MSFT_ApplockerPolicy` and walks `SrpV2` (grep-provable: no registry
 /// write, no policy-mutating CIM method, no subprocess). Grouped under the
-/// existing `Inventory` securable, the same read-only-fact-collection precedent
-/// `windows_optional_features` uses
-/// (`plugin_action_catalogue_windows_optional_features.hpp`). No securable is
-/// added. Refs #282 (PARTIAL): add_rule/remove_rule would be Destructive-class
-/// rows in a separate PR.
+/// existing `Security` securable: these are security-posture reads (which controls
+/// are not enforced), like firewall, antivirus, bitlocker and autoruns. No
+/// securable is added. Refs #282 (PARTIAL): add_rule/remove_rule would be
+/// Destructive-class rows in a separate PR.
 namespace yuzu::server::capdecls {
 
 namespace detail {
@@ -32,7 +31,7 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueAppContr
         .action = "wdac_policy",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
-        .securable = "Inventory",
+        .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
@@ -43,7 +42,7 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueAppContr
         .action = "applocker_policy",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
-        .securable = "Inventory",
+        .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
