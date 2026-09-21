@@ -211,7 +211,7 @@
     {
       "grant": "n/a - planned placeholder",
       "if_refused": "n/a - the placeholder reports `UNAVAILABLE` with `windows:planned` and reads nothing",
-      "measured": "n/a - planned placeholder",
+      "measured": "n/a - planned placeholder (the registry probe below is evidence, not a measurement of this plugin)",
       "os": "Windows",
       "runs_as": "n/a - planned placeholder"
     },
@@ -263,7 +263,60 @@
       "when": "a leg threw; reported instead of unwinding across the plugin boundary"
     }
   ],
-  "samples": {},
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "policies",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "container",
+        "leg_hash": "3349c5d2765b",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "policies",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "macos:planned",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-21",
+        "host_class": "bare-metal",
+        "leg_hash": "3349c5d2765b",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    }
+  },
   "security": [
     {
       "action": "policies",

@@ -103,7 +103,19 @@ Every row is pipe-delimited and has nine fields; field 0 is always the literal `
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-No captures yet — run `plugin-capture` on each supported OS (docs/plugin-readme-standard.md rule 5).
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 3349c5d2765b
+
+```
+== action=policies
+[result_status] UNAVAILABLE / PARTIAL / macos:planned
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 3349c5d2765b
+
+```
+== action=policies
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 A Linux host with no `/etc/opt/chrome`, `/etc/chromium` or `/etc/opt/edge` policy files reports zero rows with `OK`/`FULL`, and the Linux capture is taken from a real Debian container with no such files; the populated row shape is covered by the fixture-driven unit tests over `tests/unit/fixtures/wave10/browser_policy/linux`. The planned legs are status-only: the macOS capture shows the placeholder status alone (`UNAVAILABLE`/`PARTIAL`, `macos:planned`, zero rows), and there is no Windows capture.

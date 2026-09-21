@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(57).
+(58).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -91,7 +91,7 @@ duplicates.
 | **Certificate delete — verified / SIP-aware** (`certificates.delete`) | ✅ | ✅ | ✅ | Win: CryptoAPI store delete; Linux: `unlinkat` of the matching PEM entry on a held `/etc/ssl/certs` dirfd after a pre-unlink identity recheck (#3245). macOS: `security delete-certificate` on `System.keychain` then a re-enumeration that reports `deleted` only on a positively-proven absence (`classify_delete_verdict` in `agents/shared/macos_console_user.hpp`); `store=root` rejected (SystemRootCertificates.keychain is SIP-sealed) in `certificates_plugin.cpp` |
 | **━━ Network quality (`/network`) ━━** | | | | Measurement-first device/local-link health lens. `net_quality_sampler.cpp`; `docs/user-manual/network.md` "Platform coverage" |
 | **Network quality** (throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | 🟡 throughput only | Win `GetIfTable2` throughput + `GetTcpStatisticsEx` system-wide interval retransmit (**measurement-first, not loss-validated** — withheld from the fleet retransmit aggregate); RTT needs ESTATS (admin+overhead) → 🔜. Linux has all three. macOS `NET_RT_IFLIST2` throughput only (`read_net_counters()` sums non-loopback `if_data64` rx/tx, differenced per heartbeat); retransmit + RTT deferred — global `net.inet.tcp.stats` reads all-zero on modern macOS → 🔜 |
-| **━━ Agent plugins (57) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 43 fully cross-platform, 6 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`, `execution_artifacts`), 6 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented; `power_health` — Windows the only full leg; `wifi` — Windows full, Linux/macOS constrained; `filesystem_posture` — Linux constrained, Windows/macOS full), 2 macOS-constrained (`interaction` — GUI-less daemon; `app_usage` — macOS `usage` fold inherits TAR's process source's names-only constraint, ES entitlement absent -> poll granularity). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted). (Re-tallied 2026-09-17: the prior "3 uneven" count omitted power_health/wifi/filesystem_posture, which are not ✅✅✅ either — pre-existing drift, corrected here. `peripherals` moved from uneven to cross-platform once its Windows leg shipped, Wave 9 PR9.1a2.) |
+| **━━ Agent plugins (58) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 43 fully cross-platform, 6 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`, `execution_artifacts`), 7 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented; `power_health` — Windows the only full leg; `wifi` — Windows full, Linux/macOS constrained; `filesystem_posture` — Linux constrained, Windows/macOS full; `browser_policy` — Linux full, Windows/macOS planned), 2 macOS-constrained (`interaction` — GUI-less daemon; `app_usage` — macOS `usage` fold inherits TAR's process source's names-only constraint, ES entitlement absent -> poll granularity). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted). (Re-tallied 2026-09-17: the prior "3 uneven" count omitted power_health/wifi/filesystem_posture, which are not ✅✅✅ either — pre-existing drift, corrected here. `peripherals` moved from uneven to cross-platform once its Windows leg shipped, Wave 9 PR9.1a2.) |
 | agent_actions | ✅ | ✅ | ✅ | portable — no platform macros |
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
@@ -99,6 +99,7 @@ duplicates.
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | autoruns | ✅ | ✅ | ✅ | Linux: file reads of cron/anacron/at/systemd unit dirs/XDG autostart, `systemctl list-timers` argv fallback only when no unit dir is readable. macOS: `CFPropertyListCreateWithData` over launchd plists, `/etc/periodic`, `/etc/emond.d`; Login Items CONSTRAINED (private BTM database, no public read API). Windows: `Reg*W` over HKLM + every HKU via `win_profiles` `with_user_hive`, ITaskService COM, bounded WMI `root\subscription` query — zero spawn primitives (no `schtasks.exe`/`wmic.exe`/PowerShell); real-hardware LocalSystem probe in `tests/unit/fixtures/wave7/probes/the-rig-probe-findings.md` |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
+| browser_policy | 🔜 | ✅ | 🔜 | Enterprise-managed Chrome, Chromium and Edge policy overrides, read-only, zero subprocess. Linux full (the managed and recommended JSON policy files under `/etc/opt/{chrome,edge}` and `/etc/chromium`, rung 1). Windows planned: the `HKLM\SOFTWARE\Policies` registry read follows as its own PR; until then one placeholder result (`UNAVAILABLE`, `windows:planned`, zero rows). macOS planned: the `/Library/Managed Preferences` plist read follows as its own PR; until then the same placeholder (`macos:planned`). See `agents/plugins/browser_policy/README.md` |
 | certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain reads via a pre-split argv through the bounded runner (rung 2, #3406 — the former Decision-7 governed-shell path is retired); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS. `execute_staged` on Linux is CONSTRAINED, not unconditional: shebang-interpreted (`#!`) staged payloads are rejected (B6 fd-exec is incompatible with the kernel's binfmt_script re-open) — native executables only. Per-action detail: the generated plugin-action table below |
@@ -173,7 +174,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 55 plugins the CI gate tracks populate
+Adoption is now **complete**: all 56 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing
@@ -190,15 +191,6 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
-<!-- TODO(integrator, ws-10.2b browser_policy): after merging fresh dev, regenerate the block below on
-     Linux (tools/capmatrix-gen over the built browser_policy plugin) so it carries the three
-     `browser_policy | policies` rows (linux supported, macos planned, windows planned; the two
-     planned rows carry the fallback "follows as its own PR"), then add the hand-kept
-     browser_policy row to the Agent plugins table above and bump its plugin counts (57 -> 58 for
-     this PR alone; re-sum against whatever else has landed). Then take the Linux and macOS
-     samples (docs/samples), run `plugin_doc_gen.py --stamp browser_policy <os>` for each and
-     `plugin_doc_gen.py --all`; until then `plugin_doc_gen.py --check` reports this plugin's
-     missing matrix rows and captures. Remove this comment when done. -->
 
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
@@ -255,6 +247,9 @@ implementation is.
 | bitlocker | state | linux | supported | 1 | libblkid+sysfs | - |
 | bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
+| browser_policy | policies | linux | supported | 1 | /etc/opt/{chrome,edge} and /etc/chromium policies/{managed,recommended}/*.json (nlohmann) | - |
+| browser_policy | policies | macos | planned | 1 | /Library/Managed Preferences/{,<user>/}{com.google.Chrome,com.microsoft.Edge}.plist (CFPropertyListCreateWithData) | follows as its own PR |
+| browser_policy | policies | windows | planned | 1 | HKLM\\SOFTWARE\\Policies\\{Google\\Chrome,Microsoft\\Edge} registry reads (RegKey enumerate_value_names) | follows as its own PR |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
 | certificates | list | macos | supported | 2 | SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
