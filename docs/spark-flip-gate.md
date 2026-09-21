@@ -1559,40 +1559,60 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   item for the flip; this entry records the exposure and the compensating control only.
 
 **#4685** (Guardian: Unsupported rules not re-reconciled after a File/Registry episode, #4658)
-- Detection signal: none dedicated. Fleet level it is consistent-with only, and aggregate: the
-  fleet gauges are server-side sums and cannot identify which host is affected. This query is
-  true while `yuzu_fleet_spark_unsupported` for the mechanism is above zero and that mechanism's
-  `yuzu_fleet_spark_mechanisms` series equals `yuzu_fleet_spark_reporting` (same `os` and
-  `instance`), that is, rules stay unsupported although every reporting agent counts the
-  mechanism as functional again:
+- Detection signal: none dedicated. The three signals below are hints, not proof.
+  - Fleet (aggregate: the gauges are server-side sums and cannot name a host). The query below
+    returns a series while `yuzu_fleet_spark_unsupported` for the mechanism is above zero and
+    that mechanism's `yuzu_fleet_spark_mechanisms` series equals `yuzu_fleet_spark_reporting`
+    (same `os` and `instance`), that is, rules stay unsupported although every reporting agent
+    counts the mechanism as functional again:
 
-  ```promql
-  yuzu_fleet_spark_unsupported{os="windows",mechanism="file"} > 0
-    and on(os, instance)
-  (yuzu_fleet_spark_reporting{os="windows"}
-    - on(os, instance) yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} == 0)
-  ```
+    ```promql
+    yuzu_fleet_spark_unsupported{os="windows",mechanism="file"} > 0
+      and on(os, instance)
+    (yuzu_fleet_spark_reporting{os="windows"}
+      - on(os, instance) yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} == 0)
+    ```
 
-  The Registry form is a separate query with `mechanism="registry"` in both selectors. Both were
-  checked with promtool against synthetic series only. Only a sustained hold is consistent with
-  this defect: the gauges trail the agent by up to about 45 s (`guaranteed-state.md`, "Fleet
-  lag"). On the agent, the info line
-  `Guardian: rule '<id>' classified unsupported (<type> has no mechanism on this host) ...`
-  (`guardian_engine.cpp`, logged only on a new or changed classification), between
-  `spark_file: worker failing persistently` and
-  `spark_file: worker pass recovered after N failure(s)` (Registry:
-  `spark_registry: sweeper failing persistently` and
-  `spark_registry: sweeper pass recovered after N failure(s)`), shows a rule was classified
-  during the episode; it does not show the rule is still unsupported afterwards, and an empty
-  search proves nothing because the agent log is not flushed per line (#4608). No alert on
-  either series ships: `docs/prometheus/yuzu-alerts.yml` deliberately has no
-  `YuzuSparkUnsupported` rule and none on `yuzu_fleet_spark_mechanisms`. The per-mechanism alert
-  is tracked in #2084 and must ship before the flip.
-- Operator action: none today (see the compensating control). Once Spark is live, after the
-  mechanism has recovered, re-run the reconcile: re-push the policy (a Baseline deploy issues a
-  fleet-wide `full_sync`, `guardian_routes.cpp`) or restart the agent. R5.7 (g)(1) and
-  `docs/user-manual/guaranteed-state.md` say the rules stay disarmed until the next reconcile or
-  an agent restart; this is not a runbook step beyond that.
+    The Registry form is a separate query with `mechanism="registry"` in both selectors. Both
+    were checked with promtool against synthetic series only. Blind spot: the query needs the
+    two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
+    agent, or an unrelated concurrent episode) silences it fleet-wide; silence proves nothing
+    while any agent lacks the mechanism. Only a sustained hold is a hint: the gauges trail the
+    agent by up to about 45 s (`docs/user-manual/guaranteed-state.md`, "Fleet lag").
+  - Agent log. The line
+    `Guardian: rule '<id>' classified unsupported (<type> has no mechanism on this host) ...`
+    (`guardian_engine.cpp`, logged only on a new or changed classification), between
+    `spark_file: worker failing persistently` and
+    `spark_file: worker pass recovered after N failure(s)` (Registry:
+    `spark_registry: sweeper failing persistently` and
+    `spark_registry: sweeper pass recovered after N failure(s)`), shows a rule was classified
+    during the episode; it does not show the rule is still unsupported afterwards. Two limits:
+    an empty search proves nothing because the agent log is not flushed per line (#4608), and
+    the Guardian line and the `recovered` lines are logged at info level, so `--log-level warn`
+    hides them (the `failing persistently` lines are error level).
+  - Alerts. None ships: `docs/prometheus/yuzu-alerts.yml` deliberately has no
+    `YuzuSparkUnsupported` rule and none on `yuzu_fleet_spark_mechanisms`. The per-mechanism
+    alert is tracked in #2084 and must ship before the flip. An alert on the query above also
+    wants the `for:` hold `docs/user-manual/metrics.md` gives for the mechanism series (at least
+    two heartbeats, 60 s at the default 30 s heartbeat; a paging alert at least 10 minutes,
+    tuned on fleet data).
+- Operator action: none today (see the compensating control). Once Spark is live the gap does
+  not announce itself: an Unsupported placement returns `ReconcileOutcome::Inert`, which by
+  design does not hold `policy_generation` (`guardian_engine.cpp`, `apply_rules()`), so the
+  agent reports itself converged and the server's heartbeat reconcile does not re-push
+  (`agent_gen >= current`, `server.cpp`; see the recovery-path note in the
+  `#2815 + #2818 + #2833 + #2839` entry above), and the Unsupported branch's own comment says
+  `get_status()` is deliberately untouched, so no per-rule status contradicts "converged".
+  After the mechanism has recovered, re-run the reconcile on the affected host, narrowest
+  first: restart that agent (`start_local()` re-arms its cached rules through
+  `reconcile_rule_locked`), or send the scoped push in `docs/user-manual/guaranteed-state.md`
+  section 4 (`POST /api/v1/guaranteed-state/push` with a `scope` that selects only the affected
+  hosts and `"full_sync": true`; requires `GuaranteedState:Push`). Avoid the fleet-wide route (a
+  Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` tears
+  down and re-arms every rule on every in-scope agent (R5.7 (g)(1); its cost is the #3990
+  blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`) and re-classifies any
+  host still in an episode. No further runbook exists: R5.7 (g)(1) and the operator manual say
+  only that the rules stay disarmed until the next reconcile or an agent restart.
 - Compensating control: `prefer_spark_` is false in production, so the Unsupported placement
   cannot occur today. `agent.cpp` constructs `GuardianEngine` with the two-argument form, so
   `prefer_spark` takes its default `false` (`guardian_engine.hpp`), and
@@ -1601,13 +1621,17 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (g)(1) of `docs/spark-stage2-guardian-consumer-design.md` and in the operator manual. `inert`
   is reached about 150 ms of backoff after the first failure at the default cadence (R5.7 (g)(4)),
   so once Spark is live an episode does not need to be long to open the window.
-- Owner: not assigned in source material.
+- Owner: unassigned; until #4685 is picked up, the author of the PR-5 (F14 flip) change, as for
+  #4665.
 - Milestone: #4685 itself; no PR slot assigned yet.
 - Revisit trigger: before the F14 flip. **Not risk-accepted** - #4685 is a real, filed, open
   defect and remains a gating item for the flip until it is fixed or closed; this entry records
-  the disclosure and the compensating control only. The #4658 governance ledger
-  (`gap-a-guardian-no-rereconcile`) derives it HIGH from I1+I3, capped to LOW by E6 while
-  `prefer_spark_` is never true in production, and HIGH and blocking at the F14 flip.
+  the disclosure and the compensating control only. Severity as the #4658 governance ledger
+  records it (`gap-a-guardian-no-rereconcile`): LOW for the #4658 merge, because while
+  `prefer_spark_` is false the wrong outcome (rules enforced by neither backend) cannot occur in
+  a shipped build; HIGH and blocking at the F14 flip, when that protection lapses. The ledger's
+  impact, exposure and severity codes are defined under "Severity - DERIVE it, do not choose it"
+  in `.claude/skills/governance/SKILL.md`.
 
 **Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
@@ -1781,6 +1805,10 @@ neutralised (PR #4657). The adjudication of this exposure was made by subagents 
 consumer that treats agent-log lines as evidence, not for the #4606 diff. Tracked in #4665, which also
 covers the documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for
 the driver.
+
+**NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
+#4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
+not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry.**
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
