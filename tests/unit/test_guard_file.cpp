@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -506,7 +507,7 @@ DWORD process_handle_count() {
 class RenameRig {
 public:
     RenameRig(RigMode mode, const fs::path& rel_target, const fs::path& rel_precreate,
-              bool seed_target)
+              bool seed_target, std::function<void()> in_sink = {})
         : mode_(mode) {
         fs::create_directories(root_.path);
         target_ = root_.path / rel_target;
@@ -523,7 +524,11 @@ public:
             cfg.assertion = FileGuard::Assertion::HashEquals;
         else
             cfg.expect_present = (mode == RigMode::Present);
-        guard_ = std::make_unique<FileGuard>(cfg, [col = col_](const GuardDrift& d) { col->push(d); });
+        guard_ = std::make_unique<FileGuard>(cfg, [col = col_, in_sink](const GuardDrift& d) {
+            col->push(d);
+            if (in_sink)
+                in_sink(); // runs on the guard thread, after the report is recorded
+        });
         REQUIRE(guard_->start());
         // The first evaluation runs after the watches are armed, so its report is the barrier.
         REQUIRE(col_->wait_count(1, 10s));
@@ -624,13 +629,40 @@ void run_sibling_churn(RigMode m) {
     CHECK(rig.wait_detected(5s));
 }
 
-// Enough sibling renames to outrun the reader (a notification buffer overflow is possible, not
-// forced); the directory is renamed part-way through. Liveness only: the digest count is not
-// observable from the sink.
-void run_sibling_flood(RigMode m) {
-    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
-    rig.flood_siblings(300, 150, rig.root() / "D2");
+// Parks the guard thread inside its first report so notifications pile up unread.
+struct SinkGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool first = true;
+    bool released = false;
+
+    void hold_once() { // bounded, so a failing test cannot hang the guard join
+        std::unique_lock lk(m);
+        if (!first)
+            return;
+        first = false;
+        cv.wait_for(lk, 30s, [&] { return released; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(m);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
+// While the guard thread is parked (both watches armed), sibling renames far larger than the
+// 32 KiB notification buffer overflow the parent watch, and the directory is renamed and
+// recreated part-way through. Nothing touches the renamed directory, so the parent watch is the
+// only possible wake: after release the overflow must trigger a resync that finds the change.
+void run_overflow_resync(RigMode m) {
+    SinkGate gate;
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash, [&gate] { gate.hold_once(); });
+    yuzu::test::ScopeExit release([&gate] { gate.release(); }); // before the rig joins its thread
+    rig.flood_siblings(600, 300, rig.root() / "D2");
     rig.recreate_and_write();
+    gate.release();
     CHECK(rig.wait_detected(10s));
 }
 
@@ -715,14 +747,14 @@ TEST_CASE("FileGuard rename: sibling churn in the parent is not drift and detect
     run_sibling_churn(RigMode::Hash);
 }
 
-TEST_CASE("FileGuard rename: detection survives a sibling rename flood (tripwire)",
+TEST_CASE("FileGuard rename: a notification overflow in the parent resyncs and finds the change (tripwire)",
           "[guardian][guard][file][rename]") {
-    run_sibling_flood(RigMode::Tripwire);
+    run_overflow_resync(RigMode::Tripwire);
 }
 
-TEST_CASE("FileGuard rename: detection survives a sibling rename flood (hash)",
+TEST_CASE("FileGuard rename: a notification overflow in the parent resyncs and finds the change (hash)",
           "[guardian][guard][file][rename]") {
-    run_sibling_flood(RigMode::Hash);
+    run_overflow_resync(RigMode::Hash);
 }
 
 TEST_CASE("FileGuard rename: stop() while idle returns promptly and leaks no handles",
