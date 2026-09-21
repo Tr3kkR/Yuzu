@@ -212,9 +212,12 @@ metadata:
     Cancels EXACTLY ONE queued print job, identified by printer and job id
     (both required). This is a state-changing, Destructive+Irreversible
     action requiring role-gated approval — there is no purge-all/cancel-all
-    path. On Windows, uses SetJobW(JOB_CONTROL_CANCEL). On macOS/Linux,
-    sends an IPP Cancel-Job request over the CUPS Unix domain socket with
-    Authorization: PeerCred, and refuses (never falls back to TCP) when no
+    path. On Windows, uses SetJobW(JOB_CONTROL_CANCEL); the spooler itself
+    looks the job up on the named printer. On macOS/Linux, the agent first
+    lists the named printer's not-completed jobs and only then sends an IPP
+    Cancel-Job request (cupsd's Cancel-Job ignores the printer, so the job
+    must be proven to be on it first), over the CUPS Unix domain socket with
+    Authorization: PeerCred; it refuses (never falls back to TCP) when no
     socket is found.
   tags: [printing, remediation]
 
@@ -234,7 +237,14 @@ spec:
       printer:
         type: string
         displayName: Printer Name
-        description: 'The printer the job is queued on. The job must be on this printer: a job id that belongs to a different printer, or a printer that does not exist, is reported as not_found and nothing is cancelled.'
+        description: >-
+          The printer's name, as shown by `printers`. The job must be on this
+          printer: a job id that belongs to a different printer, or a printer that
+          does not exist, is reported as not_found and nothing is cancelled. On
+          macOS/Linux the destination URI that `jobs` prints
+          (`ipp://localhost:631/printers/NAME`) is also accepted, a job submitted
+          to a printer class is addressed by the class name, and a name over 127
+          bytes or containing control characters is refused (invalid_printer).
         validation:
           minLength: 1
           maxLength: 256
@@ -250,7 +260,7 @@ spec:
     columns:
       - name: printer
         type: string
-        description: 'The printer the target job was on (as given), or "-" when the param itself was missing.'
+        description: 'The printer the target job was on (as given), or "-" when the param itself was missing or invalid.'
         example: Office-LaserJet
         platforms: [windows, linux, darwin]
       - name: job_id

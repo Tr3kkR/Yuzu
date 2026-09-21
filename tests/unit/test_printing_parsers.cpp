@@ -5,17 +5,21 @@
  *
  * FIXTURE PROVENANCE — two tiers, honestly named (see each fixture's own
  * <name>.ipp.provenance.txt for the full detail):
- *   - Tier A, `real_*.ipp` (5 files): REAL CAPTURE, taken unprivileged
- *     (uid 501, no sudo) against the live `/private/var/run/cupsd` socket
- *     on this Mac by `tests/unit/fixtures/wave9/printing/macos/capture.sh`
- *     Phase A. The tests below assert the RECORDED status and
- *     status-message each fixture's own provenance file states, not a
- *     hardcoded table independent of the capture.
+ *   - Tier A, `real_*.ipp` (7 files): REAL CAPTURE against the live
+ *     `/private/var/run/cupsd` socket on this Mac (uid 501, no sudo).
+ *     Five were taken unprivileged with no queue by
+ *     `tests/unit/fixtures/wave9/printing/macos/capture.sh` Phase A. The two
+ *     `real_get_jobs_binding_check.ipp` / `real_get_jobs_all_printers.ipp`
+ *     captures (2026-09-21) were taken with curl against scratch queues made
+ *     with `lpadmin` and removed afterwards -- see their provenance files.
+ *     The tests below assert the RECORDED status and status-message (or job
+ *     ids) each fixture's own provenance file states, not a hardcoded table
+ *     independent of the capture.
  *   - Tier B, `synthetic_*.ipp` (3 files): SYNTHETIC, hand-assembled
  *     against printing_ipp.hpp's own wire grammar to exercise decoder
  *     shapes (a populated printer row, a populated job row, a successful
- *     cancel) that no real capture on this host can reach — this host has
- *     no configured print queues. NOT evidence of cupsd wire behaviour;
+ *     cancel) that the unprivileged, queue-less Phase A captures could not
+ *     reach. NOT evidence of cupsd wire behaviour;
  *     never cited as such anywhere in this plugin.
  *   - Tier C, the winspool bit-mapper cases below: split per-case into
  *     REAL CAPTURE the-rig (a literal (status, cJobs)/Status triplet
@@ -581,7 +585,7 @@ TEST_CASE("printer_name_is_plain_local: only names with none of backslash, slash
     CHECK(printer_name_is_plain_local("Office-Floor_2"));
 }
 
-TEST_CASE("printer_name_is_plain_local: every remote-capable shape is not plain",
+TEST_CASE("printer_name_is_plain_local: every remote-capable or separator-bearing shape is not plain",
           "[printing][classify]") {
     CHECK_FALSE(printer_name_is_plain_local("\\\\server\\queue"));          // UNC
     CHECK_FALSE(printer_name_is_plain_local("//server/queue"));              // the form the rows render
@@ -598,45 +602,304 @@ TEST_CASE("printer_name_is_plain_local: every remote-capable shape is not plain"
 }
 
 // ─────────────────────────────────── job-to-printer binding (POSIX clear_queue) ──
+//
+// cupsd's Cancel-Job looks a job up by id alone, so run_clear_queue() must prove the
+// job is on the NAMED printer before it sends one. The responses below are REAL
+// captures (see each provenance file); the transport is a recording fake, so every
+// test can assert exactly which IPP operations were sent.
 
-TEST_CASE("job_binding_check_attrs: lists ONE printer's not-completed jobs, asking only for job-id",
+namespace {
+
+IppResult result_from_fixture(const std::string& name, const std::string& os_dir = "macos") {
+    const auto bytes = read_fixture(name, os_dir);
+    return IppResult{true, 200, ipp::decode(std::span<const uint8_t>(bytes))};
+}
+
+IppResult result_with_status(uint16_t status) {
+    ipp::Message m;
+    m.op_or_status = status;
+    return IppResult{true, 200, m};
+}
+
+struct FakeTransport {
+    IppResult listing;
+    IppResult cancel;
+    std::vector<uint16_t> ops;
+    std::vector<std::vector<ipp::OperationAttr>> sent;
+    IppResult operator()(uint16_t op, const std::vector<ipp::OperationAttr>& attrs) {
+        ops.push_back(op);
+        sent.push_back(attrs);
+        return op == ipp::kGetJobs ? listing : cancel;
+    }
+};
+
+const ClearQueueTokens kTestTokens{"os:connect_failed", "os:decode_failed", "os:access_denied", "os:not_found",
+                                   "os:unexpected_status"};
+const std::vector<uint16_t> kListOnly{ipp::kGetJobs};
+const std::vector<uint16_t> kListThenCancel{ipp::kGetJobs, ipp::kCancelJob};
+
+} // namespace
+
+TEST_CASE("run_clear_queue: a job listed on the named printer is cancelled -- Get-Jobs first, then "
+          "Cancel-Job with the encoded printer, the job id and the caller's identity",
+          "[printing][binding]") {
+    // REAL: jobs 16 and 17 on yuzu4616a; REAL Linux cupsd successful-ok for the Cancel-Job.
+    FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"),
+                    result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
+    const auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+    CHECK(t.ops == kListThenCancel);
+    CHECK(d.rc == 0);
+    CHECK(d.status == ClearQueueStatus::ok);
+    CHECK(d.full);
+    CHECK(d.row == "clear_queue|yuzu4616a|16|canceled|-");
+    REQUIRE(t.sent.size() == 2);
+    const auto& cancel = t.sent[1];
+    REQUIRE(cancel.size() == 3);
+    CHECK(cancel[0].name == "printer-uri");
+    CHECK(cancel[0].value == "ipp://localhost/printers/yuzu4616a");
+    CHECK(cancel[1].name == "job-id");
+    CHECK(cancel[1].value == ipp::encode_int32(16));
+    CHECK(cancel[2].name == "requesting-user-name");
+    CHECK(cancel[2].value == "alex");
+}
+
+TEST_CASE("run_clear_queue: a job id that is not on the printer's active queue sends NO Cancel-Job",
+          "[printing][binding]") {
+    FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
+    const auto d = run_clear_queue("yuzu4616a", 99, "alex", kTestTokens, t);
+    CHECK(t.ops == kListOnly);
+    CHECK(d.rc == 1);
+    CHECK(d.status == ClearQueueStatus::unavailable);
+    CHECK(d.full);
+    CHECK(d.row == "clear_queue|yuzu4616a|99|not_found|os:not_found");
+}
+
+TEST_CASE("run_clear_queue: a job that belongs to ANOTHER queue is never cancelled, even when the "
+          "listing spans every queue (REAL all-printers listing)",
+          "[printing][binding]") {
+    // REAL: the listing cupsd returned for printer-uri ipp://localhost/printers/%00 -- jobs 16, 17
+    // on yuzu4616a and job 18 on yuzu4616b. Before the name was encoded and the job's own
+    // job-printer-uri checked, this made every job id pass.
+    const auto all = result_from_fixture("real_get_jobs_all_printers.ipp");
+    {
+        FakeTransport t{all, result_with_status(0x0000), {}, {}};
+        const auto d = run_clear_queue("yuzu4616a", 18, "alex", kTestTokens, t); // 18 is on yuzu4616b
+        CHECK(t.ops == kListOnly);
+        CHECK(d.row == "clear_queue|yuzu4616a|18|not_found|os:not_found");
+    }
+    {
+        FakeTransport t{all, result_with_status(0x0000), {}, {}};
+        const auto d = run_clear_queue("yuzu4616b", 16, "alex", kTestTokens, t); // 16 is on yuzu4616a
+        CHECK(t.ops == kListOnly);
+        CHECK(d.row == "clear_queue|yuzu4616b|16|not_found|os:not_found");
+    }
+    {
+        FakeTransport t{all, result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
+        const auto d = run_clear_queue("yuzu4616b", 18, "alex", kTestTokens, t); // the right pair
+        CHECK(t.ops == kListThenCancel);
+        CHECK(d.row == "clear_queue|yuzu4616b|18|canceled|-");
+    }
+}
+
+TEST_CASE("run_clear_queue: a '%00' printer name is sent ENCODED and cancels nothing (the exploit)",
+          "[printing][binding]") {
+    FakeTransport t{result_from_fixture("real_get_jobs_all_printers.ipp"), result_with_status(0x0000), {}, {}};
+    const auto d = run_clear_queue("%00", 18, "alex", kTestTokens, t);
+    REQUIRE(t.sent.size() == 1);
+    CHECK(t.sent[0][0].value == "ipp://localhost/printers/%2500"); // never a raw %00
+    CHECK(t.ops == kListOnly);
+    CHECK(d.row == "clear_queue|%00|18|not_found|os:not_found");
+}
+
+TEST_CASE("run_clear_queue: a nonexistent printer (REAL 0x0406 answer) is not_found and sends no Cancel-Job",
+          "[printing][binding]") {
+    FakeTransport t{result_from_fixture("real_get_jobs_no_printer.ipp"), result_with_status(0x0000), {}, {}};
+    const auto d = run_clear_queue("no_such_queue", 3, "alex", kTestTokens, t);
+    CHECK(t.ops == kListOnly);
+    CHECK(d.status == ClearQueueStatus::unavailable);
+    CHECK(d.full);
+    CHECK(d.detail == "Get-Jobs: printer not found");
+    CHECK(d.row == "clear_queue|no_such_queue|3|not_found|os:not_found");
+}
+
+TEST_CASE("run_clear_queue: every failure of the Get-Jobs step is reported and sends no Cancel-Job",
+          "[printing][binding]") {
+    {
+        FakeTransport t{IppResult{true, 403, std::nullopt}, {}, {}, {}};
+        const auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        CHECK(t.ops == kListOnly);
+        CHECK(d.status == ClearQueueStatus::permission_denied);
+        CHECK(d.full);
+        CHECK(d.row == "clear_queue|q|1|refused|os:access_denied");
+    }
+    {
+        FakeTransport t{IppResult{}, {}, {}, {}}; // transport failure
+        const auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        CHECK(t.ops == kListOnly);
+        CHECK_FALSE(d.full);
+        CHECK(d.row == "clear_queue|q|1|error|os:connect_failed");
+    }
+    {
+        FakeTransport t{IppResult{true, 200, std::nullopt}, {}, {}, {}}; // undecodable body
+        const auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        CHECK(t.ops == kListOnly);
+        CHECK(d.row == "clear_queue|q|1|error|os:decode_failed");
+    }
+    {
+        FakeTransport t{result_with_status(0x0403), {}, {}, {}}; // not-authorized
+        const auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        CHECK(t.ops == kListOnly);
+        CHECK(d.row == "clear_queue|q|1|refused|os:access_denied");
+    }
+    {
+        FakeTransport t{result_with_status(0x0400), {}, {}, {}}; // bad-request: a fault, not a denial
+        const auto d = run_clear_queue("q", 1, "alex", kTestTokens, t);
+        CHECK(t.ops == kListOnly);
+        CHECK_FALSE(d.full);
+        CHECK(d.detail == "Get-Jobs: unexpected status 0x0400");
+        CHECK(d.row == "clear_queue|q|1|error|os:unexpected_status");
+    }
+}
+
+TEST_CASE("run_clear_queue: cupsd's own Cancel-Job answer after a passing listing is reported honestly",
+          "[printing][binding]") {
+    const auto listing = result_from_fixture("real_get_jobs_binding_check.ipp");
+    {
+        FakeTransport t{listing, result_from_fixture("real_cancel_job_not_found.ipp"), {}, {}}; // REAL 0x0406
+        const auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+        CHECK(t.ops == kListThenCancel);
+        CHECK(d.row == "clear_queue|yuzu4616a|16|not_found|os:not_found");
+    }
+    {
+        FakeTransport t{listing, IppResult{true, 403, std::nullopt}, {}, {}};
+        const auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+        CHECK(d.status == ClearQueueStatus::permission_denied);
+        CHECK(d.row == "clear_queue|yuzu4616a|16|refused|os:access_denied");
+    }
+    {
+        FakeTransport t{listing, result_with_status(0x0404), {}, {}}; // already terminal
+        const auto d = run_clear_queue("yuzu4616a", 16, "alex", kTestTokens, t);
+        CHECK(d.status == ClearQueueStatus::unavailable);
+        CHECK_FALSE(d.full);
+        CHECK(d.row == "clear_queue|yuzu4616a|16|error|os:unexpected_status");
+    }
+}
+
+TEST_CASE("run_clear_queue: a printer name the agent will not build a request for sends NOTHING",
+          "[printing][binding]") {
+    for (const std::string& bad : {std::string(128, 'x'),                 // over the IPP name limit
+                                  std::string("a\x01b"),                 // control character
+                                  std::string("a\x7F"),                  // DEL
+                                  std::string("ipp://localhost:631/printers/%00")}) { // decodes to NUL
+        FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
+        const auto d = run_clear_queue(bad, 16, "alex", kTestTokens, t);
+        CHECK(t.ops.empty());
+        CHECK(d.row == "clear_queue|-|16|error|invalid_printer");
+    }
+    FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"), result_with_status(0x0000), {}, {}};
+    const auto d = run_clear_queue(std::string(127, 'x'), 16, "alex", kTestTokens, t); // exactly at the limit
+    CHECK_FALSE(t.ops.empty());
+}
+
+TEST_CASE("run_clear_queue: the destination URI the `jobs` action prints is accepted as the printer",
+          "[printing][binding]") {
+    FakeTransport t{result_from_fixture("real_get_jobs_binding_check.ipp"),
+                    result_from_fixture("cancel_job_root_vs_nobody.ipp", "linux"), {}, {}};
+    const auto d = run_clear_queue("ipp://localhost:631/printers/yuzu4616a", 17, "alex", kTestTokens, t);
+    REQUIRE(t.sent.size() == 2);
+    CHECK(t.sent[0][0].value == "ipp://localhost/printers/yuzu4616a");
+    CHECK(d.row == "clear_queue|ipp://localhost:631/printers/yuzu4616a|17|canceled|-"); // echoed as given
+}
+
+TEST_CASE("job_is_listed_on: a job matches only by id AND its own job-printer-uri (REAL captures)",
+          "[printing][binding]") {
+    const auto a_bytes = read_fixture("real_get_jobs_binding_check.ipp");
+    const auto a = ipp::decode(std::span<const uint8_t>(a_bytes));
+    REQUIRE(a.has_value());
+    CHECK(classify_cancel_job_status(a->op_or_status) == CancelStatusClass::canceled);
+    const auto a_rows = jobs_from_ipp(*a);
+    REQUIRE(a_rows.size() == 2);
+    CHECK(job_is_listed_on(a_rows, 16, "yuzu4616a"));
+    CHECK(job_is_listed_on(a_rows, 17, "yuzu4616a"));
+    CHECK_FALSE(job_is_listed_on(a_rows, 16, "yuzu4616b")); // right id, wrong printer
+    CHECK_FALSE(job_is_listed_on(a_rows, 18, "yuzu4616a")); // job of another queue
+    CHECK_FALSE(job_is_listed_on(a_rows, 0, "yuzu4616a"));
+
+    const auto all_bytes = read_fixture("real_get_jobs_all_printers.ipp");
+    const auto all = ipp::decode(std::span<const uint8_t>(all_bytes));
+    REQUIRE(all.has_value());
+    const auto all_rows = jobs_from_ipp(*all);
+    REQUIRE(all_rows.size() == 3);
+    CHECK(job_is_listed_on(all_rows, 18, "yuzu4616b"));
+    CHECK_FALSE(job_is_listed_on(all_rows, 18, "yuzu4616a"));
+    CHECK_FALSE(job_is_listed_on(all_rows, 18, "%00"));
+}
+
+TEST_CASE("job_is_listed_on: a row without a job-printer-uri never matches; an empty listing lists nothing",
+          "[printing][binding]") {
+    JobRow no_uri;
+    no_uri.job_id = 5;
+    no_uri.printer = "-"; // jobs_from_ipp's placeholder for an absent attribute
+    CHECK_FALSE(job_is_listed_on({no_uri}, 5, "-"));
+    CHECK_FALSE(job_is_listed_on({}, 1, "yuzu4616a"));
+}
+
+TEST_CASE("job_binding_check_attrs: one printer's not-completed jobs, encoded name, ids and printer URIs only",
           "[printing][binding]") {
     const auto attrs = job_binding_check_attrs("Office-LaserJet");
     REQUIRE(attrs.size() == 3);
+    CHECK(attrs[0].tag == ipp::kTagUri);
     CHECK(attrs[0].name == "printer-uri");
     CHECK(attrs[0].value == "ipp://localhost/printers/Office-LaserJet");
+    CHECK(attrs[1].tag == ipp::kTagKeyword);
     CHECK(attrs[1].name == "which-jobs");
     CHECK(attrs[1].value == "not-completed");
+    CHECK(attrs[2].tag == ipp::kTagKeyword);
     CHECK(attrs[2].name == "requested-attributes");
     CHECK(attrs[2].value == "job-id");
-    CHECK(attrs[2].additional_values.empty());
+    REQUIRE(attrs[2].additional_values.size() == 1);
+    CHECK(attrs[2].additional_values[0] == "job-printer-uri");
+    CHECK(job_binding_check_attrs("a b/c%")[0].value == "ipp://localhost/printers/a%20b%2Fc%25");
 }
 
-TEST_CASE("job_is_listed: REAL CAPTURE macOS cupsd 2026-09-21 -- a printer's not-completed listing "
-          "holds exactly the jobs on it",
+TEST_CASE("percent_encode_path_segment / percent_decode: unreserved bytes pass, everything else is %XX",
           "[printing][binding]") {
-    // real_get_jobs_binding_check.ipp: Get-Jobs for scratch queue yuzu4616a, which held jobs 6 and 7
-    // (job 8 had been cancelled before the capture).
-    const auto bytes = read_fixture("real_get_jobs_binding_check.ipp");
-    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
-    REQUIRE(decoded.has_value());
-    CHECK(classify_cancel_job_status(decoded->op_or_status) == CancelStatusClass::canceled);
-    const auto rows = jobs_from_ipp(*decoded);
-    REQUIRE(rows.size() == 2);
-    CHECK(job_is_listed(rows, 6));
-    CHECK(job_is_listed(rows, 7));
-    CHECK_FALSE(job_is_listed(rows, 8)); // cancelled: no longer in the not-completed listing
-    CHECK_FALSE(job_is_listed(rows, 1)); // never on this printer (or a job of another queue)
-    CHECK_FALSE(job_is_listed(rows, 0));
+    CHECK(percent_encode_path_segment("Az09-._~") == "Az09-._~");
+    CHECK(percent_encode_path_segment("%00") == "%2500");
+    CHECK(percent_encode_path_segment("a b") == "a%20b");
+    CHECK(percent_encode_path_segment("a/b") == "a%2Fb");
+    CHECK(percent_encode_path_segment("a?b#c") == "a%3Fb%23c");
+    CHECK(percent_encode_path_segment("\xC3\xA9") == "%C3%A9"); // UTF-8 bytes each encoded
+    CHECK(percent_encode_path_segment(std::string("a\0b", 3)) == "a%00b");
+    CHECK(percent_decode("a%20b") == "a b");
+    CHECK(percent_decode("%2500") == "%00");
+    CHECK(percent_decode("%zz") == "%zz");   // not hex: stays literal
+    CHECK(percent_decode("x%4") == "x%4");   // truncated: stays literal
+    CHECK(percent_decode("%00") == std::string("\0", 1));
 }
 
-TEST_CASE("job binding: a nonexistent printer's REAL Get-Jobs answer classifies as not_found; an "
-          "empty listing lists nothing",
-          "[printing][binding]") {
-    const auto bytes = read_fixture("real_get_jobs_no_printer.ipp");
-    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
-    REQUIRE(decoded.has_value());
-    CHECK(classify_cancel_job_status(decoded->op_or_status) == CancelStatusClass::not_found);
-    CHECK_FALSE(job_is_listed({}, 1));
+TEST_CASE("printer_name_from_operand / printer_name_is_valid_posix", "[printing][binding]") {
+    CHECK(printer_name_from_operand("yuzu_test") == "yuzu_test");
+    CHECK(printer_name_from_operand("ipp://localhost:631/printers/yuzu_test") == "yuzu_test");
+    CHECK(printer_name_from_operand("ipps://host/printers/a%20b") == "a b");
+    CHECK(printer_name_from_operand("ipp://localhost:631/classes/xp3cls") == "xp3cls");
+    CHECK(printer_name_from_operand("ipp://host/printers/a/b") == "ipp://host/printers/a/b"); // not a name
+    CHECK(printer_name_from_operand("ipp://host/other/x") == "ipp://host/other/x");
+    CHECK(printer_name_from_operand("http://host/printers/x") == "http://host/printers/x");
+    CHECK(printer_name_is_valid_posix("yuzu_test"));
+    CHECK(printer_name_is_valid_posix(std::string(127, 'x')));
+    CHECK_FALSE(printer_name_is_valid_posix(std::string(128, 'x')));
+    CHECK_FALSE(printer_name_is_valid_posix(""));
+    CHECK_FALSE(printer_name_is_valid_posix("a\x01"));
+    CHECK_FALSE(printer_name_is_valid_posix("a\x7F"));
 }
 
+TEST_CASE("encode_request refuses a value that does not fit the 16-bit IPP length (no attribute injection)",
+          "[printing][ipp][codec]") {
+    const std::string big(65536, 'x');
+    const std::string edge(65535, 'x');
+    CHECK(ipp::encode_request(ipp::kGetJobs, 1, {{ipp::kTagUri, "printer-uri", big, {}}}).empty());
+    CHECK_FALSE(ipp::encode_request(ipp::kGetJobs, 1, {{ipp::kTagUri, "printer-uri", edge, {}}}).empty());
+    CHECK(ipp::encode_request(ipp::kGetJobs, 1, {{ipp::kTagKeyword, "requested-attributes", "job-id", {big}}}).empty());
+    CHECK(ipp::encode_request(ipp::kGetJobs, 1, {{ipp::kTagUri, big, "v", {}}}).empty());
+}

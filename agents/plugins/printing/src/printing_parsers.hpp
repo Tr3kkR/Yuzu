@@ -342,7 +342,8 @@ inline constexpr uint32_t kJobStatusRestart = 0x00000800;
                         job_id, outcome, yuzu::util::safe_output_field(detail));
 }
 
-/// How a CUPS Cancel-Job response status maps onto a `clear_queue` outcome.
+/// How a CUPS response status (Cancel-Job, or the pre-cancel Get-Jobs) maps onto a
+/// `clear_queue` outcome; `canceled` means the operation succeeded (successful-*).
 enum class CancelStatusClass { canceled, not_found, refused, error };
 
 /// Pure so the mapping is unit-testable without a cupsd. Status values are
@@ -396,27 +397,253 @@ enum class OpenPrinterFailure { not_found, refused, error };
 /// the `//server/queue` form `safe_output_field` renders it as in the
 /// `printers`/`jobs` rows, `http://host/printers/x/.printer`, ...), and
 /// OpenPrinterW returns the SAME 1801 for an unreachable server as for a missing
-/// local printer, so a not-found is definitive only for a plain name. An
-/// allowlist on purpose: enumerating remote-capable name shapes is open-ended.
+/// local printer, so a not-found is definitive only for a plain name.
+/// Conservative by construction: only a name free of all three characters may
+/// claim a definitive not-found; enumerating remote-capable shapes is open-ended.
 [[nodiscard]] inline bool printer_name_is_plain_local(std::string_view name) noexcept {
     return name.find_first_of("\\/:") == std::string_view::npos;
 }
 
+// ───────────────────────── clear_queue on macOS/Linux: job-to-printer binding ──
+//
+// cupsd's Cancel-Job looks a job up by id alone: with a non-zero job-id the
+// printer-uri is neither validated nor compared to the job's queue
+// (scheduler/ipp.c cancel_job()). So the named printer only constrains the
+// cancel if the agent checks it first. Everything below is pure so the whole
+// ladder is unit-testable with an injected transport.
+
+/// One IPP round trip's outcome, as the plugin's transport layer reports it.
+struct IppResult {
+    bool transport_ok = false;
+    long http_status = 0;
+    std::optional<ipp::Message> message;
+};
+
+/// IPP name(127): the longest printer name cupsd accepts. A longer value is
+/// refused before any request is built.
+inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
+
+/// RFC 3986 path-segment encoding: every byte outside the unreserved set
+/// (A-Z a-z 0-9 - . _ ~) becomes %XX. The printer name goes into the request
+/// URI, which cupsd percent-DECODES: a raw `%00` truncated the resource at the
+/// NUL and turned the printer-uri into the all-printers collection, so the
+/// binding check passed for any job id. Encoding makes `%` a literal `%25`.
+[[nodiscard]] inline std::string percent_encode_path_segment(std::string_view s) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+/// Decodes %XX sequences; a `%` not followed by two hex digits stays literal.
+[[nodiscard]] inline std::string percent_decode(std::string_view s) {
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const int hi = hex(s[i + 1]);
+            const int lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+/// The printer NAME from what an operator supplied. The `jobs` action prints a
+/// printer as a destination URI on macOS/Linux (`ipp://localhost:631/printers/Q`,
+/// or `/classes/C` for a class), so that form is accepted and reduced to its
+/// last path segment (percent-decoded). Anything else is returned unchanged.
+[[nodiscard]] inline std::string printer_name_from_operand(std::string_view operand) {
+    for (const std::string_view scheme : {std::string_view{"ipp://"}, std::string_view{"ipps://"}}) {
+        if (!operand.starts_with(scheme))
+            continue;
+        const auto rest = operand.substr(scheme.size());
+        const auto slash = rest.find('/');
+        if (slash == std::string_view::npos)
+            break;
+        const auto path = rest.substr(slash);
+        for (const std::string_view prefix : {std::string_view{"/printers/"}, std::string_view{"/classes/"}}) {
+            if (!path.starts_with(prefix))
+                continue;
+            const auto segment = path.substr(prefix.size());
+            if (segment.find_first_of("/?#") != std::string_view::npos)
+                return std::string(operand);
+            return percent_decode(segment);
+        }
+        break;
+    }
+    return std::string(operand);
+}
+
+/// A name the macOS/Linux path will build a request for: non-empty, within the
+/// IPP name limit, and free of control characters (including one that appears
+/// only after percent-decoding a pasted URI, e.g. `%00`).
+[[nodiscard]] inline bool printer_name_is_valid_posix(std::string_view name) noexcept {
+    if (name.empty() || name.size() > kMaxPosixPrinterNameBytes)
+        return false;
+    return std::none_of(name.begin(), name.end(), [](char c) {
+        const auto u = static_cast<unsigned char>(c);
+        return u < 0x20 || u == 0x7F;
+    });
+}
+
+/// `ipp://localhost/printers/<encoded name>`
+[[nodiscard]] inline std::string printer_uri_for(std::string_view name) {
+    return "ipp://localhost/printers/" + percent_encode_path_segment(name);
+}
+
 /// Operation attributes of the Get-Jobs that lists ONE printer's not-completed
-/// jobs, asking only for the job ids. `clear_queue` sends it before Cancel-Job
-/// because cupsd's Cancel-Job looks a job up by id alone and ignores which
-/// printer was named. A nonexistent printer makes cupsd answer not-found.
-[[nodiscard]] inline std::vector<ipp::OperationAttr> job_binding_check_attrs(std::string_view printer) {
+/// jobs (pending/held/processing/stopped), asking only for each job's id and its
+/// printer URI. A nonexistent printer makes cupsd answer not-found.
+[[nodiscard]] inline std::vector<ipp::OperationAttr> job_binding_check_attrs(std::string_view printer_name) {
     std::vector<ipp::OperationAttr> attrs;
-    attrs.push_back({ipp::kTagUri, "printer-uri", "ipp://localhost/printers/" + std::string(printer), {}});
+    attrs.push_back({ipp::kTagUri, "printer-uri", printer_uri_for(printer_name), {}});
     attrs.push_back({ipp::kTagKeyword, "which-jobs", "not-completed", {}});
-    attrs.push_back({ipp::kTagKeyword, "requested-attributes", "job-id", {}});
+    attrs.push_back({ipp::kTagKeyword, "requested-attributes", "job-id", {"job-printer-uri"}});
     return attrs;
 }
 
-/// True when `job_id` is one of the listed jobs.
-[[nodiscard]] inline bool job_is_listed(const std::vector<JobRow>& rows, int64_t job_id) noexcept {
-    return std::any_of(rows.begin(), rows.end(), [job_id](const JobRow& r) { return r.job_id == job_id; });
+/// True when a listed job has this id AND belongs to the named printer. The
+/// second half is a deliberate second guard: whatever cupsd made of the
+/// request URI, a job of another queue is never accepted. A row with no
+/// `job-printer-uri` (rendered "-") never matches.
+[[nodiscard]] inline bool job_is_listed_on(const std::vector<JobRow>& rows, int64_t job_id,
+                                            std::string_view printer_name) {
+    return std::any_of(rows.begin(), rows.end(), [&](const JobRow& r) {
+        // "-" is jobs_from_ipp's placeholder for an absent job-printer-uri.
+        return r.job_id == job_id && r.printer != "-" && printer_name_from_operand(r.printer) == printer_name;
+    });
+}
+
+enum class ClearQueueStatus { ok, unavailable, permission_denied };
+
+/// What `clear_queue` reports: the shell applies it to the command context.
+struct ClearQueueDisposition {
+    int rc = 1;
+    ClearQueueStatus status = ClearQueueStatus::unavailable;
+    bool full = false; // completeness FULL (true) or PARTIAL (false)
+    std::string detail;
+    std::string row;
+};
+
+/// The per-OS failure tokens the shell owns (`<os>:cups:<detail>`).
+struct ClearQueueTokens {
+    std::string_view connect_failed;
+    std::string_view decode_failed;
+    std::string_view access_denied;
+    std::string_view not_found;
+    std::string_view unexpected_status;
+};
+
+/// The whole macOS/Linux cancel ladder over an injected transport:
+///   post(op, attrs) -> IppResult   (one IPP round trip; the shell encodes+sends)
+/// It sends NOTHING for a printer name it will not build a request for, then a
+/// Get-Jobs of the named printer, and sends Cancel-Job ONLY when that listing
+/// holds the job id on that printer. Transport, HTTP 401/403, decode and status
+/// failures of either request are reported, never turned into a cancel.
+template <class Post>
+[[nodiscard]] ClearQueueDisposition run_clear_queue(std::string_view printer_as_given, int64_t job_id,
+                                                     std::string_view user, const ClearQueueTokens& tok,
+                                                     Post&& post) {
+    const auto make = [&](ClearQueueStatus st, bool full, std::string detail, std::string_view outcome,
+                          std::string_view token) {
+        ClearQueueDisposition d;
+        d.rc = st == ClearQueueStatus::ok ? 0 : 1;
+        d.status = st;
+        d.full = full;
+        d.detail = std::move(detail);
+        d.row = format_clear_queue_row(printer_as_given, job_id, outcome, token);
+        return d;
+    };
+
+    const std::string name = printer_name_from_operand(printer_as_given);
+    if (!printer_name_is_valid_posix(name)) {
+        // The row shows "-", not the offending value: it may be arbitrarily long or
+        // hold control characters, and it was never used to build a request.
+        auto d = make(ClearQueueStatus::unavailable, false, "invalid printer name", "error", "invalid_printer");
+        d.row = format_clear_queue_row("-", job_id, "error", "invalid_printer");
+        return d;
+    }
+
+    // A round trip that failed before yielding an IPP status is reported the same
+    // way for both requests.
+    const auto round_trip_failure = [&](const IppResult& r,
+                                        std::string_view op) -> std::optional<ClearQueueDisposition> {
+        if (!r.transport_ok)
+            return make(ClearQueueStatus::unavailable, false, std::format("{}: transport failed", op), "error",
+                        tok.connect_failed);
+        if (r.http_status == 401 || r.http_status == 403)
+            return make(ClearQueueStatus::permission_denied, true, std::format("{}: HTTP auth/forbidden", op),
+                        "refused", tok.access_denied);
+        if (!r.message)
+            return make(ClearQueueStatus::unavailable, false, std::format("{}: response did not decode", op),
+                        "error", tok.decode_failed);
+        return std::nullopt;
+    };
+
+    const IppResult listing = post(ipp::kGetJobs, job_binding_check_attrs(name));
+    if (auto failure = round_trip_failure(listing, "Get-Jobs"))
+        return *failure;
+    const uint16_t listing_status = listing.message->op_or_status;
+    const CancelStatusClass listing_cls = classify_cancel_job_status(listing_status);
+    if (listing_cls == CancelStatusClass::not_found)
+        return make(ClearQueueStatus::unavailable, true, "Get-Jobs: printer not found", "not_found", tok.not_found);
+    if (listing_cls == CancelStatusClass::refused)
+        return make(ClearQueueStatus::permission_denied, true, "Get-Jobs: not authorized", "refused",
+                    tok.access_denied);
+    if (listing_cls != CancelStatusClass::canceled) // any other non-successful status
+        return make(ClearQueueStatus::unavailable, false,
+                    std::format("Get-Jobs: unexpected status 0x{:04x}", listing_status), "error",
+                    tok.unexpected_status);
+    if (!job_is_listed_on(jobs_from_ipp(*listing.message), job_id, name))
+        return make(ClearQueueStatus::unavailable, true, "Get-Jobs: job is not on the named printer's active queue",
+                    "not_found", tok.not_found);
+
+    std::vector<ipp::OperationAttr> attrs;
+    attrs.push_back({ipp::kTagUri, "printer-uri", printer_uri_for(name), {}});
+    attrs.push_back({ipp::kTagInteger, "job-id", ipp::encode_int32(static_cast<int32_t>(job_id)), {}});
+    attrs.push_back({ipp::kTagNameWithoutLanguage, "requesting-user-name", std::string(user), {}});
+    const IppResult result = post(ipp::kCancelJob, attrs);
+    if (auto failure = round_trip_failure(result, "Cancel-Job"))
+        return *failure;
+
+    // The job could finish between the two requests (cupsd then answers 0x0404 or
+    // 0x0406, reported below); one MOVED to another queue in that window is still
+    // cancelled by id -- an administrative operation, accepted as a narrow window.
+    const uint16_t status = result.message->op_or_status;
+    const CancelStatusClass cls = classify_cancel_job_status(status);
+    if (cls == CancelStatusClass::canceled)
+        return make(ClearQueueStatus::ok, true, "", "canceled", "-");
+    if (cls == CancelStatusClass::not_found)
+        return make(ClearQueueStatus::unavailable, true, "Cancel-Job: job not found", "not_found", tok.not_found);
+    if (cls == CancelStatusClass::refused)
+        return make(ClearQueueStatus::permission_denied, true, "Cancel-Job: not authorized", "refused",
+                    tok.access_denied);
+    return make(ClearQueueStatus::unavailable, false, std::format("Cancel-Job: unexpected status 0x{:04x}", status),
+                "error", tok.unexpected_status);
 }
 
 /// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never

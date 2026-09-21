@@ -26,9 +26,10 @@
  *      CUPS host); SKIPs by name ONLY when no socket path exists at all,
  *      never for want of a populated queue.
  *   2. Live clear_queue negative, over the real socket WITH the
- *      `Authorization: PeerCred` header — unconditional; proves the full
- *      clear_queue round trip end to end with no sudo and without
- *      cancelling anything.
+ *      `Authorization: PeerCred` header — unconditional; on POSIX it stops at
+ *      the pre-cancel Get-Jobs (the printer cannot exist), so it never sends
+ *      a Cancel-Job and cancels nothing. The bind-then-cancel ladder itself is
+ *      covered by the pure run_clear_queue() tests in test_printing_parsers.cpp.
  *   3. Populated-queue assertion (a real `yuzu_test` row) — the ONLY case
  *      in this file allowed to SKIP, and only by name.
  */
@@ -355,10 +356,10 @@ TEST_CASE("printing plugin: clear_queue — job_id=\"all\" is rc 1, never a purg
 
 // Case 2 (live clear_queue negative, unconditional): dispatched for real
 // over whatever socket/leg this host has — on POSIX this exercises the
-// FULL Cancel-Job round trip including the `Authorization: PeerCred`
+// pre-cancel Get-Jobs round trip including the `Authorization: PeerCred`
 // header (do_clear_queue attaches it unconditionally whenever a socket is
-// found), end to end, with no sudo and without cancelling anything (the
-// target printer cannot exist). Asserted on the PARSED outcome the plugin
+// found) with no sudo and without cancelling anything: the target printer
+// cannot exist, so it never reaches Cancel-Job. Asserted on the PARSED outcome the plugin
 // actually returns, never a value hardcoded ahead of the real dispatch.
 TEST_CASE("printing plugin: clear_queue — live negative round trip over the real per-OS leg "
           "(POSIX: with the Authorization: PeerCred header) — rc 1, never a crash, never a "
