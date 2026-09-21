@@ -34,6 +34,14 @@ static_assert(!std::is_move_constructible_v<FileGuard>);
 
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -460,6 +468,271 @@ TEST_CASE("FileGuard file-hash-equals: continuous sub-settle writes still get ha
     CHECK(col->wait_count(1, std::chrono::seconds(3)));
     g.stop();
     fs::remove_all(dir);
+}
+
+// ── watched directory renamed or moved ───────────────────────────────────────
+// An open directory handle follows its directory to a new name without a completion, so the
+// guard also watches the parent of the directory it armed. Each case renames or moves the
+// watched directory, recreates the original path and changes the target there.
+
+namespace {
+
+using namespace std::chrono_literals;
+
+enum class RigMode { Tripwire, Present, Hash };
+
+bool move_dir(const fs::path& from, const fs::path& to) {
+    return MoveFileExW(from.c_str(), to.c_str(), 0) != 0;
+}
+
+bool wait_for_hash_drift(FileDriftCollector& c, std::chrono::milliseconds to) {
+    std::unique_lock lk(c.m);
+    return c.cv.wait_for(lk, to, [&] {
+        for (const auto& e : c.events)
+            if (!e.compliant && e.detected_value.size() == 64)
+                return true;
+        return false;
+    });
+}
+
+DWORD process_handle_count() {
+    DWORD n = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &n);
+    return n;
+}
+
+// One guard over <scratch>/<rel_target>. The scratch root is declared first and the guard last,
+// so the watch thread is joined before the tree is removed.
+class RenameRig {
+public:
+    RenameRig(RigMode mode, const fs::path& rel_target, const fs::path& rel_precreate,
+              bool seed_target)
+        : mode_(mode) {
+        fs::create_directories(root_.path);
+        target_ = root_.path / rel_target;
+        if (!rel_precreate.empty())
+            fs::create_directories(root_.path / rel_precreate);
+        if (seed_target)
+            write_file(target_, "base-content");
+        FileGuard::Config cfg;
+        cfg.rule_id = "fg-rename";
+        cfg.path = target_.string();
+        cfg.event_debounce_ms = 50;
+        cfg.settle_ms = 100;
+        if (mode == RigMode::Hash)
+            cfg.assertion = FileGuard::Assertion::HashEquals;
+        else
+            cfg.expect_present = (mode == RigMode::Present);
+        guard_ = std::make_unique<FileGuard>(cfg, [col = col_](const GuardDrift& d) { col->push(d); });
+        REQUIRE(guard_->start());
+        // The first evaluation runs after the watches are armed, so its report is the barrier.
+        REQUIRE(col_->wait_count(1, 10s));
+    }
+
+    const fs::path& root() const { return root_.path; }
+    fs::path dir() const { return target_.parent_path(); }
+    FileDriftCollector& col() { return *col_; }
+
+    void move(const fs::path& from, const fs::path& to) { REQUIRE(move_dir(from, to)); }
+
+    // Recreate the directory chain at the original path, then write the target.
+    void recreate_and_write() {
+        fs::create_directories(dir());
+        write_file(target_, "content-" + std::to_string(++seq_));
+    }
+
+    void flood_siblings(int count, int rename_dir_at = -1, const fs::path& dir_dest = {}) {
+        for (int i = 0; i < count; ++i) {
+            std::error_code ec;
+            const fs::path s = root_.path / ("s" + std::to_string(i));
+            const fs::path t = root_.path / ("t" + std::to_string(i));
+            fs::create_directory(s, ec);
+            move_dir(s, t);
+            if (i == rename_dir_at)
+                move(dir(), dir_dest);
+        }
+    }
+
+    // Tripwire: the target appeared. Hash: a content drift carrying a real digest.
+    bool wait_detected(std::chrono::milliseconds to) {
+        REQUIRE(mode_ != RigMode::Present);
+        return mode_ == RigMode::Hash ? wait_for_hash_drift(*col_, to)
+                                      : col_->wait_for_detected("<present>", to);
+    }
+
+    void stop() { guard_->stop(); }
+
+private:
+    yuzu::test::TempDir root_{"yuzu_test_fgrename_"};
+    RigMode mode_;
+    fs::path target_;
+    std::shared_ptr<FileDriftCollector> col_ = std::make_shared<FileDriftCollector>();
+    int seq_{0};
+    std::unique_ptr<FileGuard> guard_;
+};
+
+void run_rename_then_recreate(RigMode m, bool move_to_other_parent) {
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+    if (move_to_other_parent) {
+        fs::create_directories(rig.root() / "P2");
+        rig.move(rig.dir(), rig.root() / "P2" / "D");
+    } else {
+        rig.move(rig.dir(), rig.root() / "D2");
+    }
+    rig.recreate_and_write();
+    CHECK(rig.wait_detected(5s));
+}
+
+void run_rename_reports_absent(RigMode m, bool move_to_other_parent) {
+    RenameRig rig(m, "D/f.txt", "D", true);
+    if (move_to_other_parent) {
+        fs::create_directories(rig.root() / "P2");
+        rig.move(rig.dir(), rig.root() / "P2" / "D");
+    } else {
+        rig.move(rig.dir(), rig.root() / "D2");
+    }
+    CHECK(rig.col().wait_for_detected("<absent>", 5s));
+}
+
+void run_delete_then_recreate(RigMode m) {
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+    std::error_code ec;
+    fs::remove_all(rig.dir(), ec);
+    rig.recreate_and_write();
+    CHECK(rig.wait_detected(5s));
+}
+
+// Only A exists at arm time (A/B/D does not), so the guard is in nearest-ancestor mode on A.
+void run_ancestor_rename(RigMode m) {
+    RenameRig rig(m, "A/B/D/f.txt", "A", false);
+    rig.move(rig.root() / "A", rig.root() / "A2");
+    rig.recreate_and_write();
+    if (m == RigMode::Hash)
+        CHECK(rig.col().wait_compliant(5s)); // first present read of the recreated file is baselined
+    else
+        CHECK(rig.wait_detected(5s));
+}
+
+void run_sibling_churn(RigMode m) {
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+    rig.flood_siblings(60);
+    std::this_thread::sleep_for(300ms); // linger so the reader has seen the burst
+    CHECK(rig.col().drift_count() == 0); // records naming other entries are not drift
+    // The parent watch must still be live after all those re-issues.
+    rig.move(rig.dir(), rig.root() / "D2");
+    rig.recreate_and_write();
+    CHECK(rig.wait_detected(5s));
+}
+
+// Enough sibling renames to outrun the reader (a notification buffer overflow is possible, not
+// forced); the directory is renamed part-way through. Liveness only: the digest count is not
+// observable from the sink.
+void run_sibling_flood(RigMode m) {
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+    rig.flood_siblings(300, 150, rig.root() / "D2");
+    rig.recreate_and_write();
+    CHECK(rig.wait_detected(10s));
+}
+
+void run_stop_cycles(RigMode m, bool rename_first) {
+    auto cycle = [&] {
+        RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+        if (rename_first)
+            rig.move(rig.dir(), rig.root() / "D2");
+        const auto t0 = std::chrono::steady_clock::now();
+        rig.stop();
+        CHECK(std::chrono::steady_clock::now() - t0 < 5s);
+    };
+    cycle(); // warm-up: process-wide lazily created handles are not a per-guard leak
+    const DWORD before = process_handle_count();
+    for (int i = 0; i < 20; ++i)
+        cycle();
+    // A handle leaked per guard would add at least 20.
+    CHECK(process_handle_count() < before + 10);
+}
+
+} // namespace
+
+TEST_CASE("FileGuard rename: renamed watched directory then recreated is detected (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_rename_then_recreate(RigMode::Tripwire, false);
+}
+
+TEST_CASE("FileGuard rename: renamed watched directory then recreated is detected (hash)",
+          "[guardian][guard][file][rename]") {
+    run_rename_then_recreate(RigMode::Hash, false);
+}
+
+TEST_CASE("FileGuard rename: moved watched directory then recreated is detected (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_rename_then_recreate(RigMode::Tripwire, true);
+}
+
+TEST_CASE("FileGuard rename: moved watched directory then recreated is detected (hash)",
+          "[guardian][guard][file][rename]") {
+    run_rename_then_recreate(RigMode::Hash, true);
+}
+
+TEST_CASE("FileGuard rename: rename or move alone reports the absent state (file-exists)",
+          "[guardian][guard][file][rename]") {
+    run_rename_reports_absent(RigMode::Present, false);
+    run_rename_reports_absent(RigMode::Present, true);
+}
+
+TEST_CASE("FileGuard rename: rename or move alone reports the absent state (hash)",
+          "[guardian][guard][file][rename]") {
+    run_rename_reports_absent(RigMode::Hash, false);
+    run_rename_reports_absent(RigMode::Hash, true);
+}
+
+TEST_CASE("FileGuard rename: deleted watched directory then recreated is still detected (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_delete_then_recreate(RigMode::Tripwire);
+}
+
+TEST_CASE("FileGuard rename: deleted watched directory then recreated is still detected (hash)",
+          "[guardian][guard][file][rename]") {
+    run_delete_then_recreate(RigMode::Hash);
+}
+
+TEST_CASE("FileGuard rename: renamed nearest ancestor then recreated is detected (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_ancestor_rename(RigMode::Tripwire);
+}
+
+TEST_CASE("FileGuard rename: renamed nearest ancestor then recreated is detected (hash)",
+          "[guardian][guard][file][rename]") {
+    run_ancestor_rename(RigMode::Hash);
+}
+
+TEST_CASE("FileGuard rename: sibling churn in the parent is not drift and detection survives it (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_sibling_churn(RigMode::Tripwire);
+}
+
+TEST_CASE("FileGuard rename: sibling churn in the parent is not drift and detection survives it (hash)",
+          "[guardian][guard][file][rename]") {
+    run_sibling_churn(RigMode::Hash);
+}
+
+TEST_CASE("FileGuard rename: detection survives a sibling rename flood (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_sibling_flood(RigMode::Tripwire);
+}
+
+TEST_CASE("FileGuard rename: detection survives a sibling rename flood (hash)",
+          "[guardian][guard][file][rename]") {
+    run_sibling_flood(RigMode::Hash);
+}
+
+TEST_CASE("FileGuard rename: stop() while idle returns promptly and leaks no handles",
+          "[guardian][guard][file][rename][teardown]") {
+    run_stop_cycles(RigMode::Tripwire, false);
+}
+
+TEST_CASE("FileGuard rename: stop() right after a rename returns promptly and leaks no handles",
+          "[guardian][guard][file][rename][teardown]") {
+    run_stop_cycles(RigMode::Hash, true);
 }
 
 #else // !_WIN32
