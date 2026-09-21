@@ -74,8 +74,8 @@ app|ColorSync Utility|12.2.0|-|13/08/2026, 03:51|/System/Applications/Utilities/
 app|Computer|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/Computer.app|com.apple.finder.Open-Computer
 app|Conflict Resolver|8.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SyncServicesUI.framework/Versions/A/Resources/Conflict Resolver.app|com.apple.syncservices.ConflictResolver
 app|Console|1.1|-|13/08/2026, 03:51|/System/Applications/Utilities/Console.app|com.apple.Console
-app|Contacts|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PeopleViewService.app|com.apple.PeopleViewService
 app|Contacts|14.0|-|13/08/2026, 03:51|/System/Applications/Contacts.app|com.apple.AddressBook
+app|Contacts|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PeopleViewService.app|com.apple.PeopleViewService
 app|ContinuityCaptureOnboardingUI|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/ContinuityCaptureOnboardingUI.app|com.apple.ContinuityCaptureOnboardingUI
 app|Control Centre|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ControlCenter.app|com.apple.controlcenter
 app|ControlStrip|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ControlStrip.app|com.apple.controlstrip
@@ -97,8 +97,8 @@ app|DiskImageMounter|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/DiskIm
 app|DiskImages UI Agent|683.160.3|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/DiskImages UI Agent.app|com.apple.frameworks.diskimages.diuiagent
 app|Display Calibrator|4.19|-|13/08/2026, 03:51|/System/Library/ColorSync/Calibrators/Display Calibrator.app|com.apple.ColorSyncCalibrator
 app|Dock|1.8|-|13/08/2026, 03:51|/System/Library/CoreServices/Dock.app|com.apple.dock
-app|Docker|4.92.0|-|13/08/2026, 16:18|/Users/jsmith/Library/Application Support/com.docker.install/in_progress/Docker.app|com.docker.docker
 app|Docker|4.89.0|-|13/08/2026, 16:18|/Applications/Docker.app|com.docker.docker
+app|Docker|4.92.0|-|13/08/2026, 16:18|/Users/jsmith/Library/Application Support/com.docker.install/in_progress/Docker.app|com.docker.docker
 app|Droplet with Settable Properties|1.0|-|13/08/2026, 03:51|/Library/Application Support/Script Editor/Templates/Droplets/Droplet with Settable Properties.app|com.apple.ScriptEditor.id.droplet-with-settable-properties-template
 app|Dwell Control|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Dwell Control.app|com.apple.DwellControl
 app|EmojiFunctionRowIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/EmojiFunctionRowIM.app|com.apple.EmojiFunctionRowItem-Container
@@ -123,8 +123,8 @@ app|FontRegistryUIAgent|81.0|-|13/08/2026, 03:51|/System/Library/Frameworks/Appl
 app|Freeform|4.5|-|13/08/2026, 03:51|/System/Applications/Freeform.app|com.apple.freeform
 app|Game Center|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Game Center.app|com.apple.gamecenter
 app|GameOverlayUI|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/GameOverlayUI.app|com.apple.GameOverlayUI
-app|Games|820.6.10.1.1|-|13/08/2026, 03:51|/System/Library/CoreServices/GameTrampoline.app|com.apple.GameTrampoline
 app|Games|1.0|-|13/08/2026, 03:51|/System/Applications/Games.app|com.apple.games
+app|Games|820.6.10.1.1|-|13/08/2026, 03:51|/System/Library/CoreServices/GameTrampoline.app|com.apple.GameTrampoline
 app|GarageBand|10.4.13|-|18/07/2026, 01:47|/Applications/GarageBand.app|com.apple.garageband10
 app|Grapher|2.8|-|13/08/2026, 03:51|/System/Applications/Utilities/Grapher.app|com.apple.grapher
 app|Home|10.0|-|13/08/2026, 03:51|/System/Applications/Home.app|com.apple.Home
@@ -233,8 +233,8 @@ app|Shortcuts|7.0|-|13/08/2026, 03:51|/System/Applications/Shortcuts.app|com.app
 app|Shortcuts Events|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Shortcuts Events.app|com.apple.shortcuts.events
 app|ShortcutsActions|-|-|13/08/2026, 03:51|/System/Library/CoreServices/ShortcutsActions.app|com.apple.ShortcutsActions
 app|Signal|8.27.0|-|04/09/2026, 22:19|/Applications/Signal.app|org.whispersystems.signal-desktop
-app|Siri|3525.5.2|-|13/08/2026, 03:51|/System/Library/CoreServices/Siri.app|com.apple.Siri
 app|Siri|1.0|-|13/08/2026, 03:51|/System/Applications/Siri.app|com.apple.siri.launcher
+app|Siri|3525.5.2|-|13/08/2026, 03:51|/System/Library/CoreServices/Siri.app|com.apple.Siri
 app|SmartCard Pairing|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/CryptoTokenKit.framework/ctkbind.app|com.apple.ctkbind
 app|Software Update|6|-|13/08/2026, 03:51|/System/Library/CoreServices/Software Update.app|com.apple.SoftwareUpdate
 app|SoftwareUpdateNotificationManager|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SoftwareUpdate.framework/Versions/A/Resources/SoftwareUpdateNotificationManager.app|com.apple.SoftwareUpdateNotificationManager
@@ -243,8 +243,8 @@ app|Speech Downloader|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/S
 app|SpeechRecognitionServer|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SpeechObjects.framework/Versions/A/SpeechRecognitionServer.app|com.apple.speech.SpeechRecognitionServer
 app|SpeechService|9.2.22|-|13/08/2026, 03:51|/System/Library/Services/SpeechService.service|com.apple.speech.SpeechService
 app|Spotify|1.3.0.277|-|14/09/2026, 11:13|/Applications/Spotify.app|com.spotify.client
-app|Spotlight|3.0|-|13/08/2026, 03:51|/System/Library/Services/Spotlight.service|com.apple.SpotlightService
 app|Spotlight|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Spotlight.app|com.apple.Spotlight
+app|Spotlight|3.0|-|13/08/2026, 03:51|/System/Library/Services/Spotlight.service|com.apple.SpotlightService
 app|StageManagerOnboarding|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/StageManagerOnboarding.app|com.apple.windowmanager.StageManagerOnboarding
 app|Stickies|10.3|-|13/08/2026, 03:51|/System/Applications/Stickies.app|com.apple.Stickies
 app|Stocks|8.5|-|13/08/2026, 03:51|/System/Applications/Stocks.app|com.apple.stocks
@@ -301,8 +301,8 @@ app|com.apple.ctcategories|-|-|20/08/2026, 14:51|/Users/jsmith/Library/HTTPStora
 app|eaptlstrust|13.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/EAP8021X.framework/Support/eaptlstrust.app|com.apple.eap8021x.eaptlstrust
 app|group.is.workflow|-|-|19/08/2026, 15:55|/Users/jsmith/Library/Application Scripts/group.is.workflow.my.app|-
 app|iCloud|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/iCloud.app|com.apple.CloudKit.ShareBear
-app|iCloud Drive|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Resources/iCloud Drive.app|com.apple.bird
 app|iCloud Drive|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/iCloud Drive.app|com.apple.finder.Open-iCloudDrive
+app|iCloud Drive|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Resources/iCloud Drive.app|com.apple.bird
 app|iCloud+|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/iCloud+.app|com.apple.icq
 app|iCloudUserNotificationsd|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSAccounts.framework/Versions/A/Resources/iCloudUserNotificationsd.app|com.apple.iCloudUserNotificationsd
 app|iMovie|10.4.4|-|18/07/2026, 01:47|/Applications/iMovie.app|com.apple.iMovieApp
@@ -404,8 +404,8 @@ user_app|system|ColorSync Utility|12.2.0|-|13/08/2026, 03:51
 user_app|system|Computer|26.4|-|13/08/2026, 03:51
 user_app|system|Conflict Resolver|8.1|-|13/08/2026, 03:51
 user_app|system|Console|1.1|-|13/08/2026, 03:51
-user_app|system|Contacts|1.0|-|13/08/2026, 03:51
 user_app|system|Contacts|14.0|-|13/08/2026, 03:51
+user_app|system|Contacts|1.0|-|13/08/2026, 03:51
 user_app|system|ContinuityCaptureOnboardingUI|1.0|-|13/08/2026, 03:51
 user_app|system|Control Centre|1.0|-|13/08/2026, 03:51
 user_app|system|ControlStrip|1.0|-|13/08/2026, 03:51
@@ -427,8 +427,8 @@ user_app|system|DiskImageMounter|1.0|-|13/08/2026, 03:51
 user_app|system|DiskImages UI Agent|683.160.3|-|13/08/2026, 03:51
 user_app|system|Display Calibrator|4.19|-|13/08/2026, 03:51
 user_app|system|Dock|1.8|-|13/08/2026, 03:51
-user_app|system|Docker|4.92.0|-|13/08/2026, 16:18
 user_app|system|Docker|4.89.0|-|13/08/2026, 16:18
+user_app|system|Docker|4.92.0|-|13/08/2026, 16:18
 user_app|system|Droplet with Settable Properties|1.0|-|13/08/2026, 03:51
 user_app|system|Dwell Control|1.0|-|13/08/2026, 03:51
 user_app|system|EmojiFunctionRowIM|1.0|-|13/08/2026, 03:51
@@ -453,8 +453,8 @@ user_app|system|FontRegistryUIAgent|81.0|-|13/08/2026, 03:51
 user_app|system|Freeform|4.5|-|13/08/2026, 03:51
 user_app|system|Game Center|1.0|-|13/08/2026, 03:51
 user_app|system|GameOverlayUI|1.0|-|13/08/2026, 03:51
-user_app|system|Games|820.6.10.1.1|-|13/08/2026, 03:51
 user_app|system|Games|1.0|-|13/08/2026, 03:51
+user_app|system|Games|820.6.10.1.1|-|13/08/2026, 03:51
 user_app|system|GarageBand|10.4.13|-|18/07/2026, 01:47
 user_app|system|Grapher|2.8|-|13/08/2026, 03:51
 user_app|system|Home|10.0|-|13/08/2026, 03:51
@@ -563,8 +563,8 @@ user_app|system|Shortcuts|7.0|-|13/08/2026, 03:51
 user_app|system|Shortcuts Events|1.0|-|13/08/2026, 03:51
 user_app|system|ShortcutsActions|-|-|13/08/2026, 03:51
 user_app|system|Signal|8.27.0|-|04/09/2026, 22:19
-user_app|system|Siri|3525.5.2|-|13/08/2026, 03:51
 user_app|system|Siri|1.0|-|13/08/2026, 03:51
+user_app|system|Siri|3525.5.2|-|13/08/2026, 03:51
 user_app|system|SmartCard Pairing|1.0|-|13/08/2026, 03:51
 user_app|system|Software Update|6|-|13/08/2026, 03:51
 user_app|system|SoftwareUpdateNotificationManager|1.0|-|13/08/2026, 03:51
@@ -573,8 +573,8 @@ user_app|system|Speech Downloader|10|-|13/08/2026, 03:51
 user_app|system|SpeechRecognitionServer|10|-|13/08/2026, 03:51
 user_app|system|SpeechService|9.2.22|-|13/08/2026, 03:51
 user_app|system|Spotify|1.3.0.277|-|14/09/2026, 11:13
-user_app|system|Spotlight|3.0|-|13/08/2026, 03:51
 user_app|system|Spotlight|1.0|-|13/08/2026, 03:51
+user_app|system|Spotlight|3.0|-|13/08/2026, 03:51
 user_app|system|StageManagerOnboarding|1.0|-|13/08/2026, 03:51
 user_app|system|Stickies|10.3|-|13/08/2026, 03:51
 user_app|system|Stocks|8.5|-|13/08/2026, 03:51
@@ -631,8 +631,8 @@ user_app|system|com.apple.ctcategories|-|-|20/08/2026, 14:51
 user_app|system|eaptlstrust|13.0|-|13/08/2026, 03:51
 user_app|system|group.is.workflow|-|-|19/08/2026, 15:55
 user_app|system|iCloud|1.0|-|13/08/2026, 03:51
-user_app|system|iCloud Drive|1.0|-|13/08/2026, 03:51
 user_app|system|iCloud Drive|26.4|-|13/08/2026, 03:51
+user_app|system|iCloud Drive|1.0|-|13/08/2026, 03:51
 user_app|system|iCloud+|1.0|-|13/08/2026, 03:51
 user_app|system|iCloudUserNotificationsd|1.0|-|13/08/2026, 03:51
 user_app|system|iMovie|10.4.4|-|18/07/2026, 01:47
@@ -952,17 +952,17 @@ inv|OpenSpell|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|SpeechService|9.2.22|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Spotlight|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Summary Service|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Signal|8.27.0|Developer ID Application: Signal Messenger, LLC (U68MSDN6DR)|04/09/2026, 22:19|app|macos||||signed||
-inv|Docker|4.92.0|Developer ID Application: Docker Inc (9BNSXJN65R)|13/08/2026, 16:18|app|macos||||signed||
-inv|Hush|1.0.19|Apple Mac OS Application Signing|24/08/2026, 12:32|app|macos||||signed||
 inv|Keynote|15.1.1|Apple Mac OS Application Signing|18/07/2026, 01:45|app|macos||||signed||
 inv|Pages|15.1.1|Apple Mac OS Application Signing|18/07/2026, 01:46|app|macos||||signed||
 inv|Numbers|15.1|Apple Mac OS Application Signing|18/07/2026, 01:46|app|macos||||signed||
 inv|iMovie|10.4.4|Apple Mac OS Application Signing|18/07/2026, 01:47|app|macos||||signed||
 inv|GarageBand|10.4.13|Apple Mac OS Application Signing|18/07/2026, 01:47|app|macos||||signed||
-inv|group.is.workflow|||19/08/2026, 15:55|app|macos||||||
 inv|MRT|1.93|Software Signing|19/08/2026, 15:56|app|macos||||signed||
 inv|XProtect|163|Software Signing|19/09/2026, 06:21|app|macos||||signed||
+inv|Signal|8.27.0|Developer ID Application: Signal Messenger, LLC (U68MSDN6DR)|04/09/2026, 22:19|app|macos||||signed||
+inv|Docker|4.92.0|Developer ID Application: Docker Inc (9BNSXJN65R)|13/08/2026, 16:18|app|macos||||signed||
+inv|Hush|1.0.19|Apple Mac OS Application Signing|24/08/2026, 12:32|app|macos||||signed||
+inv|group.is.workflow|||19/08/2026, 15:55|app|macos||||||
 inv|Tailscale|1.102.2|Developer ID Application: Tailscale Inc. (W5364U7YZB)|19/08/2026, 16:04|app|macos||||signed||
 inv|Python|3.9.6|Software Signing|19/08/2026, 16:37|app|macos||||signed||
 inv|com.apple.ctcategories|||20/08/2026, 14:51|app|macos||||||
