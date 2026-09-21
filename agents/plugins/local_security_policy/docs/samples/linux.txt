@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash e80eb38b7439
 == action=password_policy
 password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
 password_policy|PASS_MIN_DAYS|0|/etc/login.defs

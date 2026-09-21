@@ -33,17 +33,21 @@
  * This TU performs the Win32 calls and writes what those return. The exception
  * boundary is the shared execute(); it is not repeated here.
  *
- * ---- RIG PROBE (banner evidence; recorded VERBATIM by the rig session) -------
- * The exact argv is run as LocalSystem (S4U scheduled task, RunLevel Highest)
- * with the agent's granted privilege set. Fields below are FILLED IN from that
- * session and nothing here is asserted before it has run:
- *   identity                    : PENDING RIG SESSION
- *   whoami /priv (relevant)     : PENDING RIG SESSION (SeSecurityPrivilege state)
- *   secedit exit code           : PENDING RIG SESSION
- *   policy.inf size (bytes)     : PENDING RIG SESSION
- *   SeSecurityPrivilege suffices: PENDING RIG SESSION (yes/no, and what else
- *                                 was needed if no)
- *   stale-sweep pre-seed removed: PENDING RIG SESSION (and foreign-SID skipped)
+ * ---- RIG PROBE (rig session, 2026-09-21; the transcript is in the PR body) ---------
+ * The exact argv was run as LocalSystem (scheduled task, RunLevel Highest) on the-rig
+ * (Windows 11 Pro 10.0.26200 x64) with the service's default privilege set:
+ *   identity                    : nt authority\system
+ *   whoami /priv (relevant)     : SeSecurityPrivilege present, state Disabled
+ *   secedit exit code           : 0
+ *   policy.inf size (bytes)     : 12828 (UTF-16LE with a BOM, CRLF)
+ *   SeSecurityPrivilege suffices: yes -- the export succeeded with the privilege NOT enabled,
+ *                                 nothing else was granted or needed
+ *   stale-sweep pre-seed removed: yes. Three directories were pre-seeded under data_dir: a
+ *                                 SYSTEM-owned one aged 3 h (REMOVED), a same-named one owned by
+ *                                 BUILTIN\Administrators aged 3 h (SKIPPED, foreign SID) and a
+ *                                 fresh SYSTEM-owned one (kept); the log read
+ *                                 scratch_sweep:1/2, then 0/2 on the next dispatches.
+ * Fixture: tests/unit/fixtures/wave8/local_security_policy/windows/secedit_export.inf.
  */
 
 #ifdef _WIN32

@@ -1,0 +1,5 @@
+host: the-rig (Windows 11 Pro 10.0.26200, x64, bare metal); identity NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest); date 2026-09-21
+status: REAL CAPTURE, trimmed.
+command: secedit /export /cfg <file> /areas SECURITYPOLICY   (the plugin's exact argv shape; exit code 0; the full export is 12,828 bytes, UTF-16LE with a BOM and CRLF line endings)
+trim: the [Registry Values] and [Version] sections were removed (the parser reads only [System Access] and [Event Audit]); the kept sections ([Unicode], [System Access], [Event Audit]) are byte-for-byte as exported, re-encoded UTF-16LE with the BOM and CRLF.
+observed: default Windows 11 Pro policy: MaximumPasswordAge 42, every other password/lockout setting 0 (LockoutDuration and ResetLockoutCount are not written when LockoutBadCount is 0, which the plugin reports as `absent`), every audit category 0 (reported `none`).

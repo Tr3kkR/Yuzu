@@ -146,6 +146,42 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash e80eb38b7439
+
+```
+== action=password_policy
+password_policy|MinimumPasswordAge|0|secedit
+password_policy|MaximumPasswordAge|42|secedit
+password_policy|MinimumPasswordLength|0|secedit
+password_policy|PasswordComplexity|0|secedit
+password_policy|PasswordHistorySize|0|secedit
+password_policy|ClearTextPassword|0|secedit
+[result_status] OK / FULL
+
+== action=lockout_policy
+lockout_policy|LockoutBadCount|0|secedit
+lockout_policy|ResetLockoutCount|absent|secedit
+lockout_policy|LockoutDuration|absent|secedit
+[result_status] OK / FULL
+
+== action=audit_policy
+audit_policy|AuditAccountLogon|none|secedit
+audit_policy|AuditAccountManage|none|secedit
+audit_policy|AuditDSAccess|none|secedit
+audit_policy|AuditLogonEvents|none|secedit
+audit_policy|AuditObjectAccess|none|secedit
+audit_policy|AuditPolicyChange|none|secedit
+audit_policy|AuditPrivilegeUse|none|secedit
+audit_policy|AuditProcessTracking|none|secedit
+audit_policy|AuditSystemEvents|none|secedit
+[result_status] OK / FULL
+
+== action=sudoers
+sudoers|-|unsupported|-|-|-|windows_has_no_sudoers
+[result_status] UNAVAILABLE / PARTIAL / windows_has_no_sudoers
+[rc] 1
+```
+
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash e80eb38b7439
 
 ```
@@ -165,6 +201,33 @@ audit_policy|source_state|absent|/etc/security/audit_control
 == action=sudoers
 sudoers|/etc/sudoers|unreadable|-|-|-|permission_denied
 [result_status] PERMISSION_DENIED / PARTIAL / /etc/sudoers:permission_denied
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash e80eb38b7439
+
+```
+== action=password_policy
+password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
+password_policy|PASS_MIN_DAYS|0|/etc/login.defs
+password_policy|PASS_WARN_AGE|7|/etc/login.defs
+password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
+password_policy|source_state|absent|/etc/security/pwquality.conf
+password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
+[result_status] OK / FULL
+
+== action=lockout_policy
+lockout_policy|LOGIN_RETRIES|5|/etc/login.defs
+lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs
+[result_status] OK / FULL
+
+== action=audit_policy
+audit_policy|source_state|absent|/etc/audit/audit.rules
+[result_status] OK / FULL
+
+== action=sudoers
+sudoers|/etc/sudoers|absent|-|-|-|-
+sudoers|/etc/sudoers.d|absent|-|-|-|-
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
