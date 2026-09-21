@@ -4,6 +4,7 @@
 #include "spark_key_rule_index.hpp"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -1049,7 +1050,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                      "or - rarely - an invariant violation) - disarming "
                                      "the stale success rather than adopting over the "
                                      "current live generation",
-                                     claim->rule_id, claim->generation);
+                                     ::yuzu::log_id_token(claim->rule_id), claim->generation);
                     } catch (...) {
                     }
                 } else if (wedge_may_adopt) {
@@ -1518,14 +1519,14 @@ void GuardianSparkRuntime::commit_new_generation_locked(
     // window-raise log above and spark_engine.cpp's own armed-log site.
     // FIELD ORDER IS PINNED by the #3990 driver's own regex
     // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T2_RE) - change
-    // both together.
+    // both together. The line is built by format_arm_committed_line (guardian_spark_timing.cpp),
+    // which neutralises the operator-authored rule id so a hostile id cannot forge a second
+    // log line.
     try {
         const auto attach_to_commit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                              clock_() - attach_now).count();
-        spdlog::info("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
-                     "type={}, via={}, attach_to_commit_ms={})",
-                     rule_id, detach_epoch_, gen, guard_type, commit_path_name(via),
-                     attach_to_commit_ms);
+        spdlog::info("{}", format_arm_committed_line(rule_id, detach_epoch_, gen, guard_type,
+                                                     commit_path_name(via), attach_to_commit_ms));
     } catch (...) {
     }
 }

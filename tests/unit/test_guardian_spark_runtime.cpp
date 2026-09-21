@@ -2505,6 +2505,38 @@ TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a l
     CHECK(format_send_timing_line(w) == "Guardian T_wire event_id=a___b domain=health sent=1 wire_wall_ns=9");
 }
 
+TEST_CASE("the runtime's arm-committed line keeps the #3990 driver's pinned shape and cannot be "
+          "forged through the rule id",
+          "[spark][runtime]") {
+    // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
+    // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
+    CHECK(format_arm_committed_line("blackout-reg-01", 3, 101, "file", "inline-shared", 7) ==
+          "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=101, "
+          "type=file, via=inline-shared, attach_to_commit_ms=7)");
+
+    // The rule id is operator-authored and unvalidated. A newline would forge a whole physical
+    // line (here a fake benchmark T_detect line) and a space, '=' or ',' would forge tokens.
+    const auto hostile = format_arm_committed_line(
+        "x a=b,c\nGuardian T_detect event_id=victim domain=health detect_wall_ns=1", 1, 2, "file",
+        "callback-arm", 0);
+    CHECK(hostile.find('\n') == std::string::npos);
+    CHECK(hostile ==
+          "Guardian spark: arm committed for rule "
+          "'x_a_b_c_Guardian_T_detect_event_id_victim_domain_health_detect_wall_ns_1' (epoch=1, "
+          "incarnation=2, type=file, via=callback-arm, attach_to_commit_ms=0)");
+
+    // Non-ASCII bytes (U+2028, a lone lead byte) never reach the line, and an over-long id is
+    // shortened with the same head + '~' + last-24-bytes rule as the T_* lines.
+    for (const char c : format_arm_committed_line("a\xE2\x80\xA8" "b\xC3", 1, 2, "file", "x", 0))
+        CHECK(static_cast<unsigned char>(c) < 0x80);
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'a');
+    const std::string shortened =
+        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'a') + "~" +
+        std::string(yuzu::kGuardianLogIdTailBytes, 'a');
+    CHECK(format_arm_committed_line(longid, 1, 2, "file", "x", 0)
+              .rfind("Guardian spark: arm committed for rule '" + shortened + "' (epoch=1,", 0) == 0);
+}
+
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {
     // Within one runtime, two observations of the same rule get distinct ids (seq);
     // two agents get distinct id prefixes - so the server's event_id PK never drops a

@@ -203,4 +203,16 @@ YUZU_EXPORT std::string format_send_timing_line(const SendTimingRecord& r);
 YUZU_EXPORT SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool sent,
                                                      std::int64_t wire_wall_ns);
 
+/// The runtime's arm-confirmation line (R5.7 T2), NOT a T_ line: it lives here only so the
+/// agent-side Guardian log-line formatters share one neutralisation point and one unit-test
+/// seam (the runtime's own spdlog output is not capturable from a test, see test_log_capture.hpp).
+/// The rule id is operator-authored and unvalidated, so it goes through log_id_token; for an
+/// id of [A-Za-z0-9._-] that is the identity, which is all the #3990 driver's T2_RE
+/// (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) ever parses. FIELD ORDER IS PINNED
+/// by that regex - change both together.
+YUZU_EXPORT std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
+                                                  std::uint64_t incarnation, const char* type,
+                                                  const char* via,
+                                                  std::int64_t attach_to_commit_ms);
+
 } // namespace yuzu::agent

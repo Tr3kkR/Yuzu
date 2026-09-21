@@ -70,4 +70,12 @@ std::string format_send_timing_line(const SendTimingRecord& r) {
                         r.sent ? 1 : 0, r.wire_wall_ns);
 }
 
+std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
+                                      std::uint64_t incarnation, const char* type, const char* via,
+                                      std::int64_t attach_to_commit_ms) {
+    return std::format("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
+                       "type={}, via={}, attach_to_commit_ms={})",
+                       id_token(rule_id), epoch, incarnation, type, via, attach_to_commit_ms);
+}
+
 } // namespace yuzu::agent
