@@ -1535,7 +1535,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                         ev.detail = std::string("session=")
                                         .append(session_id)
                                         .append(" claimed_cluster_id=")
-                                        .append(cluster_id);
+                                        .append(cluster_id)
+                                        .append(" detected_at=pre_check");
                         ev.result = "failure";
                         if (!audit_store_->log(ev))
                             signal_grpc_audit_failed(context);
@@ -1609,7 +1610,41 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                        !res) {
                 record_route_store_failure(metrics_, "announce_connected", res.error());
             } else if (res->cluster_affinity_violation) {
+                // Gate 4 consistency-auditor SHOULD (2026-09-21): this is the
+                // SECOND of the two `cluster_affinity_violation` detection
+                // sites (the pre-check above catches the common case; this
+                // one is reached only in the narrow race window that
+                // pre-check's own comment describes — a definitive conflict
+                // the pre-check missed, e.g. on a degraded read). The pre-
+                // check site emits BOTH the metric and an AuditEvent; before
+                // this fix, this site emitted only the metric, so an operator
+                // correlating the desync counter against the audit log could
+                // see an increment here with no matching audit row. Emit the
+                // same audit event here too — best-effort, matching the
+                // pre-check site's pattern, since `set_gateway_route` has
+                // already run by this point (the pre-check's own "accepted
+                // cost" for this race) and this audit row is the only
+                // durable record of which agent/session/cluster hit it.
                 record_directory_desync(metrics_, "announce_connected", "cluster_affinity_violation");
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "gateway_cluster:" + cluster_id;
+                    ev.principal_role = "gateway";
+                    ev.action = "gateway.cluster_affinity_violation";
+                    ev.target_type = "agent";
+                    ev.target_id = agent_id;
+                    ev.detail = std::string("session=")
+                                    .append(session_id)
+                                    .append(" claimed_cluster_id=")
+                                    .append(cluster_id)
+                                    .append(" detected_at=announce_connected_write");
+                    ev.result = "failure";
+                    if (!audit_store_->log(ev))
+                        signal_grpc_audit_failed(context);
+                }
             } else if (!res->matched) {
                 record_directory_desync(metrics_, "announce_connected", "session_mismatch");
             }

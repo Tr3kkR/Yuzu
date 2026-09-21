@@ -1217,8 +1217,9 @@ adversarial review surfaced, not a routing change.
   the real cluster to have been genuinely unreachable that long, not something a rogue can force
   instantly), and its tombstone-purge sweep already removes the affinity with the row; (2)
   `GatewayRouteStore::clear_cluster_affinity` — an explicit, unconditional, operator-invoked clear (the
-  CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — see the open
-  follow-up below). Deliberately NOT gated on multi-cluster mode: `gateway_route_store_` is wired
+  CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — tracked as
+  `#4696`, which also requires the audit wiring land in the SAME diff as the route). Deliberately NOT
+  gated on multi-cluster mode: `gateway_route_store_` is wired
   whenever a gateway upstream is configured at all, and a single-cluster gateway announces a STABLE
   `cluster_id` (`YUZU_GW_CLUSTER_ID`, default `"default"`) on every connection, so TOFU-bind-then-match
   costs single-cluster deployments nothing. **Scope note:** this closes the `GatewayRouteStore`-side half
@@ -1235,7 +1236,18 @@ adversarial review surfaced, not a routing change.
   to before the tombstone, and the SAME `announce_connected` guard refuses a mismatched cluster for it
   exactly as for a live row. The `#4669` affinity mitigation therefore also holds against this reclaim-
   based variant, even though `reclaim_tombstoned_session`'s own no-secret-required session adoption is a
-  separate, pre-existing design choice this slice does not revisit.
+  separate, pre-existing design choice this slice does not revisit. **Gate 4 unhappy-path refinement
+  (2026-09-21, UP-3): this protection is ORIGIN-DEPENDENT, not universal.** A CLEAN `deregister` tombstone
+  (an ordinary DISCONNECTED) leaves `home_cluster_id` intact — the reclaim-based variant above holds
+  exactly as described, and is now regression-tested end-to-end
+  (`tests/unit/server/test_gateway_route_wiring.cpp`, `[affinity]`). A `reap_stale_routes` sweep (a)
+  tombstone, by contrast, ALSO NULLs `home_cluster_id` (it is the intended "genuine staleness" re-home
+  trigger from this section's own design) — so a session reclaimed from a REAP-origin tombstone has NO
+  bound affinity to protect, and correctly TOFU-rebinds to whichever cluster next legitimately announces
+  (also regression-tested). This is not a new bypass: it is the SAME accepted re-home path #4669 already
+  designs for, reached via `reclaim_tombstoned_session` rather than a fresh `register_fresh` — both require
+  the identical natural-outage precondition (the real cluster genuinely unreachable for the full grace
+  window), and neither is attacker-forceable on demand.
 - **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
   RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
   after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a

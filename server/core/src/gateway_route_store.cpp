@@ -405,8 +405,8 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
         "VALUES ($1, $2, $3, 0, $4, now() + ($5 || ' seconds')::interval, now(), $6, $2) "
         "ON CONFLICT (agent_id) DO NOTHING",
         std::vector<std::optional<std::string>>{
-            std::string(agent_id), cluster_arg, std::string(gateway_node), std::string(session_id),
-            std::to_string(lease_ttl_secs), std::move(home_id_arg)});
+            std::string(agent_id), std::move(cluster_arg), std::string(gateway_node),
+            std::string(session_id), std::to_string(lease_ttl_secs), std::move(home_id_arg)});
     if (ins.status() != PGRES_COMMAND_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: fallback insert failed: {}",
                       PQresultErrorMessage(ins.get()));

@@ -274,6 +274,18 @@ because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
 
+### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
+
+New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
+
+Before this change, a rogue or compromised gateway process could re-register an agent identity that was already approved and live on a DIFFERENT cluster (`ProxyRegister` needs no per-agent secret for an already-approved agent), then legitimately answer for it — intercepting command payloads and forging terminal results for that agent, despite each `--gateway-cluster-addr` entry conceptually representing a separate trust zone.
+
+**What changes:** each agent now durably binds to the first cluster that legitimately confirms its connection (trust-on-first-use). A later claim from a DIFFERENT cluster for an already-bound agent is refused outright — nothing is published to the routing directory or the in-memory dispatch path — and the refusal is audited (`gateway.cluster_affinity_violation`, see [audit-log.md](audit-log.md)) and counted (`yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="cluster_affinity_violation"}`, alerted via `YuzuGatewayClusterAffinityViolation`). An agent's affinity re-binds only when the previously-bound cluster has been genuinely unreachable for the full stale-route grace window (an operator-forced re-home route is tracked as a follow-up, `#4696` — not available in this release).
+
+**Rollout window — read this if you run multi-cluster gateway mode today.** Every agent that was already connected before you upgrade to this version has NO bound affinity until its NEXT `CONNECTED` notification — until then, that agent is still open to a same-shape claim from any cluster, exactly as before this fix. Long-lived gateway↔agent connections may not reconnect on their own for a long time. **To close this window immediately across your whole fleet, restart your gateway processes (or otherwise force your agents to reconnect) after upgrading** — each forced reconnect binds that agent's affinity right away rather than waiting on an organic reconnect.
+
+This does not provide full trust-zone isolation between clusters — a gateway's claimed `cluster_id` is still not cryptographically bound to its actual identity (mitigation 2, tracked separately, not implemented). Do not present multi-cluster gateway mode as providing that guarantee. Multi-cluster gateway mode has no production deployments as of this release.
+
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 
 New, non-breaking, purely additive. No operator action required.

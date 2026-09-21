@@ -420,6 +420,11 @@ TEST_CASE("GatewayRouteStore[pg]: announce_connected BINDS home_cluster_id on fi
     REQUIRE(ann1.has_value());
     CHECK(ann1->matched);
     CHECK_FALSE(ann1->cluster_affinity_violation);
+    // Gate 4 happy-path NICE (2026-09-21): AnnounceResult's doc comment
+    // states matched/cluster_affinity_violation are mutually exclusive but
+    // nothing asserted it — pin the invariant so a future refactor that
+    // silently breaks it fails a test, not just a code review.
+    CHECK_FALSE((ann1->matched && ann1->cluster_affinity_violation));
 
     auto row1 = fx.store().lookup_route("agent-affinity-1");
     REQUIRE(row1.has_value());
