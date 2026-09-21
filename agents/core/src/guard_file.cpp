@@ -531,7 +531,7 @@ void FileGuard::run() try {
             std::memcpy(&id, rec + kExFileIdOff, sizeof id);
             std::memcpy(&name_bytes, rec + kExNameLenOff, sizeof name_bytes);
             if (off + kExNameOff + name_bytes > bytes)
-                break; // truncated record — stop
+                break; // truncated record: stop
             const std::wstring_view name(reinterpret_cast<const WCHAR*>(rec + kExNameOff),
                                          name_bytes / sizeof(WCHAR));
             if (iequals_w(name, x_leaf) || (x_id && id == *x_id))
