@@ -243,7 +243,7 @@ TEST_CASE("capability catalogue: every Destructive row is Irreversible unless ex
 }
 
 /// Exact-row pin for `system_hardening.posture` (Wave 8), the only row of its fragment.
-/// `Security`, the antivirus/bitlocker/firewall/autoruns class (2026-09-21 decision).
+/// `Security`, the antivirus/bitlocker/firewall/autoruns class: a security-control posture read, not an inventory one.
 TEST_CASE("capability catalogue: system_hardening.posture pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_system_hardening();

@@ -59,7 +59,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: 'Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process, or the value name itself for a failed read).'
+        description: 'Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process, or the value name itself for a failed read; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows).'
         example: kernel.randomize_va_space
         platforms: [windows, linux, darwin]
       - name: raw

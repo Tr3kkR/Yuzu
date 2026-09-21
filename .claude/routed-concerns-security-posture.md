@@ -9,4 +9,4 @@
 
 | Concern | Doc | Loaded by |
 |---|---|---|
-| `system_hardening` plugin — read-only exploit-mitigation/kernel-hardening posture (`Security`, ExecuteGate::None): fixed key allowlists only (never an unbounded /proc/sys or sysctl walk, never a shell-out); every key reports one of value / `absent` (ENOENT) / `unreadable` (EACCES) — a read failure is never rendered as "not hardened". | `agents/plugins/system_hardening/README.md` | `security-guardian` + `cpp-safety` on `agents/plugins/system_hardening/`, `plugin_action_catalogue_system_hardening.hpp` |
+| `system_hardening` plugin — read-only exploit-mitigation/kernel-hardening posture (`Security`, ExecuteGate::None): fixed key allowlists only (never an unbounded /proc/sys or sysctl walk, never a shell-out); every key reports one of value / `absent` (ENOENT or Win32 not-found) / `unreadable` (any other errno or Win32 error; a refusal also reports `PERMISSION_DENIED`) — a read failure is never rendered as "not hardened". | `agents/plugins/system_hardening/README.md` | `security-guardian` + `cpp-safety` on `agents/plugins/system_hardening/`, `plugin_action_catalogue_system_hardening.hpp` |

@@ -31,35 +31,20 @@
  * for every data-level outcome; an internal exception is contained by the
  * portable execute() (rc 1, constrained|internal_error).
  *
- * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64) -- COMPLETE.
- * Run as NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest). Fixture + provenance:
+ * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64, run as
+ * NT AUTHORITY\SYSTEM). The full transcript is in the PR body; the fixture and its provenance are
  * tests/unit/fixtures/wave8/system_hardening/windows/mitigation_options.hex[.provenance.txt].
- *   whoami                  : nt authority\system
- *   date                    : 2026-09-21T15:29:55+01:00
- *   reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" /v MitigationOptions
- *                           : ERROR: The system was unable to find the specified registry key or value.
- *                             (ABSENT on this fresh install; MitigationAuditOptions likewise ABSENT)
- *   Get-ProcessMitigation -System, before: every policy NOTSET (DEP.Enable, SEHOP.Enable,
- *                             ASLR.BottomUp, ASLR.HighEntropy, CFG.Enable ... all NOTSET)
- *   After a TEMPORARY `Set-ProcessMitigation -System -Enable DEP,SEHOP,BottomUp,HighEntropy,CFG`
- *   (state then restored and verified identical: kernel + Memory Management keys, both values,
- *   bcdedit, Get-ProcessMitigation -System):
- *                             MitigationOptions REG_BINARY
- *                             110011000001000000000000000000000000000000000000 (24 bytes);
- *                             Get-ProcessMitigation -System: DEP.Enable ON, SEHOP.Enable ON,
- *                             ASLR.BottomUp ON, ASLR.HighEntropy ON, CFG.Enable ON.
- *   The five enabled options are exactly the set nibbles {0,1,4,5,10} of QWORD 0 -- this REFUTED
- *   the <winbase.h> flag layout the first decoder assumed (see system_hardening_win_parsers.hpp).
- *   MitigationAuditOptions is decoded with the same layout, but a non-zero audit value was never
- *   observed (it is absent on this host): that reading follows the documented structure and is
- *   UNVERIFIED on hardware, as are the eleven nibble positions other than {0,1,4,5,10}.
- *   GetProcessMitigationPolicy from a 64-bit SYSTEM process (throwaway MSVC probe, not committed):
- *                             ProcessDEPPolicy              BOOL=1 GetLastError=0 Flags=0x00000003
- *                             ProcessASLRPolicy             BOOL=1 GetLastError=0 Flags=0x00000005
- *                             ProcessControlFlowGuardPolicy BOOL=1 GetLastError=0 Flags=0x00000000
- *   => ProcessDEPPolicy SUCCEEDS on x64, so `self.dep` is a real row there; the
- *      ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED -> `absent` (no token) branch below is
- *      kept for 32-bit hosts and older builds and was not exercised on this rig.
+ *   - MitigationOptions and MitigationAuditOptions are ABSENT on a fresh install (`reg query`: the
+ *     system was unable to find the specified registry key or value).
+ *   - With DEP, SEHOP, BottomUp, HighEntropy and CFG enabled system-wide the value is a 24-byte
+ *     REG_BINARY whose QWORD 0 has exactly the nibbles {0,1,4,5,10} set. This REFUTED the
+ *     <winbase.h> flag layout the first decoder assumed (see system_hardening_win_parsers.hpp).
+ *     UNVERIFIED on hardware: the other eleven nibble positions, nibble values other than 1, and
+ *     any non-zero MitigationAuditOptions value.
+ *   - GetProcessMitigationPolicy from a 64-bit SYSTEM process: DEP (Flags 0x3), ASLR (0x5) and
+ *     CFG (0x0) all succeed, so `self.dep` is a real row on x64; the ERROR_INVALID_PARAMETER /
+ *     ERROR_NOT_SUPPORTED -> `absent` (no token) branch below serves 32-bit hosts and older
+ *     builds and was not exercised on this rig.
  */
 
 #if defined(_WIN32)

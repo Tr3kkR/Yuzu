@@ -169,6 +169,22 @@ def parse_content_pair_modes(content_root: Path) -> dict[tuple[str, str], list[s
     return pair_modes
 
 
+def non_string_column_values(doc: object, fallback_id: str) -> list[str]:
+    """`<definition id>.<column>: <repr>` for every non-string entry of the
+    `values` list of one definition document's result columns."""
+    if not isinstance(doc, dict):
+        return []
+    def_id = (doc.get("metadata") or {}).get("id", fallback_id)
+    result = (doc.get("spec") or {}).get("result")
+    columns = result.get("columns") if isinstance(result, dict) else None
+    return [
+        f"{def_id}.{col.get('name')}: {v!r}"
+        for col in columns or []
+        for v in col.get("values") or []
+        if not isinstance(v, str)
+    ]
+
+
 def find_non_string_column_values(content_root: Path) -> list[str]:
     """Every `<definition id>.<column>: <repr>` whose `values` list holds a
     non-string. YAML 1.1 reads an unquoted on/off/yes/no as a boolean, so such
@@ -179,17 +195,7 @@ def find_non_string_column_values(content_root: Path) -> list[str]:
         with path.open(encoding="utf-8") as f:
             docs = list(yaml.safe_load_all(f))
         for doc in docs:
-            if not isinstance(doc, dict):
-                continue
-            def_id = (doc.get("metadata") or {}).get("id", path.name)
-            result = (doc.get("spec") or {}).get("result")
-            columns = result.get("columns") if isinstance(result, dict) else None
-            for col in columns or []:
-                bad.extend(
-                    f"{def_id}.{col.get('name')}: {v!r}"
-                    for v in col.get("values") or []
-                    if not isinstance(v, str)
-                )
+            bad.extend(non_string_column_values(doc, path.name))
     return bad
 
 
@@ -347,9 +353,26 @@ class TestDefinitionValueVocabularies(unittest.TestCase):
 
 
 class TestFailureModesOnSyntheticData(unittest.TestCase):
-    """Proves `diff_gates` actually catches both drift shapes, using
-    fabricated data only — never a real fragment or content file.
+    """Proves `diff_gates` and the `values:` vocabulary scan actually catch
+    the drift shapes they guard, using fabricated data only — never a real
+    fragment or content file.
     """
+
+    def test_an_unquoted_on_off_values_entry_is_named(self) -> None:
+        # `yaml.safe_load` turns an unquoted on/off into a boolean: exactly the
+        # silent coercion the real-tree guard exists to catch.
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, on, off]}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), ["x.state: True", "x.state: False"])
+
+    def test_quoted_on_off_values_entries_pass(self) -> None:
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, 'on', 'off']}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), [])
 
     def test_stricter_content_than_catalogue_is_named(self) -> None:
         pair_modes = {("widget", "explode"): ["role-gated"]}
