@@ -1166,14 +1166,33 @@ adversarial review surfaced, not a routing change.
   BEFORE `Server::create()` — a malformed/duplicate entry is a CLI exit, not a lenient boot-time
   warning (unlike `--trusted-nat-cidr`'s own lenient-parse precedent — this is a routing-correctness
   input, not an advisory allowlist).
-- **Response-agent guard (cross-trust-zone forgery).** `forward_gateway_pending` sends exactly one
-  `agent_id` per request but previously applied `resp.agent_id()` from the wire with no check against
-  the request's own target. Single-cluster, this already let a compromised gateway forge a response for
-  any agent it named; ADR-2002's whole reason for per-cluster isolation is trust-zone separation (e.g.
-  one cluster in a DMZ, one internal), and reusing one shared credential across clusters means a
-  compromised DMZ-zone gateway could otherwise forge a terminal status for an agent it never held, on an
-  internal-zone cluster it was never dialing. Now refused and counted (`status="agent_mismatch"`)
-  rather than applied.
+- **Response-agent guard — closes ONE forgery shape, not cross-trust-zone forgery in general (post-
+  governance Fable review, pre-push, caught a false-assurance doc claim in this bullet's original
+  wording).** `forward_gateway_pending` sends exactly one `agent_id` per request but previously applied
+  `resp.agent_id()` from the wire with no check against the request's own target. Single-cluster, this
+  already let a compromised gateway forge a response for any agent it named. Now refused and counted
+  (`status="agent_mismatch"`) rather than applied — but this ONLY catches "cluster Y answers as agent B
+  while core is dialing it for agent A." It does NOT catch, and this slice does NOT close, the more
+  severe shape: **cluster Y first CLAIMS agent A's own identity, then legitimately answers commands core
+  sends for A** — at which point `resp.agent_id()` genuinely matches and the guard never fires.
+  `ProxyRegister` (`gateway_service_impl.cpp`'s "Fast path: agent already enrolled from a prior
+  connection") re-registers ANY already-approved `agent_id` with no per-agent secret — the enrollment
+  token is checked only on a NOT-yet-approved agent — and `register_fresh`'s guarded upsert mints a
+  NEWER epoch for the claimant, so the real agent's later `announce_connected` LOSES the race and is the
+  one that gets treated as stale. `NotifyStreamStatus.cluster_id` is gateway-asserted with nothing
+  binding it to the peer's identity, and it is the sole input to `GatewayMgmtStubPool::resolve()`. Net:
+  pre-4.3, a session hijack by a rogue gateway was at worst a DoS (every command still went to the one
+  configured address, so a hijacked-but-wrong-cluster agent just got `not_connected`). Post-4.3, in
+  MULTI-CLUSTER MODE ONLY, the SAME pre-existing weakness upgrades to command-payload interception
+  (instruction parameters, secrets) and forged terminal results for an agent nominally in a different
+  trust zone — because core now genuinely dials the claimant's own cluster. **Multi-cluster mode does
+  NOT yet provide trust-zone isolation** — do not describe it that way to an operator, and do not treat
+  this guard as the security boundary between clusters; it is a narrow, correct check on a narrower
+  claim than "cross-trust-zone forgery." Tracked as `#4669` (agent↔cluster affinity in
+  `GatewayRouteStore` + per-cluster peer-identity binding at the gateway-upstream listener) — not
+  blocking this slice per the reviewing pass's own recommendation (multi-cluster mode is opt-in with no
+  production deployments today), but must close before multi-cluster mode is presented as providing
+  trust-zone isolation.
 - **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
   RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
   after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a

@@ -74,6 +74,22 @@
 /// assumption every other operator-authored infra config in this codebase
 /// carries — named explicitly here because it's easy to misread the mTLS
 /// dial as a verification it isn't.
+///
+/// NOT A TRUST-ZONE BOUNDARY YET (post-governance Fable review, pre-push):
+/// classify_gateway_forward_response's agent-id mismatch check (below) only
+/// catches a response naming a DIFFERENT agent than the request targeted. It
+/// does NOT catch a gateway CLAIMING an agent's identity via `ProxyRegister`
+/// (which re-registers any already-approved agent_id with no per-agent
+/// secret) and then legitimately answering for it — `register_fresh`'s
+/// newer-epoch rule favors whichever gateway claims most recently, and
+/// `cluster_id` is gateway-asserted with nothing binding it to the
+/// presenting peer's actual identity. In multi-cluster mode this means a
+/// rogue/compromised gateway can intercept another cluster's agent traffic
+/// (command payloads, terminal results) despite `--gateway-cluster-addr`
+/// conceptually modeling separate trust zones. Tracked as `#4669`
+/// (agent<->cluster affinity + per-cluster peer-identity binding) — until
+/// that lands, do not describe multi-cluster mode as providing trust-zone
+/// isolation between clusters for a given agent.
 namespace yuzu::server {
 
 /// Parses `--gateway-cluster-addr` entries, each already a single

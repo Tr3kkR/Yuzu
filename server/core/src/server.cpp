@@ -1674,8 +1674,15 @@ public:
                 std::string(yuzu::server::kDefaultGatewayClusterKey)};
             for (const auto& id : cfg_.gateway_cluster_addresses | std::views::keys)
                 cluster_labels.insert(id);
-            if (!cfg_.gateway_cluster_addresses.empty())
-                cluster_labels.insert(std::string(yuzu::server::kUnknownGatewayClusterLabel));
+            // post-governance Fable review, pre-push: "unknown" was
+            // previously seeded only in multi-cluster mode, but UP-1's fix
+            // (server.cpp's forward_gateway_pending, the configured-but
+            // -unusable-pool branch) emits {cluster_id="unknown",
+            // status="unavailable"} in EITHER mode — a boot-time credential
+            // failure is exactly as possible with --gateway-command-addr
+            // alone as with --gateway-cluster-addr. Unconditional now, so
+            // that signal's absent-vs-zero convention holds in both modes.
+            cluster_labels.insert(std::string(yuzu::server::kUnknownGatewayClusterLabel));
             for (const auto& cl : cluster_labels) {
                 for (const char* st : {"ok", "unauthenticated", "unavailable", "other",
                                        "unknown_cluster", "not_connected", "agent_mismatch"}) {
