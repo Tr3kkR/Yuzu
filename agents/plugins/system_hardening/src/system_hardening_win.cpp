@@ -49,6 +49,9 @@
  *                             ASLR.BottomUp ON, ASLR.HighEntropy ON, CFG.Enable ON.
  *   The five enabled options are exactly the set nibbles {0,1,4,5,10} of QWORD 0 -- this REFUTED
  *   the <winbase.h> flag layout the first decoder assumed (see system_hardening_win_parsers.hpp).
+ *   MitigationAuditOptions is decoded with the same layout, but a non-zero audit value was never
+ *   observed (it is absent on this host): that reading follows the documented structure and is
+ *   UNVERIFIED on hardware, as are the eleven nibble positions other than {0,1,4,5,10}.
  *   GetProcessMitigationPolicy from a 64-bit SYSTEM process (throwaway MSVC probe, not committed):
  *                             ProcessDEPPolicy              BOOL=1 GetLastError=0 Flags=0x00000003
  *                             ProcessASLRPolicy             BOOL=1 GetLastError=0 Flags=0x00000005
