@@ -2836,6 +2836,10 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- [ ] **`installed_apps list` rows carry two more fields (breaking for fixed-width parsers):** the operator `list`
+  action now emits seven fields instead of five (`…|install_date|install_location|bundle_id`). Check any script,
+  SIEM parser or export that reads `crossplatform.software.inventory` output; agents not yet upgraded keep
+  emitting five. See [Server Administration](server-admin.md#upgrade-notes).
 - [ ] **New SparkEngine health telemetry (auto-on, engine-health only):** on agent
   upgrade, agents begin shipping SparkEngine posture tags on the existing
   heartbeat (2 keys when quiescent), and the server exposes 11 new

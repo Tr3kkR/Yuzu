@@ -16,13 +16,19 @@ cadences.
   macOS: `system_profiler`). The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
-  `bundle_id` (ADR-0028); automation that reads the first columns by position
-  is unaffected, automation that assumed a fixed field count needs an update.
-  The dashboard results table renders `installed_apps` rows as key/value (`app`
-  plus one remainder cell — a pre-existing server-side limit shared by the four
-  original columns), so the new columns are not separately sortable or
-  filterable there; read them positionally from the raw `output` on
-  `GET /api/v1/responses/{id}` or MCP `query_responses`.
+  `bundle_id` (ADR-0028). Rows are seven escape-aware tokens: split on `|` not
+  preceded by `\`, decode `\|` to `|`; every field is escaped the same way (`\`
+  folds to `/`, CR/LF to a space, a field over 4 KiB is cut), so a literal `|` in
+  a name never shifts a column; automation that assumed exactly five fields needs
+  an update, and agents still on plugin < 1.2.0 emit five (treat a missing sixth
+  or seventh as `-`). The dashboard results table renders `installed_apps` rows
+  as key/value (`app` plus one remainder cell — a pre-existing server-side limit
+  shared by the four original columns), so the new columns are not separately
+  sortable or filterable there; read them from the raw `output` on
+  `GET /api/v1/responses/{id}` or MCP `query_responses`. A macOS `list` payload
+  is about three times larger than before (14 KB to 42 KB for 323 applications);
+  `bundle_id` is `-` past the 5000-application / 120 s enrichment cap, which the
+  agent logs but does not report as degraded.
   On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition
@@ -116,9 +122,14 @@ cadences.
   only — the release moved to its own `release` column (was fused
   `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
   accordingly on the first post-upgrade sync.
-- **No end-user profiles / personal data.** We do **not** use the plugin's
-  per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
-  usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
+- **No end-user profiles / personal data in the daily sync.** We do **not** use
+  the plugin's per-user enumeration (`list_per_user`), so no logged-in-user
+  profiles and no usernames are collected by the sync — no end-user PII. The
+  operator `list` action is different: its `install_location` can name an
+  account's home directory (`/Users/<account>/...` on macOS,
+  `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
+  default retention, no per-subject erasure), outside this sync and outside
+  `--inventory-disable`. (The only `HKCU` read is the agent's
   own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -133,7 +144,7 @@ cadences.
 - **Disabling it.** Pass **`--inventory-disable`** (or set
   `YUZU_AGENT_INVENTORY_DISABLE`) on the agent to collect and push **no**
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
-  toggle.
+  toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
 
 ## How the sync behaves (and why it's quiet on the network)
 
@@ -600,6 +611,19 @@ explicit `on()/group_left()` matching with a denominator caveat. **Enable it** o
 you have observed your fleet's normal stale-count baseline and set the threshold to
 ~5–10% of your expected active fleet; correlate with `yuzu_fleet_agents_healthy` to
 separate "agents offline" from "sync source broken / disabled".
+
+**`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
+reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
+MSI-registered products, SDK and runtime component packages and some system components never populate (182 of
+241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
+`-` also results from a Windows value longer than 511 characters or stored with a non-string registry type, and
+for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
+and Linux, and on macOS for a non-bundle location or beyond the 5000-application / 120 s enrichment cap.
+
+**The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
+the first `|` (`app` plus one merged cell) while the headers come from the definition. Nothing is lost: read the
+seven fields from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
+with the results search box.
 
 ## Device-identity inventory (`device_ci`)
 

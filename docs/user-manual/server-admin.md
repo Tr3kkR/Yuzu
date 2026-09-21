@@ -211,6 +211,39 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `installed_apps list` rows carry two more fields (breaking)
+
+**What changed.** The `installed_apps` agent plugin's operator `list` action (definition
+`crossplatform.software.inventory`) now emits seven `|`-separated fields per row instead of five:
+`app|name|version|publisher|install_date|install_location|bundle_id`. `install_location` is the Windows
+Uninstall-key `InstallLocation` (unexpanded) or the location macOS reports; `bundle_id` is the macOS
+`CFBundleIdentifier`. Either is `-` where the OS has none: every Linux row ends `-|-`, and many Windows rows
+have no `InstallLocation` (182 of 241 on the reference developer workstation). The first five fields keep their
+position; every field is now escape-aware (`\` folds to `/`, `|` to `\|`, CR/LF to a space, a field over 4 KiB
+is cut), a no-op for every value in the three reference captures. `query`, `list_per_user` and the daily-sync
+inventory (ADR-0016) are unchanged.
+
+**Who this affects.** Automation reading `installed_apps list` output from `GET /api/v1/responses/{id}`, its
+`/export`, or MCP `query_responses` that (a) unpacks or anchors exactly five fields, or (b) treats the last
+field as `install_date`. The dashboard is unaffected: it has always split these rows into `app` plus one
+remainder cell, so the new fields appear inside that cell (and the search box matches them) but are not
+separate, sortable or filterable columns. A policy or script that substring-matches the raw `output` now also
+matches install paths and bundle identifiers.
+
+**Mixed fleets.** Upgrade order is server first, so agents keep answering with five fields until they take the
+release carrying `installed_apps` 1.2.0 (the definition's `minAgentVersion` stays `1.0.0`). Parse by position
+and treat a missing sixth or seventh field as "not reported", not as an error.
+
+**Existing deployments keep the old definition.** The bundled definition is seeded once and never refreshed
+on an existing server (see the InstructionStore note in [`upgrading.md`](upgrading.md); #2555), so
+`get_definition` and `discover_instructions` keep listing four columns at version 1.0.0. Row content is
+unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
+new columns is optional and cosmetic.
+
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
+pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
+
 ### vNEXT — new `Guardian T_*` diagnostic log lines at `info` level (#4606; NOT breaking)
 
 **What changed.** The server now writes one `info`-level line for every Guardian event it stores for an ordinary rule (ruleless DEX observations are excluded):

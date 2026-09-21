@@ -473,20 +473,23 @@ wait_for(exec_id)
 responses = get_responses("crossplatform.software.inventory", exec_id)
 
 # Find machines with outdated Java
+# `output` is the raw pipe row: app|name|version|publisher|install_date|install_location|bundle_id
+# (seven escape-aware tokens; agents on plugin < 1.2.0 emit five)
+import re
+def split_row(output):
+    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", output)]
 for row in responses:
-    name = row["output"].get("name", "")
-    version = row["output"].get("version", "")
+    tokens = split_row(row["output"])
+    if len(tokens) < 4 or tokens[0] != "app":
+        continue
+    name, version = tokens[1], tokens[2]
     if "java" in name.lower() and version < "21.0":
         print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
 ```
 
 #### CEL Compliance Expression
 
-Policy: Java Runtime must be version 21+:
-
-```cel
-result.name.contains('Java') && result.version.startsWith('21.')
-```
+CEL sees this definition's result as one raw `output` string (no `name`/`version` fields), so a version comparison is not expressible there; use the Python route above, or a substring test on `output` with the caveat that it also matches the publisher, install path and bundle identifier.
 
 ---
 

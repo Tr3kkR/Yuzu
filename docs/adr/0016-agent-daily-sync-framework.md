@@ -407,12 +407,22 @@ Mechanics:
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
   VENDOR). *Amended 2026-09-21:* `list` gained two trailing columns
-  (`install_location`, `bundle_id`) under ADR-0028's binding condition; its
-  first four fields are byte-unchanged, `install_date` — no longer the last
-  field — now escapes `\` and `|` (a no-op for every real value), and the
-  `inv|` rows are unchanged: the Windows name+version dedupe keeps the same
-  survivor as before and only fills that survivor's empty `install_location`
-  from a duplicate.
+  (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
+  `app` tag, `name`, `version`, `publisher` and `install_date` keep their
+  position and value for every real value; every `list` field is now
+  escape-aware (`\`→`/`, `|`→`\|`, CR/LF→space, 4 KiB cut) —
+  `query`/`list_per_user` are untouched and `list` rows are never hashed. The
+  `inv|` rows are unchanged: the Windows name+version dedupe
+  (`dedupe_uninstall_records`) keeps the same survivor as before and only fills
+  that survivor's empty `install_location` from the smallest populated
+  duplicate. Data classification: `install_location` is operator-tier — an
+  ordinary stored Response (90-day default retention, no per-subject erasure,
+  not covered by `--inventory-disable`), never in this blob — and can name an
+  account's home directory (`/Users/<account>/...`, `C:/Users/<name>/...`);
+  §8's finding for the sync stands. `list` keeps its `Inventory:Read`/no-gate
+  tier, the same as `processes.list`/`filesystem.list_dir`, which already emit
+  such paths; `list_per_user`'s AdminOrApproval gate exists for profile
+  enumeration, which `list` does not do (CC6.3 decision recorded here).
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
