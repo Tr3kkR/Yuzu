@@ -26,9 +26,9 @@
  *             RuleCount, pinned by parse_cim_applocker_row) are STILL UNVERIFIED on hardware.
  *   SrpV2 walk: `reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 /s` -> "ERROR: The
  *             system was unable to find the specified registry key or value." (no AppLocker policy
- *             configured); the plugin reports `applocker|none|absent|0`, OK / FULL / registry_srpv2.
- *             The rule-collection layout was therefore never read on an AppLocker-configured host.
- *   CI\Policy values as SYSTEM: EmodePolicyRequired=0, SkuPolicyRequired=0,
+ *             configured); the plugin reports `applocker|none|absent|0`, OK / FULL /
+ * registry_srpv2. The rule-collection layout was therefore never read on an AppLocker-configured
+ * host. CI\Policy values as SYSTEM: EmodePolicyRequired=0, SkuPolicyRequired=0,
  *             VerifiedAndReputablePolicyState=0 (maps `disabled`), SAC_PreviousState=0xffffffff
  *             (`unmodelled`); 8 default .cip policies in CodeIntegrity\CiPolicies\Active. Only
  *             VerifiedAndReputablePolicyState=0 has been observed; 1/2 are mapped per documentation
@@ -119,7 +119,8 @@ int finish(yuzu::CommandContext& ctx, const Outcome& o, std::string_view source)
 /// One REG_DWORD: ERROR_SUCCESS, the query error, or ERROR_INVALID_DATA (wrong type/size).
 LONG read_u32(HKEY key, const wchar_t* name, std::uint32_t& out) {
     DWORD type = 0, size = sizeof(DWORD), value = 0;
-    const LONG rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
+    const LONG rc =
+        RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
     if (rc == ERROR_SUCCESS && (type != REG_DWORD || size != sizeof(DWORD)))
         return ERROR_INVALID_DATA;
     out = static_cast<std::uint32_t>(value);
@@ -214,7 +215,8 @@ yuzu::shared::wmi::BoundedQueryResult bounded_cim_query(std::string_view ns, std
         return refused;
     }
     // sink: app_control/bounded_cim_query#1 -- rung 1, in-process CIM query (no PowerShell).
-    return yuzu::shared::wmi::run_bounded_wmi_query(yuzu::win::to_wide(ns), yuzu::win::to_wide(wql));
+    return yuzu::shared::wmi::run_bounded_wmi_query(yuzu::win::to_wide(ns),
+                                                    yuzu::win::to_wide(wql));
 }
 
 /// SrpV2 registry walk. Returns the number of collection rows written.
@@ -243,9 +245,9 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
             mode = raw_mode; // absent leaves it nullopt
 
         DWORD rule_subkeys = 0;
-        const LONG info_rc = RegQueryInfoKeyW(sub.get(), nullptr, nullptr, nullptr, &rule_subkeys,
-                                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                              nullptr);
+        const LONG info_rc =
+            RegQueryInfoKeyW(sub.get(), nullptr, nullptr, nullptr, &rule_subkeys, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, nullptr);
         if (o.note("srpv2_rule_count", info_rc, ReadKind::enumerate) != RegRead::ok)
             continue;
         ctx.write_output(format_applocker_row(collection, mode, rule_subkeys));
@@ -276,7 +278,8 @@ int collect_applocker(yuzu::CommandContext& ctx) {
     o.denied |= plan.denied;
 
     // No usable CIM rows (class absent / empty / failed): registry walk; CIM failures stay on `o`.
-    if (!plan.use_cim && walk_srpv2(ctx, o) == 0 && !o.acc.any_failure())
+    const std::size_t srpv2_rows = plan.use_cim ? 0 : walk_srpv2(ctx, o);
+    if (applocker_none_row_due(plan.use_cim, srpv2_rows, o.acc))
         ctx.write_output(format_applocker_none_row());
     return finish(ctx, o, plan.use_cim ? "cim_msft_applockerpolicy" : "registry_srpv2");
 }

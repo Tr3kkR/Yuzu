@@ -125,7 +125,9 @@ TEST_CASE("app_control rows: wdac / cip / applocker / unsupported / constrained 
 
 TEST_CASE("app_control CipScan: absent is definitive, a failed read never reads as absent",
           "[app_control][parsers][cip]") {
-    const auto ec_of = [](std::errc e) { return std::make_error_code(e); };
+    const auto ec_of = [](std::errc e) {
+        return std::make_error_code(e);
+    };
     yuzu::shared::ConstraintAccumulator acc;
     bool denied = false;
     CipScan scan{acc, denied};
@@ -157,7 +159,8 @@ TEST_CASE("app_control CipScan: absent is definitive, a failed read never reads 
         scan.finish({});
         CHECK_FALSE(scan.none_row_due());
         CHECK(acc.any_failure());
-        CHECK(acc.reason() == "cip_stat_failed_" + std::to_string(ec_of(std::errc::io_error).value()));
+        CHECK(acc.reason() ==
+              "cip_stat_failed_" + std::to_string(ec_of(std::errc::io_error).value()));
         CHECK_FALSE(denied);
     }
     SECTION("a permission-refused stat reaches the denied flag") {
@@ -236,11 +239,12 @@ TEST_CASE("app_control win32 reads: absent is definitive, a failed read never re
         CHECK_FALSE(f.access_denied);
     }
     // Mid-enumeration a NOT_FOUND is a failure, never a silent early stop.
-    for (const auto err : {kErrorFileNotFound, kErrorPathNotFound}) {
+    for (const auto& [err, token] : {std::pair{kErrorFileNotFound, "ci_policy_enum_0x2"},
+                                     std::pair{kErrorPathNotFound, "ci_policy_enum_0x3"}}) {
         const auto f = classify_win32_read("ci_policy_enum", err, ReadKind::enumerate);
         INFO("err=" << err);
         CHECK(f.state == RegRead::unreadable);
-        CHECK(f.token == "ci_policy_enum_0x" + std::to_string(err));
+        CHECK(f.token == token);
         CHECK_FALSE(f.access_denied);
     }
     // Absent and unreadable never share a state, and only the failure carries a token.
@@ -300,7 +304,9 @@ TEST_CASE("app_control CIM floor: only the one allowlisted namespace passes",
 }
 
 TEST_CASE("app_control CIM error classification and row mapping", "[app_control][parsers]") {
-    const auto cls = [](const char* t) { return classify_cim_error(std::string{t}); };
+    const auto cls = [](const char* t) {
+        return classify_cim_error(std::string{t});
+    };
     CHECK(classify_cim_error(std::nullopt) == CimOutcome::ok);
     CHECK(cls("wmi_connect_failed_0x8004100e") == CimOutcome::class_absent);
     CHECK(cls("wmi_query_failed_0x80041010") == CimOutcome::class_absent);
@@ -317,12 +323,12 @@ TEST_CASE("app_control CIM error classification and row mapping", "[app_control]
     CHECK(parse_cim_applocker_row(
               {{"collection", "Dll"}, {"enforcementmode", "0"}, {"rulecount", "0"}})
               .has_value());
-    for (const WmiRow& bad : std::vector<WmiRow>{
-             {},
-             {{"Collection", "Exe"}, {"RuleCount", "1"}},
-             {{"Collection", "Exe"}, {"EnforcementMode", "on"}, {"RuleCount", "1"}},
-             {{"Collection", "Exe"}, {"EnforcementMode", "1"}, {"RuleCount", "-1"}},
-             {{"Collection", ""}, {"EnforcementMode", "1"}, {"RuleCount", "1"}}})
+    for (const WmiRow& bad :
+         std::vector<WmiRow>{{},
+                             {{"Collection", "Exe"}, {"RuleCount", "1"}},
+                             {{"Collection", "Exe"}, {"EnforcementMode", "on"}, {"RuleCount", "1"}},
+                             {{"Collection", "Exe"}, {"EnforcementMode", "1"}, {"RuleCount", "-1"}},
+                             {{"Collection", ""}, {"EnforcementMode", "1"}, {"RuleCount", "1"}}})
         CHECK_FALSE(parse_cim_applocker_row(bad).has_value());
 
     CHECK(parse_u32("4294967295") == std::optional<std::uint32_t>{kMax});

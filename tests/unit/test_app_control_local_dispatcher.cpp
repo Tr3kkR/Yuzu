@@ -70,8 +70,8 @@ struct LoadedPlugin {
 };
 
 std::optional<LoadedPlugin> load_app_control_plugin() {
-    const fs::path rel = fs::path{"agents"} / "plugins" / "app_control" /
-                         (std::string{"app_control"} + kPluginExt);
+    const fs::path rel =
+        fs::path{"agents"} / "plugins" / "app_control" / (std::string{"app_control"} + kPluginExt);
     std::vector<fs::path> candidates;
     if (auto* root = std::getenv("MESON_BUILD_ROOT"))
         candidates.push_back(fs::path{root} / rel);
@@ -162,7 +162,8 @@ TEST_CASE("app_control plugin: each action -- exact unsupported row + UNAVAILABL
         if (result.rc != 0) {
             CHECK(count_prefix(rows, "constrained|") == 1);
         } else if (action == "wdac_policy") {
-            CHECK(count_prefix(rows, "wdac|") >= 1);
+            // Every host answers the .cip question (none row or files). A present-but-empty
+            // CI\Policy key is legitimate and emits no wdac| row, so that count is not asserted.
             CHECK(count_prefix(rows, "wdac_cip|") >= 1);
             CHECK(count_prefix(rows, "applocker|") == 0);
         } else {

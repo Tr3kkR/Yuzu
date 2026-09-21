@@ -3,9 +3,10 @@
  * parsers for the app_control plugin (read-only WDAC / AppLocker posture).
  *
  * Free of the Win32 headers: plain string/integer transforms, testable on every OS
- * (tests/unit/test_app_control_parsers.cpp). It also owns every decision the Windows shell
- * takes (Win32 read classification, verdict selection, the CIM plan), so the shell only
- * performs I/O. Registry types, HRESULTs and wide
+ * (tests/unit/test_app_control_parsers.cpp). It also owns the decisions the Windows shell takes
+ * that need no Win32 types (read classification, verdict selection, the CIM plan, the AppLocker
+ * none-row rule); the shell performs the I/O, the REG type-to-kind mapping and the size/cap
+ * loops. Registry types, HRESULTs and wide
  * strings never cross this header -- app_control_win.cpp casts at the boundary and
  * hands over RegValueView / plain strings / WmiRow maps (an independent alias of
  * yuzu::shared::wmi::WmiRow so this compiles everywhere; bitlocker precedent).
@@ -93,15 +94,19 @@ struct RegValueView {
 
 inline std::string format_wdac_row(const RegValueView& v) {
     const bool mapped = v.kind == RegValueKind::u32 && v.name == kVerifiedAndReputableValue;
-    const auto state = policy_state_name(mapped ? map_ci_policy_state(v.u32) : PolicyState::unmodelled);
-    const std::string raw = v.kind == RegValueKind::u32    ? std::to_string(v.u32)
-                            : v.kind == RegValueKind::text ? yuzu::util::safe_output_field(v.text)
-                                                           : "opaque_" + std::to_string(v.byte_len) + "B";
+    const auto state =
+        policy_state_name(mapped ? map_ci_policy_state(v.u32) : PolicyState::unmodelled);
+    const std::string raw = v.kind == RegValueKind::u32 ? std::to_string(v.u32)
+                            : v.kind == RegValueKind::text
+                                ? yuzu::util::safe_output_field(v.text)
+                                : "opaque_" + std::to_string(v.byte_len) + "B";
     return "wdac|" + yuzu::util::safe_output_field(v.name) + "|" + raw + "|" + std::string{state};
 }
 
 /// The CI\Policy key does not exist: a genuine "nothing configured", never a failed read.
-inline std::string format_wdac_key_absent_row() { return "wdac|policy_key|-|absent"; }
+inline std::string format_wdac_key_absent_row() {
+    return "wdac|policy_key|-|absent";
+}
 
 inline constexpr std::string_view kCipExt = ".cip";
 
@@ -120,7 +125,9 @@ inline std::string format_cip_row(std::string_view filename) {
     return "wdac_cip|" + yuzu::util::safe_output_field(stem) + "|present";
 }
 
-inline std::string format_cip_none_row() { return "wdac_cip|none|absent"; }
+inline std::string format_cip_none_row() {
+    return "wdac_cip|none|absent";
+}
 
 /// Most active *.cip rows emitted; a directory holding more records the `row_cap` failure.
 inline constexpr std::size_t kMaxCipFiles = 64;
@@ -194,12 +201,14 @@ inline std::string format_applocker_row(std::string_view collection,
                                         std::optional<std::uint32_t> mode, std::size_t rules) {
     const std::string_view mode_name =
         mode ? policy_state_name(map_enforcement_mode(*mode)) : std::string_view{"absent"};
-    return "applocker|" + yuzu::util::safe_output_field(collection) + "|" +
-           std::string{mode_name} + "|" + std::to_string(rules);
+    return "applocker|" + yuzu::util::safe_output_field(collection) + "|" + std::string{mode_name} +
+           "|" + std::to_string(rules);
 }
 
 /// SrpV2 root absent: a genuine "nothing configured", never a failed read.
-inline std::string format_applocker_none_row() { return "applocker|none|absent|0"; }
+inline std::string format_applocker_none_row() {
+    return "applocker|none|absent|0";
+}
 
 /// Any failed step: shown alongside the typed CONSTRAINED / PERMISSION_DENIED status.
 inline std::string format_constrained_row(std::string_view reason) {
@@ -267,7 +276,8 @@ inline ActionVerdict select_verdict(const yuzu::shared::ConstraintAccumulator& a
 
 /// wmi_bounded.hpp does NO namespace allowlisting: this plus is_allowed_cim_namespace()
 /// is the caller-side floor.
-inline constexpr std::string_view kCimNamespace = "root\\StandardCimv2\\Security\\ApplicationControl";
+inline constexpr std::string_view kCimNamespace =
+    "root\\StandardCimv2\\Security\\ApplicationControl";
 inline constexpr std::string_view kCimApplockerWql = "SELECT * FROM MSFT_ApplockerPolicy";
 
 /// ASCII case-insensitive equality (WMI namespaces and property names are case-insensitive).
@@ -329,10 +339,10 @@ inline const std::string* find_prop(const WmiRow& row, std::string_view name) {
 }
 } // namespace detail
 
-/// Maps one MSFT_ApplockerPolicy row. Property names are UNVERIFIED on hardware (the rig has no AppLocker provider namespace; see
-/// app_control_win.cpp's banner): a row lacking `Collection`, `EnforcementMode` or
-/// `RuleCount`, or with a non-numeric mode/count, returns nullopt and the caller
-/// records `cim_row_unrecognised` rather than emitting a guessed value.
+/// Maps one MSFT_ApplockerPolicy row. Property names are UNVERIFIED on hardware (the rig has no
+/// AppLocker provider namespace; see app_control_win.cpp's banner): a row lacking `Collection`,
+/// `EnforcementMode` or `RuleCount`, or with a non-numeric mode/count, returns nullopt and the
+/// caller records `cim_row_unrecognised` rather than emitting a guessed value.
 inline std::optional<ApplockerRowData> parse_cim_applocker_row(const WmiRow& row) {
     const auto* coll = detail::find_prop(row, "Collection");
     const auto* mode = detail::find_prop(row, "EnforcementMode");
@@ -356,6 +366,14 @@ struct CimPlan {
     bool denied{false};
     bool use_cim{false};
 };
+
+/// "No AppLocker policy" is a definitive absence only when CIM gave no usable rows, the SrpV2
+/// walk wrote no row, and NOTHING failed anywhere in the action: a failed read never reads as
+/// absent.
+inline bool applocker_none_row_due(bool use_cim, std::size_t srpv2_rows_written,
+                                   const yuzu::shared::ConstraintAccumulator& acc) noexcept {
+    return !use_cim && srpv2_rows_written == 0 && !acc.any_failure();
+}
 
 inline CimPlan plan_cim(const std::optional<std::string>& error, const std::vector<WmiRow>& rows,
                         bool truncated) {
