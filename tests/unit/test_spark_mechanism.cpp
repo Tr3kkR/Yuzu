@@ -5077,6 +5077,107 @@ TEST_CASE("Registry spark (real mechanism): an absent target watches its ancesto
     engine.stop();
 }
 
+TEST_CASE("Registry spark (real mechanism): an absent target under sibling-key churn keeps "
+          "reading None with bounded probe launches and no leaked workers (CH-11, bounded "
+          "regression scenario: 200 create+delete pairs, not proof of no unbounded growth)",
+          "[spark][established][windows][walkoff]") {
+    constexpr int kPairs = 200;
+    constexpr std::uint64_t kEventsPerPair = 2; // a name change for the create, one for the delete
+    constexpr std::uint64_t kLaunchesPerEvent = 1; // on_fire launches at most one probe per fire
+    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPairs) * kEventsPerPair;
+    ScratchRegKey parent("ch11_parent");
+    const std::string target = parent.sub + "\\Missing"; // never created: Ancestor mode on `parent`
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms; // arm() returns with the watch committed and armed
+        ctl.health_grace = 60000ms;      // keep Fault edges out of the zero-event oracle
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, registry_spec("HKCU", target));
+    REQUIRE(sub.has_value());
+
+    const auto snap = [&] { return *registry_debug_counters_for_test(*raw); };
+    const auto idle = [&] { return snap().probe_workers_active == 0; };
+    REQUIRE(eventually(idle, 5000ms));
+
+    bool reading_stable = true;
+    const auto observe = [&] {
+        const auto est = engine.subscription_establishment(*sub);
+        if (!est || est->coverage != SparkCoverage::None || est->established_at)
+            reading_stable = false;
+    };
+    // Pacing only shapes the load: a timed-out wait, or a spent 30 s budget, is not a failure.
+    const auto soak_until = std::chrono::steady_clock::now() + 30s;
+    const auto paced_event = [&](auto&& mutate) {
+        const auto before = snap().probe_launched;
+        mutate();
+        if (std::chrono::steady_clock::now() > soak_until)
+            return;
+        (void)eventually(
+            [&] {
+                const auto d = snap();
+                return d.probe_launched > before && d.probe_workers_active == 0;
+            },
+            2000ms);
+        observe();
+    };
+    const auto settle_and_bound = [&](std::uint64_t events) {
+        REQUIRE(stable_for([&] { return snap().probe_launched; }, 100ms, 5000ms));
+        REQUIRE(eventually(idle, 5000ms));
+        const auto d = snap();
+        const auto retries =
+            d.probe_admission_rejected + d.probe_backend_failed + d.probe_launch_failed;
+        INFO("probe_launched=" << d.probe_launched << " events=" << events
+                               << " retries=" << retries);
+        CHECK(d.probe_launched >= 2); // the noise reached the mechanism
+        CHECK(d.probe_launched <= 1 + kLaunchesPerEvent * events + retries);
+        CHECK(d.synthetic_fires == 0);
+    };
+
+    for (int i = 0; i < kPairs; ++i) {
+        std::unique_ptr<OwnedRegKey> sibling;
+        paced_event([&] {
+            sibling = std::make_unique<OwnedRegKey>(parent.sub + "\\Sib" + std::to_string(i),
+                                                    KEY_READ);
+            REQUIRE(sibling->h != nullptr);
+        });
+        paced_event([&] { sibling.reset(); });
+    }
+    settle_and_bound(kPaced);
+
+    for (int i = kPairs; i < 2 * kPairs; ++i) {
+        OwnedRegKey sibling(parent.sub + "\\Sib" + std::to_string(i), KEY_READ);
+        REQUIRE(sibling.h != nullptr);
+    }
+    settle_and_bound(2 * kPaced);
+
+    CHECK(reading_stable);
+    const auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    CHECK(got.count() == 0); // Ancestor mode never emits
+    const auto d = snap();
+    CHECK(d.live_watches == 1);
+    CHECK(d.retiring == 0);
+    CHECK(d.drain_backlog == 0);
+    CHECK(d.probe_workers_active == 0);
+    CHECK(d.sweep_pass_failed == 0);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
 TEST_CASE("Registry spark (real mechanism): an ordinary fire leaves a live re-armed watch and "
           "does not move established_at (#4340 RF-4)",
           "[spark][established][windows]") {
@@ -5792,6 +5893,93 @@ TEST_CASE("Registry mechanism (Windows, direct): a throwing establishment sink i
     CHECK(registry_debug_counters_for_test(*mech)->established_failed == 1);
     CHECK(log.count_key_reports(dropped_key) == 0);
     mech->stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): stop() with a staged but unserved None marker "
+          "drops it undispatched and returns once the parked sweeper is released "
+          "(CH-8, characterisation)",
+          "[spark][established][windows]") {
+    struct Ch8 {
+        std::atomic<int> fires{0};
+        std::atomic<bool> stop_returned{false};
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchRegKey a("est_ch8");
+    const auto st = std::make_shared<Ch8>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the sweeper inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_registry_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after `stopper`: the gate opens BEFORE the join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& t;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a stop() that never returns can never be joined
+                t.detach();
+            }
+        }
+    } leak_if_wedged{mech, stopper, wedged};
+
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(
+        [st](const std::string&, SparkData) { st->fires.fetch_add(1, std::memory_order_acq_rel); },
+        [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kInc = 71;
+    const auto spec = registry_spec("HKCU", a.sub);
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, kInc).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the sweeper is parked INSIDE the sink, off-lock
+    REQUIRE(log.has(key, kInc, SparkCoverage::Notification));
+
+    // on_fire stages the None marker under mu_ before it emits, so a fire that has been
+    // emitted proves the marker is staged; the parked sweeper cannot drain it.
+    a.write(1);
+    REQUIRE(eventually([&] { return st->fires.load(std::memory_order_acquire) >= 1; }, 8000ms));
+    REQUIRE(log.calls_made() == 1);
+
+    stopper = std::jthread([st, mp] {
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    // watch_incarnation refuses once stop() has set `stopping_`, in the same critical
+    // section as the sweeper's stop flag: stop() is now blocked joining the parked sweeper.
+    REQUIRE(eventually([&] { return !mech->watch_incarnation(key, spec.params, kInc).has_value(); },
+                       5000ms));
+    std::this_thread::sleep_for(300ms);
+    CHECK_FALSE(st->stop_returned.load(std::memory_order_acquire)); // weak: a negative window
+    gate.release();
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the parked sweeper being released");
+    }
+    stopper.join();
+
+    CHECK_FALSE(log.has(key, kInc, SparkCoverage::None));
+    CHECK(log.count(key, kInc) == 1);
+    CHECK(log.calls_made() == 1);
+    CHECK(stable_for([&] { return log.calls_made(); }, 300ms, 3000ms));
+    const auto d = registry_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->live_watches == 0);
+    CHECK(d->established_failed == 0);
+    CHECK(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+        5000ms));
 }
 
 TEST_CASE("Registry mechanism (Windows, direct): a dropped None is never re-sent - the last "
@@ -8386,6 +8574,117 @@ TEST_CASE("File spark (real mechanism): an absent parent dir watches its ancesto
     engine.stop();
 }
 
+TEST_CASE("File spark (real mechanism): an absent parent dir under sibling churn on its ancestor "
+          "keeps reading None with bounded probe launches and no leaked workers (CH-11, bounded "
+          "regression scenario: 200 create+remove pairs, not proof of no unbounded growth)",
+          "[spark][established][windows][walkoff]") {
+    namespace fs = std::filesystem;
+    constexpr int kPairs = 200;
+    constexpr std::uint64_t kEventsPerPair = 2; // one change record per create, one per remove
+    constexpr std::uint64_t kCompletionsPerEvent = 2; // a record may surface as two completions
+    constexpr std::uint64_t kLaunchesPerCompletion = 2; // reappearance probe + one owed re-probe
+    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPairs) * kEventsPerPair;
+    yuzu::test::TempDir tmp("yuzu_test_spark_ch11_absent_");
+    const fs::path root = tmp.path;
+    const fs::path target = root / "watched" / "file.txt"; // `watched` is never created
+    fs::create_directories(root);
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms; // arm() returns with the ancestor watch committed
+        ctl.health_grace = 60000ms;      // keep Fault edges out of the run
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, file_spec(target.string()));
+    REQUIRE(sub.has_value());
+
+    const auto snap = [&] { return *file_debug_counters_for_test(*raw); };
+    const auto idle = [&] { return snap().probe_workers_active == 0; };
+    REQUIRE(stable_for([&] { return snap().probe_launched; }, 150ms, 5000ms));
+    REQUIRE(eventually(idle, 5000ms));
+    const auto baseline = snap().probe_launched;
+
+    bool reading_stable = true;
+    const auto observe = [&] {
+        const auto est = engine.subscription_establishment(*sub);
+        if (!est || est->coverage != SparkCoverage::None || est->established_at)
+            reading_stable = false;
+    };
+    // Pacing only shapes the load: a timed-out wait, or a spent 30 s budget, is not a failure.
+    const auto soak_until = std::chrono::steady_clock::now() + 30s;
+    const auto paced_event = [&](auto&& mutate) {
+        const auto before = snap().probe_launched;
+        mutate();
+        if (std::chrono::steady_clock::now() > soak_until)
+            return;
+        (void)eventually(
+            [&] {
+                const auto d = snap();
+                return d.probe_launched > before && d.probe_workers_active == 0;
+            },
+            2000ms);
+        observe();
+    };
+    const auto settle_and_bound = [&](std::uint64_t events) {
+        REQUIRE(stable_for([&] { return snap().probe_launched; }, 100ms, 5000ms));
+        REQUIRE(eventually(idle, 5000ms));
+        const auto d = snap();
+        const auto retries =
+            d.probe_admission_rejected + d.probe_backend_failed + d.probe_launch_failed;
+        INFO("probe_launched=" << d.probe_launched << " baseline=" << baseline
+                               << " events=" << events << " retries=" << retries);
+        CHECK(d.probe_launched > baseline); // the noise reached the mechanism
+        CHECK(d.probe_launched <=
+              baseline + kLaunchesPerCompletion * kCompletionsPerEvent * events + retries);
+        CHECK(d.synthetic_fires == 0);
+    };
+    const auto make_sibling = [&](int i) {
+        std::error_code ec;
+        fs::create_directory(root / ("sib" + std::to_string(i)), ec);
+        REQUIRE(!ec);
+    };
+    const auto remove_sibling = [&](int i) {
+        std::error_code ec;
+        fs::remove(root / ("sib" + std::to_string(i)), ec);
+    };
+
+    for (int i = 0; i < kPairs; ++i) {
+        paced_event([&] { make_sibling(i); });
+        paced_event([&] { remove_sibling(i); });
+    }
+    settle_and_bound(kPaced);
+
+    for (int i = kPairs; i < 2 * kPairs; ++i) {
+        make_sibling(i);
+        remove_sibling(i);
+    }
+    settle_and_bound(2 * kPaced);
+
+    CHECK(reading_stable);
+    const auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    const auto d = snap();
+    CHECK(d.live_dirs == 1);
+    CHECK(d.live_ancestors == 1);
+    CHECK(d.retiring == 0);
+    CHECK(d.probe_workers_active == 0);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
 TEST_CASE("File spark (real mechanism): a parent-dir delete + recreate cycle loses and regains "
           "coverage without ever re-stamping established_at (#4340 FF-4)",
           "[spark][established][windows]") {
@@ -9156,6 +9455,90 @@ TEST_CASE("File mechanism (Windows, direct): a throwing establishment sink is co
     REQUIRE(eventually([&] { return log.has(key1, 84, SparkCoverage::Notification); }, 8000ms));
     CHECK(file_debug_counters_for_test(*mech)->established_failed == 1);
     mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): stop() with a staged but unserved joiner report "
+          "drops it undispatched and returns once the parked worker is released "
+          "(CH-8, characterisation)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    struct Ch8 {
+        std::atomic<bool> stop_entered{false};
+        std::atomic<bool> stop_returned{false};
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchDir scratch("est_ch8");
+    const fs::path f2 = scratch.dir / "f2.txt";
+    { std::ofstream(f2) << "seed"; }
+    const auto st = std::make_shared<Ch8>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the worker inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_file_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after `stopper`: the gate opens BEFORE the join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& t;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a stop() that never returns can never be joined
+                t.detach();
+            }
+        }
+    } leak_if_wedged{mech, stopper, wedged};
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kInc1 = 81, kInc2 = 82;
+    const auto spec1 = file_spec(scratch.file.string());
+    const auto spec2 = file_spec(f2.string());
+    const std::string key1 = spark_key(spec1), key2 = spark_key(spec2);
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, kInc1).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the worker is parked INSIDE the sink, off-lock
+    // A second key joining the directory marks its report due; the parked worker cannot drain it.
+    REQUIRE(mech->watch_incarnation(key2, spec2.params, kInc2).has_value());
+    REQUIRE(log.calls_made() == 1);
+
+    stopper = std::jthread([st, mp] {
+        st->stop_entered.store(true, std::memory_order_release);
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    REQUIRE(eventually([&] { return st->stop_entered.load(std::memory_order_acquire); }, 5000ms));
+    // No public signal shows stop() has set its stop flag, so this is a bounded window, not proof.
+    std::this_thread::sleep_for(500ms);
+    CHECK_FALSE(st->stop_returned.load(std::memory_order_acquire)); // weak: a negative window
+    gate.release();
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the parked worker being released");
+    }
+    stopper.join();
+
+    CHECK(log.count_key_reports(key2) == 0);
+    CHECK(log.count(key1, kInc1) == 1);
+    CHECK(log.calls_made() == 1);
+    CHECK(stable_for([&] { return log.calls_made(); }, 300ms, 3000ms));
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->live_dirs == 0);
+    CHECK(d->established_failed == 0);
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
 }
 
 TEST_CASE("File mechanism (Windows, direct): unwatch() and an orderly stop() report nothing "
