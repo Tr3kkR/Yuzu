@@ -408,6 +408,202 @@ TEST_CASE("GatewayRouteStore[pg]: announce_connected is a no-op against a differ
     CHECK(*(*row)->cluster_id == "cluster-a");
 }
 
+// ── #4669: agent<->cluster affinity ─────────────────────────────────────────
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected BINDS home_cluster_id on first contact "
+          "(TOFU) and a matching cluster_id on a later reconnect keeps succeeding",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-1", "session-1").value().won);
+    auto ann1 =
+        fx.store().announce_connected("agent-affinity-1", "session-1", "cluster-x", "node-1", 30);
+    REQUIRE(ann1.has_value());
+    CHECK(ann1->matched);
+    CHECK_FALSE(ann1->cluster_affinity_violation);
+
+    auto row1 = fx.store().lookup_route("agent-affinity-1");
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+    REQUIRE((*row1)->home_cluster_id.has_value());
+    CHECK(*(*row1)->home_cluster_id == "cluster-x");
+
+    // A SECOND legitimate reconnect (fresh session, same real cluster) —
+    // single-gateway/non-multi-cluster deployments look exactly like this:
+    // the SAME stable cluster_id presented on every reconnect. Must keep
+    // succeeding, unaffected by the new affinity guard.
+    REQUIRE(fx.store().register_fresh("agent-affinity-1", "session-2").value().won);
+    auto ann2 =
+        fx.store().announce_connected("agent-affinity-1", "session-2", "cluster-x", "node-2", 30);
+    REQUIRE(ann2.has_value());
+    CHECK(ann2->matched);
+    CHECK_FALSE(ann2->cluster_affinity_violation);
+
+    auto row2 = fx.store().lookup_route("agent-affinity-1");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    REQUIRE((*row2)->cluster_id.has_value());
+    CHECK(*(*row2)->cluster_id == "cluster-x");
+    REQUIRE((*row2)->home_cluster_id.has_value());
+    CHECK(*(*row2)->home_cluster_id == "cluster-x"); // unchanged
+}
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected REFUSES a same-session claim presenting a "
+          "DIFFERENT cluster_id than the bound home affinity — #4669 the rogue-gateway shape",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    // The REAL cluster (cluster-x) legitimately binds the agent's affinity.
+    REQUIRE(fx.store().register_fresh("agent-affinity-2", "session-real").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-2", "session-real", "cluster-x", "node-real",
+                                    30)
+                .value()
+                .matched);
+
+    // A ROGUE gateway calls ProxyRegister for the SAME already-approved
+    // agent_id (no per-agent secret required — #4669's finding) and its own
+    // register_fresh wins the epoch race unconditionally (it always mints a
+    // strictly higher epoch), installing a NEW session and NULLing
+    // cluster_id/gateway_node — but NOT home_cluster_id (sticky, file
+    // header). It then tries to CONFIRM its own cluster via
+    // announce_connected.
+    auto reg2 = fx.store().register_fresh("agent-affinity-2", "session-rogue");
+    REQUIRE(reg2.has_value());
+    CHECK(reg2->won); // register_fresh itself is NOT cluster-aware — this is the accepted,
+                       // pre-existing DoS-shaped churn #4669 does not attempt to close.
+
+    auto ann_rogue = fx.store().announce_connected("agent-affinity-2", "session-rogue",
+                                                    "cluster-rogue", "node-rogue", 30);
+    REQUIRE(ann_rogue.has_value());
+    CHECK_FALSE(ann_rogue->matched);
+    CHECK(ann_rogue->cluster_affinity_violation); // the mitigation: refused, not silently applied
+
+    // The row is COMPLETELY UNTOUCHED by the rogue's claim: cluster_id stays
+    // NULL (register_fresh's own NULLing, never confirmed by the refused
+    // announce_connected), home_cluster_id stays cluster-x, and the row is
+    // therefore NOT routable to the rogue's cluster.
+    auto row = fx.store().lookup_route("agent-affinity-2");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == "session-rogue"); // register_fresh's own unconditional win
+    CHECK_FALSE((*row)->cluster_id.has_value());   // never confirmed for the rogue
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // untouched
+
+    // The REAL agent's own later reconnect (its own fresh register_fresh,
+    // strictly higher epoch, always eventually wins) self-heals the row once
+    // it announces the MATCHING cluster.
+    REQUIRE(fx.store().register_fresh("agent-affinity-2", "session-real-2").value().won);
+    auto ann_real = fx.store().announce_connected("agent-affinity-2", "session-real-2",
+                                                   "cluster-x", "node-real-2", 30);
+    REQUIRE(ann_real.has_value());
+    CHECK(ann_real->matched);
+    CHECK_FALSE(ann_real->cluster_affinity_violation);
+    auto row2 = fx.store().lookup_route("agent-affinity-2");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    REQUIRE((*row2)->cluster_id.has_value());
+    CHECK(*(*row2)->cluster_id == "cluster-x");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' expired-lease sweep clears home_cluster_id "
+          "too — the 'row expired' legitimate re-home trigger (#4669)",
+          "[gateway_route][pg][store][affinity][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-reap", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-reap", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-affinity-reap", 200); // past the 180s grace
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->expired_leases_reaped == 1);
+
+    auto row = fx.store().lookup_route("agent-affinity-reap");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->home_cluster_id.has_value()); // affinity cleared, not just placement
+
+    // A DIFFERENT cluster can now legitimately bind the agent — genuine
+    // staleness is a real re-home trigger, not a hijack.
+    REQUIRE(fx.store().register_fresh("agent-affinity-reap", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-reap", "session-2", "cluster-y",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: clear_cluster_affinity is the explicit-operator-action "
+          "re-home trigger (#4669) — clears ONLY home_cluster_id, leaves current placement "
+          "untouched, and the next announce_connected can bind a new cluster",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-op", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-op", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+
+    auto cleared = fx.store().clear_cluster_affinity("agent-affinity-op");
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared);
+
+    // Current placement (cluster_id/gateway_node/session_id) is UNTOUCHED —
+    // only the sticky affinity anchor is reset.
+    auto row = fx.store().lookup_route("agent-affinity-op");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "cluster-x");
+    CHECK_FALSE((*row)->home_cluster_id.has_value());
+
+    // A DIFFERENT cluster's session can now legitimately (re-)bind.
+    REQUIRE(fx.store().register_fresh("agent-affinity-op", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-op", "session-2", "cluster-z",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+
+    // clear_cluster_affinity against an unknown agent is a harmless no-op
+    // (false, not an error).
+    auto cleared_missing = fx.store().clear_cluster_affinity("agent-affinity-op-never-seen");
+    REQUIRE(cleared_missing.has_value());
+    CHECK_FALSE(*cleared_missing);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: an ordinary deregister does NOT clear home_cluster_id — only "
+          "genuine staleness or an explicit operator action does (#4669)",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-dereg", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-dereg", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-affinity-dereg", "session-1").value().removed);
+
+    auto row = fx.store().lookup_route("agent-affinity-dereg");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value()); // tombstoned, still present
+    CHECK_FALSE((*row)->session_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value()); // affinity SURVIVES an ordinary disconnect
+    CHECK(*(*row)->home_cluster_id == "cluster-x");
+
+    // An ordinary reconnect from a DIFFERENT cluster right after a plain
+    // disconnect is STILL refused — a ProxyRegister/disconnect cycle is not,
+    // on its own, one of the two legitimate re-home triggers.
+    REQUIRE(fx.store().register_fresh("agent-affinity-dereg", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-dereg", "session-2", "cluster-rogue",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK_FALSE(ann->matched);
+    CHECK(ann->cluster_affinity_violation);
+}
+
 TEST_CASE("GatewayRouteStore[pg]: deregister tombstones only when session matches",
           "[gateway_route][pg][store]") {
     GatewayRoutePg fx;

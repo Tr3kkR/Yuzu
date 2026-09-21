@@ -198,6 +198,16 @@ CREATE TABLE IF NOT EXISTS route_meta(key TEXT PRIMARY KEY, value TEXT);
         {3, R"(
 ALTER TABLE agent_routes ADD COLUMN stream_home_id TEXT;
 )"},
+        // v4 (#4669): the STICKY agent<->cluster affinity anchor. Nullable —
+        // an existing row (or a brand-new agent) has no affinity bound yet;
+        // the first `announce_connected` binds it (TOFU). See the file
+        // header "AGENT<->CLUSTER AFFINITY" note — this is DELIBERATELY a
+        // separate column from `cluster_id`, never reset by `register_fresh`
+        // or `deregister`, only by `reap_stale_routes`' expired-lease sweep
+        // or an explicit `clear_cluster_affinity` call.
+        {4, R"(
+ALTER TABLE agent_routes ADD COLUMN home_cluster_id TEXT;
+)"},
     };
     return kMigrations;
 }
@@ -328,15 +338,29 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     std::optional<std::string> home_id_arg =
         stream_home_id.empty() ? std::nullopt
                                 : std::optional<std::string>{std::string(stream_home_id)};
+    // #4669 AFFINITY GUARD: the WHERE clause additionally requires
+    // `home_cluster_id IS NULL OR home_cluster_id = $3` — a session-matched
+    // row whose STICKY home_cluster_id differs from the presented cluster_id
+    // is left COMPLETELY UNTOUCHED (this UPDATE affects zero rows for it,
+    // exactly like a session mismatch at the SQL level, but the distinction
+    // matters to the caller — see the probe below). This is atomic: the
+    // affinity decision and the write are the SAME statement, so there is no
+    // read-then-write window a concurrent register/announce could race. A
+    // NULL home_cluster_id (never bound, or cleared by staleness/an operator
+    // re-home — see gateway_route_store.hpp's "AGENT<->CLUSTER AFFINITY")
+    // admits anything and BINDS via COALESCE.
     pg::PgResult upd = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes SET "
         "  cluster_id=$3, gateway_node=$4, stream_home_id=$6, "
+        "  home_cluster_id = COALESCE(home_cluster_id, $3), "
         "  lease_until = now() + ($5 || ' seconds')::interval, updated_at = now() "
-        "WHERE agent_id=$1 AND session_id=$2 RETURNING agent_id",
+        "WHERE agent_id=$1 AND session_id=$2 "
+        "  AND (home_cluster_id IS NULL OR home_cluster_id = $3) "
+        "RETURNING agent_id",
         std::vector<std::optional<std::string>>{
-            std::string(agent_id), std::string(session_id), std::move(cluster_arg),
-            std::string(gateway_node), std::to_string(lease_ttl_secs), home_id_arg});
+            std::string(agent_id), std::string(session_id), cluster_arg, std::string(gateway_node),
+            std::to_string(lease_ttl_secs), home_id_arg});
     if (upd.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: update failed: {}",
                       PQresultErrorMessage(upd.get()));
@@ -345,28 +369,50 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     if (PQntuples(upd.get()) > 0)
         return AnnounceResult{.matched = true};
 
+    // Zero rows: EITHER an ordinary session mismatch (pre-existing shape) OR
+    // — #4669 — the session DID match but the affinity guard refused a
+    // cross-cluster claim. Distinguish with a cheap, BEST-EFFORT follow-up
+    // read: this is a DIAGNOSTIC only, never the security decision itself
+    // (that was already enforced, atomically, by the guarded UPDATE above) —
+    // a probe failure just means the caller logs/counts a plain
+    // "session_mismatch" instead of the more specific
+    // "cluster_affinity_violation"; it can NEVER cause the write itself to
+    // have gone through when it should have been refused, or vice versa.
+    bool cluster_affinity_violation = false;
+    if (cluster_arg.has_value()) {
+        pg::PgResult probe = pg::exec_params(
+            lease.get(),
+            "SELECT 1 FROM gateway_route_store.agent_routes "
+            "WHERE agent_id=$1 AND session_id=$2 AND home_cluster_id IS NOT NULL "
+            "  AND home_cluster_id <> $3",
+            std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                     cluster_arg});
+        if (probe.status() == PGRES_TUPLES_OK && PQntuples(probe.get()) > 0)
+            cluster_affinity_violation = true;
+    }
+
     // No existing row for this (agent_id, session_id) pair — insert one, but
     // NEVER overwrite a row a different session already holds (ON CONFLICT DO
     // NOTHING, not DO UPDATE): a stale/duplicate CONNECTED for a session that
-    // lost the register_fresh race must not clobber the winner's row.
+    // lost the register_fresh race must not clobber the winner's row. This is
+    // harmless for the affinity-violation case too (agent_id already exists,
+    // so ON CONFLICT DO NOTHING always no-ops) — the row was never touched.
     pg::PgResult ins = pg::exec_params(
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
         "  (agent_id, cluster_id, gateway_node, connection_epoch, session_id, lease_until, "
-        "   updated_at, stream_home_id) "
-        "VALUES ($1, $2, $3, 0, $4, now() + ($5 || ' seconds')::interval, now(), $6) "
+        "   updated_at, stream_home_id, home_cluster_id) "
+        "VALUES ($1, $2, $3, 0, $4, now() + ($5 || ' seconds')::interval, now(), $6, $2) "
         "ON CONFLICT (agent_id) DO NOTHING",
         std::vector<std::optional<std::string>>{
-            std::string(agent_id),
-            cluster_id.empty() ? std::nullopt : std::optional<std::string>{std::string(cluster_id)},
-            std::string(gateway_node), std::string(session_id), std::to_string(lease_ttl_secs),
-            std::move(home_id_arg)});
+            std::string(agent_id), cluster_arg, std::string(gateway_node), std::string(session_id),
+            std::to_string(lease_ttl_secs), std::move(home_id_arg)});
     if (ins.status() != PGRES_COMMAND_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: fallback insert failed: {}",
                       PQresultErrorMessage(ins.get()));
         return std::unexpected(GatewayRouteStoreError::db_error);
     }
-    return AnnounceResult{.matched = false};
+    return AnnounceResult{.matched = false, .cluster_affinity_violation = cluster_affinity_violation};
 }
 
 std::expected<bool, GatewayRouteStoreError>
@@ -519,6 +565,66 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     return DeregisterResult{.removed = PQntuples(res.get()) > 0};
 }
 
+std::expected<bool, GatewayRouteStoreError>
+GatewayRouteStore::clear_cluster_affinity(std::string_view agent_id) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::clear_cluster_affinity: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // #4669: UNCONDITIONAL (no session/epoch guard — see the header doc
+    // comment) — this is a deliberate operator override, not a
+    // connection-lifecycle event. Only home_cluster_id is touched; the
+    // row's current placement (cluster_id/gateway_node/session_id/
+    // lease_until/stream_home_id/connection_epoch) is left exactly as-is.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE gateway_route_store.agent_routes SET "
+        "  home_cluster_id=NULL, updated_at=now() "
+        "WHERE agent_id=$1 "
+        "RETURNING agent_id",
+        std::vector<std::optional<std::string>>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::clear_cluster_affinity: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    return PQntuples(res.get()) > 0;
+}
+
+std::expected<bool, GatewayRouteStoreError>
+GatewayRouteStore::has_cluster_affinity_conflict(std::string_view agent_id,
+                                                 std::string_view session_id,
+                                                 std::string_view cluster_id) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    // Empty/unknown never conflicts — same convention as announce_connected
+    // (a legacy gateway build with no cluster concept at all must never be
+    // treated as an affinity violation).
+    if (cluster_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::has_cluster_affinity_conflict: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM gateway_route_store.agent_routes "
+        "WHERE agent_id=$1 AND session_id=$2 AND home_cluster_id IS NOT NULL "
+        "  AND home_cluster_id <> $3",
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::string(cluster_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::has_cluster_affinity_conflict: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    return PQntuples(res.get()) > 0;
+}
+
 std::expected<int, GatewayRouteStoreError>
 GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
                                 std::span<const std::string> session_ids, int lease_ttl_secs) {
@@ -643,7 +749,8 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
         lease.get(),
         "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
         "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
-        "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale "
+        "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
+        "       home_cluster_id "
         "FROM gateway_route_store.agent_routes WHERE agent_id=$1",
         std::vector<std::optional<std::string>>{std::string(agent_id)});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -667,6 +774,7 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               ? std::nullopt
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
+    row.home_cluster_id = col_opt(res.get(), 0, 7); // #4669
     return std::optional<RouteRow>(std::move(row));
 }
 
@@ -902,7 +1010,13 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 c,
                 "UPDATE gateway_route_store.agent_routes SET "
                 "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
-                "  stream_home_id=NULL, updated_at=now() "
+                // #4669: ALSO clear the STICKY home_cluster_id here — a route
+                // genuinely stale past the grace window is the "row expired"
+                // legitimate re-home trigger (gateway_route_store.hpp's
+                // "AGENT<->CLUSTER AFFINITY" note); this sweep is the one
+                // place besides an explicit clear_cluster_affinity() call
+                // that resets it.
+                "  stream_home_id=NULL, home_cluster_id=NULL, updated_at=now() "
                 "WHERE agent_id IN (SELECT agent_id FROM gateway_route_store.agent_routes "
                 "  WHERE lease_until IS NOT NULL "
                 "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint "

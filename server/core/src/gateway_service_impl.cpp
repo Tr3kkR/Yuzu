@@ -103,17 +103,33 @@ constexpr std::size_t kMaxStreamHomeIdLen = 64;
 //     This is a stronger failure mode than register_fresh's own (a missed
 //     CREATE is merely absent; a wrong ADOPT actively clobbers), so it gets
 //     the same fail-closed treatment.
-//   - Every OTHER site stays fail-OPEN and proceeds — see each call site's
-//     own comment for why that site specifically tolerates a degraded write:
+//   - Every OTHER site stays fail-OPEN on a DEGRADED READ (store_unavailable/
+//     db_error — this function's two `reason`s) and proceeds — see each call
+//     site's own comment for why that site specifically tolerates it:
 //     announce_connected (the CONNECTED notify is a droppable gen_server:cast
-//     and set_gateway_route already published in-memory — failing it would
-//     split memory/directory state and risk a black hole), BatchHeartbeat's
-//     OWN renew_leases call (a renew failure only yields premature
-//     lease-staleness, which the reader's `routable` predicate already
-//     treats as not-routable — a fundamentally different risk than the
-//     decision-phase renew above, which decides ADOPT vs REFUSE rather than
-//     merely extending an already-adopted lease), and deregister (bounded by
-//     the 90s lease TTL regardless).
+//     on the gateway side; a Postgres blip must not refuse every gateway
+//     CONNECTED fleet-wide), BatchHeartbeat's OWN renew_leases call (a renew
+//     failure only yields premature lease-staleness, which the reader's
+//     `routable` predicate already treats as not-routable — a fundamentally
+//     different risk than the decision-phase renew above, which decides
+//     ADOPT vs REFUSE rather than merely extending an already-adopted
+//     lease), and deregister (bounded by the 90s lease TTL regardless).
+//   - #4669 CARVE-OUT (narrower than the above, NOT a degraded-read case): a
+//     NEW, SEPARATE READ-ONLY pre-check (`has_cluster_affinity_conflict`)
+//     runs BEFORE registry_.set_gateway_route in NotifyStreamStatus's
+//     CONNECTED handling — see that call site's own comment for why it is a
+//     distinct call rather than a reorder of announce_connected's own write.
+//     When that pre-check SUCCEEDS with a definitive conflict, that IS
+//     fail-closed — the whole CONNECTED is refused, nothing is published to
+//     the in-memory registry either. This is not a "can't tell" degraded
+//     answer (a DEGRADED pre-check read stays fail-OPEN, still routed
+//     through THIS function with op="announce_connected" — see that call
+//     site); it is an affirmative "no" from the durable store, and an
+//     affirmative "no" is always honored, never downgraded to fail-open.
+//     announce_connected's OWN later write (unchanged position/posture) also
+//     independently re-checks the same affinity atomically — see
+//     `AnnounceResult::cluster_affinity_violation` and its call site's
+//     comment for the narrow race the pre-check alone cannot close.
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
@@ -183,7 +199,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "stays fail-OPEN (the RPC proceeds, integrity living at the fallback-only "
             "dispatch reader's trust predicate) - so for the fail-open writers this "
             "counter is the only signal a systemic write failure would otherwise leave "
-            "invisible.",
+            "invisible. #4669: op=\"cluster_affinity_check\" is a SEPARATE READ (the "
+            "pre-check ahead of set_gateway_route) — also fail-OPEN on a degraded read, "
+            "deliberately counted under its OWN op label rather than folded into "
+            "\"announce_connected\", which stays the write's own count.",
             "counter");
         // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
         // pre-seed every (op,reason) combo this counter can ACTUALLY emit (record_route_store_failure
@@ -195,7 +214,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // immediately below.
         for (const char* op :
             {"register_fresh", "announce_connected", "deregister", "renew_leases",
-             "reclaim_tombstoned_session"}) {
+             "reclaim_tombstoned_session",
+             // #4669: the read-only pre-check ahead of set_gateway_route —
+             // see that call site's comment for why it is a distinct op from
+             // "announce_connected".
+             "cluster_affinity_check"}) {
             for (const char* reason : {"store_unavailable", "db_error"}) {
                 metrics_->counter("yuzu_server_gateway_route_write_failed_total",
                                   {{"op", op}, {"reason", reason}});
@@ -213,7 +236,13 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "lost_race_sessions_ bookkeeping) so a benign concurrent-connect race never inflates "
             "this counter. Two benign contributors not to page on: a post-restart/failover "
             "baseline rise (a replica that lost its in-memory session map until agents "
-            "re-announce), and a redelivered/duplicate DISCONNECTED notification.",
+            "re-announce), and a redelivered/duplicate DISCONNECTED notification. #4669: "
+            "outcome=\"cluster_affinity_violation\" (op=\"announce_connected\") is the ONE "
+            "exception to \"benign, don't page\" above — a session-matched CONNECTED claiming a "
+            "DIFFERENT cluster_id than the agent's durably-bound home affinity, refused "
+            "fail-closed. ANY non-zero rate is worth investigating (a misconfigured/renamed "
+            "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
+            "to tolerate like the others.",
             "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
         // only the (op,outcome) pairs this file ACTUALLY emits (see the
@@ -248,6 +277,12 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // above.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "announce_connected"}, {"outcome", "malformed_cluster_id"}});
+        // #4669: a session-matched CONNECTED claiming a DIFFERENT cluster_id
+        // than the agent's durably-bound home affinity — refused outright
+        // (fail-closed), distinct from an ordinary session_mismatch desync.
+        // See gateway_route_store.hpp's "AGENT<->CLUSTER AFFINITY" note.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
@@ -1433,6 +1468,83 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             // path instead of a silent default.
             cluster_id = std::string(yuzu::server::kUnknownGatewayClusterLabel);
         }
+        // #4669: a READ-ONLY, non-mutating pre-check, BEFORE publishing
+        // anything — refuses EARLY (before set_gateway_route's in-memory
+        // write, the PRIMARY dispatch path: `AgentSession::cluster_id`, read
+        // by `send_to`/`send_to_all`) if the durable store shows THIS SAME
+        // session already durably bound to a DIFFERENT cluster
+        // (gateway_route_store.hpp's "AGENT<->CLUSTER AFFINITY" note). Kept
+        // as a SEPARATE check rather than reordering `announce_connected`'s
+        // own WRITE ahead of `set_gateway_route`, specifically so an
+        // ORDINARY stale/superseded CONNECTED (a DIFFERENT session than the
+        // one the row currently holds — set_gateway_route's own
+        // `stale_connected_session` check below, unrelated to affinity)
+        // keeps its EXISTING short-circuit shape unchanged: this pre-check
+        // can only ever fire true for a SESSION-MATCHED, CLUSTER-MISMATCHED
+        // row, the one case `set_gateway_route`'s own session-only check
+        // cannot see. A DEGRADED read stays fail-OPEN (proceed), matching
+        // every other `announce_connected`-adjacent site's per-site
+        // contract (Task B) — only a DEFINITIVE conflict is fail-closed.
+        // `announce_connected` (below, in its ORIGINAL position/logic)
+        // remains the enforcement OF RECORD — its own guarded UPDATE
+        // independently re-checks the SAME affinity atomically at write
+        // time, so a narrow race between this read and that write can never
+        // let a mismatched cluster_id persist DURABLY; it can only, in the
+        // narrowest window, let this pre-check miss a violation the write
+        // then still refuses — degrading to the pre-#4669 fail-open posture
+        // for that one race, never the reverse.
+        if (gateway_route_store_) {
+            bool skip = false;
+            {
+                std::lock_guard lock(sessions_mu_);
+                skip = lost_race_sessions_.contains(session_id);
+            }
+            if (!skip) {
+                if (auto conflict = gateway_route_store_->has_cluster_affinity_conflict(
+                        agent_id, session_id, cluster_id);
+                    !conflict) {
+                    // A DISTINCT op label from "announce_connected" (never
+                    // conflated with it): this is a separate READ, and a
+                    // pre-existing test pins the ONE write-failure increment
+                    // announce_connected's OWN degraded call below produces
+                    // per CONNECTED — doubling that under the same label
+                    // would also make an SRE dashboard misread "one degraded
+                    // write" as "two", conflating a read failure with a
+                    // write failure.
+                    record_route_store_failure(metrics_, "cluster_affinity_check", conflict.error());
+                    // fail-OPEN (per-site contract, unchanged): fall through.
+                } else if (*conflict) {
+                    spdlog::warn(
+                        "[gateway] NotifyStreamStatus: CONNECTED for agent {} (session {}) "
+                        "claims cluster_id '{}', which differs from this agent's already-bound "
+                        "cluster affinity — REFUSING as a likely cross-cluster identity claim "
+                        "(#4669), not publishing this placement anywhere",
+                        agent_id, session_id, cluster_id);
+                    record_directory_desync(metrics_, "announce_connected",
+                                            "cluster_affinity_violation");
+                    if (audit_store_ && audit_store_->is_open()) {
+                        AuditEvent ev;
+                        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count();
+                        ev.principal = "gateway_cluster:" + cluster_id;
+                        ev.principal_role = "gateway";
+                        ev.action = "gateway.cluster_affinity_violation";
+                        ev.target_type = "agent";
+                        ev.target_id = agent_id;
+                        ev.detail = std::string("session=")
+                                        .append(session_id)
+                                        .append(" claimed_cluster_id=")
+                                        .append(cluster_id);
+                        ev.result = "failure";
+                        if (!audit_store_->log(ev))
+                            signal_grpc_audit_failed(context);
+                    }
+                    response->set_acknowledged(false);
+                    return grpc::Status::OK;
+                }
+            }
+        }
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
         // BLOCKER 2): the session check just above (gateway_sessions_) only
         // proves `session_id` is SOME live entry for this agent — multiple
@@ -1467,7 +1579,12 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // RPC now would split the two (memory says connected, directory does
         // not) and risk a routing black hole for no correctness gain. The
         // reader's `routable` trust predicate, not this write, is the integrity
-        // backstop.
+        // backstop. #4669: the ONE exception is `cluster_affinity_violation`
+        // below — by this point the #4669 pre-check ABOVE has already refused
+        // the common case, so reaching a violation HERE is only the narrow
+        // race window that comment describes; still counted distinctly, but
+        // `set_gateway_route` has already run by then (that race's accepted
+        // cost — see the pre-check's own comment).
         if (gateway_route_store_) {
             // 4.2a #8: a session recorded in lost_race_sessions_ lost its
             // register_fresh epoch race — the durable row already belongs to
@@ -1491,6 +1608,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                            kGatewayRouteLeaseTtlSecs, stream_home_id);
                        !res) {
                 record_route_store_failure(metrics_, "announce_connected", res.error());
+            } else if (res->cluster_affinity_violation) {
+                record_directory_desync(metrics_, "announce_connected", "cluster_affinity_violation");
             } else if (!res->matched) {
                 record_directory_desync(metrics_, "announce_connected", "session_mismatch");
             }

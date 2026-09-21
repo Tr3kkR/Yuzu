@@ -75,21 +75,42 @@
 /// carries — named explicitly here because it's easy to misread the mTLS
 /// dial as a verification it isn't.
 ///
-/// NOT A TRUST-ZONE BOUNDARY YET (post-governance Fable review, pre-push):
-/// classify_gateway_forward_response's agent-id mismatch check (below) only
-/// catches a response naming a DIFFERENT agent than the request targeted. It
-/// does NOT catch a gateway CLAIMING an agent's identity via `ProxyRegister`
-/// (which re-registers any already-approved agent_id with no per-agent
-/// secret) and then legitimately answering for it — `register_fresh`'s
-/// newer-epoch rule favors whichever gateway claims most recently, and
-/// `cluster_id` is gateway-asserted with nothing binding it to the
-/// presenting peer's actual identity. In multi-cluster mode this means a
-/// rogue/compromised gateway can intercept another cluster's agent traffic
-/// (command payloads, terminal results) despite `--gateway-cluster-addr`
-/// conceptually modeling separate trust zones. Tracked as `#4669`
-/// (agent<->cluster affinity + per-cluster peer-identity binding) — until
-/// that lands, do not describe multi-cluster mode as providing trust-zone
-/// isolation between clusters for a given agent.
+/// PARTIAL TRUST-ZONE BOUNDARY (#4669, CLOSED via mitigation 1 — agent<->cluster
+/// affinity in `GatewayRouteStore`; post-governance Fable review originally flagged
+/// this as NOT a trust-zone boundary at all, pre-push). `classify_gateway_forward_
+/// response`'s agent-id mismatch check (below) still only catches a response naming
+/// a DIFFERENT agent than the request targeted — it does NOT, on its own, catch a
+/// gateway CLAIMING an agent's identity via `ProxyRegister` (which re-registers any
+/// already-approved agent_id with no per-agent secret) and then legitimately
+/// answering for it. That claim-then-answer path is now closed by a SEPARATE
+/// mechanism: `GatewayRouteStore::agent_routes` gains a STICKY `home_cluster_id`
+/// column (distinct from the ephemeral `cluster_id`/`gateway_node` `register_fresh`
+/// NULLs on every fresh registration), and `announce_connected`'s guarded UPDATE
+/// atomically refuses a session-matched write whose presented `cluster_id` differs
+/// from an already-bound `home_cluster_id` — `gateway_service_impl.cpp`'s
+/// `NotifyStreamStatus` CONNECTED handler additionally runs a READ-ONLY pre-check
+/// (`has_cluster_affinity_conflict`) before `registry_.set_gateway_route`, so a
+/// rogue's own `register_fresh` win (unconditional, epoch-only, still unchanged —
+/// this is NOT what closes) can no longer make its OWN subsequent CONNECTED move
+/// `cluster_id` — and therefore this pool's `resolve()` target — to the rogue's
+/// cluster. `cluster_id` itself is STILL gateway-asserted with nothing cryptographically
+/// binding it to the presenting peer's identity (that is what mitigation 2, per-cluster
+/// peer-identity binding at the gateway-upstream listener, would add — NOT
+/// implemented; this listener still authenticates a peer as "some gateway", never
+/// "gateway Y specifically") — the affinity mechanism instead closes the gap by
+/// making a CHANGE of cluster for an agent already bound to one require either
+/// genuine staleness (the real cluster unreachable for the full reap grace window)
+/// or an explicit operator `clear_cluster_affinity` action, never a same-instant
+/// claim. See `docs/adr/2002-high-availability-architecture.md` §7d's `#4669`
+/// update for the full design and its one adjacent, pre-existing, unchanged
+/// consideration (`reclaim_tombstoned_session`'s no-secret session adoption for an
+/// already-tombstoned row — also covered by the SAME affinity guard, since that
+/// call never touches `home_cluster_id` either). Do NOT describe multi-cluster mode
+/// as providing FULL peer-authenticated trust-zone isolation (mitigation 2 is still
+/// open) — but a rogue/compromised gateway can no longer silently redirect an
+/// already-bound agent's traffic to itself merely by winning `ProxyRegister`'s
+/// unauthenticated epoch race, which was the acceptance-criteria attack this issue
+/// was filed to close.
 namespace yuzu::server {
 
 /// The literal both single-cluster and multi-cluster mode use for the

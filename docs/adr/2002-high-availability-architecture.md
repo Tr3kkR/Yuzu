@@ -1193,6 +1193,49 @@ adversarial review surfaced, not a routing change.
   blocking this slice per the reviewing pass's own recommendation (multi-cluster mode is opt-in with no
   production deployments today), but must close before multi-cluster mode is presented as providing
   trust-zone isolation.
+
+  **Update (#4669, CLOSED via mitigation 1 — agent↔cluster affinity, NOT mitigation 2):**
+  `agent_routes` gains a STICKY `home_cluster_id` column (migration v4), separate from the EPHEMERAL
+  `cluster_id`/`gateway_node` that `register_fresh` NULLs on every fresh registration — `register_fresh`,
+  `deregister`, and an ordinary reap-clean tombstone all leave `home_cluster_id` alone. `announce_connected`
+  now enforces it: a session-matched write is ATOMICALLY refused (its own guarded UPDATE's WHERE clause,
+  no read-then-write TOCTOU) when the presented `cluster_id` differs from an already-bound
+  `home_cluster_id`, reporting a distinct `AnnounceResult::cluster_affinity_violation`; a NULL
+  `home_cluster_id` (never bound, or legitimately cleared — see below) admits and binds on first contact
+  (TOFU). `gateway_service_impl.cpp`'s `NotifyStreamStatus` CONNECTED handler adds a READ-ONLY pre-check
+  (`GatewayRouteStore::has_cluster_affinity_conflict`) BEFORE `registry_.set_gateway_route` — the PRIMARY
+  dispatch path's write (`AgentSession::cluster_id`, read by `send_to`/`send_to_all`) — so a definitive
+  violation refuses the WHOLE CONNECTED before EITHER the durable row or the in-memory registry is
+  touched, closing the exact "claims agent A's own identity, then legitimately answers for it" shape
+  above: a rogue's own `register_fresh` still unconditionally wins the epoch race (pre-existing,
+  accepted DoS-shaped churn, unchanged), but its own subsequent `announce_connected`/CONNECTED can no
+  longer make `cluster_id` — and therefore `GatewayMgmtStubPool::resolve()`'s dispatch target — move to
+  the rogue's cluster. The real agent's own later reconnect (its own fresh `register_fresh`, always
+  eventually wins the epoch race) self-heals by announcing the matching cluster. Two legitimate re-home
+  triggers, matching the issue's own design: (1) genuine staleness — `reap_stale_routes`' expired-lease
+  sweep now ALSO NULLs `home_cluster_id` (>= the existing grace window past the lease TTL, i.e. requires
+  the real cluster to have been genuinely unreachable that long, not something a rogue can force
+  instantly), and its tombstone-purge sweep already removes the affinity with the row; (2)
+  `GatewayRouteStore::clear_cluster_affinity` — an explicit, unconditional, operator-invoked clear (the
+  CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — see the open
+  follow-up below). Deliberately NOT gated on multi-cluster mode: `gateway_route_store_` is wired
+  whenever a gateway upstream is configured at all, and a single-cluster gateway announces a STABLE
+  `cluster_id` (`YUZU_GW_CLUSTER_ID`, default `"default"`) on every connection, so TOFU-bind-then-match
+  costs single-cluster deployments nothing. **Scope note:** this closes the `GatewayRouteStore`-side half
+  only (mitigation 1) — mitigation 2 (per-cluster peer-identity binding at the gateway-upstream listener,
+  so a peer physically presenting cluster Y's certificate cannot claim agents whose home is cluster X) is
+  NOT implemented; today's gateway-upstream listener still authenticates the peer as "some gateway",
+  never "gateway Y specifically" (`gateway_mgmt_stub_pool.hpp`'s TRUST BOUNDARY note). **Adjacent,
+  narrower pre-existing consideration this slice does NOT need to change:** `ProxyRegister`'s OTHER adopt
+  path, `reclaim_tombstoned_session`, accepts ANY presented `session_id` string against a row that is
+  CURRENTLY tombstoned — no secret verification, by design, for the legitimate circuit-recovery-replay-
+  after-a-core-restart case. A rogue racing the narrow window right after a genuine disconnect could
+  reclaim SESSION OWNERSHIP of the row with a fabricated session_id — but `reclaim_tombstoned_session`
+  never touches `home_cluster_id` either, so the reclaimed row's affinity is still whatever it was bound
+  to before the tombstone, and the SAME `announce_connected` guard refuses a mismatched cluster for it
+  exactly as for a live row. The `#4669` affinity mitigation therefore also holds against this reclaim-
+  based variant, even though `reclaim_tombstoned_session`'s own no-secret-required session adoption is a
+  separate, pre-existing design choice this slice does not revisit.
 - **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
   RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
   after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a
