@@ -7100,6 +7100,89 @@ TEST_CASE("File worker (direct): a worker that never fails keeps every pass-fail
     mech->stop();
 }
 
+TEST_CASE("File worker (direct): a throw after dispatched == true is counted, backed off and "
+          "recovered with no external wake (#4658 PF-15)",
+          "[spark][mechanism][windows][passfail]") {
+    // Every other PF case throws from pass_fail_hook, which fires BEFORE run() sets `dispatched`.
+    // This one throws AFTER it: emit_bookkeeping_hook fires inside run_off_lock() once the pass
+    // has launched a probe, and the catch in run() must still count the pass (`ok = false`
+    // whatever `dispatched` says), back it off and retry it. A catch that only counted
+    // pre-dispatch failures would leave pass_failed at 0. Mechanics copied from the existing
+    // "Unattempted Emit notice" scenario: B's real write stages a notice, a forced reissue
+    // failure (real_rearm_fail_hook) stages a probe launch in the same real-completion pass, and
+    // the launch fires the bookkeeping hook.
+    ScratchDir b("pf_after_dispatch");
+    std::atomic<bool> rearm_armed{false};
+    std::atomic<int> rearm_hits{0};
+    std::atomic<bool> hook_armed{false};
+    std::atomic<int> hook_hits{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> b_delivered{0};
+    const std::wstring b_dir_w = b.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 20ms;
+        ctl.sweep_cadence = 10ms; // the first backoff is 10 ms
+        // Counts passes for the quiescence wait; never throws.
+        ctl.pass_fail_hook = [&] { passes.fetch_add(1, std::memory_order_acq_rel); };
+        ctl.real_rearm_fail_hook = [&](std::wstring_view dir) {
+            if (dir == b_dir_w && rearm_armed.exchange(false, std::memory_order_acq_rel)) {
+                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            hook_hits.fetch_add(1, std::memory_order_acq_rel);
+            if (hook_armed.exchange(false, std::memory_order_acq_rel))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == "B")
+                b_delivered.fetch_add(1, std::memory_order_acq_rel);
+        },
+        pf_noop_fault);
+    REQUIRE(mech->watch("B", file_spec(b.file.string()).params).has_value());
+    REQUIRE(pf_wait_no_passes(passes, 200ms)); // B established, its read armed, nothing due
+    const int hook_before = hook_hits.load(std::memory_order_acquire);
+    rearm_armed.store(true, std::memory_order_release);
+    hook_armed.store(true, std::memory_order_release);
+    b.write("change");
+    // The throw actually fired (the hook was reached AFTER the arm and consumed it), on the pass
+    // that also took the forced reissue failure.
+    REQUIRE(eventually(
+        [&] {
+            return rearm_hits.load(std::memory_order_acquire) >= 1 &&
+                   hook_hits.load(std::memory_order_acquire) > hook_before &&
+                   !hook_armed.load(std::memory_order_acquire);
+        },
+        3000ms));
+    // The failed pass is counted...
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                     2000ms));
+    // ...and retried at its backoff deadline with NO further watch()/apply_test_controls(): the
+    // episode closes by itself.
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0 &&
+                   !mech->stats().inert;
+        },
+        2000ms));
+    CHECK(eventually([&] { return b_delivered.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " consecutive=" << d->pass_failures_consecutive);
+    CHECK(d->pass_failed == 1); // the one injected throw, counted once
+    CHECK(d->pass_failures_consecutive == 0);
+}
+
 TEST_CASE("File spark (real mechanism): a change during the INITIAL establishment window, with a "
           "prior fault edge, is observed via a late commitment - or is it? (#2012 PR-B2, "
           "criterion #3)",
