@@ -2,7 +2,7 @@
 
 **This file is a contents page, not a knowledge base.** Before adding anything, read
 `docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
-here*. This file, `AGENTS.md`, and the two routed-concern tables load into every session; each is
+here*. This file, `AGENTS.md`, and the three routed-concern tables load into every session; each is
 budgeted at 40,000 characters and capped at 48,000 (`tests/test_issue_docs.py`).
 
 ## What is Yuzu?
@@ -81,12 +81,13 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 ## Routed concerns (read the doc, not this file)
 
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
-two files solely for the per-file ceiling: the first holds platform/product/data/observability
-concerns, the second auth, access-control, and request-admission chokepoints. Same authority as this
-file.
+three files solely for the per-file ceiling: the first holds platform/product/data/observability
+concerns, the second auth, access-control, and request-admission chokepoints, the third the
+security-posture plugins (the Wave 8 split). Same authority as this file.
 
 @.claude/routed-concerns.md
 @.claude/routed-concerns-access-control.md
+@.claude/routed-concerns-security-posture.md
 
 ## Domain entry points
 
