@@ -29,7 +29,7 @@
  * (the rig probe below), so that modal state reads two `absent` rows and
  * OK/FULL. A missing or unreadable key never yields a non-zero exit: return 0
  * for every data-level outcome; an internal exception is contained by the
- * portable execute() (rc 1, constrained|internal_error).
+ * portable execute() (rc 1, constrained|<os>|internal_error|-|unreadable).
  *
  * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64, run as
  * NT AUTHORITY\SYSTEM). The full transcript is in the PR body; the fixture and its provenance are
@@ -78,7 +78,8 @@ namespace mit = yuzu::system_hardening::mitigation;
 
 constexpr wchar_t kKernelKey[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel";
 
-/// One byte over the decoder's cap is enough to detect "oversized".
+/// One byte over the decoder's cap is enough to detect "oversized": a 257-byte value reaches the
+/// decoder, which labels it so; anything larger fails the read itself (ERROR_MORE_DATA).
 constexpr DWORD kReadCap = static_cast<DWORD>(mit::kMaxBlobBytes) + 1;
 
 struct Probe {

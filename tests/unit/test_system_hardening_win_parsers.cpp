@@ -177,6 +177,7 @@ TEST_CASE("decode: malformed blobs return a typed error, never a partial decode"
     CHECK(err(7) == "odd_length");
     CHECK(err(15) == "odd_length");
     CHECK(err(12) == "not_qword_aligned");
+    CHECK(err(kMaxBlobBytes + 1) == "oversized"); // 257: odd AND over the cap; the cap wins
     CHECK(err(kMaxBlobBytes + 8) == "oversized");
     CHECK(decode_mitigation_options(std::vector<uint8_t>(16, 0), "").has_value());
     CHECK(decode_mitigation_options(std::vector<uint8_t>(24, 0), "").has_value());

@@ -47,7 +47,7 @@ spec:
     columns:
       - name: row_kind
         type: string
-        description: 'Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row; its reason lands in the next column).'
+        description: 'Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row: `os` is the host leg, `key` is `internal_error`, `state` is `unreadable`).'
         values: [posture, constrained]
         example: posture
         platforms: [windows, linux, darwin]

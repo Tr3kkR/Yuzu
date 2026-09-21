@@ -14,6 +14,7 @@
 
 #include "system_hardening_parsers.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
@@ -540,4 +541,14 @@ TEST_CASE("system_hardening: RECONSTRUCTION malformed values map to unmodelled, 
     // Unmodelled values and the keys this fixture omits (ENOENT -> absent) are not failures.
     CHECK(state_of(rows, "kernel.yama.ptrace_scope") == PostureState::absent);
     CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("system_hardening internal-error row has the published five fields",
+          "[system_hardening][parsers]") {
+    for (const std::string_view os : {"linux", "macos", "windows"}) {
+        const std::string row = format_internal_error_row(os);
+        INFO("row: " << row);
+        CHECK(row == "constrained|" + std::string{os} + "|internal_error|-|unreadable");
+        CHECK(std::count(row.begin(), row.end(), '|') == 4); // five fields, like a posture row
+    }
 }

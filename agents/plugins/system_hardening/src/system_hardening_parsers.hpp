@@ -254,6 +254,17 @@ struct PostureRow {
     return out;
 }
 
+/// The one row `execute()` writes after an internal error: the same five fields as every posture
+/// row, so a schema-driven consumer maps it like any other (`os` is the host leg, the cause sits in
+/// `key`, nothing was read). `os` is one of the fixed vocabulary, never OS-supplied text.
+[[nodiscard]] inline std::string format_internal_error_row(std::string_view os) {
+    std::string out = "constrained|";
+    out += os;
+    out += "|internal_error|-|";
+    out += state_token(PostureState::unreadable);
+    return out;
+}
+
 // ── collect loops over an injected reader ───────────────────────────────
 
 /// What a reader returns. err == 0: a successful read (Linux `text`; macOS

@@ -158,16 +158,16 @@ inline uint64_t le_qword(std::span<const uint8_t> in, std::size_t qword_index) {
 } // namespace detail
 
 /// Decodes one MitigationOptions/MitigationAuditOptions blob; `prefix` starts
-/// every policy name. A 0-byte, odd-length or non-QWORD-multiple blob is a
+/// every policy name. A 0-byte, oversized, odd-length or non-QWORD-multiple blob is a
 /// DecodeError, never a partial decode.
 inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<const uint8_t> blob,
                                                                     std::string_view prefix) {
     if (blob.empty())
         return std::unexpected(DecodeError{"empty_blob"});
-    if (blob.size() % 2 != 0)
-        return std::unexpected(DecodeError{"odd_length"});
     if (blob.size() > kMaxBlobBytes)
         return std::unexpected(DecodeError{"oversized"});
+    if (blob.size() % 2 != 0)
+        return std::unexpected(DecodeError{"odd_length"});
     if (blob.size() % 8 != 0)
         return std::unexpected(DecodeError{"not_qword_aligned"});
 

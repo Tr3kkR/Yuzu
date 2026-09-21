@@ -73,7 +73,7 @@
     {
       "columns": [
         {
-          "description": "Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row; its reason lands in the next column).",
+          "description": "Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row: `os` is the host leg, `key` is `internal_error`, `state` is `unreadable`).",
           "example": "posture",
           "name": "row_kind",
           "platforms": [
@@ -153,7 +153,7 @@
       "definition_id": "crossplatform.system_hardening.posture"
     }
   ],
-  "outputs_note": "Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `write_output()`. The first field is the fixed literal `posture`, then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent` or `unreadable`); a raw value that WAS read passes through the shared untrusted-output escaper. Windows rows can outnumber the allowlist: one registry value decodes into one row per policy field, and each trailing QWORD of a longer blob adds one raw-hex `ext_q<n>` row (`default` when zero, otherwise `unmodelled`) rather than being dropped. The action returns 0 for every data-level outcome (an unreadable key is a degraded result and an absent key is not a failure; neither is ever a failed command); only an internal exception returns 1 (any leg), adding a `constrained|internal_error` row after any rows already written. A value that was read but cannot be interpreted is `unmodelled` (Linux and macOS: non-numeric, empty or out-of-range text; Windows: a nibble with no modelled meaning), while a Windows blob whose structure cannot be decoded at all (empty, odd length, not QWORD-aligned, oversized) is `unreadable` with a reason token.",
+  "outputs_note": "Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `write_output()`. The first field is the fixed literal `posture`, then `<os>`, `<key>`, `<raw>` and `<state>`. `<raw>` is `-` when nothing was read (`absent` or `unreadable`); a raw value that WAS read passes through the shared untrusted-output escaper. Windows rows can outnumber the allowlist: one registry value decodes into one row per policy field, and each trailing QWORD of a longer blob adds one raw-hex `ext_q<n>` row (`default` when zero, otherwise `unmodelled`) rather than being dropped. The action returns 0 for every data-level outcome (an unreadable key is a degraded result and an absent key is not a failure; neither is ever a failed command); only an internal exception returns 1 (any leg), adding a `constrained|<os>|internal_error|-|unreadable` row (the same five fields as every other row) after any rows already written. A value that was read but cannot be interpreted is `unmodelled` (Linux and macOS: non-numeric, empty or out-of-range text; Windows: a nibble with no modelled meaning), while a Windows blob whose structure cannot be decoded at all (empty, odd length, not QWORD-aligned, oversized) is `unreadable` with a reason token.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -200,7 +200,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`internal_error`",
       "status": "`CONSTRAINED`",
-      "when": "Any leg: an unexpected exception escaped a leg and was contained in `execute()`; the action returns 1 with the row `constrained|internal_error`."
+      "when": "Any leg: an unexpected exception escaped a leg and was contained in `execute()`; the action returns 1 with the row `constrained|<os>|internal_error|-|unreadable`."
     },
     {
       "completeness": "`PARTIAL`",
