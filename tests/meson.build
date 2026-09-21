@@ -587,7 +587,10 @@ agent_test_exe = executable(
              # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
-             '"'],
+             '"'] +
+            # ASan pushes the Spark/Guardian test translation units past MSVC's
+            # COFF section limit (C1128), as with the server test target below.
+            (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
@@ -1446,6 +1449,11 @@ if build_server
     # actually needs it. GCC/Clang are unaffected (larger default stacks,
     # and no /STACK equivalent needed here).
     link_args: (cxx.get_id() == 'msvc' ? ['/STACK:16777216'] : []),
+    # The unoptimized ASan server-test image exceeds x86-64's 2 GiB PC-relative
+    # relocation reach. Optimize only these test TUs; retain debug symbols,
+    # sanitizer instrumentation, and the production library's selected options.
+    override_options: (host_os == 'linux' and get_option('b_sanitize').contains('address') and
+                       get_option('optimization') == '0') ? ['optimization=1'] : [],
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

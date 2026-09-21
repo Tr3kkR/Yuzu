@@ -60,6 +60,7 @@ struct FakeBackend : ISparkBackend {
     /// independent keys simultaneously Pending, not just one.
     std::atomic<bool> hang_every_arm{false};
     std::atomic<int> parked{0};
+    std::mutex completion_mu_;
     std::mutex gate_mu_;
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
@@ -73,6 +74,7 @@ struct FakeBackend : ISparkBackend {
             gate_cv_.notify_all();
             gate_cv_.wait(lk, [this] { return released_; });
         }
+        std::lock_guard completion{completion_mu_};
         if (fail_arm.load())
             return std::unexpected(std::string{"no mechanism"});
         return next.fetch_add(1);
@@ -122,6 +124,14 @@ GuardianSparkRuntime::ArmReceipt accept(GuardianSparkRuntime& rt, const std::str
     REQUIRE(res.has_value());
     REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
     return res->receipt;
+}
+
+// Keep the backend from completing until NonWaiting has returned its receipt.
+// An immediate refusal may otherwise finish inline and correctly return Failed.
+GuardianSparkRuntime::ArmReceipt accept_gated(GuardianSparkRuntime& rt, FakeBackend& backend,
+                                              const std::string& rule_id, const std::string& path) {
+    std::lock_guard completion{backend.completion_mu_};
+    return accept(rt, rule_id, path);
 }
 
 /// A minimal single-rule push, for guardian_push_content_id() and decide_retry() tests.
@@ -991,14 +1001,14 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-wa
     auto r1 = accept(*rt, "r1", "/a");
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
-    // r2: a DIFFERENT, distinct-key rule whose backend call refuses IMMEDIATELY (no
-    // hang at all - hang_next_arm was already consumed by r1's own call above, so
-    // this one proceeds straight to the fail_arm check) - a genuine, ordinary
+    // r2: a DIFFERENT, distinct-key rule whose backend call refuses as soon as
+    // attach returns its receipt. Gate that completion so this tests an async
+    // receipt rather than racing the inline-refusal path - a genuine, ordinary
     // (non-Wedged) BackendRefused failure. R5.3's "K is not a generation-wide
     // liveness bound": a sibling's ordinary refusal must hold the generation
     // regardless of r1's own reapply count.
     b->fail_arm.store(true);
-    auto r2 = accept(*rt, "r2", "/b");
+    auto r2 = accept_gated(*rt, *b, "r2", "/b");
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
     CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
@@ -1023,7 +1033,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-wa
     for (int i = 0; i < 3; ++i) {
         ledger.begin_application(1, digest, false, 2);
         auto re_r1 = accept(*rt, "r1", "/a"); // Reobserved
-        auto re_r2 = accept(*rt, "r2", "/b"); // fresh claim, refuses again
+        auto re_r2 = accept_gated(*rt, *b, "r2", "/b"); // fresh claim, refuses again
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r1", re_r1);
@@ -1071,7 +1081,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     CHECK(ledger.reapply_count_for_test() == 0);
     b->fail_arm.store(true);
     {
-        auto r2 = accept(*rt, "r2", "/b");
+        auto r2 = accept_gated(*rt, *b, "r2", "/b");
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r2", r2);
@@ -1088,7 +1098,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     for (int i = 1; i <= 3; ++i) {
         ledger.begin_application(1, digest, false, 1);
         CHECK(ledger.reapply_count_for_test() == static_cast<std::size_t>(i));
-        auto re_r2 = accept(*rt, "r2", "/b");
+        auto re_r2 = accept_gated(*rt, *b, "r2", "/b");
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r2", re_r2);
@@ -1106,7 +1116,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     b->hang_next_arm.store(true);
     auto r1 = accept(*rt, "r1", "/a");
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
-    auto r2 = accept(*rt, "r2", "/b");
+    auto r2 = accept_gated(*rt, *b, "r2", "/b");
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
     CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Committed);
 
