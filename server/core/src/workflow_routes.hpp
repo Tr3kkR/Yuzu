@@ -153,8 +153,12 @@ public:
         /// legacy `/api/schedules` mutators in `schedule_routes.cpp` are a
         /// separate, untouched capability and keep their own `ScheduleEngine*`
         /// wiring, unaffected by this seam). Unwired (default-constructed
-        /// null `shared_ptr`) ⇒ both routes answer 503, matching the
-        /// pre-seam `if (!schedule_engine)` guard's behaviour exactly.
+        /// null `shared_ptr`) ⇒ each route answers its OWN pre-seam
+        /// `!schedule_engine` behaviour exactly, and the two differ: the
+        /// fragment answers 200 with `<div class="empty-state">Not
+        /// available</div>`, while REST v1 answers 503 (adversarial-review-kimi
+        /// round: this comment previously said "both routes answer 503",
+        /// which was never true of the fragment).
         std::shared_ptr<const ScheduleApi> schedule_api;
         ProductPackStore* product_pack_store{nullptr};
         InstructionStore* instruction_store{nullptr};

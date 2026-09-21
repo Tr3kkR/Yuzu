@@ -1246,9 +1246,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // is a deliberate, disclosed behaviour delta, not a silent
         // byte-identical rewire. `result.error()` is an internal store
         // diagnostic and is NEVER rendered — a distinct degraded state
-        // instead. `truncated` is deliberately not surfaced on this fragment
-        // this round (a separate, undecided delta) — the REST v1/MCP twins
-        // already surface it.
+        // instead.
         auto result = schedule_api->list_schedules(ScheduleQuery{});
         if (!result) {
             res.set_content(
@@ -1259,10 +1257,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const auto& scheds = result->schedules;
         std::string html;
+        // adversarial-review-kimi round (Codex C1 / Kimi K1, both independently):
+        // schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+        // fragment) must surface this, never present the capped count as the
+        // fleet's true total" — REST v1/MCP already did; this fragment did not
+        // until this fix, silently rendering a capped list as complete for an
+        // operator with more schedules than the store's hard cap.
+        if (result->truncated) {
+            html += "<div class=\"empty-state\" style=\"color:var(--warn-color,#c9a227)\">"
+                   "Showing a partial list &mdash; more schedules exist than can be "
+                   "displayed.</div>";
+        }
         if (scheds.empty()) {
-            html = "<div class=\"empty-state\">No schedules configured.</div>";
+            html += "<div class=\"empty-state\">No schedules configured.</div>";
         } else {
-            html = "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
+            html += "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
                    "Run</th><th>Count</th><th></th></tr></thead><tbody>";
             for (const auto& s : scheds) {
                 html += "<tr><td>" + html_escape(s.name) +

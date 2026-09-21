@@ -3334,6 +3334,43 @@ TEST_CASE("/fragments/schedules: a store failure renders a distinct degraded sta
     CHECK(res->body.find("temporarily unavailable") != std::string::npos);
 }
 
+// adversarial-review-kimi pre-push round (Codex C1 / Kimi K1, cross-confirmed):
+// schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+// fragment) must surface this [truncated], never present the capped count as
+// the fleet's true total" -- the fragment shipped in the same commit that
+// wrote that contract without honouring it for its own case. This proves the
+// fix: a truncated result renders a partial-list notice, not a table that
+// silently looks complete.
+TEST_CASE("/fragments/schedules: a truncated result renders a partial-list notice",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto truncated_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
+        [](const ScheduleQuery&) -> std::expected<ScheduleListResult, std::string> {
+            ScheduleListResult r;
+            InstructionSchedule s;
+            s.id = "sched-1";
+            s.name = "capped-schedule";
+            s.frequency_type = "once";
+            s.enabled = true;
+            r.schedules.push_back(s);
+            r.truncated = true;
+            return r;
+        });
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/truncated_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("capped-schedule") != std::string::npos);
+    CHECK(res->body.find("partial list") != std::string::npos);
+}
+
 // guardian-confinement-2298 PR3 §3e: POST /api/scope/estimate is auth_fn-only
 // (no perm_fn at all) and probes scope_fn(expression, session->username) —
 // the caller's own visible fleet, which for a service-scoped token is still
