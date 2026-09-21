@@ -619,9 +619,6 @@ implementation is.
 | runtimes | jvm | linux | supported | 1 | /usr/lib/jvm/*/release + /opt/java/*/release file reads | - |
 | runtimes | jvm | macos | planned | 1 | /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | follows as its own PR (peripherals PR9.1a2 precedent) |
 | runtimes | jvm | windows | planned | 1 | JavaSoft keys + Program Files\\Java walk | follows as its own PR (peripherals PR9.1a2 precedent) |
-| runtimes | python | linux | supported | 1 | /usr/bin/python3* names + /usr/lib/python3*, /usr/local/lib/python3* directory walk | - |
-| runtimes | python | macos | planned | 1 | /Library/Frameworks + CommandLineTools Python3.framework Versions + Cellar/python@3.* | follows as its own PR (peripherals PR9.1a2 precedent) |
-| runtimes | python | windows | planned | 1 | PEP 514 PythonCore keys | follows as its own PR (peripherals PR9.1a2 precedent) |
 | sccm | client_version | linux | unsupported | - | - | - |
 | sccm | client_version | macos | unsupported | - | - | - |
 | sccm | client_version | windows | supported | 1 | registry+scm | - |

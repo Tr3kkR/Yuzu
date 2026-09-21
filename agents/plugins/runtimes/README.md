@@ -3,11 +3,11 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Installed .NET, JVM and Python runtime inventory |
+| **What it does** | Installed .NET and JVM runtime inventory |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.runtimes.dotnet, crossplatform.runtimes.jvm, crossplatform.runtimes.python) |
+| **Kind** | Collector · read-only · gathered (crossplatform.runtimes.dotnet, crossplatform.runtimes.jvm) |
 | **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
-| **Actions** | `dotnet` (definition `crossplatform.runtimes.dotnet`) · `jvm` (definition `crossplatform.runtimes.jvm`) · `python` (definition `crossplatform.runtimes.python`) |
+| **Actions** | `dotnet` (definition `crossplatform.runtimes.dotnet`) · `jvm` (definition `crossplatform.runtimes.jvm`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -34,7 +34,6 @@ flowchart LR
 |---|---|---|---|
 | `dotnet` | 🟡 planned · rung 1 · NDP release-key table + dotnet InstalledVersions + Program Files walk | 🟡 planned · rung 1 · /usr/local/share/dotnet/shared walk | ✅ supported · rung 1 · /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk |
 | `jvm` | 🟡 planned · rung 1 · JavaSoft keys + Program Files\\Java walk | 🟡 planned · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | ✅ supported · rung 1 · /usr/lib/jvm/*/release + /opt/java/*/release file reads |
-| `python` | 🟡 planned · rung 1 · PEP 514 PythonCore keys | 🟡 planned · rung 1 · /Library/Frameworks + CommandLineTools Python3.framework Versions + Cellar/python@3.* | ✅ supported · rung 1 · /usr/bin/python3* names + /usr/lib/python3*, /usr/local/lib/python3* directory walk |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -42,8 +41,6 @@ flowchart LR
 - **`dotnet` / macOS** — follows as its own PR (peripherals PR9.1a2 precedent)
 - **`jvm` / Windows** — follows as its own PR (peripherals PR9.1a2 precedent)
 - **`jvm` / macOS** — follows as its own PR (peripherals PR9.1a2 precedent)
-- **`python` / Windows** — follows as its own PR (peripherals PR9.1a2 precedent)
-- **`python` / macOS** — follows as its own PR (peripherals PR9.1a2 precedent)
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -61,7 +58,7 @@ No external binaries, no subprocesses, no shell-out, no network use: the plugin 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-No action takes parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -88,16 +85,6 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<r
 | `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. Status rows: the level (supported, constrained or unsupported). |
 | `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory (the directory holding the release file). Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), or "-" when the key is absent. |
-
-**`crossplatform.runtimes.python` — `row_kind|flavour|version|install_path|vendor`**
-
-| Field | Type | Values | Available | Example | Description |
-|---|---|---|---|---|---|
-| `row_kind` | string | `status` `python` | Linux | `python` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), python (one per runtime found). |
-| `flavour` | string | `cpython` `unmodelled` | Linux | `cpython` | Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython). Status rows: the action name. |
-| `version` | string | - | Linux | `3.11` | Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter. Status rows: the level (supported, constrained or unsupported). |
-| `install_path` | string | - | Linux | `/usr/bin/python3.11` | Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path. Status rows: the comma-joined failure tokens, or -. |
-| `vendor` | string | - | Linux | `-` | Always "-" for python: the interpreter name carries no vendor. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -120,7 +107,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 6da32611cf7a
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash cb47e7132f69
 
 ```
 == action=dotnet
@@ -129,13 +116,6 @@ status|dotnet|supported|-
 
 == action=jvm
 status|jvm|supported|-
-[result_status] OK / FULL
-
-== action=python
-status|python|supported|-
-python|cpython|3.13|/usr/bin/python3.13|-
-python|cpython|3.13|/usr/lib/python3.13|-
-python|cpython|3.13|/usr/local/lib/python3.13|-
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
@@ -154,4 +134,5 @@ python|cpython|3.13|/usr/local/lib/python3.13|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
 - Tests: `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wave10-pr10.1b-runtimes.added.md`
 <!-- END GENERATED -->
