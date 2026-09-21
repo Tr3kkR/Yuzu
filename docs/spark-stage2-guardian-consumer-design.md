@@ -1377,7 +1377,10 @@ the test seam (`file_debug_counters_for_test`, Windows only). The operator-visib
 log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
 `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds` and
 `spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
-`yuzu.spark_mechs`.
+`yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no alert
+on `yuzu_fleet_spark_mechanisms` ships today: a per-OS, per-mechanism alert with a `for:` hold of at
+least two heartbeats is an F14 precondition (compare `_reporting` with the one mechanism's series,
+not the sum over mechanisms, see `docs/user-manual/metrics.md`).
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
 calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
