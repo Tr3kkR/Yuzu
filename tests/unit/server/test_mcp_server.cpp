@@ -748,6 +748,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
+#include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1585,6 +1586,19 @@ private:
         if (app_perf_providers_for_test.cohort)
             verify_api_for_test = std::make_shared<yuzu::server::test::FnVerifyApi>(
                 app_perf_providers_for_test.cohort);
+
+        // ADR-0031 WS-A4 (seventh family): wire the REAL ScheduleApi seam
+        // over this test's schedule_engine_for_test — same setter idiom as
+        // set_dex_api/set_dex_perf_api above (`build_handler`'s own
+        // `ScheduleEngine* schedule_engine` param below is now unused inside
+        // list_schedules, kept for signature stability). Gated on
+        // schedule_engine_for_test's presence, mirroring production's
+        // schedule_engine_-gated construction: unwired -> null seam -> the
+        // tool's `!schedule_api_` guard answers "Schedule engine
+        // unavailable", preserving every pre-seam test's default behaviour.
+        if (schedule_engine_for_test)
+            mcp.set_schedule_api(
+                yuzu::server::make_local_schedule_api(*schedule_engine_for_test));
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -7883,6 +7897,41 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
         CHECK(a != "mcp.list_schedules|success");
     }
     CHECK(saw_denied);
+}
+
+// Governance Gate 3 (quality-engineer SHOULD-1, feat/split-a4-schedule-seam):
+// the fragment (`GET /fragments/schedules`) and REST v1 twin
+// (`GET /api/v1/schedules`) both have an explicit unwired-seam test; MCP did
+// not. The deny test above never reaches the `!schedule_api_` guard at all
+// (the fleet-wide service-scoped deny fires first, per its own comment), so
+// it cannot stand in for this case. An ORDINARY (non-service-scoped, no tier
+// restriction) caller with `schedule_engine_for_test` left at its default
+// nullptr must still hit the same "Schedule engine unavailable" fallback
+// REST v1/the fragment answer with their own equivalent (503 / "Not
+// available") -- proving the seam's null-guard still behaves correctly for
+// the one caller class the deny-focused test above cannot exercise.
+TEST_CASE("MCP: list_schedules answers 'Schedule engine unavailable' for an "
+          "ordinary caller when the seam is unwired",
+          "[mcp][integration][schedule]") {
+    McpTestServer ts;
+    // schedule_engine_for_test stays nullptr (the default) -- schedule_api_
+    // is therefore never constructed, matching production's
+    // `if (schedule_engine_) schedule_api = make_local_schedule_api(...)`
+    // gate in server.cpp when no ScheduleEngine was opened.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":48,"params":{"name":"list_schedules"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "Schedule engine unavailable");
+
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "schedule.list|success");
+        CHECK(a != "mcp.list_schedules|success");
+    }
 }
 
 // #2146 A2-R1: definition_id/enabled_only filters, threaded into the same
