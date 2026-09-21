@@ -6261,20 +6261,25 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
 }
 
 // ── File worker pass-failure backoff / counter / inert (#4658) ──────────────
-// A worker pass that throws (modelled by FileMechanismTestControls::pass_fail_hook)
-// must back off on a doubling schedule, be counted, and flip `inert` after three
-// consecutive failures instead of spinning the worker. Windows-only: spark_file.cpp
+// A worker pass that throws (injected through FileMechanismTestControls::pass_fail_hook, or,
+// for PF-15/PF-15b, through emit_bookkeeping_hook, after the pass has dispatched) must back off
+// on a doubling schedule, be counted, and flip `inert` after three consecutive failures
+// instead of spinning the worker. PF-15/PF-15b pin only that a throw after dispatch is counted
+// and that the episode then closes with no external wake; the backoff schedule itself is
+// pinned by PF-2 and PF-3. Windows-only: spark_file.cpp
 // is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time wherever
 // possible; an upper bound only where the wrong implementation differs by seconds. Where a
 // stalled runner could cross the window an assertion depends on (PF-3's exact-N read, PF-4,
 // PF-5) it degrades to SUCCEED(). The ungated bounds that remain are PF-1's and PF-9's pass
 // counts, their process CPU-time checks (skipped, with a SUCCEED, only when CPU time is
 // unreadable), PF-3's `CHECK_FALSE(inert)` right after watch(), the 2000 ms `recovered` windows
-// in PF-11/PF-12 and the `took < 2000` checks in PF-6/PF-8/PF-13. Each is wide against the
-// correct behaviour (milliseconds to a few hundred ms), so it takes a stall of about 1.5-2 s to
-// false-red one: on the test thread for the checks that read a clock, or starvation of the
-// worker or the whole process for the `recovered` windows (eventually() re-evaluates at its
-// deadline).
+// in PF-11/PF-12, the `took < 2000` checks in PF-6/PF-8/PF-13, and PF-15/PF-15b's 2000 ms
+// counter and recovery windows plus their 3000/5000 ms waits (throw fired, redelivery,
+// establishment). Each is wide against the correct behaviour (milliseconds to a few hundred
+// ms), so it takes a stall about as long as the window (1.5-2 s for the shortest, up to 3-5 s
+// for the PF-15/PF-15b waits) to false-red one: on the test thread for the checks that read a
+// clock, or starvation of the worker or the whole process for the windows (eventually()
+// re-evaluates at its deadline).
 // Every captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
 // destroys (and joins) the mechanism before the state its hooks capture.
 namespace {
@@ -7103,14 +7108,16 @@ TEST_CASE("File worker (direct): a worker that never fails keeps every pass-fail
 TEST_CASE("File worker (direct): a throw after dispatched == true is counted and the episode "
           "closes with no external wake (#4658 PF-15)",
           "[spark][mechanism][windows][passfail]") {
-    // Every other PF case throws from pass_fail_hook, which fires BEFORE run() sets `dispatched`.
-    // This one throws AFTER it: emit_bookkeeping_hook fires inside run_off_lock() once the pass
-    // has launched a probe, and the catch in run() must still count the pass (`ok = false`
-    // whatever `dispatched` says), back it off and retry it. A catch that only counted
-    // pre-dispatch failures would leave pass_failed at 0. Mechanics copied from the existing
-    // "Unattempted Emit notice" scenario: B's real write stages a notice, a forced reissue
-    // failure (real_rearm_fail_hook) stages a probe launch in the same real-completion pass, and
-    // the launch fires the bookkeeping hook.
+    // Every other failure-injecting PF case throws from pass_fail_hook, which fires BEFORE run()
+    // sets `dispatched`. This one throws AFTER it: emit_bookkeeping_hook fires inside
+    // run_off_lock() once the pass has launched a probe, and the catch in run() must still count
+    // the pass (`ok = false` whatever `dispatched` says). A catch that only counted pre-dispatch
+    // failures would leave pass_failed at 0. Mechanics copied from the existing walkoff scenario
+    // in which an ordinary Emit notice is left Outcome::Unattempted by a same-pass run_off_lock
+    // failure: B's real write stages a notice, a forced reissue failure (real_rearm_fail_hook)
+    // stages a probe launch in the same real-completion pass, and the launch fires the
+    // bookkeeping hook. This is the real-completion catch; PF-15b is the control-wake/timeout
+    // one.
     ScratchDir b("pf_after_dispatch");
     EstLog log;
     std::atomic<bool> rearm_armed{false};
@@ -7125,7 +7132,7 @@ TEST_CASE("File worker (direct): a throw after dispatched == true is counted and
     {
         FileMechanismTestControls ctl;
         ctl.backend_retry_base = 20ms;
-        ctl.sweep_cadence = 10ms; // the first backoff is 10 ms
+        ctl.sweep_cadence = 10ms; // keeps the retry after the injected failure prompt
         // Counts passes for the quiescence wait; never throws.
         ctl.pass_fail_hook = [&] { passes.fetch_add(1, std::memory_order_acq_rel); };
         ctl.real_rearm_fail_hook = [&](std::wstring_view dir) {
@@ -7170,8 +7177,10 @@ TEST_CASE("File worker (direct): a throw after dispatched == true is counted and
     // The failed pass is counted...
     CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
                      2000ms));
-    // ...and retried at its backoff deadline with NO further watch()/apply_test_controls(): the
-    // episode closes by itself.
+    // The episode closes with NO further watch()/apply_test_controls(). The predicate holds
+    // after any later successful pass (the retry at the deadline, which PF-3 and PF-7 pin, or a
+    // real completion, which is never absorbed), so it shows the episode ended, not which pass
+    // ended it.
     CHECK(eventually(
         [&] {
             const auto d = file_debug_counters_for_test(*mech);
@@ -7240,7 +7249,8 @@ TEST_CASE("File worker (direct): a throw after dispatched == true in a timer-dri
         5000ms));
     CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
                      2000ms));
-    // No watch()/apply_test_controls() from here: the episode closes by itself.
+    // No watch()/apply_test_controls() from here: the episode closes by itself (the predicate
+    // holds after any later successful pass; PF-3 and PF-7 pin the retry at the deadline).
     CHECK(eventually(
         [&] {
             const auto d = file_debug_counters_for_test(*mech);
