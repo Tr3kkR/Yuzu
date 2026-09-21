@@ -1,23 +1,21 @@
 /**
  * browser_policy_macos.cpp — macOS leg entry point.
  *
- * `run_macos` is a one-line wrapper over `run_macos_at` (defined in
- * browser_policy_macos_parsers.hpp), which takes the filesystem root as a
- * parameter. NOVEL SEAM: peripherals' `_at` precedent is Linux-only, so there
- * is no macOS template — production passes "/", the unit suite
- * (test_browser_policy_macos_plist.cpp) drives run_macos_at against a
- * materialized temp tree through a real CommandContext.
+ * PLANNED — follows as its own PR. The /Library/Managed Preferences plist read
+ * is not implemented; until it lands the leg reports the honest planned status
+ * (zero rows, UNAVAILABLE, provenance `macos:planned`) rather than an empty
+ * success, so a host never reads as "no policy configured" from a leg that did
+ * not look.
  */
 #include "browser_policy_legs.hpp"
 
 #if defined(__APPLE__)
 
-#include "browser_policy_macos_parsers.hpp"
-
 namespace yuzu::browser_policy {
 
 int run_macos(yuzu::CommandContext& ctx) {
-    return run_macos_at(ctx, "/");
+    mark_result_planned(ctx, "macos:planned");
+    return 0;
 }
 
 } // namespace yuzu::browser_policy

@@ -3,10 +3,10 @@
  *
  * Everything here is a free function over plain data: no OS calls, no file
  * or registry I/O, no logging. It compiles and is unit-tested on EVERY OS
- * (the Windows registry leg, the Linux JSON-file leg and the macOS plist leg
- * all feed the same PolicyRow/format_policy_row), which is the repo's
- * standing "pure core, thin shell" discipline (peripherals_parsers.hpp is the
- * sibling shape).
+ * (the Linux JSON-file leg feeds PolicyRow/format_policy_row today; the
+ * planned Windows registry and macOS plist legs will feed the same model),
+ * which is the repo's standing "pure core, thin shell" discipline
+ * (peripherals_parsers.hpp is the sibling shape).
  *
  * WIRE ROW (one per configured policy, 9 pipe-delimited fields):
  *
@@ -36,16 +36,17 @@
  * before its source/detail fields while still reporting success.
  *
  * NO PLACEHOLDER ROWS. A host with no managed policy (browser not installed,
- * no policy files, no Managed Preferences) reports ZERO rows and a clean OK
- * status; a read that could not be completed reports CONSTRAINED with a
- * reason instead (see legs.hpp). The two are never conflated: a failure must
- * never read as absent.
+ * no policy files) reports ZERO rows and a clean OK status; a read that could
+ * not be completed reports CONSTRAINED with a reason instead (see legs.hpp),
+ * and a PLANNED leg that has not shipped reports UNAVAILABLE with an
+ * `<os>:planned` reason (mark_result_planned). The three are never conflated:
+ * a failure, or a host that was not inspected, must never read as absent.
  *
- * TYPE MAPPING. Every JSON (and, in browser_policy_macos.hpp, CoreFoundation)
- * value maps into PolicyType, and anything the mapper does not model lands on
- * the literal PolicyType::Unmodelled ("unmodelled") — distinct from no data,
- * so a consumer can tell "policy present, value not representable" from "no
- * such policy".
+ * TYPE MAPPING. Every JSON value maps into PolicyType (the planned legs' native
+ * registry/plist values will map into the same enum), and anything the mapper
+ * does not model lands on the literal PolicyType::Unmodelled ("unmodelled") —
+ * distinct from no data, so a consumer can tell "policy present, value not
+ * representable" from "no such policy".
  *
  * JSON PARSING follows the asset_tags_plugin.cpp:87-109 nlohmann idiom
  * (parse guarded against throwing, `.is_*()` type checks before typed

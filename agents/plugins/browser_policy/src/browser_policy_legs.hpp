@@ -5,8 +5,11 @@
  *
  * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read
  * is not a failed command, and the degradation is reported through the CC-07
- * typed status (`mark_result_read`) instead. Declared unconditionally so the
- * plugin TU and every leg TU see one signature on every OS; only the
+ * typed status (`mark_result_read`) instead. Only the Linux leg reads today;
+ * the Windows and macOS legs are PLANNED placeholders that report
+ * `mark_result_planned` (zero rows, UNAVAILABLE) so a host they cannot yet
+ * inspect never reads as "no policy configured". Declared unconditionally so
+ * the plugin TU and every leg TU see one signature on every OS; only the
  * DEFINITION is self-gated (each leg .cpp wraps its body in
  * `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin TU calls only
  * the host leg — a single-OS build never links the other two.
@@ -58,6 +61,16 @@ inline void mark_result_read(yuzu::CommandContext& ctx, std::string_view failure
         return;
     }
     ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+}
+
+/// The seam a PLANNED leg reports through: UNAVAILABLE/PARTIAL with the
+/// `<os>:planned` provenance token, never CONSTRAINED, so a leg that has not
+/// shipped is not counted as a degraded read. Zero rows are written — this plugin has no status row kind, so the
+/// result status alone carries the outcome. A caller must treat it as "this
+/// host was not inspected", never as an empty policy set.
+inline void mark_result_planned(yuzu::CommandContext& ctx, std::string_view os_token) {
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          os_token);
 }
 
 } // namespace yuzu::browser_policy

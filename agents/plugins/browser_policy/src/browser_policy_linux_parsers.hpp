@@ -1,7 +1,6 @@
 /**
  * browser_policy_linux_parsers.hpp — INJECTED-ROOT Linux policy walk, plus
- * this plugin's private POSIX secure-read kit (namespace `posix`, also used
- * by the macOS walk in browser_policy_macos_parsers.hpp).
+ * this plugin's private POSIX secure-read kit (namespace `posix`).
  *
  * The boundary (peripherals_linux_parsers.hpp is the precedent): every
  * filesystem access is relative to a `root` path parameter. Production
@@ -123,7 +122,7 @@ private:
 enum class OpenStatus { ok, absent, failed };
 
 /// `errno` from a failed open/openat/fdopendir -> a stable reason detail
-/// (callers prefix the OS: `linux:` / `macos:`). Only called for a real
+/// (callers prefix the OS, e.g. `linux:`). Only called for a real
 /// failure (ENOENT is `absent`, never routed here).
 [[nodiscard]] constexpr std::string_view errno_detail(int err) noexcept {
     switch (err) {

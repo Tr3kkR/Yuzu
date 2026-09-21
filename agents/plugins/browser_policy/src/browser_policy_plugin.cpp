@@ -8,12 +8,18 @@
  *                schema: browser_policy_parsers.hpp).
  *
  * Sources (all rung 1, file/registry truth, no process spawn):
- *   Windows  HKLM\SOFTWARE\Policies\{Google\Chrome,Microsoft\Edge} (+ the
- *            Recommended subkeys)                       [P2b-2, win.cpp]
  *   Linux    /etc/opt/{chrome,edge} and /etc/chromium policies/{managed,
  *            recommended} JSON files                    [linux.cpp]
- *   macOS    /Library/Managed Preferences/{,<user>/}{com.google.Chrome,
- *            com.microsoft.Edge}.plist                  [macos.cpp]
+ *   Windows  PLANNED, follows as its own PR: HKLM\SOFTWARE\Policies\
+ *            {Google\Chrome,Microsoft\Edge} (+ the Recommended subkeys)
+ *                                                       [win.cpp]
+ *   macOS    PLANNED, follows as its own PR: /Library/Managed Preferences/
+ *            {,<user>/}{com.google.Chrome,com.microsoft.Edge}.plist
+ *                                                       [macos.cpp]
+ *
+ * The Windows and macOS legs are placeholders: each reports zero rows with
+ * result status UNAVAILABLE/PARTIAL and provenance `<os>:planned`
+ * (mark_result_planned), never an empty success.
  *
  * This is operator/IT-authored configuration, not personal data, so it is an
  * ordinary `Inventory` read with no default-off kill switch (that gate is
@@ -44,16 +50,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "(nlohmann)",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_PLANNED, 1,
          "/Library/Managed Preferences/{,<user>/}{com.google.Chrome,com.microsoft.Edge}.plist "
          "(CFPropertyListCreateWithData)",
-         "managed (mandatory) policy only: Managed Preferences carries no recommended level; "
-         "verified against a synthetic plist tree only, no live managed Mac in this run"},
+         "follows as its own PR"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 1,
+        {YUZU_SUPPORT_PLANNED, 1,
          "HKLM\\SOFTWARE\\Policies\\{Google\\Chrome,Microsoft\\Edge} registry reads "
          "(RegKey enumerate_value_names)",
-         nullptr},
+         "follows as its own PR"},
     },
 };
 

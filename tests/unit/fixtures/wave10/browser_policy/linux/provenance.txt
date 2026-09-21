@@ -26,8 +26,8 @@ carries the same header comment.
 == etc/opt/edge/policies/managed/edge_managed.json ==
 status: RECONSTRUCTION -- hand-written from Microsoft's documented Edge policy names and Linux policy
         location (/etc/opt/edge/policies/managed), not captured from a host. The Edge sign-off does NOT
-        extend to a synthetic capture: a real Edge capture comes from the-rig session in P2b-2
-        (registry) and ws-10.2a (user-data files).
+        extend to a synthetic capture: a real Edge capture comes from the-rig session in the
+        Windows follow-up PR (registry) and ws-10.2a (user-data files).
 doc: https://learn.microsoft.com/deployedge/microsoft-edge-policies
 carries a header comment naming RECONSTRUCTION and the doc above.
 

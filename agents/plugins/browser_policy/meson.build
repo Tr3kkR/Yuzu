@@ -4,12 +4,6 @@
 # for its own target so all four are listed unconditionally.
 browser_policy_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep]
 
-if host_machine.system() == 'darwin'
-  # CoreFoundation for CFPropertyListCreateWithData (Managed Preferences plists).
-  browser_policy_deps += dependency('appleframeworks', modules: ['CoreFoundation'],
-                                    include_type: 'system')
-endif
-
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this
 # build output, matching peripherals_plugin_lib / disk_actions_plugin_lib.
 browser_policy_plugin_lib = shared_library(
