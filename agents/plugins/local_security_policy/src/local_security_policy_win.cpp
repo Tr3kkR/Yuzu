@@ -1,0 +1,479 @@
+/**
+ * local_security_policy_win.cpp -- Windows leg of local_security_policy:
+ * password_policy / lockout_policy / audit_policy read from ONE
+ * `secedit /export` of the SECURITYPOLICY area, parsed from its UTF-16LE INI.
+ *
+ * RUNG 2 (an honest argv leaf, not rung 1): no in-tree LSA policy-query
+ * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md:244
+ * names `secedit /export` the authoritative source on a running box. Spawned via
+ * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), absolute
+ * System32 argv[0], no shell/PowerShell/.bat/.cmd. Sink-manifest site ID:
+ * local_security_policy/do_export#1 (one spawn per dispatch, all three actions).
+ * Read-only: no /configure, /import, other area or auditpol.
+ *
+ * ---- Scratch directory + stale sweep ---------------------------------------
+ * The CHILD writes the export, so the agent creates a per-dispatch directory
+ * with yuzu_create_temp_dir("local_security_policy-", data_dir) (128-bit
+ * random name, CREATE_NEW, owner-only DACL; `constrained|data_dir_unset` when
+ * data_dir is empty -- no fallback location), holds it open without
+ * FILE_SHARE_DELETE, verifies with scratch_dir_is_ours, and removes it (RAII)
+ * on every survivable path. A crash or service stop between export and delete
+ * would orphan a copy of the machine's policy, so EVERY dispatch first sweeps
+ * stale `local_security_policy-<32hex>` directories older than one hour under
+ * data_dir through agents/core confined_fs (open_root / enumerate_at /
+ * unlink_at), ownership-verified: a same-named directory owned by another SID
+ * is skipped, a non-flat one is left intact. The outcome is logged as
+ * `scratch_sweep:<removed>/<skipped>` only -- never a row or a token.
+ *
+ * ---- Pure/thin split -------------------------------------------------------
+ * Every decision (sweep selection, run/read classification) is a pure function
+ * in local_security_policy_scratch_sweep.hpp with tests on every OS. The
+ * exported INI -> rows mapping is NOT in this TU: it is the parsers header's
+ * (secedit_policy_rows), the one mapper the real-capture fixture test covers.
+ * This TU performs the Win32 calls and writes what those return. The exception
+ * boundary is the shared execute(); it is not repeated here.
+ *
+ * ---- RIG PROBE (banner evidence; recorded VERBATIM by the rig session) -------
+ * The exact argv is run as LocalSystem (S4U scheduled task, RunLevel Highest)
+ * with the agent's granted privilege set. Fields below are FILLED IN from that
+ * session and nothing here is asserted before it has run:
+ *   identity                    : PENDING RIG SESSION
+ *   whoami /priv (relevant)     : PENDING RIG SESSION (SeSecurityPrivilege state)
+ *   secedit exit code           : PENDING RIG SESSION
+ *   policy.inf size (bytes)     : PENDING RIG SESSION
+ *   SeSecurityPrivilege suffices: PENDING RIG SESSION (yes/no, and what else
+ *                                 was needed if no)
+ *   stale-sweep pre-seed removed: PENDING RIG SESSION (and foreign-SID skipped)
+ */
+
+#ifdef _WIN32
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winternl.h> // NTSTATUS, UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK
+
+#include "local_security_policy_legs.hpp"
+#include "local_security_policy_parsers.hpp" // decode_utf16le_bom, parse_inf_sections,
+                                              // secedit_policy_rows
+#include "local_security_policy_scratch_identity.hpp"
+#include "local_security_policy_scratch_sweep.hpp"
+
+#include <yuzu/agent/confined_fs.hpp>
+#include <yuzu/agent/confined_fs_rules.hpp>
+#include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/plugin.hpp> // yuzu_create_temp_dir
+
+#include <win_str.hpp> // yuzu::win::to_wide
+
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace yuzu::local_security_policy {
+
+namespace {
+
+namespace cfs = yuzu::agent::confined_fs;
+
+static_assert(kWin32FileNotFound == ERROR_FILE_NOT_FOUND);
+static_assert(kWin32PathNotFound == ERROR_PATH_NOT_FOUND);
+static_assert(kWin32AccessDenied == ERROR_ACCESS_DENIED);
+
+constexpr std::string_view kSecedit = "C:\\Windows\\System32\\secedit.exe";
+
+int emit_failure(yuzu::CommandContext& ctx, YuzuResultStatus status, const std::string& token) {
+    ctx.set_result_status(status, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
+    ctx.write_output("constrained|" + token);
+    return 1;
+}
+
+int emit_constrained(yuzu::CommandContext& ctx, const std::string& token) {
+    return emit_failure(ctx, YUZU_RESULT_STATUS_CONSTRAINED, token);
+}
+
+// ---- Stale sweep (confined_fs shell over the pure policy) -------------------
+
+// Local NT option values -- <winternl.h> does not reliably export them
+// (confined_fs_win.cpp's identical rationale).
+constexpr ULONG kFileDirectoryFile = 0x00000001UL;
+constexpr ULONG kFileOpenReparsePoint = 0x00200000UL;
+constexpr ULONG kFileSynchronousIoNonalert = 0x00000020UL;
+
+using NtOpenFileFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+                                       ULONG, ULONG);
+
+NtOpenFileFn resolve_ntopenfile() {
+    static const NtOpenFileFn resolved = []() -> NtOpenFileFn {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+            return nullptr;
+        return reinterpret_cast<NtOpenFileFn>(
+            reinterpret_cast<void*>(GetProcAddress(ntdll, "NtOpenFile")));
+    }();
+    return resolved;
+}
+
+/// Opens `wide_name` (one separator-free component) handle-relative to `root`
+/// with READ_CONTROL (the owner check needs it) and DELETE (so it collides with
+/// a live dispatch's no-FILE_SHARE_DELETE handle: a sharing violation, never a
+/// delete under an in-flight export). Reparse points are opened raw.
+cfs::WinHandle open_candidate_relative(HANDLE root, const std::wstring& wide_name) {
+    const NtOpenFileFn fn = resolve_ntopenfile();
+    if (fn == nullptr)
+        return {};
+    if (wide_name.size() * sizeof(wchar_t) > (std::numeric_limits<USHORT>::max)())
+        return {};
+
+    UNICODE_STRING object_name{};
+    object_name.Length = static_cast<USHORT>(wide_name.size() * sizeof(wchar_t));
+    object_name.MaximumLength = object_name.Length;
+    // ObjectName is input-only to NtOpenFile; wide_name outlives the call.
+    object_name.Buffer = const_cast<PWSTR>(wide_name.c_str());
+
+    OBJECT_ATTRIBUTES attrs{};
+    attrs.Length = sizeof(attrs);
+    attrs.RootDirectory = root;
+    attrs.ObjectName = &object_name;
+
+    HANDLE raw = INVALID_HANDLE_VALUE;
+    IO_STATUS_BLOCK iosb{};
+    const ACCESS_MASK access =
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | DELETE;
+    const ULONG share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const ULONG options = kFileDirectoryFile | kFileOpenReparsePoint | kFileSynchronousIoNonalert;
+    if (fn(&raw, access, &attrs, &iosb, share, options) < 0)
+        return {};
+    return cfs::WinHandle(raw);
+}
+
+/// Sweeps stale scratch directories under `data_dir`. Never throws, never
+/// recurses (a real export directory is flat), never removes anything the pure
+/// policy or the ownership check refuses.
+ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
+                                            std::int64_t now_unix_s) noexcept {
+    ScratchSweepResult res{};
+    try {
+        cfs::OpenRootResult opened = cfs::open_root(std::filesystem::path{data_dir});
+        if (!opened.root.has_value()) {
+            res.enumerate_error = true;
+            res.os_error = opened.os_error;
+            return res;
+        }
+        const cfs::ConfinedRoot& root = *opened.root;
+        // One deadline for every enumerate_at of the pass (the wall cap must
+        // not creep forward per call).
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{kScratchSweepMaxWallMs};
+
+        cfs::EnumerateResult root_entries = cfs::enumerate_at(
+            root.h_.get(), root.identity(),
+            cfs::EnumBudget{static_cast<std::uint64_t>(kScratchSweepMaxRootEntries), deadline});
+        if (root_entries.reason == cfs::Reason::OsError) {
+            res.enumerate_error = true;
+            res.os_error = root_entries.os_error;
+            return res;
+        }
+        if (root_entries.reason == cfs::Reason::EntryCap ||
+            root_entries.reason == cfs::Reason::WallTimeCap)
+            ++res.deferred; // truncated: never silently "nothing left"
+
+        for (const auto& entry : root_entries.entries) {
+            switch (classify_sweep_candidate(entry.name,
+                                             entry.meta.type == cfs::EntryType::Directory,
+                                             entry.meta.mtime, now_unix_s,
+                                             kScratchDirStaleAfterSecs)) {
+            case SweepCandidate::NotCandidate:
+                continue;
+            case SweepCandidate::NoMtime:
+                ++res.failed;
+                continue;
+            case SweepCandidate::Fresh:
+                ++res.skipped_fresh;
+                continue;
+            case SweepCandidate::Stale:
+                break;
+            }
+
+            // No NEW candidate once the wall budget or either cap is spent.
+            if (std::chrono::steady_clock::now() >= deadline ||
+                res.removed >= kScratchSweepMaxRemovals ||
+                res.failed >= kScratchSweepMaxFailures) {
+                ++res.deferred;
+                break;
+            }
+
+            cfs::WinHandle candidate =
+                open_candidate_relative(root.h_.get(), yuzu::win::to_wide(entry.name));
+            if (!candidate) { // includes a live dispatch's sharing violation
+                ++res.failed;
+                continue;
+            }
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(candidate.get(), &info) ||
+                (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                info.dwVolumeSerialNumber != root.identity().volume_serial) {
+                ++res.failed;
+                continue;
+            }
+            if (!sweep_may_remove(detail::scratch_dir_is_ours(candidate.get()))) {
+                ++res.skipped_not_ours;
+                spdlog::debug("local_security_policy: sweep leaving foreign-owned '{}' alone",
+                              entry.name);
+                continue;
+            }
+
+            cfs::EnumerateResult inner = cfs::enumerate_at(
+                candidate.get(), root.identity(),
+                cfs::EnumBudget{static_cast<std::uint64_t>(kScratchSweepMaxDirEntries), deadline});
+            bool flat_and_clean = inner.reason == cfs::Reason::None;
+            for (const auto& e : inner.entries)
+                flat_and_clean = flat_and_clean && e.meta.type == cfs::EntryType::RegularFile;
+            if (!flat_and_clean) { // leave the whole candidate intact
+                ++res.failed;
+                continue;
+            }
+            bool all_deleted = true;
+            for (const auto& e : inner.entries) {
+                const cfs::UnlinkOutcome o = cfs::unlink_at(
+                    candidate.get(), e.name, cfs::UnlinkKind::File,
+                    (std::numeric_limits<std::uint64_t>::max)(), root.identity());
+                if (o.status != cfs::EntryStatus::Deleted) {
+                    all_deleted = false;
+                    break;
+                }
+            }
+            if (!all_deleted) {
+                ++res.failed;
+                continue;
+            }
+            candidate.reset(); // delete-by-disposition needs no other handle open
+            const cfs::UnlinkOutcome d = cfs::unlink_at(
+                root.h_.get(), entry.name, cfs::UnlinkKind::EmptyDirectory, 0, root.identity());
+            if (d.status == cfs::EntryStatus::Deleted)
+                ++res.removed;
+            else
+                ++res.failed;
+        }
+        return res;
+    } catch (...) {
+        ++res.failed;
+        return res;
+    }
+}
+
+// ---- Per-dispatch scratch directory ---------------------------------------
+
+/// RAII owner of the per-dispatch directory: removes it and its contents on
+/// every exit path. Kept as a wstring (never a narrow std::filesystem decode,
+/// which would mangle a non-ASCII data_dir). MUST be declared BEFORE the
+/// directory handle: RemoveDirectory fails with a sharing violation while a
+/// no-FILE_SHARE_DELETE handle is open, so that handle must destruct first.
+/// A failed removal is logged (never thrown from a destructor) and left for
+/// the next dispatch's sweep.
+class ScratchDirGuard {
+public:
+    explicit ScratchDirGuard(std::wstring path) : path_(std::move(path)) {}
+    ScratchDirGuard(const ScratchDirGuard&) = delete;
+    ScratchDirGuard& operator=(const ScratchDirGuard&) = delete;
+    const std::wstring& path() const { return path_; }
+    ~ScratchDirGuard() {
+        std::error_code ec;
+        std::filesystem::remove_all(std::filesystem::path{path_}, ec);
+        if (ec) {
+            try {
+                spdlog::warn("local_security_policy: scratch directory cleanup failed; the next "
+                             "dispatch's sweep will retry");
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    std::wstring path_;
+};
+
+/// Opens the directory as a handle WITHOUT FILE_SHARE_DELETE but REQUESTING
+/// DELETE, so Windows itself refuses a concurrent delete/rename (the sweep's
+/// DELETE-requesting open) for as long as it is held. Reparse points are
+/// opened raw so the ownership check sees the object actually opened.
+detail::ScopedHandle open_scratch_dir_handle(const std::wstring& dir) {
+    return detail::ScopedHandle(CreateFileW(
+        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+}
+
+// ---- Export read ------------------------------------------------------------
+
+struct ExportBytes {
+    std::vector<std::uint8_t> bytes;
+    std::optional<ExportReadFailure> failure;
+};
+
+/// Reads the exported file (cap kExportMaxBytes) from the verified scratch
+/// directory. Reparse points and non-regular objects are refused.
+ExportBytes read_export(const std::wstring& file) {
+    ExportBytes out;
+    detail::ScopedHandle h(CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                                       nullptr));
+    if (!h) {
+        out.failure = classify_export_read_error(GetLastError());
+        return out;
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h.get(), &info)) {
+        out.failure = classify_export_read_error(GetLastError());
+        return out;
+    }
+    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        out.failure = ExportReadFailure{false, "secedit:output_not_regular"};
+        return out;
+    }
+    const std::uint64_t size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) |
+                               info.nFileSizeLow;
+    if (size > kExportMaxBytes) {
+        out.failure = ExportReadFailure{false, "secedit:output_oversized"};
+        return out;
+    }
+    out.bytes.resize(static_cast<std::size_t>(size));
+    std::size_t got = 0;
+    while (got < out.bytes.size()) {
+        DWORD n = 0;
+        if (!ReadFile(h.get(), out.bytes.data() + got, static_cast<DWORD>(out.bytes.size() - got),
+                      &n, nullptr)) {
+            out.bytes.clear();
+            out.failure = classify_export_read_error(GetLastError());
+            return out;
+        }
+        if (n == 0)
+            break;
+        got += n;
+    }
+    out.bytes.resize(got);
+    return out;
+}
+
+RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
+    using T = yuzu::agent::TerminationReason;
+    switch (r) {
+    case T::exited:
+        return RunEnd::Exited;
+    case T::deadline:
+        return RunEnd::Deadline;
+    case T::cancelled:
+        return RunEnd::Cancelled;
+    case T::signaled:
+        return RunEnd::Signaled;
+    case T::spawn_error:
+        return RunEnd::SpawnError;
+    case T::line_limit:
+        break;
+    }
+    return RunEnd::Other; // line_limit cannot occur here (no stop_after_max_lines)
+}
+
+/// decode_utf16le_bom may report failure as an optional-like or as an empty
+/// string; both mean "not a usable export" (a real export is never empty).
+template <class R>
+std::optional<std::string> usable_text(R&& r) {
+    if constexpr (requires { r.has_value(); }) {
+        if (!r.has_value())
+            return std::nullopt;
+        std::string s(*r);
+        return s.empty() ? std::nullopt : std::optional<std::string>{std::move(s)};
+    } else {
+        std::string s(std::forward<R>(r));
+        return s.empty() ? std::nullopt : std::optional<std::string>{std::move(s)};
+    }
+}
+
+} // namespace
+
+int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
+                           std::string_view data_dir) {
+    // The shared dispatcher has already validated `action` before calling a leg.
+    if (data_dir.empty())
+        return emit_constrained(ctx, "data_dir_unset");
+
+    // Sweep BEFORE spawning: a prior crash may have orphaned an export.
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    const ScratchSweepResult swept = sweep_stale_scratch_dirs(
+        std::filesystem::path{std::string{data_dir}}.wstring(), static_cast<std::int64_t>(now));
+    spdlog::info("local_security_policy: {}", format_sweep_summary(swept));
+    if (swept.enumerate_error)
+        spdlog::warn("local_security_policy: sweep could not enumerate data_dir (os error {})",
+                     swept.os_error);
+
+    // 128-bit random name, CREATE_NEW, owner-only DACL.
+    char scratch_utf8[512]{};
+    if (yuzu_create_temp_dir(std::string{kScratchDirPrefix}.c_str(),
+                             std::string{data_dir}.c_str(), scratch_utf8,
+                             sizeof(scratch_utf8)) != 0)
+        return emit_constrained(ctx, "dest_dir_create_" + std::to_string(GetLastError()));
+
+    ScratchDirGuard scratch(yuzu::win::to_wide(scratch_utf8)); // declared BEFORE the handle
+    detail::ScopedHandle dir_handle = open_scratch_dir_handle(scratch.path());
+    if (!dir_handle)
+        return emit_constrained(ctx, "dest_dir_open_" + std::to_string(GetLastError()));
+    if (!detail::scratch_dir_is_ours(dir_handle.get()))
+        return emit_constrained(ctx, "dest_dir_acl");
+
+    const std::string out_utf8 = std::string{scratch_utf8} + "\\policy.inf";
+
+    // sink: local_security_policy/do_export#1
+    const yuzu::agent::SubprocessResult run = yuzu::agent::run_bounded_subprocess(
+        {std::string{kSecedit}, "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY", "/quiet"},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::milliseconds{kExportDeadlineMs}});
+    const std::string run_token = classify_export_run(to_run_end(run.termination_reason),
+                                                      run.exit_code);
+    if (!run_token.empty())
+        return emit_constrained(ctx, run_token);
+
+    ExportBytes exported = read_export(scratch.path() + L"\\policy.inf");
+    if (exported.failure) {
+        return exported.failure->permission_denied
+                   ? emit_failure(ctx, YUZU_RESULT_STATUS_PERMISSION_DENIED,
+                                exported.failure->token)
+                   : emit_constrained(ctx, exported.failure->token);
+    }
+
+    const auto text = usable_text(decode_utf16le_bom(std::span<const std::uint8_t>{
+        exported.bytes.data(), exported.bytes.size()}));
+    if (!text)
+        return emit_constrained(ctx, "secedit:decode_failed");
+
+    // ASSUMED P83-1 seam (parsers.hpp): SeceditRows secedit_policy_rows(
+    // std::string_view action, const InfSections&) with {rows, failure_token};
+    // reconciled at Phase 4b integration -- adapt THIS call site, never re-add a mapper here.
+    const SeceditRows built = secedit_policy_rows(action, parse_inf_sections(*text));
+    if (!built.failure_token.empty())
+        return emit_constrained(ctx, built.failure_token);
+
+    for (const auto& row : built.rows)
+        ctx.write_output(row);
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    return 0;
+}
+
+} // namespace yuzu::local_security_policy
+
+#endif // defined(_WIN32)
