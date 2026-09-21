@@ -106,10 +106,10 @@
     }
   ],
   "caveats": [
-    "**No typed result status anywhere.** Every sample shows `UNDECLARED / UNKNOWN /`; the plugin never calls `set_result_status`.",
+    "**Typed result status on `sync` only.** `status`, `get` and `changes` never call `set_result_status`, so every captured sample shows `UNDECLARED / UNKNOWN /` for them.",
     "**`sync`'s output is broader than its declared schema, and was never captured.** Beyond the 4-column `event`/`key`/`old_value`/`new_value` shape, every real `sync` call also emits 4 `tag|<key>|<value>` rows and a `last_sync|<epoch>` line that `content/definitions/asset_tags.yaml`'s `result.columns` (`asset_tags.yaml:51-60`) does not describe. All three samples show `[not captured]` for `sync` under the mutator capture policy.",
-    "**The capture harness never calls `init()`.** Every sample reflects the plugin's cold-boot default state (empty tags, `last_sync=0`, `stale=true`, `check_interval=300`) because `load_state()` and the config read only run from `init()` (`asset_tags_plugin.cpp:214-237`), which the capture driver's `PluginHandle::load` + `LocalDispatcher::run` path does not call. `get key=role`'s captured `tag|role|` is therefore an empty value from a never-loaded store, not evidence the category is unset in practice — the samples do not reflect any real on-disk `asset_tags.json`.",
-    "**No dedicated unit test.** No `test_asset_tags_*.cpp` exists under `tests/unit`; only generic capability-catalogue (`test_capability_catalogue_complete.py`) and dispatch-chokepoint tests (`tests/unit/server/test_command_capability.cpp`, `test_dispatch_chokepoint.cpp`) reference the plugin by name, and none exercise `AssetTagsPlugin::execute`."
+    "**The capture harness never calls `init()`.** Every sample reflects the plugin's cold-boot default state (empty tags, `last_sync=0`, `stale=true`, `check_interval=300`) because `load_state()` and the config read only run from `init()` (`asset_tags_plugin.cpp:151-174`), which the capture driver's `PluginHandle::load` + `LocalDispatcher::run` path does not call. `get key=role`'s captured `tag|role|` is therefore an empty value from a never-loaded store, not evidence the category is unset in practice — the samples do not reflect any real on-disk `asset_tags.json`.",
+    "**No dispatcher-level test.** `tests/unit/test_asset_tags_parsers.cpp` covers the pure core (capping, the bounded log, the sync diff, row escaping, snapshot parse and whole-file rejection) and `tests/unit/test_asset_tags_store.cpp` covers the state-file lifecycle (create, replace, no leftover temp, POSIX `0600`, failure paths, restart reload). Nothing exercises `AssetTagsPlugin::execute` or the mutex/persist ordering through the plugin itself."
   ],
   "definitions": [
     {
@@ -198,7 +198,7 @@
     }
   ],
   "description": "Structured asset tag awareness — syncs server-assigned tags locally and detects changes",
-  "how_it_works": "`asset_tags` gives an agent awareness of the four structured tag categories the server treats as authoritative — `role`, `environment`, `location`, `service` (`asset_tags_plugin.cpp:43`). `sync` is the only mutating action: the server calls it, pushing all four category values as parameters; the plugin diffs them against its cached copy, appends any differences to an in-memory change log (persisted, capped at the last 50 entries), and writes the new state to `<data_dir>/asset_tags.json` (`asset_tags_plugin.cpp:260-325`, `112-144`). `status` reports the cached tags plus sync metadata — last-sync epoch, a staleness flag, the configured check interval, and the change-log length (`asset_tags_plugin.cpp:327-342`). `get` returns a single category's cached value, rejecting any key outside the fixed four (`asset_tags_plugin.cpp:344-371`). `changes` lists the change log verbatim (`asset_tags_plugin.cpp:373-387`). A background thread wakes every `check_interval` seconds (default 300, floored at 30) purely to flip `stale` to `true` if no sync has landed in that window — it never re-requests a sync itself (`asset_tags_plugin.cpp:146-169`).\n\nIt deliberately is not the general-purpose tag store: arbitrary free-form key/value tags are the sibling `tags` plugin (`content/definitions/tags.yaml`). `asset_tags` only ever holds the four server-authoritative categories, and the agent never initiates a sync — it only reacts to one the server pushes.",
+  "how_it_works": "`asset_tags` gives an agent awareness of the four structured tag categories the server treats as authoritative — `role`, `environment`, `location`, `service` (`asset_tags_parsers.hpp:39`). `sync` is the only mutating action: the server calls it, pushing all four category values as parameters; the plugin diffs them against its cached copy, appends any differences to a change log (bounded at the newest 50 entries in memory and on disk, evicting the oldest on every append), and — inside one critical section with the diff — writes the new state to `<data_dir>/asset_tags.json` via a temp file renamed into place (`asset_tags_plugin.cpp:203-254`, `asset_tags_parsers.hpp:101-125`, `asset_tags_store.hpp:76-131`). Values are capped at 448 bytes on a UTF-8 codepoint boundary (the server's own tag-value limit) and stored raw (`asset_tags_parsers.hpp:76`). `status` reports the cached tags plus sync metadata — last-sync epoch, a staleness flag, the configured check interval, and the change-log length (`asset_tags_plugin.cpp:256-268`). `get` returns a single category's cached value, rejecting any key outside the fixed four (`asset_tags_plugin.cpp:270-285`). `changes` lists the change log verbatim (`asset_tags_plugin.cpp:287-298`). A background thread wakes every `check_interval` seconds (default 300, floored at 30) purely to flip `stale` to `true` if no sync has landed in that window — it never re-requests a sync itself (`asset_tags_plugin.cpp:83-106`).\n\nIt deliberately is not the general-purpose tag store: arbitrary free-form key/value tags are the sibling `tags` plugin (`content/definitions/tags.yaml`). `asset_tags` only ever holds the four server-authoritative categories, and the agent never initiates a sync — it only reacts to one the server pushes.",
   "inputs": [
     {
       "constraints": {
@@ -428,7 +428,7 @@
           "values": null
         },
         {
-          "description": "Number of entries currently in the in-memory change log (the persisted store keeps only the last 50). Values: integer >= 0.",
+          "description": "Number of entries currently in the change log (in memory and persisted, capped at the last 50). Values: integer 0-50.",
           "example": "0",
           "name": "change_count",
           "platforms": [
@@ -506,7 +506,7 @@
       "definition_id": "device.asset_tags.sync"
     }
   ],
-  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several *different* line shapes in one response — see Caveats. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`.",
+  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several *different* line shapes in one response — see Caveats. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`. Every string field on every row — values, keys, and the echoed text of the two error rows (`unknown action: …`, `error|unknown category: …`) — is escaped with the shared `safe_output_field` (`|` becomes `\\|`, CR/LF become a space, a literal backslash is folded to `/`), so a value such as `Rack A|3` renders as `Rack A\\|3` in a stable row shape. The stored value is never rejected or stripped; the backslash fold is a limitation of the shared server decoder and applies on the wire only. Values are capped at 448 bytes on `sync` and again on load from disk.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -515,7 +515,7 @@
   "privileges": [
     {
       "grant": "None — plain file I/O under `<data_dir>`, no OS API, no elevated right",
-      "if_refused": "No refusal path exists; a write failure is silently swallowed (see below)",
+      "if_refused": "No refusal path exists; a write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync` (see below); an unreadable or corrupt state file is logged and ignored",
       "measured": "2026-09-07 on bare metal as SYSTEM",
       "os": "Windows",
       "runs_as": "agent service account — LocalSystem today, not yet the intended `NT SERVICE\\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`)"
@@ -809,10 +809,15 @@
       "content/definitions/asset_tags.yaml"
     ],
     "plugin": [
-      "agents/plugins/asset_tags/src/asset_tags_plugin.cpp"
+      "agents/plugins/asset_tags/src/asset_tags_parsers.hpp",
+      "agents/plugins/asset_tags/src/asset_tags_plugin.cpp",
+      "agents/plugins/asset_tags/src/asset_tags_store.hpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/unit/test_asset_tags_parsers.cpp",
+      "tests/unit/test_asset_tags_store.cpp"
+    ]
   },
   "version": "0.1.0",
   "where_the_data_goes": [
