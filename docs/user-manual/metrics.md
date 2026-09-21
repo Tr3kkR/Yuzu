@@ -1339,15 +1339,19 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
 | `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |
 
-**Finding an inert mechanism from the fleet series.** Compare `_reporting` with ONE mechanism's series, per OS, and only where every agent of that OS is expected to run that mechanism (Windows and `file`, for example). A form that also fires when the mechanism series is absent on every agent (an absent series makes a plain subtraction return nothing):
+**Finding an inert mechanism from the fleet series.** Compare `_reporting` with ONE mechanism's series, per OS, and only where every agent of that OS is expected to run that mechanism (Windows and `file`, for example). Match on `instance` as well as `os`: each scraped server replica publishes its own copy of these series, and matching on `os` alone fails with `found duplicate series for the match group` as soon as two replicas are scraped (`on(os, instance)` also works where no `instance` label exists). The `or` fallback keeps the query firing when the mechanism series is absent on every agent, where a plain subtraction would return nothing:
 
 ```promql
 yuzu_fleet_spark_reporting{os="windows"}
-  - on(os) (yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"}
-            or on(os) (yuzu_fleet_spark_reporting{os="windows"} * 0)) > 0
+  - on(os, instance) (yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"}
+                      or on(os, instance) (yuzu_fleet_spark_reporting{os="windows"} * 0)) > 0
 ```
 
-Do NOT compare `_reporting` with the SUM over mechanisms. A healthy Windows agent contributes to three series (`file`, `registry`, `service`), so the sum is about 3N against N reporting, and a fleet with `file` dropped still sums to about 2N; the comparison stays quiet until the average agent has lost more than two of its three mechanisms, so it cannot detect one inert mechanism on Windows. (Linux has only `service`, where the sum form happens to work; macOS has no mechanism by design, so it would always read as a gap.) The fleet series cannot tell a boot-time inert from a runtime one (a File worker or Registry sweeper that failed three consecutive passes and has not yet recovered); the agent log does, see the diagnosis steps in [Guaranteed State](guaranteed-state.md). No alert on `yuzu_fleet_spark_mechanisms` ships today, and one written against a runtime-capable mechanism needs a `for:` hold of at least two heartbeats (60 s at the default 30 s heartbeat), or a self-clearing episode will page.
+The Linux form is the same with `os="linux"` and `mechanism="service"` (the only Linux mechanism); it counts every agent without a systemd system bus, so every containerised agent, as a gap, and is only meaningful for a fleet that has none. macOS has no per-mechanism detector: it has no mechanism by design, so no series is published and there is nothing to compare.
+
+Do NOT compare `_reporting` with the SUM over mechanisms. A healthy Windows agent contributes to three series (`file`, `registry`, `service`), so the sum is about 3N against N reporting, and a fleet with `file` dropped still sums to about 2N; the comparison stays quiet until the average agent has lost more than two of its three mechanisms, so it cannot detect one inert mechanism on Windows. On Linux the sum form fires only while at least one agent still reports `service`: a fleet in which every agent is inert publishes no `{os="linux"}` mechanism series at all, and the comparison (like a plain subtraction) then returns nothing.
+
+The fleet series cannot tell a boot-time inert from a runtime one (a File worker or Registry sweeper that failed three consecutive passes and has not yet recovered); the agent log does, see [Diagnosing an inert File worker or Registry sweeper](guaranteed-state.md#diagnosing-an-inert-file-worker-or-registry-sweeper-windows). No alert on `yuzu_fleet_spark_mechanisms` ships today. One written against a runtime-capable mechanism needs a `for:` hold of at least two heartbeats (60 s at the default 30 s heartbeat) or a self-clearing episode will fire it, and a paging alert wants at least 10 minutes, tuned on fleet data (an F14 precondition).
 
 See [Guaranteed State → SparkEngine](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)
 for the observe-only migration, the `--spark-disable` flag, and the per-rung

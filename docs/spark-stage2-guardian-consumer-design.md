@@ -196,7 +196,11 @@ Verified safe to change now:
   `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; by
   inspection, the one documented inert case shows no delta - legacy fails identically
   there too - but the guarantee is narrower than this bullet's original wording
-  implied).
+  implied). A runtime-inert File worker or Registry sweeper (R5.7 (b)/(g), #4658) is a
+  second inert case and it DOES show a delta: the legacy File guard does not depend on
+  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode is
+  classified `Unsupported` and stays disarmed after recovery until the next reconcile or
+  restart (R5.7 (g)(1)).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.

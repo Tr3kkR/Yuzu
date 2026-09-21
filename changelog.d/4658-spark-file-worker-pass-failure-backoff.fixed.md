@@ -10,5 +10,5 @@
   `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds` and
   `spark_file: worker pass recovered after N failure(s)` log lines and the `inert` exclusion; the
   count of failed passes is test-visible only. No watch is armed through Spark until Spark
-  detection is turned on, which it is not in production agents; the fix is a precondition for
-  turning Spark detection on.
+  detection is turned on, which it is not in production agents; the fix is one of the
+  preconditions for turning Spark detection on.
