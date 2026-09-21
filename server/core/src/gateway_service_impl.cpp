@@ -1488,11 +1488,20 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // `announce_connected` (below, in its ORIGINAL position/logic)
         // remains the enforcement OF RECORD — its own guarded UPDATE
         // independently re-checks the SAME affinity atomically at write
-        // time, so a narrow race between this read and that write can never
-        // let a mismatched cluster_id persist DURABLY; it can only, in the
-        // narrowest window, let this pre-check miss a violation the write
-        // then still refuses — degrading to the pre-#4669 fail-open posture
-        // for that one race, never the reverse.
+        // time, so a mismatched cluster_id can never persist DURABLY; it can
+        // only let this pre-check miss a violation the write then still
+        // refuses. Gate 2 security-guardian correction (2026-09-21): this
+        // is NOT bounded to a microsecond race margin. Both this pre-check
+        // AND announce_connected's own write share the same Postgres pool,
+        // so during a SUSTAINED degradation (not just a momentary blip) the
+        // window this describes is bounded by the FULL DURATION of that
+        // degradation, not a narrow race — for its whole length, a rogue's
+        // claimed placement could reach the in-memory dispatch registry
+        // (set_gateway_route, read by send_to/send_to_all) even though the
+        // durable store never accepts it. See `YuzuGatewayClusterAffinity
+        // CheckDegradedDuringWrite` (docs/prometheus/yuzu-alerts.yml) —
+        // added specifically to measure this window's actual duration —
+        // and #4697 for the still-missing regression test.
         if (gateway_route_store_) {
             bool skip = false;
             {

@@ -618,11 +618,16 @@ public:
     /// in-memory registry), without paying for a write. NOT the security
     /// boundary by itself — `announce_connected`'s own guarded UPDATE
     /// enforces the SAME affinity atomically at write time regardless of
-    /// whether a caller uses this pre-check first: a race between this read
-    /// and the eventual write can never let a mismatched cluster_id persist
-    /// DURABLY, only (in the narrowest window) let a caller's own transient
-    /// state briefly disagree with the store, exactly the pre-#4669
-    /// fail-open posture for that one race — never the reverse.
+    /// whether a caller uses this pre-check first: this read and the
+    /// eventual write can never let a mismatched cluster_id persist
+    /// DURABLY, only let a caller's own transient state briefly disagree
+    /// with the store — exactly the pre-#4669 fail-open posture, never the
+    /// reverse. Gate 2 security-guardian correction (2026-09-21): "briefly"
+    /// is bounded by how long the CALLER's own read of this method stays
+    /// degraded, which for a sustained Postgres outage is the outage's full
+    /// duration, not a microsecond race — see the caller's own comment
+    /// (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) for the concrete
+    /// consequence and the alert that measures it.
     [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
     has_cluster_affinity_conflict(std::string_view agent_id, std::string_view session_id,
                                   std::string_view cluster_id);
