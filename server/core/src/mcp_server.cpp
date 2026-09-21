@@ -10946,10 +10946,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
-                // widens this tool's output with execution_count, the one field
-                // the dashboard fragment showed that this tool didn't. Same
-                // builder as GET /api/v1/schedules, so the two cannot drift.
+                // #4030: shared builder (schedule_row_json, schedule_model.hpp,
+                // split out of workflow_model.hpp by the ADR-0031 WS-A4
+                // seventh-family seam) — widens this tool's output with
+                // execution_count, the one field the dashboard fragment
+                // showed that this tool didn't. Same builder as
+                // GET /api/v1/schedules, so the two cannot drift.
                 JArr arr;
                 for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());

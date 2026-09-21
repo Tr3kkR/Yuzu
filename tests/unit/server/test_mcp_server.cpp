@@ -7899,6 +7899,41 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
     CHECK(saw_denied);
 }
 
+// Governance Gate 3 (quality-engineer SHOULD-1, feat/split-a4-schedule-seam):
+// the fragment (`GET /fragments/schedules`) and REST v1 twin
+// (`GET /api/v1/schedules`) both have an explicit unwired-seam test; MCP did
+// not. The deny test above never reaches the `!schedule_api_` guard at all
+// (the fleet-wide service-scoped deny fires first, per its own comment), so
+// it cannot stand in for this case. An ORDINARY (non-service-scoped, no tier
+// restriction) caller with `schedule_engine_for_test` left at its default
+// nullptr must still hit the same "Schedule engine unavailable" fallback
+// REST v1/the fragment answer with their own equivalent (503 / "Not
+// available") -- proving the seam's null-guard still behaves correctly for
+// the one caller class the deny-focused test above cannot exercise.
+TEST_CASE("MCP: list_schedules answers 'Schedule engine unavailable' for an "
+          "ordinary caller when the seam is unwired",
+          "[mcp][integration][schedule]") {
+    McpTestServer ts;
+    // schedule_engine_for_test stays nullptr (the default) -- schedule_api_
+    // is therefore never constructed, matching production's
+    // `if (schedule_engine_) schedule_api = make_local_schedule_api(...)`
+    // gate in server.cpp when no ScheduleEngine was opened.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":48,"params":{"name":"list_schedules"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "Schedule engine unavailable");
+
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "schedule.list|success");
+        CHECK(a != "mcp.list_schedules|success");
+    }
+}
+
 // #2146 A2-R1: definition_id/enabled_only filters, threaded into the same
 // ScheduleQuery the REST v1 twin (GET /api/v1/schedules) and the legacy
 // GET /api/schedules route already populate. Real ScheduleEngine so the

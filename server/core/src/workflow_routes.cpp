@@ -1249,6 +1249,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // instead.
         auto result = schedule_api->list_schedules(ScheduleQuery{});
         if (!result) {
+            // sre Gate 6 hardening (governance, feat/split-a4-schedule-seam):
+            // REST v1/MCP both route their equivalent failure through
+            // genericize_db_error(), which spdlog::errors the raw diagnostic
+            // before returning a sanitized message -- this fragment used to
+            // discard result.error() with no log call at all, leaving zero
+            // server-side signal correlating the degraded banner with
+            // backend health for an operator watching only the dashboard.
+            // Called here PURELY for its logging side effect -- the return
+            // value is intentionally discarded, never rendered (the fixed
+            // banner text below is the only thing sent to the client).
+            (void)yuzu::server::genericize_db_error("list_schedules", result.error());
             res.set_content(
                 "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
                 "retry shortly.</div>",
