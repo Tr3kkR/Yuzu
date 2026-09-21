@@ -85,8 +85,9 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 /// An inert mechanism, one that started but could not bind its OS facility (no systemd
 /// system bus in a container, OpenSCManager denied, IOCP creation failed), or whose worker
 /// is in persistent pass failure (Registry and File; three consecutive failed passes,
-/// cleared on the next success), is EXCLUDED, because every watch() on it will be refused
-/// or cannot be served. Listing it would advertise a capability the agent cannot honour:
+/// cleared on the next success), is EXCLUDED, because it is not currently serviceable:
+/// the first kind refuses every watch(), the second accepts it but cannot serve it until a
+/// pass succeeds. Listing it would advertise a capability the agent cannot honour:
 /// "looks healthy, can detect nothing" (governance Gate-3 cross-platform + Gate-6 sre,
 /// reached independently).
 ///
@@ -132,7 +133,7 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
     std::string mechs;
     for (const auto& [type, ms] : by_type) {
         if (ms.inert)
-            continue; // registered but cannot watch — not a capability
+            continue; // registered but not currently serviceable: not a capability
         if (!mechs.empty())
             mechs += ',';
         mechs += spark_type_token(type);
