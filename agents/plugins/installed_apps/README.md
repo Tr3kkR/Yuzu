@@ -112,23 +112,23 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 47e1dd9008d0
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 2d05d4707a05
 
 ```
 == action=list
-app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-
-app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-
-app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617
-app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617
-app|Baldur's Gate 3|-|Larian Studios|-
-app|Battle.net|-|Blizzard Entertainment|-
-app|CCleaner 7|7.10.1464.1889|Piriform|-
-app|CMake|4.3.3|Kitware|20260617
-app|Cities: Skylines II|-|Colossal Order Ltd.|-
-app|Crusader Kings III|-|Paradox Development Studio|-
-app|DayZ|-|Bohemia Interactive|-
-app|Defraggler|2.22|Piriform|-
-… 12 of 226 rows shown
+app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:\Program Files\7-Zip\|-
+app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-|D:\SteamLibrary\steamapps\common\AoE2DE|-
+app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|-|-
+app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|-|-
+app|BCD and Boot|10.1.22621.5337|Microsoft|20260908|-|-
+app|Baldur's Gate 3|-|Larian Studios|-|D:\SteamLibrary\steamapps\common\Baldurs Gate 3|-
+app|Battle.net|-|Blizzard Entertainment|-|C:\Program Files (x86)\Battle.net|-
+app|CCleaner 7|7.11.1522.1958|Piriform|-|C:\Program Files\Piriform\CCleaner 7|-
+app|CMake|4.3.3|Kitware|20260617|C:\Program Files\CMake\|-
+app|Cities: Skylines II|-|Colossal Order Ltd.|-|D:\SteamLibrary\steamapps\common\Cities Skylines II|-
+app|Crusader Kings III|-|Paradox Development Studio|-|D:\SteamLibrary\steamapps\common\Crusader Kings III|-
+app|DayZ|-|Bohemia Interactive|-|D:\SteamLibrary\steamapps\common\DayZ|-
+… 12 of 241 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=query name=Microsoft
@@ -148,16 +148,16 @@ app|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|Microsoft Corporation
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_per_user
-user_app|Alex|Signal 8.18.0|8.18.0|Signal Messenger, LLC|-
-user_app|Alex|Discord|1.0.9255|Discord Inc.|20212118
-user_app|Alex|NordPass|7.9.5|NordPass Team|-
-user_app|Alex|Inno Setup version 6.7.3|6.7.3|jrsoftware.org|20260714
-user_app|Alex|ninja|1.13.2|ninja-build|20260617
-user_app|Alex|Node.js (LTS)|24.16.0|Node.js Foundation|20260617
-user_app|Alex|Microsoft Visual Studio Code (User)|1.128.1|Microsoft Corporation|20260715
-user_app|Alex|Python 3.12.10 (64-bit)|3.12.10150.0|Python Software Foundation|-
-user_app|Alex|MSYS2|20260611|The MSYS2 Developers|Wed Jun 17 17:28:18 2026
-user_app|Alex|Paradox Launcher v2|1.0.0.0|Paradox Interactive|-
+user_app|jsmith|Signal 8.18.0|8.18.0|Signal Messenger, LLC|-
+user_app|jsmith|Discord|1.0.9255|Discord Inc.|20212118
+user_app|jsmith|NordPass|7.9.5|NordPass Team|-
+user_app|jsmith|Inno Setup version 6.7.3|6.7.3|jrsoftware.org|20260714
+user_app|jsmith|ninja|1.13.2|ninja-build|20260617
+user_app|jsmith|Node.js (LTS)|24.16.0|Node.js Foundation|20260617
+user_app|jsmith|Microsoft Visual Studio Code (User)|1.128.1|Microsoft Corporation|20260715
+user_app|jsmith|Python 3.12.10 (64-bit)|3.12.10150.0|Python Software Foundation|-
+user_app|jsmith|MSYS2|20260611|The MSYS2 Developers|Wed Jun 17 17:28:18 2026
+user_app|jsmith|Paradox Launcher v2|1.0.0.0|Paradox Interactive|-
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_inventory
@@ -165,35 +165,35 @@ inv|7-Zip 26.02 (x64)|26.02|Igor Pavlov||app|windows||||||
 inv|Age of Empires II: Definitive Edition||Forgotten Empires||app|windows||||||
 inv|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|app|windows||||||
 inv|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|app|windows||||||
+inv|BCD and Boot|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Baldur's Gate 3||Larian Studios||app|windows||||||
 inv|Battle.net||Blizzard Entertainment||app|windows||||||
-inv|CCleaner 7|7.10.1464.1889|Piriform||app|windows||||||
+inv|CCleaner 7|7.11.1522.1958|Piriform||app|windows||||||
 inv|CMake|4.3.3|Kitware|20260617|app|windows||||||
 inv|Cities: Skylines II||Colossal Order Ltd.||app|windows||||||
 inv|Crusader Kings III||Paradox Development Studio||app|windows||||||
 inv|DayZ||Bohemia Interactive||app|windows||||||
-inv|Defraggler|2.22|Piriform||app|windows||||||
-… 12 of 226 rows shown
+… 12 of 241 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 47e1dd9008d0
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (jsmith; user-profile paths redacted) · leg-hash 2d05d4707a05
 
 ```
 == action=list
-app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51
-app|ABAssistantService|14.0|-|13/08/2026, 03:51
-app|AMSEngagementViewService|1.0|-|13/08/2026, 03:51
-app|AOSAlertManager|1.07|-|13/08/2026, 03:51
-app|AOSHeartbeat|1.07|-|13/08/2026, 03:51
-app|AOSPushRelay|1.07|-|13/08/2026, 03:51
-app|AOSUIPrefPaneLauncher|1.0|-|13/08/2026, 03:51
-app|ARDAgent|3.9.8|-|13/08/2026, 03:51
-app|AVB Configuration|1440.7|-|13/08/2026, 03:51
-app|AXVisualSupportAgent|1.0|-|13/08/2026, 03:51
-app|About This Mac|1.0|-|13/08/2026, 03:51
-app|Accessibility Reader|1.0|-|13/08/2026, 03:51
-… 12 of 322 rows shown
+app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/50onPaletteServer.app|com.apple.50onPaletteIM
+app|ABAssistantService|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/ABAssistantService.app|com.apple.ABAssistantService
+app|AMSEngagementViewService|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AppleMediaServicesUI.framework/Versions/A/Resources/AMSEngagementViewService.app|com.apple.AMSEngagementViewService
+app|AOSAlertManager|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSAlertManager.app|com.apple.AOSAlertManager
+app|AOSHeartbeat|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSHeartbeat.app|com.apple.AOSHeartbeat
+app|AOSPushRelay|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSPushRelay.app|com.apple.AOSPushRelay
+app|AOSUIPrefPaneLauncher|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/AOSUIPrefPaneLauncher.app|com.apple.AOSUIPrefPaneLauncher
+app|ARDAgent|3.9.8|-|13/08/2026, 03:51|/System/Library/CoreServices/RemoteManagement/ARDAgent.app|com.apple.RemoteDesktopAgent
+app|AVB Configuration|1440.7|-|13/08/2026, 03:51|/System/Library/CoreServices/AVB Configuration.app|com.apple.AVB-Audio-Configuration
+app|AXVisualSupportAgent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UniversalAccess.framework/Versions/A/Resources/AXVisualSupportAgent.app|com.apple.accessibility.AXVisualSupportAgent
+app|About This Mac|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/About This Mac.app|com.apple.AboutThisMacLauncher
+app|Accessibility Reader|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Accessibility Reader.app|com.apple.accessibility.AccessibilityReader
+… 12 of 323 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=query name=bash
@@ -213,43 +213,43 @@ user_app|system|AVB Configuration|1440.7|-|13/08/2026, 03:51
 user_app|system|AXVisualSupportAgent|1.0|-|13/08/2026, 03:51
 user_app|system|About This Mac|1.0|-|13/08/2026, 03:51
 user_app|system|Accessibility Reader|1.0|-|13/08/2026, 03:51
-… 12 of 323 rows shown
+… 12 of 324 rows shown
 [result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=list_inventory
-inv|App Store|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Apps|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Automator|2.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Books|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Calculator|12.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Calendar|16.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Chess|3.18|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Clock|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Contacts|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Dictionary|2.3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FaceTime|36|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Find My|4.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-… 12 of 390 rows shown
+inv|Time Machine|1.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Tips|26.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Activity Monitor|10.14|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AirPort Utility|6.3.9|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Audio MIDI Setup|3.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Bluetooth File Exchange|9.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Boot Camp Assistant|6.1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ColorSync Utility|12.2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Console|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Digital Colour Meter|6.11|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Disk Utility|22.7|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Grapher|2.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+… 12 of 393 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 47e1dd9008d0
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 2d05d4707a05
 
 ```
 == action=list
-app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-
-app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-
-app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-
-app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-
-app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-
-app|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
-app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-
-app|binutils|2.44-3|Matthias Klose <doko@debian.org>|-
-app|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-
-app|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-
-app|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-
-app|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-|-|-
+app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-|-|-
+app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-|-|-
+app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-|-|-
+app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-|-|-
+app|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
+app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-|-|-
+app|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
 … 12 of 206 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
