@@ -3443,6 +3443,9 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 #include <filesystem>
 #include <fstream>
 
+#include <spdlog/sinks/base_sink.h> // PfStallLogger (#4658 PF-11/PF-12)
+#include <spdlog/spdlog.h>
+
 TEST_CASE("File spark (real mechanism): a live file write fires the spark",
           "[spark][mechanism][windows]") {
     namespace fs = std::filesystem;
@@ -6313,6 +6316,168 @@ long long pf_process_cpu_ms() {
 void pf_noop_emit(const std::string&, SparkData) {}
 void pf_noop_fault(const std::string&, bool, std::string_view) {}
 
+// Waits until `passes` (a pass_fail_hook invocation counter) has not moved for `quiet`: every
+// obligation the worker owed has been served and nothing is due but what the test arranged.
+bool pf_wait_no_passes(const std::atomic<int>& passes,
+                       std::chrono::milliseconds quiet = 400ms) {
+    int last = -1;
+    auto stable_since = PfClock::now();
+    return eventually(
+        [&] {
+            const int p = passes.load(std::memory_order_acquire);
+            if (p != last) {
+                last = p;
+                stable_since = PfClock::now();
+                return false;
+            }
+            return PfClock::now() - stable_since >= quiet;
+        },
+        5000ms);
+}
+
+// Stretches the OFF-LOCK tail of a failed worker pass without a production seam: replaces the
+// process default spdlog logger with one that keeps the previous sinks (the lines still reach
+// the console) plus a sink that sleeps `stall` when a payload contains `target`.
+// log_pass_outcome() runs after note_pass_outcome_locked() stamped the backoff deadline, so a
+// stall longer than the backoff leaves that deadline already expired when the worker re-locks.
+// This only works because spdlog is ONE shared image here (spdlog.dll); tests/unit/
+// test_log_capture.hpp warns (#3355) that a default-logger swap may not reach library code, so
+// every user MUST assert hits() > 0 or a test built on it can pass vacuously.
+// Declare it BEFORE the mechanism: the worker logs through the default logger, so the mechanism
+// has to be destroyed (its worker joined) before this restores the previous logger.
+class PfStallLogger {
+public:
+    PfStallLogger(std::string target, std::chrono::milliseconds stall)
+        : sink_(std::make_shared<Sink>(std::move(target), stall)),
+          prev_(spdlog::default_logger()) {
+        std::vector<spdlog::sink_ptr> sinks = prev_->sinks();
+        sinks.push_back(sink_);
+        auto logger = std::make_shared<spdlog::logger>("pf_stall", sinks.begin(), sinks.end());
+        logger->set_level(prev_->level());
+        spdlog::set_default_logger(std::move(logger));
+    }
+    ~PfStallLogger() { spdlog::set_default_logger(prev_); }
+    PfStallLogger(const PfStallLogger&) = delete;
+    PfStallLogger& operator=(const PfStallLogger&) = delete;
+
+    /// Payloads that matched `target` (each one slept `stall`).
+    [[nodiscard]] int hits() const { return sink_->hits.load(std::memory_order_acquire); }
+    /// Runs on the logging thread at each match, before the sleep. Set BEFORE the mechanism starts.
+    void set_on_hit(std::function<void()> fn) { sink_->on_hit = std::move(fn); }
+
+private:
+    struct Sink final : spdlog::sinks::base_sink<std::mutex> {
+        Sink(std::string t, std::chrono::milliseconds st) : target(std::move(t)), stall(st) {}
+        void sink_it_(const spdlog::details::log_msg& msg) override {
+            const std::string_view payload(msg.payload.data(), msg.payload.size());
+            if (payload.find(target) == std::string_view::npos)
+                return;
+            hits.fetch_add(1, std::memory_order_acq_rel);
+            if (on_hit)
+                on_hit();
+            std::this_thread::sleep_for(stall);
+        }
+        void flush_() override {}
+        std::string target;
+        std::chrono::milliseconds stall;
+        std::atomic<int> hits{0};
+        std::function<void()> on_hit;
+    };
+    std::shared_ptr<Sink> sink_;
+    std::shared_ptr<spdlog::logger> prev_;
+};
+
+// One scenario for a backoff deadline that has EXPIRED by the time the worker is back under
+// mu_ (#4658 PF-11 / PF-12): the deadline is stamped before the off-lock tail of the failed
+// pass (the log line, FilePassWork destruction), so a tail longer than the backoff leaves it in
+// the past. The retry must still run at once; with nothing else due the timeout would be
+// INFINITE, and with a later obligation (a Deferred watch's ~30 s retry) it would be that later
+// deadline. `throws` failures are injected after the watch is established and quiet; the tail
+// of the LAST one is stalled by `stall_target`.
+struct PfStaleDeadline {
+    bool deferred;                     // a Deferred retry ~30 s away is the other obligation
+    unsigned throws;                   // consecutive failed passes to inject
+    std::chrono::milliseconds cadence; // sweep_cadence: the backoffs are cadence, 2x, 4x, ...
+    const char* stall_target;          // log payload whose emission sleeps
+    std::chrono::milliseconds stall;
+    bool inert_at_stall;               // expected stats().inert while that line is being written
+};
+
+void pf_run_stale_deadline(const PfStaleDeadline& sc) {
+    ScratchDir a("pf_stale_deadline");
+    std::atomic<int> faults{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> throws_left{0};
+    std::atomic<int> passes_at_stall{-1};
+    std::atomic<int> inert_at_stall{-1};
+    const std::wstring target_dir_w = a.dir.wstring();
+    PfStallLogger stall_log(sc.stall_target, sc.stall);
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the same set.
+    const auto controls = [&] {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the probe resolves in microseconds; be generous
+        ctl.sweep_cadence = sc.cadence;
+        if (sc.deferred)
+            ctl.attach_fail_hook = [&](std::wstring_view dir) { return dir == target_dir_w; };
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_acq_rel);
+            if (throws_left.load(std::memory_order_acquire) > 0 &&
+                throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    // stats() is lock-free, so it is safe to read from the logging (worker) thread.
+    stall_log.set_on_hit([&] {
+        passes_at_stall.store(passes.load(std::memory_order_acquire), std::memory_order_release);
+        inert_at_stall.store(mech->stats().inert ? 1 : 0, std::memory_order_release);
+    });
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    mech->start(pf_noop_emit, [&](const std::string&, bool, std::string_view) {
+        faults.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    if (sc.deferred) {
+        // The health grace reports the deaf watch once; after that only the Deferred retry
+        // (~30 s away) remains.
+        REQUIRE(eventually([&] { return faults.load(std::memory_order_acquire) >= 1; }, 4000ms));
+    }
+    REQUIRE(pf_wait_no_passes(passes)); // established, marker drained: nothing else is due
+    if (sc.deferred)
+        REQUIRE(file_debug_counters_for_test(*mech)->probe_backend_failed >= 1);
+    const int passes_before = passes.load(std::memory_order_acquire);
+    throws_left.store(static_cast<int>(sc.throws), std::memory_order_release);
+    // apply_test_controls nudges run(): the first injected failure starts the episode.
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    // The stalled line was written: the sink reached the library's logger (a FALSE-GREEN
+    // guard, #3355), and the worker is now sleeping in the off-lock tail past its deadline.
+    REQUIRE(eventually([&] { return stall_log.hits() >= 1; }, 5000ms));
+    const auto t_stall = PfClock::now();
+    CHECK(passes_at_stall.load(std::memory_order_acquire) ==
+          passes_before + static_cast<int>(sc.throws));
+    CHECK(inert_at_stall.load(std::memory_order_acquire) == (sc.inert_at_stall ? 1 : 0));
+    // The retry has to run right after the tail (~stall); a stale deadline would leave it
+    // INFINITE (idle) or on the later obligation (~30 s).
+    const bool recovered = eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return !mech->stats().inert && d->pass_failures_consecutive == 0 &&
+                   d->pass_backoff_ms == 0;
+        },
+        2000ms);
+    INFO("recovery " << pf_ms_since(t_stall) << " ms after the stalled line (stall "
+                     << sc.stall.count() << " ms)");
+    CHECK(recovered);
+    CHECK_FALSE(mech->stats().inert);
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->pass_failed == sc.throws);
+}
+
 } // namespace
 
 TEST_CASE("File worker (direct): a persistently throwing pass does not spin - the pass count is "
@@ -6682,6 +6847,34 @@ TEST_CASE("File worker (direct): the retry after a failed pass runs at the backo
     CHECK_FALSE(mech->stats().inert);
     CHECK(file_debug_counters_for_test(*mech)->pass_failed == 1);
     mech->stop();
+}
+
+TEST_CASE("File worker (direct): a backoff deadline already expired when the failed pass's "
+          "off-lock tail ends still retries at once and clears inert, nothing else due "
+          "(#4658 PF-11)",
+          "[spark][mechanism][windows][passfail]") {
+    // Three injected failures at the production 50 ms cadence (backoffs 50/100/200 ms); the
+    // flip line of the third is written 400 ms late, so its 200 ms deadline is 200 ms stale.
+    pf_run_stale_deadline({.deferred = false,
+                           .throws = 3,
+                           .cadence = 50ms,
+                           .stall_target = "failing persistently",
+                           .stall = 400ms,
+                           .inert_at_stall = true});
+}
+
+TEST_CASE("File worker (direct): a backoff deadline already expired when the failed pass's "
+          "off-lock tail ends still retries at once, not at a later obligation (#4658 PF-12)",
+          "[spark][mechanism][windows][passfail]") {
+    // PF-10's state (a Deferred watch ~30 s away is the only other obligation) with one injected
+    // failure at cadence 100 ms; its "consecutive #1" line is written 300 ms late, so the 100 ms
+    // deadline is stale and the wake would slip to the Deferred deadline.
+    pf_run_stale_deadline({.deferred = true,
+                           .throws = 1,
+                           .cadence = 100ms,
+                           .stall_target = "consecutive #1",
+                           .stall = 300ms,
+                           .inert_at_stall = false});
 }
 
 TEST_CASE("File worker (direct): watch() of a second directory returns within budget while the "
