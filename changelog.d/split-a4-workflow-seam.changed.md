@@ -7,7 +7,8 @@
   wrapping `WorkflowEngine::list_workflows`/`get_workflow`/`get_execution` unmodified. `Workflow`/
   `WorkflowStep`/`WorkflowExecution`/`WorkflowStepResult`/`WorkflowQuery` relocated out of
   `workflow_engine.hpp` into a pure `workflow_types.hpp`; `workflow_model.hpp` now depends only on
-  that pure header instead of the store-coupled `workflow_engine.hpp`. The legacy unversioned
-  `GET`/`POST`/`DELETE`/`.../execute` routes (`workflow_routes.cpp`) are a separate, deliberately
-  untouched capability with no public REST v1/MCP twin of their own — unaffected, byte-identical
-  behaviour throughout.
+  that pure header instead of the store-coupled `workflow_engine.hpp`. The legacy unversioned GET
+  routes (`workflow_routes.cpp`) are the ones the new v1 GETs mirror, but are not themselves the
+  versioned resource; the `POST`/`DELETE`/`.../execute` mutators have no public REST v1/MCP twin of
+  their own at all. Both stay on the raw `WorkflowEngine*`, deliberately untouched — unaffected,
+  byte-identical behaviour throughout.

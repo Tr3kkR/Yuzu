@@ -3500,6 +3500,46 @@ TEST_CASE("GET /api/v1/workflows: lists workflows via the shared builder",
     CHECK(body["meta"]["api_version"] == "v1");
 }
 
+// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: the
+// pre-existing "store failure" test below guards this route only by
+// SIGSEGV on a revert-to-raw-engine mutation (a null-engine deref), not by a
+// clean CHECK -- this test closes that with a positive, non-crashing
+// tripwire: a REAL WorkflowEngine holding a genuine workflow AND a
+// DISTINGUISHING FnWorkflowApi override at once, so a revert flips this
+// specific test from pass to fail cleanly, matching the sibling tests above.
+TEST_CASE("GET /api/v1/workflows: answers via the WorkflowApi seam, not the raw engine, "
+          "when both are wired",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    Workflow seam_only;
+    seam_only.id = "seam-wf-only";
+    seam_only.name = "seam-double-name";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        [seam_only](const WorkflowQuery&) -> std::expected<std::vector<Workflow>, std::string> {
+            return std::vector<Workflow>{seam_only};
+        },
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/{}, /*workflow_api_override=*/seam_api);
+    h.make_def("def-SEAM-LIST", "seam-list");
+    h.make_workflow("engine-real-name", "def-SEAM-LIST");
+
+    auto res = h.sink.Get("/api/v1/workflows");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["name"] == "seam-double-name");
+}
+
 TEST_CASE("GET /api/v1/workflows/:id: full detail including yaml_source",
           "[pg][workflow][v1][twins]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -3530,6 +3570,52 @@ TEST_CASE("GET /api/v1/workflows/:id: 404 for an unknown id", "[pg][workflow][v1
     auto res = h.sink.Get("/api/v1/workflows/does-not-exist");
     REQUIRE(res);
     CHECK(res->status == 404);
+}
+
+// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: a
+// mutation run reverting this route (and get_workflow_execution below) to
+// call `workflow_engine` directly passed every pre-existing test unchanged
+// -- `workflow_routes.cpp` is INSPECTED-NOT-ENFORCED by
+// check-seam-closure.py, so nothing else caught it. This test wires a REAL
+// WorkflowEngine (so a revert-to-raw-engine still finds a live, answerable
+// store at the SAME id) AND a DISTINGUISHING FnWorkflowApi override at once,
+// so the two doors answer DIFFERENTLY -- a revert flips this from pass to
+// fail.
+TEST_CASE("GET /api/v1/workflows/:id: answers via the WorkflowApi seam, not the raw engine, "
+          "even for a valid real-engine id",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // The double ignores its `id` argument and always answers with a
+    // distinguishable name -- proving the response came from THIS double,
+    // not the real engine below, regardless of which real id is queried.
+    Workflow seam_only;
+    seam_only.name = "seam-double-detail";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [seam_only](const std::string&) -> std::expected<std::optional<Workflow>, std::string> {
+            return seam_only;
+        },
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    // Built with a REAL WorkflowEngine (so a revert-to-raw-engine still finds
+    // a live, answerable store at the SAME id) AND the distinguishing double
+    // above, passed to the constructor directly since register_routes
+    // captures workflow_api BY VALUE at construction time.
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/{}, /*workflow_api_override=*/seam_api);
+    h.make_def("def-SEAM-WF", "seam-wf");
+    auto real_id = h.make_workflow("engine-real-detail", "def-SEAM-WF");
+
+    auto res = h.sink.Get("/api/v1/workflows/" + real_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["name"] == "seam-double-detail");
 }
 
 TEST_CASE("GET /api/v1/workflows: 403 when Workflow:Read is denied", "[pg][workflow][v1][twins]") {
@@ -3632,6 +3718,51 @@ TEST_CASE("GET /api/v1/workflow-executions/:id: confines agent_ids to the caller
             audited_success = true;
     }
     CHECK(audited_success);
+}
+
+// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: same
+// mutation-testing shape as the sibling test on GET /api/v1/workflows/:id
+// above -- wires a REAL WorkflowEngine holding a genuine execution AND a
+// DISTINGUISHING FnWorkflowApi override at the same id, so a revert of this
+// route to call `workflow_engine` directly flips the test from pass to fail.
+TEST_CASE("GET /api/v1/workflow-executions/:id: answers via the WorkflowApi seam, not the "
+          "raw engine, even for a valid real-engine id",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // Ignores its `id` argument; unconfined (nullopt scope in the test) so
+    // its empty agent_ids_json still passes workflow_execution_visible().
+    WorkflowExecution seam_only;
+    seam_only.status = "seam-double-status";
+    seam_only.agent_ids_json = "[]";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        [seam_only](const std::string&)
+            -> std::expected<std::optional<WorkflowExecution>, std::string> {
+            return seam_only;
+        });
+
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/{}, /*workflow_api_override=*/seam_api);
+    h.make_def("def-SEAM-WFX", "seam-wfx");
+    auto wf_id = h.make_workflow("engine-real-exec-workflow", "def-SEAM-WFX");
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(R"({"status":"dispatched","command_id":"cmd-seam-wfx"})");
+    };
+    auto real_exec_id = h.workflows->execute(wf_id, {"agent-Q"}, dispatch_fn);
+    REQUIRE(real_exec_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/workflow-executions/" + *real_exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["status"] == "seam-double-status");
 }
 
 TEST_CASE("GET /api/v1/workflow-executions/:id: zero-overlap confined caller "
