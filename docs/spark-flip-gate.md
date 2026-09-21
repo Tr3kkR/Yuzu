@@ -1543,6 +1543,21 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (only the sequential/next-pass cases, not this same-pass mechanism) - so filing #3972 rather
   than a ledger `rejected` disposition was the deliberate correction, not a formality.
 
+**#4665** (agent log lines print operator-authored rule ids and Spark keys as authored, #4606 / PR #4657)
+- Detection signal: none - a forged physical line is indistinguishable from a real one in the agent
+  log; the R5.7 driver keeps the first line per rule and its closed `expected_rule_ids()` set is the
+  only filter.
+- Operator action: run benchmarks with harness-generated rule ids only (the driver's closed set) and
+  do not present an agent-only latency figure as criterion-10 evidence until #4665 is resolved.
+- Compensating control: the server-authored `Guardian T_server` line (neutralised on the server) is
+  the authoritative half of the join; no shipped consumer reads agent-log lines; the operator manual
+  (`docs/user-manual/server-admin.md`, Upgrade Notes) states which lines print ids as authored.
+- Owner: the author of the PR-5 (F14 flip) change.
+- Milestone: #4665 itself; it blocks criterion-10 sign-off and the F14 flip, whichever comes first.
+- Revisit trigger: the earlier of #4606 closing or the F14 flip PR opening, with a backstop review
+  date of 2026-10-31. **Not risk-accepted** - #4665 is a real, filed, open decision and remains a gating
+  item for the flip; this entry records the exposure and the compensating control only.
+
 **Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
 Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half (fixed by PR
@@ -1671,8 +1686,7 @@ line and the agent's legacy drift-sink `T_wire` line are live today; `T_detect` 
 switch other than `--log-level`. The trigger is #4606 closing (the benchmark campaign concluding):
 at that point, or no later than the PR-5 merge if that comes first, they must be retired or their
 emission moved behind a bounded non-blocking hand-off; left unrecorded they ship into the flip as
-permanent unconditional log volume. As of this writing no separate issue exists for the retirement,
-so this section is its only record.
+permanent unconditional log volume. The retirement and the hand-off are tracked in #4666.
 
 **NEW precondition for the F14 flip (added 2026-09-20, #4606 Gate 8 adjudication): synchronous
 benchmark log writes on the detection and delivery threads must be gone or non-blocking before
@@ -1698,7 +1712,24 @@ first per-event `info` line in the Subscribe handler (which already writes an `i
 stream opens, and one when a command completes inside its read loop). The architect Gate 8 reviewer
 adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark path each derive
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
-BLOCKING.
+BLOCKING. This precondition is tracked in #4666.
+
+**NEW precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
+governance review of the rule-id neutralisation): agent-side `Guardian T_detect` and `T_wire` lines may
+be used as latency evidence only if either every operator-authored identifier the agent logs is
+neutralised or rejected at one ingest chokepoint, or the correlator takes its join set from the
+server-authored `T_server` line and drops any agent line whose id is outside a benchmark-authored,
+charset-checked rule set.** Rule ids and Spark keys (which embed an operator-authored path) are
+unvalidated, and many agent log lines still print them as authored (the legacy file, registry and
+service guards, which are the live detection path today; SparkEngine; the Guardian engine; nine Spark
+key sites in the runtime), so a newline in an id lets one forged physical line pose as a benchmark
+record; the R5.7 driver already reads agent-log lines. Until one of the two holds, an agent-only latency
+figure must not be presented as criterion-10 evidence. The Spark runtime's own rule-id lines are already
+neutralised (PR #4657). The adjudication of this exposure was made by subagents of the authoring session
+(independence asserted, not verified) and awaits the PR reviewer's confirmation; it derives HIGH at the
+consumer that treats agent-log lines as evidence, not for the #4606 diff. Tracked in #4665, which also
+covers the documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for
+the driver.
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
