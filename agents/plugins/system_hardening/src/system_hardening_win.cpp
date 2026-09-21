@@ -1,26 +1,34 @@
 /**
  * system_hardening_win.cpp -- Windows leg of the system_hardening `posture`
  * action; defines collect_posture_win() from system_hardening_legs.hpp. All
- * decode logic is in the pure system_hardening_win_parsers.hpp; this TU owns
- * only the Win32 reads (rung 1: no spawn, no WMI, no PowerShell):
+ * decode and failure-classification logic is in the pure
+ * system_hardening_win_parsers.hpp; this TU owns only the Win32 reads
+ * (rung 1: no spawn, no WMI, no PowerShell):
  *   1. RegQueryValueExW on HKLM\SYSTEM\CurrentControlSet\Control\Session
  *      Manager\kernel : MitigationOptions, MitigationAuditOptions.
  *   2. GetProcessMitigationPolicy(GetCurrentProcess(), DEP/ASLR/CFG): the
  *      agent's OWN process only, as `self.*` rows.
  *
- * FAILURE SEMANTICS ("failure never reads as absent"), one token per cause:
- *   not found            -> `absent`,     <name>:not_found
+ * FAILURE SEMANTICS ("failure never reads as absent; absence is never a failure"):
+ *   ABSENT -- the OS definitively reports the thing is not there. The row reads
+ *   `absent`, adds NO token and does not lower the status:
+ *   ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on a registry value
+ *                        -> `absent`
+ *   GetProcessMitigationPolicy ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED
+ *                        -> `absent`
+ *   UNREADABLE -- the read failed; the row reads `unreadable` with one token per cause:
  *   ERROR_ACCESS_DENIED  -> `unreadable`, <name>:access_denied, status
  *                           PERMISSION_DENIED
  *   other Win32 / wrong REG type / oversized / undecodable blob
  *                        -> `unreadable`, <name>:win32_<n> | type_<n> |
  *                           oversized | <decoder token>
- *   GetProcessMitigationPolicy ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED
- *                        -> `absent`,     <name>:unsupported
- * Tokens accumulate in ConstraintAccumulator; status is PERMISSION_DENIED,
- * else CONSTRAINED/PARTIAL when any token exists, else OK/FULL. A missing or
- * unreadable key never yields a non-zero exit: return 0 for every data-level
- * outcome, 1 only for an internal exception (constrained|internal_error).
+ * Only unreadable rows accumulate tokens (ConstraintAccumulator); status is
+ * PERMISSION_DENIED, else CONSTRAINED/PARTIAL when any token exists, else
+ * OK/FULL. MitigationOptions/MitigationAuditOptions do not exist on a default
+ * install (the rig probe below), so that modal state reads two `absent` rows
+ * and OK/FULL. A missing or unreadable key never yields a non-zero exit:
+ * return 0 for every data-level outcome, 1 only for an internal exception
+ * (constrained|internal_error).
  *
  * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64) -- COMPLETE.
  * Run as NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest). Fixture + provenance:
@@ -46,7 +54,7 @@
  *                             ProcessASLRPolicy             BOOL=1 GetLastError=0 Flags=0x00000005
  *                             ProcessControlFlowGuardPolicy BOOL=1 GetLastError=0 Flags=0x00000000
  *   => ProcessDEPPolicy SUCCEEDS on x64, so `self.dep` is a real row there; the
- *      ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED -> `absent` (`:unsupported`) branch below is
+ *      ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED -> `absent` (no token) branch below is
  *      kept for 32-bit hosts and older builds and was not exercised on this rig.
  */
 
@@ -89,23 +97,27 @@ struct Probe {
     bool denied{false};
 };
 
-std::string win32_token(std::string_view name, DWORD err) {
-    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-        return std::string{name} + ":not_found";
-    if (err == ERROR_ACCESS_DENIED)
-        return std::string{name} + ":access_denied";
-    return std::string{name} + ":win32_" + std::to_string(err);
-}
+// The pure classifier keeps the Win32 numbers as plain integers; pin them to the SDK's.
+static_assert(mit::kErrorFileNotFound == static_cast<std::uint32_t>(ERROR_FILE_NOT_FOUND));
+static_assert(mit::kErrorPathNotFound == static_cast<std::uint32_t>(ERROR_PATH_NOT_FOUND));
+static_assert(mit::kErrorAccessDenied == static_cast<std::uint32_t>(ERROR_ACCESS_DENIED));
+static_assert(mit::kErrorNotSupported == static_cast<std::uint32_t>(ERROR_NOT_SUPPORTED));
+static_assert(mit::kErrorInvalidParameter == static_cast<std::uint32_t>(ERROR_INVALID_PARAMETER));
 
-/// `absent` for not-found, `unreadable` otherwise; one token per cause.
+/// Writes the row the pure classifier chose for one failed read. `absent` (the OS definitively
+/// says it is not there) adds no token and leaves the status alone; `unreadable` adds one token
+/// per cause, and ERROR_ACCESS_DENIED also marks the run PERMISSION_DENIED.
 void report_read_failure(yuzu::CommandContext& ctx, Probe& p, std::string_view row_name,
-                         DWORD err) {
-    const bool absent = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND);
-    if (err == ERROR_ACCESS_DENIED)
+                         DWORD err, mit::ReadSource source = mit::ReadSource::registry) {
+    const mit::ReadFailure f =
+        mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(err), source);
+    if (f.access_denied)
         p.denied = true;
-    p.acc.add_failure(win32_token(row_name, err));
-    p.acc.mark_incomplete();
-    ctx.write_output(mit::format_posture_row(row_name, "-", absent ? "absent" : "unreadable"));
+    if (!f.token.empty()) {
+        p.acc.add_failure(f.token);
+        p.acc.mark_incomplete();
+    }
+    ctx.write_output(mit::format_posture_row(row_name, "-", f.state));
 }
 
 void report_unreadable(yuzu::CommandContext& ctx, Probe& p, std::string_view row_name,
@@ -158,13 +170,7 @@ void collect_self(yuzu::CommandContext& ctx, Probe& p, PROCESS_MITIGATION_POLICY
     Policy policy{};
     if (!GetProcessMitigationPolicy(GetCurrentProcess(), which, &policy, sizeof(policy))) {
         const DWORD err = GetLastError();
-        if (err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_SUPPORTED) {
-            p.acc.add_failure(std::string{row_name} + ":unsupported");
-            p.acc.mark_incomplete();
-            ctx.write_output(mit::format_posture_row(row_name, "-", "absent"));
-            return;
-        }
-        return report_read_failure(ctx, p, row_name, err);
+        return report_read_failure(ctx, p, row_name, err, mit::ReadSource::process_policy);
     }
     for (const auto& r : mit::decode_self_policy(kind, static_cast<uint32_t>(policy.Flags)))
         ctx.write_output(mit::format_posture_row(r));

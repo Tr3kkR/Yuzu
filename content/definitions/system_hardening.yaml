@@ -23,9 +23,9 @@ metadata:
     reads eleven /proc/sys keys, macOS four sysctl keys, Windows the
     system-wide mitigation registry values plus the agent process's own
     DEP/ASLR/CFG policy. A key that does not exist on this host reads
-    `absent`; a key that exists but could not be read reads `unreadable`;
-    either one downgrades the result to CONSTRAINED/PARTIAL rather than
-    failing the command.
+    `absent`, which is a normal answer and not a failure; a key that exists
+    but could not be read reads `unreadable` and downgrades the result to
+    CONSTRAINED/PARTIAL rather than failing the command.
   tags: [system_hardening, security, posture, inventory]
 
 spec:

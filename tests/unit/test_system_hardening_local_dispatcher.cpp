@@ -9,13 +9,16 @@
  * dispatcher TU once hid a never-loaded plugin). Only the two host-specific
  * assertions consult a constexpr: on Linux/macOS the leg is this package's
  * and must emit exactly one row per allowlisted key; the Windows leg is a
- * sibling package's, so there only the row grammar and status pairing are
- * asserted. The Windows leg's <state> vocabulary is {on, off, default,
+ * sibling package's, so there only the row grammar and the status/token
+ * contract are asserted. The Windows leg's <state> vocabulary is {on, off, default,
  * unmodelled, absent, unreadable} by Architect ruling (a tri-state override,
  * not a hardening level), so the row-grammar check keys the accepted set on
  * the host. There is no host-specific VALUE assertion anywhere: CI runners
- * are shared and unknown-hardware, and an absent key (e.g. no Yama) is a
- * legitimate host answer that the contract turns into CONSTRAINED/PARTIAL.
+ * are shared and unknown-hardware, and an absent key (no Yama on a Docker
+ * kernel, no MitigationOptions on a default Windows install) is a legitimate,
+ * modal host answer: it adds no failure token and does not lower the status.
+ * Only an UNREADABLE key is a failure. The status test below holds on every
+ * host, Windows included, because that contract is the same on all three legs.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -146,6 +149,22 @@ bool is_state_token(const std::string& s) {
     return false;
 }
 
+/// The status reason is the comma-joined `<key>:<cause>` failure tokens.
+std::vector<std::string> split_tokens(const std::string& reason) {
+    std::vector<std::string> out;
+    std::istringstream ss(reason);
+    std::string tok;
+    while (std::getline(ss, tok, ','))
+        if (!tok.empty()) out.push_back(tok);
+    return out;
+}
+
+bool has_token_for(const std::vector<std::string>& tokens, const std::string& key) {
+    for (const auto& t : tokens)
+        if (t.rfind(key + ":", 0) == 0) return true;
+    return false;
+}
+
 } // namespace
 
 TEST_CASE("system_hardening plugin: every row is posture|os|key|raw|state with a known state",
@@ -196,7 +215,7 @@ TEST_CASE("system_hardening plugin: one row per allowlisted key, in allowlist or
     }
 }
 
-TEST_CASE("system_hardening plugin: the typed status agrees with the rows and names each failed key",
+TEST_CASE("system_hardening plugin: the typed status agrees with the rows; only an unreadable key is a failure",
           "[system_hardening][status]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -208,10 +227,13 @@ TEST_CASE("system_hardening plugin: the typed status agrees with the rows and na
     const auto rows = captured_rows(result.captured);
     REQUIRE_FALSE(rows.empty());
 
-    std::vector<std::vector<std::string>> failed;
+    std::vector<std::vector<std::string>> unreadable;
+    std::vector<std::vector<std::string>> absent;
     for (const auto& r : rows) {
         const auto f = split_fields(r);
-        if (f.size() == 5 && (f[4] == "absent" || f[4] == "unreadable")) failed.push_back(f);
+        if (f.size() != 5) continue;
+        if (f[4] == "unreadable") unreadable.push_back(f);
+        else if (f[4] == "absent") absent.push_back(f);
     }
     const bool is_ok = result.result_status == YUZU_RESULT_STATUS_OK;
     const bool is_constrained = result.result_status == YUZU_RESULT_STATUS_CONSTRAINED;
@@ -220,21 +242,33 @@ TEST_CASE("system_hardening plugin: the typed status agrees with the rows and na
     const bool is_denied =
         !kLegIsThisPackages && result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
     REQUIRE((is_ok || is_constrained || is_denied));
+    const auto tokens = split_tokens(result.result_provenance);
     if (is_ok) {
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        CHECK(tokens.empty());
     } else {
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
         CHECK_FALSE(result.result_provenance.empty());
     }
-    if (!kLegIsThisPackages) return; // the iff and the token grammar are this package's contract
-    // Constrained exactly when some key did not read -- no silent OK, no phantom failure.
-    CHECK(is_constrained == !failed.empty());
-    for (const auto& f : failed) {
-        INFO("failed key: " << f[2]);
-        // Distinct cause tokens: absent <-> `<key>:enoent`, unreadable <-> any other cause.
-        const bool has_enoent = result.result_provenance.find(f[2] + ":enoent") != std::string::npos;
-        CHECK(has_enoent == (f[4] == "absent"));
-        CHECK(result.result_provenance.find(f[2] + ":") != std::string::npos);
+    // OK exactly when no key was unreadable -- no silent OK, no phantom failure. An absent key
+    // (no Yama on a Docker kernel, no MitigationOptions on a default Windows install) does NOT
+    // lower the status.
+    CHECK(is_ok == unreadable.empty());
+    // An unreadable key is named by a `<key>:<cause>` token; an absent key has none.
+    for (const auto& f : unreadable) {
+        INFO("unreadable key: " << f[2]);
+        CHECK(has_token_for(tokens, f[2]));
+    }
+    for (const auto& f : absent) {
+        INFO("absent key: " << f[2]);
+        CHECK_FALSE(has_token_for(tokens, f[2]));
+    }
+    // The retired absence tokens must never come back.
+    for (const auto& t : tokens) {
+        INFO("token: " << t);
+        CHECK(t.find(":enoent") == std::string::npos);
+        CHECK(t.find(":not_found") == std::string::npos);
+        CHECK(t.find(":unsupported") == std::string::npos);
     }
 }
 

@@ -2,8 +2,9 @@
  * system_hardening_legs.hpp -- the seam between the portable plugin TU and
  * the three per-OS leg TUs (modelled on peripherals_legs.hpp /
  * disk_actions_legs.hpp). Each entry point is a READ that returns 0
- * unconditionally: a missing or unreadable key is a degraded read reported
- * through set_result_status, never a failed command.
+ * unconditionally: an unreadable key is a degraded read reported through
+ * set_result_status, never a failed command, and an absent key is not a
+ * failure at all.
  *
  * Declared unconditionally so every TU sees one signature on every OS; only
  * the DEFINITION is self-gated (each leg TU wraps its whole body in
@@ -24,10 +25,10 @@ int collect_posture_linux(yuzu::CommandContext& ctx);
 int collect_posture_macos(yuzu::CommandContext& ctx);
 int collect_posture_win(yuzu::CommandContext& ctx);
 
-/// Writes every row, then the CC-07 status: OK/FULL only when every
-/// allowlisted key was read (acc holds no failure token); otherwise
-/// CONSTRAINED/PARTIAL with the accumulated `<key>:<cause>` tokens as the
-/// reason. An absent optional key downgrades the run by design.
+/// Writes every row, then the CC-07 status: OK/FULL when acc holds no failure
+/// token (every key was a value or `absent`); otherwise CONSTRAINED/PARTIAL
+/// with the accumulated `<key>:<cause>` tokens as the reason. Only an
+/// `unreadable` key adds a token; an absent optional key never downgrades the run.
 inline void emit_posture(yuzu::CommandContext& ctx, const std::vector<PostureRow>& rows,
                          const yuzu::shared::ConstraintAccumulator& acc) {
     for (const auto& r : rows)

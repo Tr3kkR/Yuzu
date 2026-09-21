@@ -34,12 +34,17 @@
  *    loudly (never skips) if the capture is missing.
  * 2. The agent's own GetProcessMitigationPolicy `Flags` DWORD
  *    (decode_self_policy): effective policy, on/off only.
+ * 3. A failed Win32 read (classify_win32_failure): the OS definitively saying
+ *    the value / policy is not there is `absent` and carries NO failure token;
+ *    every other failure is `unreadable` with exactly one token.
  *
  * ROW: posture|windows|<policy>|<raw>|<state>, state in {on, off, default,
  * unmodelled, absent, unreadable}. `absent` = the OS says it does not exist;
- * `unreadable` = the read failed. Never one token for both. <raw> is "-" when
- * nothing was read (absent/unreadable), matching system_hardening_parsers.hpp.
- * Never throws (bad_alloc aside); fallible functions return std::expected.
+ * `unreadable` = the read failed. Never one state for both, and only
+ * `unreadable` adds a reason token (absence never lowers the result status).
+ * <raw> is "-" when nothing was read (absent/unreadable), matching
+ * system_hardening_parsers.hpp. Never throws (bad_alloc aside); fallible
+ * functions return std::expected.
  */
 
 #include <array>
@@ -230,6 +235,39 @@ inline std::vector<MitigationRow> decode_self_policy(SelfPolicy which, uint32_t 
         rows.push_back({std::string{b.name}, std::to_string(flags),
                         ((flags >> b.bit) & 1u) ? PolicyState::on : PolicyState::off});
     return rows;
+}
+
+/// Win32 error numbers the leg classifies, as plain numbers so this header stays
+/// free of <windows.h> (system_hardening_win.cpp static_asserts each against winerror.h).
+inline constexpr std::uint32_t kErrorFileNotFound = 2;
+inline constexpr std::uint32_t kErrorPathNotFound = 3;
+inline constexpr std::uint32_t kErrorAccessDenied = 5;
+inline constexpr std::uint32_t kErrorNotSupported = 50;
+inline constexpr std::uint32_t kErrorInvalidParameter = 87;
+
+/// Which Win32 call failed: ERROR_INVALID_PARAMETER / ERROR_NOT_SUPPORTED mean "this policy
+/// does not exist here" from GetProcessMitigationPolicy, but are real failures of a registry read.
+enum class ReadSource { registry, process_policy };
+
+/// How one failed Win32 read is reported. `state` is "absent" when the OS definitively says the
+/// thing is not there (`token` empty: no failure, status unaffected) and "unreadable" otherwise
+/// (`token` = one `<name>:<cause>` failure token). `access_denied` marks the PERMISSION_DENIED case.
+struct ReadFailure {
+    std::string_view state;
+    std::string token;
+    bool access_denied{false};
+};
+
+inline ReadFailure classify_win32_failure(std::string_view name, std::uint32_t err,
+                                          ReadSource source) {
+    const bool not_found = err == kErrorFileNotFound || err == kErrorPathNotFound;
+    const bool unsupported = source == ReadSource::process_policy &&
+                             (err == kErrorInvalidParameter || err == kErrorNotSupported);
+    if (not_found || unsupported)
+        return {"absent", {}, false};
+    if (err == kErrorAccessDenied)
+        return {"unreadable", std::string{name} + ":access_denied", true};
+    return {"unreadable", std::string{name} + ":win32_" + std::to_string(err), false};
 }
 
 /// Hex text -> bytes. Accepts bare hex (whitespace, optional "0x") or a

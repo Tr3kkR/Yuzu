@@ -14,19 +14,23 @@
  * value: kernel.sysrq=0 is `enabled` (sysrq closed), kern.coredump=1 is
  * `disabled` (core dumps allowed). `unmodelled` = a value was read but this
  * table has no interpretation for it (the raw column still carries it).
- * `absent` (the key does not exist here) and `unreadable` (it exists, or may
- * exist, but the read failed) are distinct states with distinct reason
- * tokens; a failed read NEVER reads as absent (the errno decides).
+ * `absent` (the OS definitively reports the key is not there) and `unreadable`
+ * (it exists, or may exist, but the read failed) are distinct states; a failed
+ * read NEVER reads as absent (the errno decides). ABSENCE IS NOT A FAILURE: an
+ * optional key that is simply not present (Yama not built into the kernel, an
+ * unknown sysctl oid) is the modal state on some hosts, so an `absent` row adds
+ * NO reason token and does not lower the result status.
  *
  * <raw> is "-" when no value was read (absent/unreadable); an empty value that
  * WAS read (macOS kern.bootargs) is an empty column.
  *
- * REASON TOKENS (yuzu::shared::ConstraintAccumulator, one per failed key):
- *   <key>:enoent          -> absent
+ * REASON TOKENS (yuzu::shared::ConstraintAccumulator, one per UNREADABLE key;
+ * an absent key adds none):
  *   <key>:eacces          -> unreadable (EACCES or EPERM)
  *   <key>:errno_<n>       -> unreadable (any other errno)
- * By design an absent optional key (e.g. Yama not built into the kernel)
- * therefore downgrades the action to CONSTRAINED/PARTIAL.
+ * ENOENT is the only errno that reads as `absent`, and it carries no token. A
+ * run whose every key is a value or `absent` therefore reports OK/FULL;
+ * CONSTRAINED/PARTIAL appears only when at least one key is `unreadable`.
  *
  * EMPTY IS NOT FAILED: an empty macOS kern.bootargs is a successful read of
  * an empty string (sysctlbyname size probe rc=0, len=1 -- a lone NUL); the
@@ -206,11 +210,13 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
     return err == ENOENT ? PostureState::absent : PostureState::unreadable;
 }
 
-/// `<key>:enoent` | `<key>:eacces` | `<key>:errno_<n>`.
-[[nodiscard]] inline std::string failure_token(std::string_view key, int err) {
+/// The reason token of a FAILED read: `<key>:eacces` | `<key>:errno_<n>`.
+/// Absence is not a failure: for ENOENT (classified `absent`) there is no
+/// token, so the result is nullopt and nothing reaches the accumulator.
+[[nodiscard]] inline std::optional<std::string> failure_token(std::string_view key, int err) {
+    if (classify_read_errno(err) == PostureState::absent) return std::nullopt;
     std::string t{key};
-    if (err == ENOENT) t += ":enoent";
-    else if (err == EACCES || err == EPERM) t += ":eacces";
+    if (err == EACCES || err == EPERM) t += ":eacces";
     else t += ":errno_" + std::to_string(err);
     return t;
 }
@@ -247,9 +253,12 @@ struct ReadOutcome {
     std::string text;
 };
 
+/// A read that returned errno `err`: an `absent` row with NO token for ENOENT,
+/// otherwise an `unreadable` row whose one token is recorded in `acc` (the only
+/// thing that can move the result status off OK/FULL).
 [[nodiscard]] inline PostureRow failed_row(std::string_view os, std::string_view key, int err,
                                            yuzu::shared::ConstraintAccumulator& acc) {
-    acc.add_failure(failure_token(key, err));
+    if (const auto token = failure_token(key, err)) acc.add_failure(*token);
     return {os, key, "-", classify_read_errno(err)};
 }
 

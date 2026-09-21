@@ -9,7 +9,10 @@
  * malformed input). Only the five options that capture enabled (nibbles 0, 1,
  * 4, 5, 10 = dep, sehop, aslr_bottom_up, aslr_high_entropy, cfg) are confirmed
  * on hardware; the other nibble positions are inferred, so a RECONSTRUCTION
- * case proves table mechanics, not what Windows does for that policy.
+ * case proves table mechanics, not what Windows does for that policy. The
+ * Win32 failure classifier is pinned by RECONSTRUCTION too: the error numbers
+ * are the winerror.h constants, and the Windows-only shell that applies them
+ * (system_hardening_win.cpp) is exercised on the Windows CI leg.
  */
 #include "system_hardening_win_parsers.hpp"
 
@@ -220,6 +223,75 @@ TEST_CASE("row format: posture|windows|<policy>|<raw>|<state>", "[system_hardeni
           "posture|windows|mitigation.cfg|0x1|on");
     CHECK(format_posture_row("mitigation_options", "-", "absent") ==
           "posture|windows|mitigation_options|-|absent");
+}
+
+TEST_CASE("win32 failures: not found is absent with NO token, on the registry and the policy call",
+          "[system_hardening][win_parsers]") {
+    // The default Windows 11 state (the rig capture): MitigationOptions / MitigationAuditOptions
+    // do not exist. That is a modal state, not a failure: no token, so the run stays OK/FULL.
+    for (const auto err : {kErrorFileNotFound, kErrorPathNotFound}) {
+        for (const auto src : {ReadSource::registry, ReadSource::process_policy}) {
+            const auto f = classify_win32_failure("mitigation_options", err, src);
+            INFO("err=" << err);
+            CHECK(f.state == "absent");
+            CHECK(f.token.empty());
+            CHECK_FALSE(f.access_denied);
+            CHECK(format_posture_row("mitigation_options", "-", f.state) ==
+                  "posture|windows|mitigation_options|-|absent");
+        }
+    }
+}
+
+TEST_CASE("win32 failures: GetProcessMitigationPolicy INVALID_PARAMETER / NOT_SUPPORTED are absent, "
+          "no token; a registry read of the same errors is a real failure",
+          "[system_hardening][win_parsers]") {
+    for (const auto err : {kErrorInvalidParameter, kErrorNotSupported}) {
+        const auto policy = classify_win32_failure("self.dep", err, ReadSource::process_policy);
+        INFO("err=" << err);
+        CHECK(policy.state == "absent");
+        CHECK(policy.token.empty()); // the retired `:unsupported` token must not come back
+        CHECK_FALSE(policy.access_denied);
+
+        const auto reg = classify_win32_failure("mitigation_options", err, ReadSource::registry);
+        CHECK(reg.state == "unreadable");
+        CHECK(reg.token == "mitigation_options:win32_" + std::to_string(err));
+    }
+}
+
+TEST_CASE("win32 failures: access denied and any other error are unreadable with exactly one token",
+          "[system_hardening][win_parsers]") {
+    for (const auto src : {ReadSource::registry, ReadSource::process_policy}) {
+        const auto denied = classify_win32_failure("mitigation_options", kErrorAccessDenied, src);
+        CHECK(denied.state == "unreadable");
+        CHECK(denied.token == "mitigation_options:access_denied");
+        CHECK(denied.access_denied); // the PERMISSION_DENIED case
+
+        // ERROR_INVALID_FUNCTION (1), ERROR_MORE_DATA (234), an arbitrary code: all real failures.
+        for (const std::uint32_t err : {1u, 234u, 1450u}) {
+            const auto other = classify_win32_failure("self.cfg", err, src);
+            INFO("err=" << err);
+            CHECK(other.state == "unreadable");
+            CHECK(other.token == "self.cfg:win32_" + std::to_string(err));
+            CHECK_FALSE(other.access_denied);
+        }
+    }
+    // Absent and unreadable never share a state, and only the failure carries a token.
+    const auto absent = classify_win32_failure("k", kErrorFileNotFound, ReadSource::registry);
+    const auto failed = classify_win32_failure("k", kErrorAccessDenied, ReadSource::registry);
+    CHECK(absent.state != failed.state);
+    CHECK(absent.token.empty());
+    CHECK_FALSE(failed.token.empty());
+}
+
+TEST_CASE("win32 failures: the classified error numbers are the winerror.h constants",
+          "[system_hardening][win_parsers]") {
+    // system_hardening_win.cpp static_asserts these against the SDK on Windows; pinned here on
+    // every OS so a typo in the pure header fails loudly on the fast suites too.
+    CHECK(kErrorFileNotFound == 2u);      // ERROR_FILE_NOT_FOUND
+    CHECK(kErrorPathNotFound == 3u);      // ERROR_PATH_NOT_FOUND
+    CHECK(kErrorAccessDenied == 5u);      // ERROR_ACCESS_DENIED
+    CHECK(kErrorNotSupported == 50u);     // ERROR_NOT_SUPPORTED
+    CHECK(kErrorInvalidParameter == 87u); // ERROR_INVALID_PARAMETER
 }
 
 TEST_CASE("REAL CAPTURE: decoded DEP/ASLR/CFG match Get-ProcessMitigation -System",

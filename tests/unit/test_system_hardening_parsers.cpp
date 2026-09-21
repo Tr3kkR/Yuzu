@@ -90,6 +90,20 @@ std::string raw_of(const std::vector<PostureRow>& rows, std::string_view key) {
     return "<missing>";
 }
 
+/// Does any accumulated reason token belong to `key` (`<key>:<cause>`)?
+bool has_token_for(const ConstraintAccumulator& acc, std::string_view key) {
+    const std::string reason = acc.reason();
+    std::size_t pos = 0;
+    while (pos <= reason.size()) {
+        auto end = reason.find(',', pos);
+        if (end == std::string::npos) end = reason.size();
+        const std::string_view token{reason.data() + pos, end - pos};
+        if (token.substr(0, key.size() + 1) == std::string{key} + ":") return true;
+        pos = end + 1;
+    }
+    return false;
+}
+
 } // namespace
 
 // ── allowlists ───────────────────────────────────────────────────────────
@@ -134,13 +148,49 @@ TEST_CASE("system_hardening: only ENOENT is absent; every other errno is unreada
     CHECK(classify_read_errno(EINVAL) == PostureState::unreadable);
 }
 
-TEST_CASE("system_hardening: ENOENT / EACCES(EPERM) / other errno carry distinct reason tokens",
+TEST_CASE("system_hardening: only a FAILED read has a reason token; ENOENT (absent) has none",
           "[system_hardening][errno]") {
-    CHECK(failure_token("k", ENOENT) == "k:enoent");
-    CHECK(failure_token("k", EACCES) == "k:eacces");
-    CHECK(failure_token("k", EPERM) == "k:eacces");
-    CHECK(failure_token("k", EIO) == "k:errno_" + std::to_string(EIO));
-    CHECK(failure_token("k", EIO) != failure_token("k", ENOENT));
+    // Absence is not a failure: no token can be minted for ENOENT.
+    CHECK_FALSE(failure_token("k", ENOENT).has_value());
+    // Failures carry distinct tokens: EACCES/EPERM share one, every other errno its own number.
+    const auto eacces = failure_token("k", EACCES);
+    const auto eperm = failure_token("k", EPERM);
+    const auto eio = failure_token("k", EIO);
+    REQUIRE(eacces.has_value());
+    REQUIRE(eperm.has_value());
+    REQUIRE(eio.has_value());
+    CHECK(*eacces == "k:eacces");
+    CHECK(*eperm == "k:eacces");
+    CHECK(*eio == "k:errno_" + std::to_string(EIO));
+    CHECK(*eio != *eacces);
+    // A token exists exactly when the errno classifies as `unreadable`.
+    for (const int err : {ENOENT, EACCES, EPERM, EIO, EINVAL})
+        CHECK(failure_token("k", err).has_value() ==
+              (classify_read_errno(err) == PostureState::unreadable));
+}
+
+TEST_CASE("system_hardening: failed_row -- ENOENT is an absent row with no token, any other errno "
+          "an unreadable row with its token",
+          "[system_hardening][errno]") {
+    ConstraintAccumulator acc;
+    const auto absent = failed_row("linux", "k.absent", ENOENT, acc);
+    CHECK(absent.state == PostureState::absent);
+    CHECK(absent.raw == "-");
+    CHECK_FALSE(acc.any_failure()); // absence alone never moves the status
+    CHECK(acc.reason().empty());
+
+    const auto denied = failed_row("linux", "k.denied", EACCES, acc);
+    CHECK(denied.state == PostureState::unreadable);
+    CHECK(denied.raw == "-");
+    CHECK(acc.any_failure());
+    CHECK(acc.reason() == "k.denied:eacces");
+
+    const auto io = failed_row("linux", "k.io", EIO, acc);
+    CHECK(io.state == PostureState::unreadable);
+    CHECK(acc.reason() == "k.denied:eacces,k.io:errno_" + std::to_string(EIO));
+    // A later absent key adds nothing to the tokens already recorded.
+    (void)failed_row("linux", "k.absent2", ENOENT, acc);
+    CHECK(acc.reason() == "k.denied:eacces,k.io:errno_" + std::to_string(EIO));
 }
 
 // ── mappers ──────────────────────────────────────────────────────────────
@@ -224,7 +274,8 @@ TEST_CASE("system_hardening: format_posture_row is posture|os|key|raw|state and 
 
 // ── collect loops through the injected reader ───────────────────────────
 
-TEST_CASE("system_hardening: ENOENT, EACCES and a successful read give three distinct rows and tokens",
+TEST_CASE("system_hardening: ENOENT, EACCES and a successful read give three distinct rows; only the "
+          "failures carry tokens",
           "[system_hardening][collect]") {
     // kernel.randomize_va_space: value; kptr_restrict: EACCES; yama: ENOENT;
     // dmesg_restrict: EPERM; sysrq: EIO; everything else: value "1".
@@ -246,21 +297,76 @@ TEST_CASE("system_hardening: ENOENT, EACCES and a successful read give three dis
     CHECK(state_of(rows, "kernel.dmesg_restrict") == PostureState::unreadable);
     CHECK(state_of(rows, "kernel.sysrq") == PostureState::unreadable);
     CHECK(raw_of(rows, "kernel.yama.ptrace_scope") == "-");
+    // The absent key (yama) adds NO token; the three unreadable keys carry exactly theirs. A mixed
+    // run is therefore CONSTRAINED/PARTIAL (emit_posture keys on acc.any_failure()) for the
+    // unreadable keys alone.
     CHECK(acc.any_failure());
-    CHECK(acc.reason() == "kernel.kptr_restrict:eacces,kernel.yama.ptrace_scope:enoent,"
-                          "kernel.dmesg_restrict:eacces,kernel.sysrq:errno_" + std::to_string(EIO));
+    CHECK(acc.reason() == "kernel.kptr_restrict:eacces,kernel.dmesg_restrict:eacces,"
+                          "kernel.sysrq:errno_" + std::to_string(EIO));
+    CHECK_FALSE(has_token_for(acc, "kernel.yama.ptrace_scope"));
+    CHECK(acc.reason().find("enoent") == std::string::npos);
 }
 
-TEST_CASE("system_hardening: a later successful read never erases an earlier failure",
+TEST_CASE("system_hardening: a run of only values and absent keys adds no token (OK/FULL)",
           "[system_hardening][collect]") {
+    // Three keys ENOENT (yama, bpf, sysrq: e.g. a Docker kernel without them), the rest values.
     auto reader = [](std::string_view path) -> ReadOutcome {
-        if (path == "/proc/sys/kernel/randomize_va_space") return {ENOENT, 0, {}}; // FIRST key fails
+        if (path == "/proc/sys/kernel/yama/ptrace_scope" ||
+            path == "/proc/sys/kernel/unprivileged_bpf_disabled" ||
+            path == "/proc/sys/kernel/sysrq")
+            return {ENOENT, 0, {}};
         return {0, 0, "1\n"};
     };
     ConstraintAccumulator acc;
     const auto rows = collect_linux_posture(reader, acc);
     REQUIRE(rows.size() == kLinuxAllowlist.size());
-    CHECK(acc.reason() == "kernel.randomize_va_space:enoent");
+    CHECK(state_of(rows, "kernel.yama.ptrace_scope") == PostureState::absent);
+    CHECK(state_of(rows, "kernel.unprivileged_bpf_disabled") == PostureState::absent);
+    CHECK(state_of(rows, "kernel.sysrq") == PostureState::absent);
+    CHECK_FALSE(acc.any_failure()); // emit_posture reports OK/FULL exactly when this holds
+    CHECK(acc.reason().empty());
+}
+
+TEST_CASE("system_hardening: every key absent is still not a failure",
+          "[system_hardening][collect]") {
+    ConstraintAccumulator acc;
+    const auto rows =
+        collect_linux_posture([](std::string_view) { return ReadOutcome{ENOENT, 0, {}}; }, acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    for (const auto& r : rows) {
+        CHECK(r.state == PostureState::absent);
+        CHECK(r.raw == "-");
+    }
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("system_hardening: a mixed absent + EACCES run reports exactly the EACCES token",
+          "[system_hardening][collect]") {
+    auto reader = [](std::string_view path) -> ReadOutcome {
+        if (path == "/proc/sys/kernel/yama/ptrace_scope") return {ENOENT, 0, {}};
+        if (path == "/proc/sys/kernel/kptr_restrict") return {EACCES, 0, {}};
+        return {0, 0, "1\n"};
+    };
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(reader, acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    CHECK(state_of(rows, "kernel.yama.ptrace_scope") == PostureState::absent);
+    CHECK(state_of(rows, "kernel.kptr_restrict") == PostureState::unreadable);
+    CHECK(acc.any_failure()); // CONSTRAINED/PARTIAL, because of the EACCES key alone
+    CHECK(acc.reason() == "kernel.kptr_restrict:eacces");
+}
+
+TEST_CASE("system_hardening: a later successful read never erases an earlier failure",
+          "[system_hardening][collect]") {
+    auto reader = [](std::string_view path) -> ReadOutcome {
+        if (path == "/proc/sys/kernel/randomize_va_space") return {EACCES, 0, {}}; // FIRST key fails
+        return {0, 0, "1\n"};
+    };
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(reader, acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    CHECK(state_of(rows, "kernel.randomize_va_space") == PostureState::unreadable);
+    CHECK(acc.reason() == "kernel.randomize_va_space:eacces");
 }
 
 TEST_CASE("system_hardening: an all-values Linux read adds no failure token and stays in allowlist order",
@@ -288,7 +394,8 @@ TEST_CASE("system_hardening: macOS collect classifies ENOENT/EPERM and treats em
     CHECK(state_of(rows, "kern.sugid_coredump") == PostureState::disabled);
     CHECK(state_of(rows, "kern.bootargs") == PostureState::enabled);
     CHECK(raw_of(rows, "kern.bootargs").empty()); // read-and-empty, not "-"
-    CHECK(acc.reason() == "kern.securelevel:enoent,kern.coredump:eacces"); // bootargs adds nothing
+    // The absent key (securelevel) and the empty bootargs add nothing: the EPERM key is the only token.
+    CHECK(acc.reason() == "kern.coredump:eacces");
 }
 
 // ── REAL CAPTURE fixtures ────────────────────────────────────────────────
@@ -309,9 +416,12 @@ TEST_CASE("system_hardening: REAL CAPTURE docker debian:12 and fedora:40 /proc/s
         CHECK(state_of(rows, "fs.protected_hardlinks") == P::enabled);
         CHECK(state_of(rows, "fs.protected_fifos") == P::disabled);
         CHECK(state_of(rows, "fs.suid_dumpable") == P::enabled);
-        // Yama is genuinely not built into this kernel: the real ENOENT case.
+        // Yama is genuinely not built into this kernel: the real ENOENT case. It is `absent`, and
+        // absence is not a failure: this whole real-capture host reads with no token (OK/FULL).
         CHECK(state_of(rows, "kernel.yama.ptrace_scope") == P::absent);
-        CHECK(acc.reason() == "kernel.yama.ptrace_scope:enoent"); // exactly one failure, by design
+        CHECK(raw_of(rows, "kernel.yama.ptrace_scope") == "-");
+        CHECK_FALSE(acc.any_failure());
+        CHECK(acc.reason().empty());
     }
 }
 
@@ -337,7 +447,13 @@ TEST_CASE("system_hardening: REAL CAPTURE this Mac's sysctl reads (empty bootarg
     const auto nx = fx.at("kern.nx");
     REQUIRE_FALSE(nx.ok);
     CHECK(classify_read_errno(errno_of(nx.text)) == PostureState::absent);
-    CHECK(failure_token("kern.nx", errno_of(nx.text)) == "kern.nx:enoent");
+    // ...and, being absent, it carries no reason token.
+    CHECK_FALSE(failure_token("kern.nx", errno_of(nx.text)).has_value());
+    ConstraintAccumulator nx_acc;
+    const auto nx_row = failed_row("macos", "kern.nx", errno_of(nx.text), nx_acc);
+    CHECK(nx_row.state == PostureState::absent);
+    CHECK(nx_row.raw == "-");
+    CHECK_FALSE(nx_acc.any_failure());
 }
 
 TEST_CASE("system_hardening: RECONSTRUCTION malformed values map to unmodelled, never a guess",
@@ -351,4 +467,7 @@ TEST_CASE("system_hardening: RECONSTRUCTION malformed values map to unmodelled, 
     CHECK(state_of(rows, "kernel.sysrq") == PostureState::unmodelled);              // empty file
     CHECK(state_of(rows, "fs.protected_fifos") == PostureState::unmodelled);        // overflow
     CHECK(raw_of(rows, "kernel.randomize_va_space") == "banana"); // the raw is still reported
+    // Unmodelled values and the keys this fixture omits (ENOENT -> absent) are not failures.
+    CHECK(state_of(rows, "kernel.yama.ptrace_scope") == PostureState::absent);
+    CHECK_FALSE(acc.any_failure());
 }
