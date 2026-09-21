@@ -190,6 +190,16 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
+<!-- TODO(integrator, ws-10.2b browser_policy): after merging fresh dev, regenerate the block below on
+     Linux (tools/capmatrix-gen over the built browser_policy plugin) so it carries the three
+     `browser_policy | policies` rows (linux supported, macos planned, windows planned; the two
+     planned rows carry the fallback "follows as its own PR"), then add the hand-kept
+     browser_policy row to the Agent plugins table above and bump its plugin counts (57 -> 58 for
+     this PR alone; re-sum against whatever else has landed). Then take the Linux and macOS
+     samples (docs/samples), run `plugin_doc_gen.py --stamp browser_policy <os>` for each and
+     `plugin_doc_gen.py --all`; until then `plugin_doc_gen.py --check` reports this plugin's
+     missing matrix rows and captures. Remove this comment when done. -->
+
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
