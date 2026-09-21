@@ -104,13 +104,29 @@ inline std::string cfstring_to_utf8(CFStringRef s) {
     return out;
 }
 
+// CFBundleIdentifier of the bundle at `url` (borrowed: the caller keeps the CFURL),
+// or "" when it is not a readable bundle or carries no identifier. The ONE
+// bundle-id read in this plugin: bundle_id_for() (the `list` action's bundle_id
+// column) builds a URL from a path and calls it; enrich_app() passes the CFURL it
+// already built for SecStaticCode, so each app costs one CFURL, not two.
+inline std::string bundle_id_for_url(CFURLRef url) {
+    auto* raw_bundle = CFBundleCreate(nullptr, url);
+    if (!raw_bundle)
+        return {};
+    yuzu::agent::ScopedCFRef<CFBundleRef> bundle(raw_bundle);
+    // CFBundleGetIdentifier returns a BORROWED (Get-rule) reference owned
+    // by the bundle -- never itself ScopedCFRef-wrapped, matching
+    // certificates_plugin.cpp's own borrowed-vs-owned discipline.
+    return cfstring_to_utf8(CFBundleGetIdentifier(bundle.get()));
+}
+
 } // namespace detail
 
 // Bundle identifier (CFBundleIdentifier) for the app at `app_path` (an absolute
 // .app path), or "" when the path is not a readable bundle or carries no
-// identifier. The ONE bundle-id read in this plugin: enrich_app() below and the
-// `list` action's bundle_id column both call it. No SecStaticCode -- CFBundle
-// only, so it is cheap enough for the interactive `list` path.
+// identifier. The `list` action's bundle_id column calls this; the read itself is
+// detail::bundle_id_for_url, shared with enrich_app(). No SecStaticCode --
+// CFBundle only, so it is cheap enough for the interactive `list` path.
 inline std::string bundle_id_for(const std::string& app_path) {
     yuzu::agent::ScopedCFRef<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
         // reinterpret_cast char* -> const UInt8*: byte-type aliasing is the
@@ -121,14 +137,7 @@ inline std::string bundle_id_for(const std::string& app_path) {
         static_cast<CFIndex>(app_path.size()), /*isDirectory=*/true));
     if (!url)
         return {};
-    auto* raw_bundle = CFBundleCreate(nullptr, url.get());
-    if (!raw_bundle)
-        return {};
-    yuzu::agent::ScopedCFRef<CFBundleRef> bundle(raw_bundle);
-    // CFBundleGetIdentifier returns a BORROWED (Get-rule) reference owned
-    // by the bundle -- never itself ScopedCFRef-wrapped, matching
-    // certificates_plugin.cpp's own borrowed-vs-owned discipline.
-    return detail::cfstring_to_utf8(CFBundleGetIdentifier(bundle.get()));
+    return detail::bundle_id_for_url(url.get());
 }
 
 // Enrich one app bundle at `app_path` (an absolute .app path, taken from a
@@ -149,8 +158,8 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     if (!url)
         return out;
 
-    // -- bundle identifier via CFBundle (shared read, see bundle_id_for) --
-    out.bundle_id = bundle_id_for(app_path);
+    // -- bundle identifier via CFBundle (shared read, see detail::bundle_id_for_url) --
+    out.bundle_id = detail::bundle_id_for_url(url.get());
 
     // -- signer + integrity via SecStaticCode --
     // ADOPT FIRST, TEST SECOND. Testing the status before adopting leaves a

@@ -11,13 +11,16 @@
  *             (no "-" placeholders, no sentinel row on an empty result).
  *
  * Output is pipe-delimited, one record per line via write_output():
- *   app|name|version|publisher|install_date                       (list/query)
+ *   app|name|version|publisher|install_date|install_location|bundle_id  (list)
+ *   app|name|version|publisher                                (query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
  *       signature_status|distro_id|distro_version                 (list_inventory)
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
- * (content/definitions/installed_apps.yaml et al.) — extend `list_inventory`,
- * never those.
+ * (content/definitions/installed_apps.yaml et al.). `list`'s two trailing
+ * columns were added under ADR-0028's binding condition (PR10.1-a) with its
+ * first five fields unchanged; never widen `query`/`list_per_user` — extend
+ * `list_inventory` for anything the daily sync needs.
  */
 
 #include <yuzu/plugin.hpp>
@@ -26,6 +29,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 // Pure parse/format helpers for the list_inventory action (v2 rows). In a
@@ -305,6 +309,11 @@ std::string sanitize_utf8(const std::string& s) {
 // namespace so the existing unqualified call sites resolve unchanged.
 using namespace yuzu::installed_apps::reg_utf8;
 
+// The host-independent registry-type predicate (parsers::reg_string_type_accepted)
+// carries winnt.h's REG_SZ/REG_EXPAND_SZ as literals so it is testable everywhere;
+// pin them to the real constants here.
+static_assert(parsers::kRegSz == REG_SZ && parsers::kRegExpandSz == REG_EXPAND_SZ);
+
 // RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
 // BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
 // while any subtree handle is open, so a leaked HKEY on a throw path would defeat
@@ -347,32 +356,23 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
         HKEY app_key{};
         if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
             HKeyCloser app_guard{app_key};
-            auto read_str = [&](const char* value_name) -> std::string {
-                wchar_t buf[512]{};
-                DWORD size = sizeof(buf); // size in BYTES
-                DWORD type = 0;
-                if (RegQueryValueExW(app_key, to_wide(value_name).c_str(), nullptr, &type,
-                                     reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if (type == REG_SZ && size >= sizeof(wchar_t)) {
-                        return reg_sz_to_utf8(buf, size);
-                    }
-                }
-                return {};
-            };
-            // InstallLocation only. Deliberately a SECOND lambda rather than a
-            // widened read_str: read_str feeds DisplayName/DisplayVersion/
-            // Publisher/InstallDate, which reach the ADR-0016 hashed blob-v2 rows
-            // (get_inventory_windows), so accepting expandable strings there would
-            // change what that chain hashes. The value is returned RAW (an
+            // accept_expand_sz defaults false: DisplayName/DisplayVersion/Publisher/
+            // InstallDate reach the ADR-0016 hashed blob-v2 rows
+            // (get_inventory_windows), so their acceptance must not widen. Only
+            // InstallLocation passes true. The value is returned RAW (an
             // unexpanded "%ProgramFiles%" prefix stays as written); absent stays
             // empty and is never derived from DisplayIcon/UninstallString.
-            auto read_str_expandable = [&](const char* value_name) -> std::string {
+            auto read_str = [&](const char* value_name,
+                                bool accept_expand_sz = false) -> std::string {
                 wchar_t buf[512]{};
-                DWORD size = sizeof(buf); // size in BYTES
-                DWORD type = 0;
+                DWORD size = sizeof(buf); // size in BYTES; buf is written as bytes and read back
+                DWORD type = 0;           // through its declared wchar_t lvalue (LPBYTE is align-1)
+                // The single byte-type aliasing cast (docs/cpp-conventions.md exemption):
+                // `buf` is a local that outlives the call and `size` bounds the write.
                 if (RegQueryValueExW(app_key, to_wide(value_name).c_str(), nullptr, &type,
                                      reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if ((type == REG_SZ || type == REG_EXPAND_SZ) && size >= sizeof(wchar_t)) {
+                    if (parsers::reg_string_type_accepted(type, accept_expand_sz) &&
+                        size >= sizeof(wchar_t)) {
                         return reg_sz_to_utf8(buf, size);
                     }
                 }
@@ -393,7 +393,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                 app.version = read_str("DisplayVersion");
                 app.publisher = read_str("Publisher");
                 app.install_date = read_str("InstallDate");
-                app.install_location = read_str_expandable("InstallLocation");
+                app.install_location = read_str("InstallLocation", /*accept_expand_sz=*/true);
                 apps.push_back(std::move(app));
             }
         }
@@ -416,9 +416,13 @@ AppCollection get_installed_apps_windows() {
     // Current user
     enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
 
-    // Deduplicate by name+version
+    // Deduplicate by name+version. A populated install_location sorts first among
+    // name+version duplicates across the three hives, so unique() keeps it (never a
+    // '-' shadowing a real path).
     std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
-        return a.name < b.name || (a.name == b.name && a.version < b.version);
+        const bool a_empty = a.install_location.empty();
+        const bool b_empty = b.install_location.empty();
+        return std::tie(a.name, a.version, a_empty) < std::tie(b.name, b.version, b_empty);
     });
     apps.erase(std::unique(apps.begin(), apps.end(),
                            [](const AppInfo& a, const AppInfo& b) {
@@ -516,8 +520,11 @@ AppCollection get_installed_apps_macos() {
         }
     }
 
-    std::sort(apps.begin(), apps.end(),
-              [](const AppInfo& a, const AppInfo& b) { return a.name < b.name; });
+    // Tie-break on install_location so same-named apps keep a deterministic order
+    // across captures (a name-only sort leaves their relative order arbitrary).
+    std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
+        return std::tie(a.name, a.install_location) < std::tie(b.name, b.install_location);
+    });
     return AppCollection{std::move(apps), degraded};
 }
 #endif
@@ -661,6 +668,8 @@ constexpr std::size_t kMaxPkgutilPackages = 5000;
 // remaining rows keep an empty bundle_id (rendered "-") and the run is NOT
 // reported degraded -- unlike the daily-sync leg, where a silently hollowed-out
 // security-posture field must not publish as authoritative.
+// Measured 1.63 s for 323 apps (this Mac, 2026-09-21), so kCollectionBudget is a runaway guard,
+// not the expected cost.
 std::vector<AppInfo> with_bundle_ids(std::vector<AppInfo> apps) {
     const auto start = std::chrono::steady_clock::now();
     const auto over_budget = [start]() {
@@ -1124,7 +1133,6 @@ int do_list(yuzu::CommandContext& ctx) {
     auto apps = get_installed_apps_linux();
 #elif defined(__APPLE__)
     auto apps = get_installed_apps_macos();
-    apps.apps = with_bundle_ids(std::move(apps.apps));
 #else
     AppCollection apps;
 #endif
@@ -1137,15 +1145,24 @@ int do_list(yuzu::CommandContext& ctx) {
     if (!report_if_degraded(ctx, apps.degraded, "list"))
         return 1;
 
+#if defined(__APPLE__)
+    // After the degraded guard: a withheld result must not pay the CFBundle pass.
+    apps.apps = with_bundle_ids(std::move(apps.apps));
+#endif
+
     if (apps.apps.empty()) {
-        ctx.write_output("app|No applications found|-|-|-|-|-");
+        ctx.write_output(parsers::format_app_row({.name = "No applications found"}));
         return 0;
     }
 
     for (const auto& app : apps.apps) {
-        ctx.write_output(sanitize_utf8(parsers::format_app_row(
-            {app.name, app.version, app.publisher, app.install_date, app.install_location,
-             app.bundle_id})));
+        ctx.write_output(sanitize_utf8(
+            parsers::format_app_row({.name = app.name,
+                                     .version = app.version,
+                                     .publisher = app.publisher,
+                                     .install_date = app.install_date,
+                                     .install_location = app.install_location,
+                                     .bundle_id = app.bundle_id})));
     }
     return 0;
 }
@@ -1252,7 +1269,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class InstalledAppsPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "installed_apps"; }
-    std::string_view version() const noexcept override { return "1.1.0"; }
+    std::string_view version() const noexcept override { return "1.2.0"; }
     std::string_view description() const noexcept override {
         return "Inventories installed applications and queries by name";
     }

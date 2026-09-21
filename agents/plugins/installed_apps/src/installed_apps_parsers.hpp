@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <subprocess_degradation.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 namespace yuzu::installed_apps::parsers {
 
@@ -357,11 +358,24 @@ struct AppRowFields {
     std::string bundle_id;
 };
 
+// winnt.h REG_SZ / REG_EXPAND_SZ; literals so the predicate is testable on every host
+// (plugin.cpp static_asserts them on Windows).
+constexpr unsigned long kRegSz = 1;
+constexpr unsigned long kRegExpandSz = 2;
+
+[[nodiscard]] constexpr bool reg_string_type_accepted(unsigned long type,
+                                                      bool accept_expand_sz) noexcept {
+    return type == kRegSz || (accept_expand_sz && type == kRegExpandSz);
+}
+
 // `app|name|version|publisher|install_date|install_location|bundle_id`.
 // Every field but `name` renders "-" when empty (an absent InstallLocation /
-// bundle_id is a designed "-", never fabricated). No escaping is applied here:
-// like the pre-existing four columns, a '|' inside a field is emitted as-is
-// (known gap, out of scope); the caller applies sanitize_utf8 to the result.
+// bundle_id is a designed "-", never fabricated).
+// The two ADR-0028 columns pass through safe_output_field ('\' folds to '/', '|' -> "\|",
+// CR/LF -> ' '): a Windows InstallLocation ends in '\' and the shared decoder
+// (server/core/src/result_parsing.hpp find_unescaped_pipe) reads "\|" as an escaped pipe. The
+// four pre-existing columns stay raw (known gap, pinned below). The caller applies
+// sanitize_utf8 to the result.
 [[nodiscard]] inline std::string format_app_row(const AppRowFields& f) {
     const auto or_dash = [](const std::string& v) -> const std::string& {
         static const std::string kDash = "-";
@@ -369,10 +383,13 @@ struct AppRowFields {
     };
     std::string out = "app|";
     out += f.name;
-    for (const auto* v : {&f.version, &f.publisher, &f.install_date, &f.install_location,
-                          &f.bundle_id}) {
+    for (const auto* v : {&f.version, &f.publisher, &f.install_date}) {
         out += '|';
         out += or_dash(*v);
+    }
+    for (const auto* v : {&f.install_location, &f.bundle_id}) {
+        out += '|';
+        out += v->empty() ? std::string("-") : yuzu::util::safe_output_field(*v);
     }
     return out;
 }
