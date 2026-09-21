@@ -2505,12 +2505,13 @@ TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a l
     CHECK(format_send_timing_line(w) == "Guardian T_wire event_id=a___b domain=health sent=1 wire_wall_ns=9");
 }
 
-TEST_CASE("format_arm_committed_line keeps the #3990 driver's pinned shape and cannot be forged "
-          "through the rule id",
+TEST_CASE("#4606 criterion-10: format_arm_committed_line keeps the #3990 driver's pinned shape and "
+          "cannot be forged through the rule id",
           "[spark][runtime]") {
-    // Formatter-only: the runtime's own spdlog output is not capturable from a test (it lives in
-    // libyuzu_agent_core, see test_log_capture.hpp), so nothing here pins that the call sites in
-    // guardian_spark_runtime.cpp actually go through log_id_token. Those are checked by reading.
+    // Formatter-only: the runtime's own spdlog output is not reliably capturable from a test (it
+    // lives in libyuzu_agent_core, see test_log_capture.hpp), so nothing here pins that the call
+    // sites in guardian_spark_runtime.cpp actually go through log_id_token. Those are checked by
+    // reading.
     // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
     // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
     CHECK(format_arm_committed_line("blackout-reg-01", 3, 101, "file", "inline-shared", 7) ==
@@ -2537,7 +2538,14 @@ TEST_CASE("format_arm_committed_line keeps the #3990 driver's pinned shape and c
         std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'a') + "~" +
         std::string(yuzu::kGuardianLogIdTailBytes, 'a');
     CHECK(format_arm_committed_line(longid, 1, 2, "file", "x", 0)
-              .rfind("Guardian spark: arm committed for rule '" + shortened + "' (epoch=1,", 0) == 0);
+              .rfind("Guardian spark: arm committed for rule '" + shortened + "' (epoch=1,",
+                     0) == 0);
+
+    // std::format on a null const char* is undefined; a null type or via prints as "unknown",
+    // which still fits the driver's T2_RE token class ([\w-]+).
+    CHECK(format_arm_committed_line("r1", 1, 2, nullptr, nullptr, 3) ==
+          "Guardian spark: arm committed for rule 'r1' (epoch=1, incarnation=2, type=unknown, "
+          "via=unknown, attach_to_commit_ms=3)");
 }
 
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {

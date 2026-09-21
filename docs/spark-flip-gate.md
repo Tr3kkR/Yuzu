@@ -1678,8 +1678,10 @@ so this section is its only record.
 benchmark log writes on the detection and delivery threads must be gone or non-blocking before
 `prefer_spark` goes true.** The lines are written synchronously: `T_detect` on the Spark consumer
 thread (Event passes) and on the convergence lane and priority threads, and the Spark-outbox `T_wire`
-on the detached send worker of its lane. Once Spark is live, a blocked log sink stalls whichever of
-those is writing. The Gate 8 review of #4606 traced consequences that include a full consumer queue
+on the detached send worker of its lane. The Spark runtime's own rule-id log lines (the arm-committed
+line at every arm commit, and the late-arm, sweep-residue, #4508 and lifecycle-capacity lines) are also
+synchronous writes made while holding `registry_mu_`; they predate #4606, and the same criterion
+covers them. Once Spark is live, a blocked log sink stalls whichever of those is writing. The Gate 8 review of #4606 traced consequences that include a full consumer queue
 dropping `SparkEvent`s and delayed subscription recovery (read from the code, not reproduced), and the
 convergence lanes have no queue, drop or detach containment, so a fix has to cover them and not only
 the consumer and send worker. Criterion: before the flip, retire the lines, or move their emission

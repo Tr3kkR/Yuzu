@@ -8,10 +8,10 @@ namespace yuzu::agent {
 
 namespace {
 
-/// The event id embeds the operator-authored rule id, so it is neutralised and shortened exactly
-/// as the server's T_server line does (yuzu/log_token.hpp, log_id_token): a space, '=' or
-/// newline would otherwise forge tokens or whole lines, and a different rule on either side
-/// breaks the join.
+/// An event id (which embeds the operator-authored rule id) or a bare rule id is neutralised and
+/// shortened exactly as the server's T_server line does (yuzu/log_token.hpp, log_id_token): a
+/// space, '=' or newline would otherwise forge tokens or whole lines, and a different rule on
+/// either side breaks the join.
 std::string id_token(const std::string& id) {
     return ::yuzu::log_id_token(id);
 }
@@ -73,9 +73,12 @@ std::string format_send_timing_line(const SendTimingRecord& r) {
 std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
                                       std::uint64_t incarnation, const char* type, const char* via,
                                       std::int64_t attach_to_commit_ms) {
+    // std::format on a null const char* is undefined (the spdlog/fmt path this replaced threw a
+    // catchable format_error). "unknown" also keeps the token inside the driver's T2_RE [\w-]+.
     return std::format("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
                        "type={}, via={}, attach_to_commit_ms={})",
-                       id_token(rule_id), epoch, incarnation, type, via, attach_to_commit_ms);
+                       id_token(rule_id), epoch, incarnation, type ? type : "unknown",
+                       via ? via : "unknown", attach_to_commit_ms);
 }
 
 } // namespace yuzu::agent

@@ -22,7 +22,7 @@
  * reachable via same-directory resolution, and neither is guardian_outbox.hpp
  * reachable from agents/core/include/yuzu/agent/ any other way.
  *
- * Field order/naming in both format_*_line() functions is the parseable-log-line
+ * Field order/naming in every format_*_line() function is the parseable-log-line
  * contract the benchmark tooling regexes against (same class of tooling as R5.7's
  * T0/T2 / the #3990 diagnostic) - keep it stable.
  *
@@ -203,13 +203,15 @@ YUZU_EXPORT std::string format_send_timing_line(const SendTimingRecord& r);
 YUZU_EXPORT SendTimingRecord make_outbox_send_timing(const OutboxEntry& e, bool sent,
                                                      std::int64_t wire_wall_ns);
 
-/// The runtime's arm-confirmation line (R5.7 T2), NOT a T_ line: it lives here only so the
-/// agent-side Guardian log-line formatters share one neutralisation point and one unit-test
-/// seam (the runtime's own spdlog output is not capturable from a test, see test_log_capture.hpp).
-/// The rule id is operator-authored and unvalidated, so it goes through log_id_token; for an id
-/// of up to 256 bytes drawn from [A-Za-z0-9._-] that is the identity, which covers every id the
-/// #3990 driver (docs/spark-rebuild-baselines/fullsync_blackout_diag.py, expected_rule_ids())
-/// expects. FIELD ORDER IS PINNED by that driver's T2_RE - change both together.
+/// The runtime's arm-confirmation line (the R5.7 "T2" measurand), not one of the `Guardian T_*`
+/// lines: it lives here only so the agent-side Guardian log-line formatters share one
+/// neutralisation point and one unit-test seam (the runtime's own spdlog output is not reliably
+/// capturable from a test, see test_log_capture.hpp). The rule id is operator-authored and
+/// unvalidated, so it goes through log_id_token; for an id of up to 256 bytes drawn from
+/// [A-Za-z0-9._-] that is the identity, which covers every id the #3990 driver
+/// (docs/spark-rebuild-baselines/fullsync_blackout_diag.py, expected_rule_ids()) expects. A null
+/// `type` or `via` prints as "unknown". FIELD ORDER IS PINNED by that driver's T2_RE - change
+/// both together.
 YUZU_EXPORT std::string format_arm_committed_line(const std::string& rule_id, std::uint64_t epoch,
                                                   std::uint64_t incarnation, const char* type,
                                                   const char* via,
