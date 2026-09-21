@@ -179,11 +179,21 @@ constexpr std::chrono::milliseconds kFileAdmissionBackoffSeed{50};
 /// ~one OS timeout plus this, not depth × per-probe timeout.
 constexpr std::chrono::milliseconds kFileProbeTraversalBudget{50};
 
+/// Cap on the admission-refusal backoff above; also the cap on the worker's
+/// pass-failure retry backoff (#4658), exactly as spark_registry.cpp reuses its
+/// own admission cap for its sweeper.
 constexpr std::chrono::milliseconds kFileAdmissionBackoffCap{30'000};
 /// Genuine backend failure (open/associate/read refused, probe threw): 30 s
 /// doubling to a 300 s cap, attempts reset on a successful establishment.
 constexpr std::chrono::milliseconds kFileBackendRetryBase{30'000};
 constexpr std::chrono::milliseconds kFileBackendRetryCap{300'000};
+/// Consecutive failed worker passes after which the mechanism reports itself
+/// inert on the heartbeat (the existing capability-gap signal, see
+/// SparkMechanismStats::inert). Mirrors spark_registry.cpp's
+/// kSweeperInertAfterFailures (an anonymous-namespace constant there, so it
+/// cannot be shared). A dark worker must never read as a healthy idle one
+/// (#4658; governance sre6-1's rule for Registry, applied to File).
+constexpr unsigned kFileWorkerInertAfterFailures = 3;
 
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached discovery-probe workers
 
@@ -1178,6 +1188,7 @@ public:
         watch_register_fail_hook_ = std::move(c.watch_register_fail_hook);
         attach_fail_hook_ = std::move(c.attach_fail_hook);
         commit_attach_fail_hook_ = std::move(c.commit_attach_fail_hook);
+        pass_fail_hook_ = std::move(c.pass_fail_hook);
         if (c.probe_lane_cap)
             probe_lane_.set_cap_for_test(c.probe_lane_cap);
         if (c.retiring_cap)
@@ -1211,8 +1222,11 @@ public:
         d.fault_failed = fault_failed_.load(std::memory_order_relaxed);
         d.resync_retries = resync_retries_.load(std::memory_order_relaxed);
         d.established_failed = established_failed_.load(std::memory_order_relaxed);
+        d.pass_failed = pass_failed_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         std::lock_guard lk(mu_);
+        d.pass_failures_consecutive = pass_failures_;
+        d.pass_backoff_ms = pass_backoff_.count();
         d.live_dirs = dirs_.size();
         d.live_ancestors = ancestors_.size();
         d.retiring = retiring_.size();
@@ -2805,6 +2819,15 @@ private:
         }
     }
 
+    /// Test seam (#4658): top of EVERY worker pass, under mu_, AFTER the pass
+    /// reserved its FilePassWork containers and BEFORE it mutates any watch. A
+    /// throw here models an allocation failure at that point. One helper, two
+    /// call sites (both run() branches) so they cannot drift.
+    void run_pass_hook_locked() {
+        if (pass_fail_hook_)
+            pass_fail_hook_();
+    }
+
     /// Undo a pass that threw, under mu_, noexcept: retirements/launches this
     /// pass staged are reconciled the same way publish_pass_locked() would
     /// have (reconcile_probe_launches_locked is unconditional on both paths —
@@ -3072,7 +3095,8 @@ private:
             DWORD bytes = 0;
             ULONG_PTR ckey = 0;
             LPOVERLAPPED ov = nullptr;
-            BOOL ok = ::GetQueuedCompletionStatus(iocp_.get(), &bytes, &ckey, &ov, timeout_ms);
+            BOOL gqcs_ok =
+                ::GetQueuedCompletionStatus(iocp_.get(), &bytes, &ckey, &ov, timeout_ms);
             lk.lock();
 
             const bool real_completion = (ov != nullptr);
@@ -3086,8 +3110,8 @@ private:
                 auto* w = reinterpret_cast<DirWatch*>(ckey);
                 w->io_pending = false;
                 if (notify_fail_hook_ && notify_fail_hook_(w->dir))
-                    ok = FALSE; // test seam: override the kernel's own result — see
-                                // FileMechanismTestControls::notify_fail_hook's doc comment
+                    gqcs_ok = FALSE; // test seam: override the kernel's own result — see
+                                     // FileMechanismTestControls::notify_fail_hook's doc comment
                 if (stop_.load(std::memory_order_acquire)) {
                     if (w->removing)
                         drop_watch(w);
@@ -3118,7 +3142,7 @@ private:
                 // operation in this pass, not merely before process_completion_locked. See
                 // FilePassWork's own doc comment.
                 work.consumed = w;
-                work.consumed_ok = static_cast<bool>(ok);
+                work.consumed_ok = static_cast<bool>(gqcs_ok);
                 work.consumed_is_anc = is_ancestor_watch(w);
                 bool dispatched = false;
                 try {
@@ -3136,7 +3160,8 @@ private:
                     work.dead_results.reserve(cap);
                     work.dead_watches.reserve(cap);
                     work.old_handles.reserve(cap);
-                    process_completion_locked(*w, ok, bytes, work);
+                    run_pass_hook_locked();
+                    process_completion_locked(*w, gqcs_ok, bytes, work);
                     sweep_probes_locked(work, Clock::now());
                     lk.unlock();
                     dispatched = true;
@@ -3147,6 +3172,9 @@ private:
                     if (!lk.owns_lock())
                         lk.lock();
                     unwind_pass_locked(work, dispatched);
+                    pass_failed_.fetch_add(1, std::memory_order_relaxed);
+                    if (pass_failures_ != (std::numeric_limits<unsigned>::max)())
+                        ++pass_failures_;
                 }
                 // FilePassWork's own doc comment: "Destroyed only with mu_
                 // released" (#2012/#3840 review finding 3) — publish_pass_
@@ -3184,6 +3212,7 @@ private:
                 work.dead_results.reserve(cap);
                 work.dead_watches.reserve(cap);
                 work.old_handles.reserve(cap);
+                run_pass_hook_locked();
                 sweep_probes_locked(work, Clock::now());
                 lk.unlock();
                 dispatched = true;
@@ -3194,6 +3223,9 @@ private:
                 if (!lk.owns_lock())
                     lk.lock();
                 unwind_pass_locked(work, dispatched);
+                pass_failed_.fetch_add(1, std::memory_order_relaxed);
+                if (pass_failures_ != (std::numeric_limits<unsigned>::max)())
+                    ++pass_failures_;
             }
             // See the identical comment on the real_completion branch above
             // (#2012/#3840 review finding 3).
@@ -3239,6 +3271,22 @@ private:
 
     SparkDetachedLane probe_lane_;
 
+    /// Pass-failure episode (#4658). Written only by run() (the sole worker),
+    /// under mu_; read under mu_ by wait_timeout_locked() and debug_counters().
+    /// pass_backoff_until_ is the floor every wake deadline is clamped to while a
+    /// failed pass is backing off (epoch = no episode). Not atomic: every reader
+    /// holds mu_. inert_ (below) gains a runtime writer from this state: while
+    /// run() executes it is the ONLY writer (start()'s two `true` stores sit on
+    /// paths where the worker never runs, its `false` store precedes the spawn),
+    /// so no start-time/runtime distinction is needed and a recovery can never
+    /// clear a start-time inert. A runtime-flipped inert_ survives stop() until
+    /// the next start() clears it; SparkEngine is single-shot, so nothing reads it.
+    unsigned pass_failures_{0};                 ///< consecutive failed passes; 0 = last pass ok
+    Clock::time_point pass_backoff_until_{};    ///< epoch = no active backoff
+    std::chrono::milliseconds pass_backoff_{0}; ///< last computed delay; 0 outside an episode
+    std::atomic<std::uint64_t> pass_failed_{0}; ///< all-time failed passes (mirrors Registry's
+                                                ///< sweep_pass_failed_)
+
     std::atomic<bool> inert_{false};
     std::atomic<std::uint64_t> retiring_gauge_{0};
     std::atomic<std::uint64_t> watch_rejected_{0};
@@ -3271,6 +3319,7 @@ private:
     /// test seam; read/written only under mu_ (see apply_test_controls's comment).
     std::function<bool(std::wstring_view)> ancestor_rearm_fail_hook_;
     std::function<void(std::wstring_view)> completion_hook_; ///< test seam; only under mu_
+    std::function<void()> pass_fail_hook_; ///< test seam (#4658); only under mu_
     /// Test seams added for #2012/#3840 PR-B2 review findings 1/4/5/6/7 - all
     /// read/written only under mu_, same contract as ancestor_rearm_fail_hook_/
     /// completion_hook_ above (every call site they fire from runs under mu_).
