@@ -66,7 +66,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the AppLocker enforcement mode and rule count for each rule collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy CIM class through a bounded query; when the class is absent or returns no rows, walks HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2 instead. A mode the plugin does not model is `unmodelled`; no configured policy is a single `none` row; a failed read is a `constrained` row with a reason. Windows-only: application control has no Linux/macOS equivalent here.",
+      "description": "Reports the AppLocker enforcement mode and rule count for each rule collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy CIM class through a bounded query; when the class is absent or returns no rows, walks HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2 instead. A mode the plugin does not model is `unmodelled`; with no SrpV2 key the answer is a single `none` row, and a collection that is not configured under an existing key reads `absent`; a failed read is a `constrained` row with a reason. Windows-only: application control has no Linux/macOS equivalent here.",
       "display_name": "AppLocker Policy Posture",
       "execute_roles": [
         "endpoint-admin",
@@ -103,21 +103,34 @@
     }
   ],
   "description": "Read-only effective WDAC and AppLocker application-control policy posture (Windows-only)",
-  "how_it_works": "`wdac_policy` enumerates every value under `HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\\StandardCimv2\\Security\\ApplicationControl`; when the class is absent, returns no usable rows or fails it walks `HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count).\n\n**Why it exists.** `docs/capability-map.md` §9.10 (Application Whitelisting, graded partial by this plugin) and `docs/roadmap.md` Issue 12.11 (#282, Open) are the tracked demand; `docs/enterprise-parity-plan.md` Phase 12.11 names the full action set (`get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`). This plugin delivers only the read-only posture; the rest is listed under Caveats.\n\n**What it is NOT.** No policy change of any kind, no PowerShell (`Get-AppLockerPolicy` is not used), no raw COM, no subprocess. It is not EDR-class telemetry: `docs/roadmap.md` Phase 18 excludes agent-side EDR replication (\"integrate via Phase 9 connectors to existing EDR ... do not re-implement at the agent\"), and this plugin reads the state of an OS-native control rather than collecting endpoint detection data.",
+  "how_it_works": "`wdac_policy` enumerates every value under `HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\\System32\\CodeIntegrity\\CiPolicies\\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\\StandardCimv2\\Security\\ApplicationControl`; when the class is absent, returns no usable rows or fails it walks `HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count; a collection with no subkey reads `absent`).\n\n**Why it exists.** `docs/capability-map.md` §9.10 (Application Whitelisting, graded partial by this plugin) and `docs/roadmap.md` Issue 12.11 (#282, Open) are the tracked demand; `docs/enterprise-parity-plan.md` Phase 12.11 names the full action set (`get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`). This plugin delivers only the read-only posture; the rest is listed under Caveats.\n\n**What it is NOT.** No policy change of any kind, no PowerShell (`Get-AppLockerPolicy` is not used), no raw COM, no subprocess. It is not EDR-class telemetry: `docs/roadmap.md` Phase 18 excludes agent-side EDR replication (\"integrate via Phase 9 connectors to existing EDR ... do not re-implement at the agent\"), and this plugin reads the state of an OS-native control rather than collecting endpoint detection data.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "b47a1cdbe79e",
+  "leg_hash": "ea8979e16417",
   "manifest_version": 1,
   "name": "app_control",
   "outputs": [
     {
       "columns": [
         {
-          "description": "AppLocker rule collection; `none` when no AppLocker policy is configured.",
+          "description": "Row family: `applocker` (one per rule collection, or the single `none` placeholder) or `constrained` (a failed step: the reason lands in `collection`, the rest are empty).",
+          "example": "applocker",
+          "name": "row_kind",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "applocker",
+            "constrained"
+          ]
+        },
+        {
+          "description": "AppLocker rule collection; `none` when no AppLocker policy is configured (on a constrained row, the failure reason).",
           "example": "Exe",
           "name": "collection",
           "platforms": [
@@ -134,7 +147,7 @@
           ]
         },
         {
-          "description": "Enforcement mode of the collection.",
+          "description": "Enforcement mode of the collection; `absent` when the collection is not configured (no rule-collection subkey) or has no EnforcementMode value.",
           "example": "enforced",
           "name": "mode",
           "platforms": [
@@ -164,7 +177,21 @@
     {
       "columns": [
         {
-          "description": "Registry value name under Control\\CI\\Policy (or the policy file stem on a wdac_cip row).",
+          "description": "Row family: `wdac` (a Control\\CI\\Policy value), `wdac_cip` (an active .cip policy file: the stem lands in `name`, `present` or `absent` in `raw`, and `state` is empty) or `constrained` (a failed step: the reason lands in `name`, the rest are empty).",
+          "example": "wdac",
+          "name": "row_kind",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "wdac",
+            "wdac_cip",
+            "constrained"
+          ]
+        },
+        {
+          "description": "Registry value name under Control\\CI\\Policy (or the policy file stem on a wdac_cip row, the failure reason on a constrained row).",
           "example": "VerifiedAndReputablePolicyState",
           "name": "name",
           "platforms": [
@@ -174,7 +201,7 @@
           "values": null
         },
         {
-          "description": "Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row.",
+          "description": "Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row; `present` or `absent` on a wdac_cip row.",
           "example": "1",
           "name": "raw",
           "platforms": [
@@ -184,7 +211,7 @@
           "values": null
         },
         {
-          "description": "Named state of the value.",
+          "description": "Named state of the value; empty on a wdac_cip or constrained row.",
           "example": "enforced",
           "name": "state",
           "platforms": [
@@ -203,7 +230,7 @@
       "definition_id": "windows.app_control.wdac_policy"
     }
   ],
-  "outputs_note": "Pipe-delimited rows via `write_output()`, the first field naming the row kind. `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file; `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. The `Field` column below maps onto the fields after the row kind. Placeholders: `wdac|policy_key|-|absent` (the CI\\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` files), `applocker|none|absent|0` (no AppLocker policy configured) — each a genuine \"nothing configured\" reported by the OS. Any failed step instead writes `constrained|<reason>` beside a non-OK result status; a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.",
+  "outputs_note": "Pipe-delimited rows via `write_output()`, the first field naming the row kind (`row_kind`, the first declared column). `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file (three fields: `state` stays empty); `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. Placeholders: `wdac|policy_key|-|absent` (the CI\\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` files), `applocker|none|absent|0` (the SrpV2 key does not exist: no AppLocker policy configured) — each a genuine \"nothing configured\" reported by the OS; when the SrpV2 key exists every collection gets a row, and one that is not configured reads `applocker|<collection>|absent|0`. Any failed step instead writes `constrained|<reason>` beside a non-OK result status (the reason lands in the second column); a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.",
   "platforms": {
     "linux": "unsupported",
     "macos": "unsupported",
@@ -310,7 +337,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "b47a1cdbe79e",
+        "leg_hash": "ea8979e16417",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -354,7 +381,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "b47a1cdbe79e",
+        "leg_hash": "ea8979e16417",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -402,7 +429,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "b47a1cdbe79e",
+        "leg_hash": "ea8979e16417",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"

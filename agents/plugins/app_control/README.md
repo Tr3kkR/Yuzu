@@ -14,7 +14,7 @@
 
 ## How it works
 
-`wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`; when the class is absent, returns no usable rows or fails it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count).
+`wdac_policy` enumerates every value under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` (`RegEnumValueW`, bounded: 256 values, 4 KiB each), maps `VerifiedAndReputablePolicyState` to a named state (`disabled` / `audit` / `enforced`; any other value is `unmodelled`), then lists the `*.cip` files in `%SystemRoot%\System32\CodeIntegrity\CiPolicies\Active` (presence and file stem only, never contents). `applocker_policy` runs one bounded CIM query (`agents/shared/wmi_bounded.hpp`) against `MSFT_ApplockerPolicy` in `root\StandardCimv2\Security\ApplicationControl`; when the class is absent, returns no usable rows or fails it walks `HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2` (one row per collection: `EnforcementMode` and rule-subkey count; a collection with no subkey reads `absent`).
 
 **Why it exists.** `docs/capability-map.md` §9.10 (Application Whitelisting, graded partial by this plugin) and `docs/roadmap.md` Issue 12.11 (#282, Open) are the tracked demand; `docs/enterprise-parity-plan.md` Phase 12.11 names the full action set (`get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`). This plugin delivers only the read-only posture; the rest is listed under Caveats.
 
@@ -68,24 +68,26 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows via `write_output()`, the first field naming the row kind. `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file; `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. The `Field` column below maps onto the fields after the row kind. Placeholders: `wdac|policy_key|-|absent` (the CI\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` files), `applocker|none|absent|0` (no AppLocker policy configured) — each a genuine "nothing configured" reported by the OS. Any failed step instead writes `constrained|<reason>` beside a non-OK result status; a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.
+Pipe-delimited rows via `write_output()`, the first field naming the row kind (`row_kind`, the first declared column). `wdac_policy` writes `wdac|<name>|<raw>|<state>` per registry value and `wdac_cip|<policy_stem>|present` per active policy file (three fields: `state` stays empty); `applocker_policy` writes `applocker|<collection>|<mode>|<rules>` per rule collection. Placeholders: `wdac|policy_key|-|absent` (the CI\Policy key does not exist), `wdac_cip|none|absent` (no active `.cip` files), `applocker|none|absent|0` (the SrpV2 key does not exist: no AppLocker policy configured) — each a genuine "nothing configured" reported by the OS; when the SrpV2 key exists every collection gets a row, and one that is not configured reads `applocker|<collection>|absent|0`. Any failed step instead writes `constrained|<reason>` beside a non-OK result status (the reason lands in the second column); a failure is never rendered as an absent policy. Non-Windows legs write the single row `<action>|unsupported|windows_only_concept`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`windows.app_control.applocker_policy` — `collection|mode|rules`**
+**`windows.app_control.applocker_policy` — `row_kind|collection|mode|rules`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `collection` | string | `Appx` `Dll` `Exe` `Msi` `Script` `none` | Windows | `Exe` | AppLocker rule collection; `none` when no AppLocker policy is configured. |
-| `mode` | string | `audit` `enforced` `unmodelled` `absent` | Windows | `enforced` | Enforcement mode of the collection. |
+| `row_kind` | string | `applocker` `constrained` | Windows | `applocker` | Row family: `applocker` (one per rule collection, or the single `none` placeholder) or `constrained` (a failed step: the reason lands in `collection`, the rest are empty). |
+| `collection` | string | `Appx` `Dll` `Exe` `Msi` `Script` `none` | Windows | `Exe` | AppLocker rule collection; `none` when no AppLocker policy is configured (on a constrained row, the failure reason). |
+| `mode` | string | `audit` `enforced` `unmodelled` `absent` | Windows | `enforced` | Enforcement mode of the collection; `absent` when the collection is not configured (no rule-collection subkey) or has no EnforcementMode value. |
 | `rules` | int32 | - | Windows | `12` | Number of rules in the collection (rule subkeys under the SrpV2 walk); 0 when none is configured. |
 
-**`windows.app_control.wdac_policy` — `name|raw|state`**
+**`windows.app_control.wdac_policy` — `row_kind|name|raw|state`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `name` | string | - | Windows | `VerifiedAndReputablePolicyState` | Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row). |
-| `raw` | string | - | Windows | `1` | Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row. |
-| `state` | string | `disabled` `audit` `enforced` `unmodelled` `absent` | Windows | `enforced` | Named state of the value. |
+| `row_kind` | string | `wdac` `wdac_cip` `constrained` | Windows | `wdac` | Row family: `wdac` (a Control\CI\Policy value), `wdac_cip` (an active .cip policy file: the stem lands in `name`, `present` or `absent` in `raw`, and `state` is empty) or `constrained` (a failed step: the reason lands in `name`, the rest are empty). |
+| `name` | string | - | Windows | `VerifiedAndReputablePolicyState` | Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row, the failure reason on a constrained row). |
+| `raw` | string | - | Windows | `1` | Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row; `present` or `absent` on a wdac_cip row. |
+| `state` | string | `disabled` `audit` `enforced` `unmodelled` `absent` | Windows | `enforced` | Named state of the value; empty on a wdac_cip or constrained row. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -110,7 +112,7 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind. `
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash b47a1cdbe79e
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash ea8979e16417
 
 ```
 == action=wdac_policy
@@ -133,7 +135,7 @@ applocker|none|absent|0
 [result_status] OK / FULL / registry_srpv2
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash b47a1cdbe79e
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash ea8979e16417
 
 ```
 == action=wdac_policy
@@ -147,7 +149,7 @@ applocker_policy|unsupported|windows_only_concept
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash b47a1cdbe79e
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash ea8979e16417
 
 ```
 == action=wdac_policy

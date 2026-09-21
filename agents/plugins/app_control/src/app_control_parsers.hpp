@@ -492,7 +492,10 @@ inline WmiProbeDump parse_wmi_probe_dump(std::string_view text) {
         } else if (eq == std::string_view::npos || eq == 0) {
             out.acc.add_failure("malformed_line");
         } else if (line.substr(0, eq) == "error") {
-            out.error = std::string{line.substr(eq + 1)};
+            if (eq + 1 == line.size())
+                out.acc.add_failure("malformed_line"); // a token names its cause; empty is malformed
+            else
+                out.error = std::string{line.substr(eq + 1)};
         } else {
             cur[std::string{line.substr(0, eq)}] = std::string{line.substr(eq + 1)};
         }

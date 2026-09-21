@@ -94,7 +94,6 @@ Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\pl
 Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_optional_features\windows_optional_features.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\agents\plugins\app_control\app_control.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 
 ; --- Plugins: network ---
 Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
@@ -111,6 +110,7 @@ Source: "{#BuildDir}\agents\plugins\bitlocker\bitlocker.dll"; DestDir: "{app}\pl
 Source: "{#BuildDir}\agents\plugins\certificates\certificates.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\firewall\firewall.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\quarantine\quarantine.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\app_control\app_control.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 

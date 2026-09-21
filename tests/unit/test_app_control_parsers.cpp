@@ -291,6 +291,19 @@ TEST_CASE("app_control verdict: any recorded failure is never OK / FULL / rc 0",
           "ci_policy_enum_0xea");
 }
 
+TEST_CASE("app_control applocker none row: due only when nothing was read AND nothing failed",
+          "[app_control][parsers]") {
+    yuzu::shared::ConstraintAccumulator clean;
+    yuzu::shared::ConstraintAccumulator failed;
+    failed.add_failure("srpv2_open_0x5");
+
+    CHECK(applocker_none_row_due(false, 0, clean));        // nothing configured anywhere
+    CHECK_FALSE(applocker_none_row_due(true, 0, clean));   // CIM rows were written
+    CHECK_FALSE(applocker_none_row_due(false, 2, clean));  // SrpV2 rows were written
+    CHECK_FALSE(applocker_none_row_due(false, 0, failed)); // a failed read never reads as absent
+    CHECK_FALSE(applocker_none_row_due(true, 3, failed));
+}
+
 TEST_CASE("app_control CIM floor: only the one allowlisted namespace passes",
           "[app_control][parsers]") {
     CHECK(is_allowed_cim_namespace(kCimNamespace));
@@ -397,6 +410,10 @@ TEST_CASE("app_control dump parsers: empty and malformed input record a failure,
     const auto w = parse_wmi_probe_dump("A=1\nB=2\n--\nA=3\nerror=x\n");
     CHECK(w.rows.size() == 2);
     CHECK(w.error == std::optional<std::string>{"x"});
+    // An error token names its cause: a bare `error=` is malformed, not an empty failure reason.
+    const auto bare = parse_wmi_probe_dump("A=1\nerror=\n");
+    CHECK(bare.acc.reason() == "malformed_line");
+    CHECK_FALSE(bare.error.has_value());
 }
 
 TEST_CASE("app_control real capture: CI\\Policy values format to the rig's exact rows",

@@ -142,10 +142,6 @@ void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
     std::vector<wchar_t> name(kMaxValueNameChars);
     std::vector<wchar_t> data(kMaxValueBytes / sizeof(wchar_t)); // aligned for reg_sz_to_utf8
     for (DWORD index = 0;; ++index) {
-        if (index >= kMaxValues) {
-            o.acc.add_failure("row_cap");
-            break;
-        }
         DWORD name_len = static_cast<DWORD>(name.size());
         DWORD data_len = kMaxValueBytes;
         DWORD type = 0;
@@ -153,6 +149,10 @@ void read_ci_policy_values(yuzu::CommandContext& ctx, Outcome& o) {
                                       reinterpret_cast<BYTE*>(data.data()), &data_len);
         if (rc == ERROR_NO_MORE_ITEMS)
             break;
+        if (index >= kMaxValues && (rc == ERROR_SUCCESS || rc == ERROR_MORE_DATA)) {
+            o.acc.add_failure("row_cap"); // a value exists beyond the cap: truncated
+            break;
+        }
         if (rc == ERROR_MORE_DATA) {
             o.acc.add_failure("value_too_large"); // skipped; enumeration continues
             continue;
@@ -232,8 +232,14 @@ std::size_t walk_srpv2(yuzu::CommandContext& ctx, Outcome& o) {
         yuzu::win::RegKey sub;
         const LONG sub_rc = RegOpenKeyExW(root.get(), yuzu::win::to_wide(collection).c_str(), 0,
                                           KEY_READ | KEY_WOW64_64KEY, sub.put());
-        if (o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query) != RegRead::ok)
-            continue; // absent = collection not configured; unreadable = recorded, never absent
+        const auto sub_read = o.note("srpv2_collection_open", sub_rc, ReadKind::open_or_query);
+        if (sub_read == RegRead::absent) { // collection not configured: a definitive row
+            ctx.write_output(format_applocker_row(collection, std::nullopt, 0));
+            ++written;
+            continue;
+        }
+        if (sub_read != RegRead::ok)
+            continue; // unreadable: recorded, never absent
 
         std::optional<std::uint32_t> mode;
         std::uint32_t raw_mode = 0;

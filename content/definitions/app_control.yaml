@@ -42,21 +42,27 @@ spec:
 
   result:
     # wdac|<name>|<raw>|<state>
-    # (also: wdac_cip|<policy_stem>|present, and constrained|<reason>)
+    # (also: wdac_cip|<policy_stem>|<present|absent>, and constrained|<reason>)
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `wdac` (a Control\CI\Policy value), `wdac_cip` (an active .cip policy file: the stem lands in `name`, `present` or `absent` in `raw`, and `state` is empty) or `constrained` (a failed step: the reason lands in `name`, the rest are empty).'
+        values: [wdac, wdac_cip, constrained]
+        example: wdac
+        platforms: [windows]
       - name: name
         type: string
-        description: 'Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row).'
+        description: 'Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row, the failure reason on a constrained row).'
         example: VerifiedAndReputablePolicyState
         platforms: [windows]
       - name: raw
         type: string
-        description: 'Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row.'
+        description: 'Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row; `present` or `absent` on a wdac_cip row.'
         example: "1"
         platforms: [windows]
       - name: state
         type: string
-        description: 'Named state of the value.'
+        description: 'Named state of the value; empty on a wdac_cip or constrained row.'
         values: [disabled, audit, enforced, unmodelled, absent]
         example: enforced
         platforms: [windows]
@@ -89,9 +95,10 @@ metadata:
     collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy
     CIM class through a bounded query; when the class is absent or returns
     no rows, walks HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 instead.
-    A mode the plugin does not model is `unmodelled`; no configured policy
-    is a single `none` row; a failed read is a `constrained` row with a
-    reason. Windows-only: application control has no Linux/macOS
+    A mode the plugin does not model is `unmodelled`; with no SrpV2 key the
+    answer is a single `none` row, and a collection that is not configured
+    under an existing key reads `absent`; a failed read is a `constrained`
+    row with a reason. Windows-only: application control has no Linux/macOS
     equivalent here.
   tags: [windows, applocker, application-control, security, inventory]
 
@@ -108,15 +115,21 @@ spec:
     # applocker|<collection>|<mode>|<rules>
     # (also: constrained|<reason>)
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `applocker` (one per rule collection, or the single `none` placeholder) or `constrained` (a failed step: the reason lands in `collection`, the rest are empty).'
+        values: [applocker, constrained]
+        example: applocker
+        platforms: [windows]
       - name: collection
         type: string
-        description: 'AppLocker rule collection; `none` when no AppLocker policy is configured.'
+        description: 'AppLocker rule collection; `none` when no AppLocker policy is configured (on a constrained row, the failure reason).'
         values: [Appx, Dll, Exe, Msi, Script, none]
         example: Exe
         platforms: [windows]
       - name: mode
         type: string
-        description: 'Enforcement mode of the collection.'
+        description: 'Enforcement mode of the collection; `absent` when the collection is not configured (no rule-collection subkey) or has no EnforcementMode value.'
         values: [audit, enforced, unmodelled, absent]
         example: enforced
         platforms: [windows]
