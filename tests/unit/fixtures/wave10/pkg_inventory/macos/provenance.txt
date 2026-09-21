@@ -1,5 +1,5 @@
 Directory: tests/unit/fixtures/wave10/pkg_inventory/macos/
-Package: P1c-2 (pkg_inventory leg tests), captured 2026-09-21.
+Captured 2026-09-21 for the pkg_inventory macOS leg tests (test_pkg_inventory_macos_parsers.cpp).
 
 tree.manifest
   Status: REAL CAPTURE (formulae only; see Not exercised below)
@@ -21,4 +21,4 @@ tree.manifest
 Not exercised against real data: Homebrew cask rows and tap counts above zero. This capture host has no
 installed cask and no tap directory, and populated Caskroom/Taps trees would be invented. They need a
 reconstruction sign-off (not given) or a host that has them; the cask and tap counting logic is covered
-only by the PROGRAMMATIC layouts in test_pkg_inventory_parsers.cpp, which are not captures.
+only by the SYNTHETIC in-code layouts in test_pkg_inventory_parsers.cpp, which are not captures.

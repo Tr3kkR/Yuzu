@@ -12,9 +12,9 @@
  *
  * SCOPE. MACHINE-SCOPE ONLY: per-user package stores (npm global-vs-user, pip
  * user installs, cargo, per-user Homebrew) are out of scope and deferred to
- * the user-context-bridge session helper (PR1.8).
+ * the user-context session helper (docs/adr/3003-user-session-helper.md).
  *
- * LINUX SHRINK (2026-09-19). The Linux leg is scoped to package-manager
+ * LINUX SCOPE. The Linux leg is scoped to package-manager
  * identity/presence and manager-level config facts ONLY. It never enumerates an
  * individual package in any form: installed_apps.get_inventory_linux already
  * covers dpkg + rpm + pacman + apk, so `packages` is UNSUPPORTED on Linux by

@@ -7,10 +7,9 @@
  * first, then data rows, then the CC-07 typed status). Modelled on
  * peripherals_legs.hpp.
  *
- * Also holds the guarded POSIX walk primitives (`posix::`, bottom of the file)
- * the macOS walk shell uses and the Linux `managers` leg (which follows as its
- * own PR) will share. They are excluded on Windows, so the pure text/row layer
- * (pkg_inventory_parsers.hpp) stays free of POSIX headers.
+ * Also holds the guarded POSIX directory primitives (`posix::`, bottom of the
+ * file) the macOS walk shell uses. They are excluded on Windows, so the pure
+ * text/row layer (pkg_inventory_parsers.hpp) stays free of POSIX headers.
  */
 #pragma once
 
@@ -27,11 +26,12 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <yuzu/agent/scoped_fd.hpp>
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <posix_dir_walk.hpp>
 #include <sys/stat.h>
-#include <unistd.h>
 #endif
 
 namespace yuzu::pkg_inventory {
@@ -99,15 +99,15 @@ inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_vi
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
 }
 
-// ── POSIX walk primitives (thin shell; not compiled on Windows) ──────────
+// ── POSIX directory primitives (thin shell; not compiled on Windows) ─────
 //
-// Used by the macOS walk shell (pkg_inventory_macos_parsers.hpp); the Linux
-// `managers` leg, which follows as its own PR, shares them.
-// Nothing here spawns a process: every read is open/openat/fstat/read/readdir
-// with O_NOFOLLOW on the leaf, so a swapped-in symlink is refused rather than
-// followed (private copies of the autoruns_macos.cpp open_dir_no_follow /
-// read_file_bounded shapes). Guarded because posix_dir_walk.hpp does not exist
-// on Windows; the portable row/text layer is pkg_inventory_parsers.hpp.
+// Used by the macOS walk shell (pkg_inventory_macos_parsers.hpp). Nothing
+// here spawns a process: every read is open/openat/fstatat/readdir with
+// O_NOFOLLOW on the leaf, so a swapped-in symlink is refused rather than
+// followed (a private copy of the autoruns_macos.cpp dir_open_outcome_from_fd
+// / open_dir_no_follow shape; posix_dir_walk.hpp deliberately leaves opening
+// to each caller). Guarded because posix_dir_walk.hpp does not exist on
+// Windows; the portable row/text layer is pkg_inventory_parsers.hpp.
 #if !defined(_WIN32)
 
 namespace posix {
@@ -148,22 +148,25 @@ struct OpenDirResult {
     std::string_view detail{};
 };
 
-[[nodiscard]] inline OpenDirResult finish_dir_open(int fd) {
+/// `raw_fd` is the result of an open/openat (errno still current when < 0).
+/// A ScopedFd owns the descriptor until fdopendir() takes it over.
+[[nodiscard]] inline OpenDirResult finish_dir_open(int raw_fd) {
     OpenDirResult r;
-    if (fd < 0) {
+    if (raw_fd < 0) {
         const int err = errno;
         if (is_benign_absent_errno(err)) r.absent = true;
         else r.detail = open_failure_token(err);
         return r;
     }
-    DIR* d = ::fdopendir(fd);
+    yuzu::agent::ScopedFd fd{raw_fd};
+    DIR* d = ::fdopendir(fd.get());
     if (d == nullptr) {
-        const int err = errno;
-        ::close(fd);
+        const int err = errno; // read before ScopedFd's close can disturb it
         if (is_benign_absent_errno(err)) r.absent = true;
         else r.detail = open_failure_token(err);
         return r;
     }
+    (void)fd.release(); // fdopendir() succeeded: the DIR* owns the fd now
     r.dir = Dir{d};
     return r;
 }
@@ -202,8 +205,9 @@ enum class EntryKind { directory, regular, symlink, other, error };
 /// Classifies `name` inside `parent` without following a symlink: a real
 /// directory, a regular file, a symlink (target not resolved), anything else
 /// (fifo, socket, device, or a vanished entry -- ENOENT race) as `other`, and a
-/// failed fstatat as `error` (with `detail` set). Homebrew walks accept only
-/// `directory`; the config-source counts accept `regular` and `symlink`.
+/// failed fstatat as `error` (with `detail` set). The Homebrew walks accept
+/// only `directory`; the other kinds are still named (not folded into `other`)
+/// so a caller can tell a file from a link.
 struct EntryClass {
     EntryKind kind = EntryKind::other;
     std::string_view detail{};
@@ -220,61 +224,6 @@ struct EntryClass {
     if (S_ISREG(st.st_mode)) return {EntryKind::regular, {}};
     if (S_ISLNK(st.st_mode)) return {EntryKind::symlink, {}};
     return {EntryKind::other, {}};
-}
-
-/// Bounded whole-file read of `path` (O_NOFOLLOW on the leaf), capped at
-/// `max_bytes` (production: kMaxConfigBytes). O_NONBLOCK keeps the open of a
-/// FIFO with no writer from blocking; the fstat regular-file check then rejects
-/// it (`not_regular`) before any read.
-struct FileRead {
-    bool ok = false;            ///< `text` holds the (possibly capped) content
-    bool absent = false;        ///< ENOENT
-    bool oversized = false;     ///< file was larger than the cap; `text` is a prefix
-    std::string_view detail{};  ///< non-empty => a real constraint
-    std::string text;
-};
-
-[[nodiscard]] inline FileRead read_file_bounded(const std::string& path, std::size_t max_bytes) {
-    FileRead r;
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        const int err = errno;
-        if (is_benign_absent_errno(err)) r.absent = true;
-        else r.detail = open_failure_token(err);
-        return r;
-    }
-    struct FdGuard {
-        int fd;
-        ~FdGuard() { ::close(fd); }
-    } guard{fd};
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) {
-        r.detail = open_failure_token(errno);
-        return r;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        r.detail = "not_regular";
-        return r;
-    }
-    const std::size_t size = static_cast<std::size_t>(st.st_size);
-    const std::size_t want = size > max_bytes ? max_bytes : size;
-    r.oversized = size > max_bytes;
-    r.text.resize(want);
-    std::size_t total = 0;
-    while (total < want) {
-        const ssize_t n = ::read(fd, r.text.data() + total, want - total);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            r.detail = open_failure_token(errno);
-            r.text.clear();
-            return r;
-        }
-        if (n == 0) break;
-        total += static_cast<std::size_t>(n);
-    }
-    r.text.resize(total);
-    r.ok = true;
-    return r;
 }
 
 /// Records a directory-listing outcome into `acc`. Truncation and readdir

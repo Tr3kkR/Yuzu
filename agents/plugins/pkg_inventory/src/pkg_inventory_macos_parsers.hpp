@@ -295,6 +295,24 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
     return rows;
 }
 
+/// The production macOS leg body over an INJECTED root: runs the action's walk
+/// and hands rows + constraint to the one emission seam (emit_result), so the
+/// wire status row and the CC-07 typed status are produced here. run_macos
+/// (pkg_inventory_macos.cpp) calls it with "/"; the unit suite drives it over a
+/// fixture tree through a real CommandContext. MUTATION: passing std::nullopt
+/// instead of `constraint` below fails the forced-constraint seam case in
+/// test_pkg_inventory_macos_parsers.cpp.
+inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root) {
+    std::optional<std::string> constraint;
+    std::vector<std::string> rows;
+    switch (a) {
+    case Action::managers: rows = macos_manager_rows_at(root, constraint); break;
+    case Action::packages: rows = macos_package_rows_at(root, constraint); break;
+    }
+    emit_result(ctx, a, rows, constraint);
+    return 0;
+}
+
 } // namespace yuzu::pkg_inventory::mac
 
 #endif // !defined(_WIN32)

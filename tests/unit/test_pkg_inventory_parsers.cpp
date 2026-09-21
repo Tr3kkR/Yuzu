@@ -6,10 +6,13 @@
  * Windows) wrap their bodies in `#if !defined(_WIN32)`.
  *
  * No committed fixture is loaded here. The directory layouts the walk cases
- * build in code are PROGRAMMATIC layouts that exercise the walk logic (nesting,
- * caps, hidden names, two prefixes, unreadable directories); they are not
- * captures and not committed fixtures. The real-capture tree manifest and the
- * dispatcher test are test_pkg_inventory_macos_parsers.cpp and
+ * build in code are SYNTHETIC in-code layouts (not captures, not committed
+ * fixtures): they exercise the walk logic (nesting, caps, hidden names, two
+ * prefixes, unreadable directories) over the layout the code ASSUMES Homebrew
+ * uses. The cask, tap and Intel-prefix shapes here are that assumption, not an
+ * observation: no capture host had a cask, a tap or /usr/local Homebrew
+ * (README caveat 4). The real-capture tree manifest and the dispatcher test
+ * are test_pkg_inventory_macos_parsers.cpp and
  * test_pkg_inventory_local_dispatcher.cpp.
  *
  * MUTATION NOTES (each names a wiring removal that would fail a case here):
@@ -32,6 +35,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -60,41 +64,69 @@ std::vector<std::string> split_wire(const std::string& row) {
     return fields;
 }
 
+/// Test oracle for the token grammar the README/yaml document,
+/// ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$. Production composes tokens
+/// from compile-time literals (make_token) and never validates at runtime.
+bool is_wellformed_token(std::string_view t) noexcept {
+    const auto colon = t.find(':');
+    if (colon == std::string_view::npos) return false;
+    const auto os = t.substr(0, colon);
+    if (os != "windows" && os != "macos" && os != "linux") return false;
+    std::size_t seg_len = 0;
+    std::size_t segments = 0;
+    for (std::size_t i = colon + 1; i <= t.size(); ++i) {
+        if (i == t.size() || t[i] == ':') {
+            if (seg_len == 0) return false;
+            ++segments;
+            seg_len = 0;
+            continue;
+        }
+        const char c = t[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        if (!ok) return false;
+        ++seg_len;
+    }
+    return segments >= 1;
+}
+
 } // namespace
 
 // ── pure: tokens, status rows ────────────────────────────────────────────
 
 TEST_CASE("pkg_inventory: tokens are wellformed and the fixed ones match the wire contract",
           "[pkg_inventory][parsers]") {
-    CHECK(pi::is_wellformed_token("linux:owned_by_installed_apps"));
-    CHECK(pi::is_wellformed_token("windows:planned"));
-    CHECK(pi::is_wellformed_token("macos:homebrew_cellar:permission_denied"));
-    CHECK_FALSE(pi::is_wellformed_token("planned"));
-    CHECK_FALSE(pi::is_wellformed_token("freebsd:planned"));
-    CHECK_FALSE(pi::is_wellformed_token("linux:"));
-    CHECK_FALSE(pi::is_wellformed_token("linux:a::b"));
-    CHECK_FALSE(pi::is_wellformed_token("linux:Upper"));
+    CHECK(is_wellformed_token("linux:owned_by_installed_apps"));
+    CHECK(is_wellformed_token("windows:planned"));
+    CHECK(is_wellformed_token("macos:homebrew_cellar:permission_denied"));
+    CHECK_FALSE(is_wellformed_token("planned"));
+    CHECK_FALSE(is_wellformed_token("freebsd:planned"));
+    CHECK_FALSE(is_wellformed_token("linux:"));
+    CHECK_FALSE(is_wellformed_token("linux:a::b"));
+    CHECK_FALSE(is_wellformed_token("linux:Upper"));
     CHECK(pi::kTokenLinuxPackagesOwned == "linux:owned_by_installed_apps");
     CHECK(pi::kTokenLinuxPlanned == "linux:planned");
     CHECK(pi::kTokenWindowsPlanned == "windows:planned");
-    CHECK(pi::is_wellformed_token(pi::kTokenLinuxPackagesOwned));
-    CHECK(pi::is_wellformed_token(pi::kTokenLinuxPlanned));
-    CHECK(pi::is_wellformed_token(pi::kTokenWindowsPlanned));
+    CHECK(is_wellformed_token(pi::kTokenLinuxPackagesOwned));
+    CHECK(is_wellformed_token(pi::kTokenLinuxPlanned));
+    CHECK(is_wellformed_token(pi::kTokenWindowsPlanned));
     CHECK(pi::make_token("linux", "apt_sources_d", "entry_cap") == "linux:apt_sources_d:entry_cap");
-    CHECK(pi::is_wellformed_token(pi::make_token("macos", "homebrew_taps", "io_error")));
+    CHECK(is_wellformed_token(pi::make_token("macos", "homebrew_taps", "io_error")));
 }
 
 TEST_CASE("pkg_inventory: status row is supported+dash when nothing failed, constrained+tokens otherwise",
           "[pkg_inventory][parsers][status]") {
-    yuzu::shared::ConstraintAccumulator clean;
-    // A genuinely absent manager/prefix: zero data rows and NO failure.
-    CHECK(pi::status_row("managers", clean) == "status|managers|supported|-");
+    // The decision (constrained iff any failure) lives at the emit seam
+    // (emit_result) and is proven end to end by the seam cases in
+    // test_pkg_inventory_macos_parsers.cpp; this pins the formatter and the
+    // accumulator's exact-string dedupe + comma join.
+    CHECK(pi::format_status_row("managers", pi::StatusLevel::supported, "") ==
+          "status|managers|supported|-");
 
     yuzu::shared::ConstraintAccumulator bad;
     bad.add_failure("macos:homebrew_cellar:permission_denied");
     bad.add_failure("macos:homebrew_cellar:permission_denied"); // exact-string dedupe
     bad.add_failure("macos:homebrew_taps:entry_cap");
-    CHECK(pi::status_row("packages", bad) ==
+    CHECK(pi::format_status_row("packages", pi::StatusLevel::constrained, bad.reason()) ==
           "status|packages|constrained|"
           "macos:homebrew_cellar:permission_denied,macos:homebrew_taps:entry_cap");
 
@@ -183,6 +215,16 @@ TEST_CASE("pkg_inventory: package row shape", "[pkg_inventory][parsers][rows]") 
           "package|homebrew|wget|1.24.5|formula");
     CHECK(pi::format_package_row("firefox", "130.0,1", pi::PackageKind::cask) ==
           "package|homebrew|firefox|130.0,1|cask");
+}
+
+TEST_CASE("pkg_inventory: production resource-bound defaults are pinned",
+          "[pkg_inventory][parsers][limits]") {
+    // Every cap case injects a small Limits; this is the only assertion on the
+    // shipped values. MUTATION: silently shrinking either cap fails here.
+    CHECK(pi::Limits{}.max_entries_per_dir == 4096);
+    CHECK(pi::Limits{}.max_package_rows == 20000);
+    CHECK(pi::kMaxEntriesPerDir == 4096);
+    CHECK(pi::kMaxPackageRows == 20000);
 }
 
 // ── pure: Homebrew directory-name validation ─────────────────────────────

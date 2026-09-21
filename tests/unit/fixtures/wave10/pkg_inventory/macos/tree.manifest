@@ -1,4 +1,4 @@
-# tree.manifest -- pkg_inventory macOS Homebrew tree (P1c-2). Format and provenance: see provenance.txt in this
+# tree.manifest -- pkg_inventory macOS Homebrew tree. Format and provenance: see provenance.txt in this
 # directory. payload D: = directory. Lines starting with '#' are comments.
 opt/homebrew/Cellar/ccache/4.13.6_1	D:
 opt/homebrew/Cellar/cmake/4.4.2	D:

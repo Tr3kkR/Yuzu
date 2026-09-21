@@ -4,18 +4,16 @@
  * Every function here is over plain data: no OS call, no I/O, no POSIX header.
  * It compiles and is unit-tested on EVERY OS (Windows included) by an unguarded
  * test TU -- the repo's pure-core/thin-shell discipline, same shape as
- * peripherals_parsers.hpp. The O_NOFOLLOW / walk_dir_capped file and directory
+ * peripherals_parsers.hpp. The O_NOFOLLOW / walk_dir_capped directory
  * primitives live in the guarded walk layer (pkg_inventory_legs.hpp, `posix::`).
  *
- * SCOPE (row PR10.1-c; charter and the Linux "shrink" ruling of 2026-09-19 are
- * quoted in the roadmap). MACHINE-SCOPE package-manager state only: per-user
- * package stores (npm/pip/cargo/per-user Homebrew) are out of scope and
- * deferred to the user-context-bridge session helper. This release ships the
- * macOS Homebrew legs; the Linux `managers` leg (manager identity/presence and
- * manager-level config facts) follows as its own PR and reports the PLANNED
- * token until then. Linux never reports a package roster
- * (installed_apps.get_inventory_linux owns that), so Linux `packages` is
- * UNSUPPORTED by design.
+ * SCOPE. MACHINE-SCOPE package-manager state only: per-user package stores
+ * (npm/pip/cargo/per-user Homebrew) are out of scope and deferred to the
+ * user-context-bridge session helper. This release ships the macOS Homebrew
+ * legs; the Linux `managers` leg (manager identity/presence and manager-level
+ * config facts) follows as its own PR and reports the PLANNED token until then.
+ * Linux never reports a package roster (installed_apps.get_inventory_linux owns
+ * that), so Linux `packages` is UNSUPPORTED by design.
  *
  * WIRE GRAMMAR. Every action writes the status row FIRST, then data rows:
  *
@@ -26,7 +24,8 @@
  * Every free-text field goes through yuzu::util::safe_output_field (a trailing
  * backslash or a pipe in an OS-supplied value can never shift a column).
  * `status` tokens follow the repo convention ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$
- * and are composed by make_token so that shape is enforced in one place.
+ * and are composed by make_token from compile-time literals; the grammar is
+ * pinned by the test oracle in test_pkg_inventory_parsers.cpp.
  *
  * "FAILURE NEVER READS AS ABSENT". A genuinely absent manager/prefix yields
  * `supported` + zero data rows. A failed or unreadable read yields
@@ -53,22 +52,16 @@ namespace yuzu::pkg_inventory {
 
 // ── limits ───────────────────────────────────────────────────────────────
 
-/// Per-file read cap. This package's own choice (config files here are a few
-/// hundred bytes; autoruns' kMaxPlistBytes is 1 MiB because plists can be
-/// large). A file over the cap is read up to the cap and reported `oversized`.
-inline constexpr std::size_t kMaxConfigBytes = 256 * 1024;
 /// Per-directory entry cap handed to walk_dir_capped.
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
 /// Whole-action package row cap (Homebrew): beyond it the walk stops and the
 /// status carries `row_cap`.
 inline constexpr std::size_t kMaxPackageRows = 20000;
 
-/// The three resource bounds as ONE injectable value. Production always uses
+/// The two resource bounds as ONE injectable value. Production always uses
 /// the defaults above; the unit suite passes small values so each bound (and its
-/// failure token) is exercised at cap and cap+1 without building 4096 entries
-/// or a 256 KiB file.
+/// failure token) is exercised at cap and cap+1 without building 4096 entries.
 struct Limits {
-    std::size_t max_config_bytes = kMaxConfigBytes;
     std::size_t max_entries_per_dir = kMaxEntriesPerDir;
     std::size_t max_package_rows = kMaxPackageRows;
 };
@@ -135,29 +128,6 @@ inline constexpr std::string_view kTokenLinuxPackagesOwned = "linux:owned_by_ins
 inline constexpr std::string_view kTokenLinuxPlanned = "linux:planned";
 inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
 
-/// True when `t` matches ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$.
-[[nodiscard]] inline bool is_wellformed_token(std::string_view t) noexcept {
-    const auto colon = t.find(':');
-    if (colon == std::string_view::npos) return false;
-    const auto os = t.substr(0, colon);
-    if (os != "windows" && os != "macos" && os != "linux") return false;
-    std::size_t seg_len = 0;
-    std::size_t segments = 0;
-    for (std::size_t i = colon + 1; i <= t.size(); ++i) {
-        if (i == t.size() || t[i] == ':') {
-            if (seg_len == 0) return false;
-            ++segments;
-            seg_len = 0;
-            continue;
-        }
-        const char c = t[i];
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
-        if (!ok) return false;
-        ++seg_len;
-    }
-    return segments >= 1;
-}
-
 /// `<os>:<source>:<detail>` -- the per-location failure token. `source` names
 /// the location (e.g. "apt_sources_d", "homebrew_cellar"), `detail` the
 /// failure class (an open_failure_token value, "entry_cap", ...). All three
@@ -204,16 +174,6 @@ inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
     out += '|';
     out += tokens.empty() ? std::string{"-"} : yuzu::util::safe_output_field(tokens);
     return out;
-}
-
-/// The status row for a completed read: constrained + the accumulated tokens
-/// if ANY acquisition step failed, otherwise supported (an absent manager or
-/// prefix is supported with zero data rows).
-[[nodiscard]] inline std::string
-status_row(std::string_view action, const yuzu::shared::ConstraintAccumulator& acc) {
-    return format_status_row(action,
-                             acc.any_failure() ? StatusLevel::constrained : StatusLevel::supported,
-                             acc.reason());
 }
 
 /// status|<action>|unsupported|<token>

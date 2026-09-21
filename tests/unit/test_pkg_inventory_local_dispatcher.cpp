@@ -22,12 +22,13 @@
  *    nothing else, UNAVAILABLE/PARTIAL typed status (the leg is a planned
  *    placeholder; the real leg follows as its own PR and replaces this case);
  *  - Windows: both actions exactly `status|<action>|unsupported|windows:planned`
- *    and nothing else (the legs are planned placeholders);
- *  - macOS: when /opt/homebrew/Cellar holds a well-named version directory the
- *    `packages` action yields >=1 `package|homebrew|` row and `managers` a
- *    `manager|homebrew|` row (a value read from the real host, so removing the
- *    macOS wiring fails it). No host-specific count or name is asserted (CI's
- *    macOS runner has unknown contents).
+ *    and nothing else (the legs are declared planned);
+ *  - macOS: two tiers read from the real host: when /opt/homebrew/Cellar is a
+ *    directory `managers` yields >=1 `manager|homebrew|` row, and when it also
+ *    holds a well-named version directory `packages` yields >=1
+ *    `package|homebrew|` row (so removing the macOS wiring fails it). No
+ *    host-specific count or name is asserted (CI's macOS runner has unknown
+ *    contents).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -230,7 +231,7 @@ TEST_CASE("pkg_inventory plugin: status row first, then only well-formed rows of
                 CHECK(f.size() == 7);
             } else if (f[0] == "package") {
                 CHECK(std::string_view{action} == "packages");
-                CHECK(f.size() == 5);
+                REQUIRE(f.size() == 5);
                 CHECK(f[1] == "homebrew");
             } else {
                 FAIL("unexpected row kind after the status row: " << f[0]);
@@ -284,7 +285,7 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
     using namespace yuzu::pkg_inventory;
 
 #if defined(_WIN32)
-    // Both Windows legs are planned placeholders: the status row and nothing else.
+    // Both Windows legs are declared planned: the status row and nothing else.
     for (const char* action : kActions) {
         INFO("action: " << action);
         const auto result = dispatcher.run(plugin->descriptor, action);
@@ -309,7 +310,7 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
         CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
-    // `managers` is a planned placeholder: the status row and nothing else.
+    // Linux `managers` is declared planned: the status row and nothing else.
     {
         const auto result = dispatcher.run(plugin->descriptor, "managers");
         CHECK(result.rc == 0);
@@ -324,10 +325,26 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
         CHECK(result.result_provenance == "linux:planned");
     }
 #elif defined(__APPLE__)
-    // Values read from the real host (guarded on its own Homebrew, no counts or
-    // names asserted): removing the macOS wiring fails these.
+    // Values read from the real host, in two tiers so an existing-but-empty or
+    // unreadable Cellar is never silently skipped (no counts or names asserted:
+    // CI's macOS runner has unknown contents). Removing the macOS wiring fails both.
+    //  - /opt/homebrew/Cellar is a directory   -> `managers` has >=1 manager|homebrew| row
+    //    (present or unavailable: a marker that exists always yields a row);
+    //  - it holds a well-named formula version -> `packages` has >=1 package row.
+    std::error_code cellar_ec;
+    if (!fs::is_directory("/opt/homebrew/Cellar", cellar_ec)) {
+        WARN("no /opt/homebrew/Cellar on this host -- only the shape cases apply");
+        return;
+    }
+    {
+        const auto result = dispatcher.run(plugin->descriptor, "managers");
+        const auto rows = captured_rows(result.captured);
+        REQUIRE_FALSE(rows.empty());
+        CHECK(starts_with(rows[0], "status|managers|"));
+        CHECK(count_rows_with_prefix(rows, "manager|homebrew|") >= 1);
+    }
     if (!host_has_homebrew_formula()) {
-        WARN("no /opt/homebrew/Cellar formula on this host -- only the shape cases apply");
+        WARN("no formula under /opt/homebrew/Cellar on this host -- the package-row check does not apply");
         return;
     }
     {
@@ -336,13 +353,6 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
         REQUIRE_FALSE(rows.empty());
         CHECK(starts_with(rows[0], "status|packages|"));
         CHECK(count_rows_with_prefix(rows, "package|homebrew|") >= 1);
-    }
-    {
-        const auto result = dispatcher.run(plugin->descriptor, "managers");
-        const auto rows = captured_rows(result.captured);
-        REQUIRE_FALSE(rows.empty());
-        CHECK(starts_with(rows[0], "status|managers|"));
-        CHECK(count_rows_with_prefix(rows, "manager|homebrew|") >= 1);
     }
 #endif
 }
@@ -360,4 +370,18 @@ TEST_CASE("pkg_inventory plugin: an unknown action is refused, not silently igno
     // Deliberately not a data or status row: an unknown action has no status row.
     const auto rows = captured_rows(result.captured);
     CHECK(count_rows_with_prefix(rows, "status|") == 0);
+    // The diagnostic is pinned. MUTATION: deleting or corrupting the
+    // `unknown action:` write in pkg_inventory_plugin.cpp fails here.
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "unknown action: no_such_action");
+
+    // The request-supplied name goes through safe_output_field (X12): a pipe
+    // and a trailing backslash can neither open a second field nor swallow the
+    // separator of whatever follows.
+    const auto hostile = dispatcher.run(plugin->descriptor, "no|such\\");
+    CHECK(hostile.rc != 0);
+    const auto hrows = captured_rows(hostile.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "unknown action: no\\|such/");
+    CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
 }

@@ -11,7 +11,7 @@
  * walk reads an injected root, not this host's /opt/homebrew.
  *
  * The capture is FORMULAE-ONLY (ten real Cellar entries, an empty real Caskroom,
- * no Taps directory), per the plan-gate ruling: the capture host has no casks
+ * no Taps directory): the capture host has no casks
  * and no taps, and populated trees would be invented. taps=0 / casks=0 here are
  * real "absent" / "exists but empty" readings; cask ROWS and non-zero tap counts
  * are not exercised against real data by this TU (see provenance.txt).
@@ -27,11 +27,17 @@
  *  - dropping the Taps count                                -> "taps=0" exact row
  *  - reporting the injected root instead of the logical prefix -> the "/opt/homebrew" exact row
  *  - swallowing an open failure as zero rows / a false 0    -> the unreadable-Cellar case
+ *  - dropping the constraint at the emit seam (run_macos_at -> emit_result)
+ *                                                          -> the forced-constraint seam case
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/plugin.h>
+
 #include "pkg_inventory_macos_parsers.hpp"
 #include "pkg_inventory_parsers.hpp"
+
+#include "local_dispatcher.hpp"
 
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
@@ -40,6 +46,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -121,8 +128,11 @@ bool parse_manifest_line(const std::string& line, Entry& out, std::string& error
     if (payload.rfind("L:", 0) == 0) {
         out.kind = Payload::link;
         out.data = payload.substr(2);
-        if (out.data.empty()) {
-            error = "empty link target for " + out.rel;
+        // A link target is trusted only inside the tree: no absolute target and
+        // no `.`/`..` segment, or a later entry could be written through the
+        // link, outside the root.
+        if (out.data.empty() || !rel_path_ok(out.data)) {
+            error = "unsafe link target for " + out.rel;
             return false;
         }
         return true;
@@ -192,6 +202,9 @@ TEST_CASE("pkg_inventory macos tree manifest: line grammar", "[pkg_inventory][ma
     CHECK_FALSE(parse_manifest_line("../escape\tD:", e, err));
     CHECK_FALSE(parse_manifest_line("/abs\tD:", e, err));
     CHECK_FALSE(parse_manifest_line("a//b\tD:", e, err));
+    // MUTATION: dropping the rel_path_ok check on a link target fails these two.
+    CHECK_FALSE(parse_manifest_line("a/link\tL:/tmp", e, err));
+    CHECK_FALSE(parse_manifest_line("a/link\tL:../x", e, err));
 }
 
 TEST_CASE("pkg_inventory macos tree manifest: the committed capture parses",
@@ -285,6 +298,43 @@ struct ModeGuard {
     mode_t restore;
     ~ModeGuard() { ::chmod(path.string().c_str(), restore); }
 };
+
+std::vector<std::string> captured_rows(const std::string& captured) {
+    std::vector<std::string> out;
+    std::istringstream ss(captured);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+
+// ── CommandContext-level harness ─────────────────────────────────────────
+// Drives the PRODUCTION leg body (mac::run_macos_at) through a real
+// yuzu::CommandContext via LocalDispatcher (the synthetic-descriptor precedent
+// in test_filesystem_posture_local_dispatcher.cpp), so what is asserted is the
+// emitted status row AND the CC-07 typed status the command actually reports,
+// not just the walk's return values.
+const fs::path* g_leg_root = nullptr;
+yuzu::pkg_inventory::Action g_leg_action = yuzu::pkg_inventory::Action::managers;
+
+int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
+                std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
+}
+
+yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inventory::Action a) {
+    g_leg_root = &root;
+    g_leg_action = a;
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &leg_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(&descriptor, "probe");
+    g_leg_root = nullptr;
+    return result;
+}
 
 } // namespace
 
@@ -384,6 +434,80 @@ TEST_CASE("pkg_inventory macos: an unreadable Cellar is constrained, never a fal
     CHECK(packages.empty());
     REQUIRE(token.has_value());
     CHECK(*token == "macos:homebrew_cellar:permission_denied");
+}
+
+// MUTATION: crossing the Action -> walk switch in run_macos_at (managers <->
+// packages), or reporting a non-OK/FULL typed status on a clean read, fails the
+// exact rows and the OK/FULL asserts below.
+TEST_CASE("pkg_inventory macos seam: a clean tree reaches the wire as supported + OK/FULL through run_macos_at",
+          "[pkg_inventory][macos][seam]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_seam_ok_"};
+    std::string err;
+    REQUIRE(build_macos_tree(dir.path, err));
+
+    const auto managers = run_leg(dir.path, Action::managers);
+    CHECK(managers.rc == 0);
+    const auto mrows = captured_rows(managers.captured);
+    REQUIRE(mrows.size() == 2);
+    CHECK(mrows[0] == "status|managers|supported|-");
+    CHECK(mrows[1] == "manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=10;casks=0|-");
+    CHECK(managers.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(managers.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(managers.result_provenance.empty());
+
+    const auto packages = run_leg(dir.path, Action::packages);
+    CHECK(packages.rc == 0);
+    const auto prows = captured_rows(packages.captured);
+    REQUIRE(prows.size() == 11); // status row + the ten captured formula rows
+    CHECK(prows[0] == "status|packages|supported|-");
+    CHECK(prows[1] == "package|homebrew|ccache|4.13.6_1|formula");
+    CHECK(packages.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(packages.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+}
+
+TEST_CASE("pkg_inventory macos seam: a forced constraint reaches BOTH the status row and the typed status through run_macos_at",
+          "[pkg_inventory][macos][seam]") {
+    using namespace yuzu::pkg_inventory;
+    // A symlinked Cellar is refused by the O_NOFOLLOW open on every POSIX host,
+    // root included (no chmod, so no euid-0 SKIP): a deterministic constraint.
+    // MUTATION: passing std::nullopt instead of `constraint` in run_macos_at
+    // turns every assertion below into supported|- and OK/FULL.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_seam_constrained_"};
+    fs::create_directories(dir.path / "elsewhere/wget/1.24.5");
+    fs::create_directories(dir.path / "opt/homebrew");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "opt/homebrew/Cellar", ec);
+    REQUIRE_FALSE(ec);
+
+    const auto packages = run_leg(dir.path, Action::packages);
+    CHECK(packages.rc == 0); // a degraded read is never a failed command
+    const auto prows = captured_rows(packages.captured);
+    REQUIRE(prows.size() == 1); // the status row only: the link target must not appear
+    const auto pstatus = split_fields_escape_aware(prows[0]);
+    REQUIRE(pstatus.size() == 4);
+    CHECK(pstatus[0] == "status");
+    CHECK(pstatus[1] == "packages");
+    CHECK(pstatus[2] == "constrained");
+    CHECK(pstatus[3].rfind("macos:homebrew_cellar:", 0) == 0); // ELOOP or ENOTDIR by platform
+    CHECK(packages.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(packages.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(packages.result_provenance == pstatus[3]); // one seam, two views
+
+    const auto managers = run_leg(dir.path, Action::managers);
+    CHECK(managers.rc == 0);
+    const auto mrows = captured_rows(managers.captured);
+    REQUIRE(mrows.size() == 2);
+    const auto mstatus = split_fields_escape_aware(mrows[0]);
+    REQUIRE(mstatus.size() == 4);
+    CHECK(mstatus[2] == "constrained");
+    CHECK(mstatus[3].rfind("macos:homebrew_cellar:", 0) == 0);
+    // The Cellar marker exists but cannot be opened and nothing else is there:
+    // unavailable, with this prefix's token in the reason field.
+    CHECK(mrows[1].rfind("manager|homebrew|unavailable|-|/opt/homebrew|-|macos:homebrew_cellar:", 0) == 0);
+    CHECK(managers.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(managers.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(managers.result_provenance == mstatus[3]);
 }
 
 #endif // !defined(_WIN32)
