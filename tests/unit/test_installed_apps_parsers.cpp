@@ -424,7 +424,7 @@ std::vector<std::string> split_fields_escape_aware(const std::string& row) {
 } // namespace
 
 TEST_CASE("format_app_row: a trailing backslash in install_location cannot swallow the "
-          "delimiter (B1)",
+          "delimiter",
           "[installed_apps]") {
     // A Windows InstallLocation ends in a backslash (9 of 241 rows in the pre-fix
     // Windows capture). Raw, that backslash plus the following delimiter reads as an
@@ -444,6 +444,12 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     const auto fields = split_fields_escape_aware(piped);
     CHECK(fields.size() == 7);
     CHECK(fields[5] == "a|b");
+
+    // bundle_id passes through the same escape (dropping safe_output_field on the last
+    // column alone must fail too).
+    const auto bid = format_app_row({.name = "X", .bundle_id = "a|b\\c"});
+    CHECK(bid == "app|X|-|-|-|-|a\\|b/c");
+    CHECK(split_fields_escape_aware(bid).size() == 7);
 }
 
 TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-field row",
