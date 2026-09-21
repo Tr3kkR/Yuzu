@@ -270,6 +270,12 @@ inline ReadFailure classify_win32_failure(std::string_view name, std::uint32_t e
     return {"unreadable", std::string{name} + ":win32_" + std::to_string(err), false};
 }
 
+/// A read that failed for a cause the shell detected itself (ERROR_MORE_DATA -> "oversized",
+/// a non-REG_BINARY type -> "type_<n>", a decoder token): unreadable, one token, never a denial.
+inline ReadFailure unreadable_failure(std::string_view name, std::string_view cause) {
+    return {"unreadable", std::string{name} + ":" + std::string{cause}, false};
+}
+
 /// Hex text -> bytes. Accepts bare hex (whitespace, optional "0x") or a
 /// `reg query` line ("    MitigationOptions    REG_BINARY    0022...").
 inline Result<std::vector<uint8_t>> parse_hex_blob(std::string_view text) {

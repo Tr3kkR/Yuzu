@@ -283,6 +283,21 @@ TEST_CASE("win32 failures: access denied and any other error are unreadable with
     CHECK_FALSE(failed.token.empty());
 }
 
+TEST_CASE("win32 failures: a cause the shell detects itself is unreadable with exactly one token, "
+          "never a denial",
+          "[system_hardening][win_parsers]") {
+    // ERROR_MORE_DATA, a non-REG_BINARY type and a decoder token are found by the Windows shell,
+    // not classified from an error number; this pins the token text that reaches the status reason.
+    const auto oversized = unreadable_failure("mitigation_options", "oversized");
+    CHECK(oversized.state == "unreadable");
+    CHECK(oversized.token == "mitigation_options:oversized");
+    CHECK_FALSE(oversized.access_denied);
+    CHECK(unreadable_failure("mitigation_audit_options", "type_3").token ==
+          "mitigation_audit_options:type_3");
+    CHECK(unreadable_failure("mitigation_options", "odd_length").token ==
+          "mitigation_options:odd_length");
+}
+
 TEST_CASE("win32 failures: the classified error numbers are the winerror.h constants",
           "[system_hardening][win_parsers]") {
     // system_hardening_win.cpp static_asserts these against the SDK on Windows; pinned here on

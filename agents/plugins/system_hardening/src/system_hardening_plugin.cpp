@@ -17,11 +17,13 @@
  *              (system_hardening_win.cpp)
  *
  * WHY (state plainly, do not inflate): there is no documented business
- * driver for this plugin. No capability-map, enterprise-parity, SOC 2 or
- * roadmap entry names it; the nearest idea (docs/roadmap.md Issue 18.2,
- * CIS-shaped compliance reporting) is a reporting layer over rules that would
- * have to exist elsewhere and is itself only Proposed. This is capability-gap
- * reasoning, not evidenced demand.
+ * driver for this plugin. No capability-map requirement, enterprise-parity,
+ * SOC 2 or roadmap entry names it as a need (the capability-map
+ * plugin-inventory row is added by this change as a listing, not a driver);
+ * the nearest idea (docs/roadmap.md Issue 18.2, CIS-shaped compliance
+ * reporting) is a reporting layer over rules that would have to exist
+ * elsewhere and is itself only Proposed. This is capability-gap reasoning,
+ * not evidenced demand.
  *
  * This TU is portable except for its single dispatch #if; all three
  * descriptor legs are declared unconditionally so the capability-matrix
@@ -96,15 +98,24 @@ public:
                              yuzu::util::safe_output_field(action));
             return 1;
         }
-        // Yuzu targets exactly these three OSes, so there is no fourth branch.
+        // Frozen seam: nothing may escape the plugin ABI (the SDK trampoline does not catch);
+        // every leg returns 0 for a data-level outcome, so 1 means exactly this.
+        try {
+            // Yuzu targets exactly these three OSes, so there is no fourth branch.
 #if defined(_WIN32)
-        return yuzu::system_hardening::collect_posture_win(ctx);
+            return yuzu::system_hardening::collect_posture_win(ctx);
 #elif defined(__linux__)
-        return yuzu::system_hardening::collect_posture_linux(ctx);
+            return yuzu::system_hardening::collect_posture_linux(ctx);
 #elif defined(__APPLE__)
-        return yuzu::system_hardening::collect_posture_macos(ctx);
+            return yuzu::system_hardening::collect_posture_macos(ctx);
 #endif
-        return 1;
+            return 1;
+        } catch (...) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "internal_error");
+            ctx.write_output("constrained|internal_error");
+            return 1;
+        }
     }
 };
 

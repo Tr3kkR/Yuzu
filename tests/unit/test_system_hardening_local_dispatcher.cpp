@@ -20,6 +20,11 @@
  * token and does not lower the status.
  * Only an UNREADABLE key is a failure. The status test below holds on every
  * host, Windows included, because that contract is the same on all three legs.
+ *
+ * The exercise_emit_* cases need no plugin load and no OS call: a synthetic
+ * descriptor drives emit_posture (the Linux and macOS status writer) through
+ * LocalDispatcher on every OS, so the rows-to-status wiring is proven even on
+ * a host whose real leg only ever reads values.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -29,9 +34,11 @@
 
 #include "local_dispatcher.hpp"
 
+#include "system_hardening_legs.hpp"
 #include "system_hardening_parsers.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -166,7 +173,88 @@ bool has_token_for(const std::vector<std::string>& tokens, const std::string& ke
     return false;
 }
 
+// Synthetic-descriptor callbacks: each builds rows + accumulator purely and hands them to
+// emit_posture. Nothing here reads /proc, calls sysctlbyname or touches the registry.
+int exercise_emit_mixed(YuzuCommandContext* raw, const char* /*action*/,
+                        const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PostureRow> rows;
+    rows.push_back({"linux", "kernel.sysrq", "0", PostureState::enabled});
+    rows.push_back(failed_row("linux", "kernel.kptr_restrict", EIO, acc));
+    emit_posture(ctx, rows, acc);
+    return 0;
+}
+
+int exercise_emit_absent_only(YuzuCommandContext* raw, const char* /*action*/,
+                              const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PostureRow> rows;
+    rows.push_back({"linux", "kernel.sysrq", "0", PostureState::enabled});
+    rows.push_back(failed_row("linux", "kernel.yama.ptrace_scope", ENOENT, acc));
+    emit_posture(ctx, rows, acc);
+    return 0;
+}
+
+int exercise_emit_denied(YuzuCommandContext* raw, const char* /*action*/,
+                         const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PostureRow> rows;
+    rows.push_back(failed_row("macos", "kern.coredump", EPERM, acc));
+    emit_posture(ctx, rows, acc);
+    return 0;
+}
+
 } // namespace
+
+TEST_CASE("system_hardening emit_posture: a mixed value + unreadable run is CONSTRAINED/PARTIAL "
+          "with the failed key's token",
+          "[system_hardening][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &exercise_emit_mixed;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.rc == 0);
+    CHECK(captured_rows(r.captured) ==
+          std::vector<std::string>{"posture|linux|kernel.sysrq|0|enabled",
+                                   "posture|linux|kernel.kptr_restrict|-|unreadable"});
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "kernel.kptr_restrict:errno_" + std::to_string(EIO));
+}
+
+TEST_CASE("system_hardening emit_posture: a value + absent run is OK/FULL with no provenance",
+          "[system_hardening][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &exercise_emit_absent_only;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.rc == 0);
+    CHECK(captured_rows(r.captured) ==
+          std::vector<std::string>{"posture|linux|kernel.sysrq|0|enabled",
+                                   "posture|linux|kernel.yama.ptrace_scope|-|absent"});
+    CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(r.result_provenance.empty());
+}
+
+TEST_CASE("system_hardening emit_posture: a refused read is PERMISSION_DENIED/PARTIAL, not "
+          "CONSTRAINED",
+          "[system_hardening][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &exercise_emit_denied;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.rc == 0);
+    CHECK(captured_rows(r.captured) ==
+          std::vector<std::string>{"posture|macos|kern.coredump|-|unreadable"});
+    CHECK(r.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(r.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "kern.coredump:eacces");
+}
 
 TEST_CASE("system_hardening plugin: every row is posture|os|key|raw|state with a known state",
           "[system_hardening][actions]") {
@@ -238,10 +326,9 @@ TEST_CASE("system_hardening plugin: the typed status agrees with the rows; only 
     }
     const bool is_ok = result.result_status == YUZU_RESULT_STATUS_OK;
     const bool is_constrained = result.result_status == YUZU_RESULT_STATUS_CONSTRAINED;
-    // Only the Windows leg sets PERMISSION_DENIED (ERROR_ACCESS_DENIED); the Linux/macOS
-    // legs (emit_posture) never emit it.
-    const bool is_denied =
-        !kAllowlistLeg && result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
+    // Any leg reports PERMISSION_DENIED when a read was refused (EACCES/EPERM,
+    // ERROR_ACCESS_DENIED).
+    const bool is_denied = result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
     REQUIRE((is_ok || is_constrained || is_denied));
     const auto tokens = split_tokens(result.result_provenance);
     if (is_ok) {
@@ -281,5 +368,12 @@ TEST_CASE("system_hardening plugin: an unknown action is refused, not silently i
         return;
     }
     yuzu::agent::LocalDispatcher dispatcher;
-    CHECK(dispatcher.run(plugin->descriptor, "no_such_action").rc != 0);
+    const auto r = dispatcher.run(plugin->descriptor, "no_such_action");
+    CHECK(r.rc != 0);
+    CHECK(captured_rows(r.captured) == std::vector<std::string>{"unknown action: no_such_action"});
+    // The action name is request-supplied text in a pipe-delimited stream: safe_output_field
+    // folds a newline to a space and escapes the pipe.
+    const auto escaped = dispatcher.run(plugin->descriptor, "no|such\naction");
+    CHECK(captured_rows(escaped.captured) ==
+          std::vector<std::string>{"unknown action: no\\|such action"});
 }

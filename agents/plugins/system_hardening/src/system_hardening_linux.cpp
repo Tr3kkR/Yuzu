@@ -13,6 +13,8 @@
 
 #if defined(__linux__)
 
+#include <yuzu/agent/scoped_fd.hpp>
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -30,19 +32,19 @@ constexpr std::size_t kMaxValueBytes = 256;
 
 ReadOutcome read_proc_sys(std::string_view path) {
     const std::string p{path};
-    int fd;
+    int raw;
     do {
-        fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
-    } while (fd < 0 && errno == EINTR);
-    if (fd < 0) return {errno, 0, {}};
+        raw = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (raw < 0 && errno == EINTR);
+    yuzu::agent::ScopedFd fd(raw);
+    if (!fd) return {errno, 0, {}};
 
     char buf[kMaxValueBytes];
     ssize_t n;
     do {
-        n = ::read(fd, buf, sizeof buf);
+        n = ::read(fd.get(), buf, sizeof buf);
     } while (n < 0 && errno == EINTR);
-    const int read_errno = (n < 0) ? errno : 0; // captured BEFORE close() can clobber it
-    ::close(fd);
+    const int read_errno = (n < 0) ? errno : 0; // captured before the owner closes the fd on return
     if (n < 0) return {read_errno, 0, {}};
     return {0, 0, std::string(buf, static_cast<std::size_t>(n))};
 }

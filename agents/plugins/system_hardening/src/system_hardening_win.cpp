@@ -22,13 +22,14 @@
  *   other Win32 / wrong REG type / oversized / undecodable blob
  *                        -> `unreadable`, <name>:win32_<n> | type_<n> |
  *                           oversized | <decoder token>
- * Only unreadable rows accumulate tokens (ConstraintAccumulator); status is
- * PERMISSION_DENIED, else CONSTRAINED/PARTIAL when any token exists, else
- * OK/FULL. MitigationOptions/MitigationAuditOptions do not exist on a default
- * install (the rig probe below), so that modal state reads two `absent` rows
- * and OK/FULL. A missing or unreadable key never yields a non-zero exit:
- * return 0 for every data-level outcome, 1 only for an internal exception
- * (constrained|internal_error).
+ * Only unreadable rows accumulate tokens (ConstraintAccumulator); the status is
+ * select_status (system_hardening_parsers.hpp): PERMISSION_DENIED when any read
+ * was refused, else CONSTRAINED/PARTIAL when any token exists, else OK/FULL.
+ * MitigationOptions/MitigationAuditOptions do not exist on a default install
+ * (the rig probe below), so that modal state reads two `absent` rows and
+ * OK/FULL. A missing or unreadable key never yields a non-zero exit: return 0
+ * for every data-level outcome; an internal exception is contained by the
+ * portable execute() (rc 1, constrained|internal_error).
  *
  * THE-RIG PROBE (rig session A, 2026-09-21, Windows 11 Pro 10.0.26200, x64) -- COMPLETE.
  * Run as NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest). Fixture + provenance:
@@ -107,27 +108,16 @@ static_assert(mit::kErrorAccessDenied == static_cast<std::uint32_t>(ERROR_ACCESS
 static_assert(mit::kErrorNotSupported == static_cast<std::uint32_t>(ERROR_NOT_SUPPORTED));
 static_assert(mit::kErrorInvalidParameter == static_cast<std::uint32_t>(ERROR_INVALID_PARAMETER));
 
-/// Writes the row the pure classifier chose for one failed read. `absent` (the OS definitively
-/// says it is not there) adds no token and leaves the status alone; `unreadable` adds one token
-/// per cause, and ERROR_ACCESS_DENIED also marks the run PERMISSION_DENIED.
-void report_read_failure(yuzu::CommandContext& ctx, Probe& p, std::string_view row_name,
-                         DWORD err, mit::ReadSource source = mit::ReadSource::registry) {
-    const mit::ReadFailure f =
-        mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(err), source);
+/// Writes the row for one failed read, as the pure layer classified it. `absent` (the OS
+/// definitively says it is not there) adds no token and leaves the status alone; `unreadable`
+/// adds one token per cause, and ERROR_ACCESS_DENIED also marks the run PERMISSION_DENIED.
+void report_failure(yuzu::CommandContext& ctx, Probe& p, std::string_view row_name,
+                    const mit::ReadFailure& f) {
     if (f.access_denied)
         p.denied = true;
-    if (!f.token.empty()) {
+    if (!f.token.empty())
         p.acc.add_failure(f.token);
-        p.acc.mark_incomplete();
-    }
     ctx.write_output(mit::format_posture_row(row_name, "-", f.state));
-}
-
-void report_unreadable(yuzu::CommandContext& ctx, Probe& p, std::string_view row_name,
-                       const std::string& reason) {
-    p.acc.add_failure(std::string{row_name} + ":" + reason);
-    p.acc.mark_incomplete();
-    ctx.write_output(mit::format_posture_row(row_name, "-", "unreadable"));
 }
 
 /// Reads + decodes one REG_BINARY value, emitting its rows or one absent/unreadable row.
@@ -138,16 +128,20 @@ void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const wc
     std::vector<BYTE> buf(kReadCap);
     const LSTATUS rc = RegQueryValueExW(kernel_key, value_w, nullptr, &type, buf.data(), &size);
     if (rc == ERROR_MORE_DATA)
-        return report_unreadable(ctx, p, row_name, "oversized");
+        return report_failure(ctx, p, row_name, mit::unreadable_failure(row_name, "oversized"));
     if (rc != ERROR_SUCCESS)
-        return report_read_failure(ctx, p, row_name, static_cast<DWORD>(rc));
+        return report_failure(ctx, p, row_name,
+                              mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(rc),
+                                                          mit::ReadSource::registry));
     if (type != REG_BINARY)
-        return report_unreadable(ctx, p, row_name, "type_" + std::to_string(type));
+        return report_failure(ctx, p, row_name,
+                              mit::unreadable_failure(row_name, "type_" + std::to_string(type)));
 
     auto rows = mit::decode_mitigation_options(std::span<const uint8_t>{buf.data(), size},
                                                row_prefix);
     if (!rows)
-        return report_unreadable(ctx, p, row_name, rows.error().token);
+        return report_failure(ctx, p, row_name,
+                              mit::unreadable_failure(row_name, rows.error().token));
     for (const auto& r : *rows)
         ctx.write_output(mit::format_posture_row(r));
 }
@@ -157,8 +151,10 @@ void collect_registry(yuzu::CommandContext& ctx, Probe& p) {
     const LSTATUS orc =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKernelKey, 0, KEY_READ | KEY_WOW64_64KEY, key.put());
     if (orc != ERROR_SUCCESS) {
-        report_read_failure(ctx, p, "mitigation_options", static_cast<DWORD>(orc));
-        report_read_failure(ctx, p, "mitigation_audit_options", static_cast<DWORD>(orc));
+        for (const char* name : {"mitigation_options", "mitigation_audit_options"})
+            report_failure(ctx, p, name,
+                           mit::classify_win32_failure(name, static_cast<std::uint32_t>(orc),
+                                                       mit::ReadSource::registry));
         return;
     }
     collect_blob(ctx, p, key.get(), L"MitigationOptions", "mitigation_options", "mitigation.");
@@ -173,7 +169,9 @@ void collect_self(yuzu::CommandContext& ctx, Probe& p, PROCESS_MITIGATION_POLICY
     Policy policy{};
     if (!GetProcessMitigationPolicy(GetCurrentProcess(), which, &policy, sizeof(policy))) {
         const DWORD err = GetLastError();
-        return report_read_failure(ctx, p, row_name, err, mit::ReadSource::process_policy);
+        return report_failure(ctx, p, row_name,
+                              mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(err),
+                                                          mit::ReadSource::process_policy));
     }
     for (const auto& r : mit::decode_self_policy(kind, static_cast<uint32_t>(policy.Flags)))
         ctx.write_output(mit::format_posture_row(r));
@@ -182,31 +180,18 @@ void collect_self(yuzu::CommandContext& ctx, Probe& p, PROCESS_MITIGATION_POLICY
 } // namespace
 
 int collect_posture_win(yuzu::CommandContext& ctx) {
-    try {
-        Probe p;
-        collect_registry(ctx, p);
-        collect_self<PROCESS_MITIGATION_DEP_POLICY>(ctx, p, ProcessDEPPolicy,
-                                                    mit::SelfPolicy::dep, "self.dep");
-        collect_self<PROCESS_MITIGATION_ASLR_POLICY>(ctx, p, ProcessASLRPolicy,
-                                                     mit::SelfPolicy::aslr, "self.aslr");
-        collect_self<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>(
-            ctx, p, ProcessControlFlowGuardPolicy, mit::SelfPolicy::cfg, "self.cfg");
+    Probe p;
+    collect_registry(ctx, p);
+    collect_self<PROCESS_MITIGATION_DEP_POLICY>(ctx, p, ProcessDEPPolicy, mit::SelfPolicy::dep,
+                                                "self.dep");
+    collect_self<PROCESS_MITIGATION_ASLR_POLICY>(ctx, p, ProcessASLRPolicy, mit::SelfPolicy::aslr,
+                                                 "self.aslr");
+    collect_self<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>(
+        ctx, p, ProcessControlFlowGuardPolicy, mit::SelfPolicy::cfg, "self.cfg");
 
-        if (p.denied)
-            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, p.acc.reason());
-        else if (p.acc.any_failure())
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  p.acc.reason());
-        else
-            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
-        return 0;
-    } catch (...) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              "internal_error");
-        ctx.write_output("constrained|internal_error");
-        return 1;
-    }
+    const auto s = select_status(p.acc, p.denied);
+    ctx.set_result_status(s.status, s.completeness, s.provenance);
+    return 0;
 }
 
 } // namespace yuzu::system_hardening

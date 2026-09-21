@@ -1,10 +1,10 @@
 /**
  * system_hardening_legs.hpp -- the seam between the portable plugin TU and
  * the three per-OS leg TUs (modelled on peripherals_legs.hpp /
- * disk_actions_legs.hpp). Each entry point is a READ that returns 0
- * unconditionally: an unreadable key is a degraded read reported through
- * set_result_status, never a failed command, and an absent key is not a
- * failure at all.
+ * disk_actions_legs.hpp). Each entry point is a READ that returns 0 for every
+ * data-level outcome: an unreadable key is a degraded read reported through
+ * set_result_status, an absent key is not a failure at all; the portable
+ * `execute()` alone converts an escaped exception into rc 1.
  *
  * Declared unconditionally so every TU sees one signature on every OS; only
  * the DEFINITION is self-gated (each leg TU wraps its whole body in
@@ -25,19 +25,17 @@ int collect_posture_linux(yuzu::CommandContext& ctx);
 int collect_posture_macos(yuzu::CommandContext& ctx);
 int collect_posture_win(yuzu::CommandContext& ctx);
 
-/// Writes every row, then the CC-07 status: OK/FULL when acc holds no failure
-/// token (every key was a value or `absent`); otherwise CONSTRAINED/PARTIAL
-/// with the accumulated `<key>:<cause>` tokens as the reason. Only an
-/// `unreadable` key adds a token; an absent optional key never downgrades the run.
+/// Writes every row, then the CC-07 status via select_status: OK/FULL when acc
+/// holds no failure token (every key was a value or `absent`); PERMISSION_DENIED/
+/// PARTIAL when a read was refused (EACCES/EPERM); else CONSTRAINED/PARTIAL, with
+/// the accumulated `<key>:<cause>` tokens as the reason. Only an `unreadable` key
+/// adds a token; an absent optional key never downgrades the run.
 inline void emit_posture(yuzu::CommandContext& ctx, const std::vector<PostureRow>& rows,
                          const yuzu::shared::ConstraintAccumulator& acc) {
     for (const auto& r : rows)
         ctx.write_output(format_posture_row(r));
-    if (acc.any_failure())
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              acc.reason());
-    else
-        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    const auto s = select_status(acc, any_denied(rows));
+    ctx.set_result_status(s.status, s.completeness, s.provenance);
 }
 
 } // namespace yuzu::system_hardening

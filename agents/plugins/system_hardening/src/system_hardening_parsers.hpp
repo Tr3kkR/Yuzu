@@ -26,11 +26,14 @@
  *
  * REASON TOKENS (yuzu::shared::ConstraintAccumulator, one per UNREADABLE key;
  * an absent key adds none):
- *   <key>:eacces          -> unreadable (EACCES or EPERM)
+ *   <key>:eacces          -> unreadable (EACCES or EPERM) AND the run reports
+ *                            PERMISSION_DENIED/PARTIAL
  *   <key>:errno_<n>       -> unreadable (any other errno)
  * ENOENT is the only errno that reads as `absent`, and it carries no token. A
- * run whose every key is a value or `absent` therefore reports OK/FULL;
- * CONSTRAINED/PARTIAL appears only when at least one key is `unreadable`.
+ * run whose every key is a value or `absent` therefore reports OK/FULL; a run
+ * with an `unreadable` key reports PERMISSION_DENIED/PARTIAL when any read was
+ * refused (a denial outranks every other cause), else CONSTRAINED/PARTIAL --
+ * select_status below decides, for every leg.
  *
  * EMPTY IS NOT FAILED: an empty macOS kern.bootargs is a successful read of
  * an empty string (sysctlbyname size probe rc=0, len=1 -- a lone NUL); the
@@ -40,6 +43,7 @@
 
 #include <constraint_accumulator.hpp>
 
+#include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
 #include <yuzu/string_utils.hpp>
 
 #include <array>
@@ -210,24 +214,32 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
     return err == ENOENT ? PostureState::absent : PostureState::unreadable;
 }
 
+/// EACCES/EPERM: the read was refused. The one pair failure_token spells `:eacces`
+/// and select_status turns into PERMISSION_DENIED.
+[[nodiscard]] constexpr bool is_denied_errno(int err) noexcept {
+    return err == EACCES || err == EPERM;
+}
+
 /// The reason token of a FAILED read: `<key>:eacces` | `<key>:errno_<n>`.
 /// Absence is not a failure: for ENOENT (classified `absent`) there is no
 /// token, so the result is nullopt and nothing reaches the accumulator.
 [[nodiscard]] inline std::optional<std::string> failure_token(std::string_view key, int err) {
     if (classify_read_errno(err) == PostureState::absent) return std::nullopt;
     std::string t{key};
-    if (err == EACCES || err == EPERM) t += ":eacces";
+    if (is_denied_errno(err)) t += ":eacces";
     else t += ":errno_" + std::to_string(err);
     return t;
 }
 
 // ── rows ────────────────────────────────────────────────────────────────
 
+// `os` and `key` are borrowed views into the constexpr allowlists / literals, never owned.
 struct PostureRow {
     std::string_view os;
     std::string_view key;
     std::string raw; // "-" when nothing was read
     PostureState state;
+    int err = 0; // errno of a FAILED read (0 for a value)
 };
 
 [[nodiscard]] inline std::string format_posture_row(const PostureRow& r) {
@@ -259,7 +271,33 @@ struct ReadOutcome {
 [[nodiscard]] inline PostureRow failed_row(std::string_view os, std::string_view key, int err,
                                            yuzu::shared::ConstraintAccumulator& acc) {
     if (const auto token = failure_token(key, err)) acc.add_failure(*token);
-    return {os, key, "-", classify_read_errno(err)};
+    return {os, key, "-", classify_read_errno(err), err};
+}
+
+// ── status selection (pure; the one decision every leg shares) ──────────
+
+[[nodiscard]] inline bool any_denied(std::span<const PostureRow> rows) noexcept {
+    for (const auto& r : rows)
+        if (is_denied_errno(r.err)) return true;
+    return false;
+}
+
+struct PostureStatus {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    std::string provenance;
+};
+
+/// PERMISSION_DENIED/PARTIAL when any read was refused (a denial outranks every other
+/// cause), else CONSTRAINED/PARTIAL when any token exists, else OK/FULL with no provenance.
+[[nodiscard]] inline PostureStatus select_status(const yuzu::shared::ConstraintAccumulator& acc,
+                                                 bool denied) {
+    if (denied)
+        return {YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                acc.reason()};
+    if (acc.any_failure())
+        return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, acc.reason()};
+    return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {}};
 }
 
 /// `read(path)` -> ReadOutcome. One row per kLinuxAllowlist entry, in order.

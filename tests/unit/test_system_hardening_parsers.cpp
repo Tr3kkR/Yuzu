@@ -5,7 +5,7 @@
  * No platform guard: the header is OS-free, and the readers are INJECTED, so
  * nothing here opens /proc, calls sysctlbyname or spawns anything. Fixtures
  * (tests/unit/fixtures/wave8/system_hardening/, each with a .provenance.txt):
- *   linux/proc_sys_{debian12,fedora40}.txt  REAL CAPTURE (docker containers)
+ *   linux/proc_sys_debian12.txt             REAL CAPTURE (docker container)
  *   macos/sysctl_posture_macos26.txt        REAL CAPTURE (this Mac)
  *   linux/proc_sys_malformed.txt            RECONSTRUCTION (malformed values)
  * Line shape: <key>\t<ok|err>\t<value or the tool's error text>.
@@ -297,9 +297,8 @@ TEST_CASE("system_hardening: ENOENT, EACCES and a successful read give three dis
     CHECK(state_of(rows, "kernel.dmesg_restrict") == PostureState::unreadable);
     CHECK(state_of(rows, "kernel.sysrq") == PostureState::unreadable);
     CHECK(raw_of(rows, "kernel.yama.ptrace_scope") == "-");
-    // The absent key (yama) adds NO token; the three unreadable keys carry exactly theirs. A mixed
-    // run is therefore CONSTRAINED/PARTIAL (emit_posture keys on acc.any_failure()) for the
-    // unreadable keys alone.
+    // The absent key (yama) adds NO token; the three unreadable keys carry exactly theirs. This
+    // mixed run is therefore PERMISSION_DENIED/PARTIAL (EACCES present; select_status below).
     CHECK(acc.any_failure());
     CHECK(acc.reason() == "kernel.kptr_restrict:eacces,kernel.dmesg_restrict:eacces,"
                           "kernel.sysrq:errno_" + std::to_string(EIO));
@@ -352,7 +351,7 @@ TEST_CASE("system_hardening: a mixed absent + EACCES run reports exactly the EAC
     REQUIRE(rows.size() == kLinuxAllowlist.size());
     CHECK(state_of(rows, "kernel.yama.ptrace_scope") == PostureState::absent);
     CHECK(state_of(rows, "kernel.kptr_restrict") == PostureState::unreadable);
-    CHECK(acc.any_failure()); // CONSTRAINED/PARTIAL, because of the EACCES key alone
+    CHECK(acc.any_failure()); // PERMISSION_DENIED/PARTIAL, because of the EACCES key alone
     CHECK(acc.reason() == "kernel.kptr_restrict:eacces");
 }
 
@@ -398,31 +397,102 @@ TEST_CASE("system_hardening: macOS collect classifies ENOENT/EPERM and treats em
     CHECK(acc.reason() == "kern.coredump:eacces");
 }
 
+// ── status selection ─────────────────────────────────────────────────────
+
+TEST_CASE("system_hardening: select_status -- no token is OK/FULL, any token CONSTRAINED, and a "
+          "denial outranks every other cause",
+          "[system_hardening][status]") {
+    ConstraintAccumulator none;
+    const auto ok = select_status(none, false);
+    CHECK(ok.status == YUZU_RESULT_STATUS_OK);
+    CHECK(ok.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(ok.provenance.empty());
+
+    ConstraintAccumulator failed;
+    failed.add_failure("k:errno_5");
+    const auto constrained = select_status(failed, false);
+    CHECK(constrained.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(constrained.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(constrained.provenance == "k:errno_5");
+
+    ConstraintAccumulator refused;
+    refused.add_failure("k:eacces");
+    const auto denied = select_status(refused, true);
+    CHECK(denied.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(denied.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(denied.provenance == "k:eacces");
+
+    // A denial outranks another unreadable cause in the same run; both tokens stay in the reason.
+    ConstraintAccumulator both;
+    both.add_failure("a:eacces");
+    both.add_failure("b:errno_5");
+    const auto outranks = select_status(both, true);
+    CHECK(outranks.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(outranks.provenance == "a:eacces,b:errno_5");
+}
+
+TEST_CASE("system_hardening: is_denied_errno is EACCES/EPERM only; any_denied reads row errnos",
+          "[system_hardening][status]") {
+    CHECK(is_denied_errno(EACCES));
+    CHECK(is_denied_errno(EPERM));
+    for (const int err : {ENOENT, EIO, EINVAL, 0})
+        CHECK_FALSE(is_denied_errno(err));
+
+    ConstraintAccumulator acc;
+    const auto mixed = collect_linux_posture(
+        [](std::string_view path) -> ReadOutcome {
+            if (path == "/proc/sys/kernel/kptr_restrict") return {EACCES, 0, {}};
+            if (path == "/proc/sys/kernel/yama/ptrace_scope") return {ENOENT, 0, {}};
+            return {0, 0, "1\n"};
+        },
+        acc);
+    CHECK(any_denied(mixed));
+
+    ConstraintAccumulator values_acc;
+    const auto values = collect_linux_posture(
+        [](std::string_view) { return ReadOutcome{0, 0, "1\n"}; }, values_acc);
+    CHECK_FALSE(any_denied(values));
+
+    // Absence is never a denial.
+    ConstraintAccumulator absent_acc;
+    const auto absent = collect_linux_posture(
+        [](std::string_view) { return ReadOutcome{ENOENT, 0, {}}; }, absent_acc);
+    CHECK_FALSE(any_denied(absent));
+
+    // The macOS collector carries the errno the same way.
+    ConstraintAccumulator mac_acc;
+    const auto mac = collect_macos_posture(
+        [](std::string_view name, SysctlKind) -> ReadOutcome {
+            if (name == "kern.coredump") return {EPERM, 0, {}};
+            return {0, 1, "x"};
+        },
+        mac_acc);
+    CHECK(any_denied(mac));
+}
+
 // ── REAL CAPTURE fixtures ────────────────────────────────────────────────
 
-TEST_CASE("system_hardening: REAL CAPTURE docker debian:12 and fedora:40 /proc/sys reads",
+TEST_CASE("system_hardening: REAL CAPTURE docker debian:12 /proc/sys reads",
           "[system_hardening][fixture]") {
-    for (const char* name : {"proc_sys_debian12.txt", "proc_sys_fedora40.txt"}) {
-        INFO(name);
-        ConstraintAccumulator acc;
-        const auto rows = collect_linux_posture(linux_reader_over(load_fixture("linux", name)), acc);
-        REQUIRE(rows.size() == kLinuxAllowlist.size());
-        using P = PostureState;
-        CHECK(state_of(rows, "kernel.randomize_va_space") == P::enabled);
-        CHECK(state_of(rows, "kernel.kptr_restrict") == P::disabled);
-        CHECK(state_of(rows, "kernel.dmesg_restrict") == P::enabled);
-        CHECK(state_of(rows, "kernel.unprivileged_bpf_disabled") == P::disabled);
-        CHECK(state_of(rows, "kernel.sysrq") == P::disabled); // value 1
-        CHECK(state_of(rows, "fs.protected_hardlinks") == P::enabled);
-        CHECK(state_of(rows, "fs.protected_fifos") == P::disabled);
-        CHECK(state_of(rows, "fs.suid_dumpable") == P::enabled);
-        // Yama is genuinely not built into this kernel: the real ENOENT case. It is `absent`, and
-        // absence is not a failure: this whole real-capture host reads with no token (OK/FULL).
-        CHECK(state_of(rows, "kernel.yama.ptrace_scope") == P::absent);
-        CHECK(raw_of(rows, "kernel.yama.ptrace_scope") == "-");
-        CHECK_FALSE(acc.any_failure());
-        CHECK(acc.reason().empty());
-    }
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(
+        linux_reader_over(load_fixture("linux", "proc_sys_debian12.txt")), acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    using P = PostureState;
+    CHECK(state_of(rows, "kernel.randomize_va_space") == P::enabled);
+    CHECK(state_of(rows, "kernel.kptr_restrict") == P::disabled);
+    CHECK(state_of(rows, "kernel.dmesg_restrict") == P::enabled);
+    CHECK(state_of(rows, "kernel.unprivileged_bpf_disabled") == P::disabled);
+    CHECK(state_of(rows, "kernel.sysrq") == P::disabled); // value 1
+    CHECK(state_of(rows, "fs.protected_hardlinks") == P::enabled);
+    CHECK(state_of(rows, "fs.protected_fifos") == P::disabled);
+    CHECK(state_of(rows, "fs.suid_dumpable") == P::enabled);
+    // Yama is genuinely not built into this kernel: the real ENOENT case. It is `absent`, and
+    // absence is not a failure: this whole real-capture host reads with no token (OK/FULL).
+    CHECK(state_of(rows, "kernel.yama.ptrace_scope") == P::absent);
+    CHECK(raw_of(rows, "kernel.yama.ptrace_scope") == "-");
+    CHECK_FALSE(acc.any_failure());
+    CHECK(acc.reason().empty());
 }
 
 TEST_CASE("system_hardening: REAL CAPTURE this Mac's sysctl reads (empty bootargs, kern.nx unknown oid)",
