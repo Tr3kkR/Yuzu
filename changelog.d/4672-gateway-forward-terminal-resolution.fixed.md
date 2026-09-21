@@ -1,17 +1,15 @@
-- **`forward_gateway_pending`'s terminal-failure branches now resolve the dispatching
-  operator's `command_id` instead of leaving it stuck forever (#4672).** Every terminal-failure
-  branch (`unauthenticated` — the #1422 mgmt-plane peer pin rejects; exhausted `unavailable`
-  retries; `unknown_cluster` — no configured `--gateway-cluster-addr` for the target's cluster;
-  and a response stream that produced no legitimate resolution for the targeted agent —
-  "agent_mismatch") previously logged, incremented `yuzu_server_gateway_forward_total`, and
-  silently dropped the command; the executions drawer and any API caller polling that
-  `command_id` saw it idle at RUNNING (or never resolve at all) with no terminal signal. Each
-  branch now synthesizes a terminal `FAILURE` response (`build_gateway_forward_terminal_failure`,
-  a new pure, unit-tested builder in `gateway_mgmt_stub_pool.hpp`) and applies it through the
-  same `process_gateway_response` path a real gateway response already uses, so the command
-  resolves via the established `notify_exec_tracker` terminal-write mechanism exactly once.
-  Durable outbox re-drive with backoff (ADR-2002 §7's original design note) is deliberately NOT
-  wired for this path — see `docs/adr/2002-high-availability-architecture.md` §7e for the two
-  reasons (a granularity mismatch with the WS-3 3.3 command outbox's leader-gated producer
-  contract, and the pre-existing #3279 detached-thread lifetime hazard this fix does not widen) —
-  and is tracked as a documented follow-up once #3279 closes.
+- **A command forwarded to a gateway-connected agent now always resolves to a terminal outcome
+  instead of getting stuck forever (#4672).** Every gateway-forwarding failure case — the
+  mgmt-plane peer pin rejecting this server's certificate; the gateway staying unreachable after
+  retries; a target cluster with no configured management address; a response that could not be
+  attributed to the intended agent — previously logged the failure and dropped the command
+  silently: the executions drawer and any API caller polling that command's status saw it idle at
+  RUNNING (or never resolve at all), with no terminal signal. Each of these cases now resolves the
+  command to a terminal `FAILURE` with a specific reason code (`gateway_unauthenticated`,
+  `gateway_unavailable`, `gateway_unknown_cluster`, `gateway_agent_mismatch`,
+  `gateway_forward_failed`), applied through the same path a real gateway response already uses,
+  at most once per command across every retry attempt. Durable automatic re-drive with backoff is
+  deliberately NOT provided for this path yet — see
+  `docs/adr/2002-high-availability-architecture.md` §7e for why, tracked in #4690 — so an operator
+  who wants to retry after fixing the underlying cause (a cert/pin mismatch, a missing
+  `--gateway-cluster-addr`) currently re-dispatches the command manually.

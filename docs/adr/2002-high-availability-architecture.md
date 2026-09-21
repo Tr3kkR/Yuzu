@@ -1247,11 +1247,21 @@ polling that `command_id` saw it idle at RUNNING (or unresolved) forever.
 and applies it through `process_gateway_response` — the SAME mechanism a real gateway response already
 used on every other line of this function. This keeps command_id resolution to the ONE established
 `notify_exec_tracker` terminal-write path (executions-history-ladder routed concern) rather than a
-bespoke second mechanism, and it resolves at most once per attempt: the `agent_mismatch` branch tracks,
-per stream, whether ANY frame was already legitimately applied (a real response, or a repaired
-`not_connected` frame — both of which already resolve the command_id on their own) before deciding
-whether to synthesize a failure, so a stream carrying both a mismatched frame and a later legitimate one
-is never double-resolved.
+bespoke second mechanism.
+
+**Exactly-once guard (post-Gate-2/3 correction):** the first cut of this fix scoped the double-resolve
+guard to the `agent_mismatch` branch only, tracking whether a legitimate frame was applied *within a
+single attempt*. Gate 2/3 governance (security-guardian HIGH, cpp-safety/cpp-expert independently
+confirming) caught that this left the OTHER three synthesizing branches — `unauthenticated`, the generic
+`"other"` branch, and exhausted-retries `unavailable` — able to clobber an already-applied real terminal
+response with a synthetic FAILURE, either within one attempt (a legitimate frame applied, then that same
+attempt's `Finish()` still reports a non-OK transport status) or across attempts (an earlier attempt
+resolves the command while a later attempt independently hits a different terminal-failure branch). The
+shipped guard is a single `applied_response` bool, declared ONCE before the 3-attempt retry loop (not
+per-attempt, not per-branch) and consulted by ALL FOUR synthesizing call sites — `agent_mismatch`,
+`unauthenticated`, `"other"`, and exhausted-`unavailable` — so a real response (a genuine apply, or a
+repaired `not_connected` frame) applied at ANY point across the whole command's attempts suppresses
+every later synthetic write for that same command_id.
 
 **Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
 re-drive), for two independent, load-bearing reasons — not silently, this time:**

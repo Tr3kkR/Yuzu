@@ -274,6 +274,33 @@ because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
 
+### vNEXT — a command forwarded to a gateway-connected agent always resolves instead of getting stuck at RUNNING (#4672; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, a command dispatched to a gateway-fronted agent (multi-cluster gateway
+mode — see [ha-postgres.md](ha-postgres.md) and ADR-2002 §7) could get stuck at `RUNNING`
+forever with no terminal signal if the forward itself failed: the gateway's mgmt-plane peer
+pin rejecting this server's certificate, the gateway staying unreachable after retries, a
+target cluster with no configured `--gateway-cluster-addr`, or a response that could not be
+attributed to the intended agent. The executions drawer and any API caller polling that
+command's status saw it idle indefinitely.
+
+**What changes:** every one of those cases now resolves the command to a terminal `FAILURE`,
+at most once, with a specific `error.code` you can use to diagnose the cause:
+
+| `error.code` | Meaning | What to check |
+|---|---|---|
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
+| `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
+| `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
+| `gateway_forward_failed` | Any other gateway `SendCommand` RPC failure | The gateway's own logs for the specific gRPC error |
+
+**Recovery:** there is no automatic re-drive for a gateway-forward failure — re-dispatch the
+command once the underlying cause is fixed. Automatic durable retry is tracked as a follow-up
+in #4690.
+
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 
 New, non-breaking, purely additive. No operator action required.

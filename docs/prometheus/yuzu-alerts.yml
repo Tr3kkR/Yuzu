@@ -278,6 +278,44 @@ groups:
             agent it never held. Check the cluster_id label and the
             corresponding gateway's logs. See ADR-2002 §7d.
 
+      # #4672 (Gate 6 sre SHOULD, 2026-09-21) — before this fix,
+      # unauthenticated/unknown_cluster gateway-forward failures were logged
+      # and counted but never resolved the dispatching operator's command_id
+      # (it hung at RUNNING forever); now they resolve terminally, which
+      # makes them visible here for the first time. Both are config-class
+      # defects, not transient blips — same "any occurrence is actionable"
+      # posture as YuzuGatewayResponseAgentMismatch above, no `for:`.
+      - alert: YuzuGatewayForwardUnauthenticated
+        expr: |
+          increase(yuzu_server_gateway_forward_total{status="unauthenticated"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway mgmt-plane peer pin rejected this server ({{ $value }} in 1h)"
+          description: >-
+            forward_gateway_pending's SendCommand RPC was rejected
+            UNAUTHENTICATED by a gateway's mgmt-plane peer pin (#1422) — the
+            certificate this server presents does not satisfy that gateway's
+            configured pin. Command forwarding to that gateway's agents is
+            DOWN until the pin and the server's leaf certificate agree. See
+            ADR-2002 §7e and docs/user-manual/server-admin.md's `#4672`
+            vNEXT entry for the `gateway_unauthenticated` reason code.
+
+      - alert: YuzuGatewayForwardUnknownCluster
+        expr: |
+          increase(yuzu_server_gateway_forward_total{status="unknown_cluster"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command targeted a gateway cluster with no configured mgmt address ({{ $value }} in 1h)"
+          description: >-
+            forward_gateway_pending resolved an agent to a cluster_id with
+            no matching `--gateway-cluster-addr` entry — a static
+            configuration gap, not a transient condition; it self-heals only
+            when an operator adds the missing flag. See ADR-2002 §7e and
+            docs/user-manual/server-admin.md's `#4672` vNEXT entry for the
+            `gateway_unknown_cluster` reason code.
+
       # HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b).
       # Fail-open boot semantics (a node that resolves zero peers still boots
       # and serves its own agents fine) mean a misconfigured seed name fails

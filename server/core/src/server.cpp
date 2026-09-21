@@ -12458,11 +12458,6 @@ private:
                             "gateway-connected agents is DOWN until the pin and "
                             "the server leaf agree. Command dropped.",
                             cmd_id);
-                        metrics
-                            ->counter("yuzu_server_gateway_forward_total",
-                                     {{"cluster_id", cluster_label},
-                                      {"status", "unauthenticated"}})
-                            .increment();
                         // #4672 (fixed post-Gate-2/3: security-guardian HIGH
                         // + cpp-safety/cpp-expert independently confirmed) —
                         // gate on `applied_response`: an earlier attempt, or
@@ -12471,11 +12466,21 @@ private:
                         // surfaced this UNAUTHENTICATED status. Synthesizing
                         // here anyway would silently overwrite that real
                         // result (tracker last-write-wins) and insert a
-                        // duplicate response_store row. Still log/count the
-                        // rejection either way — it's a real, observable
-                        // config defect — just don't double-resolve the
-                        // command_id.
+                        // duplicate response_store row.
+                        //
+                        // Gate 4 happy-path SHOULD (2026-09-21): the metric
+                        // increment is gated TOO, symmetric with the write —
+                        // a command that already resolved SUCCESS on an
+                        // earlier attempt must not also bump
+                        // {"status","unauthenticated"} on a later attempt's
+                        // Finish(), which would tell an operator a command
+                        // failed when it actually succeeded.
                         if (!applied_response) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "unauthenticated"}})
+                                .increment();
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
                                 "Gateway REJECTED by the gateway's mgmt-plane peer pin "
@@ -12488,10 +12493,6 @@ private:
                         spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
                                      status.error_message(),
                                      static_cast<int>(status.error_code()));
-                        metrics
-                            ->counter("yuzu_server_gateway_forward_total",
-                                     {{"cluster_id", cluster_label}, {"status", "other"}})
-                            .increment();
                         // #4672: same "resolve now, don't leave the
                         // command_id stuck" posture as every other terminal
                         // branch here — this one is not among the issue's
@@ -12499,8 +12500,24 @@ private:
                         // is identical, and leaving it unresolved while every
                         // sibling branch resolves would just move the bug
                         // rather than close it. Same `applied_response` guard
-                        // as the UNAUTHENTICATED branch above, same reason.
+                        // (write AND metric, see the UNAUTHENTICATED branch
+                        // above) as every other branch here.
+                        //
+                        // Gate 4 consistency-auditor SHOULD (2026-09-21): the
+                        // metric label ("other") intentionally does NOT match
+                        // the reason code ("gateway_forward_failed") below —
+                        // this branch covers every non-UNAVAILABLE grpc
+                        // status OTHER than UNAUTHENTICATED (which has its
+                        // own label/code pair above), so "other" is the
+                        // correct, deliberately generic metric bucket for a
+                        // more specific, per-occurrence reason code. Every
+                        // other branch's label and code DO match 1:1; this is
+                        // the one deliberate exception.
                         if (!applied_response) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "other"}})
+                                .increment();
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_forward_failed",
                                 "Gateway SendCommand RPC failed: " + status.error_message());
@@ -12511,22 +12528,23 @@ private:
                                  cmd_id, attempt + 1, status.error_message());
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                metrics
-                    ->counter("yuzu_server_gateway_forward_total",
-                             {{"cluster_id", cluster_label}, {"status", "unavailable"}})
-                    .increment();
                 // #4672: retries exhausted (3 attempts, exponential backoff)
                 // — a transient-LOOKING failure that has, for THIS dispatch,
                 // behaved exactly like a permanent one. Resolve the
                 // command_id terminally now. See forward_gateway_pending's
                 // own doc comment for why this is immediate-terminal rather
                 // than a durable outbox re-drive (granularity mismatch +
-                // #3279 — deliberately scoped out, not silently dropped).
-                // Same `applied_response` guard as the two branches above —
-                // an earlier attempt in this same 3-try loop may have
-                // already applied a real terminal frame before a later
-                // attempt exhausted on UNAVAILABLE.
+                // #3279 — deliberately scoped out, not silently dropped;
+                // tracked as #4690).
+                // Same `applied_response` guard (write AND metric) as the two
+                // branches above — an earlier attempt in this same 3-try
+                // loop may have already applied a real terminal frame before
+                // a later attempt exhausted on UNAVAILABLE.
                 if (!applied_response) {
+                    metrics
+                        ->counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", cluster_label}, {"status", "unavailable"}})
+                        .increment();
                     apply_gateway_forward_terminal_failure(
                         svc, expected_agent_id, cmd_id, "gateway_unavailable",
                         "Gateway unreachable after 3 attempts — command not delivered");

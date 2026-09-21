@@ -345,19 +345,25 @@ TEST_CASE("build_gateway_forward_terminal_failure: sets command_id, FAILURE stat
     CHECK(resp.error().message() == "rejected by mgmt-plane peer pin");
 }
 
-TEST_CASE("build_gateway_forward_terminal_failure: each of the four #4672 reason codes "
+TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason codes "
           "round-trips distinctly",
           "[server][gateway_mgmt_stub_pool][4672]") {
     // Mirrors the reason_code literals server.cpp's forward_gateway_pending
-    // passes at each of its four terminal-failure call sites — a change to
+    // passes at each of its five terminal-failure call sites (four named in
+    // #4672's own issue, plus the pre-existing unnamed generic grpc-status
+    // branch the same PR also fixed, "gateway_forward_failed") — a change to
     // one of those literals without updating this list is a doc/observability
     // drift, not a functional break, but pinning the set here catches an
-    // accidental typo/duplicate at the source of truth.
+    // accidental typo/duplicate at the source of truth. Gate 4 consistency-
+    // auditor SHOULD (2026-09-21): this list previously omitted
+    // "gateway_forward_failed", the one code the diff's own commit message
+    // said it also closed.
     const std::vector<std::string> reasons = {
         "gateway_unauthenticated",
         "gateway_unavailable",
         "gateway_unknown_cluster",
         "gateway_agent_mismatch",
+        "gateway_forward_failed",
     };
     for (const auto& reason : reasons) {
         INFO("reason=" << reason);
