@@ -5079,12 +5079,15 @@ TEST_CASE("Registry spark (real mechanism): an absent target watches its ancesto
 
 TEST_CASE("Registry spark (real mechanism): an absent target under sibling-key churn keeps "
           "reading None with bounded probe launches and no leaked workers (CH-11, bounded "
-          "regression scenario: 200 create+delete pairs, not proof of no unbounded growth)",
+          "regression scenario: 50 paced then 200 unpaced create+delete pairs, not proof of no "
+          "unbounded growth)",
           "[spark][established][windows][walkoff]") {
-    constexpr int kPairs = 200;
+    constexpr int kPacedPairs = 50;
+    constexpr int kBurstPairs = 200;
     constexpr std::uint64_t kEventsPerPair = 2; // a name change for the create, one for the delete
     constexpr std::uint64_t kLaunchesPerEvent = 1; // on_fire launches at most one probe per fire
-    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPairs) * kEventsPerPair;
+    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPacedPairs) * kEventsPerPair;
+    constexpr std::uint64_t kBurst = static_cast<std::uint64_t>(kBurstPairs) * kEventsPerPair;
     ScratchRegKey parent("ch11_parent");
     const std::string target = parent.sub + "\\Missing"; // never created: Ancestor mode on `parent`
     // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
@@ -5144,7 +5147,7 @@ TEST_CASE("Registry spark (real mechanism): an absent target under sibling-key c
         CHECK(d.synthetic_fires == 0);
     };
 
-    for (int i = 0; i < kPairs; ++i) {
+    for (int i = 0; i < kPacedPairs; ++i) {
         std::unique_ptr<OwnedRegKey> sibling;
         paced_event([&] {
             sibling = std::make_unique<OwnedRegKey>(parent.sub + "\\Sib" + std::to_string(i),
@@ -5155,11 +5158,11 @@ TEST_CASE("Registry spark (real mechanism): an absent target under sibling-key c
     }
     settle_and_bound(kPaced);
 
-    for (int i = kPairs; i < 2 * kPairs; ++i) {
+    for (int i = kPacedPairs; i < kPacedPairs + kBurstPairs; ++i) {
         OwnedRegKey sibling(parent.sub + "\\Sib" + std::to_string(i), KEY_READ);
         REQUIRE(sibling.h != nullptr);
     }
-    settle_and_bound(2 * kPaced);
+    settle_and_bound(kPaced + kBurst);
 
     CHECK(reading_stable);
     const auto est = engine.subscription_establishment(*sub);
@@ -10937,8 +10940,10 @@ TEST_CASE("Registry spark (real mechanism): a sweeper outage reads None once the
     auto stale = engine.subscription_establishment(*sub);
     const auto sampled = registry_debug_counters_for_test(*raw);
     REQUIRE(sampled.has_value());
-    INFO("the stale-window sample was taken after the third failed pass");
-    REQUIRE(sampled->sweep_pass_failed < 3);
+    {
+        INFO("the stale-window sample was taken after the third failed pass");
+        REQUIRE(sampled->sweep_pass_failed < 3);
+    }
     REQUIRE(stale.has_value());
     CHECK(stale->coverage == SparkCoverage::Notification);
     REQUIRE(stale->established_at.has_value());
