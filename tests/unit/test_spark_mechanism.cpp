@@ -6266,9 +6266,12 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
 // consecutive failures instead of spinning the worker. Windows-only: spark_file.cpp
 // is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time wherever
 // possible; an upper bound only where the wrong implementation differs by seconds. Where a
-// stalled runner could cross the window an assertion depends on (PF-4, PF-5) it degrades to
-// SUCCEED(); the few remaining wall-clock upper bounds (PF-1's pass count, PF-3's exact-N
-// read) are wide enough that only a test-thread stall of a second or more could trip them.
+// stalled runner could cross the window an assertion depends on (PF-3's exact-N read, PF-4,
+// PF-5) it degrades to SUCCEED(). The ungated wall-clock upper bounds that remain are PF-1's
+// pass count, PF-3's `CHECK_FALSE(inert)` right after watch(), the 2000 ms `recovered` windows
+// in PF-11/PF-12 and the `took < 2000` checks in PF-6/PF-8/PF-13: each is wide against the
+// correct behaviour (milliseconds), so a stall of about 1.5-2 s on the test thread is needed
+// to false-red any of them.
 // Every captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
 // destroys (and joins) the mechanism before the state its hooks capture.
 namespace {
@@ -6351,16 +6354,23 @@ bool pf_wait_no_passes(const std::atomic<int>& passes,
 // has to be destroyed (its worker joined) before this restores the previous logger.
 class PfStallLogger {
 public:
+    static constexpr const char* kName = "pf_stall";
+
     PfStallLogger(std::string target, std::chrono::milliseconds stall)
         : sink_(std::make_shared<Sink>(std::move(target), stall)),
           prev_(spdlog::default_logger()) {
         std::vector<spdlog::sink_ptr> sinks = prev_->sinks();
         sinks.push_back(sink_);
-        auto logger = std::make_shared<spdlog::logger>("pf_stall", sinks.begin(), sinks.end());
+        auto logger = std::make_shared<spdlog::logger>(kName, sinks.begin(), sinks.end());
         logger->set_level(prev_->level());
         spdlog::set_default_logger(std::move(logger));
     }
-    ~PfStallLogger() { spdlog::set_default_logger(prev_); }
+    ~PfStallLogger() {
+        spdlog::set_default_logger(prev_);
+        // set_default_logger() also REGISTERS the logger under its name; drop it so the registry
+        // does not keep it (and its sink, whose on_hit captures test locals by reference) alive.
+        spdlog::drop(kName);
+    }
     PfStallLogger(const PfStallLogger&) = delete;
     PfStallLogger& operator=(const PfStallLogger&) = delete;
 
@@ -6376,9 +6386,11 @@ private:
             const std::string_view payload(msg.payload.data(), msg.payload.size());
             if (payload.find(target) == std::string_view::npos)
                 return;
-            hits.fetch_add(1, std::memory_order_acq_rel);
+            // on_hit BEFORE the count: a test that sees hits() >= 1 has then always seen its
+            // snapshots written (the poll runs on another thread).
             if (on_hit)
                 on_hit();
+            hits.fetch_add(1, std::memory_order_acq_rel);
             std::this_thread::sleep_for(stall);
         }
         void flush_() override {}
@@ -6523,6 +6535,8 @@ TEST_CASE("File worker (direct): a persistently throwing pass does not spin - th
     INFO("cpu_ms=" << cpu_ms << " over elapsed_ms=" << elapsed_ms);
     if (cpu0 >= 0 && cpu_ms >= 0)
         CHECK(cpu_ms < elapsed_ms / 3);
+    else
+        SUCCEED("cpu time unreadable");
     mech->stop();       // joins the worker: the counters below are then exact, not a racing read
     const auto d = file_debug_counters_for_test(*mech);
     REQUIRE(d.has_value());
@@ -6951,6 +6965,7 @@ TEST_CASE("File worker (direct): a real completion during a failure episode keep
     ScratchDir a("pf_completion");
     std::atomic<bool> failing{true};
     std::atomic<int> passes{0};
+    std::atomic<int> throws{0};
     std::atomic<int> fired{0};
     auto mech = make_file_mechanism();
     REQUIRE(mech != nullptr);
@@ -6958,8 +6973,10 @@ TEST_CASE("File worker (direct): a real completion during a failure episode keep
         FileMechanismTestControls ctl;
         ctl.pass_fail_hook = [&] {
             passes.fetch_add(1);
-            if (failing.load(std::memory_order_acquire))
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1);
                 throw std::bad_alloc{};
+            }
         };
         REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
     }
@@ -6986,6 +7003,8 @@ TEST_CASE("File worker (direct): a real completion during a failure episode keep
     INFO("cpu_ms=" << cpu_ms << " over el=" << el);
     if (cpu0 >= 0 && cpu_ms >= 0)
         CHECK(cpu_ms < el / 3);
+    else
+        SUCCEED("cpu time unreadable");
     failing.store(false, std::memory_order_release);
     // The backoff may have grown to several seconds by now.
     REQUIRE(eventually([&] { return !mech->stats().inert; }, 40000ms));
@@ -6993,7 +7012,13 @@ TEST_CASE("File worker (direct): a real completion during a failure episode keep
     const int before = fired.load();
     a.write("after recovery");
     CHECK(eventually([&] { return fired.load() > before; }, 8000ms)); // the read was reissued
-    mech->stop();
+    mech->stop(); // joins the worker: the counters below are then exact
+    // Every hook throw was one failed pass and the real completion's pass is one of them, so a
+    // real-completion branch that stops recording its outcome leaves pass_failed short.
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " throws=" << throws.load());
+    CHECK(d->pass_failed == static_cast<std::uint64_t>(throws.load()));
 }
 
 TEST_CASE("File worker (direct): the retry backoff is capped at 30 s and stop() does not wait "
