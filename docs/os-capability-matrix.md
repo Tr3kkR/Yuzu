@@ -458,6 +458,18 @@ implementation is.
 | license_scan | surfaces | linux | constrained | 2 | rpm/dpkg-query/openssl via bounded argv runner | declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present |
 | license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
 | license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
+| local_security_policy | password_policy | linux | constrained | 1 | /etc/login.defs + /etc/security/pwquality.conf + /etc/pam.d password stacks (bounded file reads) | reports what the config files state, not the live PAM decision; pwquality.conf.d fragments are not read; a missing file is reported as absent, an unreadable one as permission_denied/constrained |
+| local_security_policy | password_policy | macos | constrained | 2 | pwpolicy -getaccountpolicies (CFPropertyList) | global account policies only; rung 2 because no public OpenDirectory global-policy API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value |
+| local_security_policy | password_policy | windows | constrained | 2 | secedit.exe /export /areas SECURITYPOLICY | argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner |
+| local_security_policy | lockout_policy | linux | constrained | 1 | /etc/security/faillock.conf + /etc/login.defs + /etc/pam.d auth/account stacks (bounded file reads) | reports configuration, not live lockout counters |
+| local_security_policy | lockout_policy | macos | constrained | 2 | pwpolicy -getaccountpolicies (CFPropertyList) | global account policies only; no authentication policy reports policies\|none (the default) |
+| local_security_policy | lockout_policy | windows | constrained | 2 | secedit.exe /export /areas SECURITYPOLICY | argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner |
+| local_security_policy | audit_policy | linux | constrained | 1 | /etc/audit/audit.rules (bounded file read) | rule counts and -e state of the rule file only, not the live kernel rules (auditctl -l); the file is 0640 root, so an unprivileged agent reports permission_denied |
+| local_security_policy | audit_policy | macos | constrained | 1 | /etc/security/audit_control (bounded file read) | absent by default on current macOS (only audit_control.example ships), reported as absent; a present file is root-readable only |
+| local_security_policy | audit_policy | windows | constrained | 2 | secedit.exe /export /areas SECURITYPOLICY | [Event Audit] categories only; see the Windows leg banner |
+| local_security_policy | sudoers | linux | constrained | 1 | /etc/sudoers + /etc/sudoers.d (bounded file reads) | parsed content, not sudo's evaluation: include directives are listed, not followed; unrecognised lines are kind unmodelled; needs read access to the 0440 root files |
+| local_security_policy | sudoers | macos | constrained | 1 | /etc/sudoers + /etc/sudoers.d (bounded file reads) | /etc/sudoers is root:wheel 0440: reading it needs root or group wheel, otherwise permission_denied (kind unreadable) |
+| local_security_policy | sudoers | windows | unsupported | - | no sudoers on Windows | - |
 | msi_packages | list | linux | unsupported | - | - | - |
 | msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |

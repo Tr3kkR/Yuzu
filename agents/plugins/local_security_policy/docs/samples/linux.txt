@@ -1,0 +1,24 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash pending
+== action=password_policy
+password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
+password_policy|PASS_MIN_DAYS|0|/etc/login.defs
+password_policy|PASS_WARN_AGE|7|/etc/login.defs
+password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
+password_policy|source_state|absent|/etc/security/pwquality.conf
+password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
+[result_status] OK / FULL / 
+
+== action=lockout_policy
+lockout_policy|LOGIN_RETRIES|5|/etc/login.defs
+lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs
+[result_status] OK / FULL / 
+
+== action=audit_policy
+audit_policy|source_state|absent|/etc/audit/audit.rules
+[result_status] OK / FULL / 
+
+== action=sudoers
+sudoers|/etc/sudoers|absent|-|-|-|-
+sudoers|/etc/sudoers.d|absent|-|-|-|-
+[result_status] OK / FULL / 
+
