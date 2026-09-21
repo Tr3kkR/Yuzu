@@ -2508,18 +2508,20 @@ private:
         // otherwise idle worker still retries and `inert` can clear with no
         // external wake. The retry is scheduled for the backoff deadline, even
         // when every other obligation is later (a Deferred watch's 30 s backend
-        // retry, say), or immediately when that deadline has already passed:
-        // the deadline is stamped in note_pass_outcome_locked(), before the
-        // failed pass's off-lock tail (the log line, FilePassWork destruction),
-        // which can outlast a 50 ms backoff, and run() samples the clock twice
-        // (its absorb check, then here). It cannot spin: run()'s absorb check
-        // only holds a pass back while the deadline is still in the future, every
-        // failed pass stamps a fresh future deadline and every successful pass
-        // ends the episode. Due-now producers above (health edge, coverage
-        // marker, confirmation, dead ancestor, a past Deferred/resync/grace
-        // deadline) are therefore deferred to the deadline, and obligations later
-        // than it are recomputed by the first wait after the retry pass. One
-        // assignment on the FINAL value, never per clause.
+        // retry, say), or immediately when that deadline has already passed: the
+        // deadline is stamped in note_pass_outcome_locked(), before the failed
+        // pass's off-lock tail (the log line, FilePassWork destruction), which
+        // can outlast a 50 ms backoff, and run() samples the clock twice (its
+        // absorb check, then here). The retry cannot busy-loop: run()'s absorb
+        // check only holds a pass back while the deadline is still in the future,
+        // every failed pass stamps a fresh future deadline and every successful
+        // pass ends the episode. The only polling left is under 1 ms per retry,
+        // from the millisecond truncation of the timeout (a wake that lands just
+        // before the deadline is absorbed and re-waits). Due-now producers above
+        // (health edge, coverage marker, confirmation, dead ancestor, a past
+        // Deferred/resync/grace deadline) are therefore deferred to the deadline,
+        // and obligations later than it are recomputed by the first wait after
+        // the retry pass. One assignment on the FINAL value, never per clause.
         if (pass_failures_ != 0) {
             wake = std::max(pass_backoff_until_, now);
             any = true;
@@ -2849,9 +2851,10 @@ private:
     /// branch the dequeue bookkeeping (io_pending cleared, work.consumed
     /// stamped) precedes it: that is what unwind_pass_locked() recovers when
     /// this throws. A throw here models an allocation failure at that point.
-    /// The hook runs under mu_, so it must not call watch()/unwatch()/
-    /// apply_test_controls()/debug_counters() (self-deadlock). One helper, two
-    /// call sites (both run() branches) so they cannot drift.
+    /// The hook runs under mu_, so it must not call any member that takes mu_
+    /// (watch(), watch_incarnation(), unwatch(), stop(), apply_test_controls(),
+    /// debug_counters(): self-deadlock). One helper, two call sites (both run()
+    /// branches) so they cannot drift.
     void run_pass_hook_locked() {
         if (pass_fail_hook_)
             pass_fail_hook_();
@@ -3394,12 +3397,12 @@ private:
     /// (pass_failures_ != 0; epoch = no episode): while it is in the future no
     /// timer-driven pass runs, and wait_timeout_locked() returns it as the wake
     /// (or "now" once it has passed). Not atomic: every reader holds mu_. inert_
-    /// (below) gains a runtime writer from this state: while
-    /// run() executes it is the ONLY writer (start()'s two `true` stores sit on
-    /// paths where the worker never runs, its `false` store precedes the spawn),
-    /// so no start-time/runtime distinction is needed and a recovery can never
-    /// clear a start-time inert. A runtime-flipped inert_ survives stop() until
-    /// the next start() clears it; SparkEngine is single-shot, so nothing reads it.
+    /// (below) gains a runtime writer from this state: while run() executes it is
+    /// the ONLY writer (start()'s two `true` stores sit on paths where the worker
+    /// never runs, its `false` store precedes the spawn), so no start-time/runtime
+    /// distinction is needed and a recovery can never clear a start-time inert. A
+    /// runtime-flipped inert_ survives stop() until the next start() clears it;
+    /// SparkEngine is single-shot, so nothing reads it.
     unsigned pass_failures_{0};                 ///< consecutive failed passes; 0 = last pass ok
     Clock::time_point pass_backoff_until_{};    ///< epoch = no active backoff
     std::chrono::milliseconds pass_backoff_{0}; ///< last computed delay; 0 outside an episode

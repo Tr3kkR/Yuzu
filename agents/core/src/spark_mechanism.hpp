@@ -179,9 +179,11 @@ struct SparkMechanismStats {
     /// without it, `registered` and `functional` are indistinguishable on the wire, and an
     /// inert mechanism reports byte-identically to a healthy idle one: "looks healthy, can
     /// detect nothing". Not every worker failure is reported through this flag: Service
-    /// worker death deliberately is NOT (spark_service.cpp clears started_ instead, so
-    /// watches are refused and every tracked coverage is invalidated), because `inert`
-    /// publishes fleet-wide as "no system bus".
+    /// worker death deliberately is NOT reported through `inert`. It refuses new watches
+    /// (the Linux mechanism clears `started_`, the Windows one clears `scm_ok_`) and
+    /// invalidates every tracked coverage, so `stats().inert` stays false and `service` stays
+    /// in the heartbeat CSV; spark_service.cpp keeps it out of this bit so a dead poll thread
+    /// is not misread as a bind failure at start().
     bool inert{false};
 };
 
@@ -552,9 +554,9 @@ struct FileMechanismTestControls {
     /// retried on a doubling backoff from `sweep_cadence` capped at 30 s; after
     /// kFileWorkerInertAfterFailures (3) consecutive failures the mechanism
     /// reports `inert` until a pass succeeds. The hook runs under mu_, so it must
-    /// not call watch()/unwatch()/apply_test_controls()/debug_counters()
-    /// (self-deadlock). Mirrors RegistryMechanismTestControls::sweep_hook. Null
-    /// clears it.
+    /// not call any member that takes mu_ (watch(), watch_incarnation(), unwatch(),
+    /// stop(), apply_test_controls(), debug_counters(): self-deadlock). Mirrors
+    /// RegistryMechanismTestControls::sweep_hook. Null clears it.
     std::function<void()> pass_fail_hook;
     std::size_t probe_lane_cap{0};
     std::size_t retiring_cap{0};

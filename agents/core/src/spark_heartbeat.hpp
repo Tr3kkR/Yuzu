@@ -93,19 +93,19 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 ///
 /// HOW AN INERT MECHANISM IS OBSERVED, precisely. Inertness suppresses the CAPABILITY CLAIM
 /// (the CSV above), not the telemetry: the per-type counter loop below does NOT skip inert
-/// mechanisms, so a non-zero counter on one IS reported. The Registry and Service mechanisms
-/// track none of those counters (they are File-mechanism concepts, #1979/#1980/#1982), so
-/// their stats are all-zero and the sparse rule drops every tag. File does track them
-/// (slow_op, watch_rejected, quarantined), so a File runtime-inert episode can carry
-/// non-zero cumulative counters. That is a property of which counters exist, NOT a rule the
-/// code enforces: do not rely on an inert mechanism emitting nothing.
+/// mechanisms, so a non-zero counter on one IS reported. The Service mechanism tracks none
+/// of those counters, so its stats are all-zero and the sparse rule drops every tag. File
+/// and Registry do track them (slow_op, watch_rejected, quarantined), so a File or Registry
+/// runtime-inert episode can carry non-zero cumulative counters. That is a property of which
+/// counters exist, NOT a rule the code enforces: do not rely on an inert mechanism emitting
+/// nothing.
 ///
 /// An inert mechanism is therefore visible as a CAPABILITY GAP on the server, per mechanism:
-/// `yuzu_fleet_spark_reporting{os="windows"} - on(os)
-/// yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} > 0`. That form is only valid
-/// where the mechanism is expected on every agent of that OS; an OS reports several mechanism
-/// series per agent, so comparing `reporting` with their SUM never fires. The queries are
-/// documented in `docs/user-manual/metrics.md`.
+/// the agents reporting for an OS minus the agents listing that mechanism. That comparison is
+/// only valid where the mechanism is expected on every agent of that OS, and an OS reports
+/// several mechanism series per agent, so comparing `reporting` with their SUM never fires.
+/// The absent-safe query form (a bare subtraction returns nothing when the mechanism series
+/// is missing on every agent) is documented in `docs/user-manual/metrics.md`.
 ///
 /// (Two earlier versions of this comment contradicted each other here — one claimed inert
 /// mechanisms "still report their counters", the next that they "emit NOTHING of their own"
@@ -169,9 +169,9 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
     // Per-mechanism-type health counters (sparse). Key = "yuzu.spark_<type>_<metric>",
     // composed identically to spark_type_metric_tag() in spark_fleet_tags.hpp.
     // Deliberately NOT skipped for inert mechanisms; inertness suppresses the capability
-    // claim (the CSV above), not the telemetry. See the header note: Registry and Service
-    // track none of these counters, but File does, so a File runtime-inert episode can
-    // report non-zero cumulative values here.
+    // claim (the CSV above), not the telemetry. See the header note: Service tracks none of
+    // these counters, but File and Registry do, so a File or Registry runtime-inert episode
+    // can report non-zero cumulative values here.
     for (const auto& [type, ms] : by_type) {
         if (ms.watch_rejected_total == 0 && ms.quarantined_total == 0 && ms.slow_op_total == 0)
             continue; // nothing to say — don't build the key prefix (all-zero at rung 1)
