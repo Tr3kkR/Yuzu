@@ -534,7 +534,7 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // pins the CORRECTED, live count so a future catalogue change that adds or
 // removes a Destructive row has to touch this test, not silently drift past
 // #3685's own coverage claim the way the design doc's count already did.
-TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17, not the design "
+TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19, not the design "
           "doc's stale 14 (#3685) — a new/removed Destructive row must touch this test",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;

@@ -13,5 +13,6 @@ note: cl /std:c++latest /EHsc /nologo /W3 probe_wave9_print_win.cpp winspool.lib
       OpenPrinterW handle AND via a PRINTER_ACCESS_USE-only handle; the readback after cancel
       fails ERROR_INVALID_PARAMETER (87) because the cancelled job is removed from the queue
       immediately, not left in a cancelled state; SetJobW against a nonexistent JobId (99999)
-      fails ERROR_INVALID_PARAMETER (87). See the-rig-print-probe-findings.md for the access
-      analysis this decides for the plugin's clear_queue DesiredAccess.
+      fails ERROR_INVALID_PARAMETER (87). This capture is the evidence for the plugin's clear_queue
+      DesiredAccess (PRINTER_ACCESS_USE); both identities above are already elevated -- a
+      least-privileged identity was NOT measured.
