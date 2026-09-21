@@ -6,4 +6,3 @@ with expansion:
   9 <= 8
 with message:
   max observed probe_workers_active=9 (test cap=8)
-

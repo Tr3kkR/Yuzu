@@ -32,16 +32,16 @@ iso 29 head=0 base=0
 iso 30 head=0 base=42
 ISO SUMMARY head pass=29 fail=1 | base pass=27 fail=3
 full 1 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=0 (test cases:   3469 |   3465 passed | 4 skipped)
-  head failing: 
-  base failing: 
+  head failing:
+  base failing:
 full 2 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=0 (test cases:   3469 |   3465 passed | 4 skipped)
-  head failing: 
-  base failing: 
+  head failing:
+  base failing:
 full 3 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=42 (test cases:   3469 |   3464 passed | 1 failed | 4 skipped)
-  head failing: 
-  base failing: test_spark_mechanism.cpp(7053) 
+  head failing:
+  base failing: test_spark_mechanism.cpp(7053)
 full 4 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=42 (test cases:   3469 |   3464 passed | 1 failed | 4 skipped)
-  head failing: 
-  base failing: test_spark_mechanism.cpp(7053) 
+  head failing:
+  base failing: test_spark_mechanism.cpp(7053)
 FULL SUMMARY head pass=4 fail=0 | base pass=2 fail=2
 AB_DONE
