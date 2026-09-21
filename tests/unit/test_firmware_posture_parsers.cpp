@@ -133,6 +133,34 @@ void require_all_prefixes_constrained(const Bytes& blob) {
     }
 }
 
+// The header's own Length claim rewritten to match each prefix, so the walk's per-structure bounds
+// (not just the header-length check above) decide: a prefix is either the full decode or a
+// constrained truncated/no_type0 result, never a partial success and never a throw.
+void require_self_consistent_prefixes(const Bytes& blob) {
+    const auto full = parse_smbios_type0(blob);
+    REQUIRE_FALSE(full.constrained);
+    for (std::size_t prefix = 8; prefix < blob.size(); ++prefix) {
+        Bytes cut(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(prefix));
+        const auto table_len = static_cast<std::uint32_t>(prefix - 8);
+        for (int i = 0; i < 4; ++i) cut[4 + i] = static_cast<std::uint8_t>(table_len >> (8 * i));
+        INFO("self-consistent prefix " << prefix);
+        Smbios0Result r;
+        try {
+            r = parse_smbios_type0(cut);
+        } catch (...) {
+            FAIL("parse_smbios_type0 threw on a self-consistent truncated prefix");
+        }
+        if (r.constrained) {
+            CHECK((r.token == "smbios:truncated" || r.token == "smbios:no_type0"));
+            CHECK_FALSE(r.data.vendor.value.has_value());
+        } else {
+            CHECK(r.data.vendor.value == full.data.vendor.value);
+            CHECK(r.data.version.value == full.data.version.value);
+            CHECK(r.data.release_date.value == full.data.release_date.value);
+        }
+    }
+}
+
 std::string row_str(const FirmwareRow& r) { return format_row(r); }
 
 } // namespace
@@ -178,6 +206,20 @@ TEST_CASE("parse_smbios_type0: malformed shapes are constrained, never partial",
     CHECK_FALSE(r.data.vendor.value.has_value());
     CHECK(parse_smbios_type0(smbios_blob(0x0F, 0, 0x08)).token == "smbios:malformed"); // too short
     CHECK(parse_smbios_type0(Bytes{0, 3, 3, 0, 6, 0, 0, 0, 127, 4, 1, 0, 0, 0}).token == "smbios:no_type0");
+    // One byte under the SMBIOS 2.0 type 0 minimum (0x12) is malformed, not a shorter decode.
+    CHECK(parse_smbios_type0(smbios_blob(0x0F, 0, 0x11)).token == "smbios:malformed");
+    // A structure declaring a length below its own 4-byte header is malformed, never skipped.
+    CHECK(parse_smbios_type0(Bytes{0, 3, 3, 0, 5, 0, 0, 0, 5, 3, 0, 0, 0}).token == "smbios:malformed");
+    {
+        // Nothing behind the end-of-table marker counts: a type 0 there is not a BIOS structure.
+        Bytes table{127, 4, 1, 0, 0, 0};
+        const auto real = smbios_blob();
+        table.insert(table.end(), real.begin() + 8, real.end());
+        Bytes behind{0, 3, 3, 0, 0, 0, 0, 0};
+        for (int i = 0; i < 4; ++i) behind[4 + i] = static_cast<std::uint8_t>(table.size() >> (8 * i));
+        behind.insert(behind.end(), table.begin(), table.end());
+        CHECK(parse_smbios_type0(behind).token == "smbios:no_type0");
+    }
     auto big = smbios_blob();
     big[4] = 0xFF; // header claims more table than supplied
     CHECK(parse_smbios_type0(big).token == "smbios:truncated");
@@ -188,6 +230,20 @@ TEST_CASE("parse_smbios_type0: malformed shapes are constrained, never partial",
 TEST_CASE("parse_smbios_type0: every truncated prefix is constrained", "[firmware_posture][smbios][fuzz]") {
     require_all_prefixes_constrained(smbios_blob());
     require_all_prefixes_constrained(smbios_blob(0x0F, 0, 0x1A, true));
+}
+
+// Fails under: loosening any of the walk's own bounds (structure header, formatted area, string
+// set), which the header-length prefixes above never reach.
+TEST_CASE("parse_smbios_type0: a table cut inside a structure is truncated even when its header agrees",
+          "[firmware_posture][smbios][fuzz]") {
+    require_self_consistent_prefixes(smbios_blob());
+    require_self_consistent_prefixes(smbios_blob(0x0F, 0, 0x1A, true));
+
+    // A complete type 1 structure followed by only three bytes: the next structure header is cut.
+    const Bytes stray{0, 3, 3, 0, 9, 0, 0, 0, 1, 4, 1, 0, 0, 0, 5, 2, 0};
+    const auto r = parse_smbios_type0(stray);
+    CHECK(r.constrained);
+    CHECK(r.token == "smbios:truncated");
 }
 
 TEST_CASE("parse_smbios_type0: the-rig REAL CAPTURE rsmb.bin parses and every prefix is constrained",
@@ -206,6 +262,7 @@ TEST_CASE("parse_smbios_type0: the-rig REAL CAPTURE rsmb.bin parses and every pr
     CHECK(row_str(rows[3]) == "firmware|rom_size_bytes|16777216|smbios");
     CHECK(row_str(rows[4]) == "firmware|bios_release|5.17|smbios");
     require_all_prefixes_constrained(raw);
+    require_self_consistent_prefixes(raw);
 }
 
 // ── Linux sysfs DMI ──────────────────────────────────────────────────────
@@ -367,6 +424,11 @@ TEST_CASE("fwupd_device_rows: malformed devices and the cap are failure tokens",
                                       {{"DeviceId", "b"}}});
     CHECK(r.failures == std::vector<std::string>{"fwupd:shape", "fwupd:shape", "fwupd:shape"});
     REQUIRE(r.rows.size() == 1); // only the aggregate row
+
+    // An empty DeviceId is as malformed as a missing one.
+    const auto blank = fwupd_device_rows({{{"DeviceId", ""}, {"Flags", "0"}}});
+    CHECK(blank.failures == std::vector<std::string>{"fwupd:shape"});
+    REQUIRE(blank.rows.size() == 1);
 
     std::vector<FwupdDevice> many;
     for (std::size_t i = 0; i < kMaxFwupdDevices + 1; ++i)
