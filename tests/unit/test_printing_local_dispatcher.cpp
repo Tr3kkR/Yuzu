@@ -382,4 +382,15 @@ TEST_CASE("printing plugin: clear_queue — live negative round trip over the re
     REQUIRE(f.size() == 5);
     CHECK(f[0] == "clear_queue");
     CHECK((f[3] == "not_found" || f[3] == "refused" || f[3] == "error"));
+    // The shell must pair the outcome with the matching status/completeness.
+    if (f[3] == "not_found") {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else if (f[3] == "refused") {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    }
 }

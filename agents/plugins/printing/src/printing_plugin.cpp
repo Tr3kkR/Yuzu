@@ -579,6 +579,15 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
         ctx.write_output(format_clear_queue_row(printer, 0, "error", "invalid_job_id"));
         return 1;
     }
+    // OpenPrinterW gives `,` special meaning (`,XcvPort ...`, `Printer, Job N`,
+    // `,LocalPrintServer` open non-printer handles) and a Windows printer name cannot
+    // contain one, so such a name is never a real printer: refuse it, do not open it.
+    if (!printer_name_is_valid_windows(printer)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "invalid printer name");
+        ctx.write_output(format_clear_queue_row("-", *job_id, "error", "invalid_printer"));
+        return 1;
+    }
 
     const std::wstring wprinter = yuzu::win::to_wide(printer);
 
@@ -911,6 +920,12 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
                        "job-k-octets", "date-time-at-creation"}});
 
     const auto req = ipp::encode_request(ipp::kGetJobs, next_request_id(), attrs);
+    if (req.empty()) { // the encoder refused an over-long attribute: never sent
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "Get-Jobs: printer name too long");
+        ctx.write_output("job|unavailable|invalid_printer");
+        return 0;
+    }
     const auto result = do_read_ipp(req);
 
     if (!result.transport_ok) {
@@ -960,19 +975,19 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     if (!job_id) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "invalid or missing 'job_id'");
-        ctx.write_output(format_clear_queue_row(printer, 0, "error", "invalid_job_id"));
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), 0, "error", "invalid_job_id"));
         return 1;
     }
 
-    // No socket -> refused, never a TCP fallback for this mutating action. This is
-    // a deliberate policy refusal (the agent will not cancel over TCP) even
-    // though the same token covers cupsd simply not running; unlike no_identity
-    // below, that is a documented base design and is left as it is.
+    // No socket -> refused, never a TCP fallback for this mutating action: a
+    // deliberate policy refusal (the agent will not cancel over TCP), even though
+    // the same token also covers cupsd simply not running. `no_identity` below is
+    // an `error` instead, because there cupsd is never asked.
     const auto socket_path = find_cups_socket();
     if (!socket_path) {
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
                                "no CUPS Unix socket found; refusing to cancel over TCP");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokSocketUnavailable));
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), *job_id, "refused", kTokSocketUnavailable));
         return 1;
     }
 
@@ -986,7 +1001,7 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     if (user.empty()) {
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "no resolvable effective-user identity; not sending the cancel");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokNoIdentity));
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), *job_id, "error", kTokNoIdentity));
         return 1;
     }
 
@@ -1000,8 +1015,11 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     // plus a valid job id cancelled the job and reported `canceled`). Windows
     // needs no such step: the spooler itself binds a job to its printer. This
     // shell only owns the transport and the per-OS tokens.
-    const ClearQueueTokens tokens{kTokConnectFailed, kTokDecodeFailed, kTokAccessDenied, kTokNotFound,
-                                  kTokUnexpectedStatus};
+    const ClearQueueTokens tokens{.connect_failed = kTokConnectFailed,
+                                  .decode_failed = kTokDecodeFailed,
+                                  .access_denied = kTokAccessDenied,
+                                  .not_found = kTokNotFound,
+                                  .unexpected_status = kTokUnexpectedStatus};
     const ClearQueueDisposition d = run_clear_queue(
         printer, *job_id, user, tokens, [&](uint16_t op, const std::vector<ipp::OperationAttr>& attrs) {
             const std::string body = ipp::encode_request(op, next_request_id(), attrs);

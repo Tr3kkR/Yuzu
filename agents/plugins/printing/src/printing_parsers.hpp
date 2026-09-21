@@ -526,15 +526,72 @@ inline constexpr std::size_t kMaxPosixPrinterNameBytes = 127;
     return attrs;
 }
 
-/// True when a listed job has this id AND belongs to the named printer. The
-/// second half is a deliberate second guard: whatever cupsd made of the
-/// request URI, a job of another queue is never accepted. A row with no
-/// `job-printer-uri` (rendered "-") never matches.
-[[nodiscard]] inline bool job_is_listed_on(const std::vector<JobRow>& rows, int64_t job_id,
-                                            std::string_view printer_name) {
-    return std::any_of(rows.begin(), rows.end(), [&](const JobRow& r) {
-        // "-" is jobs_from_ipp's placeholder for an absent job-printer-uri.
-        return r.job_id == job_id && r.printer != "-" && printer_name_from_operand(r.printer) == printer_name;
+/// ASCII case-insensitive equality. CUPS resolves printer names case-insensitively
+/// (cupsd answers a Get-Jobs for `YUZU4616A` with the jobs of `yuzu4616a`, whose
+/// job-printer-uri is lower case), so an exact comparison would report a live job
+/// as not found.
+[[nodiscard]] inline bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto fold = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
+        if (fold(a[i]) != fold(b[i]))
+            return false;
+    }
+    return true;
+}
+
+/// What a printer's not-completed listing says about one job id.
+enum class JobListing {
+    absent,      // the id is not listed at all
+    elsewhere,   // listed, but its own job-printer-uri names a DIFFERENT printer
+    unconfirmed, // listed, but with no job-printer-uri to confirm the printer (e.g. cupsd's
+                 // JobPrivateValues hides it from this requester)
+    on_printer,  // listed AND its own job-printer-uri names the requested printer
+};
+
+/// The second guard behind the encoded printer-uri: whatever cupsd made of the
+/// request URI, a job is accepted only when its OWN job-printer-uri names the
+/// requested printer (compared case-insensitively). "-" is jobs_from_ipp's
+/// placeholder for an absent attribute.
+[[nodiscard]] inline JobListing classify_job_listing(const std::vector<JobRow>& rows, int64_t job_id,
+                                                      std::string_view printer_name) {
+    bool seen = false;
+    bool unconfirmed = false;
+    for (const auto& r : rows) {
+        if (r.job_id != job_id)
+            continue;
+        seen = true;
+        if (r.printer == "-") {
+            unconfirmed = true;
+            continue;
+        }
+        if (ascii_iequals(printer_name_from_operand(r.printer), printer_name))
+            return JobListing::on_printer;
+    }
+    if (!seen)
+        return JobListing::absent;
+    return unconfirmed ? JobListing::unconfirmed : JobListing::elsewhere;
+}
+
+/// The printer as a row shows it on the macOS/Linux path: the printer NAME (a pasted
+/// destination URI is reduced to its name, so a long host never bloats the row), or
+/// "-" when the value is not a name the agent will use.
+[[nodiscard]] inline std::string printer_echo_posix(std::string_view operand) {
+    const std::string name = printer_name_from_operand(operand);
+    return printer_name_is_valid_posix(name) ? name : std::string("-");
+}
+
+/// Windows: a name the agent will hand to OpenPrinterW. A comma (or a control
+/// character) is refused: OpenPrinterW gives `,` special meaning (`,XcvPort ...`,
+/// `Printer, Job N`, `,LocalPrintServer`), and Windows printer names cannot
+/// contain one, so such a name is never a real printer.
+[[nodiscard]] inline bool printer_name_is_valid_windows(std::string_view name) noexcept {
+    if (name.empty())
+        return false;
+    return std::none_of(name.begin(), name.end(), [](char c) {
+        const auto u = static_cast<unsigned char>(c);
+        return c == ',' || u < 0x20 || u == 0x7F;
     });
 }
 
@@ -560,14 +617,15 @@ struct ClearQueueTokens {
 
 /// The whole macOS/Linux cancel ladder over an injected transport:
 ///   post(op, attrs) -> IppResult   (one IPP round trip; the shell encodes+sends)
-/// It sends NOTHING for a printer name it will not build a request for, then a
-/// Get-Jobs of the named printer, and sends Cancel-Job ONLY when that listing
-/// holds the job id on that printer. Transport, HTTP 401/403, decode and status
+/// It sends NOTHING for a printer name it will not build a request for; otherwise
+/// it sends a Get-Jobs of the named printer, and sends Cancel-Job ONLY when that
+/// listing holds the job id on that printer. Transport, HTTP 401/403, decode and status
 /// failures of either request are reported, never turned into a cancel.
 template <class Post>
 [[nodiscard]] ClearQueueDisposition run_clear_queue(std::string_view printer_as_given, int64_t job_id,
                                                      std::string_view user, const ClearQueueTokens& tok,
                                                      Post&& post) {
+    const std::string shown = printer_echo_posix(printer_as_given);
     const auto make = [&](ClearQueueStatus st, bool full, std::string detail, std::string_view outcome,
                           std::string_view token) {
         ClearQueueDisposition d;
@@ -575,17 +633,15 @@ template <class Post>
         d.status = st;
         d.full = full;
         d.detail = std::move(detail);
-        d.row = format_clear_queue_row(printer_as_given, job_id, outcome, token);
+        d.row = format_clear_queue_row(shown, job_id, outcome, token);
         return d;
     };
 
     const std::string name = printer_name_from_operand(printer_as_given);
     if (!printer_name_is_valid_posix(name)) {
-        // The row shows "-", not the offending value: it may be arbitrarily long or
-        // hold control characters, and it was never used to build a request.
-        auto d = make(ClearQueueStatus::unavailable, false, "invalid printer name", "error", "invalid_printer");
-        d.row = format_clear_queue_row("-", job_id, "error", "invalid_printer");
-        return d;
+        // `shown` is "-" here, not the offending value: it may be arbitrarily long or hold
+        // control characters, and it was never used to build a request.
+        return make(ClearQueueStatus::unavailable, false, "invalid printer name", "error", "invalid_printer");
     }
 
     // A round trip that failed before yielding an IPP status is reported the same
@@ -618,7 +674,14 @@ template <class Post>
         return make(ClearQueueStatus::unavailable, false,
                     std::format("Get-Jobs: unexpected status 0x{:04x}", listing_status), "error",
                     tok.unexpected_status);
-    if (!job_is_listed_on(jobs_from_ipp(*listing.message), job_id, name))
+    // Fail closed: ONLY on_printer proceeds, so a verdict added later can never fall through
+    // into a Cancel-Job.
+    const JobListing verdict = classify_job_listing(jobs_from_ipp(*listing.message), job_id, name);
+    if (verdict == JobListing::unconfirmed) // listed, but nothing confirms which printer it is on
+        return make(ClearQueueStatus::unavailable, false,
+                    "Get-Jobs: the job is listed but its printer could not be confirmed", "error",
+                    tok.unexpected_status);
+    if (verdict != JobListing::on_printer)
         return make(ClearQueueStatus::unavailable, true, "Get-Jobs: job is not on the named printer's active queue",
                     "not_found", tok.not_found);
 
@@ -631,8 +694,9 @@ template <class Post>
         return *failure;
 
     // The job could finish between the two requests (cupsd then answers 0x0404 or
-    // 0x0406, reported below); one MOVED to another queue in that window is still
-    // cancelled by id -- an administrative operation, accepted as a narrow window.
+    // 0x0406, reported below). One MOVED to another queue in that window (cupsd's
+    // default policy lets the job's owner or an administrator do that) is still
+    // cancelled by id: the id the operator named, accepted as a narrow window.
     const uint16_t status = result.message->op_or_status;
     const CancelStatusClass cls = classify_cancel_job_status(status);
     if (cls == CancelStatusClass::canceled)

@@ -213,12 +213,12 @@ metadata:
     (both required). This is a state-changing, Destructive+Irreversible
     action requiring role-gated approval — there is no purge-all/cancel-all
     path. On Windows, uses SetJobW(JOB_CONTROL_CANCEL); the spooler itself
-    looks the job up on the named printer. On macOS/Linux, the agent first
-    lists the named printer's not-completed jobs and only then sends an IPP
-    Cancel-Job request (cupsd's Cancel-Job ignores the printer, so the job
-    must be proven to be on it first), over the CUPS Unix domain socket with
-    Authorization: PeerCred; it refuses (never falls back to TCP) when no
-    socket is found.
+    looks the job up on the named printer. On macOS/Linux, over the CUPS Unix
+    domain socket with Authorization: PeerCred (it refuses, and never falls
+    back to TCP, when no socket is found), the agent first lists the named
+    printer's not-completed jobs and only then sends an IPP Cancel-Job request
+    (cupsd's Cancel-Job ignores the printer, so the job must be proven to be on
+    it first).
   tags: [printing, remediation]
 
 spec:
@@ -244,7 +244,9 @@ spec:
           macOS/Linux the destination URI that `jobs` prints
           (`ipp://localhost:631/printers/NAME`) is also accepted, a job submitted
           to a printer class is addressed by the class name, and a name over 127
-          bytes or containing control characters is refused (invalid_printer).
+          bytes or containing control characters is refused (invalid_printer),
+          as is a Windows name containing a comma. macOS/Linux match the name
+          case-insensitively, as cupsd does.
         validation:
           minLength: 1
           maxLength: 256
@@ -260,7 +262,7 @@ spec:
     columns:
       - name: printer
         type: string
-        description: 'The printer the target job was on (as given), or "-" when the param itself was missing or invalid.'
+        description: 'The printer the target job was on (its name; on macOS/Linux a pasted destination URI is reduced to the name), or "-" when the param itself was missing or invalid.'
         example: Office-LaserJet
         platforms: [windows, linux, darwin]
       - name: job_id
@@ -280,7 +282,7 @@ spec:
       - name: detail
         type: string
         description: >-
-          "-" on a successful cancel; otherwise a <os>:<source>:<detail> failure token, or missing_printer/invalid_job_id for a parameter validation failure.
+          "-" on a successful cancel; otherwise a <os>:<source>:<detail> failure token, or missing_printer/invalid_job_id/invalid_printer for a parameter validation failure.
         example: "-"
         platforms: [windows, linux, darwin]
 

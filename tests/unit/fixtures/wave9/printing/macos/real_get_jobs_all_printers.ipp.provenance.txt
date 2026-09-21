@@ -8,7 +8,9 @@ and 17 on yuzu4616a, job 18 on yuzu4616b).
 
 request: Get-Jobs (0x000A), request-id 1, with the printer-uri written RAW as
 ipp://localhost/printers/%00 (not encoded): which-jobs=not-completed,
-requested-attributes=job-id + job-printer-uri.
+requested-attributes=job-id + job-printer-uri. A throwaway program built it with
+`ipp::encode_request`, passing the three attributes of `job_binding_check_attrs`
+but with the printer-uri VALUE set to the raw string instead of the encoded one.
 
 exact command:
   curl -s --unix-socket /private/var/run/cupsd \
