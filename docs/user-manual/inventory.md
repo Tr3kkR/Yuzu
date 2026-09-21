@@ -18,6 +18,11 @@ cadences.
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028); automation that reads the first columns by position
   is unaffected, automation that assumed a fixed field count needs an update.
+  The dashboard results table renders `installed_apps` rows as key/value (`app`
+  plus one remainder cell — a pre-existing server-side limit shared by the four
+  original columns), so the new columns are not separately sortable or
+  filterable there; read them positionally from the raw `output` on
+  `GET /api/v1/responses/{id}` or MCP `query_responses`.
   On Linux/macOS, a
   degraded acquisition (timeout, kill, spawn failure, truncation, or a
   nonzero exit) now emits a single `error|installed_apps: acquisition

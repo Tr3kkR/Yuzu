@@ -33,7 +33,10 @@ metadata:
     On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
     On macOS, queries system_profiler for GUI applications. Returns
     application name, version, publisher, install date, install location,
-    and (macOS) bundle identifier.
+    and (macOS) bundle identifier. The dashboard results table shows this
+    definition's rows as key/value (app plus one remainder cell); read the
+    six columns positionally from the raw output on the REST/MCP response
+    routes.
   tags: [software, inventory, compliance]
 
 spec:
@@ -68,7 +71,7 @@ spec:
         platforms: [windows, linux]
       - name: install_date
         type: string
-        description: "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
+        description: "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. A \"\\\" or \"|\" in the value is escaped like install_location (it no longer ends the row); no real value carries either. Values: free text or \"-\"."
         example: "20260617"
         platforms: [windows, darwin]
       - name: install_location

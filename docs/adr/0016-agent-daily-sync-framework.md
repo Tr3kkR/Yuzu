@@ -408,7 +408,11 @@ Mechanics:
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
   VENDOR). *Amended 2026-09-21:* `list` gained two trailing columns
   (`install_location`, `bundle_id`) under ADR-0028's binding condition; its
-  first five fields and the `inv|` rows are unchanged.
+  first four fields are byte-unchanged, `install_date` — no longer the last
+  field — now escapes `\` and `|` (a no-op for every real value), and the
+  `inv|` rows are unchanged: the Windows name+version dedupe keeps the same
+  survivor as before and only fills that survivor's empty `install_location`
+  from a duplicate.
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
