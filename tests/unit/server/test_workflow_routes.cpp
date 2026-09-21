@@ -28,6 +28,9 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
+#include "schedule_engine.hpp" // full ScheduleEngine definition -- this harness constructs a real one (with_schedule_engine)
+#include "test_schedule_api_double.hpp" // ADR-0031 WS-A4 (seventh family): FnScheduleApi
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -107,6 +110,19 @@ fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
 
+// Fault-injection helper for the #2146 A2-R1 Gate 8 degrade tests below: runs
+// a raw statement over a fresh side connection (never the harness's own
+// pool, so the tracker's `open_`/pool state stays otherwise healthy -- only
+// the ONE targeted query fails). Mirrors test_rest_executions_v1_twins.cpp's
+// identical `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
 struct ExecHarness {
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
@@ -135,6 +151,15 @@ struct ExecHarness {
     /// file leaves it nullptr, and a fourth SQLite file per harness would be
     /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
     std::unique_ptr<WorkflowEngine> workflows;
+    /// #2146 A2-R1: opt-in real ScheduleEngine, same rationale as `workflows`
+    /// above -- unpaid cost on every other test in this file, which is
+    /// content with the pre-existing schedule_api==nullptr path.
+    std::unique_ptr<ScheduleEngine> schedule_engine;
+    /// ADR-0031 WS-A4 (seventh family): the seam wrapping `schedule_engine`
+    /// above, wired into `wf_deps.schedule_api` below when
+    /// `with_schedule_engine` is true -- mirrors the production
+    /// `schedule_engine_`-gated `schedule_api` construction in server.cpp.
+    std::shared_ptr<ScheduleApi> schedule_api;
     /// Opt-in `ProductPackStore` so `/api/product-packs*` (install/uninstall fan-out into
     /// InstructionStore/PolicyStore/WorkflowEngine, ADR-0064) is reachable. Opt-in for the same
     /// reason as `workflows` above — unpaid cost on every other test in this file.
@@ -263,7 +288,25 @@ struct ExecHarness {
                          bool wire_fleet_read_fn_arg = true,
                          bool with_product_pack_store = false,
                          WorkflowRoutes::AuthFn auth_override = {},
-                         WorkflowRoutes::FleetReadFn fleet_read_override = {})
+                         WorkflowRoutes::FleetReadFn fleet_read_override = {},
+                         // #2146 A2-R1: opt-in real ScheduleEngine so
+                         // GET /api/v1/schedules' definition_id/enabled_only
+                         // filters can be exercised end-to-end. Opt-in for
+                         // the same reason as with_workflow_engine above --
+                         // unpaid cost on every other test in this file,
+                         // which is content with the pre-existing
+                         // schedule_api==nullptr "Not available" path.
+                         bool with_schedule_engine = false,
+                         // ADR-0031 WS-A4 (seventh family): a test-supplied
+                         // ScheduleApi (typically FnScheduleApi, see
+                         // test_schedule_api_double.hpp) -- takes precedence
+                         // over with_schedule_engine above, letting a test
+                         // inject an arbitrary list_schedules result
+                         // (including a store failure) without a real
+                         // ScheduleEngine/Postgres connection. Same
+                         // captured-by-value-at-construction contract as
+                         // auth_override/fleet_read_override above.
+                         std::shared_ptr<ScheduleApi> schedule_api_override = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -307,6 +350,22 @@ struct ExecHarness {
             product_pack_store = std::make_unique<ProductPackStore>(pool);
             REQUIRE(product_pack_store->is_open());
             product_pack_store->set_require_signed_packs(false); // unsigned test bundles
+        }
+
+        // ADR-0031 WS-A4 (seventh family): an injected test double takes
+        // precedence over constructing a real engine (see
+        // schedule_api_override's own doc comment above).
+        if (schedule_api_override) {
+            schedule_api = schedule_api_override;
+        } else if (with_schedule_engine) {
+            // #2146 A2-R1: ScheduleEngine is Postgres-backed (ADR-0065) --
+            // shares this harness's `pool` (schema-per-store, ADR-0008), same
+            // as WorkflowEngine/InstructionStore/ResponseStore above.
+            schedule_engine = std::make_unique<ScheduleEngine>(pool);
+            REQUIRE(schedule_engine->is_open());
+            // ADR-0031 WS-A4 (seventh family): the seam, not the raw engine,
+            // is what Deps actually takes now.
+            schedule_api = make_local_schedule_api(*schedule_engine);
         }
 
         WorkflowRoutes::AuthFn auth_fn =
@@ -418,6 +477,7 @@ struct ExecHarness {
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
         wf_deps.product_pack_store = product_pack_store.get();
+        wf_deps.schedule_api = schedule_api; // ADR-0031 WS-A4 (seventh family), was #2146 A2-R1's raw engine
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -750,6 +810,48 @@ TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
     // the wrong branch. Match the dashboard sibling's body-substring check
     // (test_dashboard_results_fragment.cpp) to pin the actual branch.
     CHECK(res->body.find("Service unavailable") != std::string::npos);
+}
+
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("executions detail: a transient tracker degrade is 503 (not a false 404) "
+          "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-2146b", "2146b");
+    auto eid = h.make_exec("def-2146b", "completed", 1, 1, 0);
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes -- an unconfined caller
+    // never reaches that branch at all.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-0"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault.
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146b");
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146b RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    CHECK(res->body.find("Execution tracker degraded") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.detail.view/denied here.
+    for (const auto& c : h.audit_calls)
+        CHECK(c.target_id != eid);
 }
 
 // #3565: this codebase has a documented prior incident (authz_model.hpp's
@@ -1605,6 +1707,47 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
     CHECK(res->status == 410);
+}
+
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("SSE handler: a transient tracker degrade is 503 (not a false 404) and "
+          "records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][workflow][executions][pr3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-2146c", "2146c");
+    auto exec_id = h.make_exec("def-2146c", "running", 1, 0, 0);
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-0"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault.
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146c");
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146c RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    CHECK(res->body.find("tracker degraded") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.live_subscribe/denied here.
+    for (const auto& c : h.audit_calls)
+        CHECK(c.target_id != exec_id);
 }
 
 TEST_CASE("SSE handler: invisible terminal execution collapses to the missing-id 404",
@@ -3107,7 +3250,7 @@ TEST_CASE("ADR-0064: a genuine WorkflowEngine DB failure during pack install 503
 // all, and — even with a Schedule:Read gate — ITServiceOwner grants full
 // CRUD on Schedule with no owner/service filter anywhere in the query, so a
 // service-scoped token could enumerate every schedule from every other
-// service. schedule_engine stays nullptr in ExecHarness (never wired) —
+// service. schedule_api stays nullptr in ExecHarness (never wired) —
 // the deny fires before the null-check, so these tests need no real store.
 
 TEST_CASE("/fragments/schedules: an ordinary session is now gated on Schedule:Read",
@@ -3153,10 +3296,79 @@ TEST_CASE("/fragments/schedules: an ordinary session with Schedule:Read reaches 
     auto res = h.sink.Get("/fragments/schedules");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // schedule_engine is nullptr in this harness — the "Not available" branch,
+    // schedule_api is nullptr in this harness — the "Not available" branch,
     // not a denial. Confirms the deny/gate above didn't also block the
     // legitimate path.
     CHECK(res->body.find("Not available") != std::string::npos);
+}
+
+// ADR-0031 WS-A4 (seventh family): before this seam, the fragment called the
+// unchecked ScheduleEngine::query_schedules(), which had no way to signal a
+// store FAILURE distinct from a genuinely empty table — no existing test
+// harness could inject that distinction at all. FnScheduleApi (see
+// test_schedule_api_double.hpp) makes it directly testable: a `list_schedules`
+// std::unexpected must render a distinct degraded state, never the "No
+// schedules configured" empty-state string, and must never echo the
+// (internal-only) error string into the HTML.
+TEST_CASE("/fragments/schedules: a store failure renders a distinct degraded state, "
+          "not \"No schedules configured\"",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto failing_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
+        [](const ScheduleQuery&) -> std::expected<ScheduleListResult, std::string> {
+            return std::unexpected(std::string{"pool exhausted (internal, must not render)"});
+        });
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/failing_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("No schedules configured") == std::string::npos);
+    CHECK(res->body.find("pool exhausted") == std::string::npos);
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+}
+
+// adversarial-review-kimi pre-push round (Codex C1 / Kimi K1, cross-confirmed):
+// schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+// fragment) must surface this [truncated], never present the capped count as
+// the fleet's true total" -- the fragment shipped in the same commit that
+// wrote that contract without honouring it for its own case. This proves the
+// fix: a truncated result renders a partial-list notice, not a table that
+// silently looks complete.
+TEST_CASE("/fragments/schedules: a truncated result renders a partial-list notice",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    auto truncated_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
+        [](const ScheduleQuery&) -> std::expected<ScheduleListResult, std::string> {
+            ScheduleListResult r;
+            InstructionSchedule s;
+            s.id = "sched-1";
+            s.name = "capped-schedule";
+            s.frequency_type = "once";
+            s.enabled = true;
+            r.schedules.push_back(s);
+            r.truncated = true;
+            return r;
+        });
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                 /*with_product_pack_store=*/false, /*auth_override=*/{},
+                 /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                 /*schedule_api_override=*/truncated_api);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("capped-schedule") != std::string::npos);
+    CHECK(res->body.find("partial list") != std::string::npos);
 }
 
 // guardian-confinement-2298 PR3 §3e: POST /api/scope/estimate is auth_fn-only
@@ -3581,7 +3793,7 @@ TEST_CASE("GET /api/v1/schedules: reaches the same two-stage gate as the fragmen
 
     auto res = h.sink.Get("/api/v1/schedules");
     REQUIRE(res);
-    // schedule_engine is nullptr in this harness (matches the fragment twin's
+    // schedule_api is nullptr in this harness (matches the fragment twin's
     // own "Not available" test above) — 503, not a denial.
     CHECK(res->status == 503);
 }
@@ -3596,4 +3808,161 @@ TEST_CASE("GET /api/v1/schedules: a service-scoped token is denied the fleet-wid
     auto res = h.sink.Get("/api/v1/schedules");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// #2146 A2-R1: definition_id/enabled_only query params, threaded into the
+// same ScheduleQuery the legacy GET /api/schedules route already populates.
+// Real ScheduleEngine (with_schedule_engine=true) so the filters are proven
+// to actually narrow the result set, not just be accepted and ignored.
+
+TEST_CASE("GET /api/v1/schedules: definition_id narrows the result set",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule matching;
+    matching.name = "sched-match";
+    matching.definition_id = "def-2146-a2r1";
+    matching.frequency_type = "once";
+    matching.created_by = "admin";
+    auto matching_id = h.schedule_engine->create_schedule(matching);
+    REQUIRE(matching_id.has_value());
+
+    InstructionSchedule other;
+    other.name = "sched-other";
+    other.definition_id = "def-2146-other";
+    other.frequency_type = "once";
+    other.created_by = "admin";
+    auto other_id = h.schedule_engine->create_schedule(other);
+    REQUIRE(other_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?definition_id=def-2146-a2r1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_matching = false, found_other = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *matching_id)
+            found_matching = true;
+        if (row["id"] == *other_id)
+            found_other = true;
+    }
+    CHECK(found_matching);
+    CHECK_FALSE(found_other);
+}
+
+TEST_CASE("GET /api/v1/schedules: enabled_only narrows the result set",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled";
+    enabled_sched.definition_id = "def-2146-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = h.schedule_engine->create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled";
+    disabled_sched.definition_id = "def-2146-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = h.schedule_engine->create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=true");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK_FALSE(found_disabled);
+}
+
+// gov docs-writer/cpp-expert fix round: enabled_only=false must NOT behave
+// like enabled_only=true (the #4034-class presence-only defect). No prior
+// test exercised this value on either surface, so the initial parse's
+// `if (req.has_param("enabled_only")) q.enabled_only = true;` bug (any
+// presence, regardless of value, filtered to enabled-only) would have shipped
+// silently.
+TEST_CASE("GET /api/v1/schedules: enabled_only=false does NOT filter to enabled-only "
+          "(presence-only defect regression)",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-2";
+    enabled_sched.definition_id = "def-2146-enabled-2";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = h.schedule_engine->create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-2";
+    disabled_sched.definition_id = "def-2146-disabled-2";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = h.schedule_engine->create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=false");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK(found_disabled); // must NOT be filtered out by enabled_only=false
+}
+
+TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=maybe");
+    REQUIRE(res);
+    CHECK(res->status == 400);
 }

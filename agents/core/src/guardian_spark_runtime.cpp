@@ -4,6 +4,7 @@
 #include "spark_key_rule_index.hpp"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -302,83 +303,17 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         }
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutQueued;
     } else {
-        // Adversarial-review fix (rung 9c PR-5d follow-up, Blocker 2): the ONLY
-        // fallible step in this branch - wedged_by_rule_.insert_or_assign()'s
-        // node allocation - now runs FIRST, before any irreversible mutation
-        // (release_claim_index_locked, waiter_abandoned, end). Previously the
-        // irreversible steps ran first: a throw from the insert (bad_alloc)
-        // left the claim already unreachable through index_/rules_ AND through
-        // detach_rule_locked()'s Case 0 (which deliberately excludes a
-        // waiter_abandoned claim) with no locator entry either - the only
-        // structure that could still find and deactivate it. A withdrawal of
-        // that exact rule would then silently no-op, and its eventual late
-        // success would be ADOPTED (is_retained_wedge()/rg->active both still
-        // read true, neither was ever touched) for a rule no longer desired -
-        // fail-open. Doing the fallible step first means a throw here leaves
-        // the claim completely untouched (still genuinely Dispatching, still
-        // index-held, still reachable the ordinary way) - the next maintenance
-        // tick simply retries, matching this file's own commit-or-rollback
-        // discipline (see on_arm_complete's own pre-sizing comment) rather than
-        // committing a partial, unrecoverable transition.
-        if (!stopping) {
-            // rung 9c PR-5d /governance cross-examination (Gate 2/3, this run: raised by
-            // docs-writer, independently confirmed by security-guardian/cpp-expert/
-            // cpp-safety/architect - the 4th occurrence of the same fail-open class on
-            // this branch, after adversarial-review Blocker 2, governance sec-h1/cs-1,
-            // and the external-review fix at attach_core's Reobserved-restore branch,
-            // further down this same file (1cd9a0772, external review, PR #4485,
-            // fjarvis). Reachable
-            // interleaving: wedge rule_id on key A; redeploy to key B (detach_rule_locked
-            // deactivates claim A's rg->active AND erases wedged_by_rule_["rule_id"] -
-            // see that function's own wedge lookup); redeploy BACK to key A before B ever
-            // times out (attach_core's Reobserved-restore branch finds the map entry
-            // gone, so its own cross-key guard has nothing to deactivate, and reinstates
-            // claim A: wedged_by_rule_["rule_id"] = claim A, claim A's rg->active = true
-            // again); THEN key B's own arm() call finally times out and reaches HERE,
-            // where the unguarded insert_or_assign would silently overwrite the map with
-            // claim B - orphaning claim A exactly like the Reobserved-restore site's own
-            // bug, just approached from the opposite direction (the SECOND wedge to
-            // settle, not the SECOND redeploy to land, is what clobbers the first).
-            //
-            // The fix direction here is the MIRROR IMAGE of the Reobserved-restore
-            // guard's, not a copy of it - because the claim reaching each site carries
-            // opposite provenance. There, `pre_head` is the claim just re-observed by a
-            // fresh attach for the SAME (rule_id, spec) the caller currently wants -
-            // attach_core() is never called for a rule nobody wants, so `pre_head` is
-            // definitionally the desired claim and any different occupant it displaces
-            // must be the stale one. Here, `claim` just TIMED OUT - a timeout carries no
-            // signal about whether the rule is still desired, so `claim` cannot be
-            // assumed to be the one worth keeping. But the map's CURRENT occupant, if it
-            // names a different, still-live claim at this exact moment, can only have
-            // gotten there via an attach_core() call that ran strictly AFTER `claim` was
-            // created (the map's only other writer) - so that occupant is provably the
-            // FRESHER generation, and `claim` is the superseded one. The fix therefore
-            // deactivates `claim` itself, in place, and leaves the map's existing entry
-            // completely untouched - the opposite of the Reobserved-restore guard, which
-            // deactivates the DISPLACED occupant and then overwrites the map with the
-            // incoming claim.
-            //
-            // Noexcept probe first (map find + weak_ptr::lock() + a pointer comparison,
-            // no allocation) - correct to run unconditionally before the branch below
-            // decides which of the two fallible/irreversible paths to take, matching
-            // this function's existing fallible-first, decide-before-mutate discipline.
-            bool superseded = false;
-            if (const auto wit = wedged_by_rule_.find(claim->rule_id); wit != wedged_by_rule_.end()) {
-                if (const auto current = wit->second.lock(); current && current != claim)
-                    superseded = true;
-            }
-            if (superseded) {
-                // A fresher generation already occupies rule_id's slot - `claim` lost the
-                // race. Deactivate it directly (noexcept) and leave wedged_by_rule_
-                // pointing at the fresher claim exactly as it already did; there is
-                // nothing to insert or roll back here, so no fault seam applies.
-                if (claim->rg)
-                    claim->rg->active = false;
-            } else {
-                wedge_locator_fault_here_for_test(); // seam: "the locator insertion throws"
-                wedged_by_rule_.insert_or_assign(claim->rule_id, claim); // may throw - claim untouched if so
-            }
-        }
+        // #4508 W0: candidacy never writes a generation owned by rules_.
+        // A null rg means ordinary commit was attempted (the by-value argument
+        // consumed it), whether that commit succeeded or threw. Nothing remains
+        // on this claim that could be adopted.
+        // W1: another candidate can only have become desired after this claim
+        // was created, through a later attach or re-observation. A timeout is
+        // not fresh desire: deactivate this incoming claim, not that candidate.
+        // The walk and write cannot allocate; no separate locator can be lost.
+        if (!stopping && claim->rg && !generation_committed_locked(*claim) &&
+            wedge_candidate_exists_locked(claim->rule_id, claim.get()))
+            claim->rg->active = false;
         release_claim_index_locked(*claim);
         claim->waiter_abandoned = true; // the completion callback finishes this episode
         // cpp-safety SHOULD (#4221, rung 9c PR-5c follow-up governance): when
@@ -402,24 +337,6 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         // which existing seams (dispatch_entry_hook_for_test_, hang_next_arm)
         // don't currently give direct control over.
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
-        // rung 9c PR-5d (concern 1): a genuine (non-stopping) wedge is the ONLY
-        // case adoption ever applies to - R5.5's stopping-time disarm is
-        // unconditional and never consults this map (on_arm_complete's own
-        // wedge_may_adopt requires !stopping_). Corrected (adec35363 follow-up):
-        // this used to say the map entry was "already inserted above" regardless -
-        // true only for the non-superseded branch, where wedged_by_rule_.
-        // insert_or_assign(claim->rule_id, claim) above IS the last write to this
-        // map before `end` settles here, so wedged_by_rule_ and is_retained_wedge()
-        // already agree, atomically, by construction. On the `superseded` branch
-        // above, NO insert happens at all - a fresher generation already occupies
-        // rule_id's slot, so the fix deactivates `claim->rg` directly, in place,
-        // and leaves the map untouched, still pointing at that fresher claim. Both
-        // branches still reach this same agreement, just by different means: the
-        // non-superseded branch makes the map agree with `claim` by inserting it;
-        // the superseded branch makes `claim`'s own rg->active agree with its
-        // absence from the map by deactivating it directly. Either way, no window
-        // exists where wedged_by_rule_/is_retained_wedge() disagree with
-        // rg->active for the claim the map actually names.
     }
     if (!claim->outcome)
         claim->outcome = std::unexpected(reason);
@@ -823,9 +740,7 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
             // generation) the rule is live and the waiter gets its generation -
             // never "failed" for an armed rule (C2's second window); otherwise
             // it never committed and fails plainly.
-            const auto rit = rules_.find(c->rule_id);
-            if (c->kind == ClaimKind::Arm && rit != rules_.end() &&
-                rit->second->generation == c->generation) {
+            if (c->kind == ClaimKind::Arm && generation_committed_locked(*c)) {
                 c->index_held = false; // ownership is rules_/keys_'s
                 c->outcome = c->generation;
                 c->end = ClaimEnd::Committed;
@@ -1063,22 +978,13 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 // `live.empty()` runtime guard just below, not structural
                 // uniqueness - when a live follower exists, the ordinary
                 // live-siblings commit path handles it and this claim's own wedge
-                // is NOT adopted (still recoverable on the next Reapply). Its
-                // episode ends HERE either way (adopted or not), so the locator
-                // entry is dropped unconditionally before deciding which.
+                // is not adopted (still recoverable on the next Reapply).
+                // Candidacy ends by commitment or removal from claims_.
                 const bool was_wedge = is_retained_wedge(*claim);
-                if (was_wedge) {
-                    if (const auto wit = wedged_by_rule_.find(claim->rule_id);
-                        wit != wedged_by_rule_.end() && wit->second.lock() == claim)
-                        wedged_by_rule_.erase(wit);
-                }
 
-                // rung 9c PR-5d (concern 1): a late success on a Wedged claim whose
-                // rule is STILL currently desired (nobody withdrew it while it was
-                // wedged - detach_rule_locked()/detach_all()'s own new wedge lookups
-                // are what flip rg->active false on withdrawal, since neither can
-                // reach this claim through claims_/rules_/index_ the ordinary way) is
-                // ADOPTED rather than disarmed: the subscription is committed exactly
+                // A still-desired wedge's late success can be adopted. Withdrawal
+                // walks claims_ and clears candidacy before ordinary teardown.
+                // The subscription is committed exactly
                 // like an ordinary live claim's commit below, but `claim->outcome`/
                 // `claim->end` are LEFT UNTOUCHED - the sticky-Wedged receipt (this
                 // PR's own load-bearing invariant, pinned by test) records a fact
@@ -1144,7 +1050,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                      "or - rarely - an invariant violation) - disarming "
                                      "the stale success rather than adopting over the "
                                      "current live generation",
-                                     claim->rule_id, claim->generation);
+                                     ::yuzu::log_id_token(claim->rule_id), claim->generation);
                     } catch (...) {
                     }
                 } else if (wedge_may_adopt) {
@@ -1174,7 +1080,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                             commit_new_generation_locked(claim->rule_id, claim->generation,
                                                          claim->guard_type, claim->rule_name,
                                                          fresh, claim->rg, claim->attach_now,
-                                                         waker, outbox_waker);
+                                                         waker, outbox_waker,
+                                                         CommitPath::CallbackAdopt);
                         } catch (...) {
                             rules_.erase(claim->rule_id);
                             fresh->pending_initial.erase(claim->rule_id);
@@ -1285,7 +1192,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                     commit_new_generation_locked(c->rule_id, c->generation,
                                                                  c->guard_type, c->rule_name,
                                                                  fresh, std::move(c->rg),
-                                                                 c->attach_now, waker, outbox_waker);
+                                                                 c->attach_now, waker, outbox_waker,
+                                                                 CommitPath::CallbackArm);
                                 } catch (...) {
                                     rules_.erase(c->rule_id);
                                     fresh->pending_initial.erase(c->rule_id);
@@ -1321,7 +1229,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                 commit_new_generation_locked(c->rule_id, c->generation,
                                                              c->guard_type, c->rule_name, pk,
                                                              std::move(c->rg), c->attach_now,
-                                                             waker, outbox_waker);
+                                                             waker, outbox_waker,
+                                                             CommitPath::CallbackShared);
                                 c->index_held = false;
                                 stage(c, c->generation, nullptr, ClaimEnd::Committed);
                             } catch (...) {
@@ -1577,11 +1486,16 @@ std::size_t GuardianSparkRuntime::claim_queue_depth_for_test(const std::string& 
     return eit == claims_.end() ? 0 : eit->second.fifo.size();
 }
 
+std::pair<std::uint64_t, std::uint64_t> GuardianSparkRuntime::application_fence_for_test() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return {detach_epoch_, gen_counter_};
+}
+
 void GuardianSparkRuntime::commit_new_generation_locked(
     const std::string& rule_id, std::uint64_t gen, const char* guard_type,
     const std::string& rule_name, const std::shared_ptr<PerKey>& pk,
     std::shared_ptr<RuleGeneration> rg, std::chrono::steady_clock::time_point attach_now,
-    std::function<void()>& waker, std::function<void()>& outbox_waker) {
+    std::function<void()>& waker, std::function<void()>& outbox_waker, CommitPath via) {
     rules_.insert_or_assign(rule_id, std::move(rg));
     pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
     // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
@@ -1590,6 +1504,48 @@ void GuardianSparkRuntime::commit_new_generation_locked(
     waker = pending_initial_waker_;
     outbox_waker = outbox_enqueue_waker_;
     enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+    // R5.7 T2 (docs/spark-stage2-guardian-consumer-design.md): the runtime's own
+    // arm-confirmation commit - the ONLY valid log-side proxy for "this rule is
+    // armed" under spark (SparkEngine's own "armed" line fires before the OS
+    // watch exists - see spark_engine.cpp). `epoch` is detach_epoch_ read under
+    // the registry_mu_ this function already holds - it names which application
+    // (full_sync teardown) this commit belongs to; `incarnation` is `gen`, this
+    // attach's own gen_counter_ token, NOT the server policy generation. Fully
+    // firewalled INCLUDING the clock read and the duration math: this runs after
+    // the lifecycle enqueue above, and an escaping throw here would leave an
+    // "armed" audit record enqueued while every caller's own rollback (a
+    // catch(...) at the callback sites, a GuardianRollback guard at the inline
+    // sites) undoes rules_/pending_initial. Same firewall shape as the lifecycle
+    // window-raise log above and spark_engine.cpp's own armed-log site.
+    // FIELD ORDER IS PINNED by the #3990 driver's own regex
+    // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T2_RE) - change
+    // both together. The line is built by format_arm_committed_line (guardian_spark_timing.cpp),
+    // which neutralises the operator-authored rule id so a hostile id cannot forge a second
+    // log line.
+    try {
+        const auto attach_to_commit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             clock_() - attach_now).count();
+        spdlog::info("{}", format_arm_committed_line(rule_id, detach_epoch_, gen, guard_type,
+                                                     commit_path_name(via), attach_to_commit_ms));
+    } catch (...) {
+    }
+}
+
+const char* commit_path_name(GuardianSparkRuntime::CommitPath path) {
+    using P = GuardianSparkRuntime::CommitPath;
+    switch (path) {
+    case P::InlineArm:
+        return "inline-arm";
+    case P::InlineShared:
+        return "inline-shared";
+    case P::CallbackArm:
+        return "callback-arm";
+    case P::CallbackShared:
+        return "callback-shared";
+    case P::CallbackAdopt:
+        return "callback-adopt";
+    }
+    return "Unknown"; // unreachable if the switch above is kept exhaustive
 }
 
 std::expected<std::uint64_t, std::string>
@@ -1739,6 +1695,75 @@ bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
 }
 
+bool GuardianSparkRuntime::generation_committed_locked(const KeyClaim& claim) const noexcept {
+    const auto rit = rules_.find(claim.rule_id);
+    return rit != rules_.end() && rit->second->generation == claim.generation;
+}
+
+bool GuardianSparkRuntime::is_wedge_candidate_locked(const KeyClaim& claim) const noexcept {
+    return is_retained_wedge(claim) && claim.rg && claim.rg->active &&
+           !generation_committed_locked(claim);
+}
+
+void GuardianSparkRuntime::deactivate_wedge_candidates_locked(
+    std::optional<std::string_view> rule_id, const KeyClaim* except) noexcept {
+    for (const auto& [key, entry] : claims_)
+        for (const auto& claim : entry.fifo)
+            if (claim.get() != except && is_retained_wedge(*claim) &&
+                (!rule_id || claim->rule_id == *rule_id) && is_wedge_candidate_locked(*claim))
+                claim->rg->active = false;
+}
+
+bool GuardianSparkRuntime::wedge_candidate_exists_locked(
+    std::optional<std::string_view> rule_id, const KeyClaim* except) const noexcept {
+    for (const auto& [key, entry] : claims_)
+        for (const auto& claim : entry.fifo)
+            if (claim.get() != except && is_retained_wedge(*claim) &&
+                (!rule_id || claim->rule_id == *rule_id) && is_wedge_candidate_locked(*claim))
+                return true;
+    return false;
+}
+
+void GuardianSparkRuntime::log_wedge_withdrawal_postcondition_violation(
+    std::optional<std::string_view> rule_id) const noexcept {
+    try {
+        spdlog::critical(
+            "Guardian spark #4508: a wedge candidate survived a withdrawal of rule "
+            "'{}' - the sweep was skipped or reordered",
+            rule_id ? ::yuzu::log_id_token(*rule_id) : std::string{"<all>"});
+    } catch (...) {
+    }
+}
+
+std::size_t GuardianSparkRuntime::wedge_candidate_count_for_test(const std::string& rule_id) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    std::size_t count = 0;
+    for (const auto& [key, entry] : claims_)
+        for (const auto& claim : entry.fifo)
+            if (is_retained_wedge(*claim) && claim->rule_id == rule_id &&
+                is_wedge_candidate_locked(*claim))
+                ++count;
+    return count;
+}
+
+bool GuardianSparkRuntime::receipt_wedge_candidate_for_test(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return false;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    const auto eit = claims_.find(claim->key);
+    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim &&
+           is_wedge_candidate_locked(*claim);
+}
+
+std::optional<bool> GuardianSparkRuntime::rule_active_for_test(const std::string& rule_id) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto rit = rules_.find(rule_id);
+    if (rit == rules_.end())
+        return std::nullopt;
+    return rit->second->active;
+}
+
 bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
     const std::shared_ptr<KeyClaim>& claim) const noexcept {
     if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
@@ -1764,8 +1789,7 @@ bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
     if (!receipt.claim)
         return false;
     std::lock_guard<std::mutex> lk{registry_mu_};
-    const auto rit = rules_.find(receipt.claim->rule_id);
-    return rit != rules_.end() && rit->second->generation == receipt.claim->generation;
+    return generation_committed_locked(*receipt.claim);
 }
 
 bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) const {
@@ -1781,12 +1805,8 @@ GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
         return RecoveryStatus::Blocking;
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto& claim = receipt.claim;
-    // Identical logic to receipt_recovered() + receipt_wedge_k_eligible(), inlined
-    // under this ONE lock acquisition rather than calling either standalone accessor
-    // - see this function's own doc comment for why the two-call sequence is unsafe
-    // for a caller that needs both answers about the same instant.
-    const auto rit = rules_.find(claim->rule_id);
-    if (rit != rules_.end() && rit->second->generation == claim->generation)
+    // Both predicates observe the same instant under this one lock.
+    if (generation_committed_locked(*claim))
         return RecoveryStatus::Recovered;
     if (is_wedge_k_eligible_locked(claim))
         return RecoveryStatus::WedgeEligible;
@@ -1922,8 +1942,7 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
     // pass" instead of a std::terminate.
     if (c.outcome || c.commit_exception)
         return;
-    const auto rit = rules_.find(c.rule_id);
-    if (c.kind == ClaimKind::Arm && rit != rules_.end() && rit->second->generation == c.generation) {
+    if (c.kind == ClaimKind::Arm && generation_committed_locked(c)) {
         c.index_held = false;
         c.outcome = c.generation;
         c.end = ClaimEnd::Committed;
@@ -2148,26 +2167,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // comment below); it does not depend on rule_id's own generation being the
         // front, only on someone ELSE's being it.
         //
-        // rung 9c PR-5d correction: the SAME-rule_id, SAME-spec case - rule_id's
-        // own generation already IS the front, wedged - must ALSO be decided HERE,
-        // before detach_rule_locked(rule_id) runs, not after. This comment
-        // previously said detach_rule_locked "skips a waiter_abandoned claim,
-        // leaving that front unchanged" - true before PR-5d, no longer true after
-        // it: detach_rule_locked() now has its OWN wedge lookup (wedged_by_rule_),
-        // added so a genuine WITHDRAWAL of a purely-wedged rule_id is no longer a
-        // silent no-op (see that function's own comment) - and rule_id's own
-        // detach_rule_locked(rule_id) call two lines below runs UNCONDITIONALLY on
-        // every attach_core() call, including a Reobserving one. Left at its
-        // original (post-detach) position, that new lookup would deactivate this
-        // exact claim's own RuleGeneration on EVERY reobservation, permanently
-        // disabling adoption for a caller whose whole intent was "I still want
-        // this rule" - measured directly (a reobservation-then-late-success test
-        // failed to adopt until this hoist was added). Returning Reobserved HERE
-        // means detach_rule_locked(rule_id) never runs at all for this call, so
-        // its wedge lookup never sees rule_id and never touches the claim -
-        // exactly the "construct nothing new, touch no index state at all" shape
-        // the up-2 design already committed to for this case, now extended to
-        // cover rg->active too.
+        // Re-observation precedes ordinary withdrawal: the caller still wants
+        // this exact rule/spec, so do not sweep its own candidacy away first.
+        // The restore below handles a preceding full-sync sweep and preserves
+        // generation ownership if adoption committed before publication failed.
         //
         // Deliberately duplicates part of the original (post-detach) Reobserved
         // branch below rather than removing it: that branch stays as defense-in-
@@ -2189,78 +2192,15 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             if (is_retained_wedge(*pre_head) && pre_head->rule_id == rule_id &&
                 pre_head->spec == spec) {
                 wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
-                // Adversarial-review fix (rung 9c PR-5d follow-up): an intervening
-                // full-sync retry's detach_all() (or an intervening
-                // detach_rule_locked(rule_id) from a withdraw-then-immediately-
-                // readd sequence) may already have deactivated this EXACT claim's
-                // rg->active and cleared its wedged_by_rule_ entry - see
-                // detach_all()'s own comment, which justifies that sweep only for
-                // a rule genuinely OMITTED from the replacement desired set. This
-                // call reaching Reobserved is itself the proof rule_id/spec are
-                // STILL desired right now (attach_core() is never called for a
-                // rule nobody wants), so restore adoption candidacy here rather
-                // than leaving it permanently disabled by a sweep that was never
-                // meant to apply to it. Re-registering the locator (not just
-                // rg->active) matters too: a REAL subsequent withdrawal of this
-                // still-wedged claim must still be able to find and deactivate it.
-                //
-                // Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): the
-                // fallible, node-allocating wedged_by_rule_.insert_or_assign()
-                // MUST run before the irreversible rg->active=true write, exactly
-                // mirroring abandon_claim_locked's own fail-closed discipline a
-                // few hundred lines above (same file, same PR) - the two are the
-                // ONLY insert_or_assign call sites for this map and must share one
-                // exception-safety shape. Doing it in the ORIGINAL order (active
-                // first, insert second) meant a bad_alloc here left rg->active
-                // stuck true FOREVER with no locator entry: every later
-                // reobservation's own `!pre_head->rg->active` guard would then
-                // read false and skip retrying the insert, so a genuine later
-                // withdrawal could never find this claim (no locator) and its
-                // eventual late success would still read rg->active==true and be
-                // wrongly adopted - a fail-open hole in exactly the guarantee
-                // this fix exists to provide. Reordering makes the repair
-                // retry-safe: a throw here leaves rg->active untouched (still
-                // false), so the NEXT reobservation attempt retries the insert
-                // instead of silently giving up.
-                if (pre_head->rg && !pre_head->rg->active) {
-                    // External review fix (PR #4485, fjarvis): wedged_by_rule_ is
-                    // keyed by rule_id ALONE, not (rule_id, key) - the SAME
-                    // rule_id can be wedged on two different keys at once (an
-                    // ordinary flip-flop redeploy: wedge on key A, redeploy to
-                    // key B, key B ALSO wedges before redeploying back to A).
-                    // Left unguarded, the insert_or_assign below silently
-                    // overwrites whatever claim currently occupies rule_id's
-                    // slot - orphaning a genuinely live, still-parked claim on
-                    // the other key with no way for a later real withdrawal to
-                    // ever find and deactivate it again (the map is the ONLY
-                    // reachable path to a waiter_abandoned claim). That claim's
-                    // eventual late success then reads rg->active==true forever
-                    // and is wrongly adopted, even past a real withdrawal - the
-                    // same fail-open defect class as the two prior fixes in this
-                    // same branch, at a third, structurally distinct site
-                    // (cross-key locator collision, not a single-site ordering
-                    // bug). Distinct from on_arm_complete's separate
-                    // rules_.contains guard: that one only catches a collision
-                    // with an already-COMMITTED generation on another key - it
-                    // never fires here, because neither claim has reached
-                    // rules_ yet, both are still just wedged. Noexcept (map
-                    // find + weak_ptr::lock() + a shared_ptr identity
-                    // comparison + a bool write, no allocation), so safe to
-                    // run unconditionally BEFORE the fallible insert below -
-                    // correct regardless of whether that insert then succeeds
-                    // or throws.
-                    if (const auto wit = wedged_by_rule_.find(rule_id);
-                        wit != wedged_by_rule_.end()) {
-                        if (const auto orphaned = wit->second.lock();
-                            orphaned && orphaned != pre_head && orphaned->rg)
-                            orphaned->rg->active = false;
-                    }
-                    wedge_locator_fault_here_for_test(); // seam shared with
-                                                          // abandon_claim_locked's
-                                                          // own insert - see that
-                                                          // seam's doc comment
-                    wedged_by_rule_.insert_or_assign(rule_id, pre_head); // may throw - FIRST
-                    pre_head->rg->active = true; // noexcept; only after the insert succeeds
+                // #4508: re-observation proves this exact rule/spec is desired,
+                // including after a full-sync withdrawal. Preserve W1 by sweeping
+                // other candidates first, even if this claim is already active.
+                // W0 excludes an adopted-but-unpublished claim: its rg aliases
+                // the committed generation, whose active bit belongs to rules_.
+                // attach_core's stopping gate precedes this branch.
+                if (pre_head->rg && !generation_committed_locked(*pre_head)) {
+                    deactivate_wedge_candidates_locked(rule_id, pre_head.get());
+                    pre_head->rg->active = true;
                 }
                 return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
                                         .error = {}, .claim = pre_head};
@@ -2494,7 +2434,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             keys_.emplace(key, pk);
 
             commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
-                                         attach_now, waker, outbox_waker);
+                                         attach_now, waker, outbox_waker, CommitPath::InlineArm);
             rollback.committed = true;
         } else {
             // An existing, COMMITTED shared watcher for this key: reaching here with
@@ -2512,7 +2452,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 pk->pending_initial.erase(rule_id);
             };
             commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
-                                         attach_now, waker, outbox_waker);
+                                         attach_now, waker, outbox_waker,
+                                         CommitPath::InlineShared);
             rollback.committed = true;
         }
         new_gen = gen;
@@ -2582,23 +2523,21 @@ void GuardianSparkRuntime::detach_all() {
     std::vector<std::shared_ptr<KeyClaim>> works;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
-        // rung 9c PR-5d (concern 1): every currently-wedged claim loses its
-        // adoption candidacy too - a full sync that omits a wedged rule_id must
-        // not let its eventual late success resurrect it, and the per-rule
-        // detach_rule_locked() loop below can never reach a wedged claim (its
-        // own Case 0 deliberately skips waiter_abandoned entries - see that
-        // function's comment) the way it reaches a still-claimed, not-yet-
-        // abandoned one via `claimed` just below. Same deactivate-and-drop shape
-        // as detach_rule_locked()'s own new lookup, applied to every entry at
-        // once rather than by rule_id.
-        for (auto& [rid, weak] : wedged_by_rule_) {
-            if (const auto wedge = weak.lock(); wedge && wedge->rg)
-                wedge->rg->active = false;
-        }
-        wedged_by_rule_.clear();
-        // rung 9c R5.2: a full sync replaces the active set, so a rule that is still
-        // only CLAIMED (its arm in flight or queued, no rules_ entry yet) must be
-        // withdrawn too - detach_rule_locked's Case 0 handles each, generalised.
+        // R5.7 application fence (docs/spark-stage2-guardian-consumer-design.md):
+        // bumped FIRST, before any of this block's own mutation, so every commit
+        // this teardown's own re-arm eventually produces carries an epoch strictly
+        // greater than whatever a still-in-flight PRIOR application's callback
+        // could log - see the T0d line at the end of this block for the full
+        // reasoning (both share registry_mu_, so no commit can interleave between
+        // this increment and that line). #4508: a trivial, non-throwing counter
+        // bump that touches no wedge-candidacy state, so it's harmless ahead of
+        // the postcondition guard below - the guard's own contract only requires
+        // it precede the sweep and any wedge-relevant withdrawal work.
+        ++detach_epoch_;
+        WedgeWithdrawalPostcondition postcondition{*this, std::nullopt};
+        deactivate_wedge_candidates_locked(std::nullopt, nullptr);
+        // Withdraw pending arms as well as committed rules. Both loops use the
+        // pre-swept helper: neither can create a candidate under this lock.
         std::vector<std::string> claimed;
         {
             std::size_t claim_count = 0;
@@ -2614,7 +2553,7 @@ void GuardianSparkRuntime::detach_all() {
                     !c->outcome)
                     claimed.push_back(c->rule_id);
         for (const auto& rid : claimed)
-            (void)detach_rule_locked(rid);
+            (void)withdraw_rule_after_wedge_sweep_locked(rid, "disarmed");
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
         for (const auto& [rid, rg] : rules_)
@@ -2629,9 +2568,32 @@ void GuardianSparkRuntime::detach_all() {
                                         // the claim safely queued in claims_ itself -
                                         // see redrive_retained_disarms().
         for (const auto& rid : rule_ids)
-            if (auto work = detach_rule_locked(rid))
+            if (auto work = withdraw_rule_after_wedge_sweep_locked(rid, "disarmed"))
                 works.push_back(std::move(work));
         outbox_waker = outbox_enqueue_waker_;
+        // R5.7 T0d (docs/spark-stage2-guardian-consumer-design.md): the runtime's
+        // own teardown-complete marker - the #3990 diagnostic's T0d line. Logged
+        // LAST in this locked block so its timestamp means "registry cleared for
+        // this application" and every commit this application goes on to produce
+        // is guaranteed to log AFTER it. `incarnation_floor` is gen_counter_ NOW:
+        // every attach this application makes gets an incarnation strictly above
+        // it (ordinary paths) or, for a Reobserved wedge adoption specifically,
+        // AT OR BELOW it (the diagnostic's own epoch-fence design treats that as
+        // the one legal exception - see the design doc's R5.7 section). Firewalled:
+        // an escaping throw here is caught by this function's own caller
+        // (GuardianEngine's full_sync teardown catch, which counts a reconcile
+        // failure and proceeds to re-arm what it can) - a missing T0d line for an
+        // epoch that then produces commits anyway is the diagnostic's own signal
+        // to void that repeat, not a correctness problem for the engine itself.
+        // FIELD ORDER IS PINNED by the #3990 driver's own regex
+        // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T0D_RE) -
+        // change both together.
+        try {
+            spdlog::info("Guardian spark: detach_all complete (epoch={}, incarnation_floor={}, "
+                         "detached_rules={}, withdrawn_claims={})",
+                         detach_epoch_, gen_counter_, rule_ids.size(), claimed.size());
+        } catch (...) {
+        }
     }
     // rung 9c PR-2 Unit 3: submitted sequentially, off-lock, through
     // submit_disarm_off_lock() - each returns as soon as its disarm is ADMITTED, not
@@ -2647,80 +2609,14 @@ void GuardianSparkRuntime::detach_all() {
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
 GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
-    // rung 9c PR-5d (concern 1, 5th occurrence of this branch's own fail-open class -
-    // found by THIS governance run's own Gate 4 unhappy-path pass, independently
-    // confirmed by cpp-safety; unlike the prior four occurrences, not raised by an
-    // external reviewer and not a finding from an earlier Gate 2/3/7/8 round). This
-    // block - deactivate rule_id's currently-wedged claim, if any, via the
-    // wedged_by_rule_ locator (see that map's own doc comment for what populates it
-    // and why detach_rule_locked()/detach_all() are the only things that can ever
-    // reach a waiter_abandoned claim) - USED TO sit AFTER Case 0 below, reached only
-    // when Case 0's own FIFO scan fell through without matching anything. That
-    // ordering was itself the bug: Case 0's search deliberately EXCLUDES a
-    // waiter_abandoned claim (see its own comment below) but `return nullptr;`s from
-    // INSIDE its loop the instant it matches ANY live, non-abandoned claim for
-    // rule_id - which skips every line after it in this function, including this
-    // lookup. A single rule_id CAN have two structurally distinct claim objects live
-    // at once: one wedged-and-parked on an OLD key, reachable ONLY through this map;
-    // one Dispatching-and-not-yet-wedged on a NEW key after an intervening flip-flop
-    // redeploy, reachable through Case 0's own index_/claims_ scan. Reachable
-    // interleaving: wedge r1 on key A (wedged_by_rule_["r1"] = claim A, rg->active =
-    // true); redeploy r1 to key B (this same lookup - old position or new, the
-    // redeploy's own detach_rule_locked("r1") call reaches it either way, since Case
-    // 0 has nothing to match yet - deactivates claim A and erases the map entry;
-    // attach_core()'s own index_->add(B, "r1", genB) then makes claim B Dispatching,
-    // index-held, not yet wedged); redeploy r1 BACK to key A before claim B's own
-    // arm() call ever resolves (attach_core()'s hoisted Reobserved-restore branch
-    // finds the map empty, so its own cross-key guard has nothing to deactivate, and
-    // unconditionally reinstates claim A: wedged_by_rule_["r1"] = claim A again,
-    // rg->active = true again - this redeploy re-observes claim A directly and never
-    // reaches detach_rule_locked(rule_id) at all, so claim B's own index_ mapping to
-    // key B is untouched throughout); THEN withdraw r1 while claim B is STILL merely
-    // Dispatching. Under the OLD ordering, Case 0 ran first, found claim B via
-    // index_->key_for_rule("r1") == B - live, un-abandoned, index-held - matched it,
-    // marked it withdrawn, and `return nullptr;`d from inside the loop before this
-    // lookup ever ran. wedged_by_rule_ still names claim A at this point (nothing
-    // erases it between the Reobserved-restore step above and here) - the map
-    // itself is fine, it is only THIS lookup, the one thing that would have read it
-    // and deactivated claim A, that never ran. Claim A's rg->active stayed wrongly
-    // true past the withdrawal that should have deactivated it - the same fail-open
-    // shape as the four prior occurrences on this branch (a claim's adoption
-    // candidacy silently outliving a real withdrawal), at a fifth structurally
-    // distinct site: not a map-insert ordering or a same-key collision this time,
-    // but an early return that skips a LATER cleanup block entirely.
-    //
-    // The fix hoists this lookup to run UNCONDITIONALLY, first, before Case 0 even
-    // starts its scan - never gated on whether Case 0 finds a match. Provably safe,
-    // not merely plausible: wedged_by_rule_ is populated only for a claim with
-    // `waiter_abandoned == true && index_held == false` (abandon_claim_locked sets
-    // both together, atomically, in the same critical section a claim wedges in),
-    // while Case 0's own match condition below requires `!waiter_abandoned &&
-    // index_held` - the two conditions are mutually exclusive, so this lookup and
-    // Case 0's scan can NEVER match the SAME claim object; between them they can only
-    // ever find two DIFFERENT claims for the same rule_id, exactly as in the
-    // interleaving above. Running this lookup first therefore changes nothing about
-    // what Case 0 finds or what it returns - it only guarantees THIS cleanup always
-    // runs too, for every withdrawal, instead of being skipped whenever Case 0
-    // happens to match something first.
-    //
-    // What this lookup itself does, unchanged from its original introduction:
-    // rule_id has no rules_ entry (a purely-wedged claim was never committed), so
-    // without it, withdrawing a rule_id whose only presence is a wedged claim would
-    // be a silent no-op - nothing would ever tell the claim it was no longer wanted,
-    // and a later late success would be adopted as if it still were. Deactivate the
-    // claim's own RuleGeneration (on_arm_complete's late-adoption check reads exactly
-    // this) and drop the locator entry - withdrawal ends this wedge's adoption
-    // candidacy for good, it does not touch `end`/`outcome`/`waiter_abandoned` (the
-    // sticky-Wedged receipt itself stays exactly what it already was). Nothing to
-    // disarm here either: the backend arm() call this claim is waiting on is still
-    // genuinely in flight (or already resolved and racing this call) - on_arm_
-    // complete's own ordinary "nobody left to adopt" path disarms it when it lands,
-    // unchanged.
-    if (const auto wit = wedged_by_rule_.find(rule_id); wit != wedged_by_rule_.end()) {
-        if (const auto wedge = wit->second.lock(); wedge && wedge->rg)
-            wedge->rg->active = false;
-        wedged_by_rule_.erase(wit);
-    }
+    WedgeWithdrawalPostcondition postcondition{*this, rule_id};
+    deactivate_wedge_candidates_locked(rule_id, nullptr);
+    return withdraw_rule_after_wedge_sweep_locked(rule_id, lifecycle_kind);
+}
+
+std::shared_ptr<GuardianSparkRuntime::KeyClaim>
+GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
+    const std::string& rule_id, std::string_view lifecycle_kind) {
 
     // rung 9c R5.2 (Case 0, generalised from #2233 item 3): rule_id belongs to a key
     // whose arm is still CLAIMED - in flight as the head, or queued behind it - so it
@@ -2733,10 +2629,9 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     // "pending arm withdrawn -> no lifecycle entry" contract the confirmed path's
     // `known` gate already encodes). The search excludes withdrawn AND abandoned
     // claims so a retained stale claim can never match ahead of its live replacement
-    // (a wedged one is handled above, unconditionally, before this scan even starts),
-    // and (adversarial review K1') a claim whose commit already ran: on_arm_complete
-    // publishes and pops an adopted claim inside the commit's own critical section,
-    // so such a claim is never in the fifo here - the guard is belt-and-braces.
+    // (wedged candidates were swept before entering this helper), and a claim
+    // already marked Committed. Publication failure can retain a committed head;
+    // confirmed-state withdrawal below remains responsible for its generation.
     if (const auto key_opt = index_->key_for_rule(rule_id); key_opt) {
         if (const auto eit = claims_.find(*key_opt); eit != claims_.end()) {
             auto& fifo = eit->second.fifo;
@@ -2903,7 +2798,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                                      "last-resort fallback, but this leftover fifo residue "
                                      "is left for the next same-key event to sweep (see "
                                      "detach_sweep_left_residue())",
-                                     *key_opt, eit->second.fifo.size(), rule_id);
+                                     *key_opt, eit->second.fifo.size(),
+                                     ::yuzu::log_id_token(rule_id));
                     } catch (...) {
                     }
                 } else {
@@ -3146,10 +3042,24 @@ void GuardianSparkRuntime::revalidate_subscriptions() {
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
     switch (ev.kind) {
-    case SparkEventKind::Fired:
+    case SparkEventKind::Fired: {
         // The event is an invalidation HINT; evaluate_key re-reads live state.
-        evaluate_key(ev.key, EvalReason::Event);
+        // #4606 criterion-10: T_handler (diagnostic) captured here, at queued-handler entry;
+        // T_mechanism read from ev.at (already stamped by SparkEngine::emit_event(), no
+        // producer change needed — this is purely consuming an existing value).
+        const auto handler_wall = std::chrono::system_clock::now();
+        const auto handler_mono = std::chrono::steady_clock::now();
+        EvalTrigger trigger;
+        trigger.mechanism_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        ev.at.time_since_epoch()).count();
+        trigger.handler_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       handler_wall.time_since_epoch()).count();
+        trigger.handler_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       handler_mono.time_since_epoch()).count();
+        trigger.seq = ev.seq;
+        evaluate_key(ev.key, EvalReason::Event, trigger);
         return;
+    }
     case SparkEventKind::Lost:
         on_subscription_lost(ev.key, ev.subscription_id, ev.detail);
         return;
@@ -3162,7 +3072,8 @@ void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
     }
 }
 
-void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason) {
+void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason,
+                                        std::optional<EvalTrigger> trigger) {
     std::shared_ptr<PerKey> pk;
     SparkSpec spec;
     {
@@ -3178,8 +3089,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
 
     // Serialise the whole pass (plan + read + fan-out + commit) for THIS key, so
     // read order == commit order and the freshest read commits last (no backward
-    // compliance). Per-key, so sibling keys run concurrently.
-    std::lock_guard<std::mutex> eval_lk{pk->eval_mu};
+    // compliance). Per-key, so sibling keys run concurrently. unique_lock (not
+    // lock_guard) so #4606 criterion-10's deferred log emission below can explicitly
+    // release it before doing any I/O.
+    std::unique_lock<std::mutex> eval_lk{pk->eval_mu};
 
     const bool is_file = spec.type == SparkType::File;
     const bool is_reg = spec.type == SparkType::Registry;
@@ -3218,6 +3131,20 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     }
     if (planned.empty())
         return;
+
+    // #4606 criterion-10: T_detect/T_fire staging for this pass, emitted as a
+    // best-effort deferred log line after both registry_mu_ and eval_lk release
+    // (see the end of this function). Purely diagnostic — read by nothing else here.
+    // BEST-EFFORT means it may never change what is enqueued: every allocation this
+    // bookkeeping does is inside a try, and a failure drops the timing, not the event.
+    std::vector<EvalTimingRecord> staged;
+    try {
+        if (fail_timing_reserve_for_test_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{}; // test seam: as if the reserve below failed
+        staged.reserve(planned.size() * 2); // most rules produce 0-1 entries; recovery+compliance
+                                             // pairs produce 2 sharing one detect stamp
+    } catch (...) { // diagnostic only; the staging loop below re-guards its own allocations
+    }
 
     // Snapshot the debounce clock BEFORE the blocking read too, so neither the clock
     // nor the agent-id provider is invoked on the detached-post-read path (a provider
@@ -3265,6 +3192,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                 eval_rule(spec, rg->assertion, scratch, now, rg->emit_compliant_edge,
                           is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                           is_svc ? &svc_read : nullptr);
+            // #4606 criterion-10: T_detect — the REAL clock, never clock_() (that's the
+            // injected eval-window seam for debounce logic, not a latency measurement).
+            const auto detect_wall = std::chrono::system_clock::now();
+            const auto detect_mono = std::chrono::steady_clock::now();
 
             // M1 item (a): a committed repeat Unknown (edge already fired earlier in this
             // errored episode) is due a REFRESH once errored_refresh_ms has elapsed since
@@ -3306,11 +3237,68 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
 
             std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id, refresh_due);
             const bool had_entries = !entries.empty(); // captured BEFORE the move below
+
+            // #4606 criterion-10: stage one EvalTimingRecord per entry (event_id/domain
+            // already final, minted by build_entries above) BEFORE entries moves into
+            // enqueue_all below.
+            const std::size_t staged_begin = staged.size();
+            try {
+                const int fail_at = fail_timing_stage_at_for_test_.load(std::memory_order_relaxed);
+                for (const OutboxEntry& e : entries) {
+                    if (fail_at >= 0 && staged.size() == static_cast<std::size_t>(fail_at)) {
+                        // One-shot: the erase below restores staged.size(), so a seam left armed
+                        // would fire again on the next rule.
+                        fail_timing_stage_at_for_test_.store(-1, std::memory_order_relaxed);
+                        throw std::bad_alloc{}; // test seam: as if the copy below failed
+                    }
+                    EvalTimingRecord r;
+                    r.event_id = e.event_id; // the only allocating copy: a throw here must not
+                                             // prevent the enqueue below
+                    r.domain = e.domain;
+                    r.detect_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_wall.time_since_epoch()).count();
+                    r.detect_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           detect_mono.time_since_epoch()).count();
+                    r.trigger = trigger; // copied as-is; absent stays absent
+                    staged.push_back(std::move(r));
+                }
+            } catch (...) {
+                // Best-effort: drop THIS rule's timing (including any of its entries already staged
+                // before the failure), never its event, and keep earlier rules' records. erase() of a
+                // tail range does not allocate, so this handler cannot itself throw.
+                staged.erase(staged.begin() + static_cast<std::ptrdiff_t>(staged_begin),
+                             staged.end());
+            }
+
             bool accepted = true;
             if (had_entries) {
                 std::lock_guard<std::mutex> ob{outbox_mu_};
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
+
+            // #4606 criterion-10: backfill T_fire (or accepted=false) into the records
+            // just staged for this rule. MUST run regardless of `accepted` — placed
+            // before the `continue` below so a rejected batch's records still get
+            // accepted=false written, not silently left at their struct defaults. On a
+            // rejection fire_wall_ns/fire_mono_ns are deliberately left at their -1
+            // "never fired" sentinel defaults (guardian_spark_timing.hpp), never a
+            // fabricated 0. noexcept field writes only; nothing here may throw.
+            {
+                const auto fire_wall = accepted ? std::chrono::system_clock::now()
+                                                 : std::chrono::system_clock::time_point{};
+                const auto fire_mono = accepted ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+                for (std::size_t i = staged_begin; i < staged.size(); ++i) {
+                    staged[i].accepted = accepted;
+                    if (accepted) {
+                        staged[i].fire_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     fire_wall.time_since_epoch()).count();
+                        staged[i].fire_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     fire_mono.time_since_epoch()).count();
+                    }
+                }
+            }
+
             if (!accepted)
                 continue; // outbox full: RuleEvalState scratch stays uncommitted (nothing
                           // written to rg->eval/last_unhealthy_emit), so eval retries the
@@ -3352,6 +3340,32 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
     // drains everything pending regardless of how many entries accumulated.
     if (outbox_waker)
         outbox_waker();
+
+    // #4606 criterion-10: release eval_lk (this key's serialisation) BEFORE any I/O
+    // below, so a slow log write does not extend the window in which OTHER threads wait
+    // on this key, and the waker above has already fired, so nothing below delays the
+    // ENQUEUE or the drain worker's wake. That is the whole extent of the decoupling:
+    // the T_detect line is written synchronously on THIS thread (the Spark consumer
+    // thread for an Event pass, a convergence lane or the priority thread otherwise) and
+    // the T_wire line on a send worker, so a log sink that blocks stalls whichever thread
+    // is writing, including the next Event evaluation queued behind it on the consumer
+    // thread (see guardian_spark_timing.hpp). The waker also means a T_wire line can
+    // reach the log before its own T_detect line - correlate by event_id and the
+    // embedded *_wall_ns fields, never file order.
+    eval_lk.unlock();
+    if (!staged.empty()) {
+        try {
+            for (const EvalTimingRecord& r : staged)
+                spdlog::info("{}", format_eval_timing_line(r));
+        } catch (...) { // best-effort diagnostic; never propagate out of evaluate_key
+        }
+    }
+    {
+        // Test accessor only. Assigned AFTER the emission so it adds no allocation between the
+        // waker and the log line; the move is noexcept and `staged` is not used again.
+        std::lock_guard<std::mutex> lt{last_eval_timings_mu_};
+        last_eval_timings_ = std::move(staged);
+    }
 }
 
 EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const RuleAssertion& a,
@@ -3472,7 +3486,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
@@ -3515,7 +3529,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             try {
                 spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                             "rule '{}' dropped (further occurrences counted, not logged)",
-                            kind, rule_id);
+                            kind, ::yuzu::log_id_token(rule_id));
             } catch (...) {
             }
         }
@@ -4086,6 +4100,12 @@ GuardianSparkRuntime::pending_demoted_for_test(const std::string& key) const {
             out.push_back(rule_id);
     return out;
 }
+
+std::vector<EvalTimingRecord> GuardianSparkRuntime::last_eval_timings_for_test() const {
+    std::lock_guard<std::mutex> lk{last_eval_timings_mu_};
+    return last_eval_timings_;
+}
+
 bool GuardianSparkRuntime::stopping() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     return stopping_;
@@ -4131,10 +4151,6 @@ void GuardianSparkRuntime::set_index_remove_fault_for_test(bool on) noexcept {
 
 void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
     detach_fault_for_test_.store(on);
-}
-
-void GuardianSparkRuntime::set_wedge_locator_fault_for_test(bool on) noexcept {
-    wedge_locator_fault_for_test_.store(on);
 }
 
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {

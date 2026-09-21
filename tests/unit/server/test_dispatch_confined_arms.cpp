@@ -572,9 +572,9 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
         // command_dispatch_tag_v1 — irrelevant to what THIS test binds (the
         // exec_visible intersection), so advertise it for every fixture agent
         // exactly as a real gateway's CONNECTED notification would.
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     yuzu::agent::v1::CommandRequest cmd;
@@ -640,9 +640,9 @@ TEST_CASE("wire_and_dispatch_confined: concurrency_mode=\"per-device\" with a li
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-A"));
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-concurrency-cmd");
@@ -685,9 +685,9 @@ TEST_CASE("wire_and_dispatch_confined: a non-\"per-device\" concurrency_mode lea
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-A"));
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-unlimited-cmd");
@@ -766,9 +766,9 @@ TEST_CASE("wire_and_dispatch_confined: a per-device claim is released when the s
     // Fix the transport and dispatch again. If the fix works, the released claim
     // lets this second dispatch through; if the claim had leaked, this would also
     // report sent == 0, indistinguishable from a stale open claim.
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     const auto second = yuzu::server::wire_and_dispatch_confined(
         registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
         /*command_id=*/"wiring-leak-cmd-2", /*execution_id=*/"exec-leak-2",
@@ -820,9 +820,9 @@ TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-o
     AgentRegistry registry(bus, metrics);
     for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
         (void)registry.register_agent(make_wiring_test_info(id));
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     // A REAL Destructive row (tar.purge_source, DispatchClass::Destructive in
@@ -908,9 +908,9 @@ TEST_CASE("wire_and_dispatch_confined: a locally-known agent routes via the EXIS
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-local"));
-    registry.set_gateway_route(
-        "dev-local", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-local", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     // A directory row for the SAME agent id — deliberately present AND
     // routable even though the agent has a local session. If the local path
@@ -1075,9 +1075,9 @@ TEST_CASE("wire_and_dispatch_confined: a narrowed exec_visible excludes a local-
     // "dev-in-scope" has a real local session -- the caller's OWN visible set
     // admits it, so it is reached via the existing local path.
     (void)registry.register_agent(make_wiring_test_info("dev-in-scope"));
-    registry.set_gateway_route(
-        "dev-in-scope", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-in-scope", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     // "dev-excluded" is a local MISS (no session on this replica) but DOES
     // have a routable directory row -- the exact precondition for

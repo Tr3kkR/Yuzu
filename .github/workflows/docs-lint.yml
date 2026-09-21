@@ -66,6 +66,14 @@ jobs:
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
 
+      # #1611: keeps the compiled-in TSan suppression in
+      # tests/unit/test_runner_main.cpp honest — fails if any first-party code
+      # starts calling libpq's conn-less PQescapeString/PQescapeBytea (the only
+      # readers of the two globals that suppression silences). Also registered
+      # in tests/meson.build for local `meson test --suite docs` parity.
+      - name: No conn-less libpq escape references (#1611)
+        run: python3 tests/test_no_connless_pq_escape.py
+
       # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's

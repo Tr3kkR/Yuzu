@@ -65,6 +65,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   runs 4 runner agents under one OS identity and a fixed path is a cross-job
   collision class (#1038 R-15).
 
+  libpq's own connect-time write-write race on its `static_std_strings`/
+  `static_client_encoding` globals (`pqSaveParameterStatus`) is suppressed by
+  a compiled-in `__tsan_default_suppressions` hook in
+  `tests/unit/test_runner_main.cpp`, kept honest by the
+  `tests/test_no_connless_pq_escape.py` tripwire (#1611).
+
   On Test **failure or job cancellation**, the TSan job's `Capture stack trace
   under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
   failing test binary from the meson junit, maps each to its binary+args via
@@ -81,8 +87,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-07-14.
 
 `workflow_dispatch` only works once a workflow file exists on the **default
-branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
-dormant until merged.
+branch (`main`)**; the run then uses the workflow definition at whatever
+`--ref` it is dispatched on, which must also carry the file. Cron schedules
+likewise need `main`. New workflows added on `dev` are dormant until merged.
 
 ### Trusted fork pull-request CI
 
@@ -91,22 +98,30 @@ must never emit healthy self-hosted runner outputs, because fork code is not
 trusted to execute on Big Tam or Wee Tam. The ordinary preflight fails red
 when it detects a fork; it does not bypass runner control.
 
-After static review, a maintainer may approve one immutable fork revision.
-First run the hosted review workflow and wait for it to pass:
+After static review, a maintainer may approve one immutable fork revision. Both
+fork workflows execute fork code, and a `workflow_dispatch` run's GitHub
+Actions cache scope is the ref it was dispatched on — so they are never
+dispatched on `main` or `dev`. Cut a throwaway quarantine branch from the PR's
+base (normally `origin/dev`), named for the PR; `ci.yml`'s `trusted_inputs`
+step and the review workflow both refuse any other ref (#4471). First run the
+hosted review workflow and wait for it to pass:
 
 ```bash
-gh workflow run fork-dynamic-review.yml --ref main \
+git push origin origin/dev:refs/heads/trusted-fork/pr-123
+gh workflow run fork-dynamic-review.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 -f head_sha=<40-character-head-sha>
 gh run list --workflow=fork-dynamic-review.yml --limit 5
 ```
 
-Then dispatch the trusted gate using that exact SHA and successful review run:
+Then dispatch the trusted gate on the same branch using that exact SHA and
+successful review run, and delete the branch once both runs have finished:
 
 ```bash
-gh workflow run trusted-fork-ci.yml --ref main \
+gh workflow run trusted-fork-ci.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 \
   -f head_sha=<40-character-head-sha> \
   -f review_run_id=<successful-review-run-id>
+git push origin --delete trusted-fork/pr-123   # housekeeping; the wrapper already purged the scope
 ```
 
 The wrapper requires the PR to remain open, verifies that its current head is
@@ -118,9 +133,32 @@ the PAT is consumed by a hosted, base-workflow-revision runner-control step
 before the approved fork revision is checked out. Trusted self-hosted jobs
 start from a clean workspace, use run-private ccache/test state, disable vcpkg
 binary sources, and purge the workspace afterwards. They never read or write
-the normal `runner.tool_cache` caches. This deliberate approval therefore
-executes the full PR gate without turning a reviewed fork into a cache-publisher
-or exposing the administration-scoped PAT to fork-controlled code.
+the normal `runner.tool_cache` caches.
+
+The GitHub Actions cache is confined the same way. A run restores only from its
+own ref, the default branch, and a PR's base, so nothing written in
+`trusted-fork/pr-123`'s scope is reachable from `main`, `dev`, or any PR — and
+because any code executing in a run can write that run's scope, no in-workflow
+save gate could have closed this on its own (the canary's
+`trusted_execution != 'true'` gates are defence in depth behind it). The
+wrapper's final `purge-quarantine-cache` job then deletes every entry in that
+scope; `fork-dynamic-review.yml` carries an identical job that purges its own
+scope right after the hosted review finishes, so no window exists in which the
+review run's (at that point unapproved) writes are restorable by the gate's
+canary leg on the same ref. Deleting the branch does not purge caches by
+itself — unread entries would otherwise linger for seven days. Cutting the
+branch from the PR's base also means the run uses that
+base's `ci.yml` rather than `main`'s. Two operational consequences: trusted
+dispatches for DIFFERENT PRs no longer share `ci.yml`'s own concurrency group
+(each resolves a distinct `github.ref`), so they run in parallel rather than
+queuing behind an unrelated PR's build — `trusted-fork-ci.yml`'s own
+`concurrency:` group still serialises two dispatches for the SAME PR, so a
+re-approval waits for the run already in flight rather than racing it; and the
+trusted canary reads only its own (empty) scope plus `main`, so it is a cold
+build. This deliberate approval
+therefore executes the full PR gate without turning a reviewed fork into a
+cache-publisher or exposing the administration-scoped PAT to fork-controlled
+code.
 
 ## Gates outside the tier ladder
 
@@ -1487,7 +1525,10 @@ than a slow one.
 
 **Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
 read its own ref, the default branch, and its base branch — never a sibling
-PR's. Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
+PR's. The same rule is what confines a trusted-fork run: it is dispatched on a
+throwaway `trusted-fork/pr-<N>` branch, so whatever fork code writes lands in a
+scope no `dev`/`main`/PR run can restore from, and the wrapper purges it after
+the run (#4471). Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
 warming left the scope empty for five weeks and each PR saved a private ~843 MB
 duplicate (#3233). Note the canary key hashes `vcpkg.json` /
 `vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the

@@ -17,7 +17,8 @@
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
-#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -117,7 +118,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
-    auto* schedule_engine = deps.schedule_engine;
+    auto schedule_api = deps.schedule_api; // ADR-0031 WS-A4 (seventh family)
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
@@ -360,7 +361,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two; the degrade branch below matches this
+            // same route's own agents_opt degrade handling just underneath.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded, retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #1634 (Doomgoose review finding, important): fail closed on a
             // transient tracker degrade rather than silently treat it as
             // "zero agents" — see get_agent_statuses_checked's doc comment.
@@ -909,7 +928,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  auto exec_id = req.matches[1].str();
-                 auto exec_opt = execution_tracker->get_execution(exec_id);
+                 // Governance fix (#2146 A2-R1 Gate 8 re-review): was the
+                 // plain get_execution(), which collapses "row genuinely
+                 // absent" and "read degraded" (pool/query failure) to the
+                 // same nullopt -- a transient degrade here fell through to
+                 // the not-found + denial-audit branch below, producing a
+                 // FALSE 404 for a legitimate owner and a permanently wrong
+                 // CC7.2 audit trail for a non-owner. get_execution_checked's
+                 // outer std::expected distinguishes the two; the degrade
+                 // branch below matches this same route's own agents_opt
+                 // degrade handling a few lines down.
+                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                 if (!exec_r) {
+                     res.status = 503;
+                     res.set_content("live updates unavailable, tracker degraded, retry "
+                                    "shortly",
+                                    "text/plain; charset=utf-8");
+                     return;
+                 }
+                 const auto& exec_opt = *exec_r;
                  // #1634 perf (governance Gate 3 finding): only fetch/scan agent
                  // statuses when confined — an unrestricted subscriber is always
                  // visible regardless, so this indexed lookup would be pure
@@ -1180,7 +1217,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+    sink.Get("/fragments/schedules", [perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
         // deny_service_scoped_schedule_list already resolved (and validated)
@@ -1196,17 +1233,56 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // confinement-2298 hardening sweep).
         if (!perm_fn(req, res, "Schedule", "Read"))
             return;
-        if (!schedule_engine) {
+        if (!schedule_api) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
         }
 
-        auto scheds = schedule_engine->query_schedules();
+        // ADR-0031 WS-A4 (seventh family): routed through the SAME
+        // `ScheduleApi::list_schedules` seam call the REST v1/MCP twins use
+        // — the pre-seam unchecked `ScheduleEngine::query_schedules()` read
+        // could not tell "the store failed" from "there are no schedules"
+        // (see `schedule_types.hpp`'s `ScheduleListResult` doc comment); this
+        // is a deliberate, disclosed behaviour delta, not a silent
+        // byte-identical rewire. `result.error()` is an internal store
+        // diagnostic and is NEVER rendered — a distinct degraded state
+        // instead.
+        auto result = schedule_api->list_schedules(ScheduleQuery{});
+        if (!result) {
+            // sre Gate 6 hardening (governance, feat/split-a4-schedule-seam):
+            // REST v1/MCP both route their equivalent failure through
+            // genericize_db_error(), which spdlog::errors the raw diagnostic
+            // before returning a sanitized message -- this fragment used to
+            // discard result.error() with no log call at all, leaving zero
+            // server-side signal correlating the degraded banner with
+            // backend health for an operator watching only the dashboard.
+            // Called here PURELY for its logging side effect -- the return
+            // value is intentionally discarded, never rendered (the fixed
+            // banner text below is the only thing sent to the client).
+            (void)yuzu::server::genericize_db_error("list_schedules", result.error());
+            res.set_content(
+                "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
+                "retry shortly.</div>",
+                "text/html");
+            return;
+        }
+        const auto& scheds = result->schedules;
         std::string html;
+        // adversarial-review-kimi round (Codex C1 / Kimi K1, both independently):
+        // schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+        // fragment) must surface this, never present the capped count as the
+        // fleet's true total" — REST v1/MCP already did; this fragment did not
+        // until this fix, silently rendering a capped list as complete for an
+        // operator with more schedules than the store's hard cap.
+        if (result->truncated) {
+            html += "<div class=\"empty-state\" style=\"color:var(--warn-color,#c9a227)\">"
+                   "Showing a partial list &mdash; more schedules exist than can be "
+                   "displayed.</div>";
+        }
         if (scheds.empty()) {
-            html = "<div class=\"empty-state\">No schedules configured.</div>";
+            html += "<div class=\"empty-state\">No schedules configured.</div>";
         } else {
-            html = "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
+            html += "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
                    "Run</th><th>Count</th><th></th></tr></thead><tbody>";
             for (const auto& s : scheds) {
                 html += "<tr><td>" + html_escape(s.name) +
@@ -2285,24 +2361,55 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // fleet_read_fn does not apply here (matches the fragment's own gate
     // shape, not a per-agent list).
     sink.Get("/api/v1/schedules",
-            [perm_fn, schedule_engine, deny_service_scoped_schedule_list](
+            [perm_fn, schedule_api, deny_service_scoped_schedule_list](
                 const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_schedule_list(req, res))
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                if (!schedule_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "schedule engine not available"),
                                     "application/json");
                     return;
+                }
+                // #2146 A2-R1 (gov docs-writer/cpp-expert fix round): definition_id/
+                // enabled_only query params. The legacy GET /api/schedules route
+                // treats ANY presence of enabled_only as true, regardless of value
+                // -- this v1 twin does NOT reproduce that quirk. It follows the
+                // #4034 precedent already set on this same REST v1 surface
+                // (compliance_routes.cpp's PolicyQuery enabled_only fix) and
+                // matches the MCP twin list_schedules, which already honors the
+                // boolean value: presence alone must not decide it, or
+                // enabled_only=false would silently behave like enabled_only=true
+                // (the caller asked to see disabled/all schedules and got the
+                // opposite). An unrecognized value 400s.
+                ScheduleQuery q;
+                if (req.has_param("definition_id"))
+                    q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only")) {
+                    auto v = req.get_param_value("enabled_only");
+                    if (v == "true" || v == "1") {
+                        q.enabled_only = true;
+                    } else if (v == "false" || v == "0") {
+                        q.enabled_only = false;
+                    } else {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                            "application/json");
+                        return;
+                    }
                 }
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked();
+                // ADR-0031 WS-A4 (seventh family): now routed through the
+                // ScheduleApi seam (schedule_api.hpp) — the SAME checked call
+                // the dashboard fragment and MCP list_schedules also make.
+                auto scheds_result = schedule_api->list_schedules(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,

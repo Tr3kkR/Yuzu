@@ -128,16 +128,48 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
-**Verified 2026-09-18 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
+**Verified 2026-09-21 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
 4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
 stream-generation fence (PR #4492, merge commit `c37306113`, 2026-09-17T22:05:58Z,
 **MERGED**), WS-7 (#3627), WS-10 10.1/10.2. **4.3a DONE** (intra-cluster `pg`-group
 agent→node lookup + the `fanout_terminal` cross-node fix + `remote_dispatched`
-telemetry — code-complete, empirically verified, but COMPONENT-COMPLETE-AND-INERT:
-no gateway multi-node cluster-formation mechanism exists in production, `#4555`).
-Next gate items: the rest of WS-4 (4.3 cross-cluster fan-out + `#4555` cluster
-formation itself + 4.4), WS-5, WS-6, WS-8-readyz.**
+telemetry — code-complete, empirically verified, no longer inert since `#4555`
+merged). **`#4555` MERGED** (2026-09-19, `495cf24c4`, PR #4604): gateway cluster
+formation (`yuzu_gw_cluster_discovery` always-on redial loop, DNS-A-record +
+static-override discovery, dynamic address-only node identity, cookie length
+floor) implemented, Fable-adjudicated, empirically verified against a real OTP
+`peer` — see `docs/ha-delivery-matrix.md`'s WS-4 row for the full mechanism.
+**WS-4 4.4 DONE** (2026-09-20, ADR-2002 §7c): `gateway_node` convergence + the
+`#4246` #6 replay-session writeback, closed after a Fable pre-implementation
+review rejected the originally-proposed design and surfaced that
+`ProxyRegister` was unconditionally wiping placement on every replay-adopted
+registration (a live, single-replica bug, not just a multi-replica gap) — see
+the blockquote below and ADR-2002 §7c for the full mechanism.
+**WS-4 rest of 4.3 DONE** (2026-09-21, ADR-2002 §7d): cross-cluster gateway
+fan-out — `AgentSession`/`GatewayPendingCmd` now carry `cluster_id` end-to-end
+from the common `send_to`/`send_to_all` path (not just the 4.2b directory
+fallback), a new eager `GatewayMgmtStubPool` dials the OWNING cluster per
+command instead of the single legacy stub, `--gateway-cluster-addr` config,
+a response-agent forgery guard (closes ONE forgery shape — a cluster answering
+as a different agent — NOT a rogue gateway claiming an agent's own identity via
+`ProxyRegister`, which needs no per-agent secret; **multi-cluster mode does NOT
+yet provide trust-zone isolation between clusters for a given agent, tracked
+as `#4669`, pr-rev-caught pre-merge**), and one small required Erlang fix
+(`stream_responses/3` threads the real `command_id` so a gateway-side
+"not connected on this cluster" error is no longer invisible). **Closes WS-4's
+dial-selection half** — the durable re-drive-on-failure half of §7's design
+remains open (`#4672`), and `#4669` above is a separate, not-yet-closed item
+(non-blocking today: zero production multi-cluster deployments). The
+remaining safe-to-scale gate items are WS-5, WS-6, WS-8-readyz. See the
+blockquote below and ADR-2002 §7d for the full mechanism, including the 5
+findings a pre-implementation Fable review caught before any code was written
+(the original resolution rule would have broken every upgrade), and the
+pr-rev (FortitudeEtc/Codex+Kimi) round that caught the response-forgery
+overclaim plus two real code bugs (terminal-outcome double-counting; an
+oversized `cluster_id` silently routing to the default cluster instead of
+being rejected) before merge.
+Next gate items: WS-5, WS-6, WS-8-readyz. Also open: `#4669`, `#4672`.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -211,11 +243,93 @@ formation itself + 4.4), WS-5, WS-6, WS-8-readyz.**
 > different-home CONNECTED exists or is planned), replacing the
 > previously-stated `register_fresh`-ordered-epoch/CAS resolution with a
 > standing design constraint + a server-side tripwire folding into `#4464`.
-> **COMPONENT-COMPLETE-AND-INERT**: zero gateway cluster-formation code
-> exists in production (`#4555`), so this has no effect on any deployed
-> cluster yet. Remaining WS-4 work: the rest of 4.3 (cross-cluster gateway
-> fan-out — today one `gw_mgmt_stub_`) **and** `#4555` cluster formation
-> itself, plus 4.4 (`gateway_node` convergence + replay-session writeback).
+> **COMPONENT-COMPLETE-AND-INERT** as of this note; **`#4555` (gateway
+> cluster formation) MERGED 2026-09-19** (`495cf24c4`, PR #4604 — see the
+> Verified line above), no longer inert. Remaining WS-4 work as of that
+> merge: the rest of 4.3 (cross-cluster gateway fan-out — today one
+> `gw_mgmt_stub_`), plus 4.4 (`gateway_node` convergence + replay-session
+> writeback) — see the next blockquote for 4.4's closure.
+>
+> **WS-4 4.4 update (2026-09-20, `#4246` #6, ADR-2002 §7c): DONE.** A Fable
+> pre-implementation review REJECTED the originally-proposed two-mechanism
+> design (a periodic directory-sourced read-repair — would publish a route
+> with no `wire_capabilities`, which dispatch denies outright; a
+> gateway-side adoption of a server-minted session — explicitly prohibited
+> by `gateway_route_store.hpp`'s FORWARD NOTE, and unworkable regardless
+> since agent heartbeats carry the AGENT's own session id, which the
+> gateway cannot rewrite) and surfaced the actual dominant root cause: on
+> EVERY replay-adopted `ProxyRegister` — even the ordinary same-replica
+> case, no core restart needed — `register_agent` unconditionally installed
+> a brand-new `AgentSession`, wiping `gateway_node`/`wire_capabilities`/
+> `stream_home_id` regardless of whether the session was being adopted or
+> freshly minted. Fixed: `ProxyRegister` now decides ADOPT-vs-REFUSE
+> *before* calling `register_agent` — whenever `GatewayRouteStore` is
+> configured, the STORE governs this decision (never the in-memory
+> `gateway_sessions_` map on its own — a round-2 review fix, F1, closed a
+> real bug where trusting memory alone let a tombstoned-but-still-`gateway_sessions_`-known
+> session go unrepaired after a >270s gateway-uplink partition, and separately
+> let a stale local session overwrite a genuinely-live one on a different
+> node): ADOPT (response always carries the presented session, never a
+> fresh mint) on a live directory row (`renew_leases`), or the new guarded
+> CAS `GatewayRouteStore::reclaim_tombstoned_session` (re-arms a
+> TOMBSTONED or absent row — epoch `0` on a brand-new row, untouched on a
+> re-armed tombstone, either way no higher than `register_fresh`'s
+> `nextval` can mint, so a genuine `register_fresh` still always wins);
+> REFUSE (`FAILED_PRECONDITION`, nothing installed) when the row is LIVE
+> under a DIFFERENT session. `gateway_sessions_` alone decides ONLY when no
+> store is configured. Convergence comes from the GATEWAY: on ADOPT,
+> `yuzu_gw_upstream.erl` tells the still-live `yuzu_gw_agent` process
+> (`reannounce/2`) to re-send its OWN CONNECTED (same session, same home)
+> through the ordinary `NotifyStreamStatus` path — now backed by drop
+> telemetry and drip backpressure against the `MAX_NOTIFY_INFLIGHT` cap
+> (F2); on REFUSE, it feeds its circuit breaker a SUCCESS (not a failure —
+> the server answered authoritatively) and calls `disconnect/1` to force
+> the agent-driven reconnect the FORWARD NOTE requires. Also fixed a latent,
+> pre-existing crash in `do_rpc`'s error-clause pattern (never matched what
+> `grpcbox_client:unary/5` actually returns; unreachable before 4.4 since
+> this RPC never previously returned a real non-OK, non-transport grpc
+> status). **Round-2 Fable review found 3 more real bugs before push**: F1
+> (BLOCKING) — the adopt decision let an in-memory `gateway_sessions_` hit
+> override the store, missing a >270s gateway-uplink-partition tombstone
+> and a cross-node zombie-session overwrite; fixed by making the store
+> govern unconditionally whenever configured, memory only when no store
+> exists. F2 (BLOCKING) — the reannounce CONNECTED shared
+> `?MAX_NOTIFY_INFLIGHT` with everything else and dropped silently at
+> capacity (I6a); fixed with drop telemetry + drip backpressure. F3
+> (BLOCKING) — `yuzu_gw_heartbeat_buffer.erl` had the SAME impossible
+> `do_rpc`-shaped error clause; fixed identically. **A full `/governance`
+> pass (round 3) then found 3 MORE blocking issues round 2 itself
+> introduced or missed**: sec-H1 — round 2's reannounce fix converges
+> placement only if its notify is actually delivered, and a dropped one left
+> `cluster_id` permanently NULL while BatchHeartbeat's `renew_leases` kept
+> extending the row's lease AND `updated_at` forever regardless — fixed by
+> making `renew_leases` freeze BOTH `lease_until` AND `updated_at` for a
+> `cluster_id`-NULL row (freezing `lease_until` alone, the round-3 fix as
+> first shipped, does nothing for a `register_fresh` row whose `lease_until`
+> is already NULL from creation — only the `updated_at`-keyed tombstone/
+> never-announced purge sweep can ever reach it; caught by a targeted
+> post-build Fable review before push), so it reaches its own ordinary
+> TTL+grace/purge age and gets deleted, giving the next replay another
+> reclaim shot — not an instant self-heal, since convergence still needs
+> that next replay or reconnect. NEW-1/NEW-2 — round 2's own claim that
+> both drop reasons "now emit telemetry" was FALSE as shipped: the event was
+> never wired into `yuzu_gw_telemetry.erl`'s `?EVENTS`/`handle_event`/
+> `declare_metrics`, so it was a pure no-op — two Gate-6 reviewers
+> independently caught the same false ADR claim in the same wave; fixed by
+> wiring it for real, with a new test file that fires the REAL event through
+> the real handler (every other module's tests mock `telemetry` itself,
+> which can't catch this class of gap). UP-4/COMP-6 — the decision's own
+> `renew_leases`/`reclaim_tombstoned_session` calls were fail-OPEN on a
+> degraded Postgres read, so a degraded-store window bypassed the entire
+> stale/zombie-refusal mechanism outright; fixed to fail-CLOSED, mirroring
+> `register_fresh`'s own precedent for exactly this class of decision.
+> Deliberately deferred as the one remaining follow-up, not WS-4-gate-blocking: the
+> reap-vs-replay-drip race after a >270s outage at fleet scale — filed as
+> `#4627`, with related hardening filed alongside it (`#4628`-`#4632`). The
+> `yuzu_gw_cluster` gossip/adjacency gen_server `#4555`'s design notes
+> named as "remaining 4.4 scope" is judged OUT of WS-4 entirely
+> (capacity/rebalancing, not reachability — the WS-4 gate exists because
+> "commands can't reach agents").
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of a workstream here MUST update its row **and** re-stamp the
@@ -232,7 +346,7 @@ formation itself + 4.4), WS-5, WS-6, WS-8-readyz.**
 | **WS-1** | Server-plane state → Postgres: (1a) sessions DB-time; (1b) `execution_tracker`+command-correlation atomic counters; (1c) HA-critical store subset | migration ladder (serializes at the migration-version counter) | **Y** | `authdb`+`security-guardian` (1a); `architect`+`sre`+`cpp-safety` (1b/1c) | P0 | **done — 1a+1b+1c** |
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
-| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence all MERGED to `origin/dev` (PR #4492, `c37306113`, 2026-09-17); 4.3a DONE (intra-cluster `pg`-group lookup, code-complete but INERT pending `#4555` cluster formation); rest of 4.3 (cross-cluster fan-out + `#4555` itself) / 4.4 / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
+| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence + `#4555` cluster formation + 4.3a intra-cluster lookup + 4.4 (`gateway_node` convergence + `#4246` #6 writeback) all MERGED to `origin/dev`; rest of 4.3 (cross-cluster fan-out) / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
 | **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
@@ -287,21 +401,30 @@ constraint. Delivery phases (dependency-ordered):
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
-**Suggested next slices** (as of 2026-09-18 — `docs/ha-delivery-matrix.md` row
+**Suggested next slices** (as of 2026-09-21 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
-- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
-  (3.1–3.4, #4011/#4134/#4169/#4194), WS-4 4.1+4.2a+4.2b+`#4324` (PR #4492,
-  merged) + 4.3a (intra-cluster `pg`-group agent→node lookup, code-complete
-  but component-complete-and-INERT pending `#4555`), WS-7 (#3627),
-  WS-10 10.1/10.2. The storage axis is complete.
-- The **highest-leverage next** is the **rest of WS-4** — cross-cluster
-  gateway fan-out (today one `gw_mgmt_stub_`), `#4555` (gateway multi-node
-  cluster formation — zero `net_kernel`/`net_adm` code exists in production
-  today, and 4.3a has no effect until this ships), and 4.4 (`gateway_node`
-  convergence + replay-session writeback) — it also unblocks the
-  cross-replica session lookup that WS-5 needs. Then the remaining gate set:
-  **WS-5** (presence), **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free
-  cross-replica reconnect (durable outbox replay) is the open 2a-2 follow-up.
+- **Done (dial-selection, the safe-to-scale gate's WS-4 item):** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a
+  (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4's
+  dial-selection half** (4.1+4.2a+4.2b+`#4324`+`#4555` (gateway multi-node
+  cluster formation, `495cf24c4`)+4.3a (intra-cluster `pg`-group agent→node
+  lookup)+4.4 (`gateway_node` convergence + `#4246` #6 writeback, ADR-2002
+  §7c)+rest-of-4.3 (cross-cluster gateway fan-out, ADR-2002 §7d)), WS-7
+  (#3627), WS-10 10.1/10.2. The storage axis is complete. **WS-4 is NOT
+  entirely done** — two named items remain open and are tracked, not
+  disclosed-only: `#4669` (multi-cluster mode has no agent↔cluster
+  affinity/peer-identity binding, so it does not yet provide trust-zone
+  isolation — caught by pr-rev, FortitudeEtc/Codex+Kimi, pre-merge on the
+  rest-of-4.3 PR) and `#4672` (§7's durable outbox re-drive was never wired
+  into `forward_gateway_pending`'s terminal-failure branches). Neither blocks
+  the safe-to-scale gate today (multi-cluster mode has zero production
+  deployments; the re-drive gap is inherited from before 4.3, not introduced
+  by it), but do not read "WS-4 done" as "WS-4's every design goal closed."
+- The **highest-leverage next** is now the remaining gate set directly:
+  **WS-5** (presence — durable cross-replica session lookup; NOT unblocked by
+  4.3's own work, contra an earlier version of this note — 4.3 built the
+  per-cluster DIAL mechanism, not the durable cross-replica READ WS-5 needs),
+  **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free cross-replica reconnect
+  (durable outbox replay) is the open 2a-2 follow-up.
 
 **Shared with ADR-1005 (do not duplicate):** engine-tier HA (incl. NVD/CVE
 sync, withdrawn from WS-1), the MCP Decision-15 pre-commitments WS-2 inherits,
