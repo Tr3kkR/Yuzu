@@ -165,6 +165,11 @@ CommandCapabilityRegistry registry_with_n_sources(std::span<const CommandCapabil
 TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silently dropping "
           "one",
           "[server][dispatch][capability]") {
+    // Pinned exactly, as this test pinned 16 before Wave 8: the live composition is 16
+    // sources here and 17 once both Wave 8 posture plugins (app_control, system_hardening)
+    // are on dev, so a revert to 16 would overflow at that landing. Update deliberately.
+    static_assert(CommandCapabilityRegistry::kMaxSources == 32,
+                  "kMaxSources changed: re-derive the landing constraint above");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
     // Exactly kMaxSources fits; kMaxSources + 1 throws — derived from the constant, never a literal.
     CHECK_NOTHROW(registry_with_n_sources(

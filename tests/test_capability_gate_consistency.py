@@ -169,6 +169,30 @@ def parse_content_pair_modes(content_root: Path) -> dict[tuple[str, str], list[s
     return pair_modes
 
 
+def find_non_string_column_values(content_root: Path) -> list[str]:
+    """Every `<definition id>.<column>: <repr>` whose `values` list holds a
+    non-string. YAML 1.1 reads an unquoted on/off/yes/no as a boolean, so such
+    a vocabulary token renders as True/False in every generated doc unless quoted.
+    """
+    bad: list[str] = []
+    for path in sorted(content_root.glob(CONTENT_GLOB)):
+        with path.open(encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            def_id = (doc.get("metadata") or {}).get("id", path.name)
+            result = (doc.get("spec") or {}).get("result")
+            columns = result.get("columns") if isinstance(result, dict) else None
+            for col in columns or []:
+                bad.extend(
+                    f"{def_id}.{col.get('name')}: {v!r}"
+                    for v in col.get("values") or []
+                    if not isinstance(v, str)
+                )
+    return bad
+
+
 def parse_fragment_gate_rows(path: Path) -> list[tuple[str, str, str]]:
     """Every `(plugin, action, execute_gate)` triple a fragment declares, in
     file order. Pairs on `.plugin =` immediately followed by `.action =`
@@ -308,6 +332,18 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
 
         if mismatches or unexempt_missing:
             self.fail("\n" + format_gaps(mismatches, unexempt_missing))
+
+
+class TestDefinitionValueVocabularies(unittest.TestCase):
+    """Every `values:` entry of every shipped definition column is a string."""
+
+    def test_every_values_entry_is_a_string(self) -> None:
+        bad = find_non_string_column_values(REPO_ROOT)
+        self.assertFalse(
+            bad,
+            "non-string `values:` entries (quote on/off/yes/no so YAML keeps them strings):\n"
+            + "\n".join(bad),
+        )
 
 
 class TestFailureModesOnSyntheticData(unittest.TestCase):

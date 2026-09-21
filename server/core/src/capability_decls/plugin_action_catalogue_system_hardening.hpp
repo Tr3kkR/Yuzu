@@ -17,8 +17,9 @@
 /// exploit-mitigation / kernel-hardening values (Linux `/proc/sys`, macOS
 /// `sysctlbyname`, Windows mitigation registry + `GetProcessMitigationPolicy`
 /// on the agent's own process). No leg writes, spawns a process, or
-/// enumerates other processes. Grouped under the existing `Inventory`
-/// securable, as `peripherals.*` and `filesystem_posture.*` are.
+/// enumerates other processes. Grouped under the existing `Security`
+/// securable, as `antivirus.*`, `bitlocker.*`, `firewall.*` and `autoruns.*` are:
+/// the rows say which mitigations are not enforced.
 namespace yuzu::server::capdecls {
 
 namespace detail {
@@ -29,7 +30,7 @@ inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueSystemHa
         .action = "posture",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
-        .securable = "Inventory",
+        .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,

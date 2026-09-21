@@ -148,8 +148,9 @@ class CommandCapabilityRegistry {
 public:
     /// One fragment per plugin family plus this package's own
     /// `core_dispatch_capabilities()` compose here: 15 sources at the start
-    /// of Wave 8, 22 by its end. `kMaxSources` is a generous ceiling, not a
-    /// tight fit, so an additional fragment does not silently overflow it.
+    /// of Wave 8, 17 once its two posture plugins land, with headroom for the
+    /// rest of the wave. `kMaxSources` is a generous ceiling, not a tight
+    /// fit, so an additional fragment does not silently overflow it.
     /// Exceeding it is a construction-time programmer error — fail loud via
     /// an exception, never silently drop a fragment (a dropped fragment
     /// would make every one of its rows `Unclassified`, indistinguishable

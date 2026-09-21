@@ -242,6 +242,24 @@ TEST_CASE("capability catalogue: every Destructive row is Irreversible unless ex
     }
 }
 
+/// Exact-row pin for `system_hardening.posture` (Wave 8), the only row of its fragment.
+/// `Security`, the antivirus/bitlocker/firewall/autoruns class (2026-09-21 decision).
+TEST_CASE("capability catalogue: system_hardening.posture pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_system_hardening();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "system_hardening");
+    CHECK(row.action == "posture");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK_FALSE(row.system_reserved);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
 /// Exact-row pin for `autoruns` (P15 Arbiter action). Both its actions are
 /// ReadOnly/None with no Destructive row to protect via the allowlist above,
 /// so this pins their classification directly, the same way

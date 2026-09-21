@@ -25,8 +25,9 @@ metadata:
     DEP/ASLR/CFG policy. A key that does not exist on this host reads
     `absent`, which is a normal answer and not a failure; a key that exists
     but could not be read reads `unreadable` and downgrades the result to
-    CONSTRAINED/PARTIAL rather than failing the command.
-  tags: [system_hardening, security, posture, inventory]
+    CONSTRAINED/PARTIAL (PERMISSION_DENIED/PARTIAL when the read was refused)
+    rather than failing the command.
+  tags: [system_hardening, security, posture]
 
 spec:
   type: question
@@ -63,7 +64,7 @@ spec:
       - name: state
         type: string
         description: 'Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here. unreadable = the read failed.'
-        values: [enabled, disabled, partial, on, off, default, unmodelled, absent, unreadable]
+        values: [enabled, disabled, partial, 'on', 'off', default, unmodelled, absent, unreadable]
         example: enabled
         platforms: [windows, linux, darwin]
     aggregation:
@@ -78,7 +79,7 @@ spec:
     ttlSeconds: 300
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:
