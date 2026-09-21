@@ -1337,51 +1337,82 @@ cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive
 clearing on the next success. Two residuals remain: a real directory notification during an
 episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
 rather than the backoff; and a single poison obligation fails the whole pass, starving the others
-until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open, and
-the contract a consumer of `inert` needs is set out in the paragraph below.
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open; it,
+the contract a consumer of `inert` needs and two further recorded limits are set out in the list
+below.
 
-**R5.7 (g), continued: the File worker-failure contract (#4658).** (1) KNOWN open gap, a
-precondition for the F14 flip (tracked as a follow-up to be filed; the issue number will be cited
-here when it exists): while File is runtime-inert, a Guardian reconcile (a full-sync policy push,
-for example) builds its capability set without File, so `classify()` places every File rule
-`Unsupported` (enforced by neither backend) and records it in `unsupported_rules_`
-(`guardian_engine.cpp`, the capability set near :1895-1906 and the `Unsupported` branch near
-:1976-2009 at 9c84de468). Clearing `inert` notifies no consumer, so those rules stay unarmed until
-the next reconcile or a restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
-has the same shape and predates #4658. (2) `inert` is polled through `stats_by_type()`; it is not
-latched and nothing announces a flip or a clear, so a heartbeat only sees an episode it happens to
-sample. `SparkMechanismStats` cannot tell a boot-time inert (`start()` could not bind its OS
-facility, every `watch()` is refused) from a runtime one (watches are accepted but cannot be
-served until a pass succeeds). (3) File and Registry differ. File's wake IS its retry deadline, so
-an otherwise idle File worker retries at that deadline, or at once if the deadline has already
-passed; Registry waits out its backoff and then re-derives its next wake from the obligations then
-due (`next_wake_locked`, one-hour idle ceiling, `spark_registry.cpp:1388-1389`). A File pass run
-for a real IOCP completion counts toward the three failures and is never throttled or absorbed; a
-successful one ends the episode. File stamps its deadline in `note_pass_outcome_locked`, before
-the off-lock tail (log I/O and `FilePassWork` destruction), and `wait_timeout_locked` treats a
-deadline that has already passed as retry-due-now; Registry starts its backoff wait after its
-tail. File clears `inert` on the first successful pass with no `if (core_)` guard, which Registry
-has (a File worker exists only after `start()` bound its IOCP, `spark_file.cpp:682-692`).
-(4) Latency, at the default 50 ms cadence: `inert` flips after three consecutive failed passes,
-about 150 ms of backoff (50 ms, then 100 ms) after the first failure, and clears at the next
-successful pass. After the cause is removed, a quiet directory waits for the current backoff
-deadline, up to the 30 s cap; a real notification in any watched directory runs a pass at once,
-while a `watch()`/`unwatch()` control wake is absorbed until the deadline, so a watch added
-mid-episode is not armed before it and removing the poisoned watch does not shorten it. The
-`worker pass failed (consecutive #1)` and `recovered` lines are logged on every episode; the 1, 2,
-4, 8 gate bounds only an unbroken one, so intermittent failure while directories churn is not
-rate-limited across episodes. Only an
-exception that ESCAPES a pass counts: a throwing emit or fault sink is caught inside the pass,
-counted in `emit_failed`/`fault_failed`, and does not count toward the three. (5) The
-`pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only through
-the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible signals are the
-log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
-`spark_file: worker failing persistently - file sparks reported inert until a pass succeeds` and
-`spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
-`yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no alert
-on `yuzu_fleet_spark_mechanisms` ships today: a per-OS, per-mechanism alert with a `for:` hold of at
-least two heartbeats is an F14 precondition (compare `_reporting` with the one mechanism's series,
-not the sum over mechanisms, see `docs/user-manual/metrics.md`).
+**R5.7 (g), continued: the File worker-failure contract (#4658).**
+
+1. KNOWN open gap, a precondition for the F14 flip. No issue exists for this yet; it must be filed
+   and cited here before the F14 flip. While File is runtime-inert, a Guardian reconcile (a
+   full-sync policy push, for example) builds its capability set without File
+   (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File rule it touches
+   `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule already armed
+   through Spark and withdraws its legacy guard, and a full sync tears both backends down first
+   (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`). Live File
+   rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so they
+   stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
+   reconcile or an agent restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
+   has the same shape and predates #4658. `guardian_engine.cpp` is unchanged by #4658, so it is
+   cited by symbol.
+2. `inert` is a polled bit, not an event. Read it through `stats_by_type()`: it is not latched,
+   nothing announces a flip or a clear, and a heartbeat only sees an episode it happens to sample.
+   `SparkMechanismStats` cannot tell a boot-time inert (`start()` could not bind its OS facility,
+   so every `watch()` is refused) from a runtime one (watches are accepted but cannot be served
+   until a pass succeeds).
+3. File and Registry differ:
+   - Retry wake. File's wake IS its retry: an open episode always has a retry scheduled, at the
+     backoff deadline or at once if that deadline has already passed, so an otherwise idle worker
+     still retries. Registry waits out its backoff, then re-derives its next wake from the
+     obligations then due (`next_wake_locked()`, whose idle ceiling is one hour).
+   - Deadline stamp. File stamps the deadline in `note_pass_outcome_locked()`, before the pass's
+     off-lock tail (the log line and `FilePassWork` destruction), so it can already be stale when
+     the wait is computed; `wait_timeout_locked()` treats a passed deadline as retry-due-now.
+     Registry starts its backoff wait after its tail.
+   - Completion passes. A File pass run for a real IOCP completion counts toward the three
+     failures and is never throttled or absorbed; a successful one ends the episode.
+   - Clearing `inert`. File clears it on the first successful pass with no equivalent of
+     Registry's `if (core_)` check (Registry clears it only while its thread pool exists). The
+     File worker is the only writer of `inert` while it runs, so a recovery cannot clear a
+     boot-time inert.
+4. Latency and limits, at the default 50 ms cadence:
+   - `inert` flips after three consecutive failed passes, about 150 ms of backoff (50 ms, then
+     100 ms) after the first failure, and clears at the next successful pass. After the cause is
+     removed a quiet directory waits for the current backoff deadline, up to the 30 s cap; a real
+     notification in any watched directory runs a pass at once.
+   - A `watch()`/`unwatch()` control wake is absorbed until the deadline, but `watch()` does its
+     work inline: a directory that resolves within `kFileCallerWaitBudget` (50 ms) has its
+     directory read armed before `watch()` returns. What waits for a pass is that watch's
+     establishment report and its health and Fault edges, a probe that outlives the budget, and a
+     Deferred watch.
+   - The `worker pass failed (consecutive #1)` and `recovered` lines are logged on every episode;
+     the 1, 2, 4, 8 gate bounds only an unbroken one, so intermittent failure while directories
+     churn is not rate-limited across episodes.
+   - Only an exception that ESCAPES a pass counts: a throwing emit or fault sink is caught inside
+     the pass, counted in `emit_failed`/`fault_failed`, and does not count toward the three.
+   - Known limit: a retry pass that finds nothing due counts as a SUCCESS (it clears the failure
+     count, the backoff and `inert`) even when the cause persists, for example when an admission
+     attempt escalated past the deadline, or an unrelated real completion succeeds between
+     failures. An alternating failure/success pattern therefore never flips `inert`. Movement of
+     `pass_failed`, not `inert`, is the complete failure detector, and the #4606 harness must
+     read it.
+   - Known limit: a blocked or slow log sink stalls the File worker (`log_pass_outcome()` runs on
+     the worker, off `mu_`), and with it IOCP draining and the worker join in `stop()`. While the
+     agent runs, the stall lasts as long as the sink blocks. On the shutdown path a blocked
+     agent-wide sink is bounded by the 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`,
+     armed in `AgentImpl::stop()` and in `run()`'s teardown), which ends in `hard_exit(4)`: it is
+     not an indefinite hang.
+5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
+   through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
+   signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
+   `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds`
+   and `spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
+   `yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no
+   alert on `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
+   precondition: it needs a `for:` hold of at least two heartbeats so a self-clearing episode does
+   not fire it, a paging alert wants at least 10 minutes, tuned on fleet data, and it compares
+   `_reporting` with the one mechanism's series, not the sum over mechanisms (see
+   `docs/user-manual/metrics.md`).
 
 **R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
 calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
