@@ -64,20 +64,26 @@ spec:
     # status|dotnet|<level>|<reason>   (always first)
     # dotnet|<flavour>|<version>|<install_path>|<vendor or ->
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found).'
+        values: [status, dotnet]
+        example: dotnet
+        platforms: [linux]
       - name: flavour
         type: string
-        description: 'Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped).'
+        description: 'Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). Status rows: the action name.'
         values: [core, sdk, unmodelled]
         example: core
         platforms: [linux]
       - name: version
         type: string
-        description: 'Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2).'
+        description: 'Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).'
         example: 8.0.31
         platforms: [linux]
       - name: install_path
         type: string
-        description: 'Absolute path of the framework or SDK version directory the version was read from.'
+        description: 'Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -.'
         example: /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31
         platforms: [linux]
       - name: vendor
@@ -141,20 +147,26 @@ spec:
     # status|jvm|<level>|<reason>   (always first)
     # jvm|<flavour>|<version>|<install_path>|<vendor or ->
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found).'
+        values: [status, jvm]
+        example: jvm
+        platforms: [linux]
       - name: flavour
         type: string
-        description: 'Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — the Debian OpenJDK release file has no IMAGE_TYPE — and the path gives no hint; never guessed).'
+        description: 'Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — the Debian OpenJDK release file has no IMAGE_TYPE — and the path gives no hint; never guessed). Status rows: the action name.'
         values: [jdk, jre, unmodelled]
         example: jdk
         platforms: [linux]
       - name: version
         type: string
-        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present.'
+        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. Status rows: the level (supported, constrained or unsupported).'
         example: 17.0.20
         platforms: [linux]
       - name: install_path
         type: string
-        description: 'Absolute path of the JVM home directory (the directory holding the release file).'
+        description: 'Absolute path of the JVM home directory (the directory holding the release file). Status rows: the comma-joined failure tokens, or -.'
         example: /opt/java/openjdk
         platforms: [linux]
       - name: vendor
@@ -220,20 +232,26 @@ spec:
     # status|python|<level>|<reason>   (always first)
     # python|<flavour>|<version>|<install_path>|<vendor or ->
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), python (one per runtime found).'
+        values: [status, python]
+        example: python
+        platforms: [linux]
       - name: flavour
         type: string
-        description: 'Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython).'
+        description: 'Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython). Status rows: the action name.'
         values: [cpython, unmodelled]
         example: cpython
         platforms: [linux]
       - name: version
         type: string
-        description: 'Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter.'
+        description: 'Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter. Status rows: the level (supported, constrained or unsupported).'
         example: "3.11"
         platforms: [linux]
       - name: install_path
         type: string
-        description: 'Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path.'
+        description: 'Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path. Status rows: the comma-joined failure tokens, or -.'
         example: /usr/bin/python3.11
         platforms: [linux]
       - name: vendor

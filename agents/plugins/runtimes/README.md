@@ -69,31 +69,34 @@ No action takes parameters.
 Every row is pipe-delimited. The first row is always `status|<action>|<level>|<reason>` (`level` is `supported`, `constrained` or `unsupported`; `reason` is comma-joined tokens, or `-`). Runtime rows follow as `<action>|<flavour>|<version>|<install_path>|<vendor>`, one per runtime found; the leading action name is the row discriminator and is not a column below. `supported` with zero runtime rows means the runtime family is genuinely absent from the host; `constrained` means a read failed and the rows may be incomplete, so failure never reads as absent. A field the host did not supply is `-`, and every flavour mapper has a named `unmodelled` value distinct from no data. Free-text fields (`version`, `install_path`, `vendor`) go through `yuzu::util::safe_output_field`, so a value containing a pipe or ending in a backslash cannot shift the field count on the server's escape-aware decoder. `runtimes` is not in the server's `kKeyValuePlugins` set (`server/core/src/result_parsing.hpp`), so its rows are not decoded as two-cell key and value rows.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`crossplatform.runtimes.dotnet` — `flavour|version|install_path|vendor`**
+**`crossplatform.runtimes.dotnet` — `row_kind|flavour|version|install_path|vendor`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `flavour` | string | `core` `sdk` `unmodelled` | Linux | `core` | Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). |
-| `version` | string | - | Linux | `8.0.31` | Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). |
-| `install_path` | string | - | Linux | `/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31` | Absolute path of the framework or SDK version directory the version was read from. |
+| `row_kind` | string | `status` `dotnet` | Linux | `dotnet` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found). |
+| `flavour` | string | `core` `sdk` `unmodelled` | Linux | `core` | Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). Status rows: the action name. |
+| `version` | string | - | Linux | `8.0.31` | Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Linux | `/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31` | Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `-` | Always "-" for dotnet: the install tree carries no vendor field. |
 
-**`crossplatform.runtimes.jvm` — `flavour|version|install_path|vendor`**
+**`crossplatform.runtimes.jvm` — `row_kind|flavour|version|install_path|vendor`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `flavour` | string | `jdk` `jre` `unmodelled` | Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — the Debian OpenJDK release file has no IMAGE_TYPE — and the path gives no hint; never guessed). |
-| `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. |
-| `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory (the directory holding the release file). |
+| `row_kind` | string | `status` `jvm` | Linux | `jvm` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found). |
+| `flavour` | string | `jdk` `jre` `unmodelled` | Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — the Debian OpenJDK release file has no IMAGE_TYPE — and the path gives no hint; never guessed). Status rows: the action name. |
+| `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory (the directory holding the release file). Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), or "-" when the key is absent. |
 
-**`crossplatform.runtimes.python` — `flavour|version|install_path|vendor`**
+**`crossplatform.runtimes.python` — `row_kind|flavour|version|install_path|vendor`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `flavour` | string | `cpython` `unmodelled` | Linux | `cpython` | Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython). |
-| `version` | string | - | Linux | `3.11` | Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter. |
-| `install_path` | string | - | Linux | `/usr/bin/python3.11` | Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path. |
+| `row_kind` | string | `status` `python` | Linux | `python` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), python (one per runtime found). |
+| `flavour` | string | `cpython` `unmodelled` | Linux | `cpython` | Interpreter kind. Values: cpython (the name parses as python3 or python3.<minor>), unmodelled (a link to any other interpreter name, e.g. pypy3 — reported with version "-", never guessed to be CPython). Status rows: the action name. |
+| `version` | string | - | Linux | `3.11` | Version parsed from the interpreter name (3, 3.11 or 3.11.4 shapes); "-" for an unmodelled interpreter. Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Linux | `/usr/bin/python3.11` | Interpreter path (a symlink is reported as its link target, lexically joined and never resolved) or the python3.<minor> library directory path. Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `-` | Always "-" for python: the interpreter name carries no vendor. |
 <!-- END GENERATED -->
 
@@ -117,6 +120,24 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 6da32611cf7a
+
+```
+== action=dotnet
+status|dotnet|supported|-
+[result_status] OK / FULL
+
+== action=jvm
+status|jvm|supported|-
+[result_status] OK / FULL
+
+== action=python
+status|python|supported|-
+python|cpython|3.13|/usr/bin/python3.13|-
+python|cpython|3.13|/usr/lib/python3.13|-
+python|cpython|3.13|/usr/local/lib/python3.13|-
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -133,5 +154,5 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 - Definitions: `content/definitions/runtimes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
 - Tests: `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp`
-- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
