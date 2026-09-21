@@ -30,6 +30,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
@@ -670,6 +671,17 @@ public:
     /// null→error contract.
     void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
 
+    /// ADR-0031 WS-A4 (sixth family): the SAME in-process DEX app-perf-over-time
+    /// API seam the REST `/api/v1/dex/perf/*` handlers use (server.cpp wires the
+    /// IDENTICAL instance) — backs the 9 MCP DEX perf tool twins +
+    /// get_dex_device_app_perf. server.cpp constructs it UNCONDITIONALLY
+    /// (never null) — each backing store pointer is checked individually
+    /// inside the impl, matching the old per-lambda null-checks; the tools'
+    /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
+    /// fire. Additive alongside `app_perf_providers` (still wired, still used
+    /// by the dashboard fragments) until every consumer migrates.
+    void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
+
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
     /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
     /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
@@ -1136,6 +1148,7 @@ private:
     ResponseVisibleSetFn response_visible_set_fn_;
     // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
     std::shared_ptr<const DexApi> dex_api_;
+    std::shared_ptr<const DexPerfApi> dex_perf_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
 };

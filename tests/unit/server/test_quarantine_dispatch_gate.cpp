@@ -527,9 +527,9 @@ TEST_CASE("wire_and_dispatch_confined: denied_quarantined survives out through "
     AgentRegistry registry(bus, metrics);
     for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
         registry.register_agent(make_wiring_test_info(id));
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     yuzu::agent::v1::CommandRequest cmd;

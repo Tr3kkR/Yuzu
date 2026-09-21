@@ -52,7 +52,6 @@
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
-#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
 #include "dex_read_model.hpp"    // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
@@ -64,7 +63,10 @@
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
+                                     // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
@@ -270,6 +272,47 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
     if (!params[key].is_number_integer())
         return std::nullopt;
     return params[key].get<int64_t>();
+}
+
+/// Boolean sibling of `param_int_strict` above (#2146 A2-R1 governance
+/// finding, same defect class as #2970B): the plain `args.contains(key) &&
+/// args[key].is_boolean()` idiom used across most `*_only` filters silently
+/// treats a present-but-wrong-type value (the JSON string `"true"`, a
+/// number) as ABSENT -- the filter is dropped rather than rejected, so a
+/// caller who thinks they narrowed the query gets the unfiltered result
+/// instead. Same nullopt-on-present-wrong-type contract as `param_int_strict`:
+/// present+boolean -> the value; present+wrong-type -> `nullopt` (caller
+/// answers `kInvalidParams`); absent -> `def` (omitted is not malformed).
+///
+/// Deliberately a NEW helper rather than a fix to the existing ad hoc idiom
+/// everywhere it appears -- that idiom has many call sites across this file,
+/// several of which are known instances of this exact defect class but are
+/// OUT OF SCOPE for this fix (tracked separately, not silently swept in
+/// here): `list_definitions`'s `enabled_only` (~L7996) and
+/// `list_license_alerts`'s `unacknowledged_only` (~L20700).
+std::optional<bool> param_bool_strict(const nlohmann::json& params, const char* key, bool def) {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_boolean())
+        return std::nullopt;
+    return params[key].get<bool>();
+}
+
+/// String sibling of `param_int_strict`/`param_bool_strict` above (same
+/// defect class -- PR #4623 external review, #2146 A2-R1): `param_str`
+/// silently treats a present-but-wrong-type value (e.g. `{"definition_id":
+/// 42}`) as ABSENT -- the filter is dropped rather than rejected, so a
+/// caller who thinks they narrowed the query gets the unfiltered result
+/// instead. Same nullopt-on-present-wrong-type contract as its siblings:
+/// present+string -> the value; present+wrong-type -> `nullopt` (caller
+/// answers `kInvalidParams`); absent -> `def` (omitted is not malformed).
+std::optional<std::string> param_string_strict(const nlohmann::json& params, const char* key,
+                                               const std::string& def = "") {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_string())
+        return std::nullopt;
+    return params[key].get<std::string>();
 }
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
@@ -571,18 +614,28 @@ static const ToolDef kTools[] = {
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
      "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
-     "Fails closed (zero rows) when the RBAC store is corrupt.",
+     "Fails closed (zero rows) when the RBAC store is corrupt. Each row also carries "
+     "the response's own row id, its instruction_id, error_detail (populated on a "
+     "failed/errored response), the originating plugin name, and received_at_ms "
+     "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
+     "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
+     "(#2146 A2-R2).",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
-     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
-     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. Confined by management group: "
+     "Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. `op_column` picks "
+     "which column sum/avg/min/max operates on (ignored for count; defaults to \"id\" when omitted "
+     "— an arbitrary numeric column, NOT a row count; each group's `count` field already reports "
+     "the row count regardless of `op_column`); must be one of \"timestamp\", \"status\", \"id\" "
+     "(#2146 A2-R2 — previously silently ignored, every aggregate operated on the store's default column "
+     "regardless of what a caller asked for). Confined by management group: "
      "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
      "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
      "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
      "audit row is emitted on a drop.",
-     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})",
+     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]},"op_column":{"type":"string","enum":["timestamp","status","id"],"description":"Column for sum/avg/min/max; ignored for count. Defaults to \"id\" when omitted."}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
 
     {"query_inventory",
@@ -822,9 +875,35 @@ static const ToolDef kTools[] = {
      "the SAME redacted counts/scope_expression as any other confined caller. "
      "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
      "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
-     "separately from the bare call because it discloses raw agent identities.",
+     "separately from the bare call because it discloses raw agent identities. "
+     "#2146 A2-R1: the result also carries parameter_values (redacted to "
+     "\"(redacted - confined view)\" for a confined caller, exactly like "
+     "scope_expression), plus completed_at/parent_id/rerun_of, which stay "
+     "truthful for every caller - the REST v1 twin GET /api/v1/executions/{id} "
+     "already returned all four; this closes the MCP field-parity gap.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
+
+    {"get_execution_children",
+     "List an execution's child executions (spawned reruns, workflow-step "
+     "fan-out, or other lineage). Confined by management group: an invisible "
+     "or nonexistent parent execution_id returns the same not-found error, "
+     "and - per #3789 - a visible parent does NOT by itself disclose a "
+     "child dispatched by, or targeting, someone else: each child "
+     "independently passes the same visible-agent-or-owner test the parent "
+     "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
+     "GET /api/executions/{id}/children (same shared row builder, "
+     "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
+     "at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1) with no "
+     "caller-visible limit/cursor. #2146 A2-R1 Gate 8 fix: the cap is now "
+     "pushed down WITH the caller's own visibility scope, before LIMIT -- a "
+     "confined caller's cap applies to their OWN visible children, not the "
+     "fleet-wide raw row set, so an invisible sibling can no longer displace "
+     "a visible child out of the capped window. result_truncated_by_cap:true "
+     "means that scoped row set exceeded the cap; false means every child "
+     "this caller can see was returned.",
+     R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
+     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
@@ -839,8 +918,12 @@ static const ToolDef kTools[] = {
     {"list_schedules", "List scheduled (recurring) instructions. #4030: rows now also "
      "carry execution_count, matching the dashboard fragment's field set. The query is "
      "hard-capped at 100 rows with no limit/cursor parameter; a result hitting that cap "
-     "sets result_truncated_by_cap:true rather than presenting a partial list as complete.",
-     R"({"type":"object","properties":{}})",
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete. "
+     "#2146 A2-R1: optional definition_id/enabled_only filters, matching the REST v1 twin "
+     "GET /api/v1/schedules exactly (enabled_only is a real boolean on both -- unlike the "
+     "legacy unversioned GET /api/schedules route, where ANY presence of enabled_only, "
+     "regardless of value, is treated as true).",
+     R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to schedules for this instruction definition"},"enabled_only":{"type":"boolean","description":"Only return enabled schedules"}}})",
      R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["schedules"]})j"},
 
     {"list_workflows", "List multi-step workflows (WorkflowEngine — a different data model "
@@ -3418,6 +3501,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
     {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
+    // #2146 A2-R1 - same fleet_read_fn_-gated confinement mechanism as
+    // get_execution_status/list_executions above.
+    {"get_execution_children", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     // #4030: Workflow (multi-step orchestration) — RBAC seeding prerequisite
@@ -4159,6 +4245,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_api_tokens", {ToolEffect::ReadOnly, true, "List own API tokens"}},
     {"check_permission", {ToolEffect::ReadOnly, true, "Check own RBAC permission"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
+    {"get_execution_children", {ToolEffect::ReadOnly, true, "List execution children"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
     {"list_workflows", {ToolEffect::ReadOnly, true, "List workflows"}},
@@ -8359,15 +8446,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // a cap hit entirely inside another operator's out-of-scope rows.
                 const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
 
+                // #2146 A2-R2: shared builder with the v1 REST twin
+                // (response_query_model.hpp) -- widens the served row beyond
+                // the original agent_id/execution_id/status/output/timestamp
+                // set with id/instruction_id/error_detail/plugin/
+                // received_at_ms (all previously present on StoredResponse
+                // but never surfaced here). Applies uniformly to both the
+                // execution_id and instruction_id paths above.
                 JArr arr;
-                for (const auto& r : responses) {
-                    arr.add(JObj()
-                                .add("agent_id", r.agent_id)
-                                .add("execution_id", r.execution_id)
-                                .add("status", r.status)
-                                .add("output", r.output)
-                                .add("timestamp", r.timestamp));
-                }
+                for (const auto& r : responses)
+                    arr.add_raw(response_query_row_json(r).dump());
                 // A dropped-by-scope read is a security-relevant event — audit it
                 // distinctly (#1634) so an operator reaching outside their groups is
                 // visible in the chain, separate from the served-set success row. The
@@ -8618,7 +8706,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agg_str = param_str(args, "aggregate", "count");
+                // #2146 A2-R2 governance finding, fixed by this commit (same defect
+                // class as op_column below, #2970B/A2-R1 lesson applied to this
+                // sibling, tracked and closed as #4643): a present-but-wrong-JSON-type
+                // `aggregate` (e.g. a number) must not silently read as absent and
+                // default to "count" -- reject it instead. A well-typed but
+                // unrecognized string (e.g. "bogus") still falls through to Count
+                // below, matching the legacy route's own identical behavior -- that
+                // SEPARATE, narrower enum-validation gap is pre-existing, untracked,
+                // and deliberately out of scope for this fix.
+                auto agg_str_opt = param_string_strict(args, "aggregate", "count");
+                if (!agg_str_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "aggregate must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                const std::string& agg_str = *agg_str_opt;
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;
                 else if (agg_str == "avg")
@@ -8629,6 +8733,45 @@ McpServer::HandlerFn McpServer::build_handler(
                     aq.op = AggregateOp::Max;
                 else
                     aq.op = AggregateOp::Count;
+
+                // #2146 A2-R2 fix: op_column was never read from `args` here, so
+                // sum/avg/min/max silently operated on ResponseStore::aggregate()'s
+                // own default operand column ("id") regardless of what a caller
+                // asked for. Mirror response_routes.cpp's REST reference handler
+                // exactly: default to "id" when omitted, then validate the
+                // EFFECTIVE value against the store's own allow-list BEFORE calling
+                // in (#2691 Doomgoose finding #2 precedent — same rationale as
+                // group_by just above: a typo'd op_column would otherwise read as
+                // store degradation for a healthy database).
+                //
+                // Use `param_string_strict`, not `param_str` (same defect class as
+                // #2970B/#2146 A2-R1, applied proactively here since this call site
+                // is new in this change): a present-but-wrong-type `op_column` (e.g.
+                // `{"op_column": 42}`) must not silently read as absent and default
+                // to "id" -- the caller asked to aggregate a specific column and
+                // typed it wrong, not asked for the default.
+                auto op_column_opt = param_string_strict(args, "op_column");
+                if (!op_column_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "op_column must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                const std::string effective_op_column =
+                    op_column_opt->empty() ? "id" : *op_column_opt;
+                if (std::find(ResponseStore::allowed_op_column().begin(),
+                              ResponseStore::allowed_op_column().end(),
+                              effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid op_column"),
+                                    "application/json");
+                    return;
+                }
+                // Assign the NORMALIZED value (cpp-safety governance finding): assigning
+                // the raw `*op_column_opt` here worked only because ResponseStore::
+                // aggregate() independently re-derives the same empty->"id" default --
+                // two implementations agreeing by coincidence, not by construction. A
+                // future edit to either default independently would silently diverge.
+                aq.op_column = effective_op_column;
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
@@ -8672,13 +8815,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& results = *results_opt;
+                // #2146 A2-R2: shared builder with the v1 REST twin (response_query_model.hpp).
                 JArr arr;
-                for (const auto& r : results) {
-                    arr.add(JObj()
-                                .add("group_value", r.group_value)
-                                .add("count", r.count)
-                                .add("aggregate_value", r.aggregate_value));
-                }
+                for (const auto& r : results)
+                    arr.add_raw(response_aggregate_row_json(r).dump());
                 // A scope-dropped aggregate is a security-relevant event → a distinct
                 // "denied" audit row carrying the DISTINCT dropped-agent count, beside
                 // the served success row (parity with query_responses #1550/#1634).
@@ -10204,7 +10344,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                auto exec = execution_tracker->get_execution(exec_id);
+                // Governance fix (#2146 A2-R1 re-review): was the plain
+                // get_execution(), which collapses "row genuinely absent" and
+                // "read degraded" (pool/query failure) to the same nullopt --
+                // a transient degrade here fell through to the not-found +
+                // denial-audit branch below, producing a FALSE 404 for a
+                // legitimate owner and a permanently wrong CC7.2 audit trail
+                // for a non-owner. get_execution_checked's outer
+                // std::expected distinguishes the two; the degrade branch
+                // below matches this same file's get_execution_children twin
+                // (a few hundred lines below) and MUST run BEFORE any denial
+                // audit is recorded.
+                auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                if (!exec_r) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& exec = *exec_r;
                 // #4030: optional per-agent expansion, MCP twin of the REST
                 // `?include=agents` decision on GET /api/v1/executions/{id} —
                 // same param name/value, same route (this tool), not a new
@@ -10258,6 +10417,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 int64_t progress_pct =
                     execution_tracker->get_summary(exec_id).progress_pct;
                 std::string scope_expression = exec->scope_expression;
+                // #2146 A2-R1: parameter_values follows the EXACT SAME
+                // redaction rule as scope_expression -- security-relevant,
+                // do not weaken. The REST v1 twin (rest_api_v1.cpp) and the
+                // legacy detail route (execution_routes.cpp) both replace
+                // parameter_values with this same literal for a confined
+                // caller; never serialize the raw value here.
+                std::string parameter_values = exec->parameter_values;
                 if (gate.scope) {
                     // #1634 residual: see REST GET /api/v1/executions/{id} — agent status
                     // rows are response-arrival seeded, not dispatch-time target seeded,
@@ -10286,19 +10452,28 @@ McpServer::HandlerFn McpServer::build_handler(
                                        ? (agents_responded * 100 / agents_targeted)
                                        : 0;
                     scope_expression = "(redacted - confined view)";
+                    parameter_values = "(redacted - confined view)";
                 }
+                // Deliberately keep status, completion time, dispatcher, and
+                // lineage truthful for this narrower slice; none directly
+                // names another agent (matches the REST v1 detail route's
+                // identical posture, rest_api_v1.cpp).
                 auto obj = JObj()
                                .add("id", exec->id)
                                .add("definition_id", exec->definition_id)
                                .add("status", exec->status)
                                .add("scope_expression", scope_expression)
+                               .add("parameter_values", parameter_values)
                                .add("dispatched_by", exec->dispatched_by)
                                .add("dispatched_at", exec->dispatched_at)
                                .add("agents_targeted", agents_targeted)
                                .add("agents_responded", agents_responded)
                                .add("agents_success", agents_success)
                                .add("agents_failure", agents_failure)
-                               .add("progress_pct", progress_pct);
+                               .add("progress_pct", progress_pct)
+                               .add("completed_at", exec->completed_at)
+                               .add("parent_id", exec->parent_id)
+                               .add("rerun_of", exec->rerun_of);
                 // #3344: retry_after_ms is emitted ONLY while non-terminal, via
                 // the shared mcp::is_execution_terminal() predicate (Gate 8
                 // fold: this and query_responses' poll-hint independently
@@ -10338,6 +10513,167 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── get_execution_children (#2146 A2-R1) ──────────────────────
+            // REST v1 twin: GET /api/v1/executions/{id}/children
+            // (rest_api_v1.cpp); legacy twin: GET /api/executions/{id}/children
+            // (execution_routes.cpp). All three call execution_model.hpp's
+            // execution_child_row_json and share execution_scope_rules.hpp's
+            // execution_visible confinement predicate (docs/api-twin-recipe.md
+            // Rule 1) -- not re-derived here.
+            if (tool_name == "get_execution_children") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_execution_children: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!execution_tracker) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Execution tracker unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto exec_id = param_str(args, "execution_id");
+                std::string username;
+                ExecutionScope scope_arg; // nullopt = unrestricted
+                if (gate.scope) {
+                    // #1634/#3789 precedent (list_executions below): an empty
+                    // username under an engaged scope must never silently
+                    // widen to "no owner filter" -- fail closed instead.
+                    username = session->username;
+                    if (username.empty()) {
+                        spdlog::error("get_execution_children: confined session has empty "
+                                      "username; failing closed rather than risk an unfiltered "
+                                      "read");
+                        res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                        "application/json");
+                        return;
+                    }
+                    // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
+                    // visible-agent admission predicate into
+                    // get_children_checked's SQL below (execution_routes.cpp's
+                    // list route precedent) -- closes the cap-before-scope
+                    // defect where an invisible sibling could displace this
+                    // caller's own visible children out of the capped window.
+                    ExecutionListScope s;
+                    s.owner = username;
+                    s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                    scope_arg = std::move(s);
+                }
+
+                auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                if (!exec_r) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& exec_opt = *exec_r;
+
+                std::vector<AgentExecStatus> parent_statuses;
+                if (gate.scope) {
+                    auto statuses_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                    if (!statuses_opt) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    parent_statuses = std::move(*statuses_opt);
+                }
+
+                const bool parent_visible =
+                    exec_opt.has_value() &&
+                    execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                if (!exec_opt || !parent_visible) {
+                    // #3789: audit ONLY under an engaged scope -- mirrors the
+                    // REST twins' identical rationale (compliance-officer F2).
+                    if (gate.scope) {
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "execution.read", "denied", "Execution", exec_id,
+                            "MCP children query: not found or outside caller's fleet-read scope");
+                    }
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Execution not found: " + exec_id),
+                        "application/json");
+                    return;
+                }
+
+                auto children_opt = execution_tracker->get_children_checked(exec_id, scope_arg);
+                if (!children_opt) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+
+                JArr arr;
+                if (gate.scope) {
+                    // #3789: parent visibility does NOT authorize enumerating
+                    // every child -- each independently passes
+                    // execution_visible. One batched statuses call, not N+1
+                    // (ADR-0017 INV-10).
+                    std::vector<std::string> child_ids;
+                    child_ids.reserve(children_opt->children.size());
+                    for (const auto& c : children_opt->children)
+                        child_ids.push_back(c.id);
+                    auto child_statuses_opt =
+                        execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
+                    if (!child_statuses_opt) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    static const std::vector<AgentExecStatus> kEmptyStatuses;
+                    for (const auto& c : children_opt->children) {
+                        auto it = child_statuses_opt->find(c.id);
+                        const auto& c_statuses =
+                            it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                        if (!execution_visible(c, c_statuses, gate.scope, username))
+                            continue;
+                        arr.add_raw(execution_child_row_json(c).dump());
+                    }
+                } else {
+                    for (const auto& c : children_opt->children)
+                        arr.add_raw(execution_child_row_json(c).dump());
+                }
+                // gov security-guardian fix round (#2146 A2-R1): success-audit
+                // this Execution-domain read, matching get_execution_status/
+                // list_executions/list_schedules' own convention on this same
+                // MCP surface (the REST-only "denial-only" posture this tool
+                // otherwise mirrors doesn't transfer to MCP's established
+                // per-tool audit convention).
+                mcp_audit("success", exec_id);
+                // Governance re-review fix (#2146 A2-R1, blocking):
+                // get_children_checked is now hard-capped (kExecutionChildrenCap,
+                // execution_tracker.cpp) -- previously unbounded. Present-only-
+                // when-true, matching list_schedules' result_truncated_by_cap
+                // convention on this same tool surface (declared in the output
+                // schema above). #2146 A2-R1 Gate 8 fix: scope_arg above is now
+                // pushed into the SQL BEFORE the cap (ExecutionChildrenResult's
+                // doc comment), so for a confined caller this reports THEIR OWN
+                // visible row set exceeding the cap, not the fleet-wide one --
+                // the per-child execution_visible filter above is now
+                // redundant-but-safe defense in depth over an already-scoped
+                // result, never the primary admission decision.
+                JObj result_obj;
+                result_obj.raw("children", arr.str());
+                if (children_opt->truncated)
+                    result_obj.add("result_truncated_by_cap", true);
+                res.set_content(
+                    success_response(id, tool_result(result_obj.str(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -10551,7 +10887,42 @@ McpServer::HandlerFn McpServer::build_handler(
                 // from a genuinely empty table -- mirrors the same-PR
                 // list_workflows MCP tool's checked/error_response shape
                 // immediately below.
+                // #2146 A2-R1: definition_id/enabled_only filters, threaded
+                // into the same ScheduleQuery the REST v1 twin (GET
+                // /api/v1/schedules, workflow_routes.cpp) and the legacy
+                // GET /api/schedules route already populate.
                 ScheduleQuery sq;
+                // PR #4623 external review fix (#2146 A2-R1): was the bare
+                // `param_str`, which silently treats a present-but-wrong-type
+                // `definition_id` (e.g. a JSON number) as absent -- the exact
+                // defect class param_bool_strict below was written to close
+                // for `enabled_only`, not originally extended to this filter.
+                const auto definition_id_opt =
+                    param_string_strict(args, "definition_id", sq.definition_id);
+                if (!definition_id_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "definition_id must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                sq.definition_id = *definition_id_opt;
+                // Governance fix (#2146 A2-R1): was the bare
+                // `args.contains(...) && args[...].is_boolean()` idiom, which
+                // silently treats a present-but-wrong-type value (e.g. the
+                // JSON string "true") as absent -- the filter is dropped
+                // instead of the caller being told their input was rejected.
+                // param_bool_strict (above) gives this the same
+                // nullopt-on-wrong-type contract param_int_strict already
+                // gives `limit` elsewhere in this file.
+                const auto enabled_only_opt =
+                    param_bool_strict(args, "enabled_only", sq.enabled_only);
+                if (!enabled_only_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "enabled_only must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                sq.enabled_only = *enabled_only_opt;
                 auto schedules_result = schedule_engine->query_schedules_checked(sq);
                 if (!schedules_result) {
                     res.set_content(
@@ -13792,7 +14163,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return; // the gate wrote its own 401/403
-                if (!app_perf_providers.device) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         a4_error(kInternalError, "service unavailable", "retry the request",
                                  /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
@@ -13807,8 +14178,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     "device app-perf-over-time drill (B1 retained) via MCP "
                     "get_dex_device_app_perf");
                 const auto app_filter = param_str(args, "app", "");
-                auto rows = app_perf_providers.device(agent_id);
-                if (!rows) {
+                auto body = dex_perf_api_->device_app_perf_json(agent_id, app_filter, audit_ok);
+                if (!body) {
                     // Authoritative read degrade — an ERROR, never success+[] (matches
                     // every other app-perf provider-degrade branch in this file).
                     mcp_audit("failure", "app-perf store read degraded; agent=" + agent_id);
@@ -13820,9 +14191,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 mcp_audit("success", agent_id);
                 res.set_content(
-                    success_response(id, tool_result(dex_device_app_perf_json(agent_id, app_filter,
-                                                                               *rows, audit_ok),
-                                                      kObjectOutputSchema)),
+                    success_response(id, tool_result(*body, kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -14248,7 +14617,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!dex_perf_fn) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Fleet perf provider unavailable",
                                        a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the fleet-perf "
@@ -14273,7 +14642,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // are aggregates and stay on the generic mcp.<tool> audit.
                 bool device_list_audit_ok = true;
                 if (tool_name == "get_dex_perf_fleet") {
-                    const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                    const auto now = dex_perf_fleet_now(dex_perf_api_->fleet_snapshot(std::string{}));
                     payload = JObj()
                                   .raw("cpu_pct", stat_json(now.cpu))
                                   .raw("commit_pct", stat_json(now.commit))
@@ -14296,7 +14665,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    const auto snap = dex_perf_fn(key);
+                    const auto snap = dex_perf_api_->fleet_snapshot(key);
                     JArr rows;
                     for (const auto& c : dex_perf_cohorts(snap)) {
                         JObj o;
@@ -14350,7 +14719,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                    const auto d = dex_perf_cohort_diff(dex_perf_api_->fleet_snapshot(key), a, b);
                     auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                         if (!found)
                             return "null";
@@ -14427,7 +14796,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn, req, "dex.perf.device.view", "success", "GuaranteedState", "",
                         "fleet-wide DEX perf device list via MCP list_dex_perf_devices");
                     JArr arr;
-                    for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
+                    for (const auto& r : dex_perf_device_list(dex_perf_api_->fleet_snapshot(cohort_key), metric,
                                                               not_reporting, cohort_filter,
                                                               limit)) {
                         JObj o;
@@ -14505,7 +14874,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 };
                 std::string payload;
                 if (tool_name == "list_dex_perf_apps") {
-                    if (!app_perf_providers.apps) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14514,7 +14883,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     bool truncated = false;
-                    auto apps = app_perf_providers.apps(truncated);
+                    auto apps = dex_perf_api_->apps(truncated);
                     if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
@@ -14531,7 +14900,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     .add("last_day", a.last_day));
                     payload = JObj().raw("apps", arr.str()).add("truncated", truncated).str();
                 } else if (tool_name == "get_dex_app_perf") {
-                    if (!app_perf_providers.fleet) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14564,8 +14933,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.fleet(app, version);
-                    if (!rows) { // AUTHORITATIVE read degrade
+                    auto trend = dex_perf_api_->app_fleet_trend(app, version);
+                    if (!trend) { // AUTHORITATIVE read degrade
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14574,7 +14943,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                    for (const auto& pt : *trend) {
                         // Fleet floors now too — emit suppressed + gate stats, same
                         // shape as get_dex_group_app_perf (a suppressed point must not
                         // read as "N devices @ 0% CPU").
@@ -14617,7 +14986,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (redundant-but-reachable, not dead) and is deliberately
                     // NOT touched here — see
                     // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
-                    if (!app_perf_providers.group) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14667,8 +15036,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.group(group_id, app, version);
-                    if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+                    auto trend = dex_perf_api_->group_trend(group_id, app, version);
+                    if (!trend) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                         res.set_content(
                             error_response(id, kInternalError, "app-perf group read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14677,7 +15046,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                    for (const auto& pt : *trend) {
                         JObj o;
                         o.add("version", pt.version)
                             .add("day", pt.day)
@@ -14714,7 +15083,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // gives: perm_fn above already denies every service-scoped
                     // token outright for (GuaranteedState, Read) before any
                     // tool-specific branch is reached.
-                    if (!app_perf_providers.tag_cohort) {
+                    if (!dex_perf_api_) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
                                            a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf "
@@ -14790,8 +15159,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto rows = app_perf_providers.tag_cohort(key, value, app, version);
-                    if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+                    auto trend = dex_perf_api_->tag_trend(key, value, app, version);
+                    if (!trend) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
                         res.set_content(
                             error_response(id, kInternalError, "app-perf tag cohort read degraded",
                                            a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
@@ -14800,7 +15169,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                    for (const auto& pt : *trend) {
                         JObj o;
                         o.add("version", pt.version)
                             .add("day", pt.day)
@@ -14900,7 +15269,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // the gate already wrote its own JSON-RPC error body
-                if (!app_perf_providers.version_devices) {
+                if (!dex_perf_api_) {
                     res.set_content(
                         a4_error(kInternalError, "service unavailable", "retry the request",
                                  /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
@@ -14912,7 +15281,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
                 bool truncated = false;
                 auto rows =
-                    app_perf_providers.version_devices(app, version, visible_ids, truncated);
+                    dex_perf_api_->app_version_devices(app, version, visible_ids, truncated);
                 if (!rows) { // AUTHORITATIVE read degrade
                     // Dedicated verb on the degrade path too, matching the REST/dashboard
                     // siblings (set-and-proceed — MCP has no Sec-Audit-Failed equivalent).

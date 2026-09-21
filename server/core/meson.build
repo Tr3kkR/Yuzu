@@ -398,6 +398,8 @@ yuzu_server_core_lib = static_library(
     'src/update_registry.cpp',
     'src/response_store.cpp',
     'src/response_routes.cpp',
+    'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
+                                     # instruction/command-ID-keyed response query/aggregate/export surface
     'src/bundle_service.cpp',
     'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
@@ -531,6 +533,7 @@ yuzu_server_core_lib = static_library(
     'src/verify_ui.cpp',
     'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
     'src/dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+    'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
     'src/deployment_run_store.cpp',

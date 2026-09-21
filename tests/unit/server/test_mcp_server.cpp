@@ -56,9 +56,12 @@
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
 #include "test_device_api_double.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
+#include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
+#include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
@@ -945,6 +948,12 @@ struct McpTestServer {
     /// behaviour for tests that don't opt in.
     yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
 
+    /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
+    /// definition_id/enabled_only filters can be exercised end-to-end.
+    /// Default nullptr preserves the pre-existing "Schedule engine
+    /// unavailable" path for every test that doesn't opt in.
+    yuzu::server::ScheduleEngine* schedule_engine_for_test{nullptr};
+
     /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
     /// ResponseStore so query_responses can be exercised end-to-end, including
     /// the new execution_id exact-correlation collect path. Default nullptr
@@ -1473,6 +1482,26 @@ private:
             mcp.set_dex_api(yuzu::server::make_local_dex_api(
                 guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
 
+        // ADR-0031 WS-A4 (sixth family): wrap this file's plain dex_perf_fn_for_test
+        // (heartbeat-now) + app_perf_providers_for_test (over-time) fn-shaped test
+        // doubles in the DexPerfApi seam (FnDexPerfApi — mirrors FnVerifyApi's own
+        // "wrap the pre-seam fn-shaped test double" pattern above). Conditional,
+        // NOT unconditional like the DexApi wiring above: several existing tests
+        // (e.g. "tools report unavailable when no provider is wired") rely on
+        // dex_perf_fn_for_test staying entirely empty by default -> dex_perf_api_
+        // stays null -> the MCP tools' own `!dex_perf_api_` guard answers 503,
+        // exactly like the pre-seam `!dex_perf_fn` check it replaces. A test that
+        // wires ANY ONE field still gets a non-null seam whose OTHER methods
+        // individually degrade to nullopt for their own unset provider, exactly
+        // matching this file's pre-rewire per-tool provider-absent checks.
+        if (dex_perf_fn_for_test || app_perf_providers_for_test.fleet ||
+            app_perf_providers_for_test.apps || app_perf_providers_for_test.device ||
+            app_perf_providers_for_test.group || app_perf_providers_for_test.tag_cohort ||
+            app_perf_providers_for_test.tag_values ||
+            app_perf_providers_for_test.version_devices)
+            mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
+                dex_perf_fn_for_test, app_perf_providers_for_test));
+
         // #4035 hardening (governance): same setter idiom, reads
         // dex_visible_for_test LIVE at request time (see that field's doc
         // comment) — unconditional, no-op-shaped default for every
@@ -1569,7 +1598,8 @@ private:
             /*policy_store=*/nullptr,
             /*mgmt_store=*/mgmt_store_for_test,
             /*approval_manager=*/approval_manager_for_test,
-            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn),
+            /*schedule_engine=*/schedule_engine_for_test, read_only_mode_, mcp_disabled_,
+            std::move(dispatch_fn),
             /*ca_store=*/ca_store_for_test,
             /*publish_crl_fn=*/
             [this]() -> std::optional<std::vector<std::uint8_t>> {
@@ -1705,6 +1735,21 @@ TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tet
         CHECK(blob.find(std::string(fam.name)) != std::string::npos);
 }
 
+// #2146 A2-R1 Gate 8 fix: this test's `nlohmann::json::parse(res->body)` call
+// is ALSO, incidentally but genuinely, a whole-catalogue JSON-validity net
+// over every served tool's inputSchema/outputSchema -- `tools/list`'s
+// handler splices each kTools[] schema string in VERBATIM via JObj::raw
+// (mcp_server.cpp), so a single malformed schema anywhere in kTools[] makes
+// the ENTIRE response body fail to parse here, not just the one tool. This
+// is exactly what caught round 1's own malformed get_execution_children
+// output schema (a `result_truncated_by_cap` property landing outside
+// "properties", with a trailing-garbage closing brace) -- confirmed by
+// running this test against that commit: `json.exception.parse_error.101`.
+// The gap this test does NOT cover: it fails LOUDLY but does not say WHICH
+// tool broke it (a byte offset into the merged body, not a tool name), and
+// it cannot catch a schema that is syntactically valid JSON but
+// STRUCTURALLY wrong (e.g. a property nested at the wrong level) -- see the
+// dedicated get_execution_children schema-shape test below for that case.
 TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness tether B)",
           "[mcp][2g]") {
     McpTestServer ts;
@@ -1725,6 +1770,44 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
     for (const auto& t : tools)
         live.insert(t["name"].get<std::string>());
     CHECK(family_tools == live);
+}
+
+// #2146 A2-R1 Gate 8 fix: a TARGETED regression for the specific defect
+// shape staleness tether B (above) cannot catch on its own -- a schema that
+// is valid JSON but has a property nested at the WRONG level. Round 1's own
+// mistake put `result_truncated_by_cap` as a sibling of the top-level
+// "properties" key instead of nested inside it alongside "children"; that
+// particular malformed literal also happened to produce invalid JSON (an
+// extra closing brace), which is why tether B caught it too -- but a
+// same-shape defect that stayed valid JSON (e.g. if the trailing content
+// had balanced correctly) would not have been. Assert the STRUCTURE
+// directly: both declared output properties live under "properties", and
+// "result_truncated_by_cap" is NOT a stray top-level sibling of it.
+TEST_CASE("MCP: get_execution_children's output schema nests "
+          "result_truncated_by_cap inside properties (#2146 A2-R1 Gate 8 fix)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* schema = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"].get<std::string>() == "get_execution_children") {
+            schema = &t["outputSchema"];
+            break;
+        }
+    }
+    REQUIRE(schema != nullptr);
+    REQUIRE(schema->contains("properties"));
+    const auto& properties = (*schema)["properties"];
+    CHECK(properties.contains("children"));
+    CHECK(properties.contains("result_truncated_by_cap"));
+    // The exact shape of round 1's mistake: a stray top-level sibling of
+    // "properties", rather than nested inside it.
+    CHECK_FALSE(schema->contains("result_truncated_by_cap"));
+    REQUIRE(schema->contains("required"));
+    CHECK((*schema)["required"] == nlohmann::json::array({"children"}));
 }
 
 TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labeled counter",
@@ -7802,6 +7885,200 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
     CHECK(saw_denied);
 }
 
+// #2146 A2-R1: definition_id/enabled_only filters, threaded into the same
+// ScheduleQuery the REST v1 twin (GET /api/v1/schedules) and the legacy
+// GET /api/schedules route already populate. Real ScheduleEngine so the
+// filters are proven to actually narrow the result set.
+
+TEST_CASE("MCP list_schedules: definition_id narrows the result set (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule matching;
+    matching.name = "sched-match-mcp";
+    matching.definition_id = "def-2146-mcp-a2r1";
+    matching.frequency_type = "once";
+    matching.created_by = "admin";
+    auto matching_id = engine.create_schedule(matching);
+    REQUIRE(matching_id.has_value());
+
+    yuzu::server::InstructionSchedule other;
+    other.name = "sched-other-mcp";
+    other.definition_id = "def-2146-mcp-other";
+    other.frequency_type = "once";
+    other.created_by = "admin";
+    auto other_id = engine.create_schedule(other);
+    REQUIRE(other_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":770,"params":{"name":"list_schedules",)"
+        R"("arguments":{"definition_id":"def-2146-mcp-a2r1"}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["schedules"].is_array());
+    bool found_matching = false, found_other = false;
+    for (const auto& row : sc["schedules"]) {
+        if (row["id"] == *matching_id)
+            found_matching = true;
+        if (row["id"] == *other_id)
+            found_other = true;
+    }
+    CHECK(found_matching);
+    CHECK_FALSE(found_other);
+}
+
+TEST_CASE("MCP list_schedules: enabled_only narrows the result set (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-mcp";
+    enabled_sched.definition_id = "def-2146-mcp-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = engine.create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    yuzu::server::InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-mcp";
+    disabled_sched.definition_id = "def-2146-mcp-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = engine.create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":771,"params":{"name":"list_schedules",)"
+        R"("arguments":{"enabled_only":true}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["schedules"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : sc["schedules"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK_FALSE(found_disabled);
+}
+
+// Governance fix (#2146 A2-R1, this branch's own re-review): the pre-fix
+// `args.contains("enabled_only") && args["enabled_only"].is_boolean()` idiom
+// had no `else` branch, so a present-but-wrong-type value (the JSON string
+// "true", what a loosely-typed client sends) was silently treated as ABSENT
+// -- the filter was dropped rather than rejected, and the caller who thought
+// they narrowed to only-enabled schedules got both back with no error.
+// param_bool_strict (mcp_server.cpp, sibling of the pre-existing
+// param_int_strict/#2970B) closes this the same way that fix closed the
+// equivalent integer-typed defect: present+wrong-type is now kInvalidParams,
+// not a silently dropped filter.
+TEST_CASE("MCP list_schedules: enabled_only wrong JSON type is rejected, not silently "
+          "dropped (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-strict";
+    enabled_sched.definition_id = "def-2146-mcp-strict-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = engine.create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    yuzu::server::InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-strict";
+    disabled_sched.definition_id = "def-2146-mcp-strict-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = engine.create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":772,"params":{"name":"list_schedules",)"
+        R"("arguments":{"enabled_only":"true"}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    // Pre-fix: this was a `result` with `structuredContent.schedules`
+    // containing BOTH ids (the filter silently dropped) and no error at all.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON boolean") !=
+          std::string::npos);
+}
+
+// PR #4623 external review fix (#2146 A2-R1): the same defect class as
+// enabled_only's wrong-type test immediately above, but for definition_id --
+// the pre-fix `param_str` idiom silently treated a present-but-wrong-type
+// value (a JSON number) as absent, so the caller who thinks they narrowed to
+// one definition_id got every schedule back with no error.
+// param_string_strict (mcp_server.cpp, sibling of param_int_strict/
+// param_bool_strict) closes this the same way. Covers more than one wrong
+// JSON type via SECTIONs (governance ledger
+// qa-2146-a2r1-param-bool-strict-single-type-tested flagged param_bool_strict's
+// sibling test for exercising only one wrong type against a single,
+// type-blind `!is_boolean()` predicate; param_string_strict's `!is_string()`
+// predicate is the same shape, so this test does not repeat that gap here).
+TEST_CASE("MCP list_schedules: definition_id wrong JSON type is rejected -- not silently "
+          "dropped (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule sched;
+    sched.name = "sched-definition-id-strict";
+    sched.definition_id = "def-2146-mcp-strict-defid";
+    sched.frequency_type = "once";
+    sched.created_by = "admin";
+    auto sched_id = engine.create_schedule(sched);
+    REQUIRE(sched_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = "[1,2]"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":773,"params":{"name":"list_schedules",)"
+        R"("arguments":{"definition_id":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    // Pre-fix: this was a `result` with `structuredContent.schedules`
+    // containing every schedule (the filter silently dropped) and no error.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
+}
+
 // #3290 Phase 2: query_installed_software's per-tool blanket
 // deny_fleet_wide_service_scoped call (the guardian-confinement-2298 Gate
 // 2/4/6 finding this test used to pin) is RETIRED — confinement is now
@@ -9762,6 +10039,79 @@ TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non
     CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+// Governance fix (#2146 A2-R1 re-review, adjudicated): this tool used the
+// plain get_execution(), which collapses "execution genuinely absent" and
+// "read degraded" (a transient pool/query failure) to the same nullopt --
+// MCP's denial branch fires unconditionally on `!exec` (not gated on
+// `gate.scope` the way the REST twin's audit call is), so an unconfined
+// caller hitting a degrade here still fell through to the SAME
+// not-found + `mcp_audit("denied", ...)` branch a genuine absence takes.
+// get_execution_checked's outer std::expected now distinguishes the two;
+// the degrade branch returns BEFORE any denial audit is recorded.
+TEST_CASE("MCP get_execution_status: a transient tracker degrade is kInternalError, "
+          "not a false not-found, and records no denial audit (#2146 A2-R1)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-degrade-status";
+    exec.scope_expression = "ostype = 'windows'";
+    exec.dispatched_by = "operator";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the tracker's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing "Execution tracker unavailable" branch
+    // above and mask this specific defect).
+    {
+        pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{
+            PQexec(conn.get(), "ALTER TABLE execution_tracker.executions RENAME TO "
+                               "executions_hidden_2146")};
+        REQUIRE(r.ok());
+    }
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":723,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    {
+        pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "ALTER TABLE execution_tracker.executions_hidden_2146 "
+                                          "RENAME TO executions")};
+        REQUIRE(r.ok());
+    }
+
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // MCP: transport-level 200, error lives in the JSON-RPC body
+    auto body = nlohmann::json::parse(res->body);
+    // (a) kInternalError, never the old false not-found (kInvalidParams).
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int64_t>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+
+    // (b) no denial audit row -- pre-fix, this recorded
+    // "mcp.get_execution_status|denied" (audit_log records "action|result"
+    // pairs, not target_id) even for this unconfined caller, since MCP's
+    // denial audit fires unconditionally on `!exec`, unlike the REST twin's
+    // audit call which is gated on gate.scope.
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.get_execution_status|denied");
+    for (const auto& d : ts.audit_details)
+        CHECK(d.find(exec_id) == std::string::npos);
+}
+
 // #1634 (adversarial-review K3/D3 follow-up): get_execution_status migrated onto
 // fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}. Real RBAC/mgmt-group
 // composition via ResponseExecutionAuthzPgRig — not a fake gate callback.
@@ -9864,6 +10214,263 @@ TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
     // the (different) requested execution_id verbatim on both branches — the
     // no-oracle property is the shared PREFIX/code, not byte-identical text,
     // matching the "Execution not found: <id>" format on both paths.
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+}
+
+// #2146 A2-R1: get_execution_status's output gains parameter_values (redacted
+// like scope_expression for a confined caller) plus completed_at/parent_id/
+// rerun_of (truthful for every caller, matching the REST v1 twin).
+
+TEST_CASE("MCP get_execution_status: unconfined caller sees real parameter_values plus "
+          "completed_at/parent_id/rerun_of (#2146 A2-R1)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-fields-2146";
+    exec.parameter_values = R"({"path":"C:\\Windows"})";
+    exec.dispatched_by = "operator";
+    exec.status = "completed";
+    exec.completed_at = 1735689999;
+    exec.parent_id = "exec-parent-1";
+    exec.rerun_of = "exec-rerun-1";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":760,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["parameter_values"] == exec.parameter_values);
+    CHECK(sc["completed_at"] == 1735689999);
+    CHECK(sc["parent_id"] == "exec-parent-1");
+    CHECK(sc["rerun_of"] == "exec-rerun-1");
+}
+
+TEST_CASE("MCP get_execution_status: confined caller gets parameter_values redacted, never "
+          "the raw value -- completed_at/parent_id/rerun_of stay truthful (#2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-scope-params-2146";
+    exec.parameter_values = R"({"secret":"do-not-leak"})";
+    exec.scope_expression = "agent:secret-target";
+    exec.dispatched_by = "alice";
+    exec.status = "completed";
+    exec.completed_at = 1735699999;
+    exec.parent_id = "exec-parent-2";
+    exec.rerun_of = "exec-rerun-2";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(exec_id, bob_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":761,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // (a)/(b): confined caller never sees the raw value, byte-checked against
+    // the whole response body, not just the field a builder might rename.
+    CHECK(res->body.find("do-not-leak") == std::string::npos);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["parameter_values"] == "(redacted - confined view)");
+    // (c): completed_at/parent_id/rerun_of stay truthful even confined.
+    CHECK(sc["completed_at"] == 1735699999);
+    CHECK(sc["parent_id"] == "exec-parent-2");
+    CHECK(sc["rerun_of"] == "exec-rerun-2");
+}
+
+// #2146 A2-R1: get_execution_children -- REST v1/legacy twin is
+// GET /api/v1/executions/{id}/children / GET /api/executions/{id}/children.
+
+TEST_CASE("MCP get_execution_children: lists children via the shared builder (unconfined)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution parent;
+    parent.definition_id = "def-children-basic";
+    parent.dispatched_by = "operator";
+    parent.status = "completed";
+    auto parent_created = tracker.create_execution(parent);
+    REQUIRE(parent_created.has_value());
+    const std::string parent_id = *parent_created;
+
+    yuzu::server::Execution child;
+    child.definition_id = "def-children-basic";
+    child.dispatched_by = "operator";
+    child.status = "completed";
+    child.dispatched_at = 1735690000;
+    child.parent_id = parent_id;
+    auto child_created = tracker.create_execution(child);
+    REQUIRE(child_created.has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":762,)"
+                    R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+        parent_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["children"].is_array());
+    bool found = false;
+    for (const auto& c : sc["children"]) {
+        if (c["id"] == *child_created) {
+            found = true;
+            CHECK(c["status"] == "completed");
+            CHECK(c["dispatched_at"] == 1735690000);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP get_execution_children: confines each child independently of the parent's own "
+          "visibility (#3789, #2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution parent;
+    parent.definition_id = "def-children-scope";
+    parent.dispatched_by = "alice";
+    parent.status = "completed";
+    auto parent_created = tracker.create_execution(parent);
+    REQUIRE(parent_created.has_value());
+    const std::string parent_id = *parent_created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(parent_id, bob_status);
+
+    yuzu::server::Execution visible_child;
+    visible_child.definition_id = "def-children-scope";
+    visible_child.dispatched_by = "alice";
+    visible_child.status = "completed";
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = tracker.create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    tracker.update_agent_status(*visible_child_id, bob_status);
+
+    yuzu::server::Execution invisible_child;
+    invisible_child.definition_id = "def-children-scope";
+    invisible_child.dispatched_by = "alice";
+    invisible_child.status = "completed";
+    invisible_child.parent_id = parent_id;
+    auto invisible_child_id = tracker.create_execution(invisible_child);
+    REQUIRE(invisible_child_id.has_value());
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(*invisible_child_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":763,)"
+                    R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+            parent_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["children"].is_array());
+    bool found_visible = false, found_invisible = false;
+    for (const auto& c : sc["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+        if (c["id"] == *invisible_child_id)
+            found_invisible = true;
+    }
+    CHECK(found_visible);
+    CHECK_FALSE(found_invisible);
+}
+
+TEST_CASE("MCP get_execution_children: invisible parent collapses to the same not-found "
+          "error as a nonexistent one (#2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-children-invisible";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& target_id) {
+        return ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":764,)"
+                        R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+                target_id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(exec_id);
+    auto missing = call("exec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
     auto invisible_json = nlohmann::json::parse(invisible->body);
     auto missing_json = nlohmann::json::parse(missing->body);
     REQUIRE(invisible_json.contains("error"));
@@ -13537,6 +14144,48 @@ TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)"
     auto body = nlohmann::json::parse(res->body);
     auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(rows.size() == 2);
+}
+
+TEST_CASE("MCP query_responses: rows carry the widened field set (#2146 A2-R2 -- "
+          "id/instruction_id/error_detail/plugin/received_at_ms)",
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::server::StoredResponse r = mk_resp("exec-wide", "instr-wide", "agent-1", 1, "out", 500);
+    r.error_detail = "boom";
+    r.plugin = "shellexec";
+    store.store(r);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // Both the execution_id path and the instruction_id path call the SAME
+    // shared builder (response_query_row_json) -- assert the widened field
+    // set on each.
+    for (const auto& args : {R"({"execution_id":"exec-wide"})", R"({"instruction_id":"instr-wide"})"}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":73,"params":{"name":"query_responses","arguments":)" +
+            std::string(args) + "}}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        auto rows = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        REQUIRE(rows.size() == 1);
+        const auto& row = rows[0];
+        CHECK(row.contains("id"));
+        CHECK(row["instruction_id"] == "instr-wide");
+        CHECK(row["agent_id"] == "agent-1");
+        CHECK(row["execution_id"] == "exec-wide");
+        CHECK(row["status"] == 1);
+        CHECK(row["output"] == "out");
+        CHECK(row["error_detail"] == "boom");
+        CHECK(row["timestamp"] == 500);
+        CHECK(row["plugin"] == "shellexec");
+        CHECK(row.contains("received_at_ms"));
+    }
 }
 
 TEST_CASE("MCP query_responses: rejects when neither id provided",
@@ -18930,6 +19579,172 @@ TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-ope
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.aggregate_responses|denied");
     CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "
+          "dropped to the \"count\" default (#2146 A2-R2, #4643)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["sum"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":97,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-agg-badtype","group_by":"status","aggregate":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `agg_str` fell back
+    // to "count", and the tool answered 200 with a count aggregate instead of
+    // rejecting the caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // Pinned to "aggregate must be..." (not the bare "must be a JSON string"
+    // substring, which op_column's own wrong-type error also contains) so this
+    // assertion stays discriminating if a future refactor touches both messages.
+    CHECK(body["error"]["message"].get<std::string>().find("aggregate must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP aggregate_responses: op_column is honored (#2146 A2-R2 -- previously silently "
+          "ignored, every aggregate operated on the store's default operand column)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-oc", "instr-oc", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-oc", "instr-oc", "agent-2", 0, "ok", 200));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-oc","group_by":"status","aggregate":"max","op_column":"timestamp"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto result = nlohmann::json::parse(res->body)["result"];
+    auto groups = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    REQUIRE(groups.size() == 1);
+    // MAX(timestamp) over the two status=0 rows (100, 200) is 200 -- proves
+    // op_column actually reached the store rather than being silently dropped
+    // (which would fall back to the store's own default operand column, "id",
+    // and produce a small integer row-id max instead).
+    CHECK(groups[0]["aggregate_value"].get<double>() == 200.0);
+}
+
+TEST_CASE("MCP aggregate_responses: omitted op_column matches explicit op_column:\"id\" "
+          "(#2146 A2-R2 governance finding -- the handler's own default and the store's "
+          "own default must stay in lock-step)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-oc-omit", "instr-oc-omit", "agent-2", 0, "ok", 200));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto omitted = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max"}}})");
+    REQUIRE(omitted);
+    REQUIRE(omitted->status == 200);
+    auto omitted_result = nlohmann::json::parse(omitted->body)["result"];
+    auto omitted_groups =
+        nlohmann::json::parse(omitted_result["content"][0]["text"].get<std::string>());
+    REQUIRE(omitted_groups.size() == 1);
+
+    auto explicit_id = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-omit","group_by":"status","aggregate":"max",)"
+        R"("op_column":"id"}}})");
+    REQUIRE(explicit_id);
+    REQUIRE(explicit_id->status == 200);
+    auto explicit_result = nlohmann::json::parse(explicit_id->body)["result"];
+    auto explicit_groups =
+        nlohmann::json::parse(explicit_result["content"][0]["text"].get<std::string>());
+    REQUIRE(explicit_groups.size() == 1);
+
+    // If the handler's own empty->"id" default (mcp_server.cpp) and the store's
+    // independent empty->"id" default (ResponseStore::aggregate) ever drift apart,
+    // this fails: omitting op_column would silently aggregate a DIFFERENT column
+    // than explicitly asking for "id".
+    CHECK(omitted_groups[0]["aggregate_value"].get<double>() ==
+          explicit_groups[0]["aggregate_value"].get<double>());
+}
+
+TEST_CASE("MCP aggregate_responses: an invalid op_column is rejected with kInvalidParams, "
+          "not silently mapped to the store default (#2146 A2-R2)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-oc-bad","group_by":"status","aggregate":"sum","op_column":"output"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("op_column") != std::string::npos);
+}
+
+TEST_CASE("MCP aggregate_responses: op_column wrong JSON type is rejected -- not silently "
+          "dropped to the default (#2146 A2-R2)",
+          "[pg][mcp][integration][response][aggregate]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    std::string bad_json_value;
+    SECTION("number") { bad_json_value = "42"; }
+    SECTION("array") { bad_json_value = R"(["timestamp"])"; }
+    SECTION("object") { bad_json_value = "{}"; }
+    SECTION("boolean") { bad_json_value = "true"; }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"aggregate_responses",)"
+        R"("arguments":{"instruction_id":"instr-oc-badtype","group_by":"status","aggregate":"sum",)"
+        R"("op_column":)" +
+        bad_json_value + R"(}}})");
+    REQUIRE(res);
+    // Pre-fix: `param_str` silently read this as absent, `effective_op_column`
+    // fell back to "id" (a valid allow-listed value), and the tool answered
+    // 200 with an aggregate over the wrong column instead of rejecting the
+    // caller's malformed input.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON string") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
