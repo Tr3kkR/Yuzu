@@ -6540,7 +6540,10 @@ TEST_CASE("File worker (direct): control wakes during a backoff are absorbed - n
     std::this_thread::sleep_for(200ms); // time for an un-absorbed nudge to run a pass
     const auto after = file_debug_counters_for_test(*mech)->pass_failed;
     INFO("pass_failed before=" << before << " after=" << after);
-    if (pf_ms_since(t_fail) < 4000)
+    // t_fail is taken AFTER the failure was observed, so the real retry deadline (failure time +
+    // 5000 ms) can be earlier than t_fail + 5000 ms. Gate tightly so a stalled runner degrades
+    // to SUCCEED instead of comparing counters across a legitimate retry pass.
+    if (pf_ms_since(t_fail) < 2500)
         CHECK(after == before); // no absorb: +5
     else
         SUCCEED("window missed on a loaded runner");
