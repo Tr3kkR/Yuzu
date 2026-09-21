@@ -1605,19 +1605,25 @@ TEST_CASE("GET /api/v1/approvals: a genuine store failure answers 503, never a f
 
 // ── GET /api/v1/approvals/pending/count (#2146 A2-R4) ────────────────────────
 
-TEST_CASE("GET /api/v1/approvals/pending/count: happy path reflects the pending queue",
+TEST_CASE("GET /api/v1/approvals/pending/count: happy path reflects the pending queue, "
+          "excluding a non-pending row (review finding, PR #4656: a query counting ALL "
+          "statuses would have passed the prior version of this test unnoticed)",
           "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
-    REQUIRE(h->submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction)
-                .has_value());
+    auto pending_id = h->submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(pending_id.has_value());
     REQUIRE(h->submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction)
                 .has_value());
+    // Approve one of the two -- the count must exclude it, proving the
+    // underlying query is actually WHERE status='pending', not a bare
+    // COUNT(*) that would also pass with two submitted-then-untouched rows.
+    REQUIRE(h->approve(*pending_id, "reviewer-bob", "").has_value());
 
     auto res = h.sink.Get("/api/v1/approvals/pending/count");
     REQUIRE(res);
     REQUIRE(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
-    CHECK(j["data"]["count"] == 2);
+    CHECK(j["data"]["count"] == 1);
     CHECK(j["meta"]["api_version"] == "v1");
 }
 
