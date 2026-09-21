@@ -1,0 +1,1 @@
+- Guardian file guards now re-arm their watch when the watched directory is renamed or moved.
