@@ -1662,7 +1662,12 @@ public:
                           "refused / other), labelled by the resolved cluster_id "
                           "(config key, or 'unknown' — never the raw gateway-asserted "
                           "value). Any non-ok movement means commands to gateway-connected "
-                          "agents are being lost.",
+                          "agents are being lost. A DISTINCT, non-dispatch outcome shares "
+                          "this metric name: unmapped_cluster_seen (emitted from "
+                          "gateway_service_impl.cpp at gateway CONNECT time, cluster_id "
+                          "always 'unknown') — an early-warning signal that a session "
+                          "announced an unmapped cluster before any command was even "
+                          "attempted against it, consistency-auditor Gate 4 finding.",
                           "counter");
         {
             std::unordered_set<std::string> cluster_labels{
@@ -12106,8 +12111,36 @@ private:
     /// Forward any commands queued for gateway-connected agents.
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (gw_pending.empty() || !gw_mgmt_pool_ || gw_mgmt_pool_->empty())
+        if (gw_pending.empty())
             return;
+        if (!gw_mgmt_pool_ || gw_mgmt_pool_->empty()) {
+            // unhappy-path Gate 4 finding (UP-1): this shape (drain, then
+            // silently drop everything if the pool/stub isn't usable) is
+            // PRE-EXISTING — not introduced by HA WS-4 4.3 — but was already
+            // silent pre-4.3 too (no log, no metric). Gateway command
+            // forwarding being unconfigured at all is the common, silent-by
+            // -design case (no flag set); but gw_mgmt_pool_ null/empty
+            // DESPITE gateway_command_address/gateway_cluster_addresses being
+            // configured means credential construction failed at boot (see
+            // the "Gateway command forwarding NOT enabled" error a few lines
+            // up the constructor) — a real, fleet-wide, otherwise-silent loss
+            // of every gateway-routed command from then on. Surface it here,
+            // once per drain, rather than leaving an operator to notice only
+            // via the absence of expected agent activity.
+            if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
+                spdlog::error(
+                    "Gateway command forwarding is CONFIGURED but not usable ({} command(s) "
+                    "just dropped) — see the earlier boot-time error for why "
+                    "(mutual-TLS credential construction likely failed)",
+                    gw_pending.size());
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                              {"status", "unavailable"}})
+                    .increment(static_cast<double>(gw_pending.size()));
+            }
+            return;
+        }
         for (auto& gp : gw_pending) {
             // HA WS-4 4.3: resolve per-command, against the eager pool built
             // at boot — see GatewayMgmtStubPool's file header for the

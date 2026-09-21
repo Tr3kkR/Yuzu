@@ -1491,20 +1491,37 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         if (known_gateway_clusters_ && !cluster_id.empty() &&
             !known_gateway_clusters_->contains(cluster_id)) {
             bool first_warning = false;
+            bool cap_reached_transition = false;
             {
                 std::lock_guard lock(unmapped_clusters_warned_mu_);
                 // sre Gate 3: unmapped_clusters_warned_ is per-entry bounded
                 // (kMaxClusterIdLen) but was previously unbounded in COUNT — a
                 // session cycling through many distinct malformed/misconfigured
-                // cluster_id values grew it indefinitely. Cap the entry count;
-                // past the cap, dedup degrades to "always warn" for a NEW
-                // distinct id rather than growing further — bounded memory,
-                // slightly noisier logging under the degenerate case, never a
-                // silent stop.
+                // cluster_id values grew it indefinitely. Capped the entry
+                // count (below kMaxUnmappedClustersWarned).
+                //
+                // unhappy-path Gate 4 finding (UP-6): the FIRST version of this
+                // cap fix bounded memory correctly but let LOGGING degrade to
+                // unbounded — past the cap, every occurrence of any distinct
+                // id not already in the set re-warned (never inserted, so
+                // "first" every time). A gateway peer already past the
+                // mgmt-plane's mTLS+peer-pin auth (#1422) but varying its
+                // announced cluster_id across reconnects — compromised,
+                // misconfigured, or simply buggy — could still drive an
+                // unbounded per-connect WARN rate (a log/disk-pressure DoS,
+                // distinct from the memory growth the cap already fixed).
+                // Fixed: past the cap, do NOT log per-occurrence at all — only
+                // the metric below (unconditional, every occurrence) keeps
+                // counting. `cap_reached_transition` fires the ONE explicit
+                // "we've stopped logging individually" notice, exactly once,
+                // at the moment the cap is first reached.
                 if (unmapped_clusters_warned_.size() >= kMaxUnmappedClustersWarned) {
-                    first_warning = !unmapped_clusters_warned_.contains(cluster_id);
+                    first_warning = false;
                 } else {
-                    first_warning = unmapped_clusters_warned_.insert(cluster_id).second;
+                    auto [_, inserted] = unmapped_clusters_warned_.insert(cluster_id);
+                    first_warning = inserted;
+                    cap_reached_transition =
+                        inserted && unmapped_clusters_warned_.size() == kMaxUnmappedClustersWarned;
                 }
             }
             if (first_warning) {
@@ -1513,6 +1530,13 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                              "agent (and any other agent on this cluster) will be dropped as "
                              "unknown_cluster until it is added",
                              agent_id, cluster_id);
+            }
+            if (cap_reached_transition) {
+                spdlog::warn("[gateway] unmapped cluster_id tracking reached its cap ({} "
+                             "distinct ids) — further distinct unmapped cluster_id values will "
+                             "still be counted (yuzu_server_gateway_forward_total{{status="
+                             "\"unmapped_cluster_seen\"}}) but no longer individually logged",
+                             kMaxUnmappedClustersWarned);
             }
             if (metrics_) {
                 metrics_->counter("yuzu_server_gateway_forward_total",

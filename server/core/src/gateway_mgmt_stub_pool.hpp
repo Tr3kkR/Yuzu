@@ -60,6 +60,20 @@
 ///     string, even after ingest clamping (`gateway_service_impl.cpp`'s
 ///     `kMaxClusterIdLen`) — an attacker-influenced value is still a
 ///     cardinality risk as a metric label, however bounded in length.
+///
+/// TRUST BOUNDARY (unhappy-path Gate 4 finding UP-7): `--gateway-cluster-addr`
+/// is fully operator-trusted config, like every other CLI flag. Nothing here
+/// (or in `forward_gateway_pending`) verifies that the `host:port` configured
+/// for a given `cluster_id` is actually THAT cluster — mTLS via the shared
+/// credentials authenticates core's OWN identity to whatever peer answers at
+/// that address, it does not authenticate the peer's identity back to core
+/// (that's the gateway-side #1422 mgmt-plane peer pin, a different
+/// direction). A stale/wrong DNS entry or a copy-paste error in the flag
+/// value silently dials the wrong cluster with no detectable signal beyond
+/// whatever that peer's own behavior reveals. This is the same trust
+/// assumption every other operator-authored infra config in this codebase
+/// carries — named explicitly here because it's easy to misread the mTLS
+/// dial as a verification it isn't.
 namespace yuzu::server {
 
 /// Parses `--gateway-cluster-addr` entries, each already a single
