@@ -5,7 +5,11 @@
  * mitigation_options.hex from the-rig `reg query`; its .provenance.txt holds
  * `Get-ProcessMitigation -System` as `expect.<policy>=<on|off|default>` lines;
  * REQUIRE(exists), never skipped) or RECONSTRUCTION (bytes built from the
- * documented <winbase.h> layout, for table mechanics and malformed input).
+ * kernel option-map nibble table in the header, for table mechanics and
+ * malformed input). Only the five options that capture enabled (nibbles 0, 1,
+ * 4, 5, 10 = dep, sehop, aslr_bottom_up, aslr_high_entropy, cfg) are confirmed
+ * on hardware; the other nibble positions are inferred, so a RECONSTRUCTION
+ * case proves table mechanics, not what Windows does for that policy.
  */
 #include "system_hardening_win_parsers.hpp"
 
@@ -16,6 +20,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -65,23 +70,23 @@ std::vector<MitigationRow> decode_ok(const std::vector<uint8_t>& blob,
 
 } // namespace
 
-TEST_CASE("decode: every two-bit nibble value maps 0/1/2/3 to default/on/off/unmodelled",
+TEST_CASE("decode: every nibble value maps 0/1/2/3+ to default/on/off/unmodelled",
           "[system_hardening][win_parsers]") {
-    // RECONSTRUCTION; drives kPolicyTable itself.
+    // RECONSTRUCTION; drives kPolicyTable itself. EVERY nibble (dep at 0 and
+    // sehop at 1 included) is two-bit; 3..15 are all per-policy meanings.
     for (const auto& def : detail::kPolicyTable) {
-        if (def.kind != detail::Kind::two_bit)
-            continue;
         const std::pair<unsigned, PolicyState> cases[] = {{0, PolicyState::default_state},
                                                           {1, PolicyState::on},
                                                           {2, PolicyState::off},
-                                                          {3, PolicyState::unmodelled}};
+                                                          {3, PolicyState::unmodelled},
+                                                          {0xF, PolicyState::unmodelled}};
         for (const auto& [nib, want] : cases) {
             const auto rows = by_policy(decode_ok(make_blob(16, {{def.nibble, nib}})));
             const auto it = rows.find("mitigation." + std::string{def.name});
             REQUIRE(it != rows.end());
             INFO(def.name << " nibble=" << nib);
             CHECK(it->second.state == want);
-            CHECK(it->second.raw == "0x" + std::string(1, "0123"[nib]));
+            CHECK(it->second.raw == "0x" + std::string(1, "0123456789abcdef"[nib]));
             // No other table policy moves.
             for (const auto& [name, row] : rows) {
                 if (name != it->first && row.raw != "0x0" && name.find("ext_q") == std::string::npos)
@@ -91,31 +96,58 @@ TEST_CASE("decode: every two-bit nibble value maps 0/1/2/3 to default/on/off/unm
     }
 }
 
-TEST_CASE("decode: nibble 0 legacy flags are 1-bit on/default, bit 3 is unmodelled",
-          "[system_hardening][win_parsers]") {
-    // RECONSTRUCTION.
-    auto rows = by_policy(decode_ok(make_blob(16, {{0, 0x1}})));
-    CHECK(rows.at("mitigation.dep").state == PolicyState::on);
-    CHECK(rows.at("mitigation.dep_atl_thunk").state == PolicyState::default_state);
-    CHECK(rows.at("mitigation.sehop").state == PolicyState::default_state);
-
-    rows = by_policy(decode_ok(make_blob(16, {{0, 0x4}})));
-    CHECK(rows.at("mitigation.sehop").state == PolicyState::on);
-    CHECK(rows.at("mitigation.dep").state == PolicyState::default_state);
-
-    rows = by_policy(decode_ok(make_blob(16, {{0, 0x8}})));
-    REQUIRE(rows.count("mitigation.reserved_n0_bit3") == 1);
-    CHECK(rows.at("mitigation.reserved_n0_bit3").state == PolicyState::unmodelled);
+TEST_CASE("decode: prefix is applied to every row", "[system_hardening][win_parsers]") {
+    // RECONSTRUCTION: nibble 1 is sehop (a defined policy, not reserved).
+    const auto rows = decode_ok(make_blob(16, {{1, 0x2}}), "mitigation_audit.");
+    const auto by = by_policy(rows);
+    REQUIRE(by.count("mitigation_audit.sehop") == 1);
+    CHECK(by.at("mitigation_audit.sehop").state == PolicyState::off);
+    CHECK(by.count("mitigation.sehop") == 0);
+    CHECK(by.count("mitigation_audit.dep") == 1);
+    for (const auto& r : rows)
+        CHECK(r.policy.rfind("mitigation_audit.", 0) == 0);
 }
 
-TEST_CASE("decode: prefix is applied, nibble 1 non-zero is reserved/unmodelled",
-          "[system_hardening][win_parsers]") {
-    // RECONSTRUCTION.
-    const auto rows = by_policy(decode_ok(make_blob(16, {{1, 0x2}}), "mitigation_audit."));
-    REQUIRE(rows.count("mitigation_audit.reserved_n1") == 1);
-    CHECK(rows.at("mitigation_audit.reserved_n1").state == PolicyState::unmodelled);
-    CHECK(rows.count("mitigation.dep") == 0);
-    CHECK(rows.count("mitigation_audit.dep") == 1);
+TEST_CASE("REAL CAPTURE: the captured blob decodes exactly the five enabled policies on",
+          "[system_hardening][win_parsers][fixture]") {
+    // Derived from the REAL CAPTURE (mitigation_options.hex, the-rig). Its
+    // .provenance.txt records that only `Set-ProcessMitigation -System -Enable
+    // DEP,SEHOP,BottomUp,HighEntropy,CFG` was applied to a host where every
+    // mitigation was NOTSET, and that Get-ProcessMitigation -System then read
+    // those five ON and the rest NOTSET. So: five `on` (nibble value 1), every
+    // other policy `default`, and no reserved_* rows -- the old bit-flag model
+    // read sehop as `default` here.
+    const auto blob = parse_hex_blob(read_fixture_text("mitigation_options.hex"));
+    REQUIRE(blob.has_value());
+    REQUIRE(blob->size() == 24);
+    const auto rows = decode_ok(*blob);
+    const auto decoded = by_policy(rows);
+
+    const std::set<std::string> enabled{"dep", "sehop", "aslr_bottom_up", "aslr_high_entropy",
+                                        "cfg"};
+    for (const auto& def : detail::kPolicyTable) {
+        const std::string name{def.name};
+        const auto it = decoded.find("mitigation." + name);
+        INFO("policy " << name);
+        REQUIRE(it != decoded.end());
+        if (enabled.count(name) != 0) {
+            CHECK(it->second.state == PolicyState::on);
+            CHECK(it->second.raw == "0x1");
+        } else {
+            CHECK(it->second.state == PolicyState::default_state);
+            CHECK(it->second.raw == "0x0");
+        }
+    }
+    // Guards a typo in `enabled`: every name in it must be a real table row.
+    for (const auto& name : enabled)
+        CHECK(decoded.count("mitigation." + name) == 1);
+
+    // Nothing but the table rows plus the two (all-zero) trailing QWORDs.
+    CHECK(rows.size() == detail::kPolicyTable.size() + 2);
+    for (const auto& r : rows)
+        CHECK(r.policy.find("reserved") == std::string::npos);
+    CHECK(decoded.at("mitigation.ext_q1").state == PolicyState::default_state);
+    CHECK(decoded.at("mitigation.ext_q2").state == PolicyState::default_state);
 }
 
 TEST_CASE("decode: QWORDs beyond the documented table are unmodelled when non-zero",

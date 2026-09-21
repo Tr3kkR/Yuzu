@@ -7,16 +7,31 @@
  *
  * 1. HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel values
  *    `MitigationOptions` / `MitigationAuditOptions` (REG_BINARY, documented
- *    16/24 bytes = 2/3 little-endian QWORDs). The FIRST QWORD follows the
- *    PROCESS_CREATION_MITIGATION_POLICY_* layout of <winbase.h>: nibble n
- *    holds bits [4n, 4n+3]. Two-bit policies (nibble >= 2): 0 default, 1 on,
- *    2 off, 3 = per-policy meaning (reserved/opt-out/audit) -> `unmodelled`.
- *    Nibble 0 holds three 1-bit flags (bit0 DEP, bit1 DEP ATL thunk, bit2
- *    SEHOP): set reads `on`, clear reads `default`. Later QWORDs are beyond
- *    the documented table: one row, `unmodelled` when non-zero.
- *    That the registry value reuses this layout is CONFIRMED ONLY by the
- *    the-rig capture recorded in the fixture's .provenance.txt; until that
- *    fixture lands the fixture test fails loudly instead of skipping.
+ *    16/24 bytes = 2/3 little-endian QWORDs). The FIRST QWORD is the kernel's
+ *    system-wide mitigation option map: one nibble per policy (nibble n holds
+ *    bits [4n, 4n+3]), in the order of the kernel's PS_MITIGATION_OPTION
+ *    enumeration. That order is undocumented by Microsoft. It is NOT the
+ *    <winbase.h> PROCESS_CREATION_MITIGATION_POLICY_* flag layout (the-rig
+ *    capture refuted that for nibbles 0 and 1). EVERY nibble is a
+ *    two-bit value: 0 default, 1 on, 2 off, 3..15 = per-policy meaning
+ *    (reserved/opt-out/audit) -> `unmodelled`. Nibble index -> policy:
+ *      0 dep, 1 sehop, 2 force_relocate_images, 3 heap_terminate,
+ *      4 aslr_bottom_up, 5 aslr_high_entropy, 6 strict_handle_checks,
+ *      7 win32k_system_call_disable, 8 extension_point_disable,
+ *      9 prohibit_dynamic_code, 10 cfg, 11 block_non_microsoft_binaries,
+ *      12 font_disable, 13 image_load_no_remote, 14 image_load_no_low_label,
+ *      15 image_load_prefer_system32.
+ *    There is no separate DEP-ATL-thunk bit in this value. Later QWORDs are
+ *    beyond the documented table: one row, `unmodelled` when non-zero.
+ *    EVIDENCE: CONFIRMED on hardware by the capture from the-rig recorded in
+ *    fixtures/wave8/system_hardening/windows/mitigation_options.hex and its
+ *    .provenance.txt -- `Set-ProcessMitigation -System -Enable DEP,SEHOP,
+ *    BottomUp,HighEntropy,CFG` set exactly nibbles 0, 1, 4, 5 and 10, each to
+ *    1, and Get-ProcessMitigation -System reports those five ON -- but ONLY
+ *    for indices 0 (dep), 1 (sehop), 4 (aslr_bottom_up), 5
+ *    (aslr_high_entropy) and 10 (cfg). Indices 2, 3, 6-9 and 11-15 are
+ *    inferred by position, unverified on hardware. The fixture test fails
+ *    loudly (never skips) if the capture is missing.
  * 2. The agent's own GetProcessMitigationPolicy `Flags` DWORD
  *    (decode_self_policy): effective policy, on/off only.
  *
@@ -56,7 +71,7 @@ constexpr std::string_view state_token(PolicyState s) {
 
 struct MitigationRow {
     std::string policy; // e.g. "mitigation.dep"
-    std::string raw;    // "0x<hex>" -- the nibble/bit/flags value that produced `state`
+    std::string raw;    // registry rows: "0x<hex>" nibble value; self rows: Flags in decimal
     PolicyState state{PolicyState::unmodelled};
 };
 
@@ -89,34 +104,31 @@ inline std::string format_posture_row(const MitigationRow& r) {
 
 namespace detail {
 
-enum class Kind { flag_bit, two_bit };
-
 struct PolicyDef {
     std::string_view name;
-    uint8_t nibble;      // nibble index within the first QWORD (0..15)
-    uint8_t bit;         // Kind::flag_bit only: bit within the nibble
-    Kind kind;
+    uint8_t nibble; // nibble index within the first QWORD (0..15); every nibble is two-bit
 };
 
-// Source: PROCESS_CREATION_MITIGATION_POLICY_* in <winbase.h>; nibble 1 is undefined.
-inline constexpr std::array<PolicyDef, 17> kPolicyTable{{
-    {"dep", 0, 0, Kind::flag_bit},                          // DEP_ENABLE            0x01
-    {"dep_atl_thunk", 0, 1, Kind::flag_bit},                // DEP_ATL_THUNK_ENABLE  0x02
-    {"sehop", 0, 2, Kind::flag_bit},                        // SEHOP_ENABLE          0x04
-    {"force_relocate_images", 2, 0, Kind::two_bit},         // << 8
-    {"heap_terminate", 3, 0, Kind::two_bit},                // << 12
-    {"aslr_bottom_up", 4, 0, Kind::two_bit},                // << 16
-    {"aslr_high_entropy", 5, 0, Kind::two_bit},             // << 20
-    {"strict_handle_checks", 6, 0, Kind::two_bit},          // << 24
-    {"win32k_system_call_disable", 7, 0, Kind::two_bit},    // << 28
-    {"extension_point_disable", 8, 0, Kind::two_bit},       // << 32
-    {"prohibit_dynamic_code", 9, 0, Kind::two_bit},         // << 36
-    {"cfg", 10, 0, Kind::two_bit},                          // << 40
-    {"block_non_microsoft_binaries", 11, 0, Kind::two_bit}, // << 44
-    {"font_disable", 12, 0, Kind::two_bit},                 // << 48
-    {"image_load_no_remote", 13, 0, Kind::two_bit},         // << 52
-    {"image_load_no_low_label", 14, 0, Kind::two_bit},      // << 56
-    {"image_load_prefer_system32", 15, 0, Kind::two_bit},   // << 60
+// Kernel option map, one nibble per policy in PS_MITIGATION_OPTION order (see the
+// header comment: indices 0, 1, 4, 5, 10 confirmed by the rig capture, the rest
+// inferred by position).
+inline constexpr std::array<PolicyDef, 16> kPolicyTable{{
+    {"dep", 0},                           // NX                          (rig-confirmed)
+    {"sehop", 1},                         // SEHOP                       (rig-confirmed)
+    {"force_relocate_images", 2},         // ForceRelocateImages
+    {"heap_terminate", 3},                // HeapTerminate
+    {"aslr_bottom_up", 4},                // BottomUpASLR                (rig-confirmed)
+    {"aslr_high_entropy", 5},             // HighEntropyASLR             (rig-confirmed)
+    {"strict_handle_checks", 6},          // StrictHandleChecks
+    {"win32k_system_call_disable", 7},    // Win32kSystemCallDisable
+    {"extension_point_disable", 8},       // ExtensionPointDisable
+    {"prohibit_dynamic_code", 9},         // ProhibitDynamicCode
+    {"cfg", 10},                          // ControlFlowGuard            (rig-confirmed)
+    {"block_non_microsoft_binaries", 11}, // BlockNonMicrosoftBinaries
+    {"font_disable", 12},                 // FontDisable
+    {"image_load_no_remote", 13},         // ImageLoadNoRemote
+    {"image_load_no_low_label", 14},      // ImageLoadNoLowLabel
+    {"image_load_prefer_system32", 15},   // ImageLoadPreferSystem32
 }};
 
 inline std::string hex_of(uint64_t v, int min_digits = 1) {
@@ -161,37 +173,23 @@ inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<co
         const auto nib = static_cast<uint8_t>((q0 >> (4 * def.nibble)) & 0xF);
         MitigationRow row;
         row.policy = std::string{prefix} + std::string{def.name};
-        if (def.kind == detail::Kind::flag_bit) {
-            const uint8_t bit = (nib >> def.bit) & 1;
-            row.raw = detail::hex_of(bit);
-            row.state = bit ? PolicyState::on : PolicyState::default_state;
-        } else {
-            row.raw = detail::hex_of(nib);
-            switch (nib) {
-            case 0:
-                row.state = PolicyState::default_state;
-                break;
-            case 1:
-                row.state = PolicyState::on;
-                break;
-            case 2:
-                row.state = PolicyState::off;
-                break;
-            default: // 3: per-policy meaning (reserved / opt-out / audit) -- not modelled
-                row.state = PolicyState::unmodelled;
-                break;
-            }
+        row.raw = detail::hex_of(nib);
+        switch (nib) {
+        case 0:
+            row.state = PolicyState::default_state;
+            break;
+        case 1:
+            row.state = PolicyState::on;
+            break;
+        case 2:
+            row.state = PolicyState::off;
+            break;
+        default: // 3..15: per-policy meaning (reserved / opt-out / audit) -- not modelled
+            row.state = PolicyState::unmodelled;
+            break;
         }
         rows.push_back(std::move(row));
     }
-
-    // Undefined bits in QWORD 0: nibble 1, bit 3 of nibble 0.
-    if (const auto n1 = static_cast<uint8_t>((q0 >> 4) & 0xF); n1 != 0)
-        rows.push_back({std::string{prefix} + "reserved_n1", detail::hex_of(n1),
-                        PolicyState::unmodelled});
-    if (const auto b3 = static_cast<uint8_t>((q0 >> 3) & 1); b3 != 0)
-        rows.push_back({std::string{prefix} + "reserved_n0_bit3", detail::hex_of(b3),
-                        PolicyState::unmodelled});
 
     // QWORDs beyond the table.
     for (std::size_t q = 1; q < blob.size() / 8; ++q) {
