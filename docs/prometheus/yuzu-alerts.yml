@@ -268,7 +268,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway forwarded a response for an unrequested agent ({{ $value }} in 1h)"
+          summary: "Gateway rejected a response for an unrequested agent ({{ $value }} in 1h)"
           description: >-
             forward_gateway_pending refused at least one SendCommandResponse
             whose agent_id did not match the single agent the request
