@@ -19,7 +19,11 @@
  *                   code path of any kind: no repeated per-job cancel loop,
  *                   no every-job control code, no "act on every job"
  *                   selector on the Cancel-Job request — one call, one job
- *                   id, every time.
+ *                   id, every time. On macOS/Linux the named printer is
+ *                   BOUND to the job first: cupsd's Cancel-Job looks a job up
+ *                   by id alone and ignores the printer, so a Get-Jobs of
+ *                   that printer's not-completed jobs must list the id before
+ *                   the Cancel-Job is sent. Windows binds it in the spooler.
  *
  * No libcups, no vcpkg cups entry (verified absent from vcpkg.json) — the
  * IPP codec (printing_ipp.hpp) is a from-scratch minimal RFC 8010 encoder/
@@ -988,36 +992,86 @@ int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
         return 1;
     }
 
+    httplib::Headers headers;
+    headers.emplace("Authorization", "PeerCred " + user);
+
+    // A round trip that failed before yielding an IPP status (transport, HTTP
+    // 401/403, undecodable body) is reported the same way for every operation
+    // this action sends. Returns true once it has reported.
+    const auto report_round_trip_failure = [&](const IppResult& r, std::string_view op) {
+        if (!r.transport_ok) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   std::format("{}: transport failed", op));
+            ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokConnectFailed));
+            return true;
+        }
+        if (r.http_status == 401 || r.http_status == 403) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                                   std::format("{}: HTTP auth/forbidden", op));
+            ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokAccessDenied));
+            return true;
+        }
+        if (!r.message) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   std::format("{}: response did not decode", op));
+            ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokDecodeFailed));
+            return true;
+        }
+        return false;
+    };
+
+    // Bind the job to the NAMED printer before cancelling. cupsd's Cancel-Job
+    // finds the job by id alone: with a non-zero job-id the printer-uri is
+    // neither validated nor compared to the job's queue (scheduler/ipp.c
+    // cancel_job()). Observed on a real cupsd: a nonexistent printer name plus a
+    // valid job id cancelled that job and this action reported `canceled`. So
+    // list the named printer's not-completed jobs first -- cupsd refuses a
+    // nonexistent printer there as not-found -- and cancel only a job that is on
+    // it. (Windows needs no such step: the spooler itself binds a job to its
+    // printer; measured, a wrong printer with a valid job id returns not-found.)
+    // The job could move or finish between the two requests; cupsd's own
+    // Cancel-Job answer below covers that.
+    const auto listing = post_ipp_unix(
+        *socket_path,
+        ipp::encode_request(ipp::kGetJobs, next_request_id(), job_binding_check_attrs(printer)), headers);
+    if (report_round_trip_failure(listing, "Get-Jobs"))
+        return 1;
+    const uint16_t listing_status = listing.message->op_or_status;
+    const CancelStatusClass listing_cls = classify_cancel_job_status(listing_status);
+    if (listing_cls == CancelStatusClass::not_found) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
+                               "Get-Jobs: printer not found");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", kTokNotFound));
+        return 1;
+    }
+    if (listing_cls == CancelStatusClass::refused) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                               "Get-Jobs: not authorized");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokAccessDenied));
+        return 1;
+    }
+    if (listing_cls != CancelStatusClass::canceled) { // any other non-successful status
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("Get-Jobs: unexpected status 0x{:04x}", listing_status));
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokUnexpectedStatus));
+        return 1;
+    }
+    if (!job_is_listed(jobs_from_ipp(*listing.message), *job_id)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL,
+                               "Get-Jobs: job is not on the named printer's active queue");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", kTokNotFound));
+        return 1;
+    }
+
     std::vector<ipp::OperationAttr> attrs;
     attrs.push_back({ipp::kTagUri, "printer-uri", "ipp://localhost/printers/" + printer, {}});
     attrs.push_back({ipp::kTagInteger, "job-id", ipp::encode_int32(static_cast<int32_t>(*job_id)), {}});
     attrs.push_back({ipp::kTagNameWithoutLanguage, "requesting-user-name", user, {}});
 
     const auto req = ipp::encode_request(ipp::kCancelJob, next_request_id(), attrs);
-
-    httplib::Headers headers;
-    headers.emplace("Authorization", "PeerCred " + user);
-
     const auto result = post_ipp_unix(*socket_path, req, headers);
-
-    if (!result.transport_ok) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               "Cancel-Job: transport failed");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokConnectFailed));
+    if (report_round_trip_failure(result, "Cancel-Job"))
         return 1;
-    }
-    if (result.http_status == 401 || result.http_status == 403) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
-                               "Cancel-Job: HTTP auth/forbidden");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "refused", kTokAccessDenied));
-        return 1;
-    }
-    if (!result.message) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               "Cancel-Job: response did not decode");
-        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokDecodeFailed));
-        return 1;
-    }
 
     const uint16_t status = result.message->op_or_status;
     const CancelStatusClass cls = classify_cancel_job_status(status);

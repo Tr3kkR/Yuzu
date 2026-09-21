@@ -20,6 +20,7 @@
 
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <ctime>
@@ -399,6 +400,23 @@ enum class OpenPrinterFailure { not_found, refused, error };
 /// allowlist on purpose: enumerating remote-capable name shapes is open-ended.
 [[nodiscard]] inline bool printer_name_is_plain_local(std::string_view name) noexcept {
     return name.find_first_of("\\/:") == std::string_view::npos;
+}
+
+/// Operation attributes of the Get-Jobs that lists ONE printer's not-completed
+/// jobs, asking only for the job ids. `clear_queue` sends it before Cancel-Job
+/// because cupsd's Cancel-Job looks a job up by id alone and ignores which
+/// printer was named. A nonexistent printer makes cupsd answer not-found.
+[[nodiscard]] inline std::vector<ipp::OperationAttr> job_binding_check_attrs(std::string_view printer) {
+    std::vector<ipp::OperationAttr> attrs;
+    attrs.push_back({ipp::kTagUri, "printer-uri", "ipp://localhost/printers/" + std::string(printer), {}});
+    attrs.push_back({ipp::kTagKeyword, "which-jobs", "not-completed", {}});
+    attrs.push_back({ipp::kTagKeyword, "requested-attributes", "job-id", {}});
+    return attrs;
+}
+
+/// True when `job_id` is one of the listed jobs.
+[[nodiscard]] inline bool job_is_listed(const std::vector<JobRow>& rows, int64_t job_id) noexcept {
+    return std::any_of(rows.begin(), rows.end(), [job_id](const JobRow& r) { return r.job_id == job_id; });
 }
 
 /// Accepts ONLY `^[0-9]{1,9}$` with value >= 1 — a printer job id is never

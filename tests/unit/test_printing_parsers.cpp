@@ -596,3 +596,47 @@ TEST_CASE("printer_name_is_plain_local: every remote-capable shape is not plain"
     CHECK_FALSE(printer_name_is_plain_local("Office/Floor2"));              // an interior slash
     CHECK_FALSE(printer_name_is_plain_local("HP: Floor 2"));                // a colon
 }
+
+// ─────────────────────────────────── job-to-printer binding (POSIX clear_queue) ──
+
+TEST_CASE("job_binding_check_attrs: lists ONE printer's not-completed jobs, asking only for job-id",
+          "[printing][binding]") {
+    const auto attrs = job_binding_check_attrs("Office-LaserJet");
+    REQUIRE(attrs.size() == 3);
+    CHECK(attrs[0].name == "printer-uri");
+    CHECK(attrs[0].value == "ipp://localhost/printers/Office-LaserJet");
+    CHECK(attrs[1].name == "which-jobs");
+    CHECK(attrs[1].value == "not-completed");
+    CHECK(attrs[2].name == "requested-attributes");
+    CHECK(attrs[2].value == "job-id");
+    CHECK(attrs[2].additional_values.empty());
+}
+
+TEST_CASE("job_is_listed: REAL CAPTURE macOS cupsd 2026-09-21 -- a printer's not-completed listing "
+          "holds exactly the jobs on it",
+          "[printing][binding]") {
+    // real_get_jobs_binding_check.ipp: Get-Jobs for scratch queue yuzu4616a, which held jobs 6 and 7
+    // (job 8 had been cancelled before the capture).
+    const auto bytes = read_fixture("real_get_jobs_binding_check.ipp");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    REQUIRE(decoded.has_value());
+    CHECK(classify_cancel_job_status(decoded->op_or_status) == CancelStatusClass::canceled);
+    const auto rows = jobs_from_ipp(*decoded);
+    REQUIRE(rows.size() == 2);
+    CHECK(job_is_listed(rows, 6));
+    CHECK(job_is_listed(rows, 7));
+    CHECK_FALSE(job_is_listed(rows, 8)); // cancelled: no longer in the not-completed listing
+    CHECK_FALSE(job_is_listed(rows, 1)); // never on this printer (or a job of another queue)
+    CHECK_FALSE(job_is_listed(rows, 0));
+}
+
+TEST_CASE("job binding: a nonexistent printer's REAL Get-Jobs answer classifies as not_found; an "
+          "empty listing lists nothing",
+          "[printing][binding]") {
+    const auto bytes = read_fixture("real_get_jobs_no_printer.ipp");
+    const auto decoded = ipp::decode(std::span<const uint8_t>(bytes));
+    REQUIRE(decoded.has_value());
+    CHECK(classify_cancel_job_status(decoded->op_or_status) == CancelStatusClass::not_found);
+    CHECK_FALSE(job_is_listed({}, 1));
+}
+

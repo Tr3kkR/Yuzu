@@ -234,7 +234,7 @@ spec:
       printer:
         type: string
         displayName: Printer Name
-        description: 'The printer the job is queued on.'
+        description: 'The printer the job is queued on. The job must be on this printer: a job id that belongs to a different printer, or a printer that does not exist, is reported as not_found and nothing is cancelled.'
         validation:
           minLength: 1
           maxLength: 256

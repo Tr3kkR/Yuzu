@@ -147,7 +147,7 @@
     }
   ],
   "description": "Printer/job inventory plus a single narrowly-scoped clear_queue cancellation",
-  "how_it_works": "`printers` and `jobs` are plain IPP reads: encode a request (RFC 8010, no libcups — `printing_ipp.hpp` is a from-scratch minimal codec), send it over the CUPS Unix domain socket (falling back to `localhost:631` over TCP when no socket is found), decode the response, and format the rows. On Windows the same two actions go through winspool (`EnumPrintersW`/`EnumJobsW`) instead of IPP; there is no libcups dependency on any platform. The plugin keeps no history: `jobs` only ever reports not-completed jobs, and nothing here retains a record of a job once it leaves the queue. `clear_queue` is the plugin's only mutation — it cancels exactly one job id (`SetJobW(JOB_CONTROL_CANCEL)` on Windows, IPP `Cancel-Job` over the same CUPS Unix socket on macOS/Linux), never a purge-all; a human resubmitting the document from their own application is the real-world path back, not a Yuzu dispatch.",
+  "how_it_works": "`printers` and `jobs` are plain IPP reads: encode a request (RFC 8010, no libcups — `printing_ipp.hpp` is a from-scratch minimal codec), send it over the CUPS Unix domain socket (falling back to `localhost:631` over TCP when no socket is found), decode the response, and format the rows. On Windows the same two actions go through winspool (`EnumPrintersW`/`EnumJobsW`) instead of IPP; there is no libcups dependency on any platform. The plugin keeps no history: `jobs` only ever reports not-completed jobs, and nothing here retains a record of a job once it leaves the queue. `clear_queue` is the plugin's only mutation — it cancels exactly one job id (`SetJobW(JOB_CONTROL_CANCEL)` on Windows, IPP `Cancel-Job` over the same CUPS Unix socket on macOS/Linux), never a purge-all; the named `printer` is bound to the job on every OS — Windows because the spooler itself looks the job up on that printer, macOS/Linux because the agent first lists that printer's not-completed jobs and only sends `Cancel-Job` for an id on the list (cupsd's own `Cancel-Job` looks a job up by id alone and ignores the printer, so a nonexistent printer name with a valid id would otherwise cancel that job and report success); a human resubmitting the document from their own application is the real-world path back, not a Yuzu dispatch.",
   "inputs": [
     {
       "constraints": {
@@ -156,7 +156,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.printing.clear_queue",
-      "description": "The printer the job is queued on.",
+      "description": "The printer the job is queued on. The job must be on this printer: a job id that belongs to a different printer, or a printer that does not exist, is reported as not_found and nothing is cancelled.",
       "name": "printer",
       "required": true,
       "type": "string"
@@ -478,7 +478,7 @@
       "completeness": "full",
       "provenance": "`windows:winspool:printer_not_found` (plain local names) — `linux:cups:not_found` / `macos:cups:not_found`",
       "status": "`UNAVAILABLE`",
-      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a plain local printer name (no path separator or colon); macOS/Linux cupsd's own `client-error-not-found` (IPP `0x0406`) response"
+      "when": "`clear_queue`: the target printer or job no longer exists — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a plain local printer name (no path separator or colon); macOS/Linux: the named printer does not exist (cupsd answers the pre-cancel `Get-Jobs` with `client-error-not-found`, IPP `0x0406`), or the job is not on that printer's not-completed queue (including a job that was already cancelled or completed), or cupsd's own `0x0406` from `Cancel-Job`"
     },
     {
       "completeness": "full",
