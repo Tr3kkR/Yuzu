@@ -1,0 +1,1 @@
+- app_control plugin: read-only Windows WDAC (registry CI\Policy) and AppLocker (CIM) application-control posture; Linux/macOS blanket unsupported (#282).
