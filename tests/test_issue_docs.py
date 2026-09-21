@@ -241,6 +241,17 @@ def main() -> int:
                     f"agents, never WHETHER."
                 )
 
+    # 1c. Every routed-concern table is @-imported by CLAUDE.md (so it loads into every session) and
+    # named in AGENTS.md (the only loader on the Codex/Kimi leg). A dropped or mistyped line would
+    # silently unload a table while every other gate stayed green.
+    claude_lines = (ROOT / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    agents_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for rel in ROUTED_CONCERN_FILES:
+        if f"@{rel}" not in claude_lines:
+            failures.append(f"CLAUDE.md does not @-import {rel}: that table would not load into any session.")
+        if f"`{rel}`" not in agents_text:
+            failures.append(f"AGENTS.md does not name {rel}: the Codex/Kimi leg would never open it.")
+
     # 2. do-not-close.txt parses clean
     dnc_path = ROOT / "scripts" / "tracker" / "do-not-close.txt"
     if not dnc_path.exists():
