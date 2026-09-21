@@ -2132,7 +2132,8 @@ distinguishes them; **owned by rung 1** (observe-only), not left open. (sre F3.)
 > every `watch()` would be refused: "looks healthy, can detect nothing".
 >
 > Rung 1 therefore ships an `inert` bit on `SparkMechanismStats`, set at `start()` by
-> each mechanism, and **excludes inert mechanisms from the `yuzu.spark_mechs` capability
+> each mechanism (File and Registry can also raise it at runtime, R5.7 (b)), and
+> **excludes inert mechanisms from the `yuzu.spark_mechs` capability
 > CSV** — so `yuzu_fleet_spark_mechanisms{os,mechanism}` now counts only mechanisms that
 > are registered **and functional**. Inert mechanisms still report their counters;
 > inertness suppresses the capability *claim*, not the telemetry.
@@ -2328,7 +2329,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
    **Shipped beyond the original rung-1 scope**, both added by the rung-1 governance
    rounds — the ladder must not be read as still deferring them:
    - **The `inert` bit** (§Inert-mechanism distinguishability). A mechanism that started
-     but could not bind its OS facility is excluded from the capability CSV. The earlier
+     but could not bind its OS facility is excluded from the capability CSV (File and
+     Registry can also raise it at runtime, R5.7 (b)). The earlier
      deferral to rung 2 was WITHDRAWN: inertness is known at `start()`, needs no arming,
      and deferring it shipped a live misreport on every containerised Linux agent
      (`libsystemd0` is installed, but a container has no system bus).
