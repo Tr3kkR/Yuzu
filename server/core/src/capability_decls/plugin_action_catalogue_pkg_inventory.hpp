@@ -14,10 +14,11 @@
 /// entry; none is minted here.
 ///
 /// Both actions are ReadOnly/None. Every leg is a zero-subprocess
-/// filesystem read (open/openat/readdir with O_NOFOLLOW over package-manager
-/// config and Homebrew Cellar/Caskroom directory names; see
-/// pkg_inventory_{linux,macos}_parsers.hpp); nothing spawns a package
-/// manager, and nothing writes, installs, or removes a package.
+/// filesystem read (open/openat/readdir with O_NOFOLLOW over Homebrew
+/// Library/Taps, Cellar and Caskroom directory names; see
+/// pkg_inventory_macos_parsers.hpp; the Linux `managers` leg follows as its
+/// own PR); nothing spawns a package manager, and nothing writes, installs, or
+/// removes a package.
 ///
 ///   `managers` — which package managers are present on this host, plus
 ///                manager-level configuration facts (machine scope only).

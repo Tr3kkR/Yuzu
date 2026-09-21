@@ -3,9 +3,9 @@ Package: P1c-2 (pkg_inventory leg tests), captured 2026-09-21.
 
 tree.manifest
   Status: REAL CAPTURE (formulae only; see Not exercised below)
-  host:     braga.local
+  host:     bare-metal Apple-silicon Mac
   os:       macOS 26.6.2 (Darwin 25.6.0), Apple silicon
-  identity: alex (uid 501, admin; /opt/homebrew is alex-owned, no privilege used)
+  identity: an ordinary non-root local user (uid 501), no privilege used
   command:  ls /opt/homebrew/Cellar/<formula> for each of the ten formulae below;
             ls -ld /opt/homebrew/Caskroom; ls /opt/homebrew/Library/Taps
   date:     2026-09-21

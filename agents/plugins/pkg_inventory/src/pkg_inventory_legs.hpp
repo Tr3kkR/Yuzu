@@ -8,8 +8,9 @@
  * peripherals_legs.hpp.
  *
  * Also holds the guarded POSIX walk primitives (`posix::`, bottom of the file)
- * the Linux and macOS walk shells share. They are excluded on Windows, so the
- * pure text/row layer (pkg_inventory_parsers.hpp) stays free of POSIX headers.
+ * the macOS walk shell uses and the Linux `managers` leg (which follows as its
+ * own PR) will share. They are excluded on Windows, so the pure text/row layer
+ * (pkg_inventory_parsers.hpp) stays free of POSIX headers.
  */
 #pragma once
 
@@ -90,8 +91,9 @@ inline void emit_result(yuzu::CommandContext& ctx, Action a,
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
 }
 
-/// The by-design unsupported outcomes (Linux `packages`, both Windows legs):
-/// `status|<action>|unsupported|<token>` and no data rows.
+/// The by-design unsupported and planned outcomes (Linux `packages`, the planned
+/// Linux `managers` leg, both Windows legs): `status|<action>|unsupported|<token>`
+/// and no data rows.
 inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_view token) {
     ctx.write_output(unsupported_status_row(action_name(a), token));
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
@@ -99,7 +101,8 @@ inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_vi
 
 // ── POSIX walk primitives (thin shell; not compiled on Windows) ──────────
 //
-// Shared by the Linux and macOS walk shells (pkg_inventory_{linux,macos}_parsers.hpp).
+// Used by the macOS walk shell (pkg_inventory_macos_parsers.hpp); the Linux
+// `managers` leg, which follows as its own PR, shares them.
 // Nothing here spawns a process: every read is open/openat/fstat/read/readdir
 // with O_NOFOLLOW on the leaf, so a swapped-in symlink is refused rather than
 // followed (private copies of the autoruns_macos.cpp open_dir_no_follow /

@@ -3,7 +3,9 @@
  *
  * Actions:
  *   "managers" — which package managers are present on this host and their
- *                manager-level configuration facts (row PR10.1-c).
+ *                manager-level configuration facts (row PR10.1-c). macOS
+ *                Homebrew ships in this release; the Linux and Windows legs are
+ *                PLANNED placeholders (see below).
  *   "packages" — macOS Homebrew formulae and casks (Cellar/Caskroom directory
  *                names). Linux is UNSUPPORTED by construction (see below);
  *                Windows is a PLANNED placeholder.
@@ -12,23 +14,25 @@
  * user installs, cargo, per-user Homebrew) are out of scope and deferred to
  * the user-context-bridge session helper (PR1.8).
  *
- * LINUX SHRINK (Alex, 2026-09-19). The Linux leg reports package-manager
+ * LINUX SHRINK (2026-09-19). The Linux leg is scoped to package-manager
  * identity/presence and manager-level config facts ONLY. It never enumerates an
  * individual package in any form: installed_apps.get_inventory_linux already
  * covers dpkg + rpm + pacman + apk, so `packages` is UNSUPPORTED on Linux by
- * design rather than a second, drifting roster.
+ * design rather than a second, drifting roster. That identity/config `managers`
+ * leg follows as its own PR; until it lands, Linux `managers` reports the
+ * PLANNED token.
  *
  * ZERO SUBPROCESSES. Every read is a filesystem read (open/openat/readdir with
- * O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / brew / winget is spawned
- * and /var/lib/dpkg/status is never opened.
+ * O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / brew / winget is spawned.
  *
  * Every walk takes an injected root (production passes "/") so the unit suite
- * can drive it over a fixture tree; the per-OS leg TUs are one-line wrappers.
+ * can drive it over a fixture tree; the macOS leg TU is a one-line wrapper.
  *
  * All six per-OS legs are declared unconditionally so the capability-matrix
  * generator (#2204) sees a complete, stable shape whichever OS built the
- * plugin. The Windows legs are PLANNED placeholders: the Chocolatey walk and
- * winget presence follow as their own PR.
+ * plugin. The Windows legs and the Linux `managers` leg are PLANNED
+ * placeholders: the Chocolatey walk and winget presence, and the Linux manager
+ * identity/config walk, each follow as their own PR.
  *
  * Read-only: no action here mutates host state.
  */
@@ -50,11 +54,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "managers",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1,
+        {YUZU_SUPPORT_PLANNED, 1,
          "tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d "
          "count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, "
          "/etc/apk/repositories + /etc/apk/arch",
-         nullptr},
+         "follows as its own PR"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Homebrew prefix layout: Library/Taps, Cellar, Caskroom",
          nullptr},

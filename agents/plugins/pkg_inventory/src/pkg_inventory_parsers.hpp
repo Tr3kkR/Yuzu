@@ -10,9 +10,12 @@
  * SCOPE (row PR10.1-c; charter and the Linux "shrink" ruling of 2026-09-19 are
  * quoted in the roadmap). MACHINE-SCOPE package-manager state only: per-user
  * package stores (npm/pip/cargo/per-user Homebrew) are out of scope and
- * deferred to the user-context-bridge session helper. The Linux leg reports
- * manager identity/presence and manager-level config facts and NEVER a package
- * roster (installed_apps.get_inventory_linux owns that).
+ * deferred to the user-context-bridge session helper. This release ships the
+ * macOS Homebrew legs; the Linux `managers` leg (manager identity/presence and
+ * manager-level config facts) follows as its own PR and reports the PLANNED
+ * token until then. Linux never reports a package roster
+ * (installed_apps.get_inventory_linux owns that), so Linux `packages` is
+ * UNSUPPORTED by design.
  *
  * WIRE GRAMMAR. Every action writes the status row FIRST, then data rows:
  *
@@ -45,7 +48,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace yuzu::pkg_inventory {
 
@@ -73,6 +75,9 @@ struct Limits {
 
 // ── fixed vocabularies (emitted verbatim, never through safe_output_field) ──
 
+/// The full manager-name vocabulary (a wire contract; the definition lists every
+/// value). Only `homebrew` is emitted today: the Linux names are produced by
+/// the Linux `managers` leg, which follows as its own PR.
 enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew };
 
 [[nodiscard]] constexpr std::string_view manager_name(Manager m) noexcept {
@@ -125,8 +130,9 @@ enum class StatusLevel { supported, constrained, unsupported };
 
 // ── tokens ───────────────────────────────────────────────────────────────
 
-/// Fixed tokens for the two by-design unsupported outcomes.
+/// Fixed tokens for the by-design unsupported outcomes and the planned legs.
 inline constexpr std::string_view kTokenLinuxPackagesOwned = "linux:owned_by_installed_apps";
+inline constexpr std::string_view kTokenLinuxPlanned = "linux:planned";
 inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
 
 /// True when `t` matches ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$.
@@ -217,9 +223,8 @@ status_row(std::string_view action, const yuzu::shared::ConstraintAccumulator& a
 }
 
 /// Builder for the `facts` field: `k=v;k=v`, or "-" when empty. Keys and
-/// values here are validated tokens and counts by construction (arch tokens
-/// pass arch_token_ok, counts are integers); the whole field still goes
-/// through safe_output_field in format_manager_row.
+/// values here are fixed tokens and counts by construction; the whole field
+/// still goes through safe_output_field in format_manager_row.
 class Facts {
 public:
     void add(std::string_view key, std::string_view value) {
@@ -272,100 +277,7 @@ private:
     return out;
 }
 
-// ── pure text parsers ────────────────────────────────────────────────────
-
-namespace detail {
-
-[[nodiscard]] inline std::string_view trim(std::string_view s) noexcept {
-    const auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
-    while (!s.empty() && is_ws(s.front())) s.remove_prefix(1);
-    while (!s.empty() && is_ws(s.back())) s.remove_suffix(1);
-    return s;
-}
-
-/// Calls fn(trimmed_line) for every nonblank, non-`#`-comment line.
-template <typename Fn>
-void for_each_content_line(std::string_view text, Fn&& fn) {
-    std::size_t pos = 0;
-    while (pos <= text.size()) {
-        const auto nl = text.find('\n', pos);
-        const auto line =
-            trim(text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
-        if (!line.empty() && line.front() != '#') fn(line);
-        if (nl == std::string_view::npos) break;
-        pos = nl + 1;
-    }
-}
-
-} // namespace detail
-
-/// Number of nonblank, non-`#`-comment lines (pacman.conf, dnf.conf,
-/// pacman mirrorlist `Server =` lines, apt one-line sources.list entries).
-[[nodiscard]] inline std::size_t count_nonblank_noncomment_lines(std::string_view text) {
-    std::size_t n = 0;
-    detail::for_each_content_line(text, [&](std::string_view) { ++n; });
-    return n;
-}
-
-/// A dpkg/apk architecture token: 1..32 chars of [a-z0-9_-] (amd64, arm64,
-/// i386, armhf, x86_64, aarch64, ...). The underscore is required: apk's
-/// /etc/apk/arch carries `x86_64`.
-[[nodiscard]] inline bool arch_token_ok(std::string_view t) noexcept {
-    if (t.empty() || t.size() > 32) return false;
-    return std::all_of(t.begin(), t.end(), [](char c) {
-        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
-    });
-}
-
-struct ArchParse {
-    std::vector<std::string> arches; ///< valid tokens, first-seen order, de-duplicated
-    std::size_t rejected = 0;        ///< content lines that were not a valid token
-};
-
-/// /var/lib/dpkg/arch: one architecture per line (native first, then foreign;
-/// the file is created by the first `dpkg --add-architecture` and is absent on
-/// a stock image). The same one-token-per-line grammar covers /etc/apk/arch.
-/// A malformed line is counted in `rejected` (the caller turns that into a
-/// constrained token), never silently dropped.
-[[nodiscard]] inline ArchParse parse_dpkg_arch_file(std::string_view text) {
-    ArchParse out;
-    detail::for_each_content_line(text, [&](std::string_view line) {
-        if (!arch_token_ok(line)) {
-            ++out.rejected;
-            return;
-        }
-        std::string s{line};
-        if (std::find(out.arches.begin(), out.arches.end(), s) == out.arches.end())
-            out.arches.push_back(std::move(s));
-    });
-    return out;
-}
-
-[[nodiscard]] inline std::string join_arches(const std::vector<std::string>& arches) {
-    std::string out;
-    for (const auto& a : arches) {
-        if (!out.empty()) out += ',';
-        out += a;
-    }
-    return out;
-}
-
-struct ApkRepositories {
-    std::size_t count = 0;  ///< repository lines
-    std::size_t tagged = 0; ///< lines pinned with a leading `@tag`
-};
-
-/// /etc/apk/repositories: one repository per line, optionally `@tag URL`.
-/// Only COUNTS are returned -- repository URLs may embed credentials and are
-/// never surfaced.
-[[nodiscard]] inline ApkRepositories parse_apk_repositories(std::string_view text) {
-    ApkRepositories out;
-    detail::for_each_content_line(text, [&](std::string_view line) {
-        ++out.count;
-        if (line.front() == '@') ++out.tagged;
-    });
-    return out;
-}
+// ── pure name validation ─────────────────────────────────────────────────
 
 /// True when `name` is an acceptable Homebrew directory name at the formula /
 /// cask / version level (Cellar/<formula>/<version>, Caskroom/<cask>/<version>,
@@ -380,11 +292,6 @@ struct ApkRepositories {
         const auto u = static_cast<unsigned char>(c);
         return u >= 0x20 && u < 0x7f && c != '/' && c != '\\' && c != '|';
     });
-}
-
-/// File-name suffix test used for the apt/dnf source counts.
-[[nodiscard]] inline bool has_suffix(std::string_view name, std::string_view suffix) noexcept {
-    return name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
 }
 
 } // namespace yuzu::pkg_inventory

@@ -16,8 +16,7 @@
  * real "absent" / "exists but empty" readings; cask ROWS and non-zero tap counts
  * are not exercised against real data by this TU (see provenance.txt).
  *
- * MATERIALIZER: same scheme as test_pkg_inventory_linux_parsers.cpp (copied, not
- * shared): `<relpath><TAB><payload>`, payload `T:<text; escapes \n \t \\>` |
+ * MATERIALIZER: `<relpath><TAB><payload>`, payload `T:<text; escapes \n \t \\>` |
  * `D:` (directory) | `L:<target>` (symlink); '#' lines are comments. This tree
  * uses `D:` only, because the capture is a listing of directories.
  *

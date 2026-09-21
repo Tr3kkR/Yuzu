@@ -18,6 +18,9 @@
  *    ZERO `package|` rows, UNAVAILABLE/PARTIAL typed status (Linux never
  *    enumerates a package; installed_apps owns the roster). MUTATION: if the
  *    Linux leg ever emitted a package row, or the token changed, this fails;
+ *  - Linux `managers`: exactly `status|managers|unsupported|linux:planned` and
+ *    nothing else, UNAVAILABLE/PARTIAL typed status (the leg is a planned
+ *    placeholder; the real leg follows as its own PR and replaces this case);
  *  - Windows: both actions exactly `status|<action>|unsupported|windows:planned`
  *    and nothing else (the legs are planned placeholders);
  *  - macOS: when /opt/homebrew/Cellar holds a well-named version directory the
@@ -306,14 +309,19 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
         CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
-    // `managers` reads the host: never a `package|` row, whatever is installed.
+    // `managers` is a planned placeholder: the status row and nothing else.
     {
         const auto result = dispatcher.run(plugin->descriptor, "managers");
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
-        REQUIRE_FALSE(rows.empty());
-        CHECK(starts_with(rows[0], "status|managers|"));
-        CHECK(count_rows_with_prefix(rows, "package|") == 0);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "status|managers|unsupported|linux:planned");
+        CHECK(rows[0] == std::string{"status|managers|unsupported|"} +
+                             std::string{kTokenLinuxPlanned});
+        CHECK(count_rows_with_prefix(rows, "manager|") == 0);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "linux:planned");
     }
 #elif defined(__APPLE__)
     // Values read from the real host (guarded on its own Homebrew, no counts or
