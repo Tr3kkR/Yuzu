@@ -1,0 +1,47 @@
+REAL CAPTURE - winget --version under two identities (verbatim; the one path segment naming the user profile folder is redacted to jsmith)
+=====================================================================================================================
+Host ..... the-rig (Windows 11 Pro 10.0.26200, build 26200.9457, 25H2)
+Date ..... 2026-09-21, local time +01:00
+Purpose .. evidence for whether a package-manager probe can rely on winget when the agent runs as LocalSystem. A failure is a valid result; no workaround was attempted.
+Probe .... helper wg_probe.cmd <outdir> : `where winget` then `winget --version`, stdout/stderr redirected to files, errorlevel echoed; plus PowerShell Get-Command winget.
+           (winget_probe.ps1 -Tag <interactive|system>; bounded by a 120 s wait; exit codes below are the cmd errorlevels.)
+
+(a) INTERACTIVE USER - the account the ssh session runs as (name withheld); elevated administrator token (High Mandatory Level)
+    run 2026-09-21 19:15:06 (an identical first run at 19:14:33 differed only in a cosmetic log line; outputs below are from the later run)
+    where winget          errorlevel 0
+      stdout:
+      | C:\Users\jsmith\AppData\Local\Microsoft\WindowsApps\winget.exe
+      stderr:
+      | (empty)
+    winget --version      errorlevel 0
+      stdout:
+      | v1.29.290
+      stderr:
+      | (empty)
+    Get-Command winget | Format-List Name,CommandType,Source,Version
+      | Name        : winget.exe
+      | CommandType : Application
+      | Source      : C:\Users\jsmith\AppData\Local\Microsoft\WindowsApps\winget.exe
+      | Version     : 0.0.0.0
+    => winget resolves to …\AppData\Local\Microsoft\WindowsApps\winget.exe (a path under the user's profile) and runs: v1.29.290, errorlevel 0.
+
+(b) NT AUTHORITY\SYSTEM - scheduled task w10-edge-capture-system-winget (-UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest; state Ready before start; task result 0)
+    run 2026-09-21 19:16:23
+    where winget          errorlevel 1
+      stdout:
+      | (empty)
+      stderr:
+      | INFO: Could not find files for the given pattern(s).
+    winget --version      errorlevel 9009
+      stdout:
+      | (empty)
+      stderr:
+      | 'winget' is not recognized as an internal or external command,
+      | operable program or batch file.
+    Get-Command winget:
+      | Get-Command ERROR: System.Management.Automation.CommandNotFoundException: The term 'winget' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+    => under LocalSystem winget is NOT found: where exits 1, `winget --version` exits 9009
+       ('not recognized'), Get-Command throws CommandNotFoundException. No attempt was made to locate a winget.exe elsewhere or to alter PATH (the cause is not investigated here).
+
+Side effect noted: each interactive `winget --version` made winget write its own small diagnostic log (two files of ~785 bytes) under the interactive user's profile
+(Microsoft.DesktopAppInstaller LocalState\DiagOutputDir). Outside the session directory, so left in place (see the session cleanup record).

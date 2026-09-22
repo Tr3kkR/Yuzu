@@ -1,0 +1,11 @@
+{
+  "_provenance": "SYNTHETIC -- Alex sign-off 2026-09-21 (run-context.md Phase-0 item 2); shape mirrors the real Edge capture's extension manifest.json. Fabricated.",
+  "manifest_version": 3,
+  "name": "Synthetic Enabled Extension",
+  "version": "1.0.0",
+  "description": "A fabricated extension manifest used only to exercise browser_inventory_parsers.hpp's manifest.name/version reads.",
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "service_worker.js"
+  }
+}

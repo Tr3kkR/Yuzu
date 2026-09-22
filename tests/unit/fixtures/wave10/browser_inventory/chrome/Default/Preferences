@@ -1,0 +1,13 @@
+{
+  "_provenance": "SYNTHETIC -- Alex sign-off 2026-09-21 (run-context.md Phase-0 item 2); mirrors the real Edge capture's Default/Preferences shape (extensions key present, but extensions.settings absent -- see tests/unit/fixtures/wave10/browser_inventory/edge/provenance.txt 'which file carries extensions.settings'). Fabricated values.",
+  "extensions": {
+    "alerts": {
+      "initialized": true
+    },
+    "last_chrome_version": "128.0.6613.120",
+    "pinned_extensions": []
+  },
+  "protection": {
+    "macs": {}
+  }
+}

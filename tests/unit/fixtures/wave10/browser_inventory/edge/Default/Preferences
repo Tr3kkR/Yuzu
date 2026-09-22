@@ -1,0 +1,39 @@
+{
+  "extensions": {
+    "alerts": {
+      "initialized": true
+    },
+    "chrome_url_overrides": {},
+    "cws_info_fetch_error_timestamp": "13355405469682417",
+    "edge_default_installed_cws_extensions_update_frequency": 9,
+    "install_signature": {
+      "expire_date": "2024-12-25",
+      "ids": [
+        "ghbmnnjooekpmoecnnnilnnbdlolhkhi"
+      ],
+      "invalid_ids": [],
+      "salt": "REDACTED",
+      "signature": "REDACTED",
+      "signature_format_version": 2,
+      "timestamp": "13372371181061450"
+    },
+    "last_chrome_version": "150.0.4078.65",
+    "microsoft_install_signature": {
+      "expire_date": "2024-01-18",
+      "ids": [
+        "jmjflgjpcpepeafmmgdpfkogkghcpiha"
+      ],
+      "invalid_ids": [],
+      "salt": "REDACTED",
+      "signature": "REDACTED",
+      "signature_format_version": 2,
+      "timestamp": "13342787770068027"
+    },
+    "pdf_upsell_triggered": false,
+    "pinned_extension_migration": true,
+    "pinned_extensions": []
+  },
+  "protection": {
+    "macs": {}
+  }
+}
