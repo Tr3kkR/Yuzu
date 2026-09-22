@@ -327,6 +327,23 @@ TEST_CASE("parse_dmi_sysfs: unreadable vs malformed", "[firmware_posture][dmi]")
     CHECK_FALSE(parse_dmi_sysfs({{"bios_release", "1.2\n"}}).release_malformed);
 }
 
+// A failed bios_release read (EACCES/oversized) must report the same as the other three DMI
+// fields -- a row saying `unreadable`, not silence. Fails under: bios_release's row vanishing
+// entirely on a read failure while its sibling fields correctly emit `unreadable`.
+TEST_CASE("parse_dmi_sysfs: an unreadable bios_release still gets a row", "[firmware_posture][dmi]") {
+    auto files = kDmiPopulated;
+    files.erase("bios_release");
+    const auto d = parse_dmi_sysfs(files, {"bios_release"});
+    CHECK(d.release_unreadable);
+    CHECK_FALSE(d.bios_major.has_value());
+    const auto rows = dmi_rows(d);
+    REQUIRE(rows.size() == 4);
+    CHECK(row_str(rows[3]) == "firmware|bios_release|unreadable|dmi");
+    // A genuinely absent bios_release (not in unreadable_keys either) still emits no row at all
+    // -- the pre-existing, correct "absent" shape for this field is unchanged.
+    CHECK(dmi_rows(parse_dmi_sysfs(files)).size() == 3);
+}
+
 // RECONSTRUCTED Win32_BIOS row (ASSUMED SHAPE). BIOSVersion is array-typed and never reaches a row.
 // Fails under: the Windows shell's WMI namespace/class-absent and empty-result paths going back to
 // silently adding no row (the earlier, contract-violating shape: absence must be a row, not silence).
@@ -371,6 +388,15 @@ TEST_CASE("normalize_release_date: a shape match with no real calendar date is l
     CHECK(normalize_release_date("02/29/1900") == "02/29/1900");   // divisible by 100, not 400: not leap
     CHECK(normalize_release_date("20241340000000.000000+000") == "20241340000000.000000+000"); // month 13
     CHECK(normalize_release_date("20240000000000.000000+000") == "20240000000000.000000+000"); // month 0, day 0
+}
+
+// Fails under: matching the CIM-datetime shape on the '.'/sign framing alone and reformatting
+// even though the fractional-second or UTC-offset digit block is garbage.
+TEST_CASE("normalize_release_date: CIM-datetime fractional-second and UTC-offset digits are validated",
+          "[firmware_posture]") {
+    CHECK(normalize_release_date("20240314000000.XXXXXX+000") == "20240314000000.XXXXXX+000"); // fractional block garbage
+    CHECK(normalize_release_date("20240314000000.000000+XXX") == "20240314000000.000000+XXX"); // offset block garbage
+    CHECK(normalize_release_date("20240314000000.000000-000") == "2024-03-14"); // '-' offset still valid
 }
 
 // ── read classification and the shared verdict ───────────────────────────

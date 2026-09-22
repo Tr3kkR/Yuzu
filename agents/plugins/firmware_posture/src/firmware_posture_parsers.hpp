@@ -249,9 +249,14 @@ inline bool valid_calendar_date(unsigned year, unsigned month, unsigned day) noe
             return s.substr(6, 4) + '-' + s.substr(0, 2) + '-' + s.substr(3, 2);
         return s;
     }
-    // CIM datetime: 14 digits, '.', 6 digits, sign, 3 digits
+    // CIM datetime: 14 digits, '.', 6 digits, sign, 3 digits. The fractional-second and
+    // UTC-offset digit blocks are validated too (not just the '.'/sign framing) -- otherwise a
+    // string with the right punctuation in the right places but garbage in either block still
+    // matched and got silently reformatted, never falling through to the "return unchanged"
+    // fallback this function documents for anything that doesn't actually parse.
     if (s.size() == 25 && detail::all_digits(std::string_view{s}.substr(0, 14)) && s[14] == '.' &&
-        (s[21] == '+' || s[21] == '-')) {
+        detail::all_digits(s.substr(15, 6)) && (s[21] == '+' || s[21] == '-') &&
+        detail::all_digits(s.substr(22, 3))) {
         const auto yr = *detail::to_uint(s.substr(0, 4));
         const auto mo = *detail::to_uint(s.substr(4, 2));
         const auto dy = *detail::to_uint(s.substr(6, 2));
@@ -359,11 +364,16 @@ struct Smbios0Result {
     return bad("smbios:no_type0");
 }
 
-/// vendor/version/release_date always (absent when no string); the rest only when specified.
+/// vendor/version/release_date always (absent when no string); the rest only when specified,
+/// UNLESS `unreadable` says the read itself failed (DMI's bios_release only -- SMBIOS's binary
+/// major/minor bytes have no separate read step to fail, so its call site never sets this).
 inline void add_release(std::vector<FirmwareRow>& out, const char* field, std::optional<unsigned> major,
-                        std::optional<unsigned> minor, std::string_view source) {
+                        std::optional<unsigned> minor, std::string_view source,
+                        bool unreadable = false) {
     if (major && minor)
         out.push_back({field, std::to_string(*major) + '.' + std::to_string(*minor), std::string{source}});
+    else if (unreadable)
+        out.push_back({field, std::string{kUnreadable}, std::string{source}});
 }
 
 [[nodiscard]] inline std::vector<FirmwareRow> smbios_rows(const Smbios0& d,
@@ -383,6 +393,7 @@ struct DmiInfo {
     Field vendor, version, release_date;
     std::optional<unsigned> bios_major, bios_minor;
     bool release_malformed = false; // bios_release present but not `<n>.<n>`: token dmi:bios_release
+    bool release_unreadable = false; // bios_release read itself failed (EACCES/oversized/etc.)
 };
 
 /// `files` maps a /sys/class/dmi/id file name (bios_vendor, bios_version, bios_date,
@@ -398,6 +409,8 @@ struct DmiInfo {
     pick("bios_vendor", d.vendor);
     pick("bios_version", d.version);
     pick("bios_date", d.release_date);
+    d.release_unreadable = std::find(unreadable_keys.begin(), unreadable_keys.end(), "bios_release") !=
+                            unreadable_keys.end();
     auto it = files.find("bios_release");
     if (it != files.end()) {
         const std::string v = detail::rtrim(it->second);
@@ -422,7 +435,7 @@ struct DmiInfo {
     out.push_back(field_row("vendor", d.vendor, kSrcDmi));
     out.push_back(field_row("version", d.version, kSrcDmi));
     out.push_back(date_row(d.release_date, kSrcDmi));
-    add_release(out, "bios_release", d.bios_major, d.bios_minor, kSrcDmi);
+    add_release(out, "bios_release", d.bios_major, d.bios_minor, kSrcDmi, d.release_unreadable);
     return out;
 }
 
