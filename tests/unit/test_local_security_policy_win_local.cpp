@@ -128,12 +128,21 @@ TEST_CASE("local_security_policy win-local: password_policy, with agent.data_dir
     // dest_dir_acl/dest_dir_create/dest_dir_open counted as an acceptable
     // constrained outcome -- those are this test HARNESS's own setup failing,
     // not a real secedit result, and must fail loud rather than pass quiet.
+    // Also excluded: data_dir_unset and secedit:spawn_error both fire BEFORE
+    // the real secedit child process ever runs (the former is the init()-not-
+    // called guard this test deliberately bypasses above; the latter is a
+    // runner-level spawn failure) -- accepting either here would let a future
+    // regression (e.g. a typo'd config key breaking init()) keep this test
+    // green while silently losing the live-spawn coverage it exists to prove.
     const bool has_success_row = any_row_starts_with(rows, "password_policy|");
     const bool has_dest_dir_token = any_row_starts_with(rows, "constrained|dest_dir_");
+    const bool has_pre_spawn_token = any_row_starts_with(rows, "constrained|data_dir_unset") ||
+                                     any_row_starts_with(rows, "constrained|secedit:spawn_error");
     const bool has_other_constrained_row =
-        any_row_starts_with(rows, "constrained|") && !has_dest_dir_token;
+        any_row_starts_with(rows, "constrained|") && !has_dest_dir_token && !has_pre_spawn_token;
     CAPTURE(result.captured);
     CHECK_FALSE(has_dest_dir_token);
+    CHECK_FALSE(has_pre_spawn_token);
     CHECK((has_success_row || has_other_constrained_row));
     if (has_success_row)
         CHECK(result.rc == 0);
