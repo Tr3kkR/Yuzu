@@ -613,11 +613,11 @@ implementation is.
 | registry | list_profiles | macos | unsupported | - | - | - |
 | registry | list_profiles | windows | supported | 1 | win32_registry | - |
 | runtimes | dotnet | linux | supported | 1 | /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk | - |
-| runtimes | dotnet | macos | planned | 1 | /usr/local/share/dotnet/shared walk | follows as its own PR (peripherals PR9.1a2 precedent) |
-| runtimes | dotnet | windows | planned | 1 | NDP release-key table + dotnet InstalledVersions + Program Files walk | follows as its own PR (peripherals PR9.1a2 precedent) |
+| runtimes | dotnet | macos | planned | 1 | /usr/local/share/dotnet/shared walk | planned; the action answers a single unsupported status row on this OS |
+| runtimes | dotnet | windows | planned | 1 | NDP release-key table + dotnet InstalledVersions + Program Files walk | planned; the action answers a single unsupported status row on this OS |
 | runtimes | jvm | linux | supported | 1 | /usr/lib/jvm/*/release + /opt/java/*/release file reads | - |
-| runtimes | jvm | macos | planned | 1 | /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | follows as its own PR (peripherals PR9.1a2 precedent) |
-| runtimes | jvm | windows | planned | 1 | JavaSoft keys + Program Files\\Java walk | follows as its own PR (peripherals PR9.1a2 precedent) |
+| runtimes | jvm | macos | planned | 1 | /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | planned; the action answers a single unsupported status row on this OS |
+| runtimes | jvm | windows | planned | 1 | JavaSoft keys + Program Files\\Java walk | planned; the action answers a single unsupported status row on this OS |
 | sccm | client_version | linux | unsupported | - | - | - |
 | sccm | client_version | macos | unsupported | - | - | - |
 | sccm | client_version | windows | supported | 1 | registry+scm | - |

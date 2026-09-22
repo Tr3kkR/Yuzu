@@ -37,10 +37,10 @@ flowchart LR
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`dotnet` / Windows** — follows as its own PR (peripherals PR9.1a2 precedent)
-- **`dotnet` / macOS** — follows as its own PR (peripherals PR9.1a2 precedent)
-- **`jvm` / Windows** — follows as its own PR (peripherals PR9.1a2 precedent)
-- **`jvm` / macOS** — follows as its own PR (peripherals PR9.1a2 precedent)
+- **`dotnet` / Windows** — planned; the action answers a single unsupported status row on this OS
+- **`dotnet` / macOS** — planned; the action answers a single unsupported status row on this OS
+- **`jvm` / Windows** — planned; the action answers a single unsupported status row on this OS
+- **`jvm` / macOS** — planned; the action answers a single unsupported status row on this OS
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -82,7 +82,7 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<r
 |---|---|---|---|---|---|
 | `row_kind` | string | `status` `jvm` | Linux | `jvm` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found). |
 | `flavour` | string | `jdk` `jre` `unmodelled` | Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — the Debian OpenJDK release file has no IMAGE_TYPE — and the path gives no hint; never guessed). Status rows: the action name. |
-| `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. Status rows: the level (supported, constrained or unsupported). |
+| `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint. Status rows: the level (supported, constrained or unsupported). |
 | `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory (the directory holding the release file). Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), or "-" when the key is absent. |
 <!-- END GENERATED -->
@@ -107,7 +107,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash cb47e7132f69
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash cb47e7132f69
 
 ```
 == action=dotnet

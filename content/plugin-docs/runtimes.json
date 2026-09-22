@@ -13,13 +13,13 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "follows as its own PR (peripherals PR9.1a2 precedent)",
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
           "mechanism": "/usr/local/share/dotnet/shared walk",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
-          "fallback": "follows as its own PR (peripherals PR9.1a2 precedent)",
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
           "mechanism": "NDP release-key table + dotnet InstalledVersions + Program Files walk",
           "rung": "1",
           "support": "planned"
@@ -39,13 +39,13 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "follows as its own PR (peripherals PR9.1a2 precedent)",
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
           "mechanism": "/Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
-          "fallback": "follows as its own PR (peripherals PR9.1a2 precedent)",
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
           "mechanism": "JavaSoft keys + Program Files\\\\Java walk",
           "rung": "1",
           "support": "planned"
@@ -54,7 +54,7 @@
     }
   ],
   "caveats": [
-    "**macOS and Windows legs planned — each follows as its own PR.** Only the Linux leg ships here; on macOS and Windows every action answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with those legs, and the flavour vocabulary above is the Linux subset until then.",
+    "**macOS and Windows legs are planned.** Only the Linux leg ships; on macOS and Windows every action reads nothing and answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with the Windows leg, and the flavour vocabulary above is the Linux subset until then.",
     "**Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.",
     "**Only standard locations are walked.** A runtime installed elsewhere (a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles."
   ],
@@ -64,7 +64,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports installed .NET (Core/5+) shared frameworks and SDKs on Linux: one row per framework version or SDK version found under the standard install roots (flavour, version, install path), from directory names only — no `dotnet` process is started. A `supported` status with no rows means none is installed; a `constrained` status means a read failed and the list may be incomplete. macOS and Windows: planned — follows as its own PR (peripherals PR9.1a2 precedent); those hosts answer a single `status|dotnet|unsupported|<macos|windows>:planned` row.",
+      "description": "Reports installed .NET (Core/5+) shared frameworks and SDKs on Linux: one row per framework version or SDK version found under the standard install roots (flavour, version, install path), from directory names only — no `dotnet` process is started. A `supported` status with no rows means none is installed; a `constrained` status means a read failed and the list may be incomplete. macOS and Windows: planned; the action answers a single unsupported status row on this OS (`status|dotnet|unsupported|<macos|windows>:planned`).",
       "display_name": ".NET Runtime Inventory",
       "execute_roles": [
         "endpoint-admin",
@@ -85,7 +85,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports installed Java runtimes on Linux: one row per JDK/JRE home that carries a `release` metadata file (under /usr/lib/jvm/* and /opt/java/*) — flavour (jdk, jre, unmodelled), version, install path and vendor (the `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian vs Oracle, which is what tells an OpenJDK build from an Oracle JDK). No `java` process is started. A `supported` status with no rows means none is installed; a `constrained` status means a read failed and the list may be incomplete. macOS and Windows: planned — follows as its own PR (peripherals PR9.1a2 precedent); those hosts answer a single `status|jvm|unsupported|<macos|windows>:planned` row.",
+      "description": "Reports installed Java runtimes on Linux: one row per JDK/JRE home that carries a `release` metadata file (under /usr/lib/jvm/* and /opt/java/*) — flavour (jdk, jre, unmodelled), version, install path and vendor (the `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian vs Oracle, which is what tells an OpenJDK build from an Oracle JDK). No `java` process is started. A `supported` status with no rows means none is installed; a `constrained` status means a read failed and the list may be incomplete. macOS and Windows: planned; the action answers a single unsupported status row on this OS (`status|jvm|unsupported|<macos|windows>:planned`).",
       "display_name": "JVM Inventory",
       "execute_roles": [
         "endpoint-admin",
@@ -206,7 +206,7 @@
           ]
         },
         {
-          "description": "JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; \"-\" when neither is present. Status rows: the level (supported, constrained or unsupported).",
+          "description": "JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint. Status rows: the level (supported, constrained or unsupported).",
           "example": "17.0.20",
           "name": "version",
           "platforms": [
@@ -251,19 +251,19 @@
       "if_refused": "`status|<action>|unsupported|windows:planned`, result status `UNAVAILABLE`",
       "measured": "n/a",
       "os": "Windows",
-      "runs_as": "n/a — leg planned"
+      "runs_as": "n/a — the leg reads nothing (caveat 1)"
     },
     {
       "grant": "n/a",
       "if_refused": "`status|<action>|unsupported|macos:planned`, result status `UNAVAILABLE`",
       "measured": "n/a",
       "os": "macOS",
-      "runs_as": "n/a — leg planned"
+      "runs_as": "n/a — the leg reads nothing (caveat 1)"
     },
     {
-      "grant": "None — the install roots and `release` files are world-readable on stock distributions",
+      "grant": "None expected — stock install trees under `/usr` and `/opt` are world-readable (0755 directories, 0644 `release` files); not measured as `yuzu` (see Measured)",
       "if_refused": "`status|<action>|constrained|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it",
-      "measured": "container captures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture is `docs/samples/linux.txt`",
+      "measured": "fixture captures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture `docs/samples/linux.txt` ran as `euid 0` in a container, so the unprivileged read is asserted from file modes, not observed",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`)"
     }
@@ -326,7 +326,7 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-21",
+        "date": "2026-09-22",
         "host_class": "container",
         "leg_hash": "cb47e7132f69",
         "os": "linux",

@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash cb47e7132f69
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash cb47e7132f69
 == action=dotnet
 status|dotnet|supported|-
 [result_status] OK / FULL / 
