@@ -10,13 +10,24 @@
   `home_cluster_id`, distinct from the ephemeral `cluster_id`/`gateway_node` that
   `register_fresh` resets on every fresh registration: `announce_connected` refuses,
   atomically, any session-matched claim whose `cluster_id` differs from an
-  already-bound `home_cluster_id`, and `NotifyStreamStatus`'s CONNECTED handler
-  refuses the whole notification outright before publishing anything — to the durable
-  row or the in-memory dispatch path — on a definitive conflict. A first-ever
-  connection still binds its cluster on trust (TOFU); re-homing to a genuinely
-  different cluster requires either the prior cluster having been unreachable long
-  enough for the existing stale-route reaper to clear the affinity, or an explicit
-  operator `GatewayRouteStore::clear_cluster_affinity` action. Single-cluster
+  already-bound `home_cluster_id`, and `NotifyStreamStatus`'s CONNECTED handler adds a
+  read-only pre-check that refuses the whole notification before publishing anything,
+  for the common case; on a defensive-in-depth definitive write-time conflict (the
+  pre-check missed it, e.g. under a transient store degradation) the already-published
+  in-memory placement is reverted rather than left live. A first-ever connection still
+  binds its cluster on trust (TOFU); re-homing to a genuinely different cluster
+  requires either the prior cluster's lease having genuinely EXPIRED (the reaper's
+  separate expired-lease sweep, unaffected by this fix) or an explicit operator
+  `GatewayRouteStore::clear_cluster_affinity` action — and, since a pre-merge review
+  found a single rogue registration (or even a legitimate agent's own ordinary
+  disconnect) could otherwise manufacture the reaper's "tombstoned long enough"
+  predicate on a row whose affinity was never actually stale, the reaper now never
+  purges a row that still carries a bound home_cluster_id, full stop, regardless of
+  whether a session is currently claiming it. Such a row is instead parked
+  (soft-tombstoned if a claim was still outstanding; left untouched if it was already
+  tombstoned) with the affinity preserved indefinitely, so neither an abandoned rogue
+  claim nor an ordinary disconnect can be waited out to force a re-home — only a
+  genuine lease expiry or an explicit operator action still clears it. Single-cluster
   deployments are unaffected (a stable `cluster_id` is presented on every reconnect).
   **Scope:** this closes the `GatewayRouteStore` half (mitigation 1) of the two named
   in the issue; per-cluster peer-identity binding at the gateway-upstream listener

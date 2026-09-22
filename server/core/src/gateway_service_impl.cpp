@@ -1491,17 +1491,30 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // time, so a mismatched cluster_id can never persist DURABLY; it can
         // only let this pre-check miss a violation the write then still
         // refuses. Gate 2 security-guardian correction (2026-09-21): this
-        // is NOT bounded to a microsecond race margin. Both this pre-check
-        // AND announce_connected's own write share the same Postgres pool,
-        // so during a SUSTAINED degradation (not just a momentary blip) the
-        // window this describes is bounded by the FULL DURATION of that
-        // degradation, not a narrow race — for its whole length, a rogue's
-        // claimed placement could reach the in-memory dispatch registry
-        // (set_gateway_route, read by send_to/send_to_all) even though the
-        // durable store never accepts it. See `YuzuGatewayClusterAffinity
-        // CheckDegradedDuringWrite` (docs/prometheus/yuzu-alerts.yml) —
-        // added specifically to measure this window's actual duration —
-        // and #4697 for the still-missing regression test.
+        // is NOT bounded to a microsecond race margin — a rogue's claimed
+        // placement CAN reach the in-memory dispatch registry
+        // (set_gateway_route, read by send_to/send_to_all) before the
+        // durable store gets a chance to refuse it. pr-rev fix (FortitudeEtc/
+        // Codex+Kimi, BLOCKER, 2026-09-22): the window this describes used
+        // to be open-ended — a definitive refusal on the WRITE only emitted a
+        // metric+audit, never rolling back the already-published in-memory
+        // entry, so it persisted with NO reconciliation until process
+        // restart. The write-time branch below now calls
+        // `registry_.unpublish_gateway_route` on a definitive violation,
+        // closing the window down to the time between this pre-check's
+        // fail-open and that write actually completing — for the ORDINARY
+        // case (pre-check degrades, write succeeds and correctly refuses),
+        // this is now a narrow race again, not open-ended. ONE compound case
+        // remains genuinely open-ended: this pre-check AND
+        // announce_connected's own write BOTH degrading simultaneously (same
+        // Postgres pool) — then the write never reaches the
+        // `cluster_affinity_violation` branch at all (it reports
+        // `db_error`/`store_unavailable` instead), so there is nothing to
+        // revert, and the rogue's placement persists for as long as BOTH
+        // stay degraded. `YuzuGatewayClusterAffinityCheckDegradedDuringWrite`
+        // (docs/prometheus/yuzu-alerts.yml) exists specifically to make THAT
+        // compound window observable. See #4697 for the still-missing
+        // regression test covering both cases.
         if (gateway_route_store_) {
             bool skip = false;
             {
@@ -1635,6 +1648,30 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                 // cost" for this race) and this audit row is the only
                 // durable record of which agent/session/cluster hit it.
                 record_directory_desync(metrics_, "announce_connected", "cluster_affinity_violation");
+                // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+                // empirically confirmed): this is a DEFINITIVE violation --
+                // the durable store correctly refused to record the claimed
+                // placement -- but `registry_.set_gateway_route` ABOVE (this
+                // same call sequence, before this write ran) already
+                // published it to the in-memory dispatch registry that
+                // send_to/send_to_all actually read. Without this call, the
+                // rogue's cluster_id/gateway_node/wire_capabilities/
+                // stream_home_id would persist as the LIVE in-memory dispatch
+                // target indefinitely, with no reconciliation ever bringing
+                // it back in line with the durable (correctly-refused) state
+                // -- a degraded pre-check read followed by a successful,
+                // definitively-refused write left the rogue's placement live.
+                // Revert exactly what that publish just installed for THIS
+                // session; a `false` return means the session was already
+                // superseded by something newer in the interim, in which
+                // case there is nothing of THIS call's to revert (the newer
+                // publish is not touched).
+                if (!registry_.unpublish_gateway_route(agent_id, session_id)) {
+                    spdlog::debug(
+                        "[gateway] NotifyStreamStatus: cluster_affinity_violation revert "
+                        "no-op for agent {} session {} — session already superseded",
+                        agent_id, session_id);
+                }
                 if (audit_store_ && audit_store_->is_open()) {
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(

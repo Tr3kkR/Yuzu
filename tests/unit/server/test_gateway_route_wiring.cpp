@@ -1075,6 +1075,75 @@ TEST_CASE("NotifyStreamStatus: a CONNECTED claiming a DIFFERENT cluster than the
     CHECK(*(*row2)->cluster_id == "cluster-x");
 }
 
+TEST_CASE("AgentRegistry::unpublish_gateway_route reverts exactly what set_gateway_route just "
+          "published for a matching session (#4669 pr-rev Blocker 2, the write-time-violation "
+          "revert this method exists for)",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-unpublish-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session = resp.session_id();
+
+    // A legitimate CONNECTED publishes gateway_node/wire_capabilities/
+    // stream_home_id/cluster_id in-memory via set_gateway_route — the exact
+    // publish unpublish_gateway_route must be able to revert.
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-unpublish-1");
+    notif.set_session_id(session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-x");
+    notif.set_gateway_node("node-x");
+    notif.add_wire_capabilities("cap-x");
+    notif.set_stream_home_id("home-x");
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    REQUIRE(ack.acknowledged());
+
+    // Sanity: the publish actually landed before we revert it.
+    auto home_before = registry.gateway_stream_home_id("agent-unpublish-1", session);
+    REQUIRE(home_before.has_value());
+    CHECK(*home_before == "home-x");
+    CHECK(registry.gateway_has_wire_capability("agent-unpublish-1", "cap-x"));
+
+    // THE METHOD UNDER TEST: revert it, simulating what NotifyStreamStatus's
+    // write-time cluster_affinity_violation branch does after
+    // set_gateway_route already ran but announce_connected's own guarded
+    // write definitively refused the claim.
+    CHECK(registry.unpublish_gateway_route("agent-unpublish-1", session));
+
+    auto home_after = registry.gateway_stream_home_id("agent-unpublish-1", session);
+    REQUIRE(home_after.has_value()); // session still matches — just unstamped
+    CHECK(home_after->empty());
+    CHECK_FALSE(registry.gateway_has_wire_capability("agent-unpublish-1", "cap-x"));
+
+    // A SECOND call for the SAME still-installed session is a harmless,
+    // idempotent no-op — still `true` (the session_id match is what the
+    // return value reports, not whether there was anything left to clear),
+    // not an error, not a crash.
+    CHECK(registry.unpublish_gateway_route("agent-unpublish-1", session));
+
+    // A session_id that does not match the currently-installed one (a
+    // superseded/foreign session) is refused — reverting it would silently
+    // tear down a DIFFERENT, possibly newer, live publish.
+    CHECK_FALSE(registry.unpublish_gateway_route("agent-unpublish-1", "some-other-session"));
+
+    // An unknown agent_id is refused the same way — nothing to revert.
+    CHECK_FALSE(registry.unpublish_gateway_route("agent-never-registered", session));
+}
+
 TEST_CASE("#4669: a refused cross-cluster claim emits an audited gateway.cluster_affinity_"
           "violation row with the correct principal/target/detail — Gate 4 consistency-auditor "
           "SHOULD: the new AuditEvent construction was previously exercised by no test at all "

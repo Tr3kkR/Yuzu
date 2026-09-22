@@ -15722,11 +15722,16 @@ private:
                                         .increment();
                                 } else {
                                     if (reaped->expired_leases_reaped > 0 ||
-                                        reaped->tombstones_reaped > 0)
-                                        spdlog::info("gateway_route_store reap: {} expired "
-                                                     "lease(s), {} tombstone(s) reaped",
-                                                     reaped->expired_leases_reaped,
-                                                     reaped->tombstones_reaped);
+                                        reaped->tombstones_reaped > 0 ||
+                                        reaped->affinity_preserved_soft_tombstones > 0)
+                                        spdlog::info(
+                                            "gateway_route_store reap: {} expired lease(s), "
+                                            "{} tombstone(s) reaped, {} affinity-preserved "
+                                            "soft-tombstone(s) (#4669 fix — home_cluster_id "
+                                            "NOT cleared for these)",
+                                            reaped->expired_leases_reaped,
+                                            reaped->tombstones_reaped,
+                                            reaped->affinity_preserved_soft_tombstones);
                                     if (reaped->clock_anomaly) {
                                         spdlog::warn("gateway_route_store reap declined: "
                                                      "clock anomaly detected");

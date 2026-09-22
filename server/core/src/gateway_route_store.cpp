@@ -860,6 +860,7 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     // than the three-rounds-running marker-obligation defect this split closes.
     int expired_leases_reaped = 0;
     int tombstones_reaped = 0;
+    int affinity_preserved_soft_tombstones = 0;
     bool clock_anomaly = false;
     // Hoisted out of the lambda (was a lambda-local at the recovery-detection
     // site) so the recovery outcome survives past with_txn_for's return, into
@@ -1043,6 +1044,28 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // risk, and a genuine later register_fresh works identically whether
         // the row exists or not (INSERT with no conflict, always wins).
         //
+        // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+        // empirically confirmed): this predicate ORIGINALLY hard-deleted ANY
+        // NULL-lease row past the purge age, with no regard for whether a
+        // STICKY `home_cluster_id` affinity was bound. `register_fresh` sets
+        // `lease_until = NULL` but leaves `home_cluster_id` untouched — so a
+        // single rogue `register_fresh` against an already-affinity-bound
+        // agent manufactured this exact predicate on a row whose real
+        // cluster was never actually unreachable, turning ADR-2002 §7d's
+        // "requires the real cluster to have been genuinely unreachable that
+        // long" guarantee into "a rogue registers once and waits
+        // kTombstonePurgeAgeSecs" — reproduced end-to-end against real
+        // Postgres (rogue register_fresh -> this sweep -> rogue TOFU-rebind).
+        // Split into two disjoint actions below: a row with NO sticky
+        // affinity to protect (`home_cluster_id IS NULL` — a genuine
+        // tombstone, or one sweep (a) already cleared) is still hard-deleted
+        // via the SAME short purge window; a row whose affinity IS still
+        // bound is soft-tombstoned instead, PRESERVING `home_cluster_id` —
+        // see gateway_route_store.hpp's `ReapRoutesResult::
+        // affinity_preserved_soft_tombstones` doc comment for the resulting
+        // deliberate tradeoff (such a row's only remaining clears become a
+        // genuine re-establishment or an explicit `clear_cluster_affinity`).
+        //
         // The outer DELETE's WHERE re-asserts the SAME predicate the subquery
         // already applied (PR #4299 review, BLOCKER 2 — the same
         // EvalPlanQual hazard sweep (a) closed above, missed here on the
@@ -1064,9 +1087,11 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 "DELETE FROM gateway_route_store.agent_routes WHERE agent_id IN "
                 "  (SELECT agent_id FROM gateway_route_store.agent_routes "
                 "     WHERE lease_until IS NULL "
+                "       AND home_cluster_id IS NULL "
                 "       AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
                 "     LIMIT $2::bigint) "
                 "  AND lease_until IS NULL "
+                "  AND home_cluster_id IS NULL "
                 "  AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
                 "RETURNING agent_id",
                 std::vector<std::string>{std::to_string(cutoff_b_ms), std::to_string(kReapCap)});
@@ -1075,41 +1100,92 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 return false;
             }
             tombstones_reaped = PQntuples(dr.get());
-            }
+        }
 
-            // Cap-backlog probe (PR #4299 round 4, SHOULD — observability only,
-            // NOT acceleration). Hitting kReapCap does NOT prove a backlog
-            // remains (an exact-boundary pass drained the last row), so probe
-            // for a real remainder ONLY when a sweep hit its cap — the healthy
-            // path pays nothing. Same txn, mirrors audit_store.cpp's shape.
-            // Surfaces as outcome="ok_capped"; deliberately does NOT trigger a
-            // faster re-arm (see docs/clock-guarded-retention.md — acceleration
-            // would turn a mis-recovery into kReapCap tombstones every few
-            // seconds, collapsing the operator reaction window).
-            if (expired_leases_reaped >= kReapCap || tombstones_reaped >= kReapCap) {
-                pg::PgResult more = pg::exec_params(
-                    c,
-                    "SELECT "
-                    "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
-                    "  WHERE lease_until IS NOT NULL "
-                    "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint), "
-                    "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
-                    "  WHERE lease_until IS NULL "
-                    "    AND (extract(epoch FROM updated_at) * 1000)::bigint < $2::bigint)",
-                    std::vector<std::string>{std::to_string(cutoff_a_ms),
-                                             std::to_string(cutoff_b_ms)});
-                if (more.status() != PGRES_TUPLES_OK) {
-                    err = std::string("reap cap-backlog probe failed: ") + PQerrorMessage(c);
-                    return false;
-                }
-                const bool a_more = to_bool(PQgetvalue(more.get(), 0, 0));
-                const bool b_more = to_bool(PQgetvalue(more.get(), 0, 1));
-                // Only the predicate that actually hit its cap counts toward the
-                // backlog signal — a below-cap sweep never leaves a hidden
-                // remainder (it drained everything eligible this pass).
-                cap_bound_backlog = (expired_leases_reaped >= kReapCap && a_more) ||
-                                    (tombstones_reaped >= kReapCap && b_more);
+        // (b') the AFFINITY-PRESERVING soft-tombstone this fix adds: a row
+        // that would have matched (b) above except its `home_cluster_id` is
+        // STILL bound. Clears every connection-specific field a hard delete
+        // would have removed (so a stale in-memory read sees the same
+        // "not currently connected" shape either way) but explicitly does
+        // NOT touch `home_cluster_id` — the whole point. `session_id IS NOT
+        // NULL` in the predicate additionally means this action fires AT
+        // MOST ONCE per registration cycle: after it runs, the row's
+        // session_id is NULL too, so a LATER pass no longer matches this
+        // predicate (nor (b) above, since home_cluster_id is still set) —
+        // the row is now permanently excluded from BOTH reap actions until
+        // a genuine re-establishment or an explicit `clear_cluster_affinity`
+        // changes it. Same EvalPlanQual double-check pattern as (a)/(b).
+        {
+            pg::PgResult sr = pg::exec_params(
+                c,
+                "UPDATE gateway_route_store.agent_routes SET "
+                "  session_id=NULL, cluster_id=NULL, gateway_node=NULL, "
+                "  stream_home_id=NULL, updated_at=now() "
+                "WHERE agent_id IN "
+                "  (SELECT agent_id FROM gateway_route_store.agent_routes "
+                "     WHERE lease_until IS NULL "
+                "       AND session_id IS NOT NULL "
+                "       AND home_cluster_id IS NOT NULL "
+                "       AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
+                "     LIMIT $2::bigint) "
+                "  AND lease_until IS NULL "
+                "  AND session_id IS NOT NULL "
+                "  AND home_cluster_id IS NOT NULL "
+                "  AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
+                "RETURNING agent_id",
+                std::vector<std::string>{std::to_string(cutoff_b_ms), std::to_string(kReapCap)});
+            if (sr.status() != PGRES_TUPLES_OK) {
+                err = std::string("reap affinity-preserving soft-tombstone failed: ") +
+                      PQerrorMessage(c);
+                return false;
             }
+            affinity_preserved_soft_tombstones = PQntuples(sr.get());
+        }
+
+        // Cap-backlog probe (PR #4299 round 4, SHOULD — observability only,
+        // NOT acceleration). Hitting kReapCap does NOT prove a backlog
+        // remains (an exact-boundary pass drained the last row), so probe
+        // for a real remainder ONLY when a sweep hit its cap — the healthy
+        // path pays nothing. Same txn, mirrors audit_store.cpp's shape.
+        // Surfaces as outcome="ok_capped"; deliberately does NOT trigger a
+        // faster re-arm (see docs/clock-guarded-retention.md — acceleration
+        // would turn a mis-recovery into kReapCap tombstones every few
+        // seconds, collapsing the operator reaction window).
+        //
+        // pr-rev fix, 2026-09-22: also probes for a remainder behind the NEW
+        // affinity-preserving soft-tombstone predicate (b'), on the same
+        // "only the predicate that hit its cap counts" basis as (a)/(b).
+        if (expired_leases_reaped >= kReapCap || tombstones_reaped >= kReapCap ||
+            affinity_preserved_soft_tombstones >= kReapCap) {
+            pg::PgResult more = pg::exec_params(
+                c,
+                "SELECT "
+                "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
+                "  WHERE lease_until IS NOT NULL "
+                "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint), "
+                "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
+                "  WHERE lease_until IS NULL AND home_cluster_id IS NULL "
+                "    AND (extract(epoch FROM updated_at) * 1000)::bigint < $2::bigint), "
+                "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
+                "  WHERE lease_until IS NULL AND session_id IS NOT NULL "
+                "    AND home_cluster_id IS NOT NULL "
+                "    AND (extract(epoch FROM updated_at) * 1000)::bigint < $2::bigint)",
+                std::vector<std::string>{std::to_string(cutoff_a_ms),
+                                         std::to_string(cutoff_b_ms)});
+            if (more.status() != PGRES_TUPLES_OK) {
+                err = std::string("reap cap-backlog probe failed: ") + PQerrorMessage(c);
+                return false;
+            }
+            const bool a_more = to_bool(PQgetvalue(more.get(), 0, 0));
+            const bool b_more = to_bool(PQgetvalue(more.get(), 0, 1));
+            const bool b_prime_more = to_bool(PQgetvalue(more.get(), 0, 2));
+            // Only the predicate that actually hit its cap counts toward the
+            // backlog signal — a below-cap sweep never leaves a hidden
+            // remainder (it drained everything eligible this pass).
+            cap_bound_backlog = (expired_leases_reaped >= kReapCap && a_more) ||
+                                (tombstones_reaped >= kReapCap && b_more) ||
+                                (affinity_preserved_soft_tombstones >= kReapCap && b_prime_more);
+        }
         } // end if (d.run_sweeps)
 
         // Advance the persisted anchor per the decision. nullopt = LEAVE it
@@ -1182,6 +1258,7 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     }
     return ReapRoutesResult{.expired_leases_reaped = expired_leases_reaped,
                             .tombstones_reaped = tombstones_reaped,
+                            .affinity_preserved_soft_tombstones = affinity_preserved_soft_tombstones,
                             .clock_anomaly = clock_anomaly,
                             .recovered = recovered_from_prior_decline,
                             .skipped = skipped_lock,

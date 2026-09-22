@@ -1205,9 +1205,20 @@ adversarial review surfaced, not a routing change.
   (TOFU). `gateway_service_impl.cpp`'s `NotifyStreamStatus` CONNECTED handler adds a READ-ONLY pre-check
   (`GatewayRouteStore::has_cluster_affinity_conflict`) BEFORE `registry_.set_gateway_route` — the PRIMARY
   dispatch path's write (`AgentSession::cluster_id`, read by `send_to`/`send_to_all`) — so a definitive
-  violation refuses the WHOLE CONNECTED before EITHER the durable row or the in-memory registry is
-  touched, closing the exact "claims agent A's own identity, then legitimately answers for it" shape
-  above: a rogue's own `register_fresh` still unconditionally wins the epoch race (pre-existing,
+  violation caught BY THE PRE-CHECK refuses the whole CONNECTED before EITHER the durable row or the
+  in-memory registry is touched. **Correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the pre-check is fail-OPEN on a DEGRADED read, so `set_gateway_route` can
+  still run and publish BEFORE the write's own independent, atomic re-check catches a violation the
+  pre-check missed — and that write-time catch, before this fix, only emitted a metric+audit, never
+  rolling back the already-published in-memory entry, leaving a rogue's placement live with no
+  reconciliation. Fixed: the write-time `cluster_affinity_violation` branch now calls
+  `registry_.unpublish_gateway_route`, reverting exactly what this same call sequence's earlier
+  `set_gateway_route` published. One compound case remains genuinely open (both the pre-check read AND
+  the write degrading in the same window, so the write never reaches the violation branch at all) — see
+  `gateway_service_impl.cpp`'s own comment and the `YuzuGatewayClusterAffinityCheckDegradedDuringWrite`
+  alert, added to make that window observable. Closing the exact "claims agent A's own identity, then
+  legitimately answers for it" shape above: a rogue's own `register_fresh` still unconditionally wins the
+  epoch race (pre-existing,
   accepted DoS-shaped churn, unchanged), but its own subsequent `announce_connected`/CONNECTED can no
   longer make `cluster_id` — and therefore `GatewayMgmtStubPool::resolve()`'s dispatch target — move to
   the rogue's cluster. The real agent's own later reconnect (its own fresh `register_fresh`, always

@@ -492,7 +492,36 @@ struct DeregisterResult {
 /// adoption register for why acceleration is declined here.
 struct ReapRoutesResult {
     int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
-    int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
+    int tombstones_reaped{0};     ///< predicate (b): NULL-lease, NULL-affinity rows past the
+                                  ///< purge age, hard-deleted
+    /// pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically
+    /// confirmed): predicate (b)'s ORIGINAL scope (any NULL-lease row past the purge
+    /// age, hard-deleted regardless of session_id/home_cluster_id) let a single rogue
+    /// `register_fresh` -- which sets `lease_until = NULL` but leaves `home_cluster_id`
+    /// untouched -- manufacture this exact predicate on a row whose STICKY affinity was
+    /// never actually stale, turning "the real cluster must be unreachable that long"
+    /// into "a rogue registers once and waits kTombstonePurgeAgeSecs" (a Kimi-authored
+    /// store-level repro against real Postgres confirmed the full sequence: rogue
+    /// register_fresh -> purge -> rogue TOFU-rebind, home_cluster_id ends AT the
+    /// rogue's cluster). Predicate (b) now hard-deletes ONLY a row with NO sticky
+    /// affinity to protect (`home_cluster_id IS NULL`); a session-bearing,
+    /// never-announced row whose affinity is STILL bound is soft-tombstoned instead
+    /// (session_id/cluster_id/gateway_node/stream_home_id cleared, home_cluster_id
+    /// preserved) and counted here, never hard-deleted by this predicate again on any
+    /// LATER pass (home_cluster_id staying non-null permanently excludes it). This is a
+    /// deliberate tradeoff, not an oversight: such a row's ONLY remaining clears are a
+    /// genuine register_fresh+announce_connected re-establishing it, or an explicit
+    /// `clear_cluster_affinity` call (no caller until #4696) -- a rogue registering
+    /// again does not restart this timer against the row's affinity, since the
+    /// preserved home_cluster_id already excludes it from predicate (b) regardless of
+    /// how many more times session_id churns. A row that reaches `session_id IS NULL`
+    /// via an ORDINARY `deregister()` (not this soft-tombstone) rather than via a rogue's
+    /// abandoned claim is likewise excluded from predicate (b) by its own preserved
+    /// `home_cluster_id` -- and is NOT counted here either, since predicate (b') itself
+    /// requires `session_id IS NOT NULL` and never touches it. Such a row is simply left
+    /// untouched by both predicates on every pass (it was already tombstoned by the
+    /// `deregister()` call itself) -- not a gap, since nothing further needs clearing.
+    int affinity_preserved_soft_tombstones{0};
     bool clock_anomaly{false};
     bool recovered{false};
     bool skipped{false};
@@ -622,12 +651,17 @@ public:
     /// eventual write can never let a mismatched cluster_id persist
     /// DURABLY, only let a caller's own transient state briefly disagree
     /// with the store — exactly the pre-#4669 fail-open posture, never the
-    /// reverse. Gate 2 security-guardian correction (2026-09-21): "briefly"
-    /// is bounded by how long the CALLER's own read of this method stays
-    /// degraded, which for a sustained Postgres outage is the outage's full
-    /// duration, not a microsecond race — see the caller's own comment
-    /// (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) for the concrete
-    /// consequence and the alert that measures it.
+    /// reverse. Gate 2 security-guardian correction (2026-09-21): the
+    /// CALLER's own transient state (e.g. an in-memory registry) CAN diverge
+    /// from the store for longer than a microsecond race if this pre-check
+    /// degrades. pr-rev fix (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22):
+    /// the caller (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) now
+    /// reverts that transient publish on a definitive write-time refusal, so
+    /// "briefly" is accurate again for the ORDINARY case (this read degrades,
+    /// the later write still succeeds and correctly refuses). It stays
+    /// open-ended only if THIS read and the later write BOTH degrade in the
+    /// same window — see the caller's own comment for the concrete
+    /// consequence and the alert that measures that compound case.
     [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
     has_cluster_affinity_conflict(std::string_view agent_id, std::string_view session_id,
                                   std::string_view cluster_id);

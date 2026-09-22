@@ -1207,11 +1207,17 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes leaves an expired lease alon
     CHECK((*row)->is_stale); // lease_until < now() — is_stale fires independent of grace
 }
 
-TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the purge age",
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the purge age "
+          "(genuine tombstone — no confirmed cluster, so no affinity to protect)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
+    // Deliberately never calls announce_connected — home_cluster_id stays
+    // NULL, so this is a genuine no-affinity tombstone and remains a
+    // sweep-(b) hard-delete candidate under the #4669 pr-rev fix (which
+    // excludes any row carrying a bound home_cluster_id from sweep (b) —
+    // see "reap_stale_routes' tombstone-purge sweep does NOT purge a row
+    // carrying a bound home_cluster_id" below for that coverage instead).
     REQUIRE(fx.store().register_fresh("agent-reap-3", "session-1").value().won);
-    REQUIRE(fx.store().announce_connected("agent-reap-3", "session-1", "c1", "n1", 30).value().matched);
     REQUIRE(fx.store().deregister("agent-reap-3", "session-1").value().removed); // tombstoned
     // kTombstonePurgeAgeSecs is 300s — push well past it.
     fx.raw_set_updated_at_ago("agent-reap-3", 400);
@@ -1220,12 +1226,117 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the 
     REQUIRE(out.has_value());
     CHECK(out->tombstones_reaped == 1);
     CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->affinity_preserved_soft_tombstones == 0);
 
     // Purged means fully GONE — not merely re-tombstoned.
     CHECK_FALSE(fx.raw_row_exists("agent-reap-3"));
     auto row = fx.store().lookup_route("agent-reap-3");
     REQUIRE(row.has_value());
     CHECK_FALSE(row->has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' tombstone-purge sweep does NOT purge a row "
+          "carrying a bound home_cluster_id — an ordinary deregister leaves the row parked, "
+          "affinity preserved, indefinitely (#4669 pr-rev Blocker 1)",
+          "[gateway_route][pg][store][reap][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-affinity-parked", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-affinity-parked", "session-1", "cluster-x",
+                                    "node-1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-reap-affinity-parked", "session-1").value().removed);
+    // Well past kTombstonePurgeAgeSecs (300s) — under the PRE-fix predicate
+    // this would have been a sweep-(b) hard-delete candidate, wiping
+    // home_cluster_id along with the row and re-opening a TOFU rebind window
+    // for any cluster. Post-fix, a bound home_cluster_id excludes the row
+    // from sweep (b) UNCONDITIONALLY, regardless of how it reached
+    // session_id IS NULL (an ordinary deregister here, not just an
+    // abandoned rogue claim — see the Blocker-1 falsifier test below for
+    // that variant).
+    fx.raw_set_updated_at_ago("agent-reap-affinity-parked", 400);
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->tombstones_reaped == 0);
+    // session_id is already NULL (ordinary deregister), so sweep (b')'s
+    // `session_id IS NOT NULL` guard also does not match this row — it is
+    // parked untouched by either sweep, exactly as an already-tombstoned
+    // row with nothing left to clear should be.
+    CHECK(out->affinity_preserved_soft_tombstones == 0);
+
+    REQUIRE(fx.raw_row_exists("agent-reap-affinity-parked")); // NOT purged
+    auto row = fx.store().lookup_route("agent-reap-affinity-parked");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // affinity survives indefinitely
+
+    // The real agent can still reconnect and confirm the SAME cluster at any
+    // time — parked is not abandoned.
+    REQUIRE(fx.store().register_fresh("agent-reap-affinity-parked", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-reap-affinity-parked", "session-2",
+                                             "cluster-x", "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' affinity-preserving soft-tombstone closes "
+          "the rogue-register-then-wait TOFU-rebind hijack (#4669 pr-rev Blocker 1, empirically "
+          "reproduced by FortitudeEtc/Codex+Kimi)",
+          "[gateway_route][pg][store][reap][affinity]") {
+    GatewayRoutePg fx;
+    // The real agent binds cluster-x first.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-real").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-hijack", "session-real", "cluster-x", "node-real",
+                                    30)
+                .value()
+                .matched);
+
+    // A rogue's ProxyRegister wins the epoch race unconditionally (register_fresh
+    // is not cluster-aware) but never confirms via announce_connected — it just
+    // sits there, exactly the exploit shape pr-rev reproduced against real
+    // Postgres: claim, then wait out kTombstonePurgeAgeSecs.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-rogue").value().won);
+    fx.raw_set_updated_at_ago("agent-reap-hijack", 400); // past the 300s purge age
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    // THE DISCRIMINATING ASSERTION: pre-fix this counted as tombstones_reaped
+    // (a hard DELETE, wiping home_cluster_id) — post-fix it is soft-
+    // tombstoned instead, preserving the affinity.
+    CHECK(out->tombstones_reaped == 0);
+    CHECK(out->affinity_preserved_soft_tombstones == 1);
+
+    auto row = fx.store().lookup_route("agent-reap-hijack");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value()); // the rogue's claim is cleared
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // affinity SURVIVES the rogue's wait-out
+
+    // A SECOND rogue attempt — fresh register_fresh, then try to confirm the
+    // rogue's own cluster — is still refused: the reap never actually cleared
+    // the affinity, so the hijack gains nothing from waiting.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-rogue-2").value().won);
+    auto ann_rogue = fx.store().announce_connected("agent-reap-hijack", "session-rogue-2",
+                                                    "cluster-rogue", "node-rogue", 30);
+    REQUIRE(ann_rogue.has_value());
+    CHECK_FALSE(ann_rogue->matched);
+    CHECK(ann_rogue->cluster_affinity_violation);
+
+    // The REAL cluster can still reconnect and confirm at any time.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-real-2").value().won);
+    auto ann_real = fx.store().announce_connected("agent-reap-hijack", "session-real-2",
+                                                   "cluster-x", "node-real-2", 30);
+    REQUIRE(ann_real.has_value());
+    CHECK(ann_real->matched);
+    CHECK_FALSE(ann_real->cluster_affinity_violation);
 }
 
 TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes leaves a live lease untouched",
@@ -2233,11 +2344,15 @@ TEST_CASE("GatewayRouteStore[pg]: reap does not purge a tombstoned row concurren
           "by a fresh register_fresh (outer-DELETE re-assert, PR #4299 review BLOCKER 2)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
+    // Deliberately NEVER calls announce_connected — `home_cluster_id` stays
+    // NULL throughout, so this row is a genuine sweep-(b) hard-delete
+    // candidate under the #4669 pr-rev fix above (which excludes any row
+    // carrying a bound `home_cluster_id` from sweep (b) entirely — see that
+    // fix's comment). A row that HAD confirmed a cluster would instead match
+    // the new affinity-preserving sweep (b') and never take a row lock this
+    // test's race depends on; see "reap_stale_routes' affinity-preserving
+    // soft-tombstone" below for that coverage.
     REQUIRE(fx.store().register_fresh("agent-reap-epq-b", "session-b1").value().won);
-    REQUIRE(fx.store()
-                .announce_connected("agent-reap-epq-b", "session-b1", "c1", "n1", 30)
-                .value()
-                .matched);
     REQUIRE(fx.store().deregister("agent-reap-epq-b", "session-b1").value().removed);
     // Past the 300s tombstone purge age, committed — a genuine sweep-(b)
     // candidate as far as any snapshot taken before the revive below is
@@ -2275,18 +2390,21 @@ TEST_CASE("GatewayRouteStore[pg]: reap does not purge a tombstoned row concurren
     yuzu::server::pg::PgConn watcher{PQconnectdb(fx.dsn().c_str())};
     REQUIRE(PQstatus(watcher.get()) == CONNECTION_OK);
     const bool blocked = wait_for_lock_waiter(watcher.get());
+
+    // Commit (releasing the holder's row lock) and join the reaper thread
+    // UNCONDITIONALLY, before any REQUIRE that could throw — an assertion
+    // failure throws and unwinds past a still-joinable `std::thread`'s
+    // destructor, which calls std::terminate() (SIGABRT) instead of
+    // reporting a clean test failure. Only now does the revived version
+    // become visible to the blocked reaper — exactly the window BLOCKER 2's
+    // outer-WHERE re-assert defends via EvalPlanQual.
+    yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
+    const bool committed = commit.status() == PGRES_COMMAND_OK;
+    reaper.join();
+
+    REQUIRE(committed);
     REQUIRE(blocked); // if nothing ever blocks, the race this test exists to
                        // force never happened.
-
-    // Only now does the revived version become visible to the blocked
-    // reaper — exactly the window BLOCKER 2's outer-WHERE re-assert defends
-    // via EvalPlanQual.
-    {
-        yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
-        REQUIRE(commit.status() == PGRES_COMMAND_OK);
-    }
-
-    reaper.join();
 
     REQUIRE(out.has_value());
     CHECK_FALSE(out->clock_anomaly);
