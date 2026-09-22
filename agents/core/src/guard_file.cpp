@@ -18,11 +18,18 @@
  * The armed directory X (the target's parent, or the nearest existing ancestor) is
  * opened with FILE_SHARE_DELETE, so renaming or moving X gives no completion on X's
  * own handle: the handle follows X to its new name. A second, non-recursive
- * directory-name-only read on X's parent reports that rename; a record naming X (or
- * carrying X's file id) or an overflow re-runs the same reconcile. The parent is
- * re-opened by path on every re-arm and armed before X, so a rename in between is
- * not lost. Best effort: if the parent cannot be watched the guard behaves as it
- * did without it.
+ * directory-name-only read on X's parent P reports that rename; a record naming X (or
+ * carrying X's file id) or an overflow re-runs the same reconcile. P is bound to X's
+ * resolved path and RETAINED across ordinary re-arms (run()'s `bind()`, the three-arm
+ * rule in its own comment) — it is rebuilt only when X's identity actually changes, and
+ * a rebuild is still armed before X is reopened, so a rename in that gap is not lost.
+ * Matching is by path-string identity (plus X's FileId, when the extended notify API is
+ * available) captured at the last rebuild — not re-validated on the retain path, and NOT
+ * re-derived when X is deleted and recreated at the same path (a narrower instance of
+ * the "identified by path" trade-off already present elsewhere in this file). Best
+ * effort: if P cannot be armed — and no ancestor watch is active, because X's own handle
+ * succeeded — a rename of X goes undetected until X's content next changes and triggers
+ * a bind() retry; otherwise the guard behaves as it did without P.
  *
  * Detection-only: a FileGuard never writes (file-content remediation needs
  * Content Distribution; deferred). Proto-free + windows.h-free header. On
@@ -56,6 +63,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -106,6 +114,13 @@ constexpr DWORD kCancelDrainMs = 1000;
 // Consecutive failed parent-read completions tolerated before falling back to the
 // degraded re-arm cadence (no rebuild loop against a watch that fails at once).
 constexpr int kParentFailureLimit = 3;
+
+// Consecutive parent-block cancel-drain failures tolerated before permanently disabling
+// the parent-directory watch for this guard instance (sec-1): an unconfirmed drain
+// abandons the heap block rather than freeing it (see ParentIoRelease in run()), so an
+// uncapped count would leak without bound against a persistently wedged filesystem
+// driver. Matches this file's existing kParentFailureLimit convention.
+constexpr int kParentIoAbandonLimit = 3;
 
 // Low 64 bits of a directory handle's FileId (what the extended notify record carries);
 // nullopt when the query fails or the id is wider than 64 bits (e.g. ReFS): name match only.
@@ -191,20 +206,98 @@ void FileGuard::run() try {
     ChangeNotifyHandle ancestor_event; // FindFirstChangeNotificationW (normalises -1 → empty)
     bool read_pending = false;
 
-    // Parent-of-armed-directory watch (own buffer/event/OVERLAPPED; p_dir is declared after
-    // them so it closes first). X = the directory armed above; its parent P is read for X's rename.
-    alignas(8) std::byte p_buf[32 * 1024];
-    EventHandle p_event(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    OVERLAPPED p_ov{};
-    p_ov.hEvent = p_event.get();
-    DirHandle p_dir;
-    bool p_pending = false;
-    bool p_ex = false;       // extended records (carry a FileId) in use for this generation
-    bool p_logged = false;   // the "no parent watch" note is logged once per guard
-    int p_failures = 0;      // consecutive failed P completions
-    bool p_drain_pending = false; // a cancelled P read whose completion is not yet confirmed;
-                                   // p_buf/p_ov must not be reused for a new read while this holds
-    std::wstring x_leaf;     // leaf name of X
+    // Parent-of-armed-directory watch. X = the directory armed below; P = X's parent, read for
+    // X's own rename/move. One heap block per "generation" bound to a resolved X path (bind()'s
+    // three-arm rule below); ParentIoRelease — this block's unique_ptr deleter — is the single
+    // drain-or-abandon chokepoint invoked whenever a generation ends, whether by a mid-run
+    // rebind to a different X (bind()'s rebuild arm) or by run() itself exiting (normal, the
+    // WAIT_FAILED/WAIT_ABANDONED break below, or exception unwind) — one code path for both,
+    // never two separate teardown routines (sec-1).
+    struct ParentIo {
+        alignas(8) std::byte buf[32 * 1024];
+        OVERLAPPED ov{};
+        EventHandle ev;
+        DirHandle dir;
+        bool pending = false;
+        bool p_ex = false; // extended (FileId-bearing) records in use for this handle/volume
+        fs::path bound_x;  // X this block is armed for (bind()'s three-arm key)
+    };
+
+    // A genuinely in-flight read is cancelled and drained (bounded, one extension); if the
+    // drain does not confirm, the handles are closed but the block itself is deliberately NOT
+    // freed — abandoned, so a delayed kernel completion writes into still-allocated,
+    // never-reused memory instead of a freed/reused heap block. Never dispatches, re-arms, or
+    // evaluates from here: doing so would reenter bind() through the very unique_ptr being torn
+    // down. Logging is wrapped in try/catch — this can run during exception unwind through
+    // run()'s own frame, and an exception escaping a destructor-adjacent path there is
+    // std::terminate, uncatchable by run()'s own outer catch blocks.
+    struct ParentIoRelease {
+        int* abandon_count;
+        bool* disabled;
+        const std::string* rule_id;
+        const std::string* path;
+
+        void operator()(ParentIo* p) const noexcept {
+            if (!p)
+                return;
+            if (p->pending) {
+                CancelIoEx(p->dir.get(), &p->ov);
+                bool drained = WaitForSingleObject(p->ev.get(), kCancelDrainMs) == WAIT_OBJECT_0;
+                if (!drained) // one bounded extension, matches this file's existing drain convention
+                    drained = WaitForSingleObject(p->ev.get(), kCancelDrainMs) == WAIT_OBJECT_0;
+                if (drained) {
+                    DWORD bytes = 0;
+                    // Consume the completion so the kernel's bookkeeping settles; the content
+                    // itself is discarded — safe because every arm_watch()/bind() call in this
+                    // file arms before its presence re-check (see the header comment), so
+                    // whatever this read would have found is re-observed by the next re-check.
+                    GetOverlappedResult(p->dir.get(), &p->ov, &bytes, FALSE);
+                } else {
+                    // Not confirmed drained: close the handles (safe — the kernel keeps the
+                    // underlying objects alive for as long as an outstanding I/O references
+                    // them, independent of the user-mode handle) but do NOT delete p.
+                    p->dir.reset();
+                    p->ev.reset();
+                    ++*abandon_count;
+                    if (*abandon_count >= kParentIoAbandonLimit) {
+                        *disabled = true;
+                        try {
+                            spdlog::error(
+                                "Guardian FileGuard[{}]: parent-directory watch for {} "
+                                "permanently disabled after {} drain failures - directory "
+                                "rename detection unavailable for this rule until restart",
+                                *rule_id, *path, kParentIoAbandonLimit);
+                        } catch (...) {
+                        }
+                    } else {
+                        try {
+                            spdlog::warn(
+                                "Guardian FileGuard[{}]: parent-directory watch cancel for {} "
+                                "did not drain within {}ms - block abandoned ({}/{})",
+                                *rule_id, *path, kCancelDrainMs * 2, *abandon_count,
+                                kParentIoAbandonLimit);
+                        } catch (...) {
+                        }
+                    }
+                    return; // deliberately does not delete p
+                }
+            }
+            delete p;
+        }
+    };
+
+    // abandon_count/disabled are declared BEFORE `pio` so `pio`'s destructor (which reads/writes
+    // them via ParentIoRelease) runs BEFORE they are destroyed, on every exit from run() —
+    // normal, the WAIT_FAILED/WAIT_ABANDONED break, or exception unwind (mandatory ordering).
+    int p_abandon_count = 0; // consecutive parent-block cancel-drain failures (sec-1)
+    bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit
+    std::unique_ptr<ParentIo, ParentIoRelease> pio(
+        nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path});
+    bool p_logged = false; // the "no parent watch" note is logged once per guard
+    int p_failures = 0;    // consecutive failed P completions (handle_p_wake's degraded-cadence
+                           // trigger — distinct from p_abandon_count, which counts teardown
+                           // drain failures on ParentIoRelease)
+    std::wstring x_leaf;   // leaf name of X
     std::optional<std::uint64_t> x_id; // low 64 bits of X's FileId, when known
     const ReadDirChangesExFn read_ex = resolve_read_dir_changes_ex();
 
@@ -243,91 +336,99 @@ void FileGuard::run() try {
         return read_pending;
     };
 
-    // Close P's handle. A pending read is cancelled and waited out (bounded, with one extension)
-    // so the cancelled completion cannot land on the OVERLAPPED/buffer of the next generation. A
-    // drain that is still unconfirmed from an EARLIER call is rechecked here too (non-blocking):
-    // p_buf/p_ov stay off-limits for a new read until a wait actually confirms the old one landed.
-    auto p_reset = [&] {
-        if (p_drain_pending && WaitForSingleObject(p_event.get(), 0) == WAIT_OBJECT_0)
-            p_drain_pending = false;
-        if (p_dir && p_pending) {
-            CancelIoEx(p_dir.get(), &p_ov);
-            bool drained = WaitForSingleObject(p_event.get(), kCancelDrainMs) == WAIT_OBJECT_0;
-            if (!drained) // one bounded extension before giving up
-                drained = WaitForSingleObject(p_event.get(), kCancelDrainMs) == WAIT_OBJECT_0;
-            if (!drained) {
-                p_drain_pending = true; // still not confirmed: deferred until a later opportunistic check
-                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch cancel for {} did not "
-                             "drain within {}ms - deferring re-arm",
-                             cfg_.rule_id, cfg_.path, kCancelDrainMs * 2);
-            }
-        }
-        p_dir.reset();
-        p_pending = false;
-    };
-
-    // (Re)issue the directory-name-only read on the open P handle.
-    auto issue_p_read = [&]() -> bool {
-        if (!p_dir)
+    // (Re)issue the directory-name-only read on the given (already-open) P block.
+    auto issue_p_read = [&](ParentIo& p) -> bool {
+        if (!p.dir)
             return false;
-        ResetEvent(p_event.get());
-        if (p_ex && read_ex(p_dir.get(), p_buf, sizeof(p_buf), FALSE, FILE_NOTIFY_CHANGE_DIR_NAME,
-                            nullptr, &p_ov, nullptr, kNotifyExtended) != 0) {
-            p_pending = true;
+        ResetEvent(p.ev.get());
+        if (p.p_ex && read_ex(p.dir.get(), p.buf, sizeof(p.buf), FALSE, FILE_NOTIFY_CHANGE_DIR_NAME,
+                              nullptr, &p.ov, nullptr, kNotifyExtended) != 0) {
+            p.pending = true;
             return true;
         }
-        p_ex = false; // extended read unavailable: plain records, leaf-name match only
-        p_pending = ReadDirectoryChangesW(p_dir.get(), p_buf, sizeof(p_buf), FALSE,
-                                          FILE_NOTIFY_CHANGE_DIR_NAME, nullptr, &p_ov, nullptr) != 0;
-        return p_pending;
+        p.p_ex = false; // extended read unavailable: plain records, leaf-name match only
+        p.pending = ReadDirectoryChangesW(p.dir.get(), p.buf, sizeof(p.buf), FALSE,
+                                          FILE_NOTIFY_CHANGE_DIR_NAME, nullptr, &p.ov, nullptr) != 0;
+        return p.pending;
     };
 
-    // Watch X's parent for X's own rename or move. Best effort: on any failure the guard
-    // runs without it (logged once) and never fails to arm X.
-    auto arm_parent_watch = [&](const fs::path& x) {
-        p_reset();
+    // Watch X's parent P for X's own rename or move. Bound to X's resolved path and RETAINED
+    // across ordinary re-arms — rebuilt only when X's identity actually changes. Called BEFORE
+    // X's reopen (arm_watch_once, below), exactly as before, so a rename between the two arms is
+    // still reported. Returns true iff P was actually (re)built this call: the caller uses this
+    // to decide whether x_id needs re-deriving (bind() itself owns x_leaf, but x_id needs X's own
+    // handle, which is not yet open at this point — see arm_watch_once). Best effort throughout:
+    // on any failure the guard runs without P (logged once) and never fails to arm X.
+    //
+    // Three arms, keyed on whether the currently-held block (if any) is bound to THIS x:
+    //   1. bound to x, pending      — no-op; leave the block alone entirely.
+    //   2. bound to x, not pending  — reissue a fresh read on the SAME retained handle (mirrors
+    //      the reissue handle_p_wake already does after a non-matching completion); x_leaf/x_id
+    //      are untouched since the binding has not changed.
+    //   3. unbound, bound to a different x, or a same-x reissue that just failed — rebuild: drop
+    //      the old block (drains-or-abandons via ParentIoRelease), open a fresh handle on
+    //      x.parent_path(), and re-derive x_leaf (x_id is re-derived by the caller, once X's own
+    //      handle is available).
+    auto bind = [&](const fs::path& x) -> bool {
+        if (p_disabled)
+            return false; // permanently disabled (sec-1 abandon limit reached): no rebuild loop
+        if (pio && pio->bound_x == x) {
+            if (pio->pending)
+                return false; // arm 1
+            if (issue_p_read(*pio))
+                return false; // arm 2
+            // Reissue failed: do not leave a stale, bound-but-broken block — fall through to
+            // the rebuild arm below, exactly as an unbound/different-x call would.
+        }
+        // arm 3: rebuild.
+        pio.reset(); // invokes ParentIoRelease: drains (or abandons) any previous block
+        if (p_disabled)
+            return false; // the reset above may have just now tripped the abandon limit
         x_leaf.clear();
         x_id.reset();
-        if (p_drain_pending) {
-            arm_retry = true; // prior cancelled read not yet confirmed drained: leave p_buf/p_ov
-                               // untouched this generation; the existing degraded cadence retries P later
-            return;
-        }
-        if (!p_event) {
-            if (!p_logged) {
-                p_logged = true;
-                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
-                             "(event creation failed)",
-                             cfg_.rule_id, cfg_.path);
-            }
-            return;
-        }
         if (!x.has_relative_path() || x.filename().empty()) { // no parent above a root
             if (!p_logged) {
                 p_logged = true;
                 spdlog::debug("Guardian FileGuard[{}]: no parent directory to watch above {}",
                               cfg_.rule_id, cfg_.path);
             }
-            return;
+            return false;
         }
-        p_dir.reset(CreateFileW(x.parent_path().wstring().c_str(), FILE_LIST_DIRECTORY,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                                nullptr));
-        DWORD err = p_dir ? ERROR_SUCCESS : GetLastError();
-        p_ex = (read_ex != nullptr);
-        if (p_dir && !issue_p_read())
-            err = GetLastError();
-        if (!p_pending) {
-            p_reset();
+        ParentIo* fresh = new ParentIo();
+        fresh->ev.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+        fresh->ov.hEvent = fresh->ev.get();
+        if (!fresh->ev) {
+            delete fresh; // nothing issued yet: nothing pending, safe to free directly
             if (!p_logged) {
                 p_logged = true;
-                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed (err={})",
+                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
+                             "(event creation failed)",
+                             cfg_.rule_id, cfg_.path);
+            }
+            return false; // leave P unbound; no arm_retry (finding 4) — retried on the next bind()
+        }
+        fresh->dir.reset(CreateFileW(x.parent_path().wstring().c_str(), FILE_LIST_DIRECTORY,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                                     nullptr));
+        DWORD err = fresh->dir ? ERROR_SUCCESS : GetLastError();
+        fresh->p_ex = (read_ex != nullptr);
+        if (fresh->dir && !issue_p_read(*fresh))
+            err = GetLastError();
+        if (!fresh->pending) {
+            delete fresh; // never issued: nothing pending, safe to free directly
+            if (!p_logged) {
+                p_logged = true;
+                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
+                             "(err={})",
                              cfg_.rule_id, cfg_.path, err);
             }
-            return;
+            return false; // leave P unbound; no arm_retry (finding 4) — retried on the next bind()
         }
+        fresh->bound_x = x;
         x_leaf = x.filename().wstring();
+        pio.reset(fresh); // transfers ownership; pio's ParentIoRelease now owns `fresh`
+        return true;
     };
 
     auto report = [&](const std::string& detected, const std::string& expected) {
@@ -458,7 +559,8 @@ void FileGuard::run() try {
         ancestor_event.reset();
         arm_retry = false;
         const fs::path x = nearest_existing_dir();
-        arm_parent_watch(x); // BEFORE arming X, so a rename between the two arms is reported
+        const bool p_rebuilt = bind(x); // BEFORE arming X, so a rename between the two arms
+                                         // is reported (bind()'s three-arm rule, above)
         std::error_code ec;
         if (!parent.empty() && fs::is_directory(parent, ec)) {
             reset_dir(CreateFileW(parent.wstring().c_str(), FILE_LIST_DIRECTORY,
@@ -480,7 +582,10 @@ void FileGuard::run() try {
                              cfg_.rule_id, cfg_.path, kArmFailRetryMs);
             }
         }
-        if (p_dir && p_ex) { // X's FileId, from its own handle (a transient one in ancestor mode)
+        if (p_rebuilt && pio->p_ex) { // X's FileId, from its own handle (a transient one in
+                                       // ancestor mode) — only re-derived on an actual P
+                                       // rebuild (bind()'s three-arm rule); left stale on a
+                                       // no-op/reissue arm is the accepted trade-off (header)
             if (h_dir) {
                 x_id = dir_file_id(h_dir.get());
             } else {
@@ -554,13 +659,13 @@ void FileGuard::run() try {
     // Same for the parent read: ANY record naming X or carrying X's FileId (whatever its
     // action) means re-check; overflow means re-check. Extended records are walked here.
     auto parent_change_is_ours = [&](DWORD bytes) -> bool {
-        if (!p_ex)
-            return change_is_ours(p_buf, bytes, x_leaf);
+        if (!pio->p_ex)
+            return change_is_ours(pio->buf, bytes, x_leaf);
         if (bytes == 0)
             return true; // overflow
         std::size_t off = 0;
         while (off + kExNameOff <= bytes) {
-            const std::byte* rec = p_buf + off;
+            const std::byte* rec = pio->buf + off;
             DWORD next = 0, name_bytes = 0;
             std::uint64_t id = 0;
             std::memcpy(&next, rec, sizeof next);
@@ -580,30 +685,36 @@ void FileGuard::run() try {
     };
 
     // A completed P read: named so the D branch below can also service an already-signalled P
-    // without waiting for a later wait call (D is always the lowest-indexed handle).
+    // without waiting for a later wait call (D is always the lowest-indexed handle). Only
+    // called while pio is bound and pending (see both call sites below), so pio is never null
+    // here.
     auto handle_p_wake = [&] {
         DWORD bytes = 0;
-        const BOOL got = GetOverlappedResult(p_dir.get(), &p_ov, &bytes, FALSE);
+        const BOOL got = GetOverlappedResult(pio->dir.get(), &pio->ov, &bytes, FALSE);
         const DWORD p_err = got ? ERROR_SUCCESS : GetLastError();
         if (got == FALSE && p_err == ERROR_IO_INCOMPLETE)
             return; // spurious signal: the read is still in flight
-        p_pending = false;
+        pio->pending = false; // no read in flight now: a reset()/rebuild below frees without draining
         p_failures = got ? 0 : p_failures + 1;
         if (p_failures > kParentFailureLimit) {
             if (p_failures == kParentFailureLimit + 1) // once per entry into this state
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} failing "
                              "repeatedly (err={}) - degraded re-arm in {}ms",
                              cfg_.rule_id, cfg_.path, p_err, kArmFailRetryMs);
-            p_reset();
-            arm_retry = true; // repeated failures: bounded degraded re-arm, not a rebuild loop
+            pio.reset(); // pending==false: freed immediately by ParentIoRelease, no drain needed
+            // A previously-working watch degrading (unlike bind()'s fresh-open failure, which
+            // never sets arm_retry — see finding 4): bounded degraded re-arm, not a rebuild loop.
+            arm_retry = true;
         } else if (got == FALSE || parent_change_is_ours(bytes)) {
             arm_watch(); // X named / overflow / failed read: re-resolve X, then evaluate
             if (hash_mode)
                 begin_settle(); // NOT an immediate hash: an overflow flood must not cost one each
             else
                 eval_exists();
-        } else if (!issue_p_read()) {
-            arm_retry = true; // could not re-issue: one bounded degraded re-arm, no spin
+        } else if (!issue_p_read(*pio)) {
+            // Reissue on the retained handle failed: again a previously-working watch degrading,
+            // not a fresh open (finding 4) — one bounded degraded re-arm, no spin.
+            arm_retry = true;
         }
     };
 
@@ -622,9 +733,9 @@ void FileGuard::run() try {
         const DWORD idx_anc = ancestor_event ? n : 0xFFFFFFFF;
         if (idx_anc != 0xFFFFFFFF)
             handles[n++] = ancestor_event.get();
-        const DWORD idx_p = p_pending ? n : 0xFFFFFFFF;
+        const DWORD idx_p = (pio && pio->pending) ? n : 0xFFFFFFFF;
         if (idx_p != 0xFFFFFFFF)
-            handles[n++] = p_event.get();
+            handles[n++] = pio->ev.get();
         const DWORD idx_stop = n;
         handles[n++] = static_cast<HANDLE>(stop_event_);
 
@@ -661,11 +772,12 @@ void FileGuard::run() try {
             break;
         if (r == WAIT_TIMEOUT) {
             if (hash_mode && hash_pending) {
-                // Settle quiesced (or the max-defer cap fired) → hash now, then
-                // re-resolve the watch (handles a parent deleted during the write).
+                // Settle quiesced (or the max-defer cap fired) → re-resolve the watch first
+                // (handles a parent deleted during the write), then hash — matching every
+                // other arm-before-eval call site in this file.
                 hash_pending = false;
-                eval_hash();
                 arm_watch();
+                eval_hash();
             } else if (arm_retry) {
                 arm_watch(); // degraded re-arm
                 eval_now();
@@ -681,8 +793,18 @@ void FileGuard::run() try {
             // On a GetOverlappedResult failure we can't trust the buffer → reconcile.
             const bool ours = (got == FALSE) || change_is_ours(notify_buf, bytes, fname);
             if (!ours) {
-                if (!arm_dir_read())
+                // Fast path: a reissue on the same handle needs no eval at all (not our
+                // filename, watch still armed). Only the rebuild sub-branch evaluates — an
+                // unconditional eval here would turn every "not our filename" completion in a
+                // busy sibling-heavy directory into a full rebuild+eval, reintroducing the
+                // noise the header's network-kindness NFR exists to avoid.
+                if (!arm_dir_read()) {
                     arm_watch(); // re-arm failed (dir gone) → rebuild
+                    if (hash_mode)
+                        begin_settle();
+                    else
+                        eval_exists();
+                }
             } else if (hash_mode) {
                 // Defer the (expensive, mid-write-prone) hash to the settle timeout;
                 // keep the read armed and (re)start the bounded settle countdown.
@@ -695,9 +817,9 @@ void FileGuard::run() try {
             }
             // D is always the lowest-indexed handle, so sustained D activity must not starve an
             // already-signalled P completion until a later wait call: check it non-blockingly now.
-            // p_pending (not the idx_p computed at loop entry) is read here: the D branch above may
-            // itself have re-armed or reset P, and only a currently live read is safe to check.
-            if (p_pending && WaitForSingleObject(p_event.get(), 0) == WAIT_OBJECT_0)
+            // pio->pending (not the idx_p computed at loop entry) is read here: the D branch above
+            // may itself have re-armed or reset P, and only a currently live read is safe to check.
+            if (pio && pio->pending && WaitForSingleObject(pio->ev.get(), 0) == WAIT_OBJECT_0)
                 handle_p_wake();
         } else if (idx_anc != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_anc) {
             arm_watch();
@@ -714,7 +836,9 @@ void FileGuard::run() try {
             break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
         }
     }
-    // RAII: dir_event / h_dir / ancestor_event / p_dir / p_event released by their destructors.
+    // RAII: dir_event / h_dir / ancestor_event released by their destructors; pio's
+    // ParentIoRelease drains-or-abandons any in-flight P read (sec-1) before pio itself
+    // is destroyed.
 } catch (const std::exception& e) {
     spdlog::error("Guardian FileGuard[{}]: watch thread exception: {} — watch stopping", cfg_.rule_id,
                   e.what());
