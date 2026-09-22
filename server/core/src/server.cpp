@@ -19107,8 +19107,10 @@ private:
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
     /// PR1.9c: the composed classification ruleset `build_classified_command`
-    /// consults on every dispatch — core (this package) plus the six
-    /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
+    /// consults on every dispatch — core (this package) plus the per-group and
+    /// per-plugin catalogues below (16 sources in total, which is
+    /// `CommandCapabilityRegistry::kMaxSources` exactly; see its doc comment
+    /// before adding a 17th). A STATIC ruleset, constructed
     /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
     /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
     /// on every call; nothing about a dispatch OUTCOME is memoized here. No

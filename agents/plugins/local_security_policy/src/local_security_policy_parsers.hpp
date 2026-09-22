@@ -3,10 +3,13 @@
  * or clock. Every decision (errno class, status, row shape, sudoers kind) is a
  * function here; the leg TUs only read bytes and hand them in.
  *
- * Rows (fields through safe_output_field):
- *   password_policy|<key>|<value>|<source>   lockout_policy|...   audit_policy|<category>|<setting>|<source>
+ * Rows (fields through safe_output_field). All four shapes, since this header is
+ * what local_security_policy_plugin.cpp points at for them:
+ *   <action>|<key>|<value>|<source>          password_policy, lockout_policy, audit_policy
  *   sudoers|<file>|<kind>|<subject>|<runas>|<nopasswd>|<commands>
  *     kind: defaults | alias | include | includedir | user_spec | unmodelled | ignored | absent | unreadable
+ *   <action>|status|<state>|<reason>         the zero-row fallback (local_security_policy_legs.hpp)
+ *   constrained|<token>                      the Windows leg's 2-field diagnostic row
  * A definitively missing source is the row state `absent` (key `source_state`) and no
  * failure token; an unreadable one is `unreadable:<token>` -- failure never reads as absent.
  */
