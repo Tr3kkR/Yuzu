@@ -299,9 +299,18 @@ inline void add_key_rows(Report& rep, const KeySpec& spec, const KeyRead& kr) {
                                 State::unmodelled});
         }
     }
+    // An incomplete enumeration only PROVES a value wasn't seen among the values it managed to
+    // read; it never proves the value doesn't exist. An unseen expected value therefore reads
+    // `unreadable` (with a reason token), never `absent`, when the enumeration didn't finish.
     for (std::size_t i = 0; i < spec.expected.size(); ++i)
-        if (!seen[i])
-            rep.rows.push_back({spec.action, std::string{spec.expected[i].row_key}, "-", State::absent});
+        if (!seen[i]) {
+            if (kr.complete) {
+                rep.rows.push_back({spec.action, std::string{spec.expected[i].row_key}, "-", State::absent});
+            } else {
+                note_failure(rep, unreadable_failure(spec.expected[i].row_key, "enumeration_incomplete"));
+                rep.rows.push_back({spec.action, std::string{spec.expected[i].row_key}, "-", State::unreadable});
+            }
+        }
     if (!kr.complete)
         rep.acc.add_failure(std::string{spec.label} + ":enumeration_incomplete");
 }

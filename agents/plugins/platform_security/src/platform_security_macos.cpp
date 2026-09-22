@@ -10,6 +10,17 @@
  * run_bounded_subprocess with a literal absolute argv (no PATH search, no shell), a
  * deadline, stdout only and a byte cap. What a run MEANS is decided by tool_row in the
  * parsers header. vuln_scan runs the same commands via popen (rung 3); not edited here.
+ *
+ * NOT DONE, decided: the roadmap row also names Security.framework `SecStaticCode*`
+ * for "code-signing enforcement". Checked (2026-09-22) and rejected: every
+ * `SecStaticCode*` API (`SecStaticCodeCheckValidity` and friends) validates ONE named
+ * code object's OWN signature -- there is no machine-wide "is code-signing
+ * enforcement on" query in Security.framework, the way `spctl --status` and
+ * `csrutil status` report Gatekeeper/SIP policy. Reading it against the agent's own
+ * binary would report whether the AGENT is signed, not the host's posture -- a
+ * different question this action doesn't ask. Same shape as the Windows leg's WLDP decision (platform_security_win.cpp banner):
+ * the roadmap named an API, the API doesn't provide what the row needs, so it stays
+ * unshipped rather than wired to answer a question it can't actually answer.
  */
 #include "platform_security_legs.hpp"
 

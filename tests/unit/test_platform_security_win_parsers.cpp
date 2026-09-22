@@ -301,6 +301,32 @@ TEST_CASE("row builder: wrong type, opaque, text escaping, case, incomplete enum
     CHECK(select_status(rep).status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(select_status(rep).completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
 
+    // Fails under: an incomplete enumeration reading an UNSEEN expected value as `absent`
+    // (a definitive claim the enumeration cannot make) instead of `unreadable`.
+    {
+        KeyRead partial;
+        partial.values = {dword_value("EnableVirtualizationBasedSecurity", 1)};
+        partial.complete = false; // more values existed than were enumerated
+        // ci/hvci_scenario/lsa keys absent (1 expected value each -> 1 absent row each); the
+        // deviceguard key is the partial one under test, in between them (call order in
+        // build_code_integrity_report: ci, device_guard, hvci_scenario, lsa).
+        auto dg_rep = build_code_integrity_report(absent_key(), partial, absent_key(), absent_key());
+        const auto dg_got = lines(dg_rep);
+        REQUIRE(dg_got.size() == 6);
+        CHECK(dg_got[1] == "code_integrity|windows|deviceguard.EnableVirtualizationBasedSecurity|1|enabled");
+        // The two expected values NOT among the partial enumeration are `unreadable`, never `absent`:
+        // the enumeration didn't finish, so it never established that they don't exist.
+        CHECK(dg_got[2] ==
+              "code_integrity|windows|deviceguard.RequirePlatformSecurityFeatures|-|unreadable");
+        CHECK(dg_got[3] ==
+              "code_integrity|windows|deviceguard.HypervisorEnforcedCodeIntegrity|-|unreadable");
+        CHECK(dg_rep.acc.reason() ==
+              "deviceguard.RequirePlatformSecurityFeatures:enumeration_incomplete,"
+              "deviceguard.HypervisorEnforcedCodeIntegrity:enumeration_incomplete,"
+              "deviceguard:enumeration_incomplete");
+        CHECK(select_status(dg_rep).status == YUZU_RESULT_STATUS_CONSTRAINED);
+    }
+
     // One refused value outranks other tokens and the healthy keys: PERMISSION_DENIED.
     KeyRead dg;
     dg.values = {dword_value("EnableVirtualizationBasedSecurity", 1)};
