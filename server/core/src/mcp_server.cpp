@@ -1074,7 +1074,11 @@ static const ToolDef kTools[] = {
      "follow-up). If the stored source_payload nests past the JSON depth guard (#4493), the "
      "row is healed in place (payload discarded, status/members untouched) as a side effect "
      "of the rejection, so a later re-eval attempt is refused for a different reason (no "
-     "re-runnable source) instead of repeating the same depth error. REST v1 twin: POST "
+     "re-runnable source) instead of repeating the same depth error. If the original was "
+     "narrowed to a parent set at creation time and that parent has since been deleted, this "
+     "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
+     "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or error.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
@@ -12301,8 +12305,53 @@ McpServer::HandlerFn McpServer::build_handler(
                 // parent (re-eval re-asks the same question against today's
                 // estate).
                 nlohmann::json synth = nlohmann::json::object();
-                if (orig->parent_id && !orig->parent_id->empty())
-                    synth["parent_id"] = *orig->parent_id;
+                if (orig->parent_id && !orig->parent_id->empty()) {
+                    synth["parent_id"] = *orig->parent_id; // live parent: canonical, exact
+                } else if (sp.is_object() && sp.contains("scope_input_id") &&
+                           sp["scope_input_id"].is_string() &&
+                           !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
+                    // #4306 / #2500-class target erasure: the original was
+                    // NARROWED at creation (scope_input_id persisted into
+                    // source_payload by create_result_set_from_tar_query /
+                    // create_result_set_from_instruction_result), but its live
+                    // parent_id FK is now null (schema: `parent_id ... ON DELETE
+                    // SET NULL`, result_set_store.cpp) because the parent set was
+                    // deleted since. An absent parent_id reaching rs_run_async
+                    // below reads as "omitted -> broadcast to __all__" (the SAME
+                    // rule rs_run_async's own parent_id-empty guard applies to a
+                    // caller-supplied empty string), so "re-ask the same narrow
+                    // question" would silently become "ask the whole visible
+                    // fleet". Mirrors REST's identical guard on this route
+                    // (rest_api_v1.cpp).
+                    //
+                    // Deliberately NOT re-resolving scope_input_id as a fresh
+                    // alias lookup: it is the RAW caller-supplied value at
+                    // creation time and may be an ALIAS, not a canonical rs_ id.
+                    // rs_resolve_owned_parent routes a non-rs_-prefixed string
+                    // through resolve_alias(), whose SQL is `ORDER BY created_at
+                    // DESC LIMIT 1` — newest-wins — so the alias may since have
+                    // been re-bound to a DIFFERENT, newer set. Resolving it now
+                    // would retarget the dispatch to whatever the alias means
+                    // TODAY, not what it meant when this original was created: a
+                    // precision regression, not a fix. Refuse instead, before
+                    // rs_run_async / exec_visible derivation — nothing is
+                    // dispatched, no execution row is created, nothing needs
+                    // cancelling.
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", rs_id,
+                        "reason=parent_gone source_kind=" + orig->source_kind);
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
+                                 "exists; re-eval cannot reconstruct its target scope -- create "
+                                 "a new set from the intended parent instead",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                // else: genuinely parentless original (no scope_input_id was ever
+                // recorded) -> broadcast, today's behaviour, unchanged (an
+                // omitted parent_id is deliberately "the whole fleet").
                 // Skip the suffix if it's already there, else repeated
                 // re-evals of a sibling grow "foo (re-eval) (re-eval) ..."
                 // unboundedly.

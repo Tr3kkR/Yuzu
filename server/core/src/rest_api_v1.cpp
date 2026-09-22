@@ -1508,7 +1508,7 @@ const std::string& openapi_spec() {
         // #3992 F2 split just below.
         R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -10820,8 +10820,54 @@ void RestApiV1::register_routes(
                       // original's parent (re-eval re-asks the same question
                       // against the same candidate scope, today's estate).
                       nlohmann::json synth;
-                      if (orig->parent_id && !orig->parent_id->empty())
-                          synth["parent_id"] = *orig->parent_id;
+                      if (orig->parent_id && !orig->parent_id->empty()) {
+                          synth["parent_id"] = *orig->parent_id; // live parent: canonical, exact
+                      } else if (sp.is_object() && sp.contains("scope_input_id") &&
+                                 sp["scope_input_id"].is_string() &&
+                                 !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
+                          // #4306 / #2500-class target erasure: the original was
+                          // NARROWED at creation (scope_input_id was persisted into
+                          // source_payload by the from-tar-query/from-instruction-
+                          // result producers above), but its live parent_id FK is
+                          // now null — schema: `parent_id ... ON DELETE SET NULL`
+                          // (result_set_store.cpp) — because the parent set was
+                          // deleted since. An absent parent_id reaching run_async
+                          // below reads as "omitted -> broadcast to __all__" (the
+                          // SAME rule run_async's own parent_id-empty guard applies
+                          // to a caller-supplied empty string), so "re-ask the same
+                          // narrow question" would silently become "ask the whole
+                          // visible fleet".
+                          //
+                          // Deliberately NOT re-resolving scope_input_id as a fresh
+                          // alias lookup: it is the RAW caller-supplied value at
+                          // creation time and may be an ALIAS, not a canonical rs_
+                          // id. resolve_owned_parent routes a non-rs_-prefixed
+                          // string through resolve_alias(), whose SQL is `ORDER BY
+                          // created_at DESC LIMIT 1` — newest-wins — so the alias
+                          // may since have been re-bound to a DIFFERENT, newer set.
+                          // Resolving it now would retarget the dispatch to
+                          // whatever the alias means TODAY, not what it meant when
+                          // this original was created: a precision regression, not
+                          // a fix. Refuse instead, before run_async / exec_visible
+                          // derivation — nothing is dispatched, no execution row is
+                          // created, nothing needs cancelling.
+                          bool audit_ok = true;
+                          if (audit_fn)
+                              audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
+                                                   id,
+                                                   "reason=parent_gone source_kind=" +
+                                                       orig->source_kind);
+                          if (!audit_ok)
+                              res.set_header("Sec-Audit-Failed", "true");
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
+                                 "exists; re-eval cannot reconstruct its target scope -- create "
+                                 "a new set from the intended parent instead");
+                          return;
+                      }
+                      // else: genuinely parentless original (no scope_input_id was
+                      // ever recorded) -> broadcast, today's behaviour, unchanged
+                      // (an omitted parent_id is deliberately "the whole fleet").
                       // Skip the suffix if it's already there, else repeated
                       // re-evals of a sibling grow "foo (re-eval) (re-eval) …"
                       // unboundedly (review finding bug_014).

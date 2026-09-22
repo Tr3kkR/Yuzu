@@ -26994,6 +26994,301 @@ TEST_CASE("MCP reevaluate_result_set: a smuggled params bound is a permanent cli
     CHECK_FALSE(dispatched);
 }
 
+// #4306 / #2500-class target erasure: reevaluate_result_set synthesises the
+// sibling's dispatch scope from the LIVE, nullable parent_id FK. If the
+// original was narrowed at creation time (scope_input_id persisted into
+// source_payload) but its parent was later deleted (ON DELETE SET NULL), an
+// absent parent_id read downstream as "broadcast to __all__" silently turns
+// "re-ask the same narrow question" into "ask the whole visible fleet".
+// Mirrors test_rest_result_sets_async.cpp's identical coverage of the REST
+// twin on this same route family.
+TEST_CASE("MCP reevaluate_result_set: dispatch scope narrows to the still-live "
+          "parent, never broadcasts (positive control for #4306)",
+          "[pg][mcp][integration][result-sets][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "ground";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1", "a2"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 7";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(captured_scope == "from_result_set:" + parent->id);
+}
+
+TEST_CASE("MCP reevaluate_result_set: a genuinely parentless original still "
+          "broadcasts (no regression, positive control for #4306)",
+          "[pg][mcp][integration][result-sets][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig-no-parent";
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {});
+    REQUIRE(orig.has_value());
+
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-2"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(captured_scope == "__all__");
+}
+
+TEST_CASE("MCP reevaluate_result_set: refused when the original's live parent "
+          "was deleted, never falls back to broadcast (#4306 target erasure)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "narrow-target";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig->id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+
+    // No new pending/materialized row landed -- only the original remains.
+    std::string next;
+    auto rows = rs_bundle.get()->list_by_owner("test-user", "", 50, next);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].id == orig->id);
+
+    // Denied and audited with reason=parent_gone.
+    bool found_log = false;
+    for (auto& l : ts.audit_log)
+        if (l == "result_set.create|denied")
+            found_log = true;
+    CHECK(found_log);
+    bool found_detail = false;
+    for (auto& d : ts.audit_details)
+        if (d.find("reason=parent_gone") != std::string::npos)
+            found_detail = true;
+    CHECK(found_detail);
+}
+
+TEST_CASE("MCP reevaluate_result_set: an alias-referenced parent is refused "
+          "after deletion, never silently re-resolved to a newer set bound to "
+          "the same alias (#4306)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306][alias]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "my-alias";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    // Original narrowed via the ALIAS string, not the canonical rs_ id --
+    // mirrors what create_result_set_from_tar_query persists into
+    // scope_input_id when the caller supplies an alias as parent_id.
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = "my-alias";
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id; // canonical id, resolved at creation time
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+
+    // Re-bind the alias to a DIFFERENT, newer set. If the fix silently
+    // re-resolved scope_input_id as a fresh alias lookup, THIS is the set it
+    // would wrongly retarget to.
+    CreateRequest newer_cr;
+    newer_cr.owner_principal = "test-user";
+    newer_cr.name = "my-alias";
+    newer_cr.source_kind = std::string(source_kind::kManualCurate);
+    newer_cr.source_payload = "{}";
+    auto newer = rs_bundle.get()->create_materialized(newer_cr, {"b1", "b2"});
+    REQUIRE(newer.has_value());
+
+    bool dispatched = false;
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK_FALSE(dispatched);
+    CHECK(captured_scope.empty()); // never even reached from_result_set:<newer>
+}
+
+TEST_CASE("MCP reevaluate_result_set: the parent-gone refusal surfaces a "
+          "dropped audit row via audit_persisted:false, not silently",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "narrow-target-2";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig2";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+
+    auto dispatch =
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.audit_succeeds_ = false; // models a dropped audit row (#1647 posture)
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -

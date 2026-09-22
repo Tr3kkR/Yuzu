@@ -980,10 +980,134 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     // Re-dispatched the original SQL.
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].params.at("sql") == "SELECT 7");
+    // #4306: the still-live parent narrows the re-dispatch, not a broadcast.
+    REQUIRE(h.calls[0].scope_expr == "from_result_set:" + grandparent);
     // Sibling: new set's parent == original's parent (NOT the original).
     auto row = get_ok(*h.store, new_id);
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == grandparent);
+}
+
+TEST_CASE("re-eval: a genuinely parentless original still broadcasts (no regression)",
+          "[pg][result_set][async][reeval][4306]") {
+    // Positive control for the #4306 fix: an original that was NEVER narrowed
+    // at creation (no parent_id supplied, so no scope_input_id was ever
+    // persisted) must still broadcast on re-eval, unchanged. Omitting a
+    // parent_id is deliberately "the whole fleet" everywhere else on this
+    // route family; the parent-gone refusal must not widen to cover this case.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+    h.calls.clear();
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].scope_expr == "__all__");
+}
+
+TEST_CASE("re-eval: refused when the original's live parent was deleted, "
+          "never falls back to broadcast (#4306 target erasure)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.calls.clear();
+    h.audits.clear();
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched.
+    REQUIRE(h.calls.empty());
+    // No new pending/materialized row landed -- only the original remains.
+    std::string next;
+    auto rows = h.store->list_by_owner("operator-1", "", 50, next);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0].id == orig_id);
+    // Denied and audited with reason=parent_gone.
+    bool found = false;
+    for (auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos)
+            found = true;
+    CHECK(found);
+}
+
+TEST_CASE("re-eval: the parent-gone refusal surfaces a dropped audit row via "
+          "Sec-Audit-Failed, not silently",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-2", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE(h.store->delete_set(parent).has_value());
+
+    h.audit_ok = false; // models a dropped audit row (#1647 posture)
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(h.last_sec_audit_failed == "true");
+}
+
+TEST_CASE("re-eval: an alias-referenced parent is refused after deletion, never "
+          "silently re-resolved to a newer set bound to the same alias (#4306)",
+          "[pg][result_set][async][reeval][security][4306][alias]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("my-alias", {"a1"});
+    int status = 0;
+    // Original parented via the ALIAS, not the canonical rs_ id.
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    // The alias was pre-resolved to the canonical id at creation time.
+    REQUIRE(*get_ok(*h.store, orig_id)->parent_id == parent);
+    h.calls.clear();
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    // Re-bind the alias to a DIFFERENT, newer set. If the fix silently
+    // re-resolved scope_input_id as a fresh alias lookup, THIS is the set it
+    // would wrongly retarget to.
+    h.seed_materialized("my-alias", {"b1", "b2"});
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {

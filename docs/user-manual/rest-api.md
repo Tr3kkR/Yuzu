@@ -6004,12 +6004,25 @@ the existing missing-field 400 path, rather than surfacing as an uncaught
 exception (#4406, fixed on both `from-tar-query` and `from-instruction-result`
 in the same change).
 
+**`{id}/re-eval` is refused, never broadcast, when the recorded parent is gone (#4306).**
+`re-eval` synthesises the sibling's dispatch scope from the original's *live* `parent_id`
+FK, which is nulled (`ON DELETE SET NULL`) if the parent set is later deleted. An absent
+`parent_id` reaching dispatch synthesis normally means "broadcast to `__all__`" — the same
+rule the parent_id-empty guard above enforces for a caller-supplied empty string — so
+letting that happen here would silently turn "re-ask the same narrow question" into "ask
+the whole visible fleet". If the live parent is gone **and** the original's stored
+`source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id`), the
+call is refused rather than re-resolved (the recorded value may be an alias that has since
+been re-bound to a different, newer set) or silently broadcast. A genuinely parentless
+original (no `scope_input_id` was ever recorded) still broadcasts on re-eval, unchanged.
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
