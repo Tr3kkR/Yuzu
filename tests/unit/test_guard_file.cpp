@@ -588,6 +588,22 @@ void run_rename_then_recreate(RigMode m, bool move_to_other_parent) {
     CHECK(rig.wait_detected(30s));
 }
 
+// Regression for the completion-discard fix (finding 3): after a rename-then-recreate cycle
+// has already been detected once, a SECOND rename of the (freshly rebuilt) watched directory
+// must still be detected. Uses a drift-count snapshot (not wait_detected()) for the second
+// assertion, since wait_detected() would pass vacuously against the first cycle's own event.
+void run_rename_recreate_then_rename_again(RigMode m) {
+    RenameRig rig(m, "D/f.txt", "D", m == RigMode::Hash);
+    rig.move(rig.dir(), rig.root() / "D2");
+    rig.recreate_and_write();
+    CHECK(rig.wait_detected(30s));
+    const auto after_first = rig.col().drift_count();
+
+    rig.move(rig.dir(), rig.root() / "D3"); // second rename of the rebuilt directory
+    rig.recreate_and_write();
+    CHECK(rig.col().wait_drift_count(after_first + 1, 30s));
+}
+
 void run_rename_reports_absent(RigMode m, bool move_to_other_parent) {
     RenameRig rig(m, "D/f.txt", "D", true);
     if (move_to_other_parent) {
@@ -627,6 +643,25 @@ void run_sibling_churn(RigMode m) {
     rig.move(rig.dir(), rig.root() / "D2");
     rig.recreate_and_write();
     CHECK(rig.wait_detected(30s));
+}
+
+// Regression for the retain-and-reissue design (bind()'s arm 1/arm 2): an ordinary X-content
+// re-arm and a non-matching sibling completion on the parent watch must both retain the SAME
+// parent-watch block rather than rebuild it - only an actual identity change on X (the final
+// move below) may do that. RigMode::Present, seeded so the file starts present == expected,
+// lets the interleaved content rewrites exercise bind() repeatedly without themselves being
+// drift, so the only drift possible below is the proof that the retained block still detects
+// the eventual rename.
+void run_retain_across_rearm() {
+    RenameRig rig(RigMode::Present, "D/f.txt", "D", true);
+    for (int i = 0; i < 5; ++i) {
+        write_file(rig.dir() / "f.txt", "rewrite-" + std::to_string(i)); // X-content re-arm: bind() arm 1/2
+        rig.flood_siblings(10); // P completions not naming X: reissue on the retained handle
+        std::this_thread::sleep_for(20ms);
+    }
+    CHECK(rig.col().drift_count() == 0); // content rewrites of a still-present file are not drift
+    rig.move(rig.dir(), rig.root() / "D2"); // the identity change: only this may rebuild P
+    CHECK(rig.col().wait_for_detected("<absent>", 30s));
 }
 
 // Parks the guard thread inside its first report so notifications pile up unread.
@@ -716,6 +751,22 @@ TEST_CASE("FileGuard rename: moved watched directory then recreated is detected 
 TEST_CASE("FileGuard rename: moved watched directory then recreated is detected (hash)",
           "[guardian][guard][file][rename]") {
     run_rename_then_recreate(RigMode::Hash, true);
+}
+
+TEST_CASE("FileGuard rename: a second rename after a rebuild is still detected (tripwire)",
+          "[guardian][guard][file][rename]") {
+    run_rename_recreate_then_rename_again(RigMode::Tripwire);
+}
+
+TEST_CASE("FileGuard rename: a second rename after a rebuild is still detected (hash)",
+          "[guardian][guard][file][rename]") {
+    run_rename_recreate_then_rename_again(RigMode::Hash);
+}
+
+TEST_CASE("FileGuard rename: parent watch is retained (not rebuilt) across ordinary re-arms "
+          "and sibling churn before a rename",
+          "[guardian][guard][file][rename]") {
+    run_retain_across_rearm();
 }
 
 TEST_CASE("FileGuard rename: rename or move alone reports the absent state (file-exists)",
