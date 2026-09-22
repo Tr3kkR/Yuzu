@@ -74,14 +74,16 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
         break;
     case PolicyStatus::PermissionDenied:
-        spdlog::warn("local_security_policy: permission denied ({})", c.reason);
+        spdlog::warn("local_security_policy: permission denied ({})",
+                     yuzu::util::safe_output_field(c.reason));
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               c.reason);
         if (c.rows.empty())
             ctx.write_output(format_kv_row(action_prefix, "status", "permission_denied", c.reason));
         break;
     case PolicyStatus::Constrained:
-        spdlog::warn("local_security_policy: degraded read ({})", c.reason);
+        spdlog::warn("local_security_policy: degraded read ({})",
+                     yuzu::util::safe_output_field(c.reason));
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               c.reason);
         if (c.rows.empty())

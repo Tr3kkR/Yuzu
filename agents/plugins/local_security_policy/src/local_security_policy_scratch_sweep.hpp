@@ -50,16 +50,21 @@
  *     construction.
  *   - Part 7 (thresholds ABSOLUTE, never relative to a shrinking remainder):
  *     HOLDS -- is_stale compares now - mtime against one fixed threshold.
- * CONSTANTS ARE RE-DERIVED, NOT INHERITED (the concern forbids copying the
- * numbers in either direction): kScratchSweepMaxDirEntries is 64 because a real
- * export directory holds exactly ONE file (policy.inf), where the sibling sizes
- * for a hive plus its sidecars; kScratchSweepMaxFailures has no counterpart in
- * the sibling at all, and exists so a run of persistent failures cannot starve
- * a later removable orphan. The remaining caps and the one-hour floor are
- * deliberately the same numbers, because the substrate is the same (Windows
- * filesystem, agent process, the same confined_fs primitives) and the window
- * they cover is identical. This adoption is also recorded in
- * docs/clock-guarded-retention.md's own per-store adoption register.
+ * ON THE CONSTANTS. The concern forbids copying NUMBERS rather than shape, so
+ * be exact about what happened here: all five caps and the one-hour floor are
+ * the SAME VALUES as execution_artifacts' (4096 / 64 / 256 / 2000 / 64, 3600 s),
+ * and that is deliberate, not inherited by default -- the substrate is identical
+ * (Windows filesystem, agent process, the same confined_fs primitives, the same
+ * create-to-open window), so the same numbers are the right answer and a
+ * different one would need its own justification. Only one DERIVATION differs:
+ * kScratchSweepMaxDirEntries is 64 here because a real export directory holds
+ * exactly ONE file (policy.inf), where the sibling reaches the same 64 sizing
+ * for a hive plus its .LOG1/.LOG2 sidecars. kScratchSweepMaxFailures is capped
+ * separately from removals for the reason the sibling gives at its own
+ * declaration -- a failure deletes nothing, so persistent failures early in
+ * enumeration order must not exhaust the budget a later removable orphan needs.
+ * This adoption is also recorded in docs/clock-guarded-retention.md's own
+ * per-store adoption register.
  *
  * The one-hour floor is not a data-safety guard: a live directory is protected
  * by the dispatch holding it open without FILE_SHARE_DELETE; the floor only
@@ -156,11 +161,28 @@ classify_sweep_candidate(std::string_view name, bool is_directory,
     return owned_by_current_token_owner;
 }
 
-/// `scratch_sweep:<removed>/<skipped>` -- banner-level log only, never a row
-/// or a constraint token. skipped = every examined-but-not-removed outcome.
+/// Log-line only, never a row or a constraint token: the wire carries no
+/// provenance for a sweep, so the agent log is the ONLY surface a sweep's
+/// health has. Each outcome is therefore named rather than summed. An earlier
+/// shape collapsed fresh + foreign-SID + failed + deferred into one `skipped`
+/// number, which made "two concurrent dispatches" (healthy) and "two orphans
+/// that could not be removed" (disk accumulating) the same string. `failed`
+/// and `deferred` are the two that mean the sweep is not reclaiming; keep them
+/// separately visible. Same counter set execution_artifacts' own sweep logs.
 [[nodiscard]] inline std::string format_sweep_summary(const ScratchSweepResult& r) {
-    const std::size_t skipped = r.skipped_fresh + r.skipped_not_ours + r.failed + r.deferred;
-    return "scratch_sweep:" + std::to_string(r.removed) + "/" + std::to_string(skipped);
+    return "scratch_sweep: removed " + std::to_string(r.removed) + " failed " +
+           std::to_string(r.failed) + " fresh " + std::to_string(r.skipped_fresh) +
+           " not_ours " + std::to_string(r.skipped_not_ours) + " deferred " +
+           std::to_string(r.deferred);
+}
+
+/// True when a pass did anything worth a log line. A steady-state pass finds
+/// nothing and says nothing: this runs before EVERY Windows dispatch, and an
+/// unconditional per-dispatch info line is noise at fleet scale (the agent core
+/// already logs one line per command with rc, timing and provenance).
+[[nodiscard]] inline bool sweep_worth_logging(const ScratchSweepResult& r) noexcept {
+    return r.removed > 0 || r.failed > 0 || r.skipped_not_ours > 0 || r.deferred > 0 ||
+           r.enumerate_error;
 }
 
 // -- secedit run / read classification ----------------------------------------

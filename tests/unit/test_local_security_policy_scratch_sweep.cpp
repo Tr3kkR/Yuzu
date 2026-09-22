@@ -64,7 +64,11 @@ TEST_CASE("sweep_may_remove: a foreign-owned directory is never removed",
 }
 
 // Fails if: the summary shape, or which outcomes count as skipped, changes.
-TEST_CASE("format_sweep_summary: removed/skipped, skipped = every non-removed outcome",
+// Fails under: collapsing the outcomes back into one `skipped` total. The wire
+// carries no provenance for a sweep, so this log line is its only health surface;
+// summing fresh + not_ours + failed + deferred made "concurrent dispatches"
+// (healthy) and "orphans that cannot be removed" (accumulating) the same string.
+TEST_CASE("format_sweep_summary: every outcome is named, never summed",
           "[local_security_policy][sweep]") {
     ScratchSweepResult r;
     r.removed = 2;
@@ -72,7 +76,26 @@ TEST_CASE("format_sweep_summary: removed/skipped, skipped = every non-removed ou
     r.skipped_not_ours = 3;
     r.failed = 4;
     r.deferred = 5;
-    CHECK(format_sweep_summary(r) == "scratch_sweep:2/13");
+    CHECK(format_sweep_summary(r) ==
+          "scratch_sweep: removed 2 failed 4 fresh 1 not_ours 3 deferred 5");
+    CHECK(format_sweep_summary({}) == "scratch_sweep: removed 0 failed 0 fresh 0 not_ours 0 deferred 0");
+}
+
+// Fails under: logging unconditionally on every dispatch. The sweep runs before
+// EVERY Windows dispatch; a pass that reclaimed nothing and failed at nothing is
+// the steady state and must stay silent.
+TEST_CASE("sweep_worth_logging: silent in steady state, loud on anything actionable",
+          "[local_security_policy][sweep]") {
+    CHECK_FALSE(sweep_worth_logging({}));            // nothing happened
+    ScratchSweepResult fresh_only;
+    fresh_only.skipped_fresh = 4;                    // concurrent dispatches: normal
+    CHECK_FALSE(sweep_worth_logging(fresh_only));
+    for (const auto& r : {[] { ScratchSweepResult x; x.removed = 1; return x; }(),
+                          [] { ScratchSweepResult x; x.failed = 1; return x; }(),
+                          [] { ScratchSweepResult x; x.skipped_not_ours = 1; return x; }(),
+                          [] { ScratchSweepResult x; x.deferred = 1; return x; }(),
+                          [] { ScratchSweepResult x; x.enumerate_error = true; return x; }()})
+        CHECK(sweep_worth_logging(r));
 }
 
 // Fails if: any run outcome other than a clean zero exit reads as success, or a

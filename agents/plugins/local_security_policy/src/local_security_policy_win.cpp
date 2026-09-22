@@ -315,8 +315,11 @@ public:
         std::filesystem::remove_all(std::filesystem::path{path_}, ec);
         if (ec) {
             try {
-                spdlog::warn("local_security_policy: scratch directory cleanup failed; the next "
-                             "dispatch's sweep will retry");
+                // The error code matters: a sharing violation is transient, an
+                // access denial is not, and the next sweep's outcome depends on it.
+                spdlog::warn("local_security_policy: scratch directory cleanup failed ({}); the "
+                             "next dispatch's sweep will retry",
+                             ec.value());
             } catch (...) {
             }
         }
@@ -424,7 +427,11 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
                          .count();
     const ScratchSweepResult swept = sweep_stale_scratch_dirs(
         yuzu::win::to_wide(std::string{data_dir}), static_cast<std::int64_t>(now));
-    spdlog::info("local_security_policy: {}", format_sweep_summary(swept));
+    // warn, and only when the pass did something: a sweep that reclaimed nothing
+    // and failed at nothing is the steady state and needs no line. Matches the
+    // sibling's `if (total > 0) spdlog::warn(...)` shape.
+    if (sweep_worth_logging(swept))
+        spdlog::warn("local_security_policy: {}", format_sweep_summary(swept));
     if (swept.enumerate_error)
         spdlog::warn("local_security_policy: sweep could not enumerate data_dir (os error {})",
                      swept.os_error);
