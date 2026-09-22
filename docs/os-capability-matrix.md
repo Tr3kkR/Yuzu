@@ -554,6 +554,9 @@ implementation is.
 | printing | clear_queue | linux | constrained | 1 | IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred | measured in a Debian/Ubuntu cupsd container: container root/@SYSTEM (SystemGroup root lpadmin) cancelling another user's job succeeds (status 0x0000, I93-7) — but the production Linux agent runs unprivileged (docs/agent-privilege-model.md), never root or @SYSTEM, so an ordinary non-owning cancel is correctly refused (403) before Cancel-Job is ever reached; reliable only for a job the agent's own identity owns |
 | printing | clear_queue | macos | constrained | 1 | IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred | PROVISIONAL — cupsd.conf Cancel-Job policy requires @OWNER/@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by cupsd, authorisation outcome for a non-owned job UNMEASURED |
 | printing | clear_queue | windows | supported | 1 | winspool SetJobW JOB_CONTROL_CANCEL on one job id | cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see docs/agent-privilege-model.md |
+| privacy_permissions | permissions | linux | constrained | 1 | xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session bus; unavailable (no daemon/no session) on most non-sandboxed desktops | - |
+| privacy_permissions | permissions | macos | constrained | 1 | TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected to read denied | - |
+| privacy_permissions | permissions | windows | supported | 1 | HKCU/HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
@@ -822,6 +825,7 @@ implementation is.
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 
 _none — every built plugin has adopted the ABI4 capability descriptor._
+<!-- END GENERATED -->
 <!-- END GENERATED -->
 
 ## Make this self-maintaining

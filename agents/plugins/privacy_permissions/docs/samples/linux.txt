@@ -1,0 +1,5 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash pending
+== action=permissions
+permissions|linux|-|-|unsupported|-|-|-
+[result_status] OK / FULL / 
+
