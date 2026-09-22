@@ -754,6 +754,10 @@ void run_ancestor_created_chain_hits_abandon_limit() {
     cfg.expect_present = true; // absent throughout: only directories are created, never the file
     cfg.event_debounce_ms = 0; // every wake's report must be counted, not collapsed
 
+    // Counts FORCED abandons only. A genuine (not test-forced) drain exceeding kCancelDrainMs on
+    // a loaded/contended runner would still advance the real p_abandon_count without incrementing
+    // this - if the CHECKs below ever fail, that is an environment-timing signature, not evidence
+    // the counting logic itself regressed.
     std::atomic<int> hook_calls{0};
     auto col = std::make_shared<FileDriftCollector>();
     FileGuard guard(cfg, [col](const GuardDrift& d) { col->push(d); });
