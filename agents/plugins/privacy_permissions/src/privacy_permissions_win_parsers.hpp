@@ -13,12 +13,12 @@
  */
 #pragma once
 
-#include "privacy_permissions_parsers.hpp"
-
 #include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
+
+#include "privacy_permissions_parsers.hpp"
 
 namespace yuzu::privacy_permissions::win {
 

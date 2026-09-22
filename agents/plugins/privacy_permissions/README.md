@@ -63,7 +63,7 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 - **Instruction result.** Rows go to the standard `ResponseStore`, retained and served the same as every other read-only instruction, over `GET /api/responses` and the equivalent MCP result-poll tools.
 - **Not consumed by** daily-sync, TAR, DEX, or metrics.
 - **Sensitivity.** Names, per app on a specific machine, whether that app currently holds live audio/video/location/filesystem-access capability -- gated behind `Forensics:Read` + `AdminOrApproval` (Administrator-only) for exactly this reason, same posture as `execution_artifacts`.
-- **Siblings:** `execution_artifacts` (the other Forensics-class Windows-evidence plugin), `platform_security` (adjacent OS-security-posture reporting, `Security:Read` not `Forensics:Read`).
+- **Siblings:** `execution_artifacts` (the other Forensics-class Windows-evidence plugin).
 
 ## Sample output
 

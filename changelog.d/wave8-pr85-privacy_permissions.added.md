@@ -1,0 +1,1 @@
+- privacy_permissions plugin: per-app sensitive-permission grant visibility (camera, microphone, location, full-disk-access equivalents) across Windows (CapabilityAccessManager ConsentStore, HKCU+HKLM), macOS (TCC.db, read-only in-process), and Linux (xdg-desktop-portal PermissionStore over the session bus). Read-only, default-off via the plugin-config kill switch.

@@ -826,7 +826,6 @@ implementation is.
 
 _none — every built plugin has adopted the ABI4 capability descriptor._
 <!-- END GENERATED -->
-<!-- END GENERATED -->
 
 ## Make this self-maintaining
 

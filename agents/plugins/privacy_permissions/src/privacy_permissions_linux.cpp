@@ -24,14 +24,14 @@
 
 #if defined(__linux__)
 
-#if defined(YUZU_HAVE_LIBSYSTEMD)
-#include <systemd/sd-bus.h>
-#endif
-
 #include <array>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#if defined(YUZU_HAVE_LIBSYSTEMD)
+#include <systemd/sd-bus.h>
+#endif
 
 namespace yuzu::privacy_permissions {
 

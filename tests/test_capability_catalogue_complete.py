@@ -3,7 +3,7 @@
 
 The capability catalogue (`server/core/src/command_capability.hpp`'s
 `CommandCapability` rows) is authored as FIFTEEN independent, hand-written
-sources: the fourteen per-plugin-group fragment headers listed in
+sources: the fifteen per-plugin-group fragment headers listed in
 FRAGMENT_FILES below (each owned by a different package) plus the
 core-owned `capability_decls/core_dispatch_capabilities.hpp` (the four
 system-initiated dispatches a plugin never receives from a caller —
@@ -23,7 +23,7 @@ capability-catalogue headers. It fails, naming the exact offending
   1. A plugin declares an action that has no catalogue row anywhere across
      the fifteen sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
-  2. One of the fourteen per-group fragments declares a `plugin.action` no
+  2. One of the fifteen per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
      catalogue data, or a typo that silently shadows the real action. (The
      core-owned fragment is exempt from this direction only:
@@ -83,6 +83,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

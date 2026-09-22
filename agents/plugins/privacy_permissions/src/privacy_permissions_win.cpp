@@ -15,13 +15,13 @@
 
 #if defined(_WIN32)
 
-#include <win_reg_handle.hpp>
-#include <win_str.hpp>
-
 #include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
+
+#include <win_reg_handle.hpp>
+#include <win_str.hpp>
 
 namespace yuzu::privacy_permissions {
 
@@ -58,8 +58,8 @@ RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view categ
     RawGrant g{std::move(app_id), std::string{category}, PermissionState::unreadable, "-", "-", "-"};
 
     DWORD type = 0, size = 0;
-    if (RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
-        size > 0) {
+    const LONG probe_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size);
+    if (probe_rc == ERROR_SUCCESS && size > 0) {
         std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
         DWORD sz = size;
         if (RegQueryValueExW(app_key, L"Value", nullptr, &type,
@@ -68,9 +68,15 @@ RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view categ
             g.state = win::decode_consent_value(val, type == REG_SZ);
             g.raw_value = val.empty() ? "-" : val;
         }
-    } else {
-        g.state = PermissionState::absent; // no Value under this app's own key
+        // else: the second (real) read failed after the first (size-probe) succeeded -- keep
+        // the default `unreadable` rather than guess; an unusual TOCTOU-shaped registry race.
+    } else if (probe_rc == ERROR_FILE_NOT_FOUND) {
+        g.state = PermissionState::absent; // no Value under this app's own key -- genuinely not there
+    } else if (probe_rc == ERROR_ACCESS_DENIED) {
+        g.state = PermissionState::denied; // the read was refused, never collapsed into absent
     }
+    // else: any other Win32 error (or a zero-size value) stays `unreadable`, its default --
+    // a refusal we can't name more precisely, not "not there".
 
     const auto read_filetime = [&](const wchar_t* name) -> std::string {
         std::uint64_t ft = 0;
@@ -153,10 +159,13 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     std::vector<PermissionRow> rows;
     rows.reserve(merged.size());
     for (const auto& [key, g] : merged) {
+        const bool value_denied = (g.state == PermissionState::denied);
         if (g.state == PermissionState::unreadable)
             acc.add_failure(g.app_id + ":" + g.category + ":value_unreadable");
+        else if (value_denied)
+            acc.add_failure(g.app_id + ":" + g.category + ":value_access_denied");
         rows.push_back({"windows", g.app_id, g.category, g.state, g.raw_value, g.last_used_start,
-                        g.last_used_stop, false});
+                        g.last_used_stop, value_denied});
     }
 
     if (rows.empty() && hkcu_rc != ERROR_SUCCESS && hkcu_rc != ERROR_FILE_NOT_FOUND) {

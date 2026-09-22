@@ -28,12 +28,12 @@
 
 #if defined(__APPLE__)
 
-#include <sqlite3.h>
-
 #include <array>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <sqlite3.h>
 
 namespace yuzu::privacy_permissions {
 
@@ -81,12 +81,18 @@ private:
     sqlite3* db_{nullptr};
 };
 
-/// Opens TCC.db read-only. `err_msg` is filled from sqlite3_errmsg() on failure -- the real,
-/// observed diagnostic, not a guessed one (the plan's acceptance criterion for this leg is
-/// recording the ACTUAL denied/constrained outcome, not asserting one).
-DbHandle open_readonly(std::string& err_msg) {
+/// Opens `db_path` (default: the real TCC.db) read-only. `err_msg` is filled from
+/// sqlite3_errmsg() on failure -- the real, observed diagnostic, not a guessed one (the plan's
+/// acceptance criterion for this leg is recording the ACTUAL denied/constrained outcome, not
+/// asserting one). `db_path` is a parameter (not baked in) so a unit test can force the exact
+/// open-failure branch deterministically against a path this process genuinely cannot open,
+/// without needing a non-FDA identity or touching the real TCC.db -- sqlite3_open_v2 treats
+/// "file missing" and "permission refused" identically here (see the caller's own comment on
+/// why there is no finer-grained code to branch on), so a missing-path failure exercises
+/// exactly the same code as a real SIP/TCC denial would.
+DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPath) {
     sqlite3* raw = nullptr;
-    const int rc = sqlite3_open_v2(std::string{kTccDbPath}.c_str(), &raw,
+    const int rc = sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
     DbHandle db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
                       // carry the error message; RAII from here regardless of `rc`.
@@ -112,6 +118,19 @@ PermissionState decode_auth_value(int v) {
 }
 
 } // namespace
+
+// `collect_macos_permissions` itself (below) is excluded when
+// YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY is defined -- the seam
+// test_privacy_permissions_macos_internals.cpp uses to #include this TU directly and reach the
+// internal-linkage `open_readonly` for a deterministic open-failure unit test (denied-path
+// composition, K2/COD-FV-5), without pulling collect_macos_permissions's own symbol into a
+// second definition. This TU never statically links the real plugin either way
+// (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
+// runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
+// symbol conflict. Never defined by this TU's own (real) build -- meson.build does not set it.
+// Mirrors autoruns_macos.cpp's identical seam for YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
+// and execution_artifacts_win.cpp's #4392 TU-inclusion precedent.
+#ifndef YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
@@ -170,6 +189,8 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
     (void)any_row_found;
     return emit_rows(ctx, rows, acc, false);
 }
+
+#endif // !YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 } // namespace yuzu::privacy_permissions
 

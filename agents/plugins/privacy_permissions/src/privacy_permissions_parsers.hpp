@@ -27,13 +27,7 @@
  */
 #pragma once
 
-#include <constraint_accumulator.hpp>
-
-#include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
-#include <yuzu/string_utils.hpp>
-
 #include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -41,6 +35,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <constraint_accumulator.hpp>
+
+#include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
+#include <yuzu/string_utils.hpp>
 
 namespace yuzu::privacy_permissions {
 
@@ -130,18 +129,8 @@ struct PermissionStatus {
     if (acc.any_failure())
         return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, acc.reason()};
     if (unavailable)
-        return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {}};
+        return {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_FULL, {}};
     return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {}};
-}
-
-/// Only ENOENT means "not there"; every other errno is a failed read. Shared shape with every
-/// sibling Wave 8 plugin's errno classifier (platform_security_parsers.hpp, firmware_posture).
-[[nodiscard]] constexpr PermissionState classify_read_errno(int err) noexcept {
-    return err == ENOENT ? PermissionState::absent : PermissionState::unreadable;
-}
-
-[[nodiscard]] constexpr bool is_denied_errno(int err) noexcept {
-    return err == EACCES || err == EPERM;
 }
 
 } // namespace yuzu::privacy_permissions

@@ -27,14 +27,13 @@
  * unconditionally so the capability-matrix generator sees one shape everywhere.
  */
 
-#include <yuzu/plugin.hpp>
-
-#include "privacy_permissions_legs.hpp"
-
-#include <yuzu/string_utils.hpp>
-
 #include <string>
 #include <string_view>
+
+#include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp>
+
+#include "privacy_permissions_legs.hpp"
 
 namespace {
 

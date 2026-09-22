@@ -83,11 +83,18 @@ TEST_CASE("select_status: a failure token with no denial is CONSTRAINED", "[priv
     CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
-TEST_CASE("select_status: no failure, no denial is OK/FULL regardless of unavailable",
+TEST_CASE("select_status: no failure, no denial, reachable mechanism is OK/FULL",
           "[privacy_permissions][parsers]") {
     yuzu::shared::ConstraintAccumulator acc;
     CHECK(select_status(acc, false, false).status == YUZU_RESULT_STATUS_OK);
-    CHECK(select_status(acc, false, true).status == YUZU_RESULT_STATUS_OK);
+}
+
+TEST_CASE("select_status: no failure, no denial, unavailable mechanism is UNAVAILABLE/FULL",
+          "[privacy_permissions][parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto st = select_status(acc, false, true);
+    CHECK(st.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_FULL);
 }
 
 TEST_CASE("any_denied: true iff at least one row's read was refused", "[privacy_permissions][parsers]") {
@@ -98,15 +105,6 @@ TEST_CASE("any_denied: true iff at least one row's read was refused", "[privacy_
     CHECK(any_denied(rows));
     rows.pop_back();
     CHECK_FALSE(any_denied(rows));
-}
-
-TEST_CASE("classify_read_errno / is_denied_errno: ENOENT is absent, EACCES/EPERM are denied",
-          "[privacy_permissions][parsers]") {
-    CHECK(classify_read_errno(ENOENT) == PermissionState::absent);
-    CHECK(classify_read_errno(EACCES) == PermissionState::unreadable);
-    CHECK(is_denied_errno(EACCES));
-    CHECK(is_denied_errno(EPERM));
-    CHECK_FALSE(is_denied_errno(EIO));
 }
 
 // ── Windows-specific pure layer ──────────────────────────────────────────
