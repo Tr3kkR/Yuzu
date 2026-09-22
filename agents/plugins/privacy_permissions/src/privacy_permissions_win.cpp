@@ -61,21 +61,34 @@ struct RawGrant {
     bool read_denied = false;
 };
 
+// COD-P1-03: a ConsentStore subtree is under the OWNING USER's write access (packaged/
+// NonPackaged app keys), so an unbounded enumeration lets that same user pin the instruction
+// worker -- and, on the offline-hive arm, hold the process-wide offline_hive_mutex() -- for as
+// long as they can keep stuffing subkeys. Same shape and same order-of-magnitude as
+// win_profiles.hpp's own kMaxEnumeratedValueNames (4096), the precedent this cap copies.
+inline constexpr DWORD kMaxEnumeratedSubkeys = 4096;
+
 /// `terminal_rc`, if non-null, receives the RegEnumKeyExW code that ended the walk --
 /// ERROR_NO_MORE_ITEMS is the only clean stop (CDX-R2-002: a previous version discarded this
 /// entirely, so a mid-enumeration ERROR_ACCESS_DENIED was silently indistinguishable from
-/// having enumerated every child).
-std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc = nullptr) {
+/// having enumerated every child). `truncated`, if non-null, is set when the walk stopped
+/// because it hit kMaxEnumeratedSubkeys -- a THIRD, distinct outcome (visible truncation, not
+/// a Win32 error): `terminal_rc` stays whatever the last successful call returned (ordinarily
+/// ERROR_SUCCESS, since there was almost certainly a next item we simply didn't ask for).
+std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc = nullptr,
+                                                 bool* truncated = nullptr) {
     std::vector<std::wstring> out;
     constexpr DWORD kNameBufLen = 512;
     wchar_t buf[kNameBufLen]{};
     DWORD idx = 0, len = kNameBufLen;
-    LONG rc;
-    while ((rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
-          ERROR_SUCCESS) {
+    LONG rc = ERROR_SUCCESS;
+    while (idx < kMaxEnumeratedSubkeys &&
+          (rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
+              ERROR_SUCCESS) {
         out.emplace_back(buf, len);
         len = kNameBufLen;
     }
+    if (truncated) *truncated = (idx >= kMaxEnumeratedSubkeys);
     if (terminal_rc) *terminal_rc = rc;
     return out;
 }
@@ -171,7 +184,9 @@ std::vector<RawGrant> walk_consent_store(HKEY hive, LONG* root_open_err,
 
         // Packaged apps: direct children of the capability key OTHER than "NonPackaged".
         LONG packaged_enum_rc = ERROR_SUCCESS;
-        for (const auto& child : enumerate_subkey_names(cap_key.get(), &packaged_enum_rc)) {
+        bool packaged_truncated = false;
+        for (const auto& child :
+            enumerate_subkey_names(cap_key.get(), &packaged_enum_rc, &packaged_truncated)) {
             if (child == L"NonPackaged") continue;
             yuzu::win::RegKey app_key;
             if (try_open_subkey(cap_key.get(), child.c_str(), app_key,
@@ -179,7 +194,9 @@ std::vector<RawGrant> walk_consent_store(HKEY hive, LONG* root_open_err,
                 out.push_back(read_one_grant(app_key.get(), yuzu::win::from_wide(child.c_str()),
                                              cap.category));
         }
-        if (packaged_enum_rc != ERROR_NO_MORE_ITEMS)
+        if (packaged_truncated)
+            acc.add_failure(std::string{cap.category} + ":packaged_enum_truncated");
+        else if (packaged_enum_rc != ERROR_NO_MORE_ITEMS)
             acc.add_failure(std::string{cap.category} + ":packaged_enum_" +
                             std::to_string(packaged_enum_rc));
 
@@ -188,7 +205,9 @@ std::vector<RawGrant> walk_consent_store(HKEY hive, LONG* root_open_err,
         if (try_open_subkey(cap_key.get(), L"NonPackaged", nonpkg,
                             std::string{cap.category} + ":nonpackaged_container", acc)) {
             LONG nonpkg_enum_rc = ERROR_SUCCESS;
-            for (const auto& child : enumerate_subkey_names(nonpkg.get(), &nonpkg_enum_rc)) {
+            bool nonpkg_truncated = false;
+            for (const auto& child :
+                enumerate_subkey_names(nonpkg.get(), &nonpkg_enum_rc, &nonpkg_truncated)) {
                 yuzu::win::RegKey app_key;
                 if (try_open_subkey(nonpkg.get(), child.c_str(), app_key,
                                     std::string{cap.category} + ":nonpackaged_app", acc))
@@ -197,7 +216,9 @@ std::vector<RawGrant> walk_consent_store(HKEY hive, LONG* root_open_err,
                         win::unescape_nonpackaged_app_id(yuzu::win::from_wide(child.c_str())),
                         cap.category));
             }
-            if (nonpkg_enum_rc != ERROR_NO_MORE_ITEMS)
+            if (nonpkg_truncated)
+                acc.add_failure(std::string{cap.category} + ":nonpackaged_enum_truncated");
+            else if (nonpkg_enum_rc != ERROR_NO_MORE_ITEMS)
                 acc.add_failure(std::string{cap.category} + ":nonpackaged_enum_" +
                                 std::to_string(nonpkg_enum_rc));
         }
@@ -258,6 +279,12 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
                     : std::vector<yuzu::profiles::ProfileInfo>{};
     if (!profiles_ok) acc.add_failure("profiles:profile_list_unreadable");
 
+    // Counts profiles whose hive was ACTUALLY reached (status == ok), not merely enumerated --
+    // COD-P1-02/K1 (both external reviewers independently): the previous version fell back to
+    // direct, unqualified HKLM emission only when `profiles` (the ENUMERATED list) was empty,
+    // so a host with real profiles that were ALL unreachable (privilege_missing/not_found/
+    // mount_failed) silently dropped HKLM policy data entirely instead of falling back.
+    std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
         std::vector<RawGrant> user_grants;
         LONG user_rc = ERROR_SUCCESS;
@@ -266,14 +293,31 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             profile.sid, profile.profile_path,
             [&](HKEY root) { user_grants = walk_consent_store(root, &user_rc, acc); }, &report);
         if (report.unload_failed) acc.add_failure(profile.profile_name + ":hive_unload_failed");
-        if (status == yuzu::win::HiveAccessStatus::privilege_missing) {
+
+        // Exhaustive switch over the FOUR HiveAccessStatus outcomes (COD-P1-02/K1): the previous
+        // version handled only two, so `mount_failed` fell through and merge_and_emit ran with
+        // an EMPTY user_grants (fn was never called) as if the profile had been read cleanly --
+        // fabricating an OK/FULL "this profile has no grants" for a hive that was never actually
+        // opened (a locked/corrupt NTUSER.DAT, or an orphaned ProfileList record -- routine on a
+        // real fleet, not a rare edge case).
+        switch (status) {
+        case yuzu::win::HiveAccessStatus::ok:
+            ++reachable_profiles;
+            break;
+        case yuzu::win::HiveAccessStatus::privilege_missing:
             acc.add_failure(profile.profile_name + ":privilege_missing");
             continue;
-        }
-        if (status == yuzu::win::HiveAccessStatus::not_found) {
+        case yuzu::win::HiveAccessStatus::not_found:
             // Enumerated but genuinely unreachable (no live HKU entry, no offline NTUSER.DAT
-            // path) -- per-user hives are never the ONLY surface (ADR-0024 D3/R15 precedent);
-            // skip this one profile, the cycle proceeds for the rest.
+            // path). `profile_path_unreadable` (carried from the raw ProfileList record) means
+            // even the PATH itself couldn't be resolved -- name that distinctly rather than
+            // conflating it with "no path was ever recorded".
+            acc.add_failure(profile.profile_name +
+                            (profile.profile_path_unreadable ? ":profile_path_unreadable"
+                                                             : ":hive_not_found"));
+            continue;
+        case yuzu::win::HiveAccessStatus::mount_failed:
+            acc.add_failure(profile.profile_name + ":hive_mount_failed");
             continue;
         }
 
@@ -289,10 +333,12 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         }
     }
 
-    if (profiles.empty()) {
-        // No interactive user reachable at all (a server/unattended host, or the profile list
-        // itself couldn't be read) -- still surface any HKLM machine policy directly, rather
-        // than silently dropping it because there was no per-user row to merge it into.
+    if (reachable_profiles == 0) {
+        // No interactive user's hive was actually reached -- no profiles enumerated at all (a
+        // server/unattended host), the profile list itself couldn't be read, or every
+        // enumerated profile hit privilege_missing/not_found/mount_failed above -- still
+        // surface any HKLM machine policy directly, rather than silently dropping it because
+        // no per-user row existed to merge it into.
         merge_and_emit({}, hklm_by_key, "", rows, acc);
     }
 
