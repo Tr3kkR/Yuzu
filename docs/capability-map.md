@@ -1570,7 +1570,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
-| pkg_inventory | - | Y | - | Software |
+| pkg_inventory | - | - | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
