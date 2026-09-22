@@ -32,10 +32,17 @@
  * handle as X's own rename is to X's — nothing here watches P's parent for P being a
  * renamed/moved child entry. That case surfaces the same way any undetected-in-real-
  * time rename does: X's content next changes and triggers a bind() retry, not a
- * dedicated watch. Best
- * effort: if P cannot be armed — and no ancestor watch is active, because X's own handle
- * succeeded — a rename of X goes undetected until X's content next changes and triggers
- * a bind() retry; otherwise the guard behaves as it did without P.
+ * dedicated watch. Best effort, two DIFFERENT failure shapes: (1) TRANSIENT — if P
+ * cannot be armed on a given attempt (open/read failure, and no ancestor watch is
+ * active because X's own handle succeeded), no arm_retry is scheduled; it is simply
+ * retried, fresh, on the next ordinary bind() call — a rename of X goes undetected
+ * until X's content next changes and triggers that retry. (2) TERMINAL — if a
+ * teardown's cancel-drain repeatedly fails to confirm (see ParentIoRelease/
+ * kParentIoAbandonLimit below), P is PERMANENTLY disabled for the rest of this
+ * guard's lifetime (logged once, at error level) — no further retry of any kind,
+ * until the rule is next re-armed (a policy re-push or an agent restart). Either
+ * way, X's own detection (presence/content, evaluated on every wake) is unaffected;
+ * only P's rename-of-X detection is lost.
  *
  * Detection-only: a FileGuard never writes (file-content remediation needs
  * Content Distribution; deferred). Proto-free + windows.h-free header. On
@@ -128,7 +135,13 @@ constexpr int kParentFailureLimit = 3;
 // drain (unlike kParentFailureLimit/p_failures, which does reset on success) — a
 // driver that stalls every other rebuild would never trip a reset-on-success cap,
 // leaking one abandoned block per stall indefinitely, which is exactly the unbounded
-// leak this cap exists to prevent.
+// leak this cap exists to prevent. NOTE: "this run() invocation" is per guard
+// INSTANTIATION, not per agent-process lifetime — GuardianEngine tears down and
+// reconstructs a fresh FileGuard (and therefore a fresh count/disabled-flag) on
+// every reconcile that touches this rule_id, so the leak bound is 3 blocks per
+// wedged-drain episode PER RECONCILE, not 3 for the process's whole uptime; the
+// realistic total stays small only because reconcile frequency for a converged
+// rule is low (policy-generation-gated, not a periodic heartbeat re-arm).
 constexpr int kParentIoAbandonLimit = 3;
 
 // Low 64 bits of a directory handle's FileId (what the extended notify record carries);
@@ -338,6 +351,13 @@ void FileGuard::run() try {
     std::optional<std::chrono::steady_clock::time_point> retry_at; // absolute degraded-retry deadline;
         // set once on entry, not extended by intervening activity while still degraded (see below)
 
+    // KNOWN RESIDUAL (pre-existing, unchanged by the parent-watch redesign above): h_dir's
+    // RAII release (cancel_and_close_ in guard_win_handle.hpp — CancelIo+CloseHandle, no
+    // wait) does not drain a genuinely in-flight read before notify_buf/ov are reused or
+    // the stack frame is torn down — the same shape as sec-1, which THIS diff fixed for
+    // the parent watch (pio/ParentIoRelease) but deliberately left h_dir alone (X's own
+    // content channel is out of scope for this branch). A dedicated follow-up, tracked
+    // alongside the disclosure decision for this branch's other pre-existing residuals.
     auto reset_dir = [&](HANDLE h = nullptr) {
         h_dir.reset(h);
         read_pending = false;
