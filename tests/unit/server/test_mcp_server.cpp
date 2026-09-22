@@ -27378,6 +27378,72 @@ TEST_CASE("MCP reevaluate_result_set: refused when a GENERIC-create original's "
     CHECK_FALSE(dispatched);
 }
 
+TEST_CASE("MCP reevaluate_result_set: the parent-gone audit detail neutralises a "
+          "delimiter-bearing scope_input_id instead of forging adjacent k=v tokens "
+          "(Gate 8 governance follow-up, #4306)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // scope_input_id is the raw caller-supplied parent_id/alias at creation
+    // time and can be an arbitrary string (an alias, not just a canonical
+    // rs_ id). Craft one containing a space and '=' -- the exact shape that
+    // could forge an adjacent k=v token or split the audit line if not
+    // neutralised. Reaches the vulnerable branch WITHOUT ever supplying a
+    // real parent_id: the generic tool stores source_payload verbatim when
+    // parent_id is absent, so a caller can hand-craft scope_input_id directly.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // Empty tier: create_result_set is Infrastructure:Write, which "operator"
+    // tier denies outright (mcp_policy.hpp tier_allows) -- see the happy-path
+    // lifecycle test's own comment above for why this file mints via the
+    // generic tool under an empty (non-MCP-token) tier.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":{"sql":"SELECT 1","scope_input_id":"evil target_id=rs_other"}}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id = created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+
+    bool found = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("reason=parent_gone") != std::string::npos) {
+            found = true;
+            // The raw delimiter-bearing value must NOT survive verbatim.
+            CHECK(d.find("evil target_id=rs_other") == std::string::npos);
+            // The neutralised form (log_token: space and '=' -> '_') must be
+            // present exactly.
+            CHECK(d.find("scope_input_id=evil_target_id_rs_other") != std::string::npos);
+        }
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP reevaluate_result_set: a non-object source_payload on a "
           "GENERIC-create original with a real parent_id never reaches dispatch "
           "after the parent is deleted (#4306 governance follow-up -- locks the "
@@ -27572,6 +27638,49 @@ TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is con
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(payload["device_count"] == 1);
+}
+
+TEST_CASE("MCP create_result_set_from_inventory_query: a supplied parent_id is "
+          "persisted as scope_input_id (Gate 8 governance follow-up positive "
+          "control, #4306)",
+          "[pg][mcp][integration][result-sets][inventory][reeval][security][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // Gate 7's #4306 follow-up added this tool's own scope_input_id merge
+    // (mcp_server.cpp, body["scope_input_id"] = pid) but shipped with no
+    // direct test proving the merge actually happens -- only the fact that
+    // re-eval's source_kind allowlist independently refuses kInventoryQuery
+    // regardless was covered. This does not need a full re-eval assertion --
+    // just confirm the stored row.
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::server::InventoryStore inventory{rs_bundle.pool()};
+    REQUIRE(inventory.is_open());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "mcp-inv-query-parent";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered (nullopt scope)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"child-of-parent","parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    auto new_id = payload["id"].get<std::string>();
+
+    auto row = rs_bundle.get()->get(new_id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    auto sp = nlohmann::json::parse((*row)->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    CHECK(sp.value("scope_input_id", "") == parent->id);
 }
 
 // #2437-class guard (C11/C12), MCP transport: create_result_set_from_inventory_query

@@ -1162,6 +1162,52 @@ TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("re-eval: the parent-gone audit detail neutralises a delimiter-bearing "
+          "scope_input_id instead of forging adjacent k=v tokens (Gate 8 governance "
+          "follow-up, #4306)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // scope_input_id is the raw caller-supplied parent_id/alias at creation time
+    // and can be an arbitrary string (an alias, not just a canonical rs_ id).
+    // Craft one containing a space and '=' -- the exact shape that could forge
+    // an adjacent k=v token or split the audit line if not neutralised. This
+    // reaches the vulnerable branch WITHOUT ever supplying a real parent_id: the
+    // generic create route stores source_payload verbatim when parent_id is
+    // absent, so a caller can hand-craft scope_input_id directly.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query",)"
+                       R"("source_payload":{"sql":"SELECT 1","scope_input_id":)"
+                       R"("evil target_id=rs_other"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.audits.clear();
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
+
+    bool found = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos) {
+            found = true;
+            // The raw delimiter-bearing value must NOT survive verbatim.
+            CHECK(a.detail.find("evil target_id=rs_other") == std::string::npos);
+            // The neutralised form (log_token: space and '=' -> '_') must be
+            // present exactly.
+            CHECK(a.detail.find("scope_input_id=evil_target_id_rs_other") !=
+                  std::string::npos);
+        }
+    }
+    REQUIRE(found);
+}
+
 TEST_CASE("re-eval: a non-object source_payload on a GENERIC-create original with a "
           "real parent_id never reaches dispatch after the parent is deleted (#4306 "
           "governance follow-up -- locks the is_object() joint invariant between the "
@@ -2028,6 +2074,37 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(body["data"]["device_count"] == 1);
+}
+
+TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "
+          "(Gate 8 governance follow-up positive control, #4306)",
+          "[pg][result_set][async][inventory][reeval][security][4306]") {
+    // Gate 7's #4306 follow-up added this route's own scope_input_id merge
+    // (rest_api_v1.cpp, body["scope_input_id"] = pid) but shipped with no
+    // direct test proving the merge actually happens -- only the fact that
+    // re-eval's source_kind allowlist independently refuses kInventoryQuery
+    // was covered. This does not need a full re-eval assertion (re-eval never
+    // accepts inventory_query regardless) -- just confirm the stored row.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    auto parent = h.seed_materialized("inv-query-parent", {"a1"});
+
+    int status = 0;
+    auto body = h.post("/api/v1/result-sets/from-inventory-query",
+                       R"({"name":"child-of-parent","parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto new_id = body["data"]["id"].get<std::string>();
+
+    auto row = get_ok(*h.store, new_id);
+    REQUIRE(row.has_value());
+    auto sp = nlohmann::json::parse(row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    CHECK(sp.value("scope_input_id", "") == parent);
 }
 
 // #2437-class guard (C11/C12): a stored data_json row nesting past

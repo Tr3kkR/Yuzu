@@ -211,7 +211,7 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
-### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306) (breaking)
+### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
 
 **What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
 previously synthesised the sibling's dispatch scope from the original's live, nullable
@@ -224,8 +224,10 @@ shows it was narrowed at creation, instead of broadcasting.
 
 **Who this affects.** Any caller (REST or MCP) whose automation re-evaluates a result set that
 was originally narrowed to a `parent_id`, where that parent set has since been deleted.
-Previously such a call silently succeeded with a `202` dispatched to the entire visible fleet; it
-now returns a `400` refusal instead. No legitimate caller should have been relying on the
+Previously such a call silently succeeded with a `202` (REST) or a materialized/pending result
+(MCP) dispatched to the entire visible fleet; it now refuses instead -- REST returns `400
+RESULT_SET_BAD_REQUEST`, MCP returns a JSON-RPC error (`kInvalidParams`) over HTTP 200, per that
+transport's existing error-shape convention. No legitimate caller should have been relying on the
 fleet-wide broadcast — this was the target-erasure defect being fixed — but any automation
 catching only success responses on this route should add handling for the new `400
 reason=parent_gone` case: create a fresh result set from the intended parent instead of

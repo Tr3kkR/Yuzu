@@ -1003,7 +1003,7 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
-     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied, a scope_input_id key recording the raw parent_id is merged in (#4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -11887,8 +11887,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.source_kind = std::string(source_kind::kInventoryQuery);
                 // #4306 governance follow-up (Gate 2 security-guardian LOW): mirrors
                 // the identical REST fix on POST /api/v1/result-sets/from-inventory-query
-                // (rest_api_v1.cpp) -- see that comment for the full rationale. `args`
-                // is not read anywhere below this point in this handler.
+                // (rest_api_v1.cpp) -- see that comment for the full rationale.
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     // Length already checked above, ahead of the store gates.
@@ -11910,6 +11909,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     parent_members = std::move(ms);
                 }
+                // `args` is not read anywhere below this point in this handler.
                 cr.source_payload = args.dump();
                 InventoryQuery iq;
                 iq.limit = 5000;
@@ -12392,8 +12392,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // cancelling.
                     const bool audit_ok = audit_fn(
                         req, "result_set.create", "denied", "ResultSet", rs_id,
-                        "reason=parent_gone source_kind=" + orig->source_kind +
-                            " scope_input_id=" + sp["scope_input_id"].get<std::string>());
+                        "reason=parent_gone source_kind=" + audit_token(orig->source_kind) +
+                            " scope_input_id=" +
+                            audit_token(sp["scope_input_id"].get<std::string>()));
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
