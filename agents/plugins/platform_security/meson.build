@@ -1,7 +1,9 @@
 # platform_security -- Secure Boot / code-integrity posture (read-only). One
 # portable plugin TU plus three self-gated per-OS leg TUs (peripherals shape).
-# Only the Windows leg needs an import library (advapi32: RegQueryValueExW;
-# WldpGetLockdownPolicy is resolved from wldp.dll at runtime).
+# Only the Windows leg needs an import library (advapi32: RegQueryValueExW).
+# The rig probe session tried WldpGetLockdownPolicy (wldp.dll) and decided
+# against shipping it (see the platform_security_win.cpp banner) -- no
+# LoadLibrary/GetProcAddress of wldp.dll exists in the shipped code.
 platform_security_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 if host_machine.system() == 'windows'
