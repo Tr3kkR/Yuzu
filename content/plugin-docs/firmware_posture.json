@@ -31,7 +31,7 @@
     "**No documented business driver.** The priority for this plugin is asserted from a capability-gap reading, not evidenced by any tracked demand (see \"How it works\"); there is no named customer, control or CVE behind it.",
     "**Only Apple Silicon is verified on macOS.** The capture host has no `IODeviceTree:/rom`, so the Intel `version`, `release-date` and `vendor` keys are unverified on hardware. On Apple Silicon the version is an iBoot tag such as `mBoot-18000.161.10`, not a BIOS date, `release_date` reads `absent` and no `update_pending` row is reported.",
     "**Update-pending is Linux-only and needs fwupd.** Windows and macOS report no update verdict. On Linux the verdict covers only devices fwupd knows about and only their updatable ones; a host without the daemon reports `update_pending|unavailable`, and an agent built without libsystemd reports `update_pending|unreadable` with `fwupd:not_built`.",
-    "**Windows and Linux live captures are pending.** The Windows `GetSystemFirmwareTable` path has not been probed as LocalSystem, and the Linux sample from the built `.so` is not yet recorded; both are marked PENDING above. The populated-DMI shape has not been captured from a physical Linux host.",
+    "**Windows and Linux live captures are recorded, but not every shape.** The Windows `GetSystemFirmwareTable` path was probed as LocalSystem (`docs/samples/windows.txt`) and the Linux sample is a real run of the built `.so` (`docs/samples/linux.txt`), but that container has no `/sys/class/dmi` and no fwupd daemon, so the populated-DMI shape has not been captured from a physical Linux host.",
     "**Read-only by design.** The plugin lists devices and upgrades and never installs, verifies or activates firmware, and does not read the UEFI Secure Boot state or the TPM: those belong to boot-integrity posture, not this plugin."
   ],
   "definitions": [
@@ -156,7 +156,7 @@
     {
       "grant": "None documented for this plugin (`docs/agent-privilege-model.md`)",
       "if_refused": "`ERROR_ACCESS_DENIED` or a WBEM access-denied HRESULT reports the row `unreadable` and the action `PERMISSION_DENIED`/`PARTIAL`; any other failure reports `<source>:<cause>` (`smbios:win32_<n>`, `wmi:<token>`)",
-      "measured": "PENDING: the-rig capture as `NT AUTHORITY\\SYSTEM` of `Win32_BIOS`, the `GetSystemFirmwareTable('RSMB')` size and the type-0 rows (`docs/samples/windows.txt`, and the probe record in the `firmware_posture_win.cpp` banner). Not yet measured; `GetSystemFirmwareTable` has no in-tree precedent.",
+      "measured": "the-rig capture as `NT AUTHORITY\\SYSTEM` of `Win32_BIOS`, the `GetSystemFirmwareTable('RSMB')` size and the type-0 rows (`docs/samples/windows.txt`, and the probe record in the `firmware_posture_win.cpp` banner); `GetSystemFirmwareTable` had no in-tree precedent before this plugin. Not measured: a non-SYSTEM identity.",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
@@ -170,7 +170,7 @@
     {
       "grant": "None for the `bios_*` DMI attributes (kernel mode 0444; not measured, the Docker VM used for capture has no `/sys/class/dmi`). The fwupd calls are unauthenticated read methods on the system bus.",
       "if_refused": "`EACCES`/`EPERM` on a DMI file reports it `unreadable` with `dmi:<file>:eacces` and the action `PERMISSION_DENIED`; a D-Bus `AccessDenied` reports `fwupd:<call>:permission_denied`; an absent file or a daemon that is not installed is a state, never a failure",
-      "measured": "fwupd 1.9.28 replies captured as root (euid 0) in a fedora:40 container and the no-daemon `ServiceUnknown` path in a debian:12 container (`tests/unit/fixtures/wave8/firmware_posture/linux/`); the built `.so` run is PENDING (`docs/samples/linux.txt`). A non-root caller is unverified.",
+      "measured": "fwupd 1.9.28 replies captured as root (euid 0) in a fedora:40 container and the no-daemon `ServiceUnknown` path in a debian:12 container (`tests/unit/fixtures/wave8/firmware_posture/linux/`); the built `.so` run against a no-DMI, no-fwupd container is captured (`docs/samples/linux.txt`). A non-root caller and a populated-DMI host are unverified.",
       "os": "Linux",
       "runs_as": "agent daemon, default"
     }
