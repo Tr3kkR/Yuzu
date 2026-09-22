@@ -983,6 +983,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // windows_optional_features
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
+        // app_control
+        {"app_control.wdac_policy", "Report the configured WDAC (Code Integrity) application-control policy posture (Windows, read-only)"},
+        {"app_control.applocker_policy", "Report AppLocker rule-collection enforcement mode and rule count (Windows, read-only)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
