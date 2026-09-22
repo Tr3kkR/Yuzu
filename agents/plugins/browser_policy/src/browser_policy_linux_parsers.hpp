@@ -249,8 +249,10 @@ struct FileRead {
 }
 
 /// Names in an open directory selected by `keep(name)`, sorted so the row
-/// order never depends on readdir order. Records `row_cap`-style truncation
-/// and real readdir errors on `acc` under `prefix`.
+/// order never depends on readdir order. Records an entry-cap truncation
+/// (`<prefix>:entry_cap`: the directory holds more entries than the cap —
+/// distinct from the per-leg `row_cap`) and real readdir errors
+/// (`<prefix>:readdir_error`) on `acc`.
 template <typename Keep>
 [[nodiscard]] std::vector<std::string> list_names(const Dir& dir, Keep&& keep,
                                                   yuzu::shared::ConstraintAccumulator& acc,
@@ -264,7 +266,7 @@ template <typename Keep>
             return true;
         });
     if (walk.truncated)
-        acc.add_failure(std::string{prefix} + ":row_cap");
+        acc.add_failure(std::string{prefix} + ":entry_cap");
     if (walk.enumeration_error)
         acc.add_failure(std::string{prefix} + ":readdir_error");
     std::sort(names.begin(), names.end());
@@ -332,12 +334,14 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
         for (std::size_t i = 0; i < vendor.n; ++i)
             chain.push_back(vendor.parts[i]);
         chain.push_back("policies");
-        std::string base = "/etc";
-        for (std::size_t i = 0; i < vendor.n; ++i) {
+        // The display prefix is derived from the SAME chain the openat walk
+        // follows, so the two cannot diverge.
+        std::string base;
+        for (const char* part : chain) {
             base += '/';
-            base += vendor.parts[i];
+            base += part;
         }
-        base += "/policies/";
+        base += '/';
 
         posix::DirOpen policies = posix::open_dir_chain(root_open.dir.fd(), chain);
         if (policies.status == posix::OpenStatus::failed)

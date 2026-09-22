@@ -38,6 +38,24 @@ inline constexpr std::string_view kExceptionToken = "macos:leg:exception";
 inline constexpr std::string_view kExceptionToken = "linux:leg:exception";
 #endif
 
+/// The ONE place a leg's exception is contained (frozen-seam rule: nothing
+/// crosses the plugin ABI). Runs `leg(ctx)`; if it throws, reports
+/// UNAVAILABLE/PARTIAL with kExceptionToken and returns 1. The plugin TU runs
+/// its WHOLE execute body through this — the unknown-action refusal included —
+/// and the unit suite drives it with a throwing leg. MUTATION: dropping the
+/// catch, the set_result_status call or the token fails the exception case in
+/// test_browser_policy_local_dispatcher.cpp.
+template <typename Leg>
+[[nodiscard]] inline int run_guarded(yuzu::CommandContext& ctx, Leg&& leg) {
+    try {
+        return leg(ctx);
+    } catch (...) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              kExceptionToken);
+        return 1;
+    }
+}
+
 /// Emits every row, one write_output each.
 inline void write_rows(yuzu::CommandContext& ctx, const std::vector<std::string>& rows) {
     for (const auto& row : rows)

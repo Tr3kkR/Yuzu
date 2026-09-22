@@ -90,29 +90,27 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action != "policies") {
-            // `action` is request-supplied and lands in a pipe-delimited stream, so it
-            // goes through the shared escaper. Deliberately NOT a `policy|` row.
-            ctx.write_output(std::string{"unknown action: "} +
-                             yuzu::util::safe_output_field(action));
-            return 1;
-        }
-
-        // No exception may cross the plugin ABI on any leg.
-        try {
+        // The whole body runs under the exception guard (browser_policy_legs.hpp
+        // run_guarded): no exception may cross the plugin ABI from any path, the
+        // unknown-action refusal included.
+        return yuzu::browser_policy::run_guarded(ctx, [action](yuzu::CommandContext& c) -> int {
+            if (action != "policies") {
+                // `action` is request-supplied and lands in a pipe-delimited stream, so it
+                // goes through the shared escaper. Deliberately NOT a `policy|` row.
+                c.write_output(std::string{"unknown action: "} +
+                               yuzu::util::safe_output_field(action));
+                return 1;
+            }
 #if defined(_WIN32)
-            return yuzu::browser_policy::run_windows(ctx);
+            return yuzu::browser_policy::run_windows(c);
 #elif defined(__linux__)
-            return yuzu::browser_policy::run_linux(ctx);
+            return yuzu::browser_policy::run_linux(c);
 #elif defined(__APPLE__)
-            return yuzu::browser_policy::run_macos(ctx);
+            return yuzu::browser_policy::run_macos(c);
+#else
+            return 1; // no leg for this OS (Windows, Linux and macOS only)
 #endif
-        } catch (...) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  yuzu::browser_policy::kExceptionToken);
-            return 1;
-        }
-        return 1; // unreachable on a supported build (Windows/Linux/macOS only).
+        });
     }
 };
 

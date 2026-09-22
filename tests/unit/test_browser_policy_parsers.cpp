@@ -34,12 +34,17 @@
  *     assertions fail;
  *   - saturation (WalkLimits shrinks the caps so the boundary is cheap and
  *     machine-independent): drop the `walk.truncated` reporting branch or a
- *     row-cap guard -> the `linux:row_cap` cases fail; the exactly-at-cap
+ *     row-cap guard -> the `linux:row_cap` / `linux:entry_cap` cases fail; the exactly-at-cap
  *     controls fail if a cap is tightened to `>` off-by-one;
  *   - NUL: drop the NUL replacement in format_policy_row -> the row is
  *     truncated at the C-string boundary and the `nul_replaced` tail is lost;
  *   - read-to-EOF (Linux only, /proc reports st_size 0): read exactly st_size
  *     -> the /proc read returns empty.
+ *   - non-regular objects (root-safe, no chmod): delete the S_ISREG check in
+ *     read_file_at -> the FIFO reads as EOF (json_unparseable) and the directory
+ *     read fails with EISDIR (read_failed), so the exact not_regular pin fails;
+ *   - ENOTDIR (root-safe): delete the ENOTDIR arm of posix::errno_detail ->
+ *     the token degrades to open_failed and the exact not_a_directory pin fails.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -64,8 +69,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <sstream>
 #endif
 
@@ -645,6 +652,61 @@ TEST_CASE("browser_policy linux: an oversized policy file is constrained, not tr
     CHECK(reason == "linux:oversized");
 }
 
+TEST_CASE("browser_policy linux: a non-regular object at a policy-file path is constrained, never read",
+          "[browser_policy][linux][tree]") {
+    // Root-safe (no chmod, so no euid-0 SKIP): a FIFO and a directory are both
+    // refused by the S_ISREG check after the O_NONBLOCK open, whoever runs the
+    // suite. MUTATION: delete the S_ISREG check in posix::read_file_at -> the
+    // writer-less FIFO reads as EOF (zero bytes -> linux:json_unparseable) and
+    // the directory read fails with EISDIR (linux:read_failed): the exact pin
+    // below fails either way. Dropping O_NONBLOCK would block in open() on the
+    // FIFO: the future below is a deadlock guard (the healthy path returns in
+    // microseconds), not a timing assumption.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_fifo_"};
+    const fs::path managed = dir.path / "etc/opt/chrome/policies/managed";
+    fs::create_directories(managed);
+    REQUIRE(::mkfifo((managed / "fifo.json").c_str(), 0644) == 0);
+    fs::create_directories(managed / "dir.json"); // a DIRECTORY named like a policy file
+    write_file(dir.path, "etc/opt/chrome/policies/managed/ok.json", R"({"ShowHomeButton": true})");
+
+    std::string reason;
+    std::vector<std::string> rows;
+    auto fut = std::async(std::launch::async,
+                          [&] { rows = lnx::linux_policy_rows_at(dir.path, reason); });
+    if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+        // Release a blocked open() so the worker (and this process) can exit.
+        const int rel = ::open((managed / "fifo.json").c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        fut.wait();
+        if (rel >= 0)
+            ::close(rel);
+        FAIL("linux_policy_rows_at blocked in open() on a writer-less FIFO");
+    }
+    // The regular sibling still reads; both non-regular objects collapse to ONE
+    // token (the accumulator dedupes exact strings).
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].find("|ShowHomeButton|bool|true|") != std::string::npos);
+    CHECK(reason == "linux:not_regular");
+}
+
+TEST_CASE("browser_policy linux: a regular file where a policy directory is expected is constrained",
+          "[browser_policy][linux][tree]") {
+    // Root-safe: openat(O_DIRECTORY) on a regular file is ENOTDIR whoever runs
+    // the suite. Exercised at BOTH hops: a vendor component (open_dir_chain) and
+    // a level directory (open_dir_at). MUTATION: delete the ENOTDIR arm of
+    // posix::errno_detail -> the token degrades to linux:open_failed and the
+    // exact pin below fails.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_notdir_"};
+    write_file(dir.path, "etc/opt/edge", "not a directory");             // vendor hop is a FILE
+    write_file(dir.path, "etc/chromium/policies/managed", "nor is this"); // level hop is a FILE
+    write_file(dir.path, "etc/opt/chrome/policies/managed/ok.json", R"({"ShowHomeButton": true})");
+
+    std::string reason;
+    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    REQUIRE(rows.size() == 1); // chrome still reads: a failed sibling never hides it
+    CHECK(rows[0].find("|ShowHomeButton|bool|true|") != std::string::npos);
+    CHECK(reason == "linux:not_a_directory"); // both hops dedupe to the one token
+}
+
 // ── failure -> command status (the seam every degraded read reports through) ──
 
 TEST_CASE("browser_policy linux leg: acquisition failure reaches the command as CONSTRAINED/PARTIAL",
@@ -757,7 +819,7 @@ TEST_CASE("browser_policy linux leg: a truncated directory listing is reported, 
     CHECK(run.rows.size() == 2); // only the examined entries
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    CHECK(run.provenance == "linux:row_cap");
+    CHECK(run.provenance == "linux:entry_cap"); // the per-directory bound, not the per-leg row cap
 }
 
 TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",

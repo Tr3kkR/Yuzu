@@ -31,8 +31,11 @@
  *
  * The one committed source file read at run time is content/definitions/browser_policy.yaml
  * (located from YUZU_TEST_FIXTURE_DIR / MESON_SOURCE_ROOT), so a rename of the action, or a
- * drift of the row_kind-first column list, is caught here. No process is spawned, nothing
- * sleeps, and no temp file is written.
+ * drift of the row_kind-first column list, is caught here. On Linux the status case also
+ * looks, read-only, for a `*.json` under the vendor policy directories to decide whether its
+ * populated-read tier applies (a host with a policy file must yield a row or a CONSTRAINED
+ * status; a host with none gets a WARN, never a vacuous pass). No process is spawned,
+ * nothing sleeps, and no temp file is written.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -42,6 +45,7 @@
 #include "local_dispatcher.hpp"
 
 #include "browser_policy_parsers.hpp"
+#include "browser_policy_legs.hpp" // run_guarded, kExceptionToken
 
 #include <algorithm>
 #include <array>
@@ -53,6 +57,7 @@
 #include <istream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -105,6 +110,9 @@ std::vector<std::string> captured_rows(const std::string& captured) {
     while (std::getline(ss, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
+        }
+        if (line.rfind("/* TRUNCATED", 0) == 0) {
+            continue; // the HARNESS's own cap sentinel (agent.cpp append_output), never a plugin row
         }
         if (!line.empty()) {
             out.push_back(line);
@@ -377,6 +385,39 @@ void check_planned_placeholder(const yuzu::agent::LocalDispatcher::Result& resul
 }
 #endif
 
+#if defined(__linux__)
+/// The populated-read tier's host guard: true when at least one `*.json` sits under a vendor
+/// policy directory the Linux leg walks. std::filesystem here is a TEST-side look (the production
+/// walk is the O_NOFOLLOW openat chain, proven over an injected root in
+/// test_browser_policy_parsers.cpp); it only decides whether a populated read is expected on
+/// this host. An unreadable directory makes it false (WARN), never a false failure.
+bool host_has_policy_file() {
+    for (const char* vendor : {"/etc/opt/chrome", "/etc/chromium", "/etc/opt/edge"}) {
+        for (const char* level : {"managed", "recommended"}) {
+            std::error_code ec;
+            const fs::path dir = fs::path{vendor} / "policies" / level;
+            for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
+                if (it->path().extension() == ".json") {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+/// Drives run_guarded with a leg that throws: the real plugin's legs cannot be made to throw on
+/// demand, so the seam is exercised through the same synthetic-descriptor harness the parsers TU
+/// uses, on a real CommandContext.
+int throwing_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
+                     std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return bp::run_guarded(ctx, [](yuzu::CommandContext&) -> int {
+        throw std::runtime_error("leg failure injected by the test");
+    });
+}
+
 } // namespace
 
 // ── registration ─────────────────────────────────────────────────────────
@@ -502,7 +543,14 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
 
     const auto result = dispatcher.run(plugin.descriptor, "policies");
     CHECK(result.rc == 0); // a degraded or planned read is never a failed command
-    CHECK_FALSE(result.truncated);
+    // The 2 MiB capture cap is the HARNESS's (LocalDispatcher::kCaptureMaxBytes), not a leg
+    // outcome: a host with a few large policy values overruns it while the plugin behaves
+    // correctly. A truncated capture drops the overflowing row whole and appends one sentinel
+    // line (skipped by captured_rows), so every row checked below is still a complete row.
+    if (result.truncated) {
+        WARN("capture hit LocalDispatcher::kCaptureMaxBytes on this host -- shape-checking the "
+             "whole rows before the sentinel");
+    }
     for (const auto& row : captured_rows(result.captured)) {
         check_policy_row_shape(row);
     }
@@ -514,8 +562,9 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
 // branch in execute() -> the matching check in check_planned_placeholder fails.
 // MUTATION (Linux): drop the mark_result_read call in run_linux_at (UNDECLARED), report the
 // planned outcome (UNAVAILABLE) or a wrong-OS token from the Linux leg -> the OK-or-CONSTRAINED
-// and `linux:` token checks fail. Row source/scope are read from the host's real files, so they
-// are asserted only when rows exist.
+// and `linux:` token checks fail. A wrong production root or an unconditional empty OK -> the
+// populated-read tier fails on a host with a policy file. Row source/scope are read from the
+// host's real files, so they are asserted only when rows exist.
 TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeholder or the read "
           "status",
           "[browser_policy][status]") {
@@ -551,9 +600,50 @@ TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeho
         CHECK(f[3] == "machine");           // the Linux leg reads machine policy only
         CHECK(f[7].rfind("/etc/", 0) == 0); // the logical source path, never an injected root
     }
+    // The populated-read tier (X11). On a host that HAS a readable policy file the production
+    // root binding ("/") must surface it: rows, or a CONSTRAINED status if the file exists but
+    // cannot be decoded. On a host with none (most CI runners) the tier does not apply and says
+    // so; it never passes vacuously. MUTATION: run_linux passing any root but "/", or reporting
+    // an unconditional empty OK/FULL, yields zero rows + OK on a seeded host -> fails here
+    // (proven in the seeded container run recorded in the PR body).
+    if (host_has_policy_file()) {
+        CHECK((!captured_rows(result.captured).empty() ||
+               result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+    } else {
+        WARN("no *.json under /etc/{opt/chrome,chromium,opt/edge}/policies/{managed,recommended} "
+             "on this host -- the populated-read tier does not apply");
+    }
 #elif defined(__APPLE__)
     check_planned_placeholder(result, "macos:planned");
 #else
     FAIL("browser_policy has no leg for this host OS");
+#endif
+}
+
+// ── the exception guard (no exception crosses the plugin ABI) ─────────────
+
+// MUTATION: delete the catch in run_guarded (browser_policy_legs.hpp) -> the throw escapes the
+// synthetic descriptor's execute and this case fails on an unexpected exception; drop the
+// set_result_status call -> UNDECLARED, the status check fails; change the token -> the exact
+// per-OS literal fails; write a placeholder row from the catch -> the zero-rows check fails.
+TEST_CASE("browser_policy plugin: an exception inside a leg is reported as UNAVAILABLE with the "
+          "host's exception token, never thrown across the plugin ABI",
+          "[browser_policy][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &throwing_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, "policies");
+
+    CHECK(result.rc == 1);
+    CHECK(captured_rows(result.captured).empty()); // no row, no placeholder
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == std::string{bp::kExceptionToken});
+#if defined(_WIN32)
+    CHECK(result.result_provenance == "windows:leg:exception");
+#elif defined(__APPLE__)
+    CHECK(result.result_provenance == "macos:leg:exception");
+#else
+    CHECK(result.result_provenance == "linux:leg:exception");
 #endif
 }
