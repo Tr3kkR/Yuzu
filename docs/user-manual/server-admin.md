@@ -2399,6 +2399,8 @@ The Yuzu server has **two independent TLS surfaces**:
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
 
+Both surfaces pin the same TLS 1.2 cipher allow-list and version floor; see [TLS policy](tls.md) for the exact list, what's proven by CI, and what isn't pinned yet.
+
 ### HTTPS via CLI Flags
 
 HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server startup. Use `--no-https` for development without TLS. See [Server CLI Flags](#server-cli-flags).

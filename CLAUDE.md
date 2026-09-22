@@ -169,10 +169,13 @@ docs/             Architecture docs, conventions, roadmap, capability map
 ```
 
 **`common/include/` firewall (#2549) — pure decision code only:** no I/O, no store/wire types, no
-server-trust-boundary authority. One named exception, not a category: `shutdown_watcher.hpp` (#3007)
+server-trust-boundary authority. Two named exceptions, not a category: `shutdown_watcher.hpp` (#3007)
 — a self-pipe fd, a dedicated watcher thread, and firewalled failure-path logging, with the
 signal-handler side staying a single async-signal-safe `write()`; no store/wire access, no
-trust-boundary authority. **A new I/O-bearing file here must be named in this annotation** (amend it
+trust-boundary authority. And `tls_policy.hpp` (#4722) — the shared TLS cipher policy: OpenSSL-only,
+memory-only SSL_CTX calls plus ONE process-environment write (`GRPC_SSL_CIPHER_SUITES`), no file/socket
+I/O, no store/wire types, no trust-boundary authority (it selects cipher suites; it authenticates
+nobody). **A new I/O-bearing file here must be named in this annotation** (amend it
 in the same change) — this does not open the root to I/O generally.
 
 `proto/meson.build` invokes `proto/gen_proto.py`, which runs `protoc` and flattens `#include`

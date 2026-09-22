@@ -29,6 +29,7 @@
 #ifndef _WIN32
 #include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (#3007, mirrors the agent)
 #endif
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
 #include <atomic>
 #include <chrono>
@@ -284,6 +285,18 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 #endif
+
+    // #4722: gRPC's ConfigVars snapshots GRPC_SSL_CIPHER_SUITES on first use;
+    // pin it before any gRPC symbol can run (unconditional overwrite — see
+    // tls_policy.hpp). ORDERING IS THE CONTRACT: no automated test observes
+    // this line (the test executable pins from its own static initialiser);
+    // moving it below the first gRPC call silently restores gRPC's default
+    // TLS 1.2 cipher list.
+    if (!yuzu::tls::pin_grpc_cipher_env()) {
+        std::cerr << "Failed to pin " << yuzu::tls::kGrpcCipherSuitesEnvVar
+                  << " in the process environment; refusing to start\n";
+        return EXIT_FAILURE;
+    }
 
     CLI::App app{"Yuzu Server", "yuzu-server"};
     app.set_version_flag("--version",
@@ -1207,6 +1220,21 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
+    // Refuse to start rather than silently serve on an OpenSSL build where our
+    // allow-list resolves to zero usable TLS 1.2 ciphers.
+    {
+        const auto tls_policy = yuzu::tls::resolve_cipher_policy();
+        if (!tls_policy) {
+            spdlog::critical("TLS policy: cipher list '{}' resolves to zero TLS 1.2 ciphers in "
+                             "this OpenSSL build — refusing to start",
+                             yuzu::tls::kTls12CipherList);
+            return EXIT_FAILURE;
+        }
+        for (const auto& line : yuzu::tls::tls_policy_report_lines(*tls_policy))
+            spdlog::info("{}", line);
+    }
 
     // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
     // Disabling client certificate verification requires BOTH a CLI flag AND

@@ -21,10 +21,16 @@
 #include <thread>
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#include <httplib.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <yuzu/tls_policy.hpp>
 #endif
+
+#include <string_view>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -248,6 +254,65 @@ TEST_CASE("CertReloader: try_reload fails with empty files", "[cert-reload][relo
     CHECK_FALSE(result);
     CHECK(reloader.failure_count() > 0);
 }
+
+// #4722: the only test that reaches the new test_ctx cipher application --
+// the reload/lifecycle cases above write fake PEM with a null web_server and
+// stop at validate_pem_pair.
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+TEST_CASE("CertReloader: try_reload succeeds against a live SSLServer and keeps the cipher pin",
+         "[cert-reload][reload][tls]") {
+    yuzu::test::TempDir tmp_dir{"yuzu_test_cert_reload_live-"};
+    const auto& tmp = tmp_dir.path;
+    std::filesystem::create_directories(tmp);
+    auto cert_path = tmp / "test.pem";
+    auto key_path = tmp / "test-key.pem";
+
+    write_pem_files(cert_path, key_path, generate_self_signed());
+
+    httplib::SSLServer ssl_server(cert_path.string().c_str(), key_path.string().c_str());
+    REQUIRE(ssl_server.is_valid());
+    auto* ctx = static_cast<SSL_CTX*>(ssl_server.tls_context());
+    REQUIRE(yuzu::tls::apply_tls12_cipher_list(ctx));
+
+    auto cipher_names = [](SSL_CTX* c) {
+        std::vector<std::string> names;
+        STACK_OF(SSL_CIPHER)* ciphers = SSL_CTX_get_ciphers(c);
+        int n = ciphers ? sk_SSL_CIPHER_num(ciphers) : 0;
+        for (int i = 0; i < n; ++i) {
+            const SSL_CIPHER* sc = sk_SSL_CIPHER_value(ciphers, i);
+            // TLS 1.3 ciphersuites are enumerated by SSL_CTX_get_ciphers too
+            // (they're not controlled by SSL_CTX_set_cipher_list at all) --
+            // filter to the TLS 1.2 subset this pin actually governs, same
+            // partition yuzu::tls::resolve_cipher_policy() does.
+            if (sc && std::string_view(SSL_CIPHER_get_version(sc)) != "TLSv1.3")
+                names.emplace_back(SSL_CIPHER_get_name(sc));
+        }
+        return names;
+    };
+    auto names_before = cipher_names(ctx);
+
+    // Overwrite the same files with a SECOND self-signed pair for the reload.
+    write_pem_files(cert_path, key_path, generate_self_signed());
+
+    CertReloader::Params params;
+    params.cert_path = cert_path;
+    params.key_path = key_path;
+    params.interval = std::chrono::seconds{10};
+    params.web_server = &ssl_server;
+
+    CertReloader reloader(params);
+    REQUIRE(reloader.try_reload());
+    CHECK(reloader.reload_count() == 1);
+    CHECK(reloader.failure_count() == 0);
+
+    auto names_after = cipher_names(ctx);
+    CHECK(names_after == names_before);
+    auto expected = yuzu::tls::resolve_cipher_policy();
+    REQUIRE(expected.has_value());
+    CHECK(names_after == expected->tls12);
+}
+
+#endif // CPPHTTPLIB_OPENSSL_SUPPORT
 
 // ── Start / stop lifecycle ──────────────────────────────────────────────────
 

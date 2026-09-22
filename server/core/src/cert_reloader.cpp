@@ -4,6 +4,7 @@
 #include "file_utils.hpp"
 
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
@@ -217,6 +218,24 @@ bool CertReloader::try_reload() {
         yuzu::secure_zero(key_pem);
         yuzu::secure_zero(cert_pem);
         log_audit("Failed: SSL_CTX_new failed", "failure");
+        return false;
+    }
+
+    // #4722: the validation context must carry the same cipher pin as the
+    // live listener so a hot-swapped cert/key pair is validated under the
+    // production policy. (The live ctx keeps its ctx-level cipher list
+    // across SSL_CTX_use_certificate_chain_file below — test_cert_reloader.cpp
+    // asserts it; this guards the validation path.)
+    if (!yuzu::tls::apply_tls12_cipher_list(test_ctx)) {
+        spdlog::error(
+            "cert-reload: failed to pin the TLS 1.2 cipher list on the validation context; "
+            "keeping current certificate");
+        SSL_CTX_free(test_ctx);
+        ERR_clear_error();
+        ++failure_count_;
+        yuzu::secure_zero(key_pem);
+        yuzu::secure_zero(cert_pem);
+        log_audit("Failed: cipher policy could not be applied", "failure");
         return false;
     }
 

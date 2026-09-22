@@ -636,6 +636,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_transfer_watchdog.cpp',
     'src/principal_quota.cpp',
     'src/cert_reloader.cpp',
+    'src/grpc_tls_credentials.cpp',
     'src/x509_ca.cpp',
     # key_provider.cpp lives in the yuzu_key_provider leaf target above
     # (ADR-0010 arch-S3); the dep below carries it.
