@@ -223,6 +223,8 @@ void FileGuard::run() try {
     bool hash_pending = false; // a change is settling before we (re)hash
     std::chrono::steady_clock::time_point settle_first{}; // when the current settle window began
     bool arm_retry = false;    // no watch could be armed → degraded bounded re-arm scheduled
+    std::optional<std::chrono::steady_clock::time_point> retry_at; // absolute degraded-retry deadline;
+        // set once on entry, not extended by intervening activity while still degraded (see below)
 
     auto reset_dir = [&](HANDLE h = nullptr) {
         h_dir.reset(h);
@@ -641,7 +643,17 @@ void FileGuard::run() try {
                     : cfg_.max_settle_defer_ms - static_cast<std::uint64_t>(deferred);
             timeout = static_cast<DWORD>(std::min<std::uint64_t>(cfg_.settle_ms, cap_left));
         } else if (arm_retry) {
-            timeout = kArmFailRetryMs;
+            // An absolute deadline, not a fresh kArmFailRetryMs every pass: unrelated activity while
+            // still degraded (a D/P wake that does not clear arm_retry) must not keep pushing the
+            // real retry back. A deadline already in the past (the retry attempt it triggered ran and
+            // is still degraded) starts a fresh window rather than spinning at timeout=0.
+            const auto now = std::chrono::steady_clock::now();
+            if (!retry_at || *retry_at <= now)
+                retry_at = now + std::chrono::milliseconds(kArmFailRetryMs);
+            timeout = static_cast<DWORD>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(*retry_at - now).count());
+        } else {
+            retry_at.reset(); // not degraded: no deadline to track
         }
 
         const DWORD r = WaitForMultipleObjects(n, handles, FALSE, timeout);
