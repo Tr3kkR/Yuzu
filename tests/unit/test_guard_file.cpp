@@ -777,9 +777,15 @@ void run_ancestor_created_chain_hits_abandon_limit() {
     CHECK(hook_calls.load() == 3); // 3rd abandon: kParentIoAbandonLimit reached, P now disabled
 
     REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F" / "G"));
-    REQUIRE(col->wait_drift_count(5, 30s)); // still detected via X's own (h_dir) channel - now
-        // finally openable, since the full configured parent exists - unaffected by P's disable
+    REQUIRE(col->wait_drift_count(5, 30s)); // the ancestor wake on F (recursive, catches G being
+        // created) drives this reconcile, exactly like drifts #2-#4; this same reconcile also
+        // newly arms h_dir on G (the configured parent now exists) - armed, but not yet exercised
     CHECK(hook_calls.load() == 3); // unchanged: bind() short-circuited on p_disabled, no drain
+
+    write_file(target, "content"); // exercises h_dir itself (armed, not fired, above): the
+        // file's own detection must survive P's permanent disable
+    REQUIRE(col->wait_compliant(30s));
+    CHECK(hook_calls.load() == 3); // still unchanged: h_dir's own content channel never touches P
 
     const auto t0 = std::chrono::steady_clock::now();
     guard.stop();
