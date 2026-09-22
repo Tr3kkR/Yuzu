@@ -1110,6 +1110,58 @@ TEST_CASE("re-eval: an alias-referenced parent is refused after deletion, never 
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
+          "deleted, never falls back to broadcast (#4306 follow-up: the "
+          "generic POST /api/v1/result-sets route persists scope_input_id too)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that
+    // scope_input_id was ONLY persisted by the two dedicated producer routes
+    // (from-tar-query / from-instruction-result). This route accepts an
+    // UNRESTRICTED source_kind/source_payload (no allowlist) plus a
+    // caller-supplied, owner-checked parent_id -- a row minted here with a
+    // crafted tar_query-shaped payload was indistinguishable at re-eval time
+    // from a genuinely parentless original once its parent was deleted, and
+    // would have silently broadcast to __all__ (the same #2500 shape #4306
+    // itself closed for the producer routes).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-generic", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Positive control: the generic route now records scope_input_id, the
+    // same as the dedicated producers do.
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    REQUIRE(sp.value("scope_input_id", "") == parent);
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched -- before this fix, a
+    // generic-create original with no recorded scope_input_id would have
+    // fallen through to the genuinely-parentless branch and broadcast to
+    // __all__ here.
+    REQUIRE(h.calls.empty());
+}
+
 TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

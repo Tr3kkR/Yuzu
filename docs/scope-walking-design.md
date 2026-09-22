@@ -228,9 +228,14 @@ re-resolving `scope_input_id` or broadcasting. Re-resolution is deliberately not
 `scope_input_id` may be an alias rather than a canonical `rs_` id, and `resolve_alias`'s
 `ORDER BY created_at DESC LIMIT 1` means the alias may since have been re-bound to a different,
 newer set; resolving it at re-eval time would retarget the dispatch to whatever the alias means
-*today*, not what it meant when the original was created. A genuinely parentless original (no
-`scope_input_id` was ever recorded, because no `parent_id` was ever supplied at creation) still
-broadcasts on re-eval — unchanged, existing behaviour for a deliberately fleet-wide original. The
+*today*, not what it meant when the original was created. `scope_input_id` is recorded whenever
+`parent_id` was supplied at creation, via *either* the dedicated `from-tar-query`/
+`from-instruction-result` producers above *or* the generic `POST /api/v1/result-sets` / MCP
+`create_result_set` create routes -- both mirror the identical `payload["scope_input_id"] = ...`
+persistence (#4306 follow-up), closing the gap those UNRESTRICTED (no `source_kind`/
+`source_payload` allowlist) routes otherwise left in the same target-erasure shape. A genuinely
+parentless original -- no `parent_id` was ever supplied at creation, by *any* creation path -- still
+broadcasts on re-eval, unchanged, existing behaviour for a deliberately fleet-wide original. The
 refusal happens before `run_async`/`rs_run_async` — no execution row is created, nothing is
 dispatched, nothing needs cancelling — and is audited as `result_set.create|denied` with
 `reason=parent_gone`. It is **not** counted on `yuzu_server_dispatch_target_rejected_total`

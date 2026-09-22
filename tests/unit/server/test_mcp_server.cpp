@@ -27289,6 +27289,95 @@ TEST_CASE("MCP reevaluate_result_set: the parent-gone refusal surfaces a "
     CHECK(body["error"]["data"]["audit_persisted"] == false);
 }
 
+TEST_CASE("MCP reevaluate_result_set: refused when a GENERIC-create original's "
+          "live parent was deleted, never falls back to broadcast (#4306 "
+          "follow-up: the generic create_result_set tool persists "
+          "scope_input_id too)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that
+    // scope_input_id was ONLY persisted by the two dedicated producer tools
+    // (create_result_set_from_tar_query / create_result_set_from_instruction_
+    // result). create_result_set accepts an UNRESTRICTED source_kind/
+    // source_payload (no allowlist) plus a caller-supplied, owner-checked
+    // parent_id -- a row minted here with a crafted tar_query-shaped payload
+    // was indistinguishable at re-eval time from a genuinely parentless
+    // original once its parent was deleted, and would have silently
+    // broadcast to __all__ (the same #2500 shape #4306 itself closed for the
+    // producer tools).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "narrow-target-generic";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // Empty tier: create_result_set is Infrastructure:Write, which "operator"
+    // tier denies outright (mcp_policy.hpp tier_allows) -- see the happy-path
+    // lifecycle test's own comment above for why this file mints via the
+    // generic tool under an empty (non-MCP-token) tier.
+    ts.start_with_dispatch(dispatch, "");
+
+    // Minted via the GENERIC create_result_set tool (not
+    // create_result_set_from_tar_query), with a crafted source_kind/
+    // source_payload the dedicated producer would have built itself.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},"parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id =
+        created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    // Positive control: the generic tool now records scope_input_id, the same
+    // as the two dedicated producer tools do.
+    auto orig_row = rs_bundle.get()->get(orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE(orig_row->has_value());
+    auto sp = nlohmann::json::parse((*orig_row)->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    REQUIRE(sp.value("scope_input_id", "") == parent->id);
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig_id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched -- before this fix, a
+    // generic-create original with no recorded scope_input_id would have
+    // fallen through to the genuinely-parentless branch and broadcast to
+    // __all__ here.
+    CHECK_FALSE(dispatched);
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -

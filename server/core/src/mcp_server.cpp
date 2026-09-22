@@ -1003,7 +1003,7 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
-     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied, a scope_input_id key recording the raw parent_id is merged in (#4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -11597,8 +11597,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = param_str(args, "source_kind", "manual_curate");
-                cr.source_payload =
-                    args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                // #4306 follow-up (Kimi/Codex adversarial review): this tool
+                // accepts an UNRESTRICTED source_kind/source_payload (no
+                // allowlist) plus a caller-supplied parent_id, so a row
+                // minted here is otherwise indistinguishable at re-eval time
+                // from a genuinely parentless original once its parent is
+                // deleted (ON DELETE SET NULL) -- the same #4306/#2500
+                // target-erasure shape the dedicated
+                // create_result_set_from_tar_query/_instruction_result tools
+                // are already protected against. Parse into a mutable object
+                // so scope_input_id can be merged in below, once pid's
+                // ownership check (rs_load_owned) succeeds -- mirrors those
+                // tools' identical payload["scope_input_id"] = ... pattern.
+                // Named req_payload (not payload) - this handler separately
+                // builds a RESPONSE-body `payload` further down from the
+                // created row, an unrelated JSON object with the same
+                // conventional name.
+                nlohmann::json req_payload =
+                    args.contains("source_payload") ? args["source_payload"] : nlohmann::json::object();
                 // #4353 follow-up: this tool is never approval-gated (Write, but
                 // no ManagementGroup/UserManagement/Security/Policy/Execution
                 // securable_type here - see requires_approval()), so the
@@ -11663,7 +11679,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return; // rs_load_owned already wrote the error
                     cr.parent_id = *pid;
+                    // #4306 follow-up: do NOT add the marker for a parent_id
+                    // that failed ownership above -- that request is already
+                    // rejected before reaching here.
+                    if (req_payload.is_object())
+                        req_payload["scope_input_id"] = *pid;
                 }
+                cr.source_payload = req_payload.dump();
                 if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
@@ -12313,8 +12335,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // #4306 / #2500-class target erasure: the original was
                     // NARROWED at creation (scope_input_id persisted into
                     // source_payload by create_result_set_from_tar_query /
-                    // create_result_set_from_instruction_result), but its live
-                    // parent_id FK is now null (schema: `parent_id ... ON DELETE
+                    // create_result_set_from_instruction_result, OR by the
+                    // generic create_result_set -- #4306 follow-up, all three
+                    // mirror the same payload["scope_input_id"] = ... pattern),
+                    // but its live parent_id FK is now null (schema: `parent_id ... ON DELETE
                     // SET NULL`, result_set_store.cpp) because the parent set was
                     // deleted since. An absent parent_id reaching rs_run_async
                     // below reads as "omitted -> broadcast to __all__" (the SAME

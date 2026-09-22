@@ -6011,10 +6011,13 @@ FK, which is nulled (`ON DELETE SET NULL`) if the parent set is later deleted. A
 rule the parent_id-empty guard above enforces for a caller-supplied empty string — so
 letting that happen here would silently turn "re-ask the same narrow question" into "ask
 the whole visible fleet". If the live parent is gone **and** the original's stored
-`source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id`), the
+`source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id` --
+recorded by every result-set create route that accepts `parent_id`, both `from-tar-query`/
+`from-instruction-result` and the generic `POST /api/v1/result-sets`, #4306 follow-up), the
 call is refused rather than re-resolved (the recorded value may be an alias that has since
 been re-bound to a different, newer set) or silently broadcast. A genuinely parentless
-original (no `scope_input_id` was ever recorded) still broadcasts on re-eval, unchanged.
+original (no `parent_id` was ever supplied, by any creation path) still broadcasts on
+re-eval, unchanged.
 
 **Errors:**
 
