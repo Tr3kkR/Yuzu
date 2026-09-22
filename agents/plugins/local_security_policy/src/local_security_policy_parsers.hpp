@@ -319,8 +319,14 @@ inline bool parse_user_spec(std::string_view line, std::vector<SudoersEntry>& ou
         for (;;) {
             const auto w = it.substr(0, it.find_first_of(" \t"));
             if (!is_tag_word(w)) break;
+            // Only NOPASSWD:/PASSWD: are semantically decoded; any other recognized tag
+            // (SETENV:, NOEXEC:, a known sudo privilege-escalation vector among them) is
+            // left in place rather than silently consumed -- it survives verbatim as part
+            // of the stored command text, matching the "never dropped" treatment
+            // unmodelled_parameter already gets elsewhere in this file.
             if (w == "NOPASSWD:") next_nopw = "true";
             else if (w == "PASSWD:") next_nopw = "false";
+            else break;
             it = trim_ws(it.substr(w.size()));
         }
         if (it.empty()) return false;

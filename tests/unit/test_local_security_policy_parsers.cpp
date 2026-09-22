@@ -212,6 +212,32 @@ TEST_CASE("parse_sudoers: kinds, tags, escaped commas, continuations, unmodelled
     CHECK(e[8].commands == "Frobnicate the widgets");
 }
 
+// Fails under: SETENV:/NOEXEC:/any tag other than NOPASSWD:/PASSWD: being silently consumed
+// instead of surviving verbatim in the stored command text (a real sudo privilege-escalation
+// vector, SETENV, must never just vanish).
+TEST_CASE("parse_sudoers: a non-NOPASSWD/PASSWD tag is preserved verbatim, not dropped",
+          "[local_security_policy][parsers]") {
+    const auto e = parse_sudoers("web1 web = (root) SETENV: /usr/bin/foo\n"
+                                 "web2 web = (root) NOPASSWD: SETENV: /usr/bin/bar\n");
+    REQUIRE(e.size() == 2);
+    CHECK(e[0].nopasswd == "false"); // SETENV: never touches the NOPASSWD state
+    CHECK(e[0].commands == "SETENV: /usr/bin/foo"); // survives verbatim, not silently eaten
+    CHECK(e[1].nopasswd == "true"); // NOPASSWD: still decoded normally ahead of the unmodelled tag
+    CHECK(e[1].commands == "SETENV: /usr/bin/bar");
+}
+
+// Fails under: split_unescaped_commas gaining paren-nesting awareness (which would change this
+// row's shape) without a matching test update. Not a data-loss bug -- documents the existing,
+// safe fallback: a comma inside a Runas_List paren group is not comma-aware, so the whole line
+// falls back to `unmodelled` with the raw text preserved verbatim, never silently dropped.
+TEST_CASE("parse_sudoers: a multi-principal Runas_List is unmodelled, not silently misparsed",
+          "[local_security_policy][parsers]") {
+    const auto e = parse_sudoers("web1 web = (alice, bob) /usr/bin/foo\n");
+    REQUIRE(e.size() == 1);
+    CHECK(e[0].kind == "unmodelled");
+    CHECK(e[0].commands == "web1 web = (alice, bob) /usr/bin/foo");
+}
+
 // Fails under: any change to which errno is absent vs denied vs failed, or to the status table.
 TEST_CASE("classify_read_errno and select_status pin the failure contract", "[local_security_policy][parsers]") {
     CHECK(classify_read_errno(ENOENT).cls == ReadClass::Absent);
