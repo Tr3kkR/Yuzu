@@ -1,5 +1,18 @@
 #pragma once
 
+// Belt-and-suspenders for whichever TU includes this file: see the identical
+// comment and #4722 rationale in grpc_tls_credentials.hpp -- a header can only
+// guard its own includes, not an unguarded windows.h some earlier header in the
+// same TU already pulled in. Idempotent no-op when the includer already guarded.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>

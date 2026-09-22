@@ -1,3 +1,16 @@
+// #4722: this TU includes httplib.h below, which pulls in <windows.h> on Windows
+// unguarded ahead of <algorithm>'s std::max/std::min use at run_loop() -- matches
+// the same collision and the same fix shape already applied in server.cpp and
+// grpc_tls_credentials.hpp. Must be first, before any other include.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "cert_reloader.hpp"
 #include "audit_store.hpp"
 #include "background_jobs.hpp"
