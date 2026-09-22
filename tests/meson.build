@@ -2267,6 +2267,17 @@ test('capability gate consistency',
   timeout: 30,
 )
 
+# firmware_posture's definition-column contract (content/definitions/firmware_posture.yaml):
+# row_kind must be the first result column and the order must match the wire row
+# firmware_posture_parsers.hpp emits. Parses the YAML directly -- catches a reordered or
+# renamed column the C++ test's hard-coded literal cannot.
+test('firmware_posture definition columns',
+  _python3_test,
+  args: [files('test_firmware_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Plugin README standard (docs/plugin-readme-standard.md): unit tests of the
 # generator's pure functions, then the tree gate — README-existence ratchet,
 # section contract, generated fences/index/nav/manifests byte-match the
