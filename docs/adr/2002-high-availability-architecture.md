@@ -328,7 +328,11 @@ cluster unit; intra-zone scale is more nodes.
 - **Northbound (server→gateway):** the minting server reads the directory and dials the owning
   cluster; an undeliverable command (cluster unreachable, stale/expired lease, agent mid-migration)
   stays `pending` in the outbox (§6) and is re-driven — with receiver dedup absorbing any double
-  delivery during a re-home race.
+  delivery during a re-home race. **Scoped by §7e (#4672):** this design note describes the
+  LEADER-DRIVEN background plane's `route_unreadable` reschedule (§6/WS-3 3.3). The
+  `forward_gateway_pending` detached-thread forwarding path specifically does NOT enqueue into that
+  outbox — see §7e for why and what it does instead (immediate terminal resolution, never a durably
+  re-driven `pending` row).
 - **`gateway_node` convergence is a first-class requirement (finding 6b).** Today an agent's
   proxied-vs-direct routing hinges on `gateway_node` being populated by a **single `NotifyStreamStatus`
   gRPC call** succeeding (`GatewayUpstreamServiceImpl::NotifyStreamStatus`, which calls
@@ -1193,6 +1197,99 @@ adversarial review surfaced, not a routing change.
   blocking this slice per the reviewing pass's own recommendation (multi-cluster mode is opt-in with no
   production deployments today), but must close before multi-cluster mode is presented as providing
   trust-zone isolation.
+
+  **Update (#4669, CLOSED via mitigation 1 — agent↔cluster affinity, NOT mitigation 2):**
+  `agent_routes` gains a STICKY `home_cluster_id` column (migration v4), separate from the EPHEMERAL
+  `cluster_id`/`gateway_node` that `register_fresh` NULLs on every fresh registration — `register_fresh`,
+  `deregister`, and an ordinary reap-clean tombstone all leave `home_cluster_id` alone. `announce_connected`
+  now enforces it: a session-matched write is ATOMICALLY refused (its own guarded UPDATE's WHERE clause,
+  no read-then-write TOCTOU) when the presented `cluster_id` differs from an already-bound
+  `home_cluster_id`, reporting a distinct `AnnounceResult::cluster_affinity_violation`; a NULL
+  `home_cluster_id` (never bound, or legitimately cleared — see below) admits and binds on first contact
+  (TOFU). `gateway_service_impl.cpp`'s `NotifyStreamStatus` CONNECTED handler adds a READ-ONLY pre-check
+  (`GatewayRouteStore::has_cluster_affinity_conflict`) BEFORE `registry_.set_gateway_route` — the PRIMARY
+  dispatch path's write (`AgentSession::cluster_id`, read by `send_to`/`send_to_all`) — so a definitive
+  violation caught BY THE PRE-CHECK refuses the whole CONNECTED before EITHER the durable row or the
+  in-memory registry is touched. **Correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the pre-check is fail-OPEN on a DEGRADED read, so `set_gateway_route` can
+  still run and publish BEFORE the write's own independent, atomic re-check catches a violation the
+  pre-check missed — and that write-time catch, before this fix, only emitted a metric+audit, never
+  rolling back the already-published in-memory entry, leaving a rogue's placement live with no
+  reconciliation. Fixed: the write-time `cluster_affinity_violation` branch now calls
+  `registry_.unpublish_gateway_route`, reverting exactly what this same call sequence's earlier
+  `set_gateway_route` published. One compound case remains genuinely open (both the pre-check read AND
+  the write degrading in the same window, so the write never reaches the violation branch at all) — see
+  `gateway_service_impl.cpp`'s own comment and the `YuzuGatewayClusterAffinityCheckDegradedDuringWrite`
+  alert, added to make that window observable. Closing the exact "claims agent A's own identity, then
+  legitimately answers for it" shape above: a rogue's own `register_fresh` still unconditionally wins the
+  epoch race (pre-existing,
+  accepted DoS-shaped churn, unchanged), but its own subsequent `announce_connected`/CONNECTED can no
+  longer make `cluster_id` — and therefore `GatewayMgmtStubPool::resolve()`'s dispatch target — move to
+  the rogue's cluster. **Correction (pr-rev round 1, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the sweep this paragraph originally described as removing affinity ("its
+  tombstone-purge sweep already removes the affinity with the row") in fact let a SINGLE rogue
+  `register_fresh` (which never confirms via `announce_connected`) manufacture that same purge predicate
+  and force a re-home window on the real cluster — the sweep hard-deleted ANY `lease_until IS NULL` row
+  past the purge age regardless of a bound `home_cluster_id`. Fixed: the tombstone-purge sweep now NEVER
+  purges a row carrying a bound `home_cluster_id`, full stop; a session-bearing, never-reconfirmed row is
+  instead soft-tombstoned (session/cluster/gateway_node/stream_home_id cleared, `home_cluster_id`
+  PRESERVED) and an already-tombstoned affinity-bound row is left untouched indefinitely — either way it
+  is PARKED, not purged, and the sentence above is corrected accordingly at item (1) below. **Correction
+  (pr-rev round 2, FortitudeEtc/Codex+Kimi, CRITICAL, 2026-09-22, empirically confirmed twice
+  independently):** that same round-1 soft-tombstone, by clearing the durable `session_id` while
+  preserving `home_cluster_id`, reopened the ORIGINAL hijack through a different door — the rogue's
+  original `ProxyRegister` already installed its session in the gateway's own in-memory state, and
+  nothing invalidates that entry when its first CONNECTED is refused, so once the soft-tombstone fires
+  (~300s later) the rogue simply resends CONNECTED under that same still-live session. Both affinity
+  probes (`has_cluster_affinity_conflict` and `announce_connected`'s own diagnostic probe) matched only
+  `session_id=$2` exactly, which a durable NULL can never satisfy, so the resend was invisible to both
+  and classified as an ordinary, unaudited `session_mismatch` — the durable row was never fooled
+  (`home_cluster_id` stays correct throughout), but the IN-MEMORY dispatch route (`AgentSession::cluster_id`,
+  what `send_to`/`send_to_all` actually read) silently took the rogue's cluster. Fixed: both probes'
+  predicates extended to `(session_id=$2 OR session_id IS NULL) AND home_cluster_id IS NOT NULL AND
+  home_cluster_id <> $3` — a session-orphaned row with a bound, differing affinity is now caught by the
+  pre-check itself, before anything is published, exactly like a session-matched violation always was.
+  Safe for a genuine first-ever TOFU contact, which always has `home_cluster_id IS NULL` and so is
+  excluded by the predicate's own `IS NOT NULL` clause regardless of session_id. The real agent's own
+  later reconnect (its own fresh `register_fresh`, always eventually wins the epoch race) self-heals by
+  announcing the matching cluster. Two legitimate re-home triggers, matching the issue's own design:
+  (1) genuine staleness — `reap_stale_routes`' expired-lease sweep now ALSO NULLs `home_cluster_id` (>=
+  the existing grace window past the lease TTL, i.e. requires the real cluster to have been genuinely
+  unreachable that long, not something a rogue can force instantly); the tombstone-purge sweep, per the
+  round-1 correction above, does NOT remove the affinity — it parks the row with the affinity preserved,
+  so re-home via that path still requires the SAME genuine lease-expiry precondition to occur first; (2)
+  `GatewayRouteStore::clear_cluster_affinity` — an explicit, unconditional, operator-invoked clear (the
+  CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — tracked as
+  `#4696`, which also requires the audit wiring land in the SAME diff as the route). Deliberately NOT
+  gated on multi-cluster mode: `gateway_route_store_` is wired
+  whenever a gateway upstream is configured at all, and a single-cluster gateway announces a STABLE
+  `cluster_id` (`YUZU_GW_CLUSTER_ID`, default `"default"`) on every connection, so TOFU-bind-then-match
+  costs single-cluster deployments nothing. **Scope note:** this closes the `GatewayRouteStore`-side half
+  only (mitigation 1) — mitigation 2 (per-cluster peer-identity binding at the gateway-upstream listener,
+  so a peer physically presenting cluster Y's certificate cannot claim agents whose home is cluster X) is
+  NOT implemented; today's gateway-upstream listener still authenticates the peer as "some gateway",
+  never "gateway Y specifically" (`gateway_mgmt_stub_pool.hpp`'s TRUST BOUNDARY note). **Adjacent,
+  narrower pre-existing consideration this slice does NOT need to change:** `ProxyRegister`'s OTHER adopt
+  path, `reclaim_tombstoned_session`, accepts ANY presented `session_id` string against a row that is
+  CURRENTLY tombstoned — no secret verification, by design, for the legitimate circuit-recovery-replay-
+  after-a-core-restart case. A rogue racing the narrow window right after a genuine disconnect could
+  reclaim SESSION OWNERSHIP of the row with a fabricated session_id — but `reclaim_tombstoned_session`
+  never touches `home_cluster_id` either, so the reclaimed row's affinity is still whatever it was bound
+  to before the tombstone, and the SAME `announce_connected` guard refuses a mismatched cluster for it
+  exactly as for a live row. The `#4669` affinity mitigation therefore also holds against this reclaim-
+  based variant, even though `reclaim_tombstoned_session`'s own no-secret-required session adoption is a
+  separate, pre-existing design choice this slice does not revisit. **Gate 4 unhappy-path refinement
+  (2026-09-21, UP-3): this protection is ORIGIN-DEPENDENT, not universal.** A CLEAN `deregister` tombstone
+  (an ordinary DISCONNECTED) leaves `home_cluster_id` intact — the reclaim-based variant above holds
+  exactly as described, and is now regression-tested end-to-end
+  (`tests/unit/server/test_gateway_route_wiring.cpp`, `[affinity]`). A `reap_stale_routes` sweep (a)
+  tombstone, by contrast, ALSO NULLs `home_cluster_id` (it is the intended "genuine staleness" re-home
+  trigger from this section's own design) — so a session reclaimed from a REAP-origin tombstone has NO
+  bound affinity to protect, and correctly TOFU-rebinds to whichever cluster next legitimately announces
+  (also regression-tested). This is not a new bypass: it is the SAME accepted re-home path #4669 already
+  designs for, reached via `reclaim_tombstoned_session` rather than a fresh `register_fresh` — both require
+  the identical natural-outage precondition (the real cluster genuinely unreachable for the full grace
+  window), and neither is attacker-forceable on demand.
 - **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
   RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
   after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a
@@ -1216,20 +1313,98 @@ being unnecessary complexity for a closed boot-time config set (switched to eage
 fix. All five folded into the shipped design before implementation started, rather than caught in a
 later review round.
 
-**Deliberately unchanged by this slice:** the command-outbox/retry contract. `forward_gateway_pending`
-remains fire-and-forget past `AgentRegistry::gw_pending_` for every terminal-failure branch
-(`unauthenticated`, exhausted `unavailable` retries, and the new `unknown_cluster`/`agent_mismatch`
-branches) — none synthesize a terminal FAILED status the tracker or an API caller can see, only a log
-+ counter. §7's own design note ("an undeliverable command stays `pending` in the outbox and is
-re-driven") is therefore only HALF satisfied by WS-4 as a whole: the "dial the owning cluster" half is
-done, the "durable re-drive on failure" half is a pre-existing gap this slice inherits rather than
-introduces. Not filed as a new issue — it is the same shape as the outbox work WS-3 3.3 already owns
-for the leader-driven plane; a future pass wiring gateway-forward failures into that same durable
-outbox is the natural closure, not a bespoke retry mechanism here.
+**Deliberately unchanged by this slice, closed by #4672 (§7e below):** at the time this slice merged,
+`forward_gateway_pending` was fire-and-forget past `AgentRegistry::gw_pending_` for every
+terminal-failure branch (`unauthenticated`, exhausted `unavailable` retries, and the new
+`unknown_cluster`/`agent_mismatch` branches) — none synthesized a terminal FAILED status the tracker or
+an API caller could see, only a log + counter. This slice's own text originally disclosed the gap here
+without filing a tracking issue; #4672 is that issue, and §7e records how it closed.
 
 **Remaining WS-4 gate items:** WS-5 (durable cross-replica session lookup / shared presence — this is
 also what makes the 4.2b directory-fallback reader BEHAVIORALLY live, not merely wired, since only then
 can a directory row outlive the writing replica's own in-memory registry).
+
+### 7e. `forward_gateway_pending` terminal-failure resolution (#4672, 2026-09-21)
+
+**Status: CLOSED — immediate terminal resolution; durable outbox re-drive explicitly deferred, not
+silently dropped.** §7d's own text disclosed a gap without filing a tracking issue: none of
+`forward_gateway_pending`'s terminal-failure branches (`unauthenticated`, exhausted `unavailable`
+retries, `unknown_cluster`, and a stream that produced no legitimate response for the targeted agent —
+"agent_mismatch") ever resolved the dispatching operator's `command_id`. Each logged, incremented
+`yuzu_server_gateway_forward_total`, and dropped the command — the executions drawer and any API caller
+polling that `command_id` saw it idle at RUNNING (or unresolved) forever.
+
+**What shipped:** every one of those branches, plus the pre-existing (unnamed by #4672, but same shape)
+`"other"` grpc-status branch, now synthesizes a terminal `FAILURE` `CommandResponse`
+(`build_gateway_forward_terminal_failure`, `gateway_mgmt_stub_pool.hpp` — a pure, unit-tested builder)
+and applies it through `process_gateway_response` — the SAME mechanism a real gateway response already
+used on every other line of this function. This keeps command_id resolution to the ONE established
+`notify_exec_tracker` terminal-write path (executions-history-ladder routed concern) rather than a
+bespoke second mechanism.
+
+**Exactly-once guard (post-Gate-2/3 correction):** the first cut of this fix scoped the double-resolve
+guard to the `agent_mismatch` branch only, tracking whether a legitimate frame was applied *within a
+single attempt*. Gate 2/3 governance (security-guardian HIGH, cpp-safety/cpp-expert independently
+confirming) caught that this left the OTHER three synthesizing branches — `unauthenticated`, the generic
+`"other"` branch, and exhausted-retries `unavailable` — able to clobber an already-applied real terminal
+response with a synthetic FAILURE, either within one attempt (a legitimate frame applied, then that same
+attempt's `Finish()` still reports a non-OK transport status) or across attempts (an earlier attempt
+resolves the command while a later attempt independently hits a different terminal-failure branch). The
+shipped guard is a single `applied_response` bool (renamed `applied_terminal`, post-pr-rev correction
+below), declared ONCE before the 3-attempt retry loop (not per-attempt, not per-branch) and consulted by
+ALL FIVE synthesizing call sites — `agent_mismatch`, `unauthenticated`, `"other"`, exhausted-`unavailable`,
+and `unknown_cluster` — so a real TERMINAL response (a genuine terminal apply, or a repaired
+`not_connected` frame, itself always FAILURE by `classify_gateway_forward_response`'s own contract) applied
+at ANY point across the whole command's attempts suppresses every later synthetic write for that same
+command_id.
+
+**Second correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically confirmed by both
+reviewers independently):** the guard above was itself over-broad through PR review — `applied_response`
+was set to `true` by ANY applied frame, including a non-terminal RUNNING progress update, not only a
+terminal one. A gateway streaming a single RUNNING frame, then faulting before a clean close with every
+retry exhausted UNAVAILABLE, left the guard already tripped, so the exhausted-retry synthesis was
+suppressed and the command_id stayed at RUNNING forever — the exact defect #4672 exists to close,
+reintroduced by this guard's own predicate. Fixed: the flag (renamed `applied_terminal`) is now set only
+when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_status`,
+`gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
+unconditionally terminal by its classifier's own contract and needs no such check.
+
+**Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
+re-drive), for two independent, load-bearing reasons — not silently, this time:**
+
+1. **Granularity mismatch with WS-3 3.3's `command_outbox_store`/`command_outbox_delivery`.** That
+   store's producer API (`claim_and_enqueue`) is epoch-fenced, and its one existing producer
+   (`ScheduleRunner`) runs strictly inside a `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the
+   fence exists on the assumption that only a caller who has ALREADY confirmed leadership calls it.
+   `forward_gateway_pending` is reachable from every replica via ordinary operator-synchronous dispatch,
+   never gated on leadership, so an enqueue attempt from inside it would silently no-op on a non-leader
+   replica (`LeaderElector::epoch()` returns `nullopt` there — there is no epoch to embed), producing an
+   inconsistent, replica-dependent retry strictly worse than today's uniform resolution. Separately,
+   `command_outbox_delivery`'s own `sent` means "the confined-dispatch resolution QUEUED the command"
+   (`ConfinedDispatchOutcome::sent`), never "the gateway RPC actually completed" — reusing its generic
+   `DispatchFn` re-dispatch path for a redelivery would mark the occurrence terminal in the outbox the
+   instant `send_to` re-queues it into `gw_pending_`, racing and swallowing the very gateway failure a
+   redelivery would exist to observe.
+2. **#3279** (named in `server.cpp`, "KNOWN GAP, filed as #3279, NOT fixed here"). This function's
+   detached per-command `std::thread(...).detach()` is untracked by every shutdown drain/quiesce
+   mechanism this server has; its raw-pointer capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+   carefully-scoped, individually-justified exception to that gap, not a precedent to extend. A durable
+   retry producer would need that same thread to ALSO touch `command_outbox_store_`/`leader_elector_`,
+   widening #3279's reach into two more `ServerImpl`-owned stores with no existing destruction-order
+   analysis covering them. #3279 is explicitly deferred to a human owner to adjudicate; widening its
+   blast radius as a side effect of #4672 would be scope creep into that separately-tracked decision, not
+   a fix for it.
+
+A durable gateway-forward re-drive therefore stays a documented, scoped-out follow-up — real once #3279
+gives `forward_gateway_pending` its own pooling/draining story (so a retry producer has a safe place to
+touch `command_outbox_store_`), not before. Until then, §7's "stays pending... and is re-driven" design
+note is accurate for the LEADER-DRIVEN background plane (schedule fires, via `route_unreadable`) and
+inaccurate for the gateway-forwarding path specifically — which instead resolves terminally, immediately,
+for every command that reaches the per-command retry loop below, including the previously-silent
+unusable-pool short-circuit above it (now resolved through the same helper, pr-rev finding
+FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, not silently: a clean
+`Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
+every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:

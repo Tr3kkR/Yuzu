@@ -315,3 +315,78 @@ TEST_CASE("classify_gateway_forward_response: a FAILURE with exit_code -1 but ou
     CHECK(yuzu::server::classify_gateway_forward_response(resp, "agent-1") ==
          yuzu::server::GatewayForwardOutcome::kApply);
 }
+
+// ── build_gateway_forward_terminal_failure (#4672) ──────────────────────────
+//
+// Pure builder for the synthetic terminal FAILURE `forward_gateway_pending`
+// applies on its `unauthenticated` / exhausted `unavailable` /
+// `unknown_cluster` / no-legitimate-resolution `agent_mismatch` branches, so
+// the dispatching operator's command_id always resolves instead of being
+// silently dropped. See server.cpp's `apply_gateway_forward_terminal_failure`
+// (the ONE call site, feeding every branch through `process_gateway_response`
+// — integration coverage for that half lives in
+// test_agent_service_impl.cpp, which cannot see this static ServerImpl
+// helper directly).
+
+TEST_CASE("build_gateway_forward_terminal_failure: sets command_id, FAILURE status, "
+          "the synthetic exit_code sentinel, and the reason/detail on error",
+          "[server][gateway_mgmt_stub_pool][4672]") {
+    auto resp = yuzu::server::build_gateway_forward_terminal_failure(
+        "cmd-123", "gateway_unauthenticated", "rejected by mgmt-plane peer pin");
+    CHECK(resp.command_id() == "cmd-123");
+    CHECK(resp.status() == ::yuzu::agent::v1::CommandResponse::FAILURE);
+    // -1 matches the same synthetic-terminal sentinel
+    // classify_gateway_forward_response's kNotConnected branch already
+    // recognizes elsewhere on this forwarding path — never a real agent's
+    // exit code.
+    CHECK(resp.exit_code() == -1);
+    REQUIRE(resp.has_error());
+    CHECK(resp.error().code() == "gateway_unauthenticated");
+    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+    // error().code() is never read back anywhere under server/core/src, so
+    // the reason code is ALSO prefixed onto the persisted message — the
+    // field that actually reaches an operator/agentic worker.
+    CHECK(resp.error().message() == "[gateway_unauthenticated] rejected by mgmt-plane peer pin");
+}
+
+TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason codes "
+          "round-trips distinctly",
+          "[server][gateway_mgmt_stub_pool][4672]") {
+    // Mirrors the reason_code literals server.cpp's forward_gateway_pending
+    // passes at each of its five terminal-failure call sites (four named in
+    // #4672's own issue, plus the pre-existing unnamed generic grpc-status
+    // branch the same PR also fixed, "gateway_forward_failed") — a change to
+    // one of those literals without updating this list is a doc/observability
+    // drift, not a functional break, but pinning the set here catches an
+    // accidental typo/duplicate at the source of truth. Gate 4 consistency-
+    // auditor SHOULD (2026-09-21): this list previously omitted
+    // "gateway_forward_failed", the one code the diff's own commit message
+    // said it also closed.
+    const std::vector<std::string> reasons = {
+        "gateway_unauthenticated",
+        "gateway_unavailable",
+        "gateway_unknown_cluster",
+        "gateway_agent_mismatch",
+        "gateway_forward_failed",
+    };
+    for (const auto& reason : reasons) {
+        INFO("reason=" << reason);
+        auto resp = yuzu::server::build_gateway_forward_terminal_failure("cmd-x", reason, "d");
+        CHECK(resp.error().code() == reason);
+        CHECK(resp.status() == ::yuzu::agent::v1::CommandResponse::FAILURE);
+    }
+}
+
+TEST_CASE("is_terminal_command_status: RUNNING is the ONLY non-terminal status "
+          "(pr-rev finding FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22)",
+          "[server][gateway_mgmt_stub_pool][4672]") {
+    // The exact guard matrix requested by the review: every CommandResponse::
+    // Status value, and whether applying a frame carrying it should suppress
+    // a later synthetic terminal-failure write. Only RUNNING must not.
+    using S = ::yuzu::agent::v1::CommandResponse;
+    CHECK_FALSE(yuzu::server::is_terminal_command_status(S::RUNNING));
+    CHECK(yuzu::server::is_terminal_command_status(S::SUCCESS));
+    CHECK(yuzu::server::is_terminal_command_status(S::FAILURE));
+    CHECK(yuzu::server::is_terminal_command_status(S::TIMEOUT));
+    CHECK(yuzu::server::is_terminal_command_status(S::REJECTED));
+}

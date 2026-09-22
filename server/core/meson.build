@@ -573,6 +573,7 @@ yuzu_server_core_lib = static_library(
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',

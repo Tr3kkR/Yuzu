@@ -119,6 +119,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
     auto schedule_api = deps.schedule_api; // ADR-0031 WS-A4 (seventh family)
+    auto workflow_api = deps.workflow_api; // ADR-0031 WS-A4 (eighth family)
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
@@ -2165,11 +2166,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // scope for this twin PR).
 
     // GET /api/v1/workflows -- v1 twin of GET /api/workflows above.
-    sink.Get("/api/v1/workflows", [perm_fn, workflow_engine](const httplib::Request& req,
-                                                             httplib::Response& res) {
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam —
+    // list_workflows() already returned a checked std::expected to this
+    // route pre-seam, so dropping the separate `!is_open()` pre-check and
+    // relying on the seam call's own result introduces no new
+    // honest-empty-vs-failure distinction (see workflow_api.cpp's doc
+    // comment); it only removes the direct presentation -> store reach.
+    sink.Get("/api/v1/workflows", [perm_fn, workflow_api](const httplib::Request& req,
+                                                          httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Read"))
             return;
-        if (!workflow_engine || !workflow_engine->is_open()) {
+        if (!workflow_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "workflow engine not available"),
                             "application/json");
@@ -2198,7 +2205,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // (clamped to 500) and the sibling GET /api/v1/executions (also
         // capped 500).
         q.limit = std::min(q.limit, 500);
-        auto workflows_result = workflow_engine->list_workflows(q);
+        auto workflows_result = workflow_api->list_workflows(q);
         if (!workflows_result) {
             res.status = 503;
             res.set_content(detail::a4_error(res,
@@ -2225,18 +2232,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // GET /api/v1/workflows/:id -- v1 twin of GET /api/workflows/:id above.
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam.
     sink.Get(R"(/api/v1/workflows/([^/]+))",
-            [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
+            [perm_fn, workflow_api](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine) {
+                if (!workflow_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
                                     "application/json");
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto workflow_result = workflow_engine->get_workflow(id);
+                auto workflow_result = workflow_api->get_workflow(id);
                 if (!workflow_result) {
                     res.status = 503;
                     res.set_content(
@@ -2268,9 +2276,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // gates on fleet_read_fn (not the legacy route's plain perm_fn) and
     // confines the emitted agent_ids array to the caller's visible scope --
     // reviewer-flagged scope point in the issue, resolved here.
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam.
     sink.Get(R"(/api/v1/workflow-executions/([^/]+))",
-            [fleet_read_fn, audit_fn, workflow_engine](const httplib::Request& req,
-                                                        httplib::Response& res) {
+            [fleet_read_fn, audit_fn, workflow_api](const httplib::Request& req,
+                                                    httplib::Response& res) {
                 if (!fleet_read_fn) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
@@ -2280,14 +2289,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto gate = fleet_read_fn(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                if (!workflow_engine) {
+                if (!workflow_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
                                     "application/json");
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto exec_result = workflow_engine->get_execution(id);
+                auto exec_result = workflow_api->get_workflow_execution(id);
                 if (!exec_result) {
                     res.status = 503;
                     res.set_content(
