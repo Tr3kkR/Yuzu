@@ -166,8 +166,9 @@ inline void strip_trailing_cr(std::string& line) {
 // with that shell stage gone (rung 2: clean argv, no pipe), this function
 // replicates that three-way selection in-process. `query`'s emitted rows are
 // byte-identical to before FOR EVERY APP THE OLD GREP ADMITTED, and `list`'s are
-// too for every value free of `\`, `|`, CR, LF and NUL (format_app_row now
-// escapes every field), with TWO deliberate, documented deviations:
+// too for every value within the 4 KiB field bound and free of `\`, `|`, CR, LF
+// and NUL (format_app_row now escapes and bounds every field), with TWO
+// deliberate, documented deviations:
 //   (1) the header-character WIDENING described below -- additive only;
 //   (2) the header-BEFORE-attribute branch order (see the ordering comment in
 //       the loop): an app named "Location"/"Version"/"Last Modified" is now
@@ -264,8 +265,9 @@ inline void strip_trailing_cr(std::string& line) {
             // directory name may contain LF, so a planted bundle can print
             // well-formed extra lines; only a structured system_profiler
             // output closes that -- tracked issue). Accept only an absolute
-            // path with no control byte: a relative value would resolve
-            // against the agent's cwd in CFURLCreateFromFileSystemRepresentation.
+            // path with no byte below 0x20 (DEL is not rejected): a relative
+            // value would resolve against the agent's cwd in
+            // CFURLCreateFromFileSystemRepresentation.
             const auto loc = detail::value_after_colon(trimmed);
             const bool absolute = !loc.empty() && loc.front() == '/';
             const bool clean = std::none_of(loc.begin(), loc.end(), [](char c) {
@@ -432,11 +434,12 @@ inline void dedupe_uninstall_records(std::vector<Rec>& apps) {
 }
 
 // Per-field bound for `list` rows. Above every legitimate source: the Windows
-// reader's 512-WCHAR buffer bounds a registry value at 1,533 UTF-8 bytes, a
-// macOS path at PATH_MAX (1,024); the longest field in the three reference
-// captures is 135 bytes. It exists because CoreFoundation returns a hostile
-// multi-MiB CFBundleIdentifier in full and one such row would exceed the 4 MiB
-// gRPC receive default and tear the agent stream (governance r1 UP-1).
+// reader's 512-WCHAR buffer bounds a registry value at 1,536 UTF-8 bytes at most
+// (512 WCHAR x 3), a macOS path at PATH_MAX (1,024); the longest field in the
+// three reference captures is 135 bytes. It exists because CoreFoundation returns
+// a hostile multi-MiB CFBundleIdentifier in full and one such row would exceed the
+// 4 MiB gRPC receive default and tear the agent stream. The raw value is cut here,
+// before escaping, so an emitted field can reach 8 KiB (every byte a `|`).
 constexpr std::size_t kMaxListFieldBytes = 4096;
 
 namespace detail {
@@ -444,6 +447,8 @@ namespace detail {
 // to a C string, so an interior NUL would otherwise truncate the whole ROW and
 // strand the later columns), bound the length at a UTF-8 sequence boundary,
 // then safe_output_field ('\' -> '/', '|' -> "\|", CR/LF -> ' '); "-" if empty.
+// The NUL cut and the bound MUST precede the escape: escaping first can cut
+// between a '\' and its '|', and the stranded '\' then swallows the delimiter.
 inline std::string list_field(std::string_view v) {
     v = v.substr(0, v.find('\0'));
     if (v.size() > kMaxListFieldBytes) {
@@ -460,9 +465,11 @@ inline std::string list_field(std::string_view v) {
 // EVERY field goes through detail::list_field, so a row is always exactly seven
 // escape-aware tokens (server/core/src/result_parsing.hpp find_unescaped_pipe
 // grammar) whatever bytes a registry value, an Info.plist or a path carries; a
-// value free of '\', '|', CR, LF and NUL is emitted byte-identically (0 of 770
-// rows in the reference captures contain one). `query`/`list_per_user` keep
-// their own raw std::format rows and the ADR-0016 `inv|` rows never pass here.
+// value within the 4 KiB bound and free of '\', '|', CR, LF and NUL is emitted
+// byte-identically (in the reference captures the new install_location is the
+// exception: 59 of 241 Windows rows carry a populated one, its backslashes
+// folded to '/'). `query`/`list_per_user` keep their own raw std::format rows
+// and the ADR-0016 `inv|` rows never pass here.
 // `name` stays "" when empty (the collectors never produce one; the sentinel
 // row sets it); every other empty field renders "-". The caller applies
 // sanitize_utf8 to the result (a no-op on the boundary-safe cut).

@@ -87,10 +87,12 @@ inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
 // accept_expand_sz=false is the ADR-0016 hashed-field policy (REG_SZ only,
 // unchanged since #1662); only InstallLocation passes true, and the value is
 // returned RAW (an unexpanded "%ProgramFiles%\..." stays as written). A value
-// over 511 WCHARs (ERROR_MORE_DATA), of any other type, or absent reads as
-// empty -- the same "-" the row renders for a missing value (README caveats).
+// larger than the 512-WCHAR buffer (ERROR_MORE_DATA; a terminated value is over
+// 511 characters), of any other type, or absent reads as empty -- the same "-" the
+// row renders for a missing value (README caveats).
 // Lives here, not in the plugin's lambda, so test_installed_apps_registry_utf8
-// exercises the code the plugin runs (the #1662 Gate-3 rule for this header).
+// exercises the same code the plugin runs, rather than a re-implementation that
+// could silently diverge.
 inline std::string read_reg_string(HKEY key, const char* value_name, bool accept_expand_sz) {
     wchar_t buf[512]{};
     DWORD size = sizeof(buf); // BYTES; buf is written as bytes and read back through

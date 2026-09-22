@@ -307,8 +307,8 @@ TEST_CASE("system_profiler apps: deeper-indented lines are never app headers",
 
 TEST_CASE("system_profiler apps: a Location value must be absolute and control-byte free",
           "[installed_apps]") {
-    // Governance r1 C02 defence in depth (not a closure -- see the issue on
-    // structured system_profiler output). Mutation: removing the guard yields
+    // Defence in depth (not a closure -- see the issue on structured
+    // system_profiler output). Mutation: removing the guard yields
     // "relative.app" as the location.
     constexpr std::string_view out = "    Rel:\n"
                                      "      Version: 1\n"
@@ -324,6 +324,17 @@ TEST_CASE("system_profiler apps: a Location value must be absolute and control-b
     CHECK(apps[0].location.empty());
     CHECK(apps[1].location.empty());
     CHECK(apps[2].location == "/Applications/Ok.app");
+}
+
+TEST_CASE("system_profiler apps: a non-ASCII Location is preserved", "[installed_apps]") {
+    // Mutation: comparing plain `char` (signed on the macOS targets) instead of
+    // `unsigned char` in the guard's byte-below-0x20 test blanks every UTF-8 path.
+    constexpr std::string_view out = "    \xC3\x9C" "bersicht:\n"
+                                     "      Version: 2.0\n"
+                                     "      Location: /Applications/\xC3\x9C" "bersicht.app\n";
+    const auto apps = parse_system_profiler_apps(out);
+    REQUIRE(apps.size() == 1);
+    CHECK(apps[0].location == "/Applications/\xC3\x9C" "bersicht.app");
 }
 
 // ── macOS: brew list --versions ─────────────────────────────────────────
@@ -490,10 +501,10 @@ TEST_CASE("format_app_row: the empty-list sentinel is the formatter's own seven-
 
 TEST_CASE("format_app_row: hostile bytes in ANY field cannot forge or split a row",
           "[installed_apps]") {
-    // Governance r1 C01/C04 (chaos T1). Every one of the six fields carries the
-    // full hostile alphabet; the row must stay one NUL-free line of exactly seven
-    // escape-aware tokens that decode to the folded value. Mutation: dropping
-    // list_field on `name` (raw std::string append) fails the first sub-case.
+    // Every one of the six fields carries the full hostile alphabet; the row must
+    // stay one NUL-free line of exactly seven escape-aware tokens that decode to
+    // the folded value. Mutation: dropping list_field on `name` (raw std::string
+    // append) fails the first sub-case.
     const std::string hostile = "a|b\\c\r\nd";
     const std::string folded = "a|b/c  d";
     const AppRowFields f{"N", "V", "P", "D", "L", "B"};
@@ -525,10 +536,9 @@ TEST_CASE("format_app_row: an interior NUL cuts the FIELD, never the row", "[ins
 
 TEST_CASE("format_app_row: every field is length-bounded at a UTF-8 boundary",
           "[installed_apps]") {
-    // Governance r1 C03 (chaos T2): CoreFoundation returns a 5 MiB
-    // CFBundleIdentifier in full (probe_bigid_bundle); one such row would exceed
-    // the 4 MiB gRPC receive default. Mutation: removing the bound in list_field
-    // fails the size check.
+    // CoreFoundation returns a 5 MiB CFBundleIdentifier in full; one such row
+    // would exceed the 4 MiB gRPC receive default. Mutation: removing the bound in
+    // list_field fails the size check.
     const auto big = format_app_row({.name = "X", .bundle_id = std::string(5u << 20, 'a')});
     const auto fields = split_fields_escape_aware(big);
     REQUIRE(fields.size() == 7);
@@ -537,10 +547,42 @@ TEST_CASE("format_app_row: every field is length-bounded at a UTF-8 boundary",
     // sequence is cut before the sequence, not inside it.
     const auto edge =
         format_app_row({.name = std::string(kMaxListFieldBytes - 1, 'a') + "\xC3\xA9"});
-    CHECK(split_fields_escape_aware(edge)[1].size() == kMaxListFieldBytes - 1);
+    const auto edge_fields = split_fields_escape_aware(edge);
+    REQUIRE(edge_fields.size() > 1);
+    CHECK(edge_fields[1].size() == kMaxListFieldBytes - 1);
     // A field exactly at the bound is untouched.
     const auto exact = format_app_row({.name = std::string(kMaxListFieldBytes, 'a')});
-    CHECK(split_fields_escape_aware(exact)[1].size() == kMaxListFieldBytes);
+    const auto exact_fields = split_fields_escape_aware(exact);
+    REQUIRE(exact_fields.size() > 1);
+    CHECK(exact_fields[1].size() == kMaxListFieldBytes);
+    // A field of nothing but UTF-8 continuation bytes backs off to empty and renders
+    // "-". Mutation: dropping the `cut > 0` guard in list_field walks the back-off
+    // past index 0 (out-of-bounds read; the Linux ASan/UBSan legs observe it).
+    CHECK(format_app_row({.name = "X",
+                          .bundle_id = std::string(kMaxListFieldBytes + 1, '\x80')}) ==
+          "app|X|-|-|-|-|-");
+}
+
+TEST_CASE("format_app_row: a pipe-filled field is bounded before it is escaped",
+          "[installed_apps]") {
+    // Mutation: escape-then-bound in list_field. Escaping first can cut between a '\'
+    // and its '|'; the stranded '\' swallows the next delimiter and the row loses a
+    // token (the odd-offset input), and the bounded field decodes to 2,048 pipes
+    // instead of 4,096 (the 5,000-pipe input).
+    const auto expect_bounded = [](const std::string& hostile) {
+        const auto row = format_app_row({.name = "X", .version = hostile});
+        const auto fields = split_fields_escape_aware(row);
+        REQUIRE(fields.size() == 7);
+        // A decoded token never holds a backslash: none survives folding, so a
+        // trailing lone one would be a cut escape.
+        for (const auto& token : fields)
+            CHECK(token.find('\\') == std::string::npos);
+        CHECK(fields[2].size() == kMaxListFieldBytes);
+    };
+    expect_bounded(std::string(5000, '|'));
+    // 4095 ordinary bytes then pipes: the 4096-byte cut falls between an escaping
+    // '\' and its '|' if the escape ran first.
+    expect_bounded(std::string(kMaxListFieldBytes - 1, 'a') + std::string(10, '|'));
 }
 
 // ── Windows registry value types (InstallLocation acceptance) ───────────────
@@ -579,8 +621,12 @@ TEST_CASE("dedupe_uninstall_records: unsorted input is sorted by (name, version)
     REQUIRE(v.size() == 3);
     CHECK(v[0].name == "Tool");
     CHECK(v[0].version == "1.0");
-    CHECK(v[0].publisher == "Acme"); // first record of the run as given: base survivor
-    CHECK(v[0].install_date == "20200101");
+    // The survivor is whichever Tool 1.0 record std::sort leaves first (equal-key
+    // order is unspecified): its publisher/install_date pair is one input record's
+    // pair, never a mix of the two.
+    const bool first_record = v[0].publisher == "Acme" && v[0].install_date == "20200101";
+    const bool second_record = v[0].publisher == "Acme Inc" && v[0].install_date == "20240202";
+    CHECK((first_record || second_record));
     CHECK(v[0].install_location == "C:\\Program Files\\Tool\\");
     CHECK(v[1].version == "2.0");
     CHECK(v[1].install_location.empty()); // never borrowed across versions
@@ -590,9 +636,9 @@ TEST_CASE("dedupe_uninstall_records: unsorted input is sorted by (name, version)
 TEST_CASE("dedupe_uninstall_records: among populated locations the lexicographic minimum wins, "
           "whatever the run order",
           "[installed_apps]") {
-    // Governance r1 CP-2/UP-6 (chaos T5): the value must not depend on the order
-    // std::sort leaves equal keys in. Mutation: "first populated wins" fails the
-    // permutation whose first record is C:\B\.
+    // The value must not depend on the order std::sort leaves equal keys in.
+    // Mutation: "first populated wins" fails the permutation whose first record is
+    // C:\B\.
     std::vector<AppRowFields> run{
         {.name = "Tool", .version = "1.0", .install_location = "C:\\B\\"},
         {.name = "Tool", .version = "1.0", .install_location = "C:\\A\\"},
@@ -612,8 +658,8 @@ TEST_CASE("dedupe_uninstall_records: among populated locations the lexicographic
 
 TEST_CASE("dedupe_uninstall_records: a location never leaks across products sharing a version",
           "[installed_apps]") {
-    // Governance r1 QE-3: dropping the `name` compare in the run detection makes
-    // A inherit B's location.
+    // Mutation: dropping the `name` compare in the run detection makes A inherit
+    // B's location.
     std::vector<AppRowFields> v{
         {.name = "A", .version = "1.0"},
         {.name = "B", .version = "1.0", .install_location = "C:\\B\\"},
@@ -622,4 +668,20 @@ TEST_CASE("dedupe_uninstall_records: a location never leaks across products shar
     REQUIRE(v.size() == 2);
     CHECK(v[0].install_location.empty());
     CHECK(v[1].install_location == "C:\\B\\");
+}
+
+TEST_CASE("dedupe_uninstall_records: a location never leaks across versions of one product",
+          "[installed_apps]") {
+    // Mutation: dropping `apps[end].version == apps[i].version` from the run loop
+    // makes Tool 1.0 inherit Tool 2.0's location.
+    std::vector<AppRowFields> v{
+        {.name = "Tool", .version = "1.0"},
+        {.name = "Tool", .version = "2.0", .install_location = "C:\\Tool2\\"},
+    };
+    dedupe_uninstall_records(v);
+    REQUIRE(v.size() == 2);
+    CHECK(v[0].version == "1.0");
+    CHECK(v[0].install_location.empty());
+    CHECK(v[1].version == "2.0");
+    CHECK(v[1].install_location == "C:\\Tool2\\");
 }

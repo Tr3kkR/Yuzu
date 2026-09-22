@@ -185,7 +185,7 @@ TEST_CASE("installed_apps read_reg_string: a REG_DWORD reads as empty under eith
 }
 
 TEST_CASE("installed_apps read_reg_string: a value over 511 WCHARs reads as empty, never "
-          "truncated (ERROR_MORE_DATA; D4 retry is a tracked follow-up)",
+          "truncated (ERROR_MORE_DATA; a larger-buffer retry is a tracked follow-up)",
           "[installed_apps][registry][windows]") {
     ScratchKey scratch;
     REQUIRE(scratch.ok);

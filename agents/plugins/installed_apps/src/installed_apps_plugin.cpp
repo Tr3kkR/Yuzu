@@ -358,7 +358,9 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
 
             auto display_name = read_str("DisplayName", false);
             if (!display_name.empty()) {
-                // Skip system components and updates without meaningful names
+                // Meant to skip system components, but SystemComponent is a
+                // REG_DWORD and read_reg_string accepts strings only, so this test
+                // never matches today (tracked separately).
                 auto sys_component = read_str("SystemComponent", false);
                 if (sys_component == "1") {
                     name_len = kNameBufLen;
@@ -396,7 +398,8 @@ AppCollection get_installed_apps_windows() {
     // Sort, `list`-only location layer, unique(): one pure pass shared with the
     // tests (installed_apps_parsers.hpp). The comparator and survivor are the
     // pre-ADR-0028 code byte-for-byte, so the ADR-0016 `inv|` rows and `query`
-    // cannot move; only the survivor's empty install_location is filled.
+    // cannot move; only the survivor's install_location changes (it becomes the
+    // lexicographically smallest populated one in its run).
     parsers::dedupe_uninstall_records(apps);
 
     return AppCollection{std::move(apps), degraded};
@@ -658,8 +661,7 @@ constexpr std::size_t kMaxPkgutilPackages = 5000;
             continue;
         if (filled >= kMaxEnrichApps || over_budget()) {
             // The alphabetical tail loses bundle_id ("-", indistinguishable from
-            // a bundle without one); the log line is the only signal (D2 adds a
-            // warning row).
+            // a bundle without one); the log line is the only signal.
             spdlog::warn("installed_apps: list bundle_id enrichment stopped after {} of {} "
                          "located apps (cap {} apps / {} s); remaining rows carry '-'",
                          filled, located, kMaxEnrichApps, kCollectionBudget.count());

@@ -83,8 +83,8 @@ TEST_CASE("cell_hint_for is safe against a field_index past the end of a short "
 TEST_CASE("installed_apps rows split as key|remainder (pre-existing server decode; a "
           "definition-aware splitter is a tracked follow-up)",
           "[result_parsing]") {
-    // Governance r1 QE-4 (chaos T4): removing installed_apps from kKeyValuePlugins
-    // makes this a seven-cell split and fails both checks.
+    // Mutation: removing installed_apps from kKeyValuePlugins makes this a
+    // seven-cell split and fails both checks.
     CHECK(split_fields("installed_apps",
                        "app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-") ==
           std::vector<std::string>{"app",

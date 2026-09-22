@@ -178,9 +178,9 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
 
     // Wire contract (ADR-0028 binding condition): every row is
     // app|name|version|publisher|install_date|install_location|bundle_id --
-    // exactly 7 escape-aware fields on every host, the sentinel included, because
-    // format_app_row escapes every field (governance r1 C01); a `|` in a real name
-    // is escaped, not a delimiter.
+    // exactly 7 escape-aware tokens on every host, the sentinel included, because
+    // format_app_row escapes every field; a `|` in a real name is escaped, not a
+    // delimiter.
     std::istringstream iss(result.captured);
     std::string line;
     std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
