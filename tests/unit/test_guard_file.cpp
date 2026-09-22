@@ -507,7 +507,8 @@ DWORD process_handle_count() {
 class RenameRig {
 public:
     RenameRig(RigMode mode, const fs::path& rel_target, const fs::path& rel_precreate,
-              bool seed_target, std::function<void()> in_sink = {})
+              bool seed_target, std::function<void()> in_sink = {},
+              std::function<void(FileGuard&)> pre_start = {})
         : mode_(mode) {
         fs::create_directories(root_.path);
         target_ = root_.path / rel_target;
@@ -529,6 +530,8 @@ public:
             if (in_sink)
                 in_sink(); // runs on the guard thread, after the report is recorded
         });
+        if (pre_start)
+            pre_start(*guard_); // e.g. set_parent_drain_fail_hook_for_test — must run before start()
         REQUIRE(guard_->start());
         // The first evaluation runs after the watches are armed, so its report is the barrier.
         REQUIRE(col_->wait_count(1, 30s));
@@ -659,8 +662,19 @@ void run_sibling_churn(RigMode m) {
 // lets the interleaved content rewrites exercise bind() repeatedly without themselves being
 // drift, so the only drift possible below is the proof that the retained block still detects
 // the eventual rename.
+//
+// drift_count()==0 plus eventual detection alone cannot tell "P was retained" apart from "P was
+// silently rebuilt every time" - a rebuild-every-time regression still arms a working P each
+// time and would pass both checks. The forced-drain-fail hook below makes this discriminating:
+// it only fires if bind() actually calls pio.reset() on a genuinely-pending block, which a
+// correct retain-only implementation never does during ordinary churn (arm 1's no-op and arm
+// 2's same-handle reissue never touch pio at all). A regression that rebuilds on every ordinary
+// re-arm would trip the hook repeatedly, hit kParentIoAbandonLimit well within the loop below,
+// and permanently disable P - making the final rename go undetected and failing this test.
 void run_retain_across_rearm() {
-    RenameRig rig(RigMode::Present, "D/f.txt", "D", true);
+    RenameRig rig(RigMode::Present, "D/f.txt", "D", true, {}, [](FileGuard& g) {
+        g.set_parent_drain_fail_hook_for_test([] { return true; });
+    });
     for (int i = 0; i < 5; ++i) {
         write_file(rig.dir() / "f.txt", "rewrite-" + std::to_string(i)); // X-content re-arm: bind() arm 1/2
         rig.flood_siblings(10); // P completions not naming X: reissue on the retained handle
@@ -668,7 +682,8 @@ void run_retain_across_rearm() {
     }
     CHECK(rig.col().drift_count() == 0); // content rewrites of a still-present file are not drift
     rig.move(rig.dir(), rig.root() / "D2"); // the identity change: only this may rebuild P
-    CHECK(rig.col().wait_for_detected("<absent>", 30s));
+    CHECK(rig.col().wait_for_detected("<absent>", 30s)); // still detected: proves P was never
+        // reset (and thus never forced-abandoned) during the churn above
 }
 
 // Regression for sec-1 (the memory-safety fix this branch's whole redesign exists for):

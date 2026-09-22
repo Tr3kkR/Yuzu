@@ -26,7 +26,13 @@
  * Matching is by path-string identity (plus X's FileId, when the extended notify API is
  * available) captured at the last rebuild — not re-validated on the retain path, and NOT
  * re-derived when X is deleted and recreated at the same path (a narrower instance of
- * the "identified by path" trade-off already present elsewhere in this file). Best
+ * the "identified by path" trade-off already present elsewhere in this file). P watches
+ * only ONE level above X: P's own handle is opened the same FILE_SHARE_DELETE way as
+ * X's, so a rename of P itself (or of anything above it) is just as invisible to P's
+ * handle as X's own rename is to X's — nothing here watches P's parent for P being a
+ * renamed/moved child entry. That case surfaces the same way any undetected-in-real-
+ * time rename does: X's content next changes and triggers a bind() retry, not a
+ * dedicated watch. Best
  * effort: if P cannot be armed — and no ancestor watch is active, because X's own handle
  * succeeded — a rename of X goes undetected until X's content next changes and triggers
  * a bind() retry; otherwise the guard behaves as it did without P.
@@ -275,7 +281,8 @@ void FileGuard::run() try {
                             spdlog::error(
                                 "Guardian FileGuard[{}]: parent-directory watch for {} "
                                 "permanently disabled after {} drain failures - directory "
-                                "rename detection unavailable for this rule until restart",
+                                "rename detection unavailable for this rule until it is next "
+                                "re-armed (a policy re-push or an agent restart)",
                                 *rule_id, *path, kParentIoAbandonLimit);
                         } catch (...) {
                         }

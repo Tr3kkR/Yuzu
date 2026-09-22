@@ -6,11 +6,14 @@
  * Watches a target file in REAL TIME via ReadDirectoryChangesW on its parent
  * directory (kernel-notified, NO polling — unlike the Trigger Engine's mtime
  * poll). Resilient like RegistryGuard (C1/C2): the watch is live from arm until
- * the rule is disabled, survives the parent directory (or an ancestor) being
- * deleted, renamed or moved, and recreated (a nearest-existing-ancestor watch
- * catches a recreation; a watch on the armed directory's own parent catches
- * its rename or move), and reconciles the target's state from scratch on
- * every wake.
+ * the rule is disabled, and reconciles the target's state from scratch on every
+ * wake. It survives the armed directory (the target's parent, or its nearest
+ * existing ancestor) being deleted and recreated anywhere in that ancestor
+ * chain (a nearest-existing-ancestor watch catches the recreation). A rename
+ * or move of the armed directory ITSELF is caught separately, via a watch on
+ * its own parent — one level up only: a rename or move of that parent, or of
+ * anything above it, is not itself detected in real time (picked up once the
+ * target's content next changes).
  *
  * B1 implements the `file-exists` assertion: drift when the file's presence
  * (exists / absent) differs from the rule's expected state — i.e. realtime
@@ -119,7 +122,9 @@ public:
     /// than-free path (sec-1) without depending on a real, timing-dependent delayed
     /// kernel completion, which cannot be forced on local NTFS from user mode. Never
     /// overrides a genuinely-unconfirmed drain the other way. No-op when unset
-    /// (default; production is unaffected). Set before start().
+    /// (default; production is unaffected). Set before start(). CONTRACT: invoked
+    /// inside a noexcept teardown path with no try/catch around the call — the hook
+    /// must not throw, or the process terminates.
     void set_parent_drain_fail_hook_for_test(std::function<bool()> hook) {
         assert((!hook || !thread_.joinable()) &&
                "set_parent_drain_fail_hook_for_test: arm before start()");
