@@ -40,9 +40,16 @@
  * teardown's cancel-drain repeatedly fails to confirm (see ParentIoRelease/
  * kParentIoAbandonLimit below), P is PERMANENTLY disabled for the rest of this
  * guard's lifetime (logged once, at error level) — no further retry of any kind,
- * until the rule is next re-armed (a policy re-push or an agent restart). Either
- * way, X's own detection (presence/content, evaluated on every wake) is unaffected;
- * only P's rename-of-X detection is lost.
+ * until the rule is next re-armed (a policy re-push or an agent restart). On that
+ * transition this guard reports itself "guard.unhealthy" (once at the edge, then
+ * re-sent every parent_unhealthy_refresh_ms while still disabled — a lost-edge
+ * backstop, since the legacy sink drops events on disconnect with no retry) and
+ * withholds every further compliant publication until the rule is re-armed, so the
+ * operator-facing census cannot show 100% compliant while rename detection is dead
+ * (see report_compliant() below). Either way, X's own detection (presence/content,
+ * evaluated on every wake) is unaffected and keeps reporting drift/compliant
+ * normally; only P's rename-of-X detection is lost, and only P's loss changes what
+ * gets published.
  *
  * Detection-only: a FileGuard never writes (file-content remediation needs
  * Content Distribution; deferred). Proto-free + windows.h-free header. On
@@ -89,6 +96,15 @@ namespace {
 // breaking live-until-disabled (mirrors RegistryGuard's kArmFailRetryMs). The
 // healthy path never uses this — it stays fully event-driven (no poll).
 constexpr DWORD kArmFailRetryMs = 30000;
+
+// Health-report detail text for the parent-watch permanent-disable transition (see
+// ParentIoRelease/kParentIoAbandonLimit). No path in the string — the accompanying
+// spdlog::error line already carries it, and this text is pinned by tests, so keeping
+// it path-free keeps the pin stable across different watched paths.
+constexpr std::string_view kParentDisabledDetail =
+    "parent-directory watch permanently disabled after 3 unconfirmed cancel drains; "
+    "a rename or move of the watched directory is not detected in real time until "
+    "this rule is re-armed (policy re-push or agent restart)";
 
 // (A dead, uncalled local to_wide copy was removed here in the #1681 win_str
 // de-dup — guard_file does no wide<->UTF-8 conversion of its own.)
@@ -222,6 +238,11 @@ void FileGuard::run() try {
         spdlog::error("Guardian FileGuard[{}]: CreateEventW failed — watch not started", cfg_.rule_id);
         return;
     }
+    // Waitable timer for the disabled-parent-watch unhealthy refresh (lost-edge backstop).
+    // Created lazily, only at the disable transition (on_parent_disabled, below) — most
+    // guards never disable P and never pay for this handle. CloseHandle (EventHandle's
+    // deleter) is the correct release for a waitable timer, same as any other handle.
+    EventHandle p_refresh_timer;
     OVERLAPPED ov{};
     ov.hEvent = dir_event.get();
     DirHandle h_dir;                   // parent dir, open for ReadDirectoryChangesW
@@ -322,10 +343,12 @@ void FileGuard::run() try {
     int p_abandon_count = 0; // parent-block cancel-drain failures this run() (sec-1); does
                              // NOT reset on a confirmed drain — see kParentIoAbandonLimit
     bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit;
-        // TRACKED: no per-guard health surface reads this today (GuardianEngine::get_status()
-        // stamps every rule "errored"/unhealthy unconditionally, pending its own named
-        // "richer status-taxonomy follow-up" — see guardian_engine.cpp) — when that rung
-        // lands, p_disabled should become a queryable per-rule field, not just this log line
+        // drives report_parent_unhealthy()/on_parent_disabled() below and gates
+        // report_compliant() — the operator-facing "guard.unhealthy" census signal for
+        // this state. GuardianEngine::get_status() (a SEPARATE, still-placeholder surface
+        // that stamps every rule "errored" unconditionally) is untouched by this and
+        // remains its own named follow-up — this field's real consumer is the event path,
+        // not get_status().
     std::unique_ptr<ParentIo, ParentIoRelease> pio(
         nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path,
                                   &parent_drain_fail_hook_for_test_});
@@ -377,6 +400,62 @@ void FileGuard::run() try {
         read_pending = ReadDirectoryChangesW(h_dir.get(), notify_buf, sizeof(notify_buf), FALSE,
                                              kFilter, nullptr, &ov, nullptr) != 0;
         return read_pending;
+    };
+
+    // Health report for the parent-watch permanent-disable state (NOT a compliance
+    // verdict — see guard.hpp's GuardDrift::Health doc). Called once at the disable
+    // edge (on_parent_disabled, below) and again on every refresh-timer tick, and
+    // substituted for a compliant publication by report_compliant()'s gate (below).
+    // Best-effort: never let a sink failure end the worker over a health report —
+    // run()'s outer catch would tear down the whole guard on an escaping exception,
+    // and a health report is strictly less important than the drift/compliance
+    // detection this guard exists to provide.
+    auto report_parent_unhealthy = [&]() {
+        GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = cfg_.rule_id;
+        d.rule_name = cfg_.rule_name;
+        d.health = GuardDrift::Health::Unhealthy;
+        d.health_detail = std::string(kParentDisabledDetail);
+        try {
+            if (sink_)
+                sink_(d);
+        } catch (const std::exception& e) {
+            spdlog::warn("Guardian FileGuard[{}]: health-report sink threw: {} — continuing",
+                         cfg_.rule_id, e.what());
+        } catch (...) {
+            spdlog::warn("Guardian FileGuard[{}]: health-report sink threw (unknown) — continuing",
+                         cfg_.rule_id);
+        }
+    };
+
+    // Fired exactly once, at the p_disabled transition. The SOLE call site is bind()'s
+    // rebuild arm (below), immediately after pio.reset() trips the abandon limit —
+    // never from inside ParentIoRelease itself, which stays free of event dispatch,
+    // evaluation, and re-arming (sec-1's own invariant). Arms the lost-edge refresh
+    // timer (if configured) and sends the first unhealthy report. No filesystem work:
+    // this never touches X or P.
+    auto on_parent_disabled = [&]() {
+        if (cfg_.parent_unhealthy_refresh_ms > 0) {
+            p_refresh_timer.reset(CreateWaitableTimerW(nullptr, FALSE, nullptr));
+            if (p_refresh_timer) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -static_cast<LONGLONG>(cfg_.parent_unhealthy_refresh_ms) * 10'000;
+                if (!SetWaitableTimer(p_refresh_timer.get(), &due,
+                                      static_cast<LONG>(cfg_.parent_unhealthy_refresh_ms), nullptr,
+                                      nullptr, FALSE)) {
+                    spdlog::warn("Guardian FileGuard[{}]: SetWaitableTimer failed (err={}) — "
+                                 "unhealthy refresh disabled, edge report only",
+                                 cfg_.rule_id, GetLastError());
+                    p_refresh_timer.reset();
+                }
+            } else {
+                spdlog::warn("Guardian FileGuard[{}]: CreateWaitableTimerW failed (err={}) — "
+                             "unhealthy refresh disabled, edge report only",
+                             cfg_.rule_id, GetLastError());
+            }
+        }
+        report_parent_unhealthy();
     };
 
     // (Re)issue the directory-name-only read on the given (already-open) P block. Note for the
@@ -431,8 +510,10 @@ void FileGuard::run() try {
         }
         // arm 3: rebuild.
         pio.reset(); // invokes ParentIoRelease: drains (or abandons) any previous block
-        if (p_disabled)
-            return false; // the reset above may have just now tripped the abandon limit
+        if (p_disabled) {
+            on_parent_disabled(); // the reset above just tripped the abandon limit: report once
+            return false;
+        }
         x_leaf.clear();
         x_id.reset();
         if (!x.has_relative_path() || x.filename().empty()) { // no parent above a root
@@ -513,6 +594,15 @@ void FileGuard::run() try {
         if (last_compliant == true)
             return;
         last_compliant = true;
+        if (p_disabled) {
+            // The primary channel IS at its expected state — last_compliant still
+            // records that — but the PUBLICATION is replaced: never show green while
+            // P's rename-of-X detection is permanently dead. This is the sole
+            // compliant emitter (report() below is the drift arm), so no other eval
+            // site can bypass this gate.
+            report_parent_unhealthy();
+            return;
+        }
         GuardDrift d;
         d.guard_type = "file";
         d.rule_id = cfg_.rule_id;
@@ -780,7 +870,7 @@ void FileGuard::run() try {
     eval_now(); // initial compare (hash: baseline-on-arm or compare to expected)
 
     while (!stop_.load(std::memory_order_acquire)) {
-        HANDLE handles[4];
+        HANDLE handles[5];
         DWORD n = 0;
         const DWORD idx_dir = read_pending ? n : 0xFFFFFFFF;
         if (idx_dir != 0xFFFFFFFF)
@@ -791,6 +881,13 @@ void FileGuard::run() try {
         const DWORD idx_p = (pio && pio->pending) ? n : 0xFFFFFFFF;
         if (idx_p != 0xFFFFFFFF)
             handles[n++] = pio->ev.get();
+        // Lost-edge backstop for the disabled-parent-watch health report (see
+        // on_parent_disabled): only live once P has been permanently disabled AND a
+        // timer was successfully armed. Its own wait-set branch, below — never
+        // touches the timeout/deadline computation for settle/arm_retry.
+        const DWORD idx_refresh = p_refresh_timer ? n : 0xFFFFFFFF;
+        if (idx_refresh != 0xFFFFFFFF)
+            handles[n++] = p_refresh_timer.get();
         const DWORD idx_stop = n;
         handles[n++] = static_cast<HANDLE>(stop_event_);
 
@@ -884,6 +981,9 @@ void FileGuard::run() try {
                 eval_exists();
         } else if (idx_p != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_p) {
             handle_p_wake();
+        } else if (idx_refresh != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_refresh) {
+            // Lost-edge backstop tick: re-send, no re-arm, no filesystem access.
+            report_parent_unhealthy();
         } else {
             spdlog::error("Guardian FileGuard[{}]: WaitForMultipleObjects failed (r={}, err={}) — "
                           "watch stopping",

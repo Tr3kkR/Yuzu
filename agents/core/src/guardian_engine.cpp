@@ -1537,13 +1537,32 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
     ev.set_guard_category("event");
-    // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
-    // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
-    // byte-for-byte with the spark consumer's Compliance branch — set them from the
-    // single apply_drift_to_event source of truth so the two producers cannot drift
-    // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
-    // stay stamped here (idempotency- and host-specific).
-    apply_drift_to_event(d, ev);
+    if (d.health != GuardDrift::Health::None) {
+        // Health arm: never through apply_drift_to_event — its default arm would mint
+        // drift.detected from a report that carries no verdict, and every compliance
+        // field on a health report is ignored outright (guard.hpp's doc comment).
+        // Shape pinned byte-for-byte to guardian_spark_send.cpp's Health/!healthy case
+        // (#2237) so the two wire producers cannot drift apart; extracting a shared
+        // apply_health_to_event() helper is a named follow-up, not done here, because
+        // test_guardian_spark_send.cpp pins that serializer's exact literal output and
+        // a shared-helper refactor is out of scope for this fix.
+        ev.set_guard_type(d.guard_type);
+        ev.set_rule_name(d.rule_name);
+        ev.set_event_type("guard.unhealthy");
+        if (!d.health_detail.empty()) {
+            nlohmann::json j;
+            j["detail"] = d.health_detail;
+            ev.set_detail_json(j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+        }
+    } else {
+        // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
+        // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
+        // byte-for-byte with the spark consumer's Compliance branch — set them from the
+        // single apply_drift_to_event source of truth so the two producers cannot drift
+        // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
+        // stay stamped here (idempotency- and host-specific).
+        apply_drift_to_event(d, ev);
+    }
     ev.mutable_timestamp()->set_seconds(now_ms / 1000);
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.

@@ -72,6 +72,15 @@ public:
         /// Event/sink debounce window (ms) — collapses rapid drift events into a
         /// count (shared convention with RegistryGuard). 0 = emit every drift.
         std::uint64_t event_debounce_ms{1000};
+        /// Cadence at which the disabled-parent-watch "guard.unhealthy" report is
+        /// re-sent while the guard stays disabled — a lost-edge backstop mirroring
+        /// the Spark runtime's `errored_refresh_ms` (default 300s; see
+        /// docs/spark-legacy-delta-registry.md D1). The legacy sink drops events on
+        /// disconnect with no retry (agent.cpp), so a single edge-only report can be
+        /// silently lost; the refresh corrects a stale-green census on the next tick
+        /// without depending on that one report's delivery. 0 = edge-only, no
+        /// refresh. No filesystem work happens on a refresh tick.
+        std::uint64_t parent_unhealthy_refresh_ms{300'000};
         /// #4021: fired EXACTLY ONCE, on the run() worker thread, the moment
         /// `expected_hash.empty() && !baseline_set` captures a fresh baseline (never
         /// again for this FileGuard instance — mirrors the source guard above's own
