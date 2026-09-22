@@ -29,6 +29,7 @@
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
 #include "event_bus.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
 #include "scope_engine.hpp"
 
 // Forward declarations
@@ -627,8 +628,27 @@ public:
     void remove_agent(const std::string& agent_id);
 
     /// Remove an agent only if its current session_id matches (prevents stale
-    /// Subscribe cleanup from clobbering a newer reconnection).
-    void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
+    /// Subscribe cleanup from clobbering a newer reconnection). Returns true
+    /// iff the CURRENT session was removed, false on a session mismatch
+    /// (no-op — a newer connection has already taken over).
+    ///
+    /// HA WS-5 governance hardening (external review finding, 2026-09-22):
+    /// the return value is load-bearing for the caller's durable-presence
+    /// mirror (agent_service_impl.cpp / gateway_service_impl.cpp), which
+    /// must fire OfflineEndpointStore::remove_if_session ONLY when this
+    /// returns true. The durable row's own session_id column is
+    /// heartbeat-driven, not registration-driven (see heartbeat_ingestion.cpp)
+    /// — so on an ordinary same-replica reconnect (S1 disconnects, S2
+    /// registers, S2 hasn't heartbeated yet), the durable row can still read
+    /// S1's session_id even though S1 is already locally superseded by S2.
+    /// A caller that fires the durable delete unconditionally (using S1's
+    /// own session_id, which still legitimately matches the stale row) would
+    /// delete a LIVE agent's presence row — a false-negative other replicas'
+    /// evaluate_scope()/all_ids() would silently inherit. Bool was `void`
+    /// before this fix; every caller was already local to this repo (grep
+    /// verified two call sites, both updated in the same change).
+    [[nodiscard]] bool remove_agent_if_session(const std::string& agent_id,
+                                               const std::string& session_id);
 
     /// HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): remove an agent ONLY
     /// if the CURRENTLY installed session is the exact object `install` returned — pointer
@@ -900,6 +920,20 @@ public:
 
     bool has_any() const;
 
+    // HA WS-5 governance hardening (external review finding, 2026-09-22):
+    // has_any() above is LOCAL-ONLY (!agents_.empty()) and predates presence
+    // entirely — two REST dispatch entrypoints (command_routes.cpp,
+    // server.cpp's forward_legacy_command) use it as a cheap pre-dispatch
+    // 503-short-circuit, which on a replica holding zero local sessions but
+    // a healthy presence-visible fleet (the ordinary HA topology this slice
+    // exists to support) rejected every dispatch with "no agent connected"
+    // BEFORE all_ids()/evaluate_scope() or any presence lookup ever ran —
+    // deterministic, not a race. This is the presence-aware replacement:
+    // local_any first (cheap, matches has_any()'s existing fast path when
+    // true), then live_presence() (already cached, kPresenceCacheTtl) only
+    // when the fleet looks empty locally.
+    [[nodiscard]] bool has_any_reachable() const;
+
     std::string display_name(const std::string& agent_id) const;
 
     // Build JSON array of all agents for the web UI (structured).
@@ -923,8 +957,51 @@ public:
     // Render command palette instruction results as HTML.
     std::string palette_html(std::string_view query) const;
 
-    // Get list of all agent IDs.
+    // Get list of all agent IDs. HA WS-5 (ADR-2002 §7a): merges in any
+    // cross-replica presence row (see configure_presence below) for an id
+    // this replica has no local session for — local ids always take
+    // precedence, no id is ever duplicated. Unconfigured (no presence store
+    // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
+
+    // Local-only agent count, under the SAME lock all_ids() uses — never
+    // includes presence. Exposed for tests/diagnostics; NOT used by
+    // dispatch_confined_arms.hpp's fast-path gate (see has_remote_presence
+    // below and its own doc comment for why a two-call size comparison is
+    // racy and this single-call membership check replaced it, governance
+    // Gate 4 unhappy-path finding, 2026-09-22).
+    [[nodiscard]] std::size_t local_agent_count() const;
+
+    // HA WS-5 governance hardening (Gate 4 unhappy-path finding, 2026-09-22):
+    // returns true iff ANY of `ids` is NOT in the local live registry, under
+    // ONE lock acquisition against the registry's CURRENT state — replaces
+    // the two-call `known_agent_ids().size() == local_agent_count()`
+    // comparison `confined_broadcast`'s fast-path gate originally used.
+    // That comparison raced: `local_agent_count()` and `known_agent_ids()`
+    // (→ all_ids()) are two SEPARATE lock acquisitions, so concurrent local
+    // registry churn between them could make the SIZES coincidentally match
+    // while the SETS differ (a local disconnect and a presence addition
+    // canceling out numerically) — silently taking the fast path
+    // (`send_to_all_unfiltered`, which re-walks a FRESH local snapshot and
+    // has no per-id directory-fallback hook) while `ids` genuinely contained
+    // a presence-only id, with no `not_sent` entry and no metric to catch
+    // it. This method instead does a DIRECT membership check against `ids`
+    // (already fetched by the caller) — self-correcting in the safe
+    // direction: if an id in `ids` was presence-only at fetch time but has
+    // since genuinely registered locally, this correctly reports "no longer
+    // remote" and the fast path (which walks the CURRENT registry) reaches
+    // it anyway.
+    [[nodiscard]] bool has_remote_presence(const std::vector<std::string>& ids) const;
+
+    // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
+    // that all_ids()/evaluate_scope() merge in for ids absent from the local
+    // live registry. `ttl` bounds how stale a presence row may be and still
+    // count as live — pass the same window `reap_stale_sessions` uses
+    // (`cfg_.session_timeout`), so a single replica's presence-derived
+    // liveness window matches its own local one. Called once during server
+    // wiring; unset (default) = local-only behavior, unchanged from
+    // pre-WS-5. Non-owning — the caller (ServerImpl) outlives this registry.
+    void configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl);
 
     // Look up the agent_id that was registered for a given Subscribe call.
     std::string find_agent_by_stream(
@@ -970,8 +1047,12 @@ public:
     // one (e.g. an operator-authored rule scope) must treat nullopt as
     // "unresolvable here — match nothing" (governance H1, 2026-07-29).
     // Aliases must be pre-resolved
-    // to canonical ids by the caller. Stale members (offline / decommissioned
-    // agents not in the live registry) drop silently.
+    // to canonical ids by the caller. A genuinely offline/decommissioned
+    // agent (absent from BOTH the local live registry and — HA WS-5,
+    // ADR-2002 §7a — cross-replica presence, when configured via
+    // configure_presence) drops silently; an agent connected to a DIFFERENT
+    // replica no longer drops merely for that reason — see
+    // configure_presence's doc comment.
     //
     // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract,
     // widened per governance H1 2026-07-29, and again per ADR-0045) in FIVE
@@ -1013,6 +1094,45 @@ private:
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
+
+    /// HA WS-5 (ADR-2002 §7a). Non-owning; null = presence unconfigured
+    /// (local-only behavior, unchanged from pre-WS-5). Set once via
+    /// configure_presence during server wiring, read (without mu_ held — a
+    /// Postgres round trip must never run under the same lock
+    /// register_agent/send_to/evaluate_scope contend on) by all_ids() and
+    /// evaluate_scope().
+    OfflineEndpointStore* presence_store_{nullptr};
+    std::chrono::seconds presence_ttl_{90};
+
+    /// HA WS-5 governance hardening (Gate 3 performance + sre, 2026-09-22):
+    /// a bare `presence_store_->query_live_ids(...)` on every all_ids()/
+    /// evaluate_scope() call put a synchronous Postgres round trip on paths
+    /// that were previously pure in-memory on EVERY deployment — presence is
+    /// wired unconditionally at boot whenever `OfflineEndpointStore`
+    /// constructs, not gated behind an HA/2nd-replica signal (none exists).
+    /// This collapses arbitrarily many callers within `kPresenceCacheTtl` of
+    /// each other into ONE Postgres query, on the SAME read-cache mutex
+    /// (deliberately separate from `mu_` — the whole point of keeping the
+    /// Postgres read off `mu_` is defeated if a second lock serializes it
+    /// against that one instead). A `kPresenceCacheTtl`-stale read is
+    /// harmless here specifically because presence is already an
+    /// eventually-consistent, over-inclusion-safe signal (bounded by
+    /// `presence_ttl_`, itself ~90s) — a few extra seconds of read staleness
+    /// on top of that is a negligible relative addition, never a new
+    /// correctness class. `live_presence()` is the ONLY caller of
+    /// `presence_store_->query_live_ids`; all_ids()/evaluate_scope() must
+    /// route through it, never call query_live_ids directly.
+    static constexpr std::chrono::seconds kPresenceCacheTtl{3};
+    mutable std::mutex presence_cache_mu_;
+    mutable std::vector<PresenceIdentity> presence_cache_;
+    mutable std::chrono::steady_clock::time_point presence_cache_at_{};
+
+    /// Returns the cached (or freshly-fetched, if stale/first-call) live
+    /// presence set. Empty immediately, no lock taken, when presence is
+    /// unconfigured (`presence_store_ == nullptr`) — the common single-
+    /// replica case pays only the pointer check.
+    std::vector<PresenceIdentity> live_presence() const;
+
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
 
