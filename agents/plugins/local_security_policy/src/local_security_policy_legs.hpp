@@ -107,11 +107,19 @@ inline DirList posix_list_dir(const std::string& path) {
         out.err = errno;
         return out;
     }
+    // RAII, not a bare closedir() after the walk: the callback appends to a vector, so a
+    // throw between opendir and the close would leak the stream. Same three-line guard
+    // autoruns_linux.cpp puts around this same shared primitive.
+    struct DirGuard {
+        DIR* d;
+        ~DirGuard() {
+            if (d) ::closedir(d);
+        }
+    } guard{d};
     const auto walk = yuzu::shared::walk_dir_capped(d, kMaxDirEntries, [&](const dirent* e) {
         out.names.emplace_back(e->d_name);
         return true;
     });
-    ::closedir(d);
     out.truncated = walk.truncated;
     if (walk.enumeration_error) out.err = EIO;
     std::sort(out.names.begin(), out.names.end());
