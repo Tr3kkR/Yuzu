@@ -24,7 +24,6 @@
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
-#include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate/export row builders
@@ -1846,7 +1845,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
+    std::shared_ptr<const GuardianApi> guardian_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1864,7 +1864,7 @@ void RestApiV1::register_routes(
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
                     std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
-                    std::move(dex_api), std::move(dex_perf_api));
+                    std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api));
 }
 
 void RestApiV1::register_routes(
@@ -1890,7 +1890,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
-    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
+    std::shared_ptr<const GuardianApi> guardian_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -12106,7 +12107,7 @@ void RestApiV1::register_routes(
     };
 
     sink.Get("/api/v1/guaranteed-state/rules",
-             [perm_fn, guaranteed_state_store, rule_to_jobj,
+             [perm_fn, guardian_api, rule_to_jobj,
               deny_fleet_wide_service_scoped](const httplib::Request& req,
                                               httplib::Response& res) {
                  // Fleet-wide rule catalogue: no per-target shape to scope a
@@ -12123,14 +12124,16 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!guardian_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
                  // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
                  // set): a degraded read must never render as an empty list.
-                 auto rows = guaranteed_state_store->list_rules();
+                 // ADR-0031 WS-A4 (ninth family): GuardianApi::list_rules is the SAME
+                 // seam MCP list_guardian_rules calls — REST and MCP cannot drift.
+                 auto rows = guardian_api->list_rules();
                  if (!rows) {
                      res.status = 503;
                      res.set_content(
@@ -12320,7 +12323,7 @@ void RestApiV1::register_routes(
     });
 
     sink.Get(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-             [perm_fn, guaranteed_state_store, rule_to_jobj,
+             [perm_fn, guardian_api, rule_to_jobj,
               deny_fleet_wide_service_scoped](const httplib::Request& req,
                                               httplib::Response& res) {
                  // Same fleet-wide-catalogue confinement gap as the list
@@ -12335,7 +12338,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!guardian_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
@@ -12343,7 +12346,9 @@ void RestApiV1::register_routes(
                  auto id = req.matches[1].str();
                  // get_rule is now three-state (ADR-0038): found / genuinely absent /
                  // degraded — a degrade must render 503, never collapse into 404.
-                 auto row = guaranteed_state_store->get_rule(id);
+                 // ADR-0031 WS-A4 (ninth family): GuardianApi::get_rule is the SAME
+                 // seam MCP get_guardian_rule calls.
+                 auto row = guardian_api->get_rule(id);
                  if (!row) {
                      res.status = 503;
                      res.set_content(
@@ -12377,7 +12382,7 @@ void RestApiV1::register_routes(
     // filter into, unlike the fleet /status route's COUNT aggregate).
     sink.Get(
         R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+)/status)",
-        [list_read_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+        [list_read_fn, audit_fn, guardian_api](const httplib::Request& req,
                                                           httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -12393,7 +12398,7 @@ void RestApiV1::register_routes(
             auto gate = list_read_fn(req, res, "GuaranteedState", "Read");
             if (!gate.admitted)
                 return;
-            if (!guaranteed_state_store) {
+            if (!guardian_api) {
                 spdlog::error("guaranteed_state.rule.view (drilldown): store null — "
                               "registration-order defect; cid={}",
                               cid);
@@ -12405,7 +12410,8 @@ void RestApiV1::register_routes(
             const auto rule_id = req.matches[1].str();
             // get_rule is three-state (ADR-0038): found / genuinely absent /
             // degraded — a degrade must render 503, never collapse into 404.
-            auto row = guaranteed_state_store->get_rule(rule_id);
+            // ADR-0031 WS-A4 (ninth family): GuardianApi::get_rule.
+            auto row = guardian_api->get_rule(rule_id);
             if (!row) {
                 res.status = 503;
                 res.set_content(
@@ -12440,7 +12446,7 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                 return;
             }
-            auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
+            auto rows = guardian_api->rule_status(rule_id);
             if (!rows) {
                 res.status = 503;
                 res.set_content(
@@ -12847,7 +12853,7 @@ void RestApiV1::register_routes(
     //    /guaranteed-state/status route on a separate, unmerged branch — this
     //    route's deny does not depend on it landing.)
     sink.Get("/api/v1/guaranteed-state/events",
-             [perm_fn, scoped_perm_fn, audit_fn, guaranteed_state_store,
+             [perm_fn, scoped_perm_fn, audit_fn, guardian_api,
               deny_fleet_wide_service_scoped](const httplib::Request& req,
                                               httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
@@ -12912,7 +12918,7 @@ void RestApiV1::register_routes(
                 return;
         }
 
-        if (!guaranteed_state_store) {
+        if (!guardian_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
@@ -12976,7 +12982,10 @@ void RestApiV1::register_routes(
             }
             q.offset = v;
         }
-        auto rows = guaranteed_state_store->query_events(q);
+        // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
+        // plain-vector, empty-on-degrade contract as the wrapped store call
+        // (ADR-0038 "deferred widening", #2659; see guardian_api.hpp).
+        auto rows = guardian_api->list_events(q);
         JArr arr;
         for (const auto& e : rows) {
             arr.add(
@@ -15267,7 +15276,7 @@ void RestApiV1::register_routes(
     // twinned too, via get_guardian_agent_status (#2146 Batch B1), same pattern.
     sink.Get(
         "/api/v1/guaranteed-state/status",
-        [list_read_fn, guaranteed_state_store](const httplib::Request& req,
+        [list_read_fn, guardian_api](const httplib::Request& req,
                                                httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -15286,7 +15295,7 @@ void RestApiV1::register_routes(
             auto gate = list_read_fn(req, res, "GuaranteedState", "Read");
             if (!gate.admitted)
                 return;
-            if (!guaranteed_state_store) {
+            if (!guardian_api) {
                 spdlog::error("guaranteed-state.status: store null — registration-order "
                               "defect; cid={}",
                               cid);
@@ -15300,10 +15309,11 @@ void RestApiV1::register_routes(
             // ADR-0017 INV-3: gate.scope (nullopt = unfiltered; engaged, incl.
             // empty = INV-2) is applied IN SQL by errored_rule_count, before the
             // aggregate — never a C++ post-filter over the full fleet census.
-            // #4037: guardian_status_rollup (guardian_model.hpp) is the SAME
-            // function the MCP get_guardian_status twin calls — REST and MCP
-            // cannot drift on total_rules/errored_rules derivation by construction.
-            auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
+            // #4037/ADR-0031 WS-A4 (ninth family): GuardianApi::status wraps the
+            // SAME guardian_status_rollup function the MCP get_guardian_status
+            // twin calls — REST and MCP cannot drift on total_rules/errored_rules
+            // derivation by construction.
+            auto rollup = guardian_api->status(gate.scope);
             if (!rollup) {
                 res.status = 503;
                 // Transient (unlike the unwired-gate/null-store 503s above, which
@@ -15359,7 +15369,7 @@ void RestApiV1::register_routes(
     // scope).
     sink.Get(
         R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
-        [scoped_perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+        [scoped_perm_fn, audit_fn, guardian_api](const httplib::Request& req,
                                                             httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -15385,7 +15395,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
-            if (!guaranteed_state_store) {
+            if (!guardian_api) {
                 spdlog::error("guaranteed-state.status.agent: store null — "
                               "registration-order defect; cid={}",
                               cid);
@@ -15394,14 +15404,15 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            // #2146 Batch B1: guardian_agent_status_rollup (guardian_model.hpp) is the
-            // SAME function the MCP get_guardian_agent_status twin calls — REST and MCP
-            // cannot drift on total_rules/errored_rules derivation by construction (same
-            // extraction precedent as guardian_status_rollup's #4037 header comment).
-            // Folds the former two-store-call sequence (agent_rule_statuses_for_agent +
+            // #2146 Batch B1/ADR-0031 WS-A4 (ninth family): GuardianApi::agent_status
+            // wraps the SAME guardian_agent_status_rollup function the MCP
+            // get_guardian_agent_status twin calls — REST and MCP cannot drift on
+            // total_rules/errored_rules derivation by construction (same extraction
+            // precedent as guardian_status_rollup's #4037 header comment). Folds the
+            // former two-store-call sequence (agent_rule_statuses_for_agent +
             // rule_names_for) into one; a degrade in EITHER underlying read now surfaces
             // as a single `nullopt`.
-            auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
+            auto rollup = guardian_api->agent_status(agent_id);
             // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel,
             // same HELPER as GET /guaranteed-state/device-compliance, but NOT identical
             // fault-handling: device-compliance has a separate PRE-audit baseline_store_ok
@@ -15478,7 +15489,7 @@ void RestApiV1::register_routes(
     // both already use.
     sink.Get(
         R"(/api/v1/guaranteed-state/agents/([A-Za-z0-9._\-]+)/rules)",
-        [scoped_perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+        [scoped_perm_fn, audit_fn, guardian_api](const httplib::Request& req,
                                                             httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -15503,7 +15514,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
-            if (!guaranteed_state_store) {
+            if (!guardian_api) {
                 spdlog::error("guardian.device.view (all-guards): store null — "
                               "registration-order defect; cid={}",
                               cid);
@@ -15512,7 +15523,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = guardian_device_all_guards(*guaranteed_state_store, agent_id);
+            // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
+            auto rows = guardian_api->device_guards(agent_id);
             // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647
             // kernel, same verb + target shape as GET
             // /guaranteed-state/status/{agent_id} above (an unrecognised
@@ -15586,8 +15598,8 @@ void RestApiV1::register_routes(
     // operator isn't fail-closed out of in-scope devices) + guardian.device.view audit.
     sink.Get(
         "/api/v1/guaranteed-state/device-compliance",
-        [scoped_perm_fn, audit_fn, guaranteed_state_store,
-         baseline_store](const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, audit_fn,
+         guardian_api](const httplib::Request& req, httplib::Response& res) {
             // One correlation id for the whole request, surfaced as X-Correlation-Id
             // on EVERY path (success + all error branches) — parity with the
             // dex.device.view / dex.signals / events siblings (#1651, cons-1). Every
@@ -15663,7 +15675,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
-            if (!guaranteed_state_store || !baseline_store) {
+            if (!guardian_api) {
                 spdlog::error("guardian.device.baseline: store null "
                               "(guaranteed_state_store/baseline_store) — "
                               "registration-order defect; cid={}",
@@ -15679,11 +15691,13 @@ void RestApiV1::register_routes(
             // below - the prior inline version audited "success" right after the
             // first read, so a degrade in any of the other three still surfaced a
             // 503 the audit had already called successful.
+            // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance wraps
+            // guardian_device_compliance_rollup verbatim, including its exact
+            // out-param contract.
             bool store_degraded = false;
             bool pii_access_began = false;
-            auto rollup = guardian_device_compliance_rollup(*baseline_store, *guaranteed_state_store,
-                                                             baseline_name, agent_id,
-                                                             &store_degraded, &pii_access_began);
+            auto rollup = guardian_api->device_compliance(baseline_name, agent_id,
+                                                           &store_degraded, &pii_access_began);
             if (store_degraded) {
                 // Store FAULT (DB locked/corrupt) in one of the four reads, NOT a
                 // genuine miss — return a retryable 503, not the 404 a CMDB would

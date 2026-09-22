@@ -750,6 +750,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
+#include "guardian_api_local.hpp"       // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
 #include "workflow_api_local.hpp"       // ADR-0031 WS-A4 (eighth family): wire the real WorkflowApi seam
 #include "mcp_server.hpp"
@@ -1636,6 +1637,21 @@ private:
             mcp.set_workflow_api(
                 yuzu::server::make_local_workflow_api(*workflow_engine_for_test));
         }
+
+        // ADR-0031 WS-A4 (ninth family): wire the REAL GuardianApi seam over
+        // this test's guaranteed_state_store_for_test + baseline_store_for_test
+        // — same setter idiom as set_dex_api above. Constructed
+        // UNCONDITIONALLY (mirrors server.cpp / make_local_dex_perf_api's own
+        // multi-dependency posture, NOT set_dex_api's store-gated one): most
+        // existing test cases in this file wire ONLY
+        // guaranteed_state_store_for_test (seven of the nine tools never
+        // touch baseline_store_for_test at all), so gating construction on
+        // BOTH would 503 those tools' tests purely because they don't happen
+        // to need a baseline fixture — each method degrades individually
+        // instead (guardian_api.cpp), preserving every pre-seam test's
+        // default behaviour exactly.
+        mcp.set_guardian_api(yuzu::server::make_local_guardian_api(
+            guaranteed_state_store_for_test, baseline_store_for_test));
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),

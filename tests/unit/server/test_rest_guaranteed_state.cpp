@@ -31,6 +31,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dex_api_local.hpp" // ADR-0031 WS-A4: wire the real DexApi seam so the DEX REST cases exercise it
+#include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
@@ -539,6 +540,17 @@ struct RestGsHarness {
         auto dex_perf_api_local =
             std::make_shared<yuzu::server::test::FnDexPerfApi>(dex_perf_fn_, app_perf_providers_);
 
+        // ADR-0031 WS-A4 (ninth family): the REAL GuardianApi seam over this
+        // harness's live GuaranteedStateStore + BaselineStore, so the
+        // guaranteed-state REST cases exercise the SEAM path (production
+        // wires it identically). Constructed unconditionally, mirroring
+        // server.cpp — this harness's constructor already REQUIREs both
+        // stores open before reaching here, so both pointers are always
+        // non-null in practice; each method still degrades individually if
+        // either were absent (guardian_api.cpp).
+        auto guardian_api_local =
+            yuzu::server::make_local_guardian_api(store.get(), baseline_store.get());
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -612,7 +624,10 @@ struct RestGsHarness {
                             verify_api_,
                             // ADR-0031 WS-A4: device_api unused by this harness;
                             // dex_api_local is the real DEX signals seam (above).
-                            /*device_api=*/nullptr, dex_api_local, dex_perf_api_local);
+                            /*device_api=*/nullptr, dex_api_local, dex_perf_api_local,
+                            // ADR-0031 WS-A4 (ninth family): the real Guardian-read
+                            // seam (guardian_api_local above).
+                            guardian_api_local);
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
