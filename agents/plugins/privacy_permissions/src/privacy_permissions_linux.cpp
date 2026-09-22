@@ -134,7 +134,13 @@ bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& ro
         return true;
     }
 
-    if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "{sas}") < 0) {
+    // CDX-R2-004: sd_bus_message_enter_container returns >0 entered, 0 a genuine type
+    // MISMATCH at the current position (not an error, but NOT entered either), <0 an error --
+    // both guards below previously accepted 0 as success (`< 0` / `>= 0`), so a reply whose
+    // shape didn't actually match the expected `{sas}`/`s` container silently fell through as
+    // if it had, producing a fabricated `absent` (or an empty-string `denied`) instead of the
+    // `unreadable:shape` a malformed reply must report.
+    if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "{sas}") <= 0) {
         acc.add_failure(std::string{t.category} + ":shape");
         rows.push_back({"linux", "-", t.category, PermissionState::unreadable, "-", "-", "-", false});
         return true;
@@ -144,7 +150,7 @@ bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& ro
     while ((r = sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_DICT_ENTRY, "sas")) > 0) {
         const char* app_id = nullptr;
         sd_bus_message_read(reply.m, "s", &app_id);
-        if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "s") >= 0) {
+        if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "s") > 0) {
             std::string joined;
             const char* perm = nullptr;
             while (sd_bus_message_read(reply.m, "s", &perm) > 0) {
@@ -158,6 +164,10 @@ bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& ro
             const auto state = decode_portal_permissions(joined);
             rows.push_back({"linux", app_id ? app_id : "-", t.category, state,
                             joined.empty() ? "-" : joined, "-", "-", false});
+        } else {
+            // This one dict-entry's inner array didn't match the expected shape -- named and
+            // visible, not silently skipped.
+            acc.add_failure(std::string{t.category} + ":entry_shape");
         }
         sd_bus_message_exit_container(reply.m);
     }

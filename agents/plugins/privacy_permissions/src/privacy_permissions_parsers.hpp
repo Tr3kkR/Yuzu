@@ -71,6 +71,9 @@ inline constexpr std::array<std::string_view, 4> kCategories{"camera", "micropho
 /// `app_id` is owned (a per-app identifier -- an exe path, a bundle id, a PFN); `category` and
 /// `os` borrow literals. `denied` = the read was refused (distinct from PermissionState::denied,
 /// which means "this app's grant for this category is denied" -- a normal, non-failure result).
+/// On Windows, `app_id` is qualified with the owning profile's name (`<profile>\<app_id>`,
+/// never a SID -- ADR-0024 D11) since the agent runs as LocalSystem and reads MULTIPLE real
+/// users' ConsentStore hives, so the same app across two profiles must not collide.
 struct PermissionRow {
     std::string_view os;
     std::string app_id;

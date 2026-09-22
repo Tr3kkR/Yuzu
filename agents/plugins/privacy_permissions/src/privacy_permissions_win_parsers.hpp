@@ -58,13 +58,23 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
 /// `NonPackaged` subkey names are the app's executable path with a small set of characters
 /// percent/hash-escaped (Windows uses `#` in place of `\` and other reserved registry-path
 /// characters in this specific tree). This is a best-effort unescape pending the real-capture
-/// probe (unknown #4/#5 in the plan) -- `#` -> `\`, everything else passed through unchanged,
-/// which degrades safely: an unrecognized escape leaves a literal `#` in the output rather
-/// than corrupting the path or throwing.
+/// probe (unknown #4/#5 in the plan): the publicly documented ConsentStore NonPackaged scheme
+/// escapes BOTH `\`->`#` AND `:`->`#3A` (e.g. `C#3AUsers#Admin#app.exe`), so `#3A` is checked
+/// FIRST (KIMI-P1-05) -- a single-pass `#`->`\` alone would corrupt the drive separator into
+/// `C\3AUsers\...` instead of `C:\Users\...`. An unrecognized `#`-escape (this scheme's only
+/// other use) still falls through to `\`, degrading safely rather than corrupting or throwing.
 [[nodiscard]] inline std::string unescape_nonpackaged_app_id(std::string_view escaped) {
     std::string out;
     out.reserve(escaped.size());
-    for (const char c : escaped) out += (c == '#') ? '\\' : c;
+    for (std::size_t i = 0; i < escaped.size(); ++i) {
+        if (escaped[i] == '#' && i + 2 < escaped.size() && escaped[i + 1] == '3' &&
+            escaped[i + 2] == 'A') {
+            out += ':';
+            i += 2;
+        } else {
+            out += (escaped[i] == '#') ? '\\' : escaped[i];
+        }
+    }
     return out;
 }
 

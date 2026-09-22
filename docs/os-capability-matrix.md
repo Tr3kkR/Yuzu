@@ -556,7 +556,7 @@ implementation is.
 | printing | clear_queue | windows | supported | 1 | winspool SetJobW JOB_CONTROL_CANCEL on one job id | cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see docs/agent-privilege-model.md |
 | privacy_permissions | permissions | linux | constrained | 1 | xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session bus; unavailable (no daemon/no session) on most non-sandboxed desktops | - |
 | privacy_permissions | permissions | macos | constrained | 1 | TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected to read denied | - |
-| privacy_permissions | permissions | windows | supported | 1 | HKCU/HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | - |
+| privacy_permissions | permissions | windows | supported | 1 | per-profile (with_user_hive, LocalSystem's own HKCU is not a real user's) + HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |

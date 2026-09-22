@@ -128,10 +128,15 @@ TEST_CASE("win::decode_consent_value: Allow/Deny decode, wrong type or empty is 
     CHECK(win::decode_consent_value("Prompt", true) == PermissionState::prompt_undetermined);
 }
 
-TEST_CASE("win::unescape_nonpackaged_app_id: '#' maps to a path separator",
+TEST_CASE("win::unescape_nonpackaged_app_id: '#3A' is the drive colon, bare '#' the path "
+          "separator (KIMI-P1-05: #3A must be checked first or the colon is corrupted)",
           "[privacy_permissions][win_parsers]") {
-    CHECK(win::unescape_nonpackaged_app_id("C#3AProgram Files#3AApp.exe") ==
-         "C\\3AProgram Files\\3AApp.exe");
+    // Real ConsentStore NonPackaged shape: C:\Program Files\App.exe ->
+    // C#3A#Program Files#App.exe (':'->'#3A', '\'->'#').
+    CHECK(win::unescape_nonpackaged_app_id("C#3A#Program Files#App.exe") ==
+         "C:\\Program Files\\App.exe");
+    // A bare '#' with no following "3A" still falls through to the path separator.
+    CHECK(win::unescape_nonpackaged_app_id("C#3AUsers#name#app.exe") == "C:Users\\name\\app.exe");
 }
 
 TEST_CASE("win::filetime_to_epoch_ms_string: zero and pre-epoch are '-', a real value converts",

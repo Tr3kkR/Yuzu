@@ -7,7 +7,7 @@
  *   macOS:   TCC.db read-only, in-process sqlite3 (rung 1) -- SIP-protected; an unentitled
  *            agent is expected to read `denied`, recorded honestly, never claimed working
  *            without real-hardware evidence
- *   Windows: HKCU/HKLM ...\CapabilityAccessManager\ConsentStore registry walk (rung 1)
+ *   Windows: per-profile + HKLM ...\CapabilityAccessManager\ConsentStore registry walk (rung 1)
  *
  * Default-off (Forensics class, same posture as execution_artifacts) -- the server-side
  * kill-switch seed (server.cpp) gates whether this plugin's dispatch is even reachable; this
@@ -49,8 +49,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "to read denied", nullptr},
      /* windows_leg = */
      {YUZU_SUPPORT_SUPPORTED, 1,
-      "HKCU/HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\"
-      "ConsentStore registry walk", nullptr}},
+      "per-profile (with_user_hive, LocalSystem's own HKCU is not a real user's) + HKLM "
+      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore "
+      "registry walk", nullptr}},
 };
 
 } // namespace

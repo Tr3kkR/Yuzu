@@ -63,12 +63,24 @@ TEST_CASE("privacy_permissions macOS: open_readonly on a genuinely unopenable pa
     CHECK_FALSE(err_msg.empty());
 }
 
-TEST_CASE("privacy_permissions macOS: open_readonly against the real TCC.db path succeeds on "
-          "this FDA-granted host (corroborates the dispatcher test's success-path evidence)",
+TEST_CASE("privacy_permissions macOS: open_readonly against the real TCC.db path either "
+          "succeeds (FDA-granted host) or fails through the same denied-shaped path test #1 "
+          "already proves deterministically -- never a bare CHECK on a host-privilege property",
           "[privacy_permissions][macos][internals]") {
+    // CDX-R2-003 (both external reviewers independently): a bare CHECK(open succeeds) turns
+    // this test red on any CI runner identity without Full Disk Access -- a host-privilege
+    // property, not a code defect (the plugin's own contract says a refused open is the
+    // CORRECT, expected outcome for an unentitled process). Branch instead: a success here is
+    // real corroboration of the dispatcher test's success-path evidence on THIS host; a
+    // failure is just re-confirming what test #1 already proves with a synthetic path, and is
+    // not itself a finding.
     std::string err_msg;
     auto db = open_readonly(err_msg);
-    CHECK(static_cast<bool>(db));
+    if (db) {
+        SUCCEED("real TCC.db opened -- this host/identity holds FDA");
+    } else {
+        CHECK_FALSE(err_msg.empty());
+    }
 }
 
 TEST_CASE("privacy_permissions macOS: composing a real open_readonly failure through "

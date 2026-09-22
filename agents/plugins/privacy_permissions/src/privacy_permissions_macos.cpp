@@ -8,10 +8,12 @@
  * this file assumes the commonly-documented 0=denied/2=allowed/3=limited shape but treats any
  * other value as prompt_undetermined rather than guessing), and whether the shipped agent
  * identity (root LaunchDaemon today) can open TCC.db at all -- SIP-protected, so `denied` is
- * the charter's own expected outcome for an unentitled process. Whether `location` is even
- * represented in this table (vs a separate locationd mechanism) is also unconfirmed; the query
- * simply finds no matching rows for it if that's the case, which surfaces as every app reading
- * `absent` for that category -- not wrongly reported as "denied".
+ * the charter's own expected outcome for an unentitled process.
+ *
+ * `location` is NOT queried here at all (CDX-R2-005) -- ADR-3003's platform investigation
+ * established macOS Location Services is administered by `locationd`, OUTSIDE TCC; there is no
+ * kTCCServiceLocation row to ask for. It ships as its own explicit `unsupported` row instead
+ * (see kTccServices' own banner), same shape as the Linux leg's full_disk_access row.
  *
  * REAL PROBE, this Mac (`braga`, macOS 26.6.2), 2026-09-22, via the unit test binary's own
  * ambient identity (a Terminal/VSCode-launched process, NOT the production agent identity --
@@ -20,9 +22,9 @@
  * open + query against `access` succeeded and returned real `full_disk_access` rows --
  * sshd-keygen-wrapper and com.microsoft.VSCode both `allowed` (auth_value 2);
  * com.nordvpn.macos, com.spotify.client and net.whatsapp.WhatsApp all `denied` (auth_value 0).
- * No camera/microphone/location rows were present for any queried app on this host at capture
- * time -- consistent with the query itself being schema-correct rather than silently
- * false-empty, since the identical query DID return real full_disk_access rows.
+ * No camera/microphone rows were present for any queried app on this host at capture time --
+ * consistent with the query itself being schema-correct rather than silently false-empty,
+ * since the identical query DID return real full_disk_access rows.
  */
 #include "privacy_permissions_legs.hpp"
 
@@ -46,13 +48,17 @@ struct TccService {
     std::string_view category;
 };
 
-// Only the charter's four categories are mapped; every other TCC service (kTCCServiceContacts,
-// kTCCServiceAppleEvents, kTCCServiceScreenCapture, ...) is out of scope by deliberate filter,
-// not a decode failure -- the query below simply never asks for them.
-inline constexpr std::array<TccService, 4> kTccServices{{
+// Only three of the four charter categories are TCC services; every other TCC service
+// (kTCCServiceContacts, kTCCServiceAppleEvents, kTCCServiceScreenCapture, ...) is out of scope
+// by deliberate filter, not a decode failure -- the query below simply never asks for them.
+// `location` is NOT here (CDX-R2-005): ADR-3003's platform investigation established macOS
+// Location Services is administered by `locationd`, OUTSIDE TCC entirely -- there is no
+// kTCCServiceLocation row to query, so this was previously a fake lookup that always silently
+// returned zero rows, indistinguishable from "the app never asked". It ships as its own
+// explicit `unsupported` row below instead, matching the Linux full_disk_access precedent.
+inline constexpr std::array<TccService, 3> kTccServices{{
     {"kTCCServiceCamera", "camera"},
     {"kTCCServiceMicrophone", "microphone"},
-    {"kTCCServiceLocation", "location"}, // UNCONFIRMED to exist in this table -- see file banner
     {"kTCCServiceSystemPolicyAllFiles", "full_disk_access"},
 }};
 
@@ -211,9 +217,17 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
         }
     }
 
+    // Fixed four-category vocabulary (CDX-R2-005, same shape as Linux full_disk_access,
+    // CDX-P1-006): location has no TCC service to query at all (see kTccServices' own banner),
+    // so it ships its own explicit `unsupported` row on every collection -- never silently
+    // omitted, which a consumer cannot distinguish from a missed collector row.
+    rows.push_back({"macos", "-", "location", PermissionState::unsupported, "-", "-", "-", false});
+
     if (rows.empty()) {
-        // Query ran cleanly but found nothing for any of the four mapped services -- a
-        // definitive, honest "no grants recorded" (not a failure): absent, not unreadable.
+        // Query ran cleanly but found nothing for any of the three mapped TCC services, and
+        // the unconditional location row above never fires (dead in practice, kept as a
+        // defensive fallback) -- a definitive, honest "no grants recorded": absent, not
+        // unreadable.
         rows.push_back({"macos", "-", "-", PermissionState::absent, "-", "-", "-", false});
     }
     (void)any_row_found;

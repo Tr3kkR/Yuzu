@@ -16,8 +16,8 @@
 
 One action, `permissions` (`privacy_permissions_plugin.cpp`), reports per-app sensitive-permission grants for four categories -- camera, microphone, location, full-disk-access -- as rows `permissions|<os>|<app_id>|<category>|<state>|<raw>|<last_used_start>|<last_used_stop>`. The action takes no parameters. Every leg is rung 1: no PowerShell, no subprocess on Windows or macOS, and Linux's session-bus D-Bus call is the only process boundary crossed anywhere in the plugin.
 
-- **macOS** reads `TCC.db` read-only, in-process (`sqlite3_open_v2`, never a `sqlite3` CLI shellout), querying the `access` table for the four mapped TCC service identifiers.
-- **Windows** walks the `HKCU`/`HKLM` `...\CapabilityAccessManager\ConsentStore` registry subtree for the four mapped `CapabilityName` keys, enumerating each one's own `Value` plus its `NonPackaged` and packaged-app children; `HKLM` wins over `HKCU` for the same app+category when both are present (an MDM/GPO-locked policy).
+- **macOS** reads `TCC.db` read-only, in-process (`sqlite3_open_v2`, never a `sqlite3` CLI shellout), querying the `access` table for the three TCC-governed categories (camera, microphone, full-disk-access); `location` is administered by `locationd` outside TCC entirely (ADR-3003) and ships as its own explicit `unsupported` row instead of a query.
+- **Windows** walks the `...\CapabilityAccessManager\ConsentStore` registry subtree, once per real interactive profile (the agent runs as LocalSystem, so its own `HKEY_CURRENT_USER` is not any user's -- each profile's hive is reached via the shared live-hive-first/offline-NTUSER.DAT-fallback ladder, `with_user_hive`) plus once for the machine-wide `HKLM` mirror, for the four mapped `CapabilityName` keys, enumerating each one's own `Value` plus its `NonPackaged` and packaged-app children; `HKLM` wins over a profile's own entry for the same app+category when both are present (an MDM/GPO-locked policy), and `app_id` is qualified with the owning profile's name so the same app across two profiles never collides.
 - **Linux** calls `org.freedesktop.impl.portal.PermissionStore.Lookup` over the **session** D-Bus (`sd_bus_open_user`) -- no daemon or no session is the honest, expected outcome on most non-sandboxed desktops, not a failure.
 
 ```mermaid
@@ -35,14 +35,14 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `permissions` | ✅ supported · rung 1 · HKCU/HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | 🟡 constrained · rung 1 · TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected to read denied | 🟡 constrained · rung 1 · xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session bus; unavailable (no daemon/no session) on most non-sandboxed desktops |
+| `permissions` | ✅ supported · rung 1 · per-profile (with_user_hive, LocalSystem's own HKCU is not a real user's) + HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | 🟡 constrained · rung 1 · TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected to read denied | 🟡 constrained · rung 1 · xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session bus; unavailable (no daemon/no session) on most non-sandboxed desktops |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md`) | Not yet measured on the-rig | `ERROR_ACCESS_DENIED` reports the app-level row `unreadable` and the action reports `PERMISSION_DENIED`/`PARTIAL`; any other Win32 error reports `unreadable` with `<key>:win32_<n>` |
+| Windows | agent service account (LocalSystem today, #1442) -- HKEY_CURRENT_USER would resolve to LocalSystem's own profile, not any interactive user's, so this leg reads each real profile's ConsentStore via the shared live-hive-first/offline-NTUSER.DAT-fallback ladder (`with_user_hive`, the `license_scan`/`registry` precedent), never the process's own HKCU | SeBackupPrivilege + SeRestorePrivilege for the offline-mount fallback -- already held by the agent account (no new grant; same privileges `tar.*`/certificate-store writes use) | Not yet measured on the-rig | A denied `Value` read reports the row `denied` and the action `PERMISSION_DENIED`/`PARTIAL`; a denied profile root or the HKLM root reports the same, named `<profile>:access_denied` / `hklm:access_denied`; a capability/app-key/enumeration-level denial below a root that DID open is named in provenance (`<category>:capability:access_denied` etc.) and reports `CONSTRAINED`/`PARTIAL`, since the rest of that profile's tree still read; any other Win32 error reports `unreadable` with `<key>:win32_<n>` |
 | macOS | agent daemon, root today (LaunchDaemon carries no `UserName` key -- `docs/agent-privilege-model.md` TL;DR) | TCC.db is SIP-protected regardless of privilege level; a separate Full Disk Access (FDA) grant is needed | 2026-09-22, this Mac (`braga`), via the unit test binary's own ambient identity (a Terminal/VSCode-launched process, NOT the production agent identity) -- proves the read mechanism works end to end when FDA is present; whether the production LaunchDaemon identity holds FDA is a still-open acceptance item | `SQLITE_CANTOPEN`/`SQLITE_AUTH`/`SQLITE_PERM` on open reports the whole read `denied`, `PERMISSION_DENIED`/`PARTIAL` |
 | Linux | agent daemon, default | None -- the portal call is an ordinary session-bus D-Bus method call | Not yet measured against a real running `xdg-desktop-portal` | An `AccessDenied`-shaped D-Bus error reports the category `denied`, `PERMISSION_DENIED`/`PARTIAL`; a shape mismatch reports `unreadable` with `<category>:shape` |
 
@@ -66,7 +66,7 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `os` | string | `macos` `windows` `linux` | Windows, Linux, macOS | `macos` | The reporting OS. |
-| `app_id` | string | - | Windows, Linux, macOS | `com.example.App` | Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path or Package Family Name (Windows), a portal-reported app id (Linux). "-" when the row reports the capability's own global default rather than a specific app, or when the whole read failed before any app-level row could be produced. |
+| `app_id` | string | - | Windows, Linux, macOS | `com.example.App` | Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path or Package Family Name qualified with the owning profile's name (Windows -- the agent runs as LocalSystem and reads every real profile's ConsentStore, so `<profile>\<app_id>` keeps the same app on two different profiles from colliding), a portal-reported app id (Linux). "-" when the row reports the capability's own global default rather than a specific app, or when the whole read failed before any app-level row could be produced. |
 | `category` | string | `camera` `microphone` `location` `full_disk_access` | Windows, Linux, macOS | `camera` | The fixed cross-OS permission category. "-" only on a whole-read-failed row. |
 | `state` | string | `allowed` `denied` `prompt_undetermined` `absent` `unreadable` `unsupported` | Windows, Linux, macOS | `allowed` | allowed/denied: a real, decoded grant. prompt_undetermined: the mechanism reported a value this plugin doesn't map to allowed/denied (never guessed). absent: no record for this app+category -- the app never asked, not a failure. unreadable: the read itself failed. unsupported: no mechanism reaches this category on this OS/host (e.g. no portal daemon running). |
 | `raw` | string | - | Windows, Linux, macOS | `2` | The mechanism-native value behind `state` (a TCC auth_value integer, a ConsentStore Value string, a joined portal permission list) -- "-" when nothing meaningful beyond the state itself. |
@@ -79,8 +79,8 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `OK` | `FULL` | — | No read was refused and no failure token exists: every category was either read or `absent`/`unsupported`. A host with no grants recorded for any mapped category still reports `OK`. |
-| `CONSTRAINED` | `PARTIAL` | `<category>:query_step_failed`, `<category>:shape`, `<app_id>:<category>:value_unreadable`, `consent_store:win32_<n>`, `tcc_db:prepare_failed:<msg>`, `internal_error` | A read failed for a reason other than a refusal; the reason names the mechanism-specific cause. |
-| `PERMISSION_DENIED` | `PARTIAL` | `tcc_db:open_failed:<msg>`, `consent_store:access_denied`, `<category>:access_denied` | The read was refused outright -- SIP/TCC denying `TCC.db`, `ERROR_ACCESS_DENIED` on the registry, or an `AccessDenied`-shaped D-Bus error. |
+| `CONSTRAINED` | `PARTIAL` | `<category>:query_step_failed`, `<category>:shape`, `<category>:entry_shape`, `<app_id>:<category>:value_unreadable`, `<category>:capability:access_denied`, `<category>:packaged_app:access_denied`, `<category>:nonpackaged_container:access_denied`, `<category>:nonpackaged_app:access_denied`, `hklm:win32_<n>`, `<profile>:win32_<n>`, `tcc_db:prepare_failed:<msg>` | A read failed for a reason other than a refusal, or a below-root Windows denial that left the rest of that root's tree readable; the reason names the mechanism-specific cause. |
+| `PERMISSION_DENIED` | `PARTIAL` | `tcc_db:open_failed:<msg>`, `hklm:access_denied`, `<profile>:access_denied`, `<app_id>:<category>:value_access_denied`, `<category>:access_denied` | The read was refused outright -- SIP/TCC denying `TCC.db`, `ERROR_ACCESS_DENIED` on a Windows root (HKLM, or a user profile's own hive) or a specific `Value`, or an `AccessDenied`-shaped D-Bus error. |
 
 ### Where the data goes
 
@@ -92,7 +92,7 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner) · leg-hash fe9aa1c1d5d5
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner) · leg-hash 3ae8f69c8f94
 
 ```
 == action=permissions
@@ -101,10 +101,11 @@ permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-
 permissions|macos|com.nordvpn.macos|full_disk_access|denied|0|-|-
 permissions|macos|com.spotify.client|full_disk_access|denied|0|-|-
 permissions|macos|net.whatsapp.WhatsApp|full_disk_access|denied|0|-|-
+permissions|macos|-|location|unsupported|-|-|-
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash fe9aa1c1d5d5
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 3ae8f69c8f94
 
 ```
 == action=permissions
