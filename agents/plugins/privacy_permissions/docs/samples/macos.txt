@@ -1,0 +1,8 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner) · leg-hash pending
+== action=permissions
+permissions|macos|/usr/libexec/sshd-keygen-wrapper|full_disk_access|allowed|2|-|-
+permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-
+permissions|macos|com.nordvpn.macos|full_disk_access|denied|0|-|-
+permissions|macos|com.spotify.client|full_disk_access|denied|0|-|-
+permissions|macos|net.whatsapp.WhatsApp|full_disk_access|denied|0|-|-
+[result_status] OK / FULL /

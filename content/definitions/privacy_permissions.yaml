@@ -1,0 +1,124 @@
+## Privacy Permissions Definitions
+## Per-app sensitive-permission grants -- camera, microphone, location and full-disk-access
+## equivalents -- read-only, one row per app per category.
+## Plugin: privacy_permissions | Actions: permissions
+##
+## Gated behind the SAME Forensics securable execution_artifacts uses, Administrator-only
+## (Forensics:Read + AdminOrApproval). The higher RiskTier is operator-triage metadata, not a
+## wider authorization gap -- see this plugin's README
+## (agents/plugins/privacy_permissions/README.md). See
+## server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp.
+##
+## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
+## (`PluginConfigStore::seed_kill_switch_default_off`) -- an operator must explicitly
+## `PUT /api/v1/plugin-config/privacy_permissions/kill-switch {"enabled":true}` before this
+## action will dispatch.
+##
+## macOS: TCC.db, SIP-protected -- an unentitled agent identity is expected to read `denied`
+## for the whole read. Windows: the CapabilityAccessManager\ConsentStore registry subtree.
+## Linux: xdg-desktop-portal's PermissionStore over the session bus -- `unsupported` (no
+## session/no daemon) is the honest, expected outcome on most non-sandboxed desktops.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.privacy_permissions.permissions
+  displayName: Privacy Permissions
+  version: 1.0.0
+  description: >
+    Per-app sensitive-permission grants as `permissions|os|app_id|category|state|raw
+    |last_used_start|last_used_stop` rows. `category` is a fixed cross-OS vocabulary: camera,
+    microphone, location, full_disk_access. `state`: allowed, denied, prompt_undetermined
+    (mechanism-native, not yet a clear yes/no), absent (the app never asked -- not a failure),
+    unreadable (the read failed) or unsupported (no mechanism on this OS/host). A refused read
+    (SIP/TCC denial, registry access denied, a portal AccessDenied error) is always `denied`,
+    never collapsed into `absent`. The two `last_used_*` fields are Windows-only
+    (epoch-milliseconds; "-" elsewhere).
+  tags: [privacy_permissions, security, posture, privacy, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: privacy_permissions
+    action: permissions
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # permissions|<os>|<app_id>|<category>|<state>|<raw>|<last_used_start>|<last_used_stop>
+    columns:
+      - name: os
+        type: string
+        description: The reporting OS.
+        values: [macos, windows, linux]
+        example: macos
+        platforms: [windows, linux, darwin]
+      - name: app_id
+        type: string
+        description: >
+          Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path
+          or Package Family Name (Windows), a portal-reported app id (Linux). "-" when the row
+          reports the capability's own global default rather than a specific app, or when the
+          whole read failed before any app-level row could be produced.
+        example: com.example.App
+        platforms: [windows, linux, darwin]
+      - name: category
+        type: string
+        description: The fixed cross-OS permission category. "-" only on a whole-read-failed row.
+        values: [camera, microphone, location, full_disk_access]
+        example: camera
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: >
+          allowed/denied: a real, decoded grant. prompt_undetermined: the mechanism reported a
+          value this plugin doesn't map to allowed/denied (never guessed). absent: no record
+          for this app+category -- the app never asked, not a failure. unreadable: the read
+          itself failed. unsupported: no mechanism reaches this category on this OS/host (e.g.
+          no portal daemon running).
+        values: [allowed, denied, prompt_undetermined, absent, unreadable, unsupported]
+        example: allowed
+        platforms: [windows, linux, darwin]
+      - name: raw
+        type: string
+        description: >
+          The mechanism-native value behind `state` (a TCC auth_value integer, a ConsentStore
+          Value string, a joined portal permission list) -- "-" when nothing meaningful beyond
+          the state itself.
+        example: "2"
+        platforms: [windows, linux, darwin]
+      - name: last_used_start
+        type: string
+        description: Windows ConsentStore LastUsedTimeStart, epoch milliseconds. "-" elsewhere.
+        example: "1700000000000"
+        platforms: [windows]
+      - name: last_used_stop
+        type: string
+        description: Windows ConsentStore LastUsedTimeStop, epoch milliseconds. "-" elsewhere.
+        example: "1700000100000"
+        platforms: [windows]
+
+  readablePayload: "Report per-app camera/microphone/location/full-disk-access grants"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [privacy_permissions]
+
+status:
+  phase: active

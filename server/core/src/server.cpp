@@ -166,6 +166,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -4659,6 +4660,22 @@ public:
                     "/api/v1/plugin-config/execution_artifacts/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: execution_artifacts default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+        // Wave 8: privacy_permissions (per-app sensitive-permission grants —
+        // camera/microphone/location/full-disk-access equivalents) ships
+        // default-off, same Forensics-class posture as execution_artifacts. An
+        // operator must explicitly enable it via PUT
+        // /api/v1/plugin-config/privacy_permissions/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "privacy_permissions",
+                    "default-off: forensics class (Wave 8); enable per PUT "
+                    "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: privacy_permissions default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
@@ -19426,6 +19443,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
+        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
