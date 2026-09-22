@@ -549,6 +549,7 @@ if build_agent
   subdir('agents/plugins/peripherals')  # Wave 9 PR9.1a
   subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
   subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
+  subdir('agents/plugins/app_control')  # Wave 8 PR8.6
   subdir('agents/plugins/printing')  # Wave 9 PR9.1b
 endif
 
