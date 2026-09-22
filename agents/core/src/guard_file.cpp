@@ -321,7 +321,11 @@ void FileGuard::run() try {
     // normal, the WAIT_FAILED/WAIT_ABANDONED break, or exception unwind (mandatory ordering).
     int p_abandon_count = 0; // parent-block cancel-drain failures this run() (sec-1); does
                              // NOT reset on a confirmed drain — see kParentIoAbandonLimit
-    bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit
+    bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit;
+        // TRACKED: no per-guard health surface reads this today (GuardianEngine::get_status()
+        // stamps every rule "errored"/unhealthy unconditionally, pending its own named
+        // "richer status-taxonomy follow-up" — see guardian_engine.cpp) — when that rung
+        // lands, p_disabled should become a queryable per-rule field, not just this log line
     std::unique_ptr<ParentIo, ParentIoRelease> pio(
         nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path,
                                   &parent_drain_fail_hook_for_test_});

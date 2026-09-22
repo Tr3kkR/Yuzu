@@ -13,6 +13,7 @@
 
 #include "test_helpers.hpp" // yuzu::test::unique_temp_path
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -699,10 +700,11 @@ void run_retain_across_rearm() {
 // from user mode: stop() still returns promptly (the fix's whole point - abandon-not-free must
 // never become a hang) and the process does not crash. It intentionally leaks one ~32KB block
 // (the abandoned ParentIo) - the same accepted, capped trade-off kParentIoAbandonLimit exists
-// for in production, exercised here exactly once. Scoped to the single, definitely-reachable
-// teardown case; the rarer mid-run rebuild-while-genuinely-pending race (a D-triggered rebuild
-// catching an unconsumed P completion) would need a second, more invasive seam to force
-// deterministically and is not attempted here.
+// for in production, exercised here exactly once. Covers run()'s own final-teardown case;
+// run_ancestor_created_chain_hits_abandon_limit (below) covers the OTHER deterministic
+// pending-teardown case - an ancestor-triggered rebuild racing a still-outstanding P read - and
+// drives the counter to the actual disable threshold. A THIRD case (a D-triggered rebuild
+// racing an unconsumed P completion) is genuinely timing-dependent and is not attempted here.
 void run_parent_drain_forced_abandon() {
     yuzu::test::TempDir root("yuzu_test_fgabandon_");
     fs::create_directories(root.path / "D");
@@ -724,6 +726,65 @@ void run_parent_drain_forced_abandon() {
     guard.stop();
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < 5s);
+}
+
+// Regression for the OTHER deterministic mid-run pending-teardown case (distinct from the
+// final-teardown case above): an ancestor-triggered rebuild racing a genuinely outstanding P
+// read. The ancestor watch (armed on nearest_existing_dir(), FindFirstChangeNotificationW with
+// watchSubtree=TRUE) is RECURSIVE; P (bind()'s ParentIo, ReadDirectoryChangesW on
+// x.parent_path()) is NOT - it only sees x's parent's DIRECT children changing. So creating one
+// directory level at a time beneath a not-yet-existing watched path wakes the (recursive)
+// ancestor watch on every level, each wake resolving a NEW x one level deeper - but the event
+// that woke it (a grandchild being created, invisible to the OLD P, which only watched for the
+// old x's OWN rename one level up) never touches P at all. Every such rebuild therefore tears
+// down a genuinely still-pending P block: this is not a rare race, it is the ordinary, ONLY way
+// an already-armed P block gets torn down for a reason other than its own completion, deterministic
+// given fs::create_directory calls in order (not fs::create_directories, which would jump levels
+// and skip abandons). With the forced-fail hook, three such levels reliably drives P to its
+// kParentIoAbandonLimit and disables it; a fourth level is a deterministic negative (bind()
+// short-circuits on p_disabled before touching pio at all - no drain, no hook call, no wait).
+void run_ancestor_created_chain_hits_abandon_limit() {
+    yuzu::test::TempDir root("yuzu_test_fgabandonchain_");
+    fs::create_directories(root.path / "A"); // only the first level pre-exists
+    const fs::path target = root.path / "A" / "D" / "E" / "F" / "G" / "f.txt";
+
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-abandon-chain";
+    cfg.path = target.string();
+    cfg.expect_present = true; // absent throughout: only directories are created, never the file
+    cfg.event_debounce_ms = 0; // every wake's report must be counted, not collapsed
+
+    std::atomic<int> hook_calls{0};
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard guard(cfg, [col](const GuardDrift& d) { col->push(d); });
+    guard.set_parent_drain_fail_hook_for_test([&hook_calls] {
+        ++hook_calls;
+        return true; // force every drain to fail
+    });
+    REQUIRE(guard.start());
+    REQUIRE(col->wait_drift_count(1, 30s)); // initial eval: absent, x=A, P on root
+
+    REQUIRE(fs::create_directory(root.path / "A" / "D"));
+    REQUIRE(col->wait_drift_count(2, 30s));
+    CHECK(hook_calls.load() == 1); // 1st abandon: P (on root, watching A) never saw A/D
+
+    REQUIRE(fs::create_directory(root.path / "A" / "D" / "E"));
+    REQUIRE(col->wait_drift_count(3, 30s));
+    CHECK(hook_calls.load() == 2); // 2nd abandon: P (on A, watching A/D) never saw A/D/E
+
+    REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F"));
+    REQUIRE(col->wait_drift_count(4, 30s));
+    CHECK(hook_calls.load() == 3); // 3rd abandon: kParentIoAbandonLimit reached, P now disabled
+
+    REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F" / "G"));
+    REQUIRE(col->wait_drift_count(5, 30s)); // still detected via X's own (h_dir) channel - now
+        // finally openable, since the full configured parent exists - unaffected by P's disable
+    CHECK(hook_calls.load() == 3); // unchanged: bind() short-circuited on p_disabled, no drain
+
+    const auto t0 = std::chrono::steady_clock::now();
+    guard.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 5s); // pio is already null (abandoned, not freed) - nothing to drain here
 }
 
 // Parks the guard thread inside its first report so notifications pile up unread.
@@ -835,6 +896,12 @@ TEST_CASE("FileGuard rename: a forced non-drain at teardown is abandoned, not fr
           "still returns promptly",
           "[guardian][guard][file][rename]") {
     run_parent_drain_forced_abandon();
+}
+
+TEST_CASE("FileGuard rename: an ancestor-triggered rebuild chain reaches the abandon limit and "
+          "disables the parent watch, without affecting the file's own detection",
+          "[guardian][guard][file][rename]") {
+    run_ancestor_created_chain_hits_abandon_limit();
 }
 
 TEST_CASE("FileGuard rename: rename or move alone reports the absent state (file-exists)",
