@@ -211,6 +211,42 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `installed_apps list` rows carry two more fields (breaking)
+
+**What changed.** The `installed_apps` agent plugin's operator `list` action (definition
+`crossplatform.software.inventory`) now emits seven `|`-separated fields per row instead of five:
+`app|name|version|publisher|install_date|install_location|bundle_id`. `install_location` is the Windows
+Uninstall-key `InstallLocation` (unexpanded) or the location macOS reports; `bundle_id` is the macOS
+`CFBundleIdentifier`. Either is `-` where the OS has none: every Linux row ends `-|-`, and many Windows rows
+have no `InstallLocation` (182 of 241 on the reference developer workstation). The first five fields keep their
+position; every field is now escape-aware (`\` folds to `/`, `|` to `\|`, CR/LF to a space, a field over 4 KiB
+is cut), a no-op for every value in the three reference captures. Row shape for `query`, `list_per_user` and the
+daily-sync inventory (ADR-0016) is unchanged, though on macOS the collector `list`/`query`/`list_per_user` share
+now sorts same-named apps by (name, install_location) instead of leaving their order arbitrary.
+
+**Who this affects.** Automation reading `installed_apps list` output from `GET /api/v1/responses/{id}`, its
+`/export`, or MCP `query_responses` that (a) unpacks or anchors exactly five fields, or (b) treats the last
+field as `install_date`. The dashboard is unaffected: it has always split these rows into `app` plus one
+remainder cell, so the new fields appear inside that cell (and the search box matches them) but are not
+separate, sortable or filterable columns. A policy or script that substring-matches the raw `output` now also
+matches install paths and bundle identifiers.
+
+**Mixed fleets.** Upgrade order is server first, so agents keep answering with five fields until they take the
+release carrying `installed_apps` 1.2.0 (the definition's `minAgentVersion` stays `1.0.0`). Agents older than
+1.2.0 do not escape `|` in name, version, publisher or install date, so a row from one of them can split into
+any count under the escape-aware split: accept a row only when it has exactly 5 or exactly 7 tokens, reject any
+other count, and read the sixth/seventh columns only for agents known to be on plugin 1.2.0 or later.
+
+**Existing deployments keep the old definition.** The bundled definition is seeded once and never refreshed
+on an existing server (see the InstructionStore note in [`upgrading.md`](upgrading.md); #2555), so
+`get_definition` and `discover_instructions` keep listing four columns at version 1.0.0. Row content is
+unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
+new columns is optional and cosmetic.
+
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
+pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
+
 ### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
 
 **What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
