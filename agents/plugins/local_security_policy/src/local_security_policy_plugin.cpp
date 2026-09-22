@@ -30,10 +30,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "pwpolicy -getaccountpolicies (CFPropertyList)",
          "global account policies only; rung 2 because no public OpenDirectory global-policy "
-         "API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value"},
+         "API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value. "
+         "Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload "
+         "surfaces here is unverified"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
-         "argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner"},
+         "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
+         "LOCAL security database after GPO application; domain-account policy is not reported. "
+         "Measured on a standalone host; see the Windows leg banner"},
     },
     {
         /* .action      = */ "lockout_policy",
@@ -43,10 +47,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "reports configuration, not live lockout counters"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "pwpolicy -getaccountpolicies (CFPropertyList)",
-         "global account policies only; no authentication policy reports policies|none (the default)"},
+         "global account policies only; no authentication policy reports policies|none (the default). "
+         "Measured on an UNMANAGED Mac, so on a managed device policies|none must not be read as "
+         "'no lockout enforced' -- profile-delivered policy is unverified here"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
-         "argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner"},
+         "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
+         "LOCAL security database after GPO application; domain-account policy is not reported. "
+         "Measured on a standalone host; see the Windows leg banner"},
     },
     {
         /* .action      = */ "audit_policy",
@@ -60,7 +68,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "a present file is root-readable only"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
-         "[Event Audit] categories only; see the Windows leg banner"},
+         "the LEGACY [Event Audit] categories only. Where Advanced Audit Policy "
+         "subcategories are in force -- the Windows 10/11 default and the norm under GPO -- "
+         "these are NOT the effective audit state: a category reading none means the legacy "
+         "category is unset, not that the host is not auditing. auditpol subcategories are "
+         "not read; see the Windows leg banner"},
     },
     {
         /* .action      = */ "sudoers",

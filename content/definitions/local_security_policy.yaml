@@ -29,7 +29,7 @@ metadata:
     `secedit /export`. It reports what the configuration states, not the live
     PAM or LSA decision. A source the OS reports missing reads `absent`; one
     that could not be read reads `unreadable` with a reason and downgrades
-    the result to CONSTRAINED or PERMISSION_DENIED, never an empty success.
+    the result to CONSTRAINED or PERMISSION_DENIED, never an empty success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms (Windows MinimumPasswordLength, Linux PASS_MIN_LEN or pwquality minlen, macOS minimum_length all state a minimum length), so a fleet-wide comparison must branch per OS.
   tags: [local_security_policy, password, policy, compliance, security, posture]
 
 spec:
@@ -105,7 +105,7 @@ metadata:
     `secedit /export`. It reports configuration, not live lockout counters. A
     source the OS reports missing reads `absent`; one that could not be read
     reads `unreadable` with a reason and downgrades the result, never an empty
-    success.
+    success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms, so a fleet-wide comparison must branch per OS.
   tags: [local_security_policy, lockout, policy, compliance, security, posture]
 
 spec:
@@ -179,7 +179,12 @@ metadata:
     /etc/security/audit_control, which is absent by default on current
     macOS (reported `absent`, not a failure); Windows reports every [Event
     Audit] category from one `secedit /export` as none, success, failure or
-    success_failure. audit.rules is 0640 root, so an unprivileged Linux
+    success_failure. Those are the LEGACY audit categories: where Advanced
+    Audit Policy subcategories are in force -- the Windows 10/11 default and
+    the norm under GPO -- they are not the effective audit state, so a
+    category reading none means the legacy category is unset, NOT that the
+    host is not auditing. `auditpol /get /category:*` is the effective state
+    and is not read. audit.rules is 0640 root, so an unprivileged Linux
     agent reports `unreadable` and PERMISSION_DENIED.
   tags: [local_security_policy, audit, policy, compliance, security, posture]
 

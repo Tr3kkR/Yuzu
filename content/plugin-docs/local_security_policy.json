@@ -19,7 +19,7 @@
           "support": "constrained"
         },
         "windows": {
-          "fallback": "[Event Audit] categories only; see the Windows leg banner",
+          "fallback": "the LEGACY [Event Audit] categories only. Where Advanced Audit Policy subcategories are in force -- the Windows 10/11 default and the norm under GPO -- these are NOT the effective audit state: a category reading none means the legacy category is unset, not that the host is not auditing. auditpol subcategories are not read; see the Windows leg banner",
           "mechanism": "secedit.exe /export /areas SECURITYPOLICY",
           "rung": "2",
           "support": "constrained"
@@ -39,13 +39,13 @@
           "support": "constrained"
         },
         "macos": {
-          "fallback": "global account policies only; no authentication policy reports policies|none (the default)",
+          "fallback": "global account policies only; no authentication policy reports policies|none (the default). Measured on an UNMANAGED Mac, so on a managed device policies|none must not be read as 'no lockout enforced' -- profile-delivered policy is unverified here",
           "mechanism": "pwpolicy -getaccountpolicies (CFPropertyList)",
           "rung": "2",
           "support": "constrained"
         },
         "windows": {
-          "fallback": "argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner",
+          "fallback": "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the LOCAL security database after GPO application; domain-account policy is not reported. Measured on a standalone host; see the Windows leg banner",
           "mechanism": "secedit.exe /export /areas SECURITYPOLICY",
           "rung": "2",
           "support": "constrained"
@@ -65,13 +65,13 @@
           "support": "constrained"
         },
         "macos": {
-          "fallback": "global account policies only; rung 2 because no public OpenDirectory global-policy API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value",
+          "fallback": "global account policies only; rung 2 because no public OpenDirectory global-policy API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value. Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload surfaces here is unverified",
           "mechanism": "pwpolicy -getaccountpolicies (CFPropertyList)",
           "rung": "2",
           "support": "constrained"
         },
         "windows": {
-          "fallback": "argv leaf parsed from the exported UTF-16LE INI; see the Windows leg banner",
+          "fallback": "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the LOCAL security database after GPO application; domain-account policy is not reported. Measured on a standalone host; see the Windows leg banner",
           "mechanism": "secedit.exe /export /areas SECURITYPOLICY",
           "rung": "2",
           "support": "constrained"
@@ -107,10 +107,10 @@
   ],
   "caveats": [
     "**No documented business driver.** The priority for this plugin is asserted from a capability-gap reading, not evidenced by any tracked demand (see \"How it works\"); there is no capability-map requirement, named customer, SOC 2 control or CVE behind it.",
-    "**Configuration, not evaluation.** Linux and macOS report what the files state, not what PAM or sudo would decide: `pwquality.conf.d` and `faillock` drop-ins are not read, `sudoers` include directives are listed and not followed, `audit.rules` counts are of the file and not the live kernel rules, and a `pwpolicy` expression is reported verbatim (only `minimum_length` is derived from it).",
-    "**The Windows leg is measured on real hardware.** It is rung 2 by design; a rig session captured a real `secedit /export` as LocalSystem, confirming `SeSecurityPrivilege` suffices with the privilege in its default Disabled state (fixture, sample and the `RIG PROBE` banner in `local_security_policy_win.cpp` all reflect this).",
+    "**Configuration, not evaluation — and on Windows `audit_policy`, not the effective audit state.** Linux and macOS report what the files state, not what PAM or sudo would decide: `pwquality.conf.d` and `faillock` drop-ins are not read, `sudoers` include directives are listed and not followed, `audit.rules` counts are of the file and not the live kernel rules, and a `pwpolicy` expression is reported verbatim (only `minimum_length` is derived from it). The sharpest case is Windows `audit_policy`: `secedit /export` returns the nine **legacy** `[Event Audit]` categories, and where Advanced Audit Policy subcategories are in force — the Windows 10/11 default, and the norm under GPO — those are not what the host actually audits. A category reading `none` means the legacy category is unset, **not** that the host is not auditing; the committed rig capture is exactly that shape (a default Windows 11 Pro, all nine `none`). `auditpol /get /category:*` is the effective state and is not read — that would be a second argv leaf with its own sink-manifest row.",
+    "**The Windows leg is measured on real hardware — a standalone host.** It is rung 2 by design; a rig session captured a real `secedit /export` as LocalSystem, confirming `SeSecurityPrivilege` suffices with the privilege in its default Disabled state (fixture, sample and the `RIG PROBE` banner in `local_security_policy_win.cpp` all reflect this). That host was **not domain-joined**: on a domain-joined member the export is the local security database *after* GPO application, and domain-account password policy is not reported at all.",
     "**Privileged files read as `unreadable` for an unprivileged agent.** `/etc/sudoers` (`0440`), `/etc/sudoers.d/*` and Linux `/etc/audit/audit.rules` (`0640`) need root or a read-override capability; without it the action reports `PERMISSION_DENIED`, never an empty list. macOS `audit_control` is absent by default and reads `absent`.",
-    "**Global scope only.** macOS `pwpolicy` is queried for the global account policies, not per-user policies, and the Windows export covers the local security policy area only (no domain policy resultant set, no `auditpol` subcategories beyond `[Event Audit]`)."
+    "**Global scope only, unmanaged captures, and no cross-OS normalisation.** macOS `pwpolicy` is queried for the global account policies, not per-user policies, and the Windows export covers the local security policy area only (no domain policy resultant set, no `auditpol` subcategories beyond `[Event Audit]`). The macOS captures are from an **unmanaged** Mac, so whether an MDM configuration-profile passcode payload surfaces in `pwpolicy -getaccountpolicies` is unverified — on a managed device `lockout_policy|policies|none` must not be read as \"no lockout enforced\". Separately, keys are each OS's own vocabulary and are deliberately **not** normalised: the same fact is `MinimumPasswordLength` on Windows, `PASS_MIN_LEN` (or pwquality's `minlen`) on Linux and `minimum_length` on macOS, so a fleet-wide \"weaker than our baseline\" query has to branch per OS. The `source` field names the origin on every row; no normalised column is offered."
   ],
   "definitions": [
     {
@@ -118,7 +118,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the local audit policy. Linux reads /etc/audit/audit.rules and reports rule, watch-rule and syscall-rule counts, lines it does not model, and the -e state (enabled, disabled, immutable or unset), from the rule file only, not the live kernel rules; macOS reads /etc/security/audit_control, which is absent by default on current macOS (reported `absent`, not a failure); Windows reports every [Event Audit] category from one `secedit /export` as none, success, failure or success_failure. audit.rules is 0640 root, so an unprivileged Linux agent reports `unreadable` and PERMISSION_DENIED.",
+      "description": "Reports the local audit policy. Linux reads /etc/audit/audit.rules and reports rule, watch-rule and syscall-rule counts, lines it does not model, and the -e state (enabled, disabled, immutable or unset), from the rule file only, not the live kernel rules; macOS reads /etc/security/audit_control, which is absent by default on current macOS (reported `absent`, not a failure); Windows reports every [Event Audit] category from one `secedit /export` as none, success, failure or success_failure. Those are the LEGACY audit categories: where Advanced Audit Policy subcategories are in force -- the Windows 10/11 default and the norm under GPO -- they are not the effective audit state, so a category reading none means the legacy category is unset, NOT that the host is not auditing. `auditpol /get /category:*` is the effective state and is not read. audit.rules is 0640 root, so an unprivileged Linux agent reports `unreadable` and PERMISSION_DENIED.",
       "display_name": "Local Audit Policy",
       "execute_roles": [
         "endpoint-admin",
@@ -140,7 +140,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the local account lockout policy as one row per setting. Linux reads the lockout keys of login.defs, faillock.conf and the faillock/tally lines of the auth and account stacks in /etc/pam.d; macOS reads the authentication policies from `pwpolicy -getaccountpolicies` (no authentication policy reports `policies|none`, the default); Windows reads LockoutBadCount, ResetLockoutCount and LockoutDuration from one `secedit /export`. It reports configuration, not live lockout counters. A source the OS reports missing reads `absent`; one that could not be read reads `unreadable` with a reason and downgrades the result, never an empty success.",
+      "description": "Reports the local account lockout policy as one row per setting. Linux reads the lockout keys of login.defs, faillock.conf and the faillock/tally lines of the auth and account stacks in /etc/pam.d; macOS reads the authentication policies from `pwpolicy -getaccountpolicies` (no authentication policy reports `policies|none`, the default); Windows reads LockoutBadCount, ResetLockoutCount and LockoutDuration from one `secedit /export`. It reports configuration, not live lockout counters. A source the OS reports missing reads `absent`; one that could not be read reads `unreadable` with a reason and downgrades the result, never an empty success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms, so a fleet-wide comparison must branch per OS.",
       "display_name": "Local Lockout Policy",
       "execute_roles": [
         "endpoint-admin",
@@ -162,7 +162,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the local password policy as one row per setting: which setting, its value and where it was read. Linux reads login.defs, pwquality.conf and the password stacks in /etc/pam.d (pwquality, pwhistory, cracklib and unix module lines); macOS reads the global account policies from `pwpolicy -getaccountpolicies`; Windows reads MinimumPasswordAge, MaximumPasswordAge, MinimumPasswordLength, PasswordComplexity, PasswordHistorySize and ClearTextPassword from one `secedit /export`. It reports what the configuration states, not the live PAM or LSA decision. A source the OS reports missing reads `absent`; one that could not be read reads `unreadable` with a reason and downgrades the result to CONSTRAINED or PERMISSION_DENIED, never an empty success.",
+      "description": "Reports the local password policy as one row per setting: which setting, its value and where it was read. Linux reads login.defs, pwquality.conf and the password stacks in /etc/pam.d (pwquality, pwhistory, cracklib and unix module lines); macOS reads the global account policies from `pwpolicy -getaccountpolicies`; Windows reads MinimumPasswordAge, MaximumPasswordAge, MinimumPasswordLength, PasswordComplexity, PasswordHistorySize and ClearTextPassword from one `secedit /export`. It reports what the configuration states, not the live PAM or LSA decision. A source the OS reports missing reads `absent`; one that could not be read reads `unreadable` with a reason and downgrades the result to CONSTRAINED or PERMISSION_DENIED, never an empty success. Keys are each OS's own vocabulary and are deliberately NOT normalised across platforms (Windows MinimumPasswordLength, Linux PASS_MIN_LEN or pwquality minlen, macOS minimum_length all state a minimum length), so a fleet-wide comparison must branch per OS.",
       "display_name": "Local Password Policy",
       "execute_roles": [
         "endpoint-admin",
