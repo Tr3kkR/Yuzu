@@ -522,6 +522,7 @@ agent_test_exe = executable(
     'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure secedit/login.defs/pwquality/pam/auditd/sudoers/pwpolicy parsers over REAL CAPTURE fixtures
     'unit/test_local_security_policy_scratch_sweep.cpp',    # Wave 8 PR8.3: pure Windows scratch-dir sweep + secedit run classification decisions, unguarded on every OS
     'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real local_security_policy dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_local_security_policy_win_local.cpp', # Wave 8 PR8.3: live secedit /export spawn + scratch-dir lifecycle, Windows-only body, unguarded TU
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
