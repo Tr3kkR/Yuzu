@@ -204,12 +204,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: 'Setting name: rules, watch_rules, syscall_rules, unmodelled_lines or enabled (Linux), an audit_control key (macOS), an [Event Audit] category name (Windows), or source_state when the source is absent or unreadable.'
+        description: 'Setting name: rules, watch_rules, syscall_rules, unmodelled_lines, control_lines or enabled (Linux), an audit_control key (macOS), an [Event Audit] category name (Windows), or source_state when the source is absent or unreadable.'
         example: watch_rules
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The setting value: a count (Linux), the audit_control value (macOS), none/success/failure/success_failure or unmodelled:<raw> (Windows), or enabled/disabled/immutable/unset for the Linux enabled row. For source_state, absent or unreadable:<reason>.'
+        description: 'The setting value: a count (Linux -- rules is the RULE count, equal to watch_rules + syscall_rules + unmodelled_lines, with control_lines counting the -D/-b/-f/-e style directives that configure auditd rather than add a rule), the audit_control value (macOS), none/success/failure/success_failure or unmodelled:<raw> (Windows), or enabled/disabled/immutable/unset for the Linux enabled row. For source_state, absent or unreadable:<reason>.'
         example: "12"
         platforms: [windows, linux, darwin]
       - name: source
@@ -300,7 +300,7 @@ spec:
       - name: nopasswd
         type: string
         description: 'Whether a user spec carries NOPASSWD: true or false; a dash on a row that is not a user spec.'
-        values: ['true', 'false']
+        values: ['true', 'false', '-']
         example: 'false'
         platforms: [linux, darwin]
       - name: commands
