@@ -93,6 +93,11 @@ ps::ValueOutcome read_value(HKEY key, const ps::KeySpec& spec, const std::string
     if (rc != ERROR_SUCCESS)
         return failed(o, ps::classify_win32_failure(rk, static_cast<std::uint32_t>(rc)));
     o.value.type = type;
+    const DWORD probed_type = type; // the plan below is chosen from THIS type; the fill call's
+                                     // own returned type is re-checked against it so a value
+                                     // whose type changes between the probe and the fill (a
+                                     // narrow TOCTOU window) is never silently misread as the
+                                     // stale plan's kind.
     switch (ps::plan_value_read(type, size)) {
     case ps::ReadPlan::dword: {
         DWORD v = 0;
@@ -100,6 +105,8 @@ ps::ValueOutcome read_value(HKEY key, const ps::KeySpec& spec, const std::string
         rc = RegQueryValueExW(key, wname.c_str(), nullptr, &type, reinterpret_cast<BYTE*>(&v), &sz);
         if (rc != ERROR_SUCCESS)
             return failed(o, ps::classify_win32_failure(rk, static_cast<std::uint32_t>(rc)));
+        if (type != probed_type)
+            return failed(o, ps::unreadable_failure(rk, "type_changed"));
         o.value.kind = ps::ValueKind::dword;
         o.value.dword = static_cast<std::uint32_t>(v);
         return o;
@@ -111,6 +118,8 @@ ps::ValueOutcome read_value(HKEY key, const ps::KeySpec& spec, const std::string
                               &sz);
         if (rc != ERROR_SUCCESS)
             return failed(o, ps::classify_win32_failure(rk, static_cast<std::uint32_t>(rc)));
+        if (type != probed_type)
+            return failed(o, ps::unreadable_failure(rk, "type_changed"));
         o.value.kind = ps::ValueKind::text;
         o.value.text = yuzu::win::reg_sz_to_utf8(buf.data(), sz);
         return o;
