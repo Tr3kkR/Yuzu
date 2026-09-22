@@ -15,23 +15,30 @@
  * yuzu::util::safe_output_field. Nothing is rejected or stripped at rest.
  * safe_output_field is lossy on a literal backslash on the wire (folded to
  * '/'); that is a documented limitation of the shared server decoder.
+ *
+ * Persistence is lossy in exactly one case: a stored value that is not valid
+ * UTF-8 is written with U+FFFD in place of each bad byte (serialize_state),
+ * so it differs after a restart. A value the server accepted is valid UTF-8
+ * and round-trips byte-for-byte.
  */
-
-#include <yuzu/string_utils.hpp>
-
-#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include <yuzu/string_utils.hpp>
 
 namespace yuzu::asset_tags {
 
@@ -64,6 +71,11 @@ struct AssetTagState {
     int64_t last_sync_epoch{0};
     bool stale{true};
     std::vector<ChangeRecord> change_log;
+};
+
+/// Why a snapshot was rejected; `message` names the offending field.
+struct ParseError {
+    std::string message;
 };
 
 inline bool is_category_key(std::string_view key) {
@@ -140,110 +152,128 @@ inline std::string serialize_state(const AssetTagState& st) {
     j["change_log"] = std::move(log_arr);
     // Raw stored values may carry invalid UTF-8; replace rather than throw
     // (dump()'s default would raise type_error 316 inside the sync lock).
+    // This is the one lossy case — see the file header.
     return j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 namespace detail {
 
-/// Read an optional string field (capped). Returns false, with err set, when
-/// the field is present but not a string.
-inline bool read_string_field(const nlohmann::json& obj, const char* name, const std::string& where,
-                              std::string& out, std::string& err) {
+/// Look up an optional field and check its type. Returns nullptr when the
+/// field is absent, the field when present and of the expected type, and a
+/// ParseError naming `where + name` when present but of another type.
+template <class IsType>
+[[nodiscard]] inline std::expected<const nlohmann::json*, ParseError>
+optional_field(const nlohmann::json& obj, const char* name, const std::string& where,
+               IsType&& is_type, const char* type_name) {
     auto it = obj.find(name);
     if (it == obj.end())
-        return true;
-    if (!it->is_string()) {
-        err = where + name + ": expected string";
-        return false;
-    }
-    out = cap_value(it->get_ref<const std::string&>());
-    return true;
+        return nullptr;
+    if (!is_type(*it))
+        return std::unexpected(ParseError{where + name + ": expected " + type_name});
+    return &*it;
+}
+
+/// Optional capped string field: nullopt when absent.
+[[nodiscard]] inline std::expected<std::optional<std::string>, ParseError>
+optional_string(const nlohmann::json& obj, const char* name, const std::string& where) {
+    auto f = optional_field(
+        obj, name, where, [](const nlohmann::json& v) { return v.is_string(); }, "string");
+    if (!f)
+        return std::unexpected(f.error());
+    if (!*f)
+        return std::nullopt;
+    return cap_value((*f)->get_ref<const std::string&>());
 }
 
 } // namespace detail
 
 /// Parse an on-disk snapshot. ONE recovery policy: any schema violation
-/// rejects the WHOLE snapshot (nullopt, err names the offending field); no
+/// rejects the WHOLE snapshot (a ParseError naming the offending field); no
 /// partial state is ever returned. Unknown top-level keys are ignored
-/// (forward compatibility); missing known fields keep their defaults. Never
-/// throws. Loaded values are capped (an older plugin stored them uncapped)
-/// and an oversized change log is trimmed to the newest kMaxChangeLog.
-inline std::optional<AssetTagState> parse_state(std::string_view text, std::string& err) {
-    err.clear();
-    auto j = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
-    if (j.is_discarded()) {
-        err = "not valid JSON";
-        return std::nullopt;
-    }
-    if (!j.is_object()) {
-        err = "root: expected object";
-        return std::nullopt;
-    }
+/// (forward compatibility); missing known top-level fields keep their
+/// defaults. A change-log entry must carry a category `key`. Never throws.
+/// Loaded values are capped (an older plugin stored them uncapped) and an
+/// oversized change log is trimmed to the newest kMaxChangeLog.
+[[nodiscard]] inline std::expected<AssetTagState, ParseError> parse_state(std::string_view text) {
+    using nlohmann::json;
+    auto j = json::parse(text.begin(), text.end(), nullptr, false);
+    if (j.is_discarded())
+        return std::unexpected(ParseError{"not valid JSON"});
+    if (!j.is_object())
+        return std::unexpected(ParseError{"root: expected object"});
 
     AssetTagState st;
 
-    if (auto it = j.find("tags"); it != j.end()) {
-        if (!it->is_object()) {
-            err = "tags: expected object";
-            return std::nullopt;
-        }
-        for (const auto& [key, val] : it->items()) {
-            if (!is_category_key(key)) {
-                err = "tags." + key + ": unknown category";
-                return std::nullopt;
-            }
-            if (!val.is_string()) {
-                err = "tags." + key + ": expected string";
-                return std::nullopt;
-            }
+    auto tags = detail::optional_field(
+        j, "tags", "", [](const json& v) { return v.is_object(); }, "object");
+    if (!tags)
+        return std::unexpected(tags.error());
+    if (*tags) {
+        for (const auto& [key, val] : (*tags)->items()) {
+            if (!is_category_key(key))
+                return std::unexpected(ParseError{"tags." + key + ": unknown category"});
+            if (!val.is_string())
+                return std::unexpected(ParseError{"tags." + key + ": expected string"});
             st.tags[key] = cap_value(val.get_ref<const std::string&>());
         }
     }
 
-    if (auto it = j.find("last_sync_epoch"); it != j.end()) {
-        if (!it->is_number_integer()) {
-            err = "last_sync_epoch: expected integer";
-            return std::nullopt;
-        }
-        st.last_sync_epoch = it->get<int64_t>();
-    }
+    auto epoch = detail::optional_field(
+        j, "last_sync_epoch", "", [](const json& v) { return v.is_number_integer(); }, "integer");
+    if (!epoch)
+        return std::unexpected(epoch.error());
+    if (*epoch)
+        st.last_sync_epoch = (*epoch)->get<int64_t>();
 
-    if (auto it = j.find("stale"); it != j.end()) {
-        if (!it->is_boolean()) {
-            err = "stale: expected boolean";
-            return std::nullopt;
-        }
-        st.stale = it->get<bool>();
-    }
+    auto stale = detail::optional_field(
+        j, "stale", "", [](const json& v) { return v.is_boolean(); }, "boolean");
+    if (!stale)
+        return std::unexpected(stale.error());
+    if (*stale)
+        st.stale = (*stale)->get<bool>();
 
-    if (auto it = j.find("change_log"); it != j.end()) {
-        if (!it->is_array()) {
-            err = "change_log: expected array";
-            return std::nullopt;
-        }
+    auto log = detail::optional_field(
+        j, "change_log", "", [](const json& v) { return v.is_array(); }, "array");
+    if (!log)
+        return std::unexpected(log.error());
+    if (*log) {
         std::size_t idx = 0;
-        for (const auto& entry : *it) {
+        for (const auto& entry : **log) {
             const std::string where = "change_log[" + std::to_string(idx) + "].";
-            if (!entry.is_object()) {
-                err = "change_log[" + std::to_string(idx) + "]: expected object";
-                return std::nullopt;
-            }
+            if (!entry.is_object())
+                return std::unexpected(
+                    ParseError{"change_log[" + std::to_string(idx) + "]: expected object"});
+
             ChangeRecord cr;
-            if (!detail::read_string_field(entry, "key", where, cr.key, err) ||
-                !detail::read_string_field(entry, "old_value", where, cr.old_value, err) ||
-                !detail::read_string_field(entry, "new_value", where, cr.new_value, err))
-                return std::nullopt;
-            if (entry.contains("key") && !is_category_key(cr.key)) {
-                err = where + "key: unknown category";
-                return std::nullopt;
-            }
-            if (auto it_t = entry.find("timestamp"); it_t != entry.end()) {
-                if (!it_t->is_number_integer()) {
-                    err = where + "timestamp: expected integer";
-                    return std::nullopt;
-                }
-                cr.timestamp = it_t->get<int64_t>();
-            }
+            auto key = detail::optional_string(entry, "key", where);
+            if (!key)
+                return std::unexpected(key.error());
+            if (!*key)
+                return std::unexpected(ParseError{where + "key: missing"});
+            if (!is_category_key(**key))
+                return std::unexpected(ParseError{where + "key: unknown category"});
+            cr.key = std::move(**key);
+
+            auto old_value = detail::optional_string(entry, "old_value", where);
+            if (!old_value)
+                return std::unexpected(old_value.error());
+            if (*old_value)
+                cr.old_value = std::move(**old_value);
+
+            auto new_value = detail::optional_string(entry, "new_value", where);
+            if (!new_value)
+                return std::unexpected(new_value.error());
+            if (*new_value)
+                cr.new_value = std::move(**new_value);
+
+            auto ts = detail::optional_field(
+                entry, "timestamp", where, [](const json& v) { return v.is_number_integer(); },
+                "integer");
+            if (!ts)
+                return std::unexpected(ts.error());
+            if (*ts)
+                cr.timestamp = (*ts)->get<int64_t>();
+
             st.change_log.push_back(std::move(cr));
             ++idx;
         }

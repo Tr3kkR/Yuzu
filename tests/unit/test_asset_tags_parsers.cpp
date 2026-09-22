@@ -6,7 +6,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::asset_tags;
@@ -154,8 +156,7 @@ TEST_CASE("asset_tags snapshot round trip and caps", "[agent][asset_tags_parsers
     apply_sync(st, vals("db2", "Production", "Rack A|3"), 200);
 
     const auto text = serialize_state(st);
-    std::string err;
-    auto parsed = parse_state(text, err);
+    auto parsed = parse_state(text);
     REQUIRE(parsed.has_value());
     CHECK(parsed->tags == st.tags);
     CHECK(parsed->last_sync_epoch == st.last_sync_epoch);
@@ -172,7 +173,7 @@ TEST_CASE("asset_tags snapshot round trip and caps", "[agent][asset_tags_parsers
         AssetTagState big;
         for (int i = 1; i <= 60; ++i)
             big.change_log.push_back(ChangeRecord{"role", "", std::to_string(i), i});
-        auto p = parse_state(serialize_state(big), err);
+        auto p = parse_state(serialize_state(big));
         REQUIRE(p.has_value());
         REQUIRE(p->change_log.size() == kMaxChangeLog);
         CHECK(p->change_log.front().new_value == "11");
@@ -183,13 +184,13 @@ TEST_CASE("asset_tags snapshot round trip and caps", "[agent][asset_tags_parsers
         j["tags"] = {{"role", std::string(600, 'x')}};
         j["change_log"] = nlohmann::json::array(
             {{{"key", "role"}, {"old_value", std::string(600, 'y')}, {"new_value", "z"}}});
-        auto p = parse_state(j.dump(), err);
+        auto p = parse_state(j.dump());
         REQUIRE(p.has_value());
         CHECK(p->tags.at("role").size() == kMaxValueBytes);
         CHECK(p->change_log.at(0).old_value.size() == kMaxValueBytes);
     }
     SECTION("an unknown extra top-level key is ignored") {
-        auto p = parse_state(R"({"future_field":1,"tags":{"role":"db"}})", err);
+        auto p = parse_state(R"({"future_field":1,"tags":{"role":"db"}})");
         REQUIRE(p.has_value());
         CHECK(p->tags.at("role") == "db");
         CHECK(p->stale);
@@ -203,13 +204,13 @@ TEST_CASE("asset_tags snapshot round trip and caps", "[agent][asset_tags_parsers
 
 TEST_CASE("asset_tags parse_state rejects the whole snapshot on a schema violation",
           "[agent][asset_tags_parsers]") {
-    std::string err;
-    CHECK_FALSE(parse_state("", err).has_value());
-    CHECK_FALSE(err.empty());
-    CHECK_FALSE(parse_state("{not json", err).has_value());
-    CHECK_FALSE(err.empty());
-    CHECK_FALSE(parse_state("[]", err).has_value());
-    CHECK_FALSE(err.empty());
+    for (const char* text : {"", "{not json", "[]"}) {
+        DYNAMIC_SECTION("not an object: '" << text << "'") {
+            auto p = parse_state(text);
+            REQUIRE_FALSE(p.has_value());
+            CHECK_FALSE(p.error().message.empty());
+        }
+    }
 
     struct Bad {
         const char* text;
@@ -221,18 +222,22 @@ TEST_CASE("asset_tags parse_state rejects the whole snapshot on a schema violati
         {R"({"last_sync_epoch":"x"})", "last_sync_epoch"},
         {R"({"stale":"yes"})", "stale"},
         {R"({"change_log":{}})", "change_log"},
-        {R"({"change_log":[{"timestamp":"s"}]})", "change_log[0].timestamp"},
+        {R"({"change_log":[{"key":"role","timestamp":"s"}]})", "change_log[0].timestamp"},
         {R"({"change_log":[{"key":"ro|le"}]})", "change_log[0].key"},
+        {R"({"change_log":[{"key":7}]})", "change_log[0].key"},
+        // A change record without a category key is not a record this plugin
+        // ever writes: rejected whole, never loaded as key="".
+        {R"({"change_log":[{"old_value":"a","new_value":"b","timestamp":1}]})",
+         "change_log[0].key: missing"},
         {R"({"change_log":[{"key":"role"},5]})", "change_log[1]"},
         {R"({"tags":{"colour":"red"}})", "tags.colour"},
     };
     for (const auto& c : cases) {
         DYNAMIC_SECTION(c.text) {
-            err.clear();
-            std::optional<AssetTagState> p;
-            REQUIRE_NOTHROW(p = parse_state(c.text, err));
-            CHECK_FALSE(p.has_value());
-            CHECK(err.find(c.field) != std::string::npos);
+            std::expected<AssetTagState, ParseError> p;
+            REQUIRE_NOTHROW(p = parse_state(c.text));
+            REQUIRE_FALSE(p.has_value());
+            CHECK(p.error().message.find(c.field) != std::string::npos);
         }
     }
 }

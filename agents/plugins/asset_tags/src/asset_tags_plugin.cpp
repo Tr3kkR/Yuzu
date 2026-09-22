@@ -64,17 +64,18 @@ void load_state() {
     if (g_store_path.empty())
         return;
 
-    std::string err;
-    auto text = read_state_file(g_store_path, err);
+    auto text = read_state_file(g_store_path);
     if (!text) {
-        if (!err.empty())
-            spdlog::warn("asset_tags: cannot read state file {}: {}", g_store_path.string(), err);
+        spdlog::warn("asset_tags: cannot read state file: {}", text.error().message);
         return;
     }
+    if (!*text)
+        return; // first run
 
-    auto parsed = parse_state(*text, err);
+    auto parsed = parse_state(**text);
     if (!parsed) {
-        spdlog::warn("asset_tags: ignoring corrupt state file {}: {}", g_store_path.string(), err);
+        spdlog::warn("asset_tags: ignoring corrupt state file {}: {}", g_store_path.string(),
+                     parsed.error().message);
         return;
     }
     g_state = std::move(*parsed);
@@ -219,10 +220,13 @@ private:
             new_changes = apply_sync(g_state, values, now);
 
             if (!g_store_path.empty()) {
-                std::string err;
-                persisted = write_state_file_atomic(g_store_path, serialize_state(g_state), err);
-                if (!err.empty())
-                    spdlog::warn("asset_tags: state file {}: {}", g_store_path.string(), err);
+                auto written = write_state_file_atomic(g_store_path, serialize_state(g_state));
+                if (!written) {
+                    persisted = false;
+                    spdlog::warn("asset_tags: state not persisted: {}", written.error().message);
+                } else if (*written) {
+                    spdlog::warn("asset_tags: {}", (*written)->message);
+                }
             }
 
             for (std::size_t i = 0; i < kCategoryKeys.size(); ++i)
@@ -249,7 +253,7 @@ private:
             ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL);
         else
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "persist_failed");
+                                  "asset_tags:persist_failed");
         return 0;
     }
 

@@ -7,8 +7,10 @@
   never rejected or stripped. State is now persisted under the same lock as the change that produced it,
   through a temp file renamed into place (owner-only `0600` on POSIX; Windows keeps the inherited ACL),
   and write failures are logged and reported on `sync` as a `CONSTRAINED` / `PARTIAL` result status with
-  provenance `persist_failed` (`sync` previously declared no status). A corrupt or wrong-typed state file
+  provenance `asset_tags:persist_failed` (`sync` previously declared no status). A corrupt or wrong-typed state file
   is now rejected whole with a logged reason, and the agent starts from defaults until the next `sync`
   rewrites it; a malformed `asset_tags.check_interval` is logged instead of silently ignored. Visible on
   upgrade: an existing state file holding more than 50 change entries is trimmed to the newest 50 on load,
-  and stored values longer than 448 bytes are capped on load.
+  and stored values longer than 448 bytes are capped on load. A stored value that is not valid UTF-8 is
+  persisted with U+FFFD in place of each bad byte, so it changes after a restart; a value the server
+  accepted is valid UTF-8 and is unaffected.
