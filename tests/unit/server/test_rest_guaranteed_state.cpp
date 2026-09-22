@@ -4695,19 +4695,24 @@ TEST_CASE("REST gs.status/{agent_id} (seam-bypass tripwire): answers via Guardia
 TEST_CASE("REST gs.rules/{id}/status (seam-bypass tripwire): answers via GuardianApi, not the "
           "raw store",
           "[pg][rest][guaranteed_state][twins]") {
-    // The handler's existence pre-check calls get_rule() through the SAME
-    // seam, so the double must answer both methods it needs.
+    // The handler makes TWO seam calls — the get_rule() existence pre-check,
+    // then rule_status() — and each must be independently revert-sensitive.
+    // "seam-rule" exists ONLY in the double: reverting the pre-check to the
+    // raw store 404s; reverting rule_status() answers no WS-SEAM row. The
+    // real store's r1 is noise that must not surface.
     GuaranteedStateRuleRow found;
-    found.rule_id = "r1";
-    found.name = "rule-one";
+    found.rule_id = "seam-rule";
+    found.name = "seam-rule-name";
     GuardianRuleAgentStatusRow seam_row;
     seam_row.agent_id = "WS-SEAM";
     seam_row.state = "drifted";
     seam_row.updated_at = "2026-06-20T10:00:00Z";
     auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
         yuzu::server::test::FnGuardianApi::ListRulesFn{},
-        [found](const std::string&)
+        [found](const std::string& id)
             -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            if (id != "seam-rule")
+                return std::optional<GuaranteedStateRuleRow>{};
             return std::optional<GuaranteedStateRuleRow>{found};
         },
         yuzu::server::test::FnGuardianApi::StatusFn{},
@@ -4716,10 +4721,10 @@ TEST_CASE("REST gs.rules/{id}/status (seam-bypass tripwire): answers via Guardia
             return std::vector<GuardianRuleAgentStatusRow>{seam_row};
         });
     RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
-    // Real store's r1 has NO status rows — a revert would answer an empty list.
     h.seed_rule("r1", "rule-one");
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    auto res =
+        h.sink.Get("/api/v1/guaranteed-state/rules/seam-rule/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);

@@ -26,8 +26,9 @@
 /// otherwise refuse to render, never render an empty/zero result that would
 /// misreport the fleet as compliant or a rule as having no reporting agents.
 ///
-/// The five result structs these functions return (`GuardianStatusRollup`
-/// through `GuardianDeviceComplianceRollup`) live in the pure
+/// The six result structs these functions return (`GuardianStatusRollup`
+/// through `GuardianDeviceComplianceRollup`, plus its nested
+/// `GuardianDeviceComplianceGuardRow`) live in the pure
 /// `guardian_types.hpp` (included below), NOT here — this header
 /// forward-declares `GuaranteedStateStore`/`BaselineStore` and its functions
 /// take them by reference, so it cannot itself sit behind the ADR-0031 WS-A4

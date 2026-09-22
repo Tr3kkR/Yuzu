@@ -5487,19 +5487,25 @@ TEST_CASE("MCP get_guardian_rule_status (seam-bypass tripwire): answers via the 
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
-    mcp_seed_rule(store, "r1", "rule-one"); // real rule, NO real status rows
+    // Two seam calls (get_rule() pre-check, then rule_status()), each
+    // independently revert-sensitive: "seam-rule" exists ONLY in the double,
+    // so a raw-store pre-check answers not-found and a raw-store rule_status()
+    // answers no WS-SEAM row. The real store's r1 is noise.
+    mcp_seed_rule(store, "r1", "rule-one");
 
     GuaranteedStateRuleRow found;
-    found.rule_id = "r1";
-    found.name = "rule-one";
+    found.rule_id = "seam-rule";
+    found.name = "seam-rule-name";
     GuardianRuleAgentStatusRow seam_row;
     seam_row.agent_id = "WS-SEAM";
     seam_row.state = "drifted";
     seam_row.updated_at = "2026-06-20T10:00:00Z";
     auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
         yuzu::server::test::FnGuardianApi::ListRulesFn{},
-        [found](const std::string&)
+        [found](const std::string& id)
             -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            if (id != "seam-rule")
+                return std::optional<GuaranteedStateRuleRow>{};
             return std::optional<GuaranteedStateRuleRow>{found};
         },
         yuzu::server::test::FnGuardianApi::StatusFn{},
@@ -5514,7 +5520,7 @@ TEST_CASE("MCP get_guardian_rule_status (seam-bypass tripwire): answers via the 
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"get_guardian_rule_status",)"
-        R"("arguments":{"rule_id":"r1"}}})");
+        R"("arguments":{"rule_id":"seam-rule"}}})");
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));

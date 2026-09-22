@@ -252,15 +252,25 @@ TEST_CASE("GuardianApi: a null baseline_store degrades ONLY device_compliance �
     PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
     GuaranteedStateStore store{gs_pool};
     REQUIRE(store.create_rule(make_rule("rule-1", "match-me")).has_value());
+    REQUIRE(store.insert_event(make_event("evt-1", "rule-1", "agent-1")).has_value());
 
     auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
 
+    // All seven store-only methods, each asserted functional — a stray
+    // baseline_store null-check added to any one of them fails here.
     auto rows = api->list_rules();
     REQUIRE(rows.has_value());
     CHECK(rows->size() == 1);
 
-    auto status = api->status(std::nullopt);
-    REQUIRE(status.has_value());
+    auto found = api->get_rule("rule-1");
+    REQUIRE(found.has_value());
+    CHECK(found->has_value());
+
+    CHECK(api->status(std::nullopt).has_value());
+    CHECK(api->agent_status("agent-1").has_value());
+    CHECK(api->rule_status("rule-1").has_value());
+    CHECK(api->device_guards("agent-1").has_value());
+    CHECK(api->list_events(GuaranteedStateEventQuery{}).size() == 1);
 
     bool store_degraded = false;
     bool pii_access_began = true; // pre-seed non-default so a no-op wrap can't fake false
@@ -289,4 +299,23 @@ TEST_CASE("GuardianApi: a null guaranteed_state_store degrades every method to i
     CHECK_FALSE(api->device_compliance("any", "any", &store_degraded, &pii_access_began)
                     .has_value());
     CHECK(store_degraded);
+    CHECK_FALSE(pii_access_began);
+}
+
+TEST_CASE("GuardianApi: a null guaranteed_state_store with a LIVE baseline_store still degrades "
+          "device_compliance — it needs both stores",
+          "[pg][guardian_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, baselinestore_tpl);
+    PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 2}};
+    BaselineStore baseline_store{bl_pool};
+
+    auto api = make_local_guardian_api(/*store=*/nullptr, &baseline_store);
+
+    bool store_degraded = false;
+    bool pii_access_began = true; // pre-seed non-default so a no-op wrap can't fake false
+    auto rollup = api->device_compliance("Any Baseline", "agent-1", &store_degraded,
+                                         &pii_access_began);
+    CHECK_FALSE(rollup.has_value());
+    CHECK(store_degraded);
+    CHECK_FALSE(pii_access_began);
 }

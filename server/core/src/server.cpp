@@ -16638,8 +16638,9 @@ private:
         if (workflow_engine_)
             workflow_api = make_local_workflow_api(*workflow_engine_);
         // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
-        // instance backing the 9 GET /api/v1/guaranteed-state/* resources
-        // (RestApiV1) and their MCP twins, so the two can never disagree.
+        // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
+        // (all but the store-free `schemas`) and their MCP twins, so the two
+        // can never disagree.
         // Constructed UNCONDITIONALLY (never null) — mirrors dex_perf_api's
         // own multi-dependency posture, NOT dex_api's/workflow_api's
         // store-gated one: seven of the eight methods need ONLY
@@ -19146,7 +19147,7 @@ private:
             mcp_server_->set_workflow_api(workflow_api);
             // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
             // instance the REST GET /api/v1/guaranteed-state/* handlers use
-            // (constructed unconditionally above), so the 9 MCP Guardian
+            // (constructed unconditionally above), so the 8 seamed MCP Guardian
             // read tools can never disagree with REST v1 — each method
             // individually degrades when its own backing store is absent,
             // matching the pre-seam per-route !guaranteed_state_store/

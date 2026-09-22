@@ -10,8 +10,9 @@
 ///      header back, ODR-safe, so every existing includer keeps seeing them
 ///      transitively — the same relocation shape `dex_types.hpp` /
 ///      `schedule_types.hpp` / `workflow_types.hpp` already established).
-///   2. The five pure result structs (`GuardianStatusRollup` through
-///      `GuardianDeviceComplianceRollup`) — relocated out of
+///   2. The six pure result structs (`GuardianStatusRollup` through
+///      `GuardianDeviceComplianceRollup`, plus its nested member type
+///      `GuardianDeviceComplianceGuardRow`) — relocated out of
 ///      `guardian_model.hpp`, whose function DECLARATIONS stay put (they
 ///      forward-declare `GuaranteedStateStore`/`BaselineStore` and take them
 ///      by reference, so `guardian_model.hpp` itself cannot sit behind the

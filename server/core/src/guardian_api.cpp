@@ -29,7 +29,12 @@ namespace yuzu::server {
 /// existing store-unavailable 503 today"). Neither REST nor MCP surfaces the
 /// distinction to the caller today (both branches already render a generic
 /// 503 without inspecting which guard fired), and in production the null
-/// case is unreachable regardless — `guaranteed_state_store_`/
+/// case is unreachable regardless. One exception to the 503 parity:
+/// `list_events` returns a plain vector (the ADR-0038 deferred widening this
+/// seam preserves), so a null store there answers an EMPTY 200 — the same
+/// result `query_events` already gives on a genuine read failure — where the
+/// pre-seam handler's own null-store guard answered 503. That path is
+/// unreachable in production too — `guaranteed_state_store_`/
 /// `baseline_store_` fail the WHOLE server closed at boot if either can't
 /// open (ADR-0012 §1), so by the time any request reaches this class both
 /// are always live.
