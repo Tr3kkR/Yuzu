@@ -561,14 +561,15 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // (mirrors test_capability_catalogue.cpp's own `build_registry`) and pins
 // the live Destructive row count. #3685's design doc claimed 14 Destructive
 // rows; counting the actual capability_decls/*.hpp fragments during this
-// checkpoint found 17 (verified via `git grep -c ".dispatch_class =
+// checkpoint found 17 (19 once power_health's and printing's rows landed;
+// verified at the time via `git grep -c ".dispatch_class =
 // DispatchClass::Destructive" capability_decls/*.hpp`) — the "four
 // Execution:Execute rows" sub-claim (script_exec.{exec,powershell,bash} +
 // content_dist.execute_staged) IS accurate, but the total is not. This case
 // pins the CORRECTED, live count so a future catalogue change that adds or
 // removes a Destructive row has to touch this test, not silently drift past
 // #3685's own coverage claim the way the design doc's count already did.
-TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17, not the design "
+TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19, not the design "
           "doc's stale 14 (#3685) — a new/removed Destructive row must touch this test",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
@@ -609,11 +610,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 18, not 17: power_health's set_power_plan is a Destructive row and the
-// mirror must include it, or a FUTURE Destructive row in that fragment
-// lands with the aggregate tripwire still passing -- which is exactly the
-// drift this test's own title forbids.
-    CHECK(destructive_count == 18);
+    // 19, not 17: power_health's set_power_plan and printing's clear_queue are
+// each a Destructive row and the mirror must include both, or a FUTURE
+// Destructive row in either fragment lands with the aggregate tripwire
+// still passing -- which is exactly the drift this test's own title
+// forbids.
+    CHECK(destructive_count == 19);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS

@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -147,6 +148,16 @@ struct Config {
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
+
+    // HA WS-4 4.3: per-cluster ManagementService addresses for cross-cluster
+    // command fan-out (`--gateway-cluster-addr cluster_id=host:port`, comma-
+    // repeatable). Empty (the default) means single-cluster mode:
+    // `gateway_command_address` alone is used regardless of which cluster_id
+    // an agent's gateway announces — byte-for-byte the pre-4.3 behavior. Set
+    // means multi-cluster mode: see `GatewayMgmtStubPool`
+    // (gateway_mgmt_stub_pool.hpp) for the full resolution rule, including
+    // the `"default"` auto-alias to `gateway_command_address`.
+    std::unordered_map<std::string, std::string> gateway_cluster_addresses;
 
     // #1128: operator-declared multi-egress NAT/proxy ranges. When a direct-
     // connect agent's Register and Subscribe present different source IPs that

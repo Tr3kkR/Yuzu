@@ -266,7 +266,7 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 ### 3.9 Printer Inventory :white_check_mark: `T3` *(verified 2026-09-15)*
 
-`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. See `agents/plugins/printing/README.md`.
+`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. `clear_queue` cancels exactly one job (Destructive/Irreversible, admin-or-approval) with no purge-all path. See `agents/plugins/printing/README.md`.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2` *(verified 2026-09-10)*
 

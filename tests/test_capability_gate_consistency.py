@@ -115,14 +115,14 @@ FRAGMENT_FILES = [
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
-# Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
-# focused follow-up PR on top of this one.
+# Wave 9 PR9.1b: +2 printing (printers/jobs).
+# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue.
 # Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 2 (browser_inventory) = 211.
-EXPECTED_TOTAL_ROWS = 211
+# 1 (printing.clear_queue) + 2 (browser_inventory) = 212.
+EXPECTED_TOTAL_ROWS = 212
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
