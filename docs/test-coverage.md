@@ -169,7 +169,6 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 
 | Component | Why Untested | Priority |
 |-----------|-------------|----------|
-| **EventBus** (SSE) | Needs thread-safe test harness | Medium |
 | **AgentRegistry** | Depends on gRPC protobuf types | Medium |
 | **AgentServiceImpl** (Register/Subscribe) | Requires mock gRPC streams | Low |
 | **GatewayUpstreamServiceImpl** | Requires mock gRPC streams | Low |
@@ -211,9 +210,8 @@ If a plugin has pure functions worth testing:
 
 ## Future Test Priorities
 
-1. **EventBus** — thread-safe subscribe/publish/unsubscribe
-2. **AgentRegistry** — to_json, help_json, evaluate_scope (once protobuf dep is available to tests)
-3. **Netstat parsing** — extract Linux parse_ipv4/ipv6/hex_port to a header for testing
-4. **Firewall parsing** — extract Windows parse_firewall_state/rules to a header for testing
-5. **NvdClient JSON parsing** — mock HTTP responses and test parse_response
-6. **Integration tests** — full Register/Subscribe flow with mock gRPC
+1. **AgentRegistry** — to_json, help_json, evaluate_scope (once protobuf dep is available to tests)
+2. **Netstat parsing** — extract Linux parse_ipv4/ipv6/hex_port to a header for testing
+3. **Firewall parsing** — extract Windows parse_firewall_state/rules to a header for testing
+4. **NvdClient JSON parsing** — mock HTTP responses and test parse_response
+5. **Integration tests** — full Register/Subscribe flow with mock gRPC

@@ -103,7 +103,7 @@ Two patterns coexist for embedding static front-end assets in the server binary;
 
 Use for assets we author in this repo (page HTML shells, small bespoke JS modules, hand-curated bundle code).
 
-- Single namespace-scope `extern const std::string` (or `extern const char* const` for HTML strings) declared in the consuming TU and defined in its own `.cpp` (e.g. `viz_page_ui.cpp`, `tar_page_ui.cpp`, `yuzu_viz_js_bundle.cpp`, `charts_js_bundle.cpp`).
+- Single namespace-scope `extern const std::string` (or `extern const char* const` for HTML strings) declared in the consuming TU and defined in its own `.cpp` (e.g. `viz_page_ui.cpp`, `tar_page_ui.cpp`, `charts_js_bundle.cpp`).
 - Source code is the authoritative form; raw-string literal embeds the body verbatim.
 - Stay under MSVC's 16,380-byte raw-string-literal limit (C2026); chunk by hand or migrate to Pattern B once growth approaches the limit.
 - Test tags in `tests/unit/server/test_static_js_bundle.cpp` follow the surface they describe, not the TU pattern: `[viz][page]` / `[viz][routes]` for the HTML pages and routes, `[static-js][viz]` / `[static-js][three]` / `[static-js][htmx]` for JS bundles.

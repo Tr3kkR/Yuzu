@@ -445,11 +445,11 @@ campaign's inline-route-extraction goal is complete.
 | Agent KV storage | SQLite (`agent.db`) | Cross-instruction persistent state |
 | Server substrate | **PostgreSQL** (shared `PgPool`) | Server storage substrate (ADR-0006/0007); server **fails closed** without it |
 | Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store) |
-| Server responses | SQLite (sharded) | Command response persistence with TTL *(SQLite today; per-store PG migration pending)* |
-| Server audit | SQLite | User action audit trail *(SQLite today; per-store PG migration pending)* |
-| Server identity/auth | AuthDB (`auth.db`) + config files (`.cfg`) | Users, tokens, enrollment, settings *(AuthDB since v0.12.0; per-store PG migration pending)* |
-| NVD/CVE data | SQLite | Vulnerability database |
-| Policy state | SQLite | Rule evaluation history, compliance |
+| Server responses | **PostgreSQL** (shared `PgPool`) | Command response persistence with TTL |
+| Server audit | **PostgreSQL** (shared `PgPool`) | User action audit trail |
+| Server identity/auth | **PostgreSQL** (`auth` + `scim_store` schemas) + config files (`.cfg`) | Users, tokens, enrollment, settings |
+| NVD/CVE data | SQLite | Vulnerability database *(the one server store deliberately still on SQLite — see `docs/postgres-migration-ladder.md`)* |
+| Policy state | **PostgreSQL** (shared `PgPool`) | Rule evaluation history, compliance |
 | Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
 | VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
