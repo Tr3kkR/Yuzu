@@ -35,6 +35,8 @@ upstream_test_() ->
       {"empty flush sends no rpc", fun empty_flush_no_rpc/0},
       {"proxy_register returns response", fun proxy_register_ok/0},
       {"proxy_register returns error", fun proxy_register_error/0},
+      {"HA WS-4 4.4 (c-1/CH-2): a real http_error shape does not crash",
+       fun proxy_register_http_error/0},
       {"proxy_inventory returns response", fun proxy_inventory_ok/0},
       {"notify_stream_status does not crash on error", fun notify_no_crash/0},
       {"connect notification advertises command_dispatch_tag_v1", fun notify_advertises_dispatch_tag_capability/0},
@@ -142,14 +144,41 @@ proxy_register_ok() ->
     ?assertMatch({ok, #{session_id := <<"new-sess">>}}, Result).
 
 proxy_register_error() ->
+    %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error return for a
+    %% genuine (non-transport) grpc status is a 3-ELEMENT tuple — `error`,
+    %% the `{Status, Message}` pair, and the trailers map
+    %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) — not the
+    %% OLD mocked shape here (`{error, {Status, Message, Trailers}}`, a
+    %% 2-element tuple whose 2nd element was itself a 3-tuple), which this
+    %% test previously used and do_rpc's matching clause mirrored. That
+    %% shape does not match ANYTHING grpcbox actually returns, so do_rpc's
+    %% corresponding clause could never fire against the real dependency —
+    %% both were wrong together. Fixed to the real shape.
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _       -> {error, {14, <<"UNAVAILABLE">>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertMatch({error, {14, _}}, Result).
+
+proxy_register_http_error() ->
+    %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
+    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
+    %% `{http_error, {Status, Message}, Trailers}` (a non-grpc-layer HTTP
+    %% error), previously matched no clause in do_rpc and would have crashed
+    %% this gen_server with a case_clause exception.
+    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _       -> {http_error, {502, <<>>}, #{}}
+        end
+    end),
+    Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertMatch({error, {internal, _}}, Result),
+    %% Above all: the gen_server survived and answers normally.
+    ?assert(is_pid(whereis(yuzu_gw_upstream))).
 
 proxy_inventory_ok() ->
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->

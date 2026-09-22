@@ -3,9 +3,11 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <limits>
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include "dex_alert_router.hpp"
@@ -105,9 +107,15 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
-            spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
+            spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}",
+                         log_id_token(agent_id));
             return; // a malformed frame never reaches the store - not a timed ingest
         }
+        // #4606 criterion-10 T_server waypoint: server receipt, captured before
+        // store.insert_event_classified so store latency is not folded in.
+        const std::int64_t recv_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
         ev_row.rule_id = ev.rule_id();
@@ -132,8 +140,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // CRLF-forging exposure.
             spdlog::warn("Guardian: dropping oversized detail_json ({} bytes) from agent {} "
                          "event {} (cap {})",
-                         ev_row.detail_json.size(), sanitize_label(agent_id),
-                         sanitize_label(ev_row.event_id), kMaxDetailJson);
+                         ev_row.detail_json.size(), log_id_token(agent_id),
+                         log_id_token(ev_row.event_id), kMaxDetailJson);
             ev_row.detail_json.clear();
         }
 
@@ -187,29 +195,65 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         case EventInsertOutcome::Inserted:
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
-            // Agent-controlled identifiers are sanitize_label'd before they reach any log
-            // line: the NUL guard strips \0 but not CR/LF, and the tightened
-            // YuzuGuardianEventsDropped alert directs operators to trust these logs, so a
-            // raw event_id could otherwise forge log lines (sec-M1). Same chokepoint the
-            // observer path uses. res.error is dropped on Conflict — it only repeats the
-            // (now-sanitized) event_id.
+            // Agent-controlled identifiers are neutralised before they reach any key=value
+            // log line: the NUL guard strips \0 but not CR/LF, a space or '=' forges extra
+            // tokens, and the tightened YuzuGuardianEventsDropped alert directs operators to
+            // trust these logs (sec-M1). log_id_token is the neutraliser and length rule that
+            // the T_server line and the agent's T_wire/T_detect lines use, so an id reads
+            // identically on every line an operator joins across. (sanitize_label above stays
+            // for the observer path: the alert-sink labels and the observer-threw warns below,
+            // which are not key=value lines.) res.error is dropped on Conflict: it only
+            // repeats the (now-neutralised) event_id.
             spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
                           "event_id={} agent={} rule={}",
-                          sanitize_label(ev_row.event_id), sanitize_label(agent_id),
-                          sanitize_label(ev_row.rule_id));
+                          log_id_token(ev_row.event_id), log_id_token(agent_id),
+                          log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Conflict:
             spdlog::warn("Guardian: event_id collision with MISMATCHED fields (possible "
                          "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}",
-                         sanitize_label(ev_row.event_id), sanitize_label(agent_id),
-                         sanitize_label(ev_row.rule_id));
+                         log_id_token(ev_row.event_id), log_id_token(agent_id),
+                         log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Error:
             // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
-            // input — but the identifiers still get sanitized.
+            // input — but the identifiers still get neutralised.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
-                         sanitize_label(agent_id), sanitize_label(ev_row.rule_id), res.error);
+                         log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);
             return;
+        }
+        if (ev_row.rule_id != kObservationRuleId) {
+            // #4606 criterion-10 T_server: benchmark-diagnostic latency waypoint, always-on at
+            // info level (the shipped default is what the benchmark must measure). Best-effort —
+            // formatting/logging must never escape onto the gRPC ingest thread (same posture as
+            // the metrics try/catch above and the blast-radius try/catch below).
+            try {
+                const std::int64_t store_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                   std::chrono::steady_clock::now() - store_t0)
+                                                   .count();
+                // Agent-supplied wire timestamp, checked before use (untrusted protobuf input):
+                // the field must be present, nanos must be in [0, 1e9) and seconds must not
+                // overflow an int64 once scaled. An ABSENT timestamp reads as seconds()==0, which
+                // must not be reported as a real epoch-0 instant, so it takes the sentinel too.
+                std::int64_t agent_ns = -1; // sentinel: invalid/unavailable
+                const std::int64_t secs = ev.timestamp().seconds();
+                const std::int32_t nanos = ev.timestamp().nanos();
+                constexpr std::int64_t kNsPerSec = 1'000'000'000;
+                if (ev.has_timestamp() && nanos >= 0 && nanos < kNsPerSec && secs >= 0 &&
+                    secs <= (std::numeric_limits<std::int64_t>::max() / kNsPerSec) - 1)
+                    agent_ns = secs * kNsPerSec + nanos;
+                // The three ids are agent- or operator-supplied text embedded in a space-delimited
+                // key=value line, so each goes through the SAME neutraliser and shortening the
+                // agent's T_wire/T_detect lines use (yuzu/log_token.hpp, log_id_token): a space or
+                // '=' would otherwise forge extra tokens, and a per-side rule would break the
+                // event_id join.
+                spdlog::info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
+                             "committed_ns={} agent_ns={} store_ms={}",
+                             log_id_token(ev_row.event_id), log_id_token(agent_id),
+                             log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
+                             agent_ns, store_ms);
+            } catch (...) { // best-effort diagnostic; never propagate onto the ingest thread
+            }
         }
         // Fleet-wide incident detection — RULELESS observations only, and only
         // AFTER the event committed (a rolled-back duplicate must never count a

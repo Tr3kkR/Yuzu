@@ -242,6 +242,9 @@ TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",
     REQUIRE(body["results"].size() == 1);
     CHECK(body["results"][0]["agent_id"] == "agent-3");
     CHECK(body["result_truncated_by_cap"] == false);
+    // #4496: emitted unconditionally (0 when nothing was excluded), same
+    // convention as `count`/`result_truncated_by_cap` on this route.
+    CHECK(body["results_excluded_by_poison"] == 0);
 }
 
 TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
@@ -290,6 +293,11 @@ TEST_CASE("GET /api/inventory/:agent_id/:plugin: a poisoned data_json is exclude
     CHECK(body["error"]["code"] == 404);
 }
 
+// #4496: this test predates the `results_excluded_by_poison` signal - it
+// originally only proved the exclusion was silent-but-safe (no crash, `count`
+// consistent). It now also proves the caller can TELL a record was excluded,
+// which #4496 exists to fix (the response otherwise looks identical to "no
+// poisoned records existed").
 TEST_CASE("POST /api/inventory/query: a poisoned record is excluded, a healthy matching "
           "record is still returned, and count stays consistent with the exclusion",
           "[server][routes][data_inventory_routes][rest][pg][security]") {
@@ -317,6 +325,9 @@ TEST_CASE("POST /api/inventory/query: a poisoned record is excluded, a healthy m
     REQUIRE(body["results"].size() == 1);
     CHECK(body["results"][0]["agent_id"] == "agent-healthy");
     CHECK(body["count"] == 1); // consistent with the exclusion, not silently wrong
+    // #4496: the signal this test was missing before - without it, this
+    // response is byte-for-byte identical to "no poisoned record existed".
+    CHECK(body["results_excluded_by_poison"] == 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -87,6 +87,59 @@
 
 #include <cstdio>
 
+// #1611: TSan suppression for libpq's two connect-time process globals.
+//
+// libpq (vcpkg libpq 16.9, src/interfaces/libpq/fe-exec.c, pqSaveParameterStatus)
+// copies EVERY new connection's client_encoding and standard_conforming_strings
+// ParameterStatus into two file-scope statics, static_client_encoding and
+// static_std_strings. Upstream's own comment says why: "so that PQescapeString and
+// PQescapeBytea can behave somewhat sanely (at least in single-connection-using
+// programs)". Any two threads establishing Postgres connections concurrently (two
+// PgPool::connect_one() calls, or a pool connect racing a test fixture's direct
+// PQconnectdb) are a write-write race on those statics; TSan sees it because the
+// TSan triplet instruments libpq itself.
+//
+// Benign HERE and only here: the statics are read solely by the conn-less
+// PQescapeString / PQescapeBytea (no `Conn` suffix), which no first-party code
+// calls — every Yuzu query goes through pg::exec_params
+// (docs/postgres-store-playbook.md). tests/test_no_connless_pq_escape.py is the
+// tripwire that keeps that true; the suppression and the tripwire ship together
+// and must not be separated. Anchored to the two GLOBALS by name, not the
+// enclosing function, so a race on a shared PGconn inside the same call frame (a
+// real first-party bug) still fires.
+//
+// Do not "fix" this race instead with a process-wide connect mutex: libpq also
+// delivers ParameterStatus asynchronously outside connect (any later SET/GUC
+// notice), which a connect-time mutex can't cover, and serializing every
+// PgPool's connect against the LeaderElector's own dedicated connection
+// (server/core/src/leader_elector.cpp) adds cross-component latency coupling for
+// no correctness gain here.
+//
+// Compiled in (not TSAN_OPTIONS=suppressions=<file>) so this one definition
+// covers every invocation of these binaries: nightly, on-demand sanitizer runs,
+// scripts/ci/tsan-gdb-capture.py re-runs, local runs. This project compiles with
+// -fvisibility=hidden globally (meson.build); a bare extern "C" definition of
+// this hook would therefore never reach the binary's dynamic symbol table and
+// the TSan runtime would silently keep its built-in empty suppression list
+// instead — the explicit `visibility("default")` below is load-bearing, not
+// decorative. Verify with `nm -D <binary> | grep __tsan_default_suppressions`
+// after building (must show a defined, GLOBAL/default-bound symbol, not
+// missing/local) — see this PR's own verification notes for the exact command.
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TEST_TSAN 1
+#endif
+#endif
+#ifdef YUZU_TEST_TSAN
+extern "C" __attribute__((visibility("default"), used)) const char*
+__tsan_default_suppressions() {
+    return "race:^static_std_strings$\n"
+           "race:^static_client_encoding$\n";
+}
+#endif
+
 int main(int argc, char* argv[]) {
     Catch::Session session;
 

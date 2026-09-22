@@ -6,6 +6,8 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
+#include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -397,6 +399,21 @@ int main(int argc, char* argv[]) {
     app.add_option("--gateway-command-addr", cfg.gateway_command_address,
                    "Gateway ManagementService address for command forwarding (host:port)")
         ->envname("YUZU_GATEWAY_COMMAND_ADDR");
+    // HA WS-4 4.3: raw entries, parsed+validated into cfg.gateway_cluster_addresses
+    // after CLI11_PARSE below (parse_gateway_cluster_addrs needs to reject a
+    // malformed entry with a CLI exit, not a lenient warning — see that
+    // function's doc comment, gateway_mgmt_stub_pool.hpp).
+    std::vector<std::string> gateway_cluster_addr_entries;
+    app.add_option("--gateway-cluster-addr", gateway_cluster_addr_entries,
+                   "Per-cluster gateway ManagementService address(es) for cross-cluster command "
+                   "fan-out, cluster_id=host:port (e.g. us-east=10.0.1.5:50063). Repeatable or "
+                   "comma-separated. Unset (default) = single-cluster mode: "
+                   "--gateway-command-addr alone is used for every cluster_id. Per-cluster "
+                   "routing only -- trust-zone isolation between clusters is not yet provided "
+                   "(#4669); do not rely on this to keep one cluster's gateway from being able "
+                   "to answer for an agent on another cluster.")
+        ->delimiter(',')
+        ->envname("YUZU_GATEWAY_CLUSTER_ADDR");
     app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
                    "Multi-egress NAT/proxy CIDR(s) (e.g. 203.0.113.0/24,2001:db8::/32). A direct "
                    "agent whose Register and Subscribe source IPs both fall in one range is "
@@ -1087,6 +1104,20 @@ int main(int argc, char* argv[]) {
         cfg.csp_extra_sources = std::move(*validated);
     } else {
         std::cerr << "Invalid --csp-extra-sources: " << validated.error() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    // ── Validate --gateway-cluster-addr (HA WS-4 4.3) ──
+    // A malformed/duplicate entry here is a routing-correctness defect, not
+    // an advisory allowlist like --trusted-nat-cidr's own lenient parse —
+    // fail the CLI outright rather than silently dropping or half-applying
+    // an entry (Fable pre-implementation review, 4.3 plan).
+    if (auto parsed = yuzu::server::parse_gateway_cluster_addrs(
+            gateway_cluster_addr_entries, yuzu::server::detail::kMaxClusterIdLen);
+        parsed.has_value()) {
+        cfg.gateway_cluster_addresses = std::move(*parsed);
+    } else {
+        std::cerr << "Invalid --gateway-cluster-addr: " << parsed.error() << "\n";
         return EXIT_FAILURE;
     }
 

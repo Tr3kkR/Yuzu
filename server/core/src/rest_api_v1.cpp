@@ -3,6 +3,8 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
+#include "pg_error_class.hpp" // is_permanent_pg_error — approval store error classification (PR #4656)
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "token_rotation_lookup.hpp"    // shared REST/MCP human-token rotation successor lookup (P2 #11)
@@ -10,12 +12,13 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
-#include "dex_read_model.hpp" // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
@@ -23,6 +26,8 @@
 #include "execution_event_scope.hpp"
 #include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
+                                     // response query/aggregate/export row builders
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
 #include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
@@ -236,8 +241,16 @@ std::string ok_json(std::string_view data_json) {
 // retry_after_ms per agentic-first §A4.
 
 std::string list_json(std::string_view data_json, int64_t total, int64_t start = 0,
-                      int64_t page_size = 50) {
-    auto pag = JObj().add("total", total).add("start", start).add("page_size", page_size).str();
+                      int64_t page_size = 50, bool result_truncated_by_cap = false) {
+    auto pag_obj = JObj().add("total", total).add("start", start).add("page_size", page_size);
+    // Present-only-when-true, matching list_schedules'/query_responses' own
+    // result_truncated_by_cap convention: `total` above is the count RETURNED,
+    // never asserted as the true total, and a caller must not read an absent
+    // key as "definitely complete" vs. "not applicable to this route" -- both
+    // read the same (absent), which is the existing convention's own limit.
+    if (result_truncated_by_cap)
+        pag_obj.add("result_truncated_by_cap", true);
+    auto pag = pag_obj.str();
     return JObj()
         .raw("data", data_json)
         .raw("pagination", pag)
@@ -1149,6 +1162,9 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}/responses": {
       "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}/children": {
+      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible limit/cursor). #2146 A2-R1 Gate 8 fix: the cap is now pushed down TOGETHER WITH the caller's own visibility scope, before LIMIT -- a confined caller's cap applies to their OWN visible children, not the fleet-wide raw row set, so an invisible sibling can no longer displace a visible child out of the capped window. result_truncated_by_cap:true means that scoped row set exceeded the cap; a truncated:false confined response means every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -1156,6 +1172,15 @@ const std::string& openapi_spec() {
         // at compile time, so the emitted OpenAPI JSON is byte-identical to
         // the unsplit form.
         R"json(,
+    "/responses/{id}": {
+      "get": {"summary": "Query command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id} and MCP query_responses' instruction_id path (shared builder response_query_row_json, response_query_model.hpp -- REST v1 and MCP cannot drift on row shape by construction; the legacy route is frozen reference code for this PR, not retrofitted onto the shared builder). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read) -- resolve-then-scope: the in-scope agent set is pushed into the store query BEFORE limit, never post-filtered. No offset parameter (unlike the legacy route): the result set orders by a non-unique, actively-growing timestamp, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400 (mirrors GET /executions/{id}/responses and MCP query_responses). limit is clamped to [1,1000] on BOTH bounds, default 100 when omitted; when the served row count equals limit, pagination.result_truncated_by_cap is set true (matching MCP query_responses' own hit_cap convention) so a caller cannot mistake a capped page for a complete result. Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row (CC7.2), and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows: id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin, received_at_ms. pagination.result_truncated_by_cap (bool, optional) present true when the limit cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/responses/{id}/aggregate": {
+      "get": {"summary": "Aggregate command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/aggregate and MCP aggregate_responses (shared builder response_aggregate_row_json). group_by must be status or agent_id; op is one of count|sum|avg|min|max (default count); op_column (sum/avg/min/max only) must be one of timestamp|status|id, default id when omitted -- an invalid group_by/op_column is a 400, validated against ResponseStore's own allow-list before the query runs. Gated on Response:Read with the same resolve-then-scope confinement as the query route above (filter-before-aggregate, ADR-0017 INV-3). Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row, and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "group_by", "in": "query", "required": false, "schema": {"type": "string", "enum": ["status", "agent_id"], "default": "status"}}, {"name": "op", "in": "query", "required": false, "schema": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"], "default": "count"}}, {"name": "op_column", "in": "query", "required": false, "schema": {"type": "string", "enum": ["timestamp", "status", "id"], "default": "id"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}], "responses": {"200": {"description": "{instruction_id, groups: [{group_value, count, aggregate_value}], total_groups, total_rows}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid group_by, op_column, or numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/responses/{id}/export": {
+      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv -- an unrecognised value falls through to json, matching the legacy route's own behavior exactly (neither route rejects an unknown format with 400); both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds, default 10000 when omitted -- a real, pre-existing gap on the legacy route (an unbounded caller-supplied limit) that is not propagated here. No offset parameter, same non-unique-timestamp-ordering rationale as GET /responses/{id} above -- a caller-supplied offset is rejected with 400. When the served row count equals limit, a cap-hit is signalled: pagination.result_truncated_by_cap on the JSON format, an X-Result-Truncated-By-Cap: true response header on the CSV format (which has no JSON envelope to carry the field in) -- most consequential here since bulk export is this route's purpose and a truncated CSV would otherwise look byte-for-byte like a complete one. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}. pagination.result_truncated_by_cap (JSON) / X-Result-Truncated-By-Cap header (CSV) present true when the limit cap dropped rows.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
     "/workflows": {
       "get": {"summary": "List workflows (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows and MCP list_workflows (new). Requires Workflow:Read (RBAC seeding prerequisite fixed by #4030/#4032 — Workflow was gated but never seeded, so no role could hold this grant before this change). Shared builder workflow_row_json (workflow_model.hpp) — REST/MCP cannot drift on field set.", "parameters": [{"name": "name", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Workflow list"}, "400": {"description": "Invalid limit or numeric query parameter"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "503": {"description": "Workflow engine not available"}}}
     },
@@ -1166,12 +1191,18 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fetch one workflow execution (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflow-executions/{id} and MCP get_workflow_execution (new) — WorkflowEngine's own per-step execution record, a DIFFERENT data model from ExecutionTracker's fan-out Execution (GET /executions/{id}). Both this route and the legacy twin gate on fleet_read_fn (Workflow:Read) with record-level confinement (#4030 Gate 8 fix): a caller with no agent visible in agent_ids_json 404s identically to a nonexistent execution, never a narrower-but-present record; an admitted confined caller's agent_ids is narrowed to their visible agents and each step's result.agents_reached is stripped. Audited as workflow_execution.detail.fetch (set-and-proceed) on both the success path and the confinement-denied path — a genuinely nonexistent id writes no audit row (the denied row alone therefore distinguishes 'exists, out of scope' from 'never existed' for a caller who also holds AuditLog:Read; tracked open). Shared builder workflow_execution_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow execution detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Execution not found"}, "503": {"description": "Workflow engine not available"}}}
     },
     "/schedules": {
-      "get": {"summary": "List schedules (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the dashboard GET /fragments/schedules fragment and the widened MCP list_schedules tool (now includes execution_count). NOT the separate legacy unversioned GET /api/schedules (a distinct, untouched capability). Same two-stage gate as the fragment: a service-scoped token is denied the fleet-wide list outright, then Schedule:Read. Shared builder schedule_row_json. Gated on query_schedules_checked (#4030 review finding): a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when the fleet has more schedules than that, `pagination.result_truncated_by_cap: true` is added so `pagination.total` is never presented as the fleet's true count.", "responses": {"200": {"description": "Schedule list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows."}, "403": {"description": "Insufficient permission (Schedule:Read), or a service-scoped token denied the fleet-wide list"}, "503": {"description": "Schedule engine not available, or the store query itself failed (retry_after_ms in the A4 envelope)"}}}
+      "get": {"summary": "List schedules (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the dashboard GET /fragments/schedules fragment and the widened MCP list_schedules tool (now includes execution_count). NOT the separate legacy unversioned GET /api/schedules (a distinct, untouched capability). Same two-stage gate as the fragment: a service-scoped token is denied the fleet-wide list outright, then Schedule:Read. Shared builder schedule_row_json. Gated on query_schedules_checked (#4030 review finding): a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when the fleet has more schedules than that, `pagination.result_truncated_by_cap: true` is added so `pagination.total` is never presented as the fleet's true count. definition_id/enabled_only filters (#2146 A2-R1): enabled_only is a real boolean (matching the #4034 fix on GET /api/v1/policies, unlike the legacy GET /api/schedules route's presence-only quirk) -- an unrecognized value 400s.", "parameters": [{"name": "definition_id", "in": "query", "schema": {"type": "string"}}, {"name": "enabled_only", "in": "query", "schema": {"type": "boolean"}}], "responses": {"200": {"description": "Schedule list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows."}, "400": {"description": "Invalid boolean value for enabled_only"}, "403": {"description": "Insufficient permission (Schedule:Read), or a service-scoped token denied the fleet-wide list"}, "503": {"description": "Schedule engine not available, or the store query itself failed (retry_after_ms in the A4 envelope)"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
         R"json(,
     "/approvals/{id}": {
       "get": {"summary": "Fetch a single approval by id", "tags": ["Approvals"], "description": "The versioned single-approval status endpoint, and the target of an A4 error envelope's status_url (the kApprovalRequired specialisation): a worker told its request needs approval polls this for the current status rather than re-issuing the gated request. Read-only — it never mutates the approval lifecycle (submit/approve/reject live on the legacy /api/approvals/* routes). Requires Approval:Read. 404 (A4 envelope) when no approval matches the id. Response always includes X-Correlation-Id.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Approval object", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/Approval"}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "404": {"description": "Approval not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Approval store not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/approvals": {
+      "get": {"summary": "List approval requests (#2146 A2-R4)", "tags": ["Approvals"], "description": "REST v1 twin of the legacy unversioned GET /api/approvals and the widened MCP list_pending_approvals tool. Same gate as GET /api/v1/approvals/{id} (bare Approval:Read — a fleet-wide operator-facing review queue with no per-agent axis, so the ADR-0017 admit-then-filter fleet-read gate does not apply here), same status/submitted_by filters as the legacy route, and the SAME field set (shared builder approval_row_json). Gated on query_checked: a store/pool failure returns 503, never a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when more than 100 approvals match, pagination.result_truncated_by_cap is added so pagination.total is never presented as the true match count.", "parameters": [{"name": "status", "in": "query", "required": false, "schema": {"type": "string", "enum": ["pending", "approved", "rejected", "expired"]}}, {"name": "submitted_by", "in": "query", "required": false, "schema": {"type": "string"}}], "responses": {"200": {"description": "Approval list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows.", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/Approval"}}, "pagination": {"type": "object", "properties": {"total": {"type": "integer"}, "start": {"type": "integer"}, "page_size": {"type": "integer"}, "result_truncated_by_cap": {"type": "boolean"}}}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "400": {"description": "Invalid status value (not one of pending/approved/rejected/expired)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "503": {"description": "Approval store not available or degraded; envelope's retry_after_ms is a concrete hint on a transient failure (e.g. pool exhaustion), null on a permanent one (e.g. schema drift, disk-full) that will NOT clear on retry.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/approvals/pending/count": {
+      "get": {"summary": "Count pending approval requests (#2146 A2-R4)", "tags": ["Approvals"], "description": "REST v1 twin of the legacy unversioned GET /api/approvals/pending/count and the new MCP get_pending_approval_count tool. Same gate as GET /api/v1/approvals. Gated on pending_count_checked: a store/pool failure returns 503, never a false zero count.", "responses": {"200": {"description": "{data: {count}}"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "503": {"description": "Approval store not available or degraded; envelope's retry_after_ms is a concrete hint on a transient failure (e.g. pool exhaustion), null on a permanent one (e.g. schema drift, disk-full) that will NOT clear on retry.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
@@ -1194,7 +1225,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-device app performance over time (B1 drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. This device's retained daily per-app-version performance series from the Postgres B1 store — the 'over time, on THIS box' companion to the fleet trend GET /dex/perf/app. One row per (app, version, UTC day) over the B1 retention (up to 31 days): cpu_avg/cpu_max are share-of-capacity %, ws_avg_bytes/ws_max_bytes are working-set bytes, samples is the hourly-bucket count, instances_max the peak concurrent process count. No percentiles — a single device's daily averages ARE the series. Optional app query parameter narrows to one app name. Individual-identifying behavioral data, so every call emits a dex.device.app_perf.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist. Covers only resource-significant app-versions (procperf top-N), NOT every installed app.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "app", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Exact app-name filter (optional)."}], "responses": {"200": {"description": "{data:{agent_id, app, rows[].{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}}}"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.device.app_perf.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/perf/fleet": {
-      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators (windows_online: historically the only OS with a perf collector). linux_online/macos_online are the same online-count per OS, and reporting_windows/reporting_linux/reporting_macos split the reporting population by OS — macos_online is real (agents connect) but reporting_macos is always 0 today (no macOS perf collector yet). Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online, linux_online, macos_online, reporting_windows, reporting_linux, reporting_macos)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/cohorts": {
       "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
@@ -1203,7 +1234,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/devices": {
-      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
     },
     )json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile.
@@ -1465,14 +1496,19 @@ const std::string& openapi_spec() {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), or dispatch unavailable/failed"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
+      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
     },
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
       "delete": {"summary": "Delete a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403). A pinned set must be unpinned first.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{deleted: true}"}, "403": {"description": "Result-set delete denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the delete itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "409": {"description": "RESULT_SET_PINNED — unpin the set first"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
-    },
+    },)json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) -- #4540 fix: the
+        // #4493 /re-eval description addition below pushed the prior literal
+        // back over the cap; split immediately before it, same idiom as the
+        // #3992 F2 split just below.
+        R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (e.g. sql/instruction_id missing), or the source_kind is not yet supported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -1708,6 +1744,25 @@ std::string error_json_a4(int code, std::string_view message, std::string_view c
                          A4ErrorOpts{.retry_after_ms = retry_after_ms, .remediation = remediation});
 }
 
+/// REST-shaped counterpart of `mcp::approval_store_read_error_body`
+/// (mcp_approval_error.hpp): same permanent-vs-transient classification
+/// (`!mgr.is_open() || is_permanent_pg_error(sqlstate)`), REST's A4 envelope
+/// instead of the MCP JSON-RPC one. review finding (PR #4656): both
+/// `GET /api/v1/approvals` and `GET /api/v1/approvals/pending/count`
+/// answered a permanent store failure (schema drift, disk-full, store never
+/// opened) with the same `retry_after_ms: 5000` as a transient one — an
+/// unbounded "retry forever" hint for a condition that will not clear
+/// without an operator.
+std::string approval_store_error_json(const ApprovalManager& mgr, std::string_view cid,
+                                      std::string_view sqlstate) {
+    if (!mgr.is_open() || is_permanent_pg_error(sqlstate)) {
+        return error_json_a4(503, "approval store unavailable", cid,
+                             "this will NOT clear on retry; escalate to an operator");
+    }
+    return error_json_a4(503, "approval store degraded", cid, 5000,
+                         "retry shortly; if this persists, escalate to an operator");
+}
+
 /// Payload size cap on `ev.data` before raw-embed into the envelope.
 /// Agent-sourced fields (`AgentExecStatus::error_detail` populated
 /// from agent reports) currently have no upstream cap, and every event
@@ -1789,8 +1844,9 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
+    DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1806,8 +1862,9 @@ void RestApiV1::register_routes(
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
-                    std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api));
+                    std::move(response_visible_set_fn),
+                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
+                    std::move(dex_api), std::move(dex_perf_api));
 }
 
 void RestApiV1::register_routes(
@@ -1831,8 +1888,9 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
+    DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
+    std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1953,7 +2011,7 @@ void RestApiV1::register_routes(
     // deny_fleet_wide_service_scoped above — that closes the service-scoped
     // -API-token axis, this closes the management-group-confined-OPERATOR
     // axis; neither substitutes for the other (see the SCOPING NOTE on
-    // server.cpp's dex_fleet_fn provider). nullopt = unfiltered (global read
+    // server.cpp's dex_visible_fn provider). nullopt = unfiltered (global read
     // / RBAC off, unresolved session, or dex_visible_fn unwired).
     auto resolve_dex_visible =
         [auth_fn, dex_visible_fn](const httplib::Request& req) -> std::optional<std::set<std::string>> {
@@ -8074,6 +8132,524 @@ void RestApiV1::register_routes(
             res.set_content(list_json(arr.str(), arr.size()), "application/json");
         });
 
+    // ══════════════════════════════════════════════════════════════════════
+    // GET /api/v1/responses/{instruction_id}[/aggregate|/export] — v1 twins
+    // of the legacy, unversioned command/instruction-ID-keyed Responses API
+    // (`response_routes.cpp`, #2146 A2-R2). DISTINCT from the execution-ID-
+    // keyed `/api/v1/executions/{id}/responses` route just above — that
+    // route is a different, already-shipped capability this PR does not
+    // touch.
+    //
+    // Same confinement pattern as the legacy routes (resolve-then-scope,
+    // #1634/ADR-0017 INV-3: push the in-scope agent set into the store call
+    // BEFORE any LIMIT/aggregate, never post-filter) and the same query
+    // semantics (group_by/op/op_column/agent_id/status/since/until), gated
+    // on the SAME `Response:Read` securable via `fleet_read_fn`. The legacy
+    // routes are read-only reference for this PR (not touched) — see
+    // `response_query_model.hpp`'s file comment for why the shared row
+    // builders below are a REST-v1/MCP pair, not a three-way share.
+    //
+    // Two v1-specific corrections vs. the legacy routes (both deliberate,
+    // documented deviations — see this PR's changelog):
+    //   - `limit` is clamped on BOTH bounds (legacy's export route only
+    //     floors its own DEFAULT at 10000; a caller-supplied `limit` there
+    //     has no ceiling at all — a real, pre-existing bug this PR does not
+    //     propagate here, see the changelog for the tracked-issue decision).
+    //   - `offset` is rejected outright on the plain query route (400, not
+    //     silently accepted) — mirrors `/api/v1/executions/{id}/responses`'s
+    //     own #4030 Gate 8 fix just above: `query()`'s result set orders by
+    //     non-unique `timestamp DESC`, so offset-based paging over a table
+    //     that can still be receiving rows for this instruction silently
+    //     skips/duplicates rows with zero signal to the caller. The legacy
+    //     route accepts (and silently mis-serves) `offset` today; this PR
+    //     does not fix that pre-existing route, only declines to repeat the
+    //     defect on the new one.
+    //
+    // Audit posture: fail-closed `emit_behavioral_audit` on every audited
+    // event (a scope-drop "denied" row, parity with the legacy routes' own
+    // CC7.2 evidence, PLUS a "success" row per docs/api-twin-recipe.md §4's
+    // REST-JSON posture and the `/api/v1/executions/{id}/responses` REST
+    // precedent above) — a judgment call: the legacy routes only audit
+    // scope-drops, never success; this v1 surface adds the success audit
+    // deliberately, matching the closer response-body-read precedent rather
+    // than leaving v1 unaudited on the happy path.
+    //
+    // Registration order: aggregate/export MUST register before the plain
+    // catch-all below, matching the legacy family's own load-bearing order
+    // (response_routes.hpp's file header) — not strictly load-bearing here
+    // since all three patterns bound the id to `[A-Za-z0-9_-]{1,128}` (the
+    // same charset `/api/v1/executions/{id}/responses` above uses for this
+    // exact command_id/instruction_id key space — `plugin-name` + "-" + 16
+    // random hex bytes, `server.cpp`'s dispatch mint site — which cannot
+    // cross a '/' either, unlike legacy's unbounded `.+` catch-all), but
+    // kept for parity/readability with the routes they twin. The bound
+    // itself is deliberate, not just a registration-order nicety: an
+    // unbounded id would otherwise flow unvalidated into `audit_fn`, spdlog,
+    // SQL bind parameters, and (on the export route) a
+    // `Content-Disposition: filename="responses-<id>.csv"` header value —
+    // matching the governance sec-F3/C-15 rationale already applied to the
+    // sibling `/api/v1/executions/{id}/visualization` route's `definition_id`
+    // bound above.
+    // ══════════════════════════════════════════════════════════════════════
+
+    sink.Get(
+        R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/aggregate)",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error(
+                    "GET /api/v1/responses/{{id}}/aggregate: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            auto group_by = req.get_param_value("group_by");
+            if (group_by.empty())
+                group_by = "status";
+            if (std::find(ResponseStore::allowed_group_by().begin(),
+                          ResponseStore::allowed_group_by().end(),
+                          group_by) == ResponseStore::allowed_group_by().end()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid group_by"), "application/json");
+                return;
+            }
+
+            AggregateOp op = AggregateOp::Count;
+            auto op_str = req.get_param_value("op");
+            if (op_str == "sum")
+                op = AggregateOp::Sum;
+            else if (op_str == "avg")
+                op = AggregateOp::Avg;
+            else if (op_str == "min")
+                op = AggregateOp::Min;
+            else if (op_str == "max")
+                op = AggregateOp::Max;
+
+            auto op_column_param = req.get_param_value("op_column");
+            const std::string effective_op_column =
+                op_column_param.empty() ? "id" : op_column_param;
+            if (std::find(ResponseStore::allowed_op_column().begin(),
+                          ResponseStore::allowed_op_column().end(),
+                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid op_column"), "application/json");
+                return;
+            }
+
+            AggregationQuery aq;
+            aq.group_by = group_by;
+            aq.op = op;
+            // Assign the NORMALIZED value, not the raw (possibly-empty) param --
+            // see mcp_server.cpp's aggregate_responses handler for the same fix and
+            // its rationale (cpp-safety governance finding, #2146 A2-R2).
+            aq.op_column = effective_op_column;
+
+            ResponseQuery filter;
+            if (req.has_param("agent_id"))
+                filter.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    filter.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    filter.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    filter.until = std::stoll(req.get_param_value("until"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+
+            AggregateScope agg_scope; // nullopt = no restriction
+            std::size_t agg_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store unavailable",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++agg_dropped;
+                }
+                agg_scope = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (agg_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(agg_dropped) + " surface=v1_aggregate")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->aggregate(instruction_id, aq, filter, agg_scope);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& results = *results_opt;
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response aggregate cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            int64_t total_rows = 0;
+            JArr groups;
+            for (const auto& r : results) {
+                total_rows += r.count;
+                groups.add_raw(response_aggregate_row_json(r).dump());
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("instruction_id", instruction_id)
+                                        .raw("groups", groups.str())
+                                        .add("total_groups", static_cast<int64_t>(results.size()))
+                                        .add("total_rows", total_rows)
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get(
+        R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/export)",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/responses/{{id}}/export: fleet_read_fn unwired; cid={}",
+                             cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            // unhappy-path governance finding: this route restated the same
+            // unsafe-offset rationale as GET /api/v1/responses/{id}'s own
+            // guard (below) in its header comment but never applied the
+            // guard to itself — offset-based paging on a non-unique,
+            // actively-growing timestamp-ordered result set silently skips
+            // or duplicates rows, same reasoning as the plain-GET sibling.
+            if (req.has_param("offset")) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "offset is not supported on this route -- the result set "
+                                     "orders by a non-unique, actively-growing timestamp and "
+                                     "offset-based paging would silently skip or duplicate rows; "
+                                     "use the limit/since cursor shape instead, matching MCP "
+                                     "query_responses"),
+                    "application/json");
+                return;
+            }
+
+            // #2146 A2-R2: this v1 twin clamps a CALLER-SUPPLIED limit too —
+            // the legacy export route (response_routes.cpp) only floors its
+            // own DEFAULT at kExportLimitCap; an explicit `?limit=` there has
+            // no ceiling at all and can attempt an unbounded fetch. Not fixed
+            // on the legacy route (out of scope for this PR — read-only
+            // reference); not propagated here.
+            static constexpr int kExportLimitCap = 10000;
+            ResponseQuery q;
+            if (req.has_param("agent_id"))
+                q.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::clamp(std::stoi(req.get_param_value("limit")), 1,
+                                         kExportLimitCap);
+                else
+                    q.limit = kExportLimitCap; // higher default for exports, matches legacy
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (export_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(export_dropped) + " surface=v1_export")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->query(instruction_id, q, scope_arg);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response export cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            // happy-path/enterprise-readiness governance finding: this route
+            // never signalled a cap-hit -- a caller with more than `limit`
+            // matching rows got exactly `limit` back with no marker that the
+            // export was cut, most consequential here since bulk export is
+            // this route's whole purpose. Mirrors MCP query_responses' own
+            // `hit_cap = results.size() == limit` convention (this PR's own
+            // MCP twin already computes this).
+            const bool hit_cap = results.size() == static_cast<std::size_t>(q.limit);
+            auto format = req.get_param_value("format");
+            if (format == "csv") {
+                std::string csv{kResponseExportCsvHeader};
+                for (const auto& r : results)
+                    csv += response_export_csv_row(r);
+                res.set_header("Content-Disposition",
+                               "attachment; filename=\"responses-" + instruction_id + ".csv\"");
+                if (hit_cap)
+                    res.set_header("X-Result-Truncated-By-Cap", "true");
+                res.set_content(csv, "text/csv; charset=utf-8");
+            } else {
+                JArr arr;
+                for (const auto& r : results)
+                    arr.add_raw(response_query_row_json(r).dump());
+                res.set_header("Content-Disposition",
+                               "attachment; filename=\"responses-" + instruction_id + ".json\"");
+                res.set_content(list_json(arr.str(), arr.size(), 0, 50, hit_cap),
+                                "application/json; charset=utf-8");
+            }
+        });
+
+    sink.Get(
+        R"(/api/v1/responses/([A-Za-z0-9_-]{1,128}))",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/responses/{{id}}: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            // #2146 A2-R2: `offset` is deliberately NOT accepted here, matching
+            // `/api/v1/executions/{id}/responses`'s own #4030 Gate 8 fix above and
+            // MCP `query_responses` — the result set orders by non-unique
+            // `timestamp DESC` and can still be gaining rows for this instruction,
+            // so offset-based paging silently skips/duplicates rows. Reject rather
+            // than silently ignore a caller-supplied `offset`; the legacy route
+            // (response_routes.cpp) accepts it today, a pre-existing gap this PR
+            // does not fix on that route.
+            if (req.has_param("offset")) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "offset is not supported on this route -- the result set "
+                                     "orders by a non-unique, actively-growing timestamp and "
+                                     "offset-based paging would silently skip or duplicate rows; "
+                                     "use the limit/since cursor shape instead, matching MCP "
+                                     "query_responses"),
+                    "application/json");
+                return;
+            }
+
+            ResponseQuery q;
+            if (req.has_param("agent_id"))
+                q.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            // Clamp BOTH bounds, matching MCP query_responses and the
+            // execution-scoped v1 twin above — a negative/huge caller-supplied
+            // limit must neither bind unbounded nor silently under-serve.
+            q.limit = static_cast<int>(std::clamp<int64_t>(q.limit, 1, 1000));
+
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (get_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(get_dropped) + " surface=v1_get")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->query(instruction_id, q, scope_arg);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response query cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            // happy-path/enterprise-readiness governance finding: this route
+            // never signalled a cap-hit, unlike MCP query_responses (this
+            // PR's own twin) and the established list_schedules/executions-
+            // children REST pagination pattern (#2146 A2-R1 Gate 8). A caller
+            // whose matching rows equal `limit` cannot tell a complete result
+            // from a truncated one.
+            const bool hit_cap = results.size() == static_cast<std::size_t>(q.limit);
+            JArr arr;
+            for (const auto& r : results)
+                arr.add_raw(response_query_row_json(r).dump());
+            res.set_content(list_json(arr.str(), arr.size(), 0, 50, hit_cap), "application/json");
+        });
+
     // ── GET /api/v1/executions/{id} — final-state lookup (#1088 UAT-found gap)
     //
     // The W5.1 `GET /api/v1/events` 410 envelope's remediation hint
@@ -8121,7 +8697,27 @@ void RestApiV1::register_routes(
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two, matching this same route's own
+            // GET .../children twin below; the degrade branch MUST run
+            // BEFORE any denial audit is recorded.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "execution tracker degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; the execution read failed transiently"),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #4030: optional per-agent status/duration expansion --
             // `?include=agents` adds a per-agent array + KPI summary to this
             // SAME route (the issue's query-param decision, not a distinct
@@ -8303,6 +8899,186 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(data_obj.str()), "application/json");
         });
 
+    // ── GET /api/v1/executions/{id}/children (#2146 A2-R1) ──────────────
+    //
+    // REST v1 twin of the legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) -- same gate (fleet_read_fn, Execution:Read),
+    // same confinement rules (execution_scope_rules.hpp's execution_visible,
+    // applied to the parent AND independently to each child -- a visible
+    // parent does not by itself disclose a child dispatched by, or
+    // targeting, someone else, #3789), and the SAME execution_child_row_json
+    // shared builder (execution_model.hpp) the legacy route now also calls
+    // (docs/api-twin-recipe.md Rule 1). Batched per-child status lookup
+    // under confinement (get_agent_statuses_for_executions_checked), never
+    // N+1 (ADR-0017 INV-10).
+    //
+    // Auth: Execution:Read via fleet_read_fn. Audit: mirrors the legacy
+    // route's own posture exactly -- "execution.read"/"denied" ONLY under an
+    // engaged scope when the parent is invisible/nonexistent; no audit call
+    // on a successful read (metadata about executions, not itself the
+    // per-agent behavioural PII the detail route's `?include=agents`
+    // expansion carries) and no audit call for an unconfined caller's
+    // genuinely-nonexistent id (ordinary 404, not a confinement decision).
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/children)",
+        [fleet_read_fn, auth_fn, audit_fn, execution_tracker](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions/{{id}}/children: fleet_read_fn unwired; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+
+            auto exec_id = req.matches[1].str();
+            std::string username;
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
+            if (gate.scope) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                username = session->username;
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after the fleet gate already
+                // admitted the request -- fail closed rather than silently
+                // fall through to agent-only visibility (matches the bare
+                // detail/list routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "unable to resolve caller identity for a confined read",
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-visible-
+                // agent admission predicate into get_children_checked's SQL
+                // below (this file's own LIST handler precedent) -- closes
+                // the cap-before-scope defect where an invisible sibling
+                // could displace this caller's own visible children out of
+                // the capped window.
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
+            }
+
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> parent_statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                parent_statuses = std::move(*statuses_opt);
+            }
+
+            const bool parent_visible =
+                exec_opt.has_value() &&
+                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            if (!exec_opt || !parent_visible) {
+                // #3789: audit ONLY under an engaged scope -- matches the
+                // legacy route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_fn(req, "execution.read", "denied", "Execution", exec_id,
+                                   "not found or outside caller's fleet-read scope "
+                                   "surface=children cid=" +
+                                       cid);
+                }
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "execution not found", cid),
+                                "application/json");
+                return;
+            }
+
+            auto children_opt = execution_tracker->get_children_checked(exec_id, scope_arg);
+            if (!children_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            if (gate.scope) {
+                // #3789 (Sol/gpt-5.6-sol adversarial review, mirrored from
+                // the legacy route): parent visibility does NOT authorize
+                // enumerating every child -- each independently passes
+                // execution_visible. One batched statuses call, not N+1.
+                std::vector<std::string> child_ids;
+                child_ids.reserve(children_opt->children.size());
+                for (const auto& c : children_opt->children)
+                    child_ids.push_back(c.id);
+                auto child_statuses_opt =
+                    execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
+                if (!child_statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& c : children_opt->children) {
+                    auto it = child_statuses_opt->find(c.id);
+                    const auto& c_statuses =
+                        it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                        continue;
+                    arr.add_raw(execution_child_row_json(c).dump());
+                }
+            } else {
+                for (const auto& c : children_opt->children)
+                    arr.add_raw(execution_child_row_json(c).dump());
+            }
+            // #2146 A2-R1 (governance re-review, blocking): get_children_checked
+            // is now hard-capped (kExecutionChildrenCap, execution_tracker.cpp)
+            // -- previously unbounded. Present-only-when-true, matching MCP
+            // list_schedules/query_responses' result_truncated_by_cap
+            // convention -- top-level next to `children` since this route
+            // has no `pagination` envelope to nest it under (unlike GET
+            // /api/v1/schedules). #2146 A2-R1 Gate 8 fix: scope_arg above is
+            // now pushed into the SQL BEFORE the cap (ExecutionChildrenResult's
+            // doc comment), so for a confined caller this reports THEIR OWN
+            // visible row set exceeding the cap, not the fleet-wide one --
+            // the per-child confinement filter above is now
+            // redundant-but-safe defense in depth over an already-scoped
+            // result, never the primary admission decision.
+            JObj result_obj;
+            result_obj.raw("children", arr.str());
+            if (children_opt->truncated)
+                result_obj.add("result_truncated_by_cap", true);
+            res.set_content(ok_json(result_obj.str()), "application/json");
+        });
+
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──
     //
     // The versioned single-fetch approval endpoint. This is the `status_url`
@@ -8351,18 +9127,143 @@ void RestApiV1::register_routes(
             // stable agentic surface should leave a trail. Best-effort (success
             // path only; not fail-closed — no new PII beyond the legacy route).
             (void)audit_fn(req, "approval.read", "success", "Approval", id, "status=" + a.status);
-            auto data = JObj()
-                            .add("id", a.id)
-                            .add("definition_id", a.definition_id)
-                            .add("status", a.status)
-                            .add("submitted_by", a.submitted_by)
-                            .add("submitted_at", static_cast<int64_t>(a.submitted_at))
-                            .add("reviewed_by", a.reviewed_by)
-                            .add("reviewed_at", static_cast<int64_t>(a.reviewed_at))
-                            .add("review_comment", a.review_comment)
-                            .add("scope_expression", a.scope_expression)
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            // Shared builder (approval_model.hpp, #2146 A2-R4 Rule 1) — same
+            // JSON shape as GET /api/v1/approvals and MCP list_pending_approvals,
+            // so the three cannot drift from each other.
+            res.set_content(ok_json(approval_row_json(a).dump()), "application/json");
+        });
+
+    // ── GET /api/v1/approvals — approval list (v1 twin) ───────────────────
+    //
+    // REST v1 twin of the legacy unversioned GET /api/approvals. Same gate
+    // (bare Approval:Read — this is a fleet-wide operator-facing review
+    // queue with no per-agent axis, so the ADR-0017 admit-then-filter
+    // fleet-read gate does not apply here, matching the legacy route's own
+    // gate shape), same status/submitted_by filters, and the SAME field set
+    // (shared builder approval_row_json — Rule 1: this route, the single-
+    // fetch route above, and MCP list_pending_approvals all call it, so the
+    // three cannot drift). Gated on query_checked (#2146 A2-R4): a store/
+    // pool failure returns 503 with retry_after_ms rather than a false
+    // empty list — the legacy route's unchecked query() cannot tell "the
+    // store is down" from "zero approvals", a silent false-negative on
+    // exactly the signal a maker-checker workflow depends on. The
+    // underlying query is hard-capped at 100 rows (no caller-visible
+    // limit/cursor); when more than 100 approvals match,
+    // pagination.result_truncated_by_cap is added so pagination.total is
+    // never presented as the true match count (precedent: GET
+    // /api/v1/schedules).
+    sink.Get(
+        "/api/v1/approvals",
+        [perm_fn, audit_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+
+            ApprovalQuery q;
+            if (req.has_param("status")) {
+                q.status = req.get_param_value("status");
+                // unhappy-path governance finding (#2146 A2-R4): status was
+                // never validated against the declared OpenAPI enum -- a
+                // typo/case-mismatch flowed straight into the SQL filter and
+                // silently produced a false-empty result rather than a 400.
+                if (std::find(ApprovalManager::allowed_status().begin(),
+                              ApprovalManager::allowed_status().end(),
+                              q.status) == ApprovalManager::allowed_status().end()) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "invalid status"), "application/json");
+                    return;
+                }
+            }
+            if (req.has_param("submitted_by"))
+                q.submitted_by = req.get_param_value("submitted_by");
+
+            auto list_result = approval_manager->query_checked(q);
+            if (!list_result) {
+                res.status = 503;
+                res.set_content(
+                    detail::approval_store_error_json(*approval_manager, cid,
+                                                      list_result.error().sqlstate),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& a : list_result->approvals)
+                arr.add_raw(approval_row_json(a).dump());
+            // Audit the read (gov security-guardian, #2146 A2-R4 fix round):
+            // this is the fleet-wide approval-review queue, a broader
+            // disclosure than the single-fetch route above, which already
+            // audits. Best-effort (success path only), matching that route's
+            // posture.
+            (void)audit_fn(req, "approval.read", "success", "Approval", "",
+                           "surface=list count=" + std::to_string(arr.size()));
+            JObj pagination;
+            pagination.add("total", arr.size()).add("start", int64_t{0}).add("page_size", int64_t{50});
+            if (list_result->truncated)
+                pagination.add("result_truncated_by_cap", true);
+            res.set_content(
+                JObj()
+                    .raw("data", arr.str())
+                    .raw("pagination", pagination.str())
+                    .raw("meta", R"({"api_version":"v1"})")
+                    .str(),
+                "application/json");
+        });
+
+    // ── GET /api/v1/approvals/pending/count — pending count (v1 twin) ─────
+    //
+    // REST v1 twin of the legacy unversioned GET /api/approvals/pending/count.
+    // Same gate as GET /api/v1/approvals. Gated on pending_count_checked
+    // (#2146 A2-R4): a store/pool failure returns 503, never a false zero —
+    // the legacy route's unchecked pending_count() silently returns 0,
+    // indistinguishable from "no pending approvals", exactly the ambiguity a
+    // maker-checker backlog monitor cannot tolerate. retry_after_ms is a
+    // concrete hint on a transient failure, null on a permanent one (review
+    // finding, PR #4656; see approval_store_error_json below).
+    sink.Get(
+        "/api/v1/approvals/pending/count",
+        [perm_fn, audit_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+
+            auto count_result = approval_manager->pending_count_checked();
+            if (!count_result) {
+                res.status = 503;
+                res.set_content(
+                    detail::approval_store_error_json(*approval_manager, cid,
+                                                      count_result.error().sqlstate),
+                    "application/json");
+                return;
+            }
+
+            // Audit the read (gov security-guardian, #2146 A2-R4 fix round) --
+            // same posture as the list route above.
+            (void)audit_fn(req, "approval.read", "success", "Approval", "",
+                           "surface=count count=" + std::to_string(*count_result));
+            res.set_content(
+                ok_json(JObj().add("count", *count_result).str()),
+                "application/json");
         });
 
     // ── Response Visualization (issue #253, capability 20.6) ─────────────
@@ -8713,7 +9614,10 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
                       JArr arr;
                       for (const auto& r : results) {
                           arr.add(JObj()
@@ -8728,19 +9632,39 @@ void RestApiV1::register_routes(
                       // simply not have been read (same flag name as the
                       // typed-store route, result_truncated_by_cap). Same
                       // data/pagination/meta shape as list_json, plus the flag.
-                      if (inv_truncated) {
+                      //
+                      // #4496: a poisoned (over-nested) record excluded by
+                      // evaluate_inventory()'s #2437-class depth guard is the
+                      // same "the caller sees fewer matches than actually
+                      // exist" shape as a capped read - surfaced the same way,
+                      // as `results_excluded_by_poison` (count, present only
+                      // when non-zero, same convention as `result_truncated_by_cap`).
+                      //
+                      // #4496 follow-up: a record excluded because its
+                      // data_json failed to parse at all is the SAME shape,
+                      // a different cause - surfaced as its own
+                      // `results_excluded_by_parse_error` field, kept separate
+                      // from `results_excluded_by_poison` so a caller can
+                      // tell WHICH guard excluded a record.
+                      if (inv_truncated || excluded_by_poison > 0 || excluded_by_parse_error > 0) {
                           auto pag = JObj()
                                          .add("total", static_cast<int64_t>(results.size()))
                                          .add("start", int64_t{0})
                                          .add("page_size", int64_t{50})
                                          .str();
-                          res.set_content(JObj()
-                                              .raw("data", arr.str())
-                                              .add("result_truncated_by_cap", true)
-                                              .raw("pagination", pag)
-                                              .raw("meta", R"({"api_version":"v1"})")
-                                              .str(),
-                                          "application/json");
+                          JObj envelope;
+                          envelope.raw("data", arr.str());
+                          if (inv_truncated)
+                              envelope.add("result_truncated_by_cap", true);
+                          if (excluded_by_poison > 0)
+                              envelope.add("results_excluded_by_poison",
+                                           static_cast<int64_t>(excluded_by_poison));
+                          if (excluded_by_parse_error > 0)
+                              envelope.add("results_excluded_by_parse_error",
+                                           static_cast<int64_t>(excluded_by_parse_error));
+                          envelope.raw("pagination", pag);
+                          envelope.raw("meta", R"({"api_version":"v1"})");
+                          res.set_content(envelope.str(), "application/json");
                           return;
                       }
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
@@ -9165,6 +10089,40 @@ void RestApiV1::register_routes(
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
                 return;
             }
+            // Gate 8 sibling-sweep finding: the two producer routes' identical
+            // body.value("name", "") shape threw uncaught on a type-mismatched
+            // field (#4406) - this generic create route has the same shape on
+            // BOTH name and source_kind and was never part of that sweep.
+            if (body.contains("name")) {
+                if (!body["name"].is_string()) {
+                    rs_err(res, 400, "name must be a JSON string");
+                    return;
+                }
+                // PR review finding: this header's own kResultSetNameMaxLen is
+                // MCP's enforced length cap for the same field - REST fixed the
+                // type-confusion crash but never applied the matching length
+                // bound, contradicting this PR's own "same caps as MCP" claim.
+                if (body["name"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetNameMaxLen) {
+                    rs_err(res, 400,
+                           std::format("name must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetNameMaxLen));
+                    return;
+                }
+            }
+            if (body.contains("source_kind")) {
+                if (!body["source_kind"].is_string()) {
+                    rs_err(res, 400, "source_kind must be a JSON string");
+                    return;
+                }
+                if (body["source_kind"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetSourceKindMaxLen) {
+                    rs_err(res, 400,
+                           std::format("source_kind must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetSourceKindMaxLen));
+                    return;
+                }
+            }
             CreateRequest cr;
             cr.owner_principal = session->username;
             cr.name = body.value("name", "");
@@ -9252,8 +10210,8 @@ void RestApiV1::register_routes(
                           bool ok = true;
                           if (audit_fn)
                               ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
-                                            "source_kind=inventory_query reason=" +
-                                                std::string(reason));
+                                            "reason=" + std::string(reason) +
+                                                " source_kind=inventory_query");
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
@@ -9349,9 +10307,20 @@ void RestApiV1::register_routes(
                                  "parent set; omit it entirely to search all devices");
                           return;
                       }
-                      if (body.contains("name") && !body["name"].is_string()) {
-                          rs_err(res, 400, "name must be a JSON string");
-                          return;
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       // Gate 4 unhappy-path fix: moved below the client-input
                       // validation above (combine/conditions/parent_id/name) - a
@@ -9407,7 +10376,13 @@ void RestApiV1::register_routes(
                           // silently changes who gets acted on (#2500/#2492
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
-                          // pagination is the tracked follow-up.
+                          // pagination is the tracked follow-up (#2633).
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonQueryTruncated)}})
+                                  .increment();
                           audit_failure("query_truncated");
                           rs_err(res, 503,
                                  "inventory query truncated at the row or byte cap - refusing to "
@@ -9424,7 +10399,54 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      // #4496: fold poison-exclusion into the SAME M1
+                      // dispatch-targeting-invariant refusal as inv_truncated
+                      // just above, rather than a silent flag - this producer
+                      // MATERIALISES the matched set into a durable result set
+                      // other operators/dispatches consume later; a flag on
+                      // this 201 response would never reach them, so a
+                      // narrowed target set here gets the same hard-refuse
+                      // treatment as a capped read, not the softer
+                      // flag-on-response posture the two read-only routes
+                      // (POST /api/inventory/query, POST
+                      // /api/v1/inventory/evaluate) use instead.
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
+                      if (excluded_by_poison > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonPoisonExcluded)}})
+                                  .increment();
+                          audit_failure("poison_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for nesting too deeply - refusing "
+                                 "to materialise a result set narrower than the true match set");
+                          return;
+                      }
+                      // #4496 follow-up: same M1 refusal as the poison check
+                      // above, for the sibling cause - a record whose
+                      // data_json failed to parse at all. Kept as a SEPARATE
+                      // check (not folded into the condition above) so the
+                      // metric reason, audit detail and error message all
+                      // name the actual cause rather than conflating the two.
+                      if (excluded_by_parse_error > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonParseErrorExcluded)}})
+                                  .increment();
+                          audit_failure("parse_error_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set");
+                          return;
+                      }
                       std::unordered_set<std::string> seen;
                       std::vector<std::string> members;
                       for (const auto& r : results) {
@@ -9494,7 +10516,13 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string sql = body.value("sql", "");
+                      // #4406 fix: .value() throws nlohmann::json::type_error on a
+                      // type-mismatched 'sql' (e.g. a number) rather than coercing -
+                      // guard with is_string() first, same as re-eval's identical
+                      // guard on this field and MCP's create_result_set_from_tar_query.
+                      std::string sql =
+                          (body.contains("sql") && body["sql"].is_string()) ? body.value("sql", "")
+                                                                             : "";
                       if (sql.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
                           return;
@@ -9510,6 +10538,27 @@ void RestApiV1::register_routes(
                       if (body.contains("include_empty") && !body["include_empty"].is_boolean()) {
                           rs_err(res, 400, "include_empty must be a JSON boolean");
                           return;
+                      }
+                      // Adversarial-review finding: body.value("name", "") below threw
+                      // uncaught on a type-mismatched name (e.g. a number) - the same
+                      // #4406 mechanism this PR fixed for sql/instruction_id, on the
+                      // exact same routes, just missed for this sibling optional field.
+                      // Same guard shape as the from-inventory-query route's name check
+                      // above and this route's own include_empty check just above.
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       const bool include_empty = body.value("include_empty", false);
                       nlohmann::json matcher =
@@ -9551,10 +10600,6 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
-                      if (!instruction_store || !instruction_store->is_open()) {
-                          rs_err(res, 503, "instruction store not available");
-                          return;
-                      }
                       // #2437-class guard: raw-text depth check before parse, same
                       // as the identical guard on POST /api/v1/result-sets above.
                       if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
@@ -9566,9 +10611,112 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string instruction_id = body.value("instruction_id", "");
+                      // Gate 4 unhappy-path finding: the other three near-identical
+                      // instruction_id/sql extractions in this file (re-eval's two
+                      // branches, MCP's own reevaluate_result_set) all guard with
+                      // is_string() first - this one didn't, so a type-mismatched
+                      // instruction_id (e.g. a number or object) threw an uncaught
+                      // nlohmann::json::type_error -> an unguarded HTTP 500 instead of
+                      // a clean 400 (this is the #4406 defect class, distinct from the
+                      // #2437-class JSON-depth-guard convention used elsewhere in this
+                      // file - there is no server-wide exception handler, per line
+                      // ~11368's guardian-route comment).
+                      std::string instruction_id =
+                          (body.contains("instruction_id") && body["instruction_id"].is_string())
+                              ? body.value("instruction_id", "")
+                              : "";
                       if (instruction_id.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
+                          return;
+                      }
+                      // Adversarial-review finding: the same #4406-class gap as
+                      // instruction_id above, on the sibling optional 'name' field
+                      // this route also passes unguarded to run_async below.
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
+                      }
+                      // #4373-class fix: this route had no bound at all on instruction_id
+                      // or params (unlike the sql-bearing from-tar-query route directly
+                      // above, which caps sql at creation time) - an ordinary authenticated
+                      // caller with plain Execution:Execute could dispatch fleet-wide with
+                      // an oversized instruction_id or an over-keyed/oversized params object
+                      // in ONE step, no smuggle-via-create-then-reeval needed. Same caps
+                      // MCP's create_result_set_from_instruction_result already enforces at
+                      // creation time. Checked here, ahead of the instruction_store gate
+                      // moved below (Gate 3 architect finding: the gate was originally
+                      // above this validation, same fix as the from-inventory-query route's
+                      // own Gate 4 reordering), since a malformed/oversized field is a
+                      // permanent client error regardless of backend availability.
+                      if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                          rs_err(res, 400,
+                                 std::format(
+                                     "RESULT_SET_BAD_REQUEST: instruction_id must be at most {} "
+                                     "bytes",
+                                     yuzu::server::mcp::kInstructionIdMaxLen));
+                          return;
+                      }
+                      // Gate 4 unhappy-path finding: a present-but-non-object `params`
+                      // (string/array/number) skipped every check below AND the
+                      // params-map-build loop further down, so it silently dispatched
+                      // with an EMPTY params map while persisting the oversized/wrong-
+                      // shaped value verbatim into source_payload, unbounded and
+                      // re-parsed on every future re-eval. Reject it outright instead
+                      // of silently ignoring it.
+                      if (body.contains("params") && !body["params"].is_object()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
+                          return;
+                      }
+                      if (body.contains("params") && body["params"].is_object()) {
+                          const auto& p = body["params"];
+                          if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: params must have at most {} "
+                                         "keys",
+                                         yuzu::server::mcp::kExecInstrParamCountMax));
+                              return;
+                          }
+                          for (const auto& [k, v] : p.items()) {
+                              if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params key exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                  return;
+                              }
+                              const std::size_t vlen =
+                                  v.is_string() ? v.get_ref<const std::string&>().size()
+                                                : v.dump().size();
+                              if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params value exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                  return;
+                              }
+                          }
+                      }
+                      // Gate 3 architect finding: moved below the client-input validation
+                      // above (instruction_id/params bounds) - same reasoning as the
+                      // from-inventory-query route's Gate 4 fix: a malformed/oversized
+                      // field is a permanent client error regardless of backend
+                      // availability, so a caller retrying this 503 would never succeed.
+                      if (!instruction_store || !instruction_store->is_open()) {
+                          rs_err(res, 503, "instruction store not available");
                           return;
                       }
                       // ADR-0058: get_definition now returns std::expected — distinguish a
@@ -9610,8 +10758,8 @@ void RestApiV1::register_routes(
         // dispatch and land a new pending row; sync sources are deferred to
         // PR-G (their re-eval needs the inventory evaluator on this path).
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
-                  [auth_fn, perm_fn, rs_err, load_owned, run_async, instruction_store](
-                      const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, perm_fn, audit_fn, rs_err, load_owned, run_async, instruction_store,
+                   result_set_store](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -9639,8 +10787,32 @@ void RestApiV1::register_routes(
                       // guards above; on rejection, never reach run_async (no
                       // re-dispatch of a row we can't safely re-serialise).
                       if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          // #4493: heal the row in place so it is never a live
+                          // grenade for a future read again -- this specific
+                          // re-eval attempt still cannot proceed (the original
+                          // query is unrecoverably gone), but every future read
+                          // of this row (this route included) hits the safe
+                          // placeholder instead of repeating the same
+                          // depth-check dance against the poisoned text forever.
+                          // Gate 2/4 governance finding (#4493 re-review): this
+                          // is the only rejection branch in the whole result-set
+                          // family that performs a real write to an otherwise
+                          // immutable-by-design table (scope-walking-design.md),
+                          // so audit BOTH outcomes explicitly rather than
+                          // silently mutating on an error path -- and never
+                          // claim the payload "has been discarded" unless the
+                          // write actually committed (a naive unconditional
+                          // audit_fn("success",...) here would fabricate a
+                          // durable record of a write that never happened).
+                          const bool healed = result_set_store->heal_poisoned_payload(id);
+                          audit_fn(req, "result_set.heal", healed ? "success" : "failure",
+                                   "ResultSet", id, "");
                           rs_err(res, 400,
-                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                                 healed ? "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                          "nested too deeply and has been discarded; re-eval "
+                                          "is unavailable for this set"
+                                        : "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                          "nested too deeply; heal attempt failed, try again");
                           return;
                       }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
@@ -9658,7 +10830,19 @@ void RestApiV1::register_routes(
                           : orig->name.ends_with(" (re-eval)") ? orig->name
                                                                : (orig->name + " (re-eval)");
                       if (orig->source_kind == source_kind::kTarQuery) {
-                          std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                          // #4373 fix: sp.value("sql", "") throws nlohmann::json::type_error
+                          // on a type mismatch rather than coercing - orig->source_payload
+                          // isn't caller-supplied on THIS call, but a row minted via the
+                          // generic (uncapped) create_result_set constructor can carry an
+                          // arbitrary source_payload with a non-string "sql", the same
+                          // #2500-class row the SQL-size cap two lines below exists to
+                          // catch. Treat a non-string sql the same as absent: the empty
+                          // check just below already has the right error for that. Mirrors
+                          // the identical guard on reevaluate_result_set (mcp_server.cpp).
+                          std::string sql =
+                              (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
+                                  ? sp.value("sql", "")
+                                  : "";
                           if (sql.empty()) {
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
                               return;
@@ -9678,8 +10862,74 @@ void RestApiV1::register_routes(
                                     source_kind::kTarQuery, orig->source_payload, orig->matcher,
                                     synth, reeval_name);
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
+                          // Same type-confusion guard as the sql field above.
                           std::string instruction_id =
-                              sp.is_object() ? sp.value("instruction_id", "") : "";
+                              (sp.is_object() && sp.contains("instruction_id") &&
+                               sp["instruction_id"].is_string())
+                                  ? sp.value("instruction_id", "")
+                                  : "";
+                          // #4373 fix: re-apply the SAME caps MCP's
+                          // create_result_set_from_instruction_result enforces at creation
+                          // time (REST's own from-instruction-result route now enforces the
+                          // same caps too, added above in this same change; that route's
+                          // type-confusion defect, #4406, is also fixed above in this
+                          // change), and the SAME fix MCP's reevaluate_result_set
+                          // already got (PR #4394) - checked
+                          // here ahead of the instruction_store gate below, since a
+                          // malformed/oversized field is a permanent client error
+                          // regardless of backend availability. `orig` may have been minted
+                          // via the uncapped POST /api/v1/result-sets (no source_kind
+                          // allowlist there) - without this, re-eval would smuggle an
+                          // over-keyed or oversized params object past those caps, then
+                          // dispatch it fleet-wide, and an oversized instruction_id would
+                          // reach instruction_store's lookup unbounded.
+                          if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: instruction_id must be at "
+                                         "most {} bytes",
+                                         yuzu::server::mcp::kInstructionIdMaxLen));
+                              return;
+                          }
+                          // Gate 4 unhappy-path fix: same present-but-non-object gap
+                          // as the creation route above - reject rather than
+                          // silently dispatch with an empty params map.
+                          if (sp.contains("params") && !sp["params"].is_object()) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
+                              return;
+                          }
+                          if (sp.contains("params") && sp["params"].is_object()) {
+                              const auto& p = sp["params"];
+                              if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: params must have at most "
+                                             "{} keys",
+                                             yuzu::server::mcp::kExecInstrParamCountMax));
+                                  return;
+                              }
+                              for (const auto& [k, v] : p.items()) {
+                                  if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params key exceeds "
+                                                 "{} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                      return;
+                                  }
+                                  const std::size_t vlen =
+                                      v.is_string() ? v.get_ref<const std::string&>().size()
+                                                    : v.dump().size();
+                                  if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params value "
+                                                 "exceeds {} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                      return;
+                                  }
+                              }
+                          }
                           // ADR-0058: get_definition now returns std::expected — a genuine DB
                           // error 503s distinctly; a not-found/store-unavailable/empty-id
                           // condition keeps the pre-migration 400 collapse.
@@ -11669,23 +12919,21 @@ void RestApiV1::register_routes(
 
     // GET /dex/signals — whole-catalogue rollup (every obs_type in the window,
     // with event count + blast radius). Aggregate; not audited.
-    sink.Get("/api/v1/dex/signals", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                      httplib::Response& res) {
+    sink.Get("/api/v1/dex/signals", [perm_fn, dex_api](const httplib::Request& req,
+                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
-        const std::string since = dex_iso_since(dex_window_to_days(window));
         // A1 parity: `os=windows|linux|macos` narrows the rollup to one OS's own
         // signals (anything else = all-OS), matching the dashboard catalogue's
         // OS filter so the machine surface can never drift from what the page shows.
-        const std::string os_scope =
-            dex_normalize_os_filter(req.has_param("os") ? req.get_param_value("os") : "");
-        auto rows = guaranteed_state_store->dex_signal_summary(since, os_scope);
+        const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
+        auto rows = dex_api->signals(window, os_raw);
         JArr arr;
         for (const auto& r : rows) {
             arr.add(JObj()
@@ -11706,8 +12954,8 @@ void RestApiV1::register_routes(
     // same posture as /fragments/device/dex.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+))",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (success + error), the
@@ -11725,7 +12973,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -11764,12 +13012,10 @@ void RestApiV1::register_routes(
                              agent_id);
                 return;
             }
-            const std::string since = dex_iso_since(dex_window_to_days(window));
-            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
-            // get_dex_device_score calls the SAME two functions so the two
-            // response shapes cannot drift (docs/api-twin-recipe.md Rule 1).
-            const auto model =
-                build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+            // #4035: shared model (dex_read_model.hpp), now assembled behind the
+            // DexApi seam (ADR-0031 WS-A4) -- the MCP twin get_dex_device_score
+            // consumes the SAME api so the two response shapes cannot drift.
+            const auto model = dex_api->device_score(agent_id, window);
             res.set_content(ok_json(dex_device_score_json(model)), "application/json");
         });
 
@@ -11783,7 +13029,7 @@ void RestApiV1::register_routes(
     // concept.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/app-perf)",
-        [scoped_perm_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [scoped_perm_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
@@ -11796,7 +13042,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
-            if (!app_perf_providers.device) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -11820,8 +13066,12 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            auto rows = app_perf_providers.device(agent_id);
-            if (!rows) { // AUTHORITATIVE read degrade
+            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
+            // #4035: shared seam (dex_perf_api.hpp) -- the MCP twin
+            // get_dex_device_app_perf calls the SAME seam so the two response
+            // shapes cannot drift (Rule 1).
+            auto body = dex_perf_api->device_app_perf_json(agent_id, app_filter);
+            if (!body) { // AUTHORITATIVE read degrade
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -11830,12 +13080,7 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
-            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
-            // get_dex_device_app_perf calls the SAME provider + serializer so
-            // the two response shapes cannot drift (Rule 1).
-            res.set_content(ok_json(dex_device_app_perf_json(agent_id, app_filter, *rows)),
-                            "application/json");
+            res.set_content(ok_json(*body), "application/json");
         });
 
     if (metrics_registry) {
@@ -12059,18 +13304,17 @@ void RestApiV1::register_routes(
 
     // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
     // platform reports, and total events). Aggregate; not audited.
-    sink.Get("/api/v1/dex/scope", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Get("/api/v1/dex/scope", [perm_fn, dex_api](const httplib::Request& req,
+                                                     httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
-        const std::string since = dex_iso_since(dex_window_to_days(window));
-        auto rows = guaranteed_state_store->dex_os_signal_scope(since);
+        auto rows = dex_api->scope(window);
         JArr arr;
         for (const auto& r : rows) {
             arr.add(JObj()
@@ -12092,7 +13336,7 @@ void RestApiV1::register_routes(
     // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
     // read-model has no such observations — it is not an entity-not-found).
     sink.Get(R"(/api/v1/dex/signals/([^/]+))",
-             [perm_fn, audit_fn, guaranteed_state_store, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api](
                  const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): the devices[] array
@@ -12116,7 +13360,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
@@ -12137,7 +13381,6 @@ void RestApiV1::register_routes(
                  }
                  const std::string window =
                      req.has_param("window") ? req.get_param_value("window") : "7d";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
                  int limit = 50;
                  if (req.has_param("limit")) {
                      int v = 0;
@@ -12154,8 +13397,8 @@ void RestApiV1::register_routes(
                  // A1 parity: `os=windows|linux|macos` scopes the drilldown detail
                  // lists to one OS (anything else = all-OS), matching the dashboard
                  // catalogue drilldown. by_os stays cross-OS (it IS the split).
-                 const std::string os_scope =
-                     dex_normalize_os_filter(req.has_param("os") ? req.get_param_value("os") : "");
+                 const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
+                 const std::string os_scope = dex_normalize_os_filter(os_raw);
                  // Behavioral-PII access audit: the devices[] list below names the
                  // agent_ids exhibiting this signal. Emit the same verb the
                  // dashboard per-signal view does so a SIEM filter catches both.
@@ -12183,9 +13426,13 @@ void RestApiV1::register_routes(
                      return;
                  }
 
+                 // ADR-0031 WS-A4: the four raw signal-detail reads, bundled by
+                 // the DexApi seam (the impl derives since + normalizes os the
+                 // same way; os_scope below still feeds the response "os" field).
+                 const DexSignalDetailModel detail =
+                     dex_api->signal_detail(obs_type, window, os_raw, limit);
                  JArr subjects;
-                 for (const auto& s : guaranteed_state_store->dex_signal_subjects(obs_type, since,
-                                                                                  limit, os_scope)) {
+                 for (const auto& s : detail.subjects) {
                      subjects.add(JObj()
                                       .add("subject", s.subject)
                                       .add("count", s.count)
@@ -12193,7 +13440,7 @@ void RestApiV1::register_routes(
                                       .add("last_seen", s.last_seen));
                  }
                  JArr by_os;
-                 for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                 for (const auto& o : detail.by_os) {
                      // DexOsCrashCount.crashes carries the generic event count for
                      // the generalised per-obs_type read (see the store header).
                      by_os.add(JObj()
@@ -12202,16 +13449,14 @@ void RestApiV1::register_routes(
                                    .add("distinct_devices", o.distinct_devices));
                  }
                  JArr devices;
-                 for (const auto& d : guaranteed_state_store->dex_signal_devices(obs_type, since,
-                                                                                 limit, os_scope)) {
+                 for (const auto& d : detail.devices) {
                      devices.add(JObj()
                                      .add("agent_id", d.agent_id)
                                      .add("count", d.crashes)
                                      .add("last_seen", d.last_seen));
                  }
                  JArr by_day;
-                 for (const auto& d :
-                      guaranteed_state_store->dex_signal_by_day(obs_type, since, os_scope)) {
+                 for (const auto& d : detail.by_day) {
                      by_day.add(JObj().add("day", d.day).add("count", d.crashes));
                  }
                  res.set_content(ok_json(JObj()
@@ -12253,7 +13498,7 @@ void RestApiV1::register_routes(
     // GET /dex/perf/fleet — the now-stats per metric + the honest denominators
     // (the same numbers the yuzu_fleet_perf_* Prometheus gauges export).
     sink.Get("/api/v1/dex/perf/fleet",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
@@ -12261,7 +13506,7 @@ void RestApiV1::register_routes(
                  // id on every response + the A4 error envelope on failures.
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12271,13 +13516,21 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
+                 const auto now = dex_perf_fleet_now(dex_perf_api->fleet_snapshot(std::string{}));
                  res.set_content(ok_json(JObj()
                                              .raw("cpu_pct", perf_stat_json(now.cpu))
                                              .raw("commit_pct", perf_stat_json(now.commit))
                                              .raw("disk_lat_ms", perf_stat_json(now.disk_lat))
                                              .add("reporting", now.reporting)
                                              .add("windows_online", now.windows_online)
+                                             // Additive per-OS denominators (C1) — appended
+                                             // after the original fields, which stay
+                                             // byte-identical for existing callers.
+                                             .add("linux_online", now.linux_online)
+                                             .add("macos_online", now.macos_online)
+                                             .add("reporting_windows", now.reporting_windows)
+                                             .add("reporting_linux", now.reporting_linux)
+                                             .add("reporting_macos", now.reporting_macos)
                                              .str()),
                                  "application/json");
              });
@@ -12287,14 +13540,14 @@ void RestApiV1::register_routes(
     // carry suppressed=true with their population and no stats; the untagged
     // residual is the cohort=="" row.
     sink.Get("/api/v1/dex/perf/cohorts",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12312,7 +13565,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto snap = dex_perf_fn(key);
+                 const auto snap = dex_perf_api->fleet_snapshot(key);
                  JArr rows;
                  for (const auto& c : dex_perf_cohorts(snap)) {
                      JObj o;
@@ -12347,13 +13600,13 @@ void RestApiV1::register_routes(
     // half of the BRD F2c residual, row 100, is deferred: per-app data is
     // device-drill-only, not fleet render-time — see dex_perf_model.hpp.)
     sink.Get("/api/v1/dex/perf/cohort-diff",
-             [perm_fn, dex_perf_fn, perf_stat_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, perf_stat_json](const httplib::Request& req,
                                                     httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12395,7 +13648,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const auto d = dex_perf_cohort_diff(dex_perf_fn(key), a, b);
+                 const auto d = dex_perf_cohort_diff(dex_perf_api->fleet_snapshot(key), a, b);
                  auto cohort_obj = [&](bool found, const DexPerfCohortRow& c) -> std::string {
                      if (!found)
                          return "null";
@@ -12444,7 +13697,7 @@ void RestApiV1::register_routes(
     // (default), the not-reporting complement (filter=not_reporting), or a
     // cohort's members (cohort_key + cohort_value; empty value = untagged).
     sink.Get("/api/v1/dex/perf/devices",
-             [perm_fn, audit_fn, dex_perf_fn, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, dex_perf_api, deny_fleet_wide_service_scoped](
                  const httplib::Request& req, httplib::Response& res) {
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
@@ -12464,7 +13717,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!dex_perf_fn) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "service unavailable", cid,
@@ -12530,8 +13783,8 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.perf.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const auto rows = dex_perf_device_list(dex_perf_fn(cohort_key), metric,
-                                                        not_reporting, cohort_filter, limit);
+                 const auto rows = dex_perf_device_list(dex_perf_api->fleet_snapshot(cohort_key),
+                                                        metric, not_reporting, cohort_filter, limit);
                  JArr arr;
                  for (const auto& r : rows) {
                      JObj o;
@@ -12544,6 +13797,8 @@ void RestApiV1::register_routes(
                          o.add("disk_lat_ms", *r.disk_lat_ms);
                      if (r.fleet_pctile >= 0)
                          o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                     // Additive (C1): the row's normalized OS token, trailing.
+                     o.add("os", r.os);
                      arr.add(std::move(o));
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
@@ -12576,12 +13831,12 @@ void RestApiV1::register_routes(
     // data, so a worker discovers which `app=` values are answerable (A2).
     sink.Get(
         "/api/v1/dex/perf/apps",
-        [perm_fn, app_perf_providers](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, dex_perf_api](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.apps) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12591,7 +13846,7 @@ void RestApiV1::register_routes(
                 return;
             }
             bool truncated = false;
-            auto apps = app_perf_providers.apps(truncated);
+            auto apps = dex_perf_api->apps(truncated);
             if (!apps) { // AUTHORITATIVE read degrade — surface, never a silent empty
                 res.status = 503;
                 res.set_content(
@@ -12616,13 +13871,13 @@ void RestApiV1::register_routes(
     // (version omitted = every version, interleaved, each point tagged with its
     // canonicalized version). Exact fleet mean/max + bucket-resolution p50/p95.
     sink.Get("/api/v1/dex/perf/app",
-             [perm_fn, app_perf_providers, app_pct_json](const httplib::Request& req,
+             [perm_fn, dex_perf_api, app_pct_json](const httplib::Request& req,
                                                          httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!app_perf_providers.fleet) {
+                 if (!dex_perf_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(
                                          503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12658,8 +13913,8 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto rows = app_perf_providers.fleet(app, version);
-                 if (!rows) { // AUTHORITATIVE read degrade
+                 auto trend = dex_perf_api->app_fleet_trend(app, version);
+                 if (!trend) { // AUTHORITATIVE read degrade
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "app-perf store read degraded", cid,
@@ -12669,7 +13924,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  JArr points;
-                 for (const auto& pt : app_perf_fleet_trend(*rows)) {
+                 for (const auto& pt : *trend) {
                      // The fleet path floors too now, so a sub-floor point carries
                      // suppressed=true with device_count only — same shape as the
                      // group endpoint; without the flag a suppressed point would read
@@ -12734,7 +13989,7 @@ void RestApiV1::register_routes(
     // honest instead of generic).
     sink.Get(
         "/api/v1/dex/perf/app/devices",
-        [fleet_read_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, dex_perf_api](const httplib::Request& req,
                                                        httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -12789,7 +14044,7 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
             if (!gate.admitted)
                 return;
-            if (!app_perf_providers.version_devices) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12802,7 +14057,7 @@ void RestApiV1::register_routes(
             if (gate.scope)
                 visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
             bool truncated = false;
-            auto rows = app_perf_providers.version_devices(app, version, visible_ids, truncated);
+            auto rows = dex_perf_api->app_version_devices(app, version, visible_ids, truncated);
             if (!rows) { // AUTHORITATIVE read degrade
                 (void)detail::try_persist_audit(
                     audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
@@ -12884,7 +14139,7 @@ void RestApiV1::register_routes(
     // adjacent fleet/cohort aggregates, which are likewise unaudited.
     sink.Get(
         "/api/v1/dex/perf/group",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.group.view", "GuaranteedState",
@@ -12895,7 +14150,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.group) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12946,8 +14201,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.group(group_id, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
+            auto trend = dex_perf_api->group_trend(group_id, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (member resolution OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf group read degraded", cid,
@@ -12957,7 +14212,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)
@@ -12996,7 +14251,7 @@ void RestApiV1::register_routes(
     // cohort is equally a "named set of specific devices".
     sink.Get(
         "/api/v1/dex/perf/tag",
-        [perm_fn, app_perf_providers, app_pct_json,
+        [perm_fn, dex_perf_api, app_pct_json,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.perf.tag.view", "GuaranteedState",
@@ -13007,7 +14262,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.tag_cohort) {
+            if (!dex_perf_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -13067,8 +14322,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto rows = app_perf_providers.tag_cohort(key, value, app, version);
-            if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+            auto trend = dex_perf_api->tag_trend(key, value, app, version);
+            if (!trend) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf tag cohort read degraded", cid,
@@ -13078,7 +14333,7 @@ void RestApiV1::register_routes(
                 return;
             }
             JArr points;
-            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+            for (const auto& pt : *trend) {
                 JObj o;
                 o.add("version", pt.version)
                     .add("day", pt.day)
@@ -13270,13 +14525,14 @@ void RestApiV1::register_routes(
 
     // ── #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ──
     //
-    // Every builder call below is the SAME shared pure function
-    // (dex_read_model.hpp) the MCP twins in mcp_server.cpp call — Rule 1
-    // (docs/api-twin-recipe.md): REST/MCP/the HTML fragment build their
-    // response DATA from one function, never three independently-maintained
-    // copies. `dex_fleet_fn` is the SAME DexFleet provider DexRoutes already
-    // uses for the dashboard fragments (server.cpp wires the identical
-    // lambda to both).
+    // Every read below routes through the SAME in-process `DexApi` seam
+    // (dex_api.hpp) the MCP twins in mcp_server.cpp also call — Rule 1
+    // (docs/api-twin-recipe.md): REST/MCP build their response DATA from one
+    // API, never independently-maintained copies. The fleet denominator is
+    // obtained INSIDE the seam via its own FleetFn (server.cpp wires it into
+    // make_local_dex_api); these handlers no longer receive a dex_fleet_fn of
+    // their own. (The dashboard fragments still use DexRoutes' fleet provider
+    // directly — that rewire is deferred, ISSUE #4576.)
     //
     // Audit posture (per capability, matching each fragment's OWN posture --
     // #4035 AC): `apps`/`catalogue/group`/`health`/`trends` are fleet
@@ -13301,10 +14557,9 @@ void RestApiV1::register_routes(
     // faulting modules + exceptions + affected devices). Fleet-wide
     // identity-linked device list -> deny_fleet_wide_service_scoped +
     // fail-closed success audit (dex.app.view), per the posture note above.
-    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, guaranteed_state_store,
-                                 deny_fleet_wide_service_scoped,
+    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
                                  resolve_dex_visible](const httplib::Request& req,
-                                                       httplib::Response& res) {
+                                                      httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
         if (deny_fleet_wide_service_scoped(
@@ -13315,7 +14570,7 @@ void RestApiV1::register_routes(
             return;
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -13349,7 +14604,6 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
             return;
         }
-        const std::string since = dex_iso_since(dex_window_to_days(window));
         // #4035 hardening (governance): confine the affected-devices list to
         // the caller's management-group scope (ADR-0017 World A) — the
         // service-scoped-token axis is already closed above by
@@ -13357,21 +14611,20 @@ void RestApiV1::register_routes(
         // confined-OPERATOR axis the equivalent /fragments/dex/app fragment
         // already applies via resolve_visible (dex_routes.cpp).
         const auto vis = resolve_dex_visible(req);
-        const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
-                                               vis ? &*vis : nullptr);
+        const auto model = dex_api->app(name, window, vis ? &*vis : nullptr);
         res.set_content(ok_json(dex_app_json(model)), "application/json");
     });
 
     // GET /dex/apps?window= -- app-centric stability list. No per-agent
     // identity (a distinct-device COUNT per app, never an agent_id) -- no
     // audit, matching the fragment's own posture.
-    sink.Get("/api/v1/dex/apps", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Get("/api/v1/dex/apps", [perm_fn, dex_api](const httplib::Request& req,
+                                                    httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -13385,8 +14638,7 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         }
-        const std::string since = dex_iso_since(dex_window_to_days(window));
-        const auto model = build_dex_apps_model(guaranteed_state_store, window, since);
+        const auto model = dex_api->apps(window);
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
 
@@ -13394,13 +14646,12 @@ void RestApiV1::register_routes(
     // member signals (Catalogue View 2). No per-agent identity -- no audit,
     // matching the fragment's own posture.
     sink.Get("/api/v1/dex/catalogue/group",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13424,10 +14675,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 auto model = build_dex_catalogue_group_model(guaranteed_state_store, name, os,
-                                                              fleet, window, since);
+                 auto model = dex_api->catalogue_group(name, os, window);
                  if (!model) {
                      res.status = 404;
                      res.set_content(
@@ -13441,13 +14689,12 @@ void RestApiV1::register_routes(
     // GET /dex/health?weighting=&window= -- the derived composite health
     // score. No per-agent identity -- no audit, matching the fragment.
     sink.Get("/api/v1/dex/health",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13464,23 +14711,19 @@ void RestApiV1::register_routes(
                  }
                  const std::string weighting =
                      req.has_param("weighting") ? req.get_param_value("weighting") : "default";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 const auto model = build_dex_health_model(guaranteed_state_store, fleet, weighting,
-                                                            window, since);
+                 const auto model = dex_api->health(weighting, window);
                  res.set_content(ok_json(dex_health_json(model)), "application/json");
              });
 
     // GET /dex/trends?window= -- cross-OS comparison + per-family
     // small-multiples/heatmap source data. No per-agent identity -- no audit.
     sink.Get("/api/v1/dex/trends",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13495,10 +14738,7 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 const auto model =
-                     build_dex_trends_model(guaranteed_state_store, fleet, window, since);
+                 const auto model = dex_api->trends(window);
                  res.set_content(ok_json(dex_trends_json(model)), "application/json");
              });
 
@@ -13506,10 +14746,9 @@ void RestApiV1::register_routes(
     // Fleet-wide identity-linked top-devices list -> deny_fleet_wide_service_scoped
     // + fail-closed success audit (dex.overview.view), per the posture note above.
     sink.Get("/api/v1/dex/overview",
-             [perm_fn, audit_fn, guaranteed_state_store, dex_fleet_fn,
-              deny_fleet_wide_service_scoped,
+             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
               resolve_dex_visible](const httplib::Request& req,
-                                    httplib::Response& res) {
+                                   httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (deny_fleet_wide_service_scoped(
@@ -13521,7 +14760,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13529,7 +14768,6 @@ void RestApiV1::register_routes(
                  }
                  const std::string window =
                      req.has_param("window") ? req.get_param_value("window") : "7d";
-                 const int window_days = dex_window_to_days(window);
                  if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
                      res.status = 400;
                      res.set_content(
@@ -13551,15 +14789,11 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const std::string since = dex_iso_since(window_days);
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
                  // #4035 hardening (governance): confine the top-devices list
                  // to the caller's management-group scope (ADR-0017 World A) —
                  // same independent second belt as GET /api/v1/dex/app above.
                  const auto vis = resolve_dex_visible(req);
-                 const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
-                                                              window_days, since,
-                                                              vis ? &*vis : nullptr);
+                 const auto model = dex_api->overview(window, vis ? &*vis : nullptr);
                  res.set_content(ok_json(dex_overview_json(model)), "application/json");
              });
 
@@ -13572,8 +14806,8 @@ void RestApiV1::register_routes(
     // fragment's ground truth rather than inventing a second verb).
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/history)",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -13585,7 +14819,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -13613,9 +14847,7 @@ void RestApiV1::register_routes(
                              agent_id);
                 return;
             }
-            const std::string since = dex_iso_since(dex_window_to_days(window));
-            const auto model =
-                build_dex_device_history_model(guaranteed_state_store, agent_id, window, since);
+            const auto model = dex_api->device_history(agent_id, window);
             res.set_content(ok_json(dex_device_history_json(model)), "application/json");
         });
 
@@ -13624,8 +14856,8 @@ void RestApiV1::register_routes(
     // per-device SCOPED, fail-closed audit (dex.observation.view).
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/observations/([^/]+))",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const std::string event_id = req.matches[2].str();
             const auto cid = detail::make_correlation_id();
@@ -13644,7 +14876,7 @@ void RestApiV1::register_routes(
             // as "no such observation" — storage-layer failure masked as
             // not-found (build_dex_observation_model folds !store into
             // nullopt, same as the not-found/foreign-device cases).
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -13654,7 +14886,7 @@ void RestApiV1::register_routes(
             // (dex_routes.cpp:2916): a guessed/foreign event_id and a
             // genuinely-absent one both resolve to the SAME 404, so neither
             // reveals anything beyond what the scope gate already allowed.
-            auto obs = build_dex_observation_model(guaranteed_state_store, agent_id, event_id);
+            auto obs = dex_api->observation(agent_id, event_id);
             if (!obs) {
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "observation not found", cid),
@@ -14618,7 +15850,27 @@ void RestApiV1::register_routes(
             return;
         }
 
-        auto exec_opt = execution_tracker->get_execution(exec_id);
+        // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+        // get_execution(), which collapses "row genuinely absent" and "read
+        // degraded" (pool/query failure) to the same nullopt -- a transient
+        // degrade here fell through to the not-found + denial-audit branch
+        // below, producing a FALSE 404 for a legitimate owner and a
+        // permanently wrong CC7.2 audit trail for a non-owner.
+        // get_execution_checked's outer std::expected distinguishes the two;
+        // the degrade branch below matches this same route's own agents_opt
+        // degrade handling a few lines down.
+        auto exec_r = execution_tracker->get_execution_checked(exec_id);
+        if (!exec_r) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503, "execution tracker degraded", cid,
+                                      /*retry_after_ms=*/5000,
+                                      "retry shortly; the execution read failed "
+                                      "transiently"),
+                "application/json");
+            return;
+        }
+        const auto& exec_opt = *exec_r;
         // #1634 perf (governance Gate 3 finding): only fetch/scan agent
         // statuses when confined — an unrestricted subscriber is always
         // visible regardless, so this indexed lookup would be pure waste on

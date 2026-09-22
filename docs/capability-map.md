@@ -270,7 +270,7 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 ### 3.9 Printer Inventory :white_check_mark: `T3` *(verified 2026-09-15)*
 
-`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. See `agents/plugins/printing/README.md`.
+`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. `clear_queue` cancels exactly one job (Destructive/Irreversible, admin-or-approval) with no purge-all path. See `agents/plugins/printing/README.md`.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2` *(verified 2026-09-10)*
 
@@ -1603,7 +1603,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 |--------|:---:|:-----:|:-----:|----------|
 | os_info | Y | Y | Y | System Info |
 | hardware | Y | Y | Y | System Info |
-| peripherals | - | Y | Y | System Info | *Windows leg: follow-up PR* |
+| peripherals | Y | Y | Y | System Info |
 | device_identity | Y | Y | Y | System Info |
 | status | Y | Y | Y | System Info |
 | power_health | Y | Y | Y | System Info |
@@ -1662,7 +1662,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**55 plugins** (+ 2 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus this PR's own `peripherals`. `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**55 plugins** (+ 2 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
 
 ---
 

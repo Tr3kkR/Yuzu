@@ -29,15 +29,21 @@
  * single-OS build, and execute() branches on _WIN32 only to choose between
  * the real Windows legs (P32's execution_artifacts_win.cpp, declared in
  * execution_artifacts_legs.hpp) and the fixed non-Windows
- * "unsupported|windows_only_artefact" outcome every action reports there.
+ * "<action>|unsupported|windows_only_artefact" outcome every action reports there.
  */
 
 #include <yuzu/plugin.hpp>
 
 #include "execution_artifacts_legs.hpp"
+#include "execution_artifacts_scratch_sweep.hpp"
 
 #include <yuzu/string_utils.hpp>
 
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -137,6 +143,13 @@ public:
         // string_view over the C ABI's own buffer, not guaranteed to
         // outlive this call (tar_plugin.cpp:569's same precedent).
         data_dir_ = std::string{ctx.get_config("agent.data_dir")};
+#ifdef _WIN32
+        // A1 (#4390): reclaim any stale scratch directory a crashed/killed
+        // prior dispatch left under agent.data_dir before this agent ever
+        // runs amcache itself. Never affects init()'s own outcome -- see
+        // sweep_scratch_dirs's own try/catch(...).
+        sweep_scratch_dirs("startup");
+#endif
         return {};
     }
 
@@ -147,15 +160,24 @@ public:
 #ifdef _WIN32
         if (action == "shimcache")
             return yuzu::execution_artifacts::collect_shimcache(ctx);
-        if (action == "amcache")
+        if (action == "amcache") {
+            // Log-only, never an output row (row shapes stay byte-identical)
+            // -- reclaims an orphan left by a crashed dispatch at the first
+            // amcache dispatch at least kScratchDirStaleAfterSecs after it
+            // was left, rather than only at the next agent restart.
+            sweep_scratch_dirs("pre-dispatch");
             return yuzu::execution_artifacts::collect_amcache(ctx, data_dir_);
+        }
         if (action == "prefetch")
             return yuzu::execution_artifacts::collect_prefetch(ctx);
 #else
         if (action == "shimcache" || action == "amcache" || action == "prefetch") {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "windows_only_artefact");
-            ctx.write_output(std::string{"unsupported|"} +
+            // `action` is safe to write raw here (unlike the unknown-action row below):
+            // this branch is reachable only when it string-equals one of the three
+            // literals just checked above, never request-supplied free text.
+            ctx.write_output(std::string{action} + "|unsupported|" +
                              std::string{yuzu::execution_artifacts::kUnsupportedWindowsOnly});
             return 1;
         }
@@ -168,6 +190,57 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    // A1 (#4390): sweep stale execution_artifacts- scratch directories out
+    // of agent.data_dir. The ENTIRE body sits inside one try/catch(...):
+    // the SDK's init trampoline (sdk/include/yuzu/plugin.hpp's
+    // YUZU_PLUGIN_EXPORT _yuzu_init_) calls this->init() with no catch of
+    // its own, so an exception escaping from here during the "startup"
+    // call would cross the plugin's C ABI boundary. Never throws; never
+    // affects this plugin's own result -- init() still returns success
+    // unconditionally regardless of what the sweep found, and the
+    // "pre-dispatch" call from execute() never produces an output row.
+    void sweep_scratch_dirs(const char* trigger) noexcept {
+        try {
+            // UTF-8-view-based std::filesystem::path construction, NEVER
+            // the narrow-string constructor -- the same reasoning as
+            // execution_artifacts_win.cpp's ScratchDirGuard banner (a
+            // narrow std::string is decoded via the ANSI code page on
+            // MSVC, silently mangling a non-ASCII agent.data_dir). This TU
+            // stays portable/OS-header-free, so this goes through
+            // std::filesystem's own C++20 u8 constructor rather than
+            // yuzu::win::to_wide (agents/shared, Windows-only).
+            const std::u8string_view data_dir_u8{
+                reinterpret_cast<const char8_t*>(data_dir_.data()), data_dir_.size()};
+            const std::wstring wide_data_dir = std::filesystem::path{data_dir_u8}.wstring();
+
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+
+            const auto result = yuzu::execution_artifacts::sweep_stale_scratch_dirs(
+                wide_data_dir, static_cast<std::int64_t>(now));
+
+            const std::size_t total = result.removed + result.failed + result.skipped_not_ours +
+                                       result.deferred;
+            if (total > 0) {
+                spdlog::warn(
+                    "execution_artifacts: {} scratch sweep under agent.data_dir: removed {} "
+                    "failed {} not_ours {} deferred {}",
+                    trigger, result.removed, result.failed, result.skipped_not_ours,
+                    result.deferred);
+            }
+            if (result.enumerate_error) {
+                spdlog::warn(
+                    "execution_artifacts: {} scratch sweep could not enumerate agent.data_dir "
+                    "(os_error={})",
+                    trigger, result.os_error);
+            }
+        } catch (...) {
+        }
+    }
+#endif
+
     // Captured at init() (tar_plugin.cpp:565-581's precedent); only the
     // amcache leg consumes it (execution_artifacts_win.cpp's collect_amcache,
     // as the parent directory for its per-dispatch random scratch

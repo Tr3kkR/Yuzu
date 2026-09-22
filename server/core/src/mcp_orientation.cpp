@@ -55,8 +55,10 @@ constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition
 // securable (ProductPack), own family.
 constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product_pack"};
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
-constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_executions",
-                                                 "query_audit_log"};
+// #2146 A2-R1: get_execution_children joins the family - same securable
+// (Execution:Read), same domain as get_execution_status/list_executions.
+constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_execution_children",
+                                                 "list_executions", "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses", "get_agent_app_usage"};
@@ -78,8 +80,9 @@ constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
                                             "add_management_group_member",
                                             "list_management_group_roles",
                                             "assign_management_group_role"};
-constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
-                                           "reject_request"};
+constexpr std::string_view kApprovals[] = {"list_pending_approvals",
+                                           "get_pending_approval_count", // #2146 A2-R4
+                                           "approve_request", "reject_request"};
 constexpr std::string_view kDexSignals[] = {
     "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",

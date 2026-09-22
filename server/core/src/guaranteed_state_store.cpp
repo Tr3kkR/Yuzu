@@ -883,6 +883,9 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
 
     if (!txn.commit())
         return op_error(std::string("commit failed: ") + PQerrorMessage(conn), kReasonQueryError);
+    const std::int64_t committed_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
 
     events_written_.fetch_add(1, std::memory_order_relaxed);
     // Census upsert AFTER commit, as a separate best-effort autocommit
@@ -892,7 +895,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     if (!is_reserved_rule_id(row.rule_id))
         if (const char* state = event_state_from_type(row.event_type))
             upsert_rule_status(conn, row.agent_id, row.rule_id, state, row.timestamp);
-    return {EventInsertOutcome::Inserted, {}};
+    return {EventInsertOutcome::Inserted, {}, committed_wall_ns};
 }
 
 std::expected<void, std::string>

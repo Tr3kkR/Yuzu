@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn's return type
+#include "dex_window.hpp" // ADR-0031 WS-A4: dex_iso_since (+ the window/os resolvers) -- pure, re-exported here
 
 /// @file dex_view_types.hpp
 /// STORE-FREE symbols hoisted out of `dex_routes.hpp` (ADR-0031 WS-A4 prep) so a
@@ -69,13 +70,10 @@ using DexAuditFn = std::function<bool(const httplib::Request&, const std::string
                                       const std::string& result, const std::string& target_type,
                                       const std::string& target_id, const std::string& detail)>;
 
-/// Shared window-selector resolver — the single source of truth for how both the
-/// dashboard fragments and the `/api/v1/dex/*` REST surface turn a resolved day
-/// count into an ISO-8601 UTC cutoff ("" when days<=0 = "all"). Thin wrapper over
-/// the dashboard's internal helper so REST and HTMX can never drift on the window
-/// vocabulary. (`dex_window_to_days`, the token->day-count half, stays declared in
-/// `dex_routes.hpp` — it is not needed store-free by any current caller.)
-std::string dex_iso_since(int days);
+// `dex_iso_since` (and the window/os resolvers) are now declared in the pure
+// `dex_window.hpp` (included above) and re-exported here transitively, so every
+// existing caller is unaffected while the core `DexApi` impl can resolve a
+// window without this httplib-coupled header.
 
 /// Friendly display label for an obs_type; unknown types fall back to the
 /// HTML-escaped raw obs_type (forward-compatible, render-safe).

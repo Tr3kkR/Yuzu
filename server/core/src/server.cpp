@@ -189,6 +189,10 @@
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
+#include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
+#include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
+#include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -249,6 +253,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
 #include "gateway_service_impl.hpp"
 
@@ -463,9 +468,9 @@ struct ScopedKeyZero {
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
 // #1290 adds (field confusion), and a CRLF could split the audit line. The
-// canonical implementation now lives in web_utils.hpp so the same neutralizer
-// guards every structured-audit call site (here + tar_tree_routes.cpp) without
-// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// shared mapping is yuzu::log_token (common/include/yuzu/log_token.hpp) and
+// web_utils.hpp's audit_token forwards to it, so the same neutralizer guards every
+// structured-audit call site (here + tar_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
 // spellings below resolving unchanged.
 using yuzu::server::audit_token;
 
@@ -1430,6 +1435,16 @@ public:
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // #4496 (+ follow-up): the from-inventory-query result-set producer
+        // (REST and its MCP twin) - its OWN reachable set, same discipline as
+        // `result_set_parent` above: this route can only ever emit these
+        // three data-quality reasons, never the targeting-shape ones.
+        for (const auto reason : {yuzu::server::kReasonQueryTruncated,
+                                  yuzu::server::kReasonPoisonExcluded,
+                                  yuzu::server::kReasonParseErrorExcluded})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_inventory_query"},
+                              {"reason", std::string(reason)}});
         // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
         // It refuses `scope` outright (PolicyEvaluator::remediate takes only
         // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
@@ -1624,15 +1639,72 @@ public:
         // healthy). "unauthenticated" = the gateway's mgmt-plane peer pin
         // rejected this server's cert - fleet forwarding is down until the pin
         // and the server leaf agree.
+        //
+        // HA WS-4 4.3: added the `cluster_id` label (resolved config key, or
+        // "unknown" for an unmapped cluster — NEVER the raw gateway-asserted
+        // wire value, a cardinality risk even after ingest clamping) and
+        // three outcomes: "unknown_cluster" (no configured mgmt address for
+        // a command's resolved cluster), "not_connected" (the gateway-side
+        // "agent not connected on this cluster" error, folded into "ok"
+        // before this slice — see forward_gateway_pending's comment), and
+        // "agent_mismatch" (a response naming a different agent than the
+        // one this request targeted — refused, not applied; Fable
+        // pre-implementation review finding 6a). The label SET is derived
+        // from `cfg_` here (not `gw_mgmt_pool_`, which is built later in
+        // run(), post-bootstrap) — "default" always, plus every configured
+        // `--gateway-cluster-addr` key, matching the pool's own resolution
+        // rule exactly (GatewayMgmtStubPool's file header comment).
         metrics_.describe("yuzu_server_gateway_forward_total",
                           "Gateway SendCommand forwards by terminal outcome (ok / "
                           "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
-                          "peer pin / unavailable = dropped after 3 attempts / other). "
-                          "Any non-ok movement means commands to gateway-connected "
-                          "agents are being lost.",
+                          "peer pin / unavailable = dropped after 3 attempts / "
+                          "unknown_cluster = no configured address for the resolved "
+                          "cluster / not_connected = agent not connected on the dialed "
+                          "cluster / agent_mismatch = response named a different agent, "
+                          "refused / other), labelled by the resolved cluster_id "
+                          "(config key, or 'unknown' - never the raw gateway-asserted "
+                          "value). Any non-ok movement means commands to gateway-connected "
+                          "agents are being lost. A DISTINCT, non-dispatch outcome shares "
+                          "this metric name: unmapped_cluster_seen (emitted from "
+                          "gateway_service_impl.cpp at gateway CONNECT time, cluster_id "
+                          "always 'unknown') - an early-warning signal that a session "
+                          "announced an unmapped cluster before any command was even "
+                          "attempted against it, consistency-auditor Gate 4 finding.",
                           "counter");
-        for (const char* st : {"ok", "unauthenticated", "unavailable", "other"}) {
-            metrics_.counter("yuzu_server_gateway_forward_total", {{"status", st}});
+        {
+            std::unordered_set<std::string> cluster_labels{
+                std::string(yuzu::server::kDefaultGatewayClusterKey)};
+            for (const auto& id : cfg_.gateway_cluster_addresses | std::views::keys)
+                cluster_labels.insert(id);
+            // post-governance Fable review, pre-push: "unknown" was
+            // previously seeded only in multi-cluster mode, but UP-1's fix
+            // (server.cpp's forward_gateway_pending, the configured-but
+            // -unusable-pool branch) emits {cluster_id="unknown",
+            // status="unavailable"} in EITHER mode — a boot-time credential
+            // failure is exactly as possible with --gateway-command-addr
+            // alone as with --gateway-cluster-addr. Unconditional now, so
+            // that signal's absent-vs-zero convention holds in both modes.
+            cluster_labels.insert(std::string(yuzu::server::kUnknownGatewayClusterLabel));
+            for (const auto& cl : cluster_labels) {
+                for (const char* st : {"ok", "unauthenticated", "unavailable", "other",
+                                       "unknown_cluster", "not_connected", "agent_mismatch"}) {
+                    metrics_.counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cl}, {"status", st}});
+                }
+            }
+            // sre Gate 3: unmapped_cluster_seen (gateway_service_impl.cpp's
+            // CONNECTED-time early-warning counter) is a DISTINCT event from
+            // the dispatch-time outcomes above — always fired with cluster_id
+            // "unknown" — and was missing from this seed, breaking the
+            // absent-vs-zero convention for exactly the metric designed to
+            // warn an operator BEFORE the first dropped command. Only
+            // meaningful once "unknown" is even in the label set (multi
+            // -cluster mode configured), same gate as that insert above.
+            if (!cfg_.gateway_cluster_addresses.empty()) {
+                metrics_.counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                  {"status", "unmapped_cluster_seen"}});
+            }
         }
 
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
@@ -3792,7 +3864,7 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // Gateway command-forwarding client (gw_mgmt_pool_, HA WS-4 4.3) is
         // built in run(), AFTER bootstrap_default_certs() — for a default-cert
         // install the client cert/key paths are empty here and only populated by
         // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
@@ -7258,27 +7330,48 @@ public:
         // unauthenticated container — including a compromised agent with no
         // CA-issued cert — can no longer push commands to the fleet. Only a
         // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
-        if (!cfg_.gateway_command_address.empty()) {
+        //
+        // HA WS-4 4.3: gw_mgmt_pool_ replaces the pre-4.3 single
+        // gw_mgmt_channel_/gw_mgmt_stub_ pair — one shared credentials object
+        // (built once, below), reused across every cluster's channel
+        // (GatewayMgmtStubPool's contract; the mgmt-plane peer pin, #1422,
+        // lives per-cluster on the GATEWAY side, not something core varies
+        // its own identity for). Built whenever EITHER
+        // --gateway-command-addr OR --gateway-cluster-addr is set — the
+        // latter alone is a valid multi-cluster-only configuration with no
+        // default/legacy address (GatewayMgmtStubPool handles an empty
+        // default_address correctly, see its constructor).
+        if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
             std::shared_ptr<grpc::ChannelCredentials> gw_creds;
             if (cfg_.tls_enabled) {
                 gw_creds = build_gateway_command_credentials();
                 if (!gw_creds)
-                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
-                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
-                                  "build mutual-TLS credentials.",
-                                  cfg_.gateway_command_address);
+                    // fail-closed: leave gw_mgmt_pool_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled — could not build "
+                                  "mutual-TLS credentials.");
             } else {
-                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
-                             "fan-out plane is unauthenticated — keep it on a trusted network.",
-                             cfg_.gateway_command_address);
+                spdlog::warn("Gateway command plane is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.");
                 gw_creds = grpc::InsecureChannelCredentials();
             }
             if (gw_creds) {
-                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
-                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-                spdlog::info("Gateway command forwarding enabled: {} ({})",
-                             cfg_.gateway_command_address,
-                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                gw_mgmt_pool_ = std::make_unique<yuzu::server::GatewayMgmtStubPool>(
+                    cfg_.gateway_command_address, cfg_.gateway_cluster_addresses, gw_creds);
+                if (gw_mgmt_pool_->multi_cluster_mode()) {
+                    spdlog::info(
+                        "Gateway command forwarding enabled: multi-cluster mode, {} cluster(s) "
+                        "configured via --gateway-cluster-addr ({})",
+                        gw_mgmt_pool_->known_clusters().size(),
+                        cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                    if (gateway_service_) {
+                        gateway_service_->set_known_gateway_clusters(
+                            &gw_mgmt_pool_->known_clusters());
+                    }
+                } else {
+                    spdlog::info("Gateway command forwarding enabled: {} ({})",
+                                 cfg_.gateway_command_address,
+                                 cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                }
             }
         }
 
@@ -9782,6 +9875,17 @@ public:
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
         //
+        // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
+        // now includes a raw `Stub*` resolved from gw_mgmt_pool_
+        // (GatewayMgmtStubPool::resolve(), captured per-command into the same
+        // forward_gateway_pending() detached thread). Unlike metrics_ above,
+        // this one is NOT a subset-of-existing-envelope case — see the
+        // gw_mgmt_pool_.reset() call site (immediately before pg_pool_.reset()
+        // below) for why it was deliberately placed as late as practical in
+        // this function rather than mirrored next to gateway_route_store_'s
+        // reset, and why that placement restores parity with, rather than
+        // widening, the pre-4.3 timing.
+        //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
         // the nvd_sync leak-and-continue precedent (Gate 8 unhappy-path
@@ -10057,6 +10161,42 @@ public:
         ca_store_.reset();
         // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
         // before auth_key_provider_ (the codec borrows it) — see that comment.
+        //
+        // HA WS-4 4.3 (Gate 2 security-guardian finding, pre-push): gw_mgmt_pool_
+        // is deliberately reset HERE — the latest practical point in stop(), not
+        // alongside gateway_route_store_ above (where it originally sat, mirroring
+        // that store's own reset). The mirror was WRONG for this resource: unlike
+        // gateway_route_store_ (read only from gRPC handler threads that
+        // mgmt_server_->Shutdown(deadline) has already drained by that point),
+        // gw_mgmt_pool_ is also read by forward_gateway_pending()'s DETACHED,
+        // UNTRACKED std::thread(...).detach() workers (#3279 — see that comment
+        // block above response_store_.reset()/notification_store_.reset(), which
+        // this same untracked-thread class already reaches). Placing the reset
+        // where gateway_route_store_'s sits would free the pool's channels/stubs
+        // up to ~60s+ EARLIER than the pre-4.3 code ever did (the old single
+        // gw_mgmt_stub_/gw_mgmt_channel_ pair was never explicitly reset in stop()
+        // at all — it lived until IMPLICIT member destruction, which only runs
+        // after this entire function returns) — a real widening of #3279's
+        // existing UAF window, not a no-op relocation. Moving the reset here,
+        // after every other quiesce/drain this function performs, does not CLOSE
+        // #3279 (that fix is join/drain forward_gateway_pending()'s workers,
+        // tracked there).
+        //
+        // pr-rev correction (FortitudeEtc/Codex+Kimi, SHOULD 5): an earlier
+        // version of this comment claimed this placement "restores parity
+        // with the pre-4.3 timing" — that overstates it. gw_mgmt_pool_ is
+        // STILL explicitly reset here, INSIDE stop(), which is still
+        // strictly earlier than the pre-4.3 baseline (implicit member
+        // destruction, which ran only after this entire function RETURNED —
+        // i.e. after even this line). The honest claim: this is the LATEST
+        // PRACTICAL point achievable inside stop() itself, which narrows
+        // #3279's window as far as an explicit in-function reset can, but
+        // does not fully match — let alone restore — the old timing. Fully
+        // closing the gap needs #3279's actual fix (join/drain the detached
+        // workers before any reset), not a reordering within this function.
+        if (gateway_service_)
+            gateway_service_->set_known_gateway_clusters(nullptr);
+        gw_mgmt_pool_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -11989,92 +12129,490 @@ private:
         }
     }
 
+    /// #4672: synthesize and apply a terminal FAILURE `CommandResponse` for a
+    /// gateway-forwarded command whose delivery will never otherwise resolve
+    /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
+    /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
+    /// `agent_mismatch` branches — see that function's own comments). Routes
+    /// through `process_gateway_response` — the SAME mechanism every real
+    /// gateway response already takes at this function's other call sites —
+    /// so the command_id resolves via the one established
+    /// `notify_exec_tracker` terminal-write path (executions-history-ladder
+    /// routed concern: exactly once, never a bespoke second mechanism).
+    ///
+    /// STATIC and takes `svc` explicitly (never `this`) ON PURPOSE: every
+    /// call site inside `forward_gateway_pending`'s detached per-command
+    /// thread reaches this through the ALREADY-captured `svc = &agent_service_`
+    /// raw pointer — that thread is `std::thread(...).detach()`ed and,
+    /// per #3279 (see the block a few hundred lines up this file, "KNOWN GAP,
+    /// filed as #3279, NOT fixed here"), is untracked by every shutdown
+    /// drain/quiesce mechanism this server has. #3279's own destruction-order
+    /// analysis is scoped to the raw pointers ALREADY captured there
+    /// (`svc`/`metrics`/the resolved `Stub*`); widening that detached thread's
+    /// reach with a fresh `this` capture — which this synthesis could
+    /// otherwise be tempted to take, to reach `command_outbox_store_`/
+    /// `leader_elector_` for a durable-outbox re-drive — would extend a
+    /// KNOWN, separately-tracked, human-adjudicated lifetime hazard rather
+    /// than closing this issue's own scope. See `forward_gateway_pending`'s
+    /// doc comment for the resulting, deliberate design boundary: every
+    /// branch here resolves IMMEDIATELY rather than rescheduling.
+    static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
+                                                        const std::string& agent_id,
+                                                        const std::string& command_id,
+                                                        const std::string& reason_code,
+                                                        const std::string& detail_msg) {
+        svc->process_gateway_response(
+            agent_id, yuzu::server::build_gateway_forward_terminal_failure(
+                          command_id, reason_code, detail_msg));
+    }
+
     /// Forward any commands queued for gateway-connected agents.
+    ///
+    /// #4672 (durable resolution of the terminal-failure branches — this
+    /// function's own catastrophic-if-violated gap before this change: a
+    /// command hitting `unauthenticated`, exhausted `unavailable`,
+    /// `unknown_cluster`, `agent_mismatch`, or a generic non-UNAVAILABLE
+    /// grpc status ("other") was logged, counted, and dropped — the
+    /// dispatching operator's command_id then NEVER resolved, silently,
+    /// forever). Every one of those FIVE branches (pr-rev finding
+    /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
+    /// said "four", undercounting the pre-existing "other" branch this same
+    /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
+    /// now calls `apply_gateway_forward_terminal_failure` exactly once
+    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// unresolved command_id ALWAYS eventually reaches a terminal state —
+    /// "ALWAYS" describes the per-command retry loop below; the null/empty
+    /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
+    /// a clean `Finish()` with zero frames (#4691, still open), are the
+    /// two paths outside that loop the same claim must also hold for or be
+    /// scoped around — the former is now resolved through the same helper
+    /// (see that branch's own comment); the latter is not, and is tracked.
+    ///
+    /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
+    /// ALL FIVE branches — including the transient-looking exhausted-
+    /// `unavailable` case, which ADR-2002 §7's design note originally
+    /// intended to "stay pending... and be re-driven [with backoff]" the way
+    /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
+    /// does for `route_unreadable`/`containment_unreadable`. Two independent
+    /// reasons that mechanism cannot be safely reused here without a
+    /// SEPARATE, dedicated change (tracked as a documented follow-up, not
+    /// silently deferred):
+    ///
+    ///   1. GRANULARITY MISMATCH. `command_outbox_store`'s producer API
+    ///      (`claim_and_enqueue`) is epoch-fenced and its ONLY existing
+    ///      producer (`ScheduleRunner`) runs strictly inside a
+    ///      `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the whole
+    ///      point of the fence is that only a caller who has ALREADY
+    ///      confirmed leadership calls it. `forward_gateway_pending` is
+    ///      reachable from every replica via ordinary operator-synchronous
+    ///      dispatch (REST/MCP/dashboard), never gated on leadership, so an
+    ///      enqueue attempt here would silently no-op on a non-leader
+    ///      replica (`LeaderElector::epoch()` returns `nullopt` — there is no
+    ///      epoch to embed) — an inconsistent, replica-dependent retry that
+    ///      is worse than today's uniform drop. And `command_outbox_delivery`'s
+    ///      own "sent" means "the confined-dispatch resolution QUEUED it"
+    ///      (`ConfinedDispatchOutcome::sent`), not "the gateway RPC actually
+    ///      completed" — reusing its generic `DispatchFn` path for a
+    ///      redelivery would mark the occurrence `sent`/terminal in the
+    ///      outbox the instant `send_to` re-queues it, racing and swallowing
+    ///      the very gateway failure this redelivery exists to observe.
+    ///
+    ///   2. #3279 (see the KNOWN GAP block documented a few hundred lines up
+    ///      this file). This function's own detached per-command
+    ///      `std::thread(...).detach()` is untracked by every shutdown
+    ///      drain/quiesce mechanism this server has, and its raw-pointer
+    ///      capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+    ///      carefully-scoped, individually-justified exception to that gap —
+    ///      not a precedent to extend. A durable-retry producer would need
+    ///      that thread to ALSO touch `command_outbox_store_`/
+    ///      `leader_elector_`, widening #3279's reach into two more
+    ///      ServerImpl-owned stores with no existing destruction-order
+    ///      analysis covering them. #3279 is explicitly "deferred to Dave to
+    ///      adjudicate" — expanding its blast radius as a side effect of this
+    ///      issue would be scope creep into a separately-tracked, human-owned
+    ///      decision, not a fix for it.
+    ///
+    /// `docs/adr/2002-high-availability-architecture.md` §7 is updated
+    /// alongside this change to describe the gateway-forwarding path
+    /// accurately: immediate terminal resolution today, with the durable
+    /// re-drive this function's comment above describes as a documented,
+    /// scoped-out follow-up (blocked on #3279).
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (!gw_pending.empty() && gw_mgmt_stub_) {
-            for (auto& gp : gw_pending) {
-                auto* stub = gw_mgmt_stub_.get();
-                auto* svc = &agent_service_;
-                auto* metrics = &metrics_;
-                auto cmd_id = gp.cmd.command_id();
-                spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id]() {
-                    ::yuzu::server::v1::SendCommandRequest req;
-                    req.add_agent_ids(gp.agent_id);
-                    *req.mutable_command() = gp.cmd;
-                    req.set_timeout_seconds(300);
-
-                    // Retry up to 3 times on transient connection failures
-                    for (int attempt = 0; attempt < 3; ++attempt) {
-                        if (attempt > 0) {
-                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                         attempt + 1);
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
-                        }
-
-                        grpc::ClientContext ctx;
-                        ctx.set_deadline(std::chrono::system_clock::now() +
-                                         std::chrono::seconds(300));
-                        auto reader = stub->SendCommand(&ctx, req);
-
-                        ::yuzu::server::v1::SendCommandResponse resp;
-                        int resp_count = 0;
-                        while (reader->Read(&resp)) {
-                            ++resp_count;
-                            svc->process_gateway_response(resp.agent_id(), resp.response());
-                        }
-                        auto status = reader->Finish();
-                        if (status.ok()) {
-                            spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
-                                          cmd_id, resp_count);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "ok"}})
-                                .increment();
-                            return; // success — done
-                        }
-                        // #1422: the gateway's mgmt-plane peer pin rejects with
-                        // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                        // grpc-message when an auth_fun rejects) — the generic
-                        // warn below would render as "failed:  (16)", which is
-                        // invisible as the fleet-wide forwarding outage it
-                        // actually is. Name the cause and the fix.
-                        if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
-                            spdlog::error(
-                                "Gateway SendCommand for {} REJECTED by the gateway's "
-                                "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
-                                "server presents does not satisfy the gateway's "
-                                "mgmt_peer_pins posture (rotated leaf? BYO cert "
-                                "without repointing the pin, or without the "
-                                "serverAuth EKU?). The gateway log's reason atom "
-                                "names the exact cause. Command forwarding to "
-                                "gateway-connected agents is DOWN until the pin and "
-                                "the server leaf agree. Command dropped.",
-                                cmd_id);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "unauthenticated"}})
-                                .increment();
-                            return; // config defect — retry cannot help
-                        }
-                        // Only retry on UNAVAILABLE (connection refused / not ready)
-                        if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-                            spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                         status.error_message(),
-                                         static_cast<int>(status.error_code()));
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "other"}})
-                                .increment();
-                            return; // non-transient error — don't retry
-                        }
-                        spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                     cmd_id, attempt + 1, status.error_message());
-                    }
-                    spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                    metrics->counter("yuzu_server_gateway_forward_total",
-                                     {{"status", "unavailable"}})
-                        .increment();
-                }).detach();
+        if (gw_pending.empty())
+            return;
+        if (!gw_mgmt_pool_ || gw_mgmt_pool_->empty()) {
+            // unhappy-path Gate 4 finding (UP-1): this shape (drain, then
+            // silently drop everything if the pool/stub isn't usable) is
+            // PRE-EXISTING — not introduced by HA WS-4 4.3 — but was already
+            // silent pre-4.3 too (no log, no metric). Gateway command
+            // forwarding being unconfigured at all is the common, silent-by
+            // -design case (no flag set); but gw_mgmt_pool_ null/empty
+            // DESPITE gateway_command_address/gateway_cluster_addresses being
+            // configured means credential construction failed at boot (see
+            // the "Gateway command forwarding NOT enabled" error a few lines
+            // up the constructor) — a real, fleet-wide, otherwise-silent loss
+            // of every gateway-routed command from then on. Surface it here,
+            // once per drain, rather than leaving an operator to notice only
+            // via the absence of expected agent activity.
+            if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
+                spdlog::error(
+                    "Gateway command forwarding is CONFIGURED but not usable ({} command(s) "
+                    "just dropped) — see the earlier boot-time error for why "
+                    "(mutual-TLS credential construction likely failed)",
+                    gw_pending.size());
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                              {"status", "unavailable"}})
+                    .increment(static_cast<double>(gw_pending.size()));
+                // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+                // the metric/log above previously left every drained command's
+                // command_id unresolved -- the exact "stuck forever" shape
+                // #4672 exists to close, just reached via a different branch
+                // (an unusable pool/stub rather than a per-command RPC
+                // failure). Resolve each one through the SAME helper the
+                // per-command retry loop below uses, so this path is no
+                // longer a silent exception to the "always reaches a
+                // terminal state" contract.
+                for (auto& gp : gw_pending) {
+                    apply_gateway_forward_terminal_failure(
+                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
+                        "Gateway command forwarding is configured but not usable "
+                        "(mutual-TLS credential construction likely failed at boot) "
+                        "— command not delivered");
+                }
             }
+            return;
+        }
+        for (auto& gp : gw_pending) {
+            // HA WS-4 4.3: resolve per-command, against the eager pool built
+            // at boot — see GatewayMgmtStubPool's file header for the
+            // two-mode resolution rule (single-cluster mode ignores
+            // gp.cluster_id entirely; multi-cluster mode resolves it, with
+            // an unmapped cluster_id treated as a config defect below,
+            // mirroring the pre-existing UNAUTHENTICATED "retry cannot help"
+            // treatment).
+            auto resolution = gw_mgmt_pool_->resolve(gp.cluster_id);
+            auto cmd_id = gp.cmd.command_id();
+            if (!resolution.stub) {
+                spdlog::error(
+                    "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
+                    "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
+                    "cluster is DOWN until it is added",
+                    cmd_id, gp.cluster_id.value_or("<none>"));
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
+                    .increment();
+                // #4672: a definite config gap (this cluster_id has no
+                // configured mgmt address AT ALL, resolved deterministically
+                // against boot-time config) — not a degraded read, so this is
+                // the "answered no" case dispatch_confined_arms.hpp's
+                // route_unreadable doc comment distinguishes from "the read
+                // itself could not answer", and not worth a durable backoff
+                // retry: it self-heals only via an operator adding
+                // --gateway-cluster-addr, which time alone does not fix.
+                // Resolve the command_id terminally now rather than leaving
+                // it stuck forever.
+                apply_gateway_forward_terminal_failure(
+                    &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
+                    "No configured mgmt address for cluster '" +
+                        gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                continue;
+            }
+            auto* stub = resolution.stub;
+            auto* svc = &agent_service_;
+            auto* metrics = &metrics_;
+            auto expected_agent_id = gp.agent_id;
+            auto cluster_label = resolution.label;
+            spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
+                         cluster_label, gp.agent_id);
+            std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id, expected_agent_id,
+                        cluster_label]() {
+                ::yuzu::server::v1::SendCommandRequest req;
+                req.add_agent_ids(gp.agent_id);
+                *req.mutable_command() = gp.cmd;
+                req.set_timeout_seconds(300);
+
+                // #4672 Gate-2/Gate-3 fix (security-guardian HIGH + cpp-safety
+                // BLOCKING, independently confirmed): this MUST live outside
+                // the retry loop, not per-attempt. `process_gateway_response`
+                // is not idempotent — a second terminal write for the same
+                // command_id is a silent tracker overwrite plus a duplicate
+                // response_store row, not a safe no-op. A real terminal frame
+                // can be legitimately applied in one attempt (e.g. `Read()`
+                // delivers it) and THAT SAME attempt's `Finish()` can still
+                // report a transport-level non-OK status (stream fault after
+                // the last frame, before a clean close) or an earlier attempt
+                // can apply a response while a LATER attempt independently
+                // hits UNAUTHENTICATED/other/exhausted-UNAVAILABLE. Every
+                // synthesizing call site below must be gated on this,
+                // cumulative across the whole command's attempts — only the
+                // `agent_mismatch` site (status.ok() branch) was gated
+                // before this fix; the other three (UNAUTHENTICATED, the
+                // generic "other" branch, and exhausted-retries) were not,
+                // which could clobber an already-applied real SUCCESS/FAILURE
+                // with a synthetic FAILURE — a worse defect than the
+                // stuck-forever bug this issue set out to close.
+                bool applied_terminal = false;
+
+                // Retry up to 3 times on transient connection failures
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    if (attempt > 0) {
+                        spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
+                                     attempt + 1);
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                    }
+
+                    grpc::ClientContext ctx;
+                    ctx.set_deadline(std::chrono::system_clock::now() +
+                                     std::chrono::seconds(300));
+                    auto reader = stub->SendCommand(&ctx, req);
+
+                    ::yuzu::server::v1::SendCommandResponse resp;
+                    int resp_count = 0;
+                    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD 1):
+                    // Finish() still returns OK regardless of what the
+                    // stream's individual responses classified as, so a
+                    // not_connected/agent_mismatch response was ALSO
+                    // counted "ok" below unconditionally — a misconfigured
+                    // cluster read as a healthy ok rate for commands that
+                    // never ran, contradicting gateway_mgmt_stub_pool.hpp's
+                    // own "instead of / rather than ok" doc claim for both
+                    // outcomes. Track whether this attempt saw a non-apply
+                    // outcome and gate the terminal "ok" increment on it.
+                    bool saw_non_apply = false;
+                    while (reader->Read(&resp)) {
+                        ++resp_count;
+                        // HA WS-4 4.3: classification is a pure function
+                        // (gateway_mgmt_stub_pool.hpp) — see its doc comment
+                        // for the two Fable pre-implementation review
+                        // findings (6a agent-mismatch/forgery, 1a
+                        // not_connected) it implements.
+                        auto outcome = yuzu::server::classify_gateway_forward_response(
+                            resp, expected_agent_id);
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kAgentMismatch) {
+                            saw_non_apply = true;
+                            spdlog::error(
+                                "Gateway SendCommand for {} received a response for agent "
+                                "'{}' but this request targeted '{}' — REFUSING to apply it "
+                                "(possible cross-cluster response forgery)",
+                                cmd_id, resp.agent_id(), expected_agent_id);
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "agent_mismatch"}})
+                                .increment();
+                            continue;
+                        }
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kNotConnected) {
+                            saw_non_apply = true;
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "not_connected"}})
+                                .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD
+                            // 4, "mixed-version correlation"): a gateway
+                            // still running a PRE-4.3 build (rolling
+                            // upgrade window) sends this same not_connected
+                            // shape with command_id == "" — the Erlang fix
+                            // (yuzu_gw_mgmt_service.erl's stream_responses/3)
+                            // only threads the real id through a build that
+                            // HAS it. Core already knows the real command_id
+                            // (cmd_id, from the request it sent) regardless
+                            // of gateway version — repair the response
+                            // before it reaches process_gateway_response so
+                            // execution-tracker correlation works
+                            // independent of which gateway build answered.
+                            if (resp.response().command_id().empty()) {
+                                auto repaired = resp.response();
+                                repaired.set_command_id(cmd_id);
+                                svc->process_gateway_response(resp.agent_id(), repaired);
+                                // kNotConnected's classify_gateway_forward_response
+                                // contract guarantees this repaired frame is ALWAYS
+                                // FAILURE (exit_code=-1, output="not_connected"/
+                                // "agent_disconnected") -- unconditionally terminal,
+                                // safe to mark without a status() check.
+                                applied_terminal = true;
+                                continue;
+                            }
+                        }
+                        // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER,
+                        // 2026-09-22, empirically confirmed by both
+                        // reviewers independently): a kApply frame is NOT
+                        // guaranteed terminal -- `process_gateway_response`
+                        // also accepts a RUNNING progress frame. The
+                        // previous unconditional `applied_terminal = true`
+                        // here meant a single RUNNING frame, followed by a
+                        // stream fault and exhausted retries, permanently
+                        // suppressed every synthetic terminal-failure site
+                        // below (all four gate on `!applied_terminal`) --
+                        // the command_id stayed RUNNING forever, exactly
+                        // the bug #4672 exists to close, reintroduced via
+                        // this guard's own over-broad predicate. Only a
+                        // TERMINAL status (anything but RUNNING) may
+                        // suppress the synthetic-failure sites; a RUNNING
+                        // frame is real progress, not a resolution.
+                        svc->process_gateway_response(resp.agent_id(), resp.response());
+                        if (yuzu::server::is_terminal_command_status(resp.response().status()))
+                            applied_terminal = true;
+                    }
+                    auto status = reader->Finish();
+                    if (status.ok()) {
+                        spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
+                                      cmd_id, resp_count);
+                        // Retrying cannot help either outcome any more than
+                        // it could the pre-existing UNAUTHENTICATED branch
+                        // below (not_connected/agent_mismatch are not
+                        // transient) — still return (no retry) regardless
+                        // of saw_non_apply, just don't ALSO claim "ok".
+                        if (!saw_non_apply) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "ok"}})
+                                .increment();
+                        } else if (!applied_terminal) {
+                            // #4672: every frame this stream carried (if any)
+                            // was agent_mismatch — never not_connected/apply,
+                            // both of which already resolve the command_id
+                            // above. Nothing legitimate ever answered for
+                            // OUR agent. Treated as a security-relevant
+                            // anomaly (possible cross-cluster response
+                            // forgery / stale cluster resolution), not a
+                            // transient condition worth retrying — resolve
+                            // now rather than leaving the command_id stuck.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_agent_mismatch",
+                                "Gateway forwarding produced no legitimate response for this "
+                                "agent (agent mismatch) — command not delivered");
+                        }
+                        return; // success — done
+                    }
+                    // #1422: the gateway's mgmt-plane peer pin rejects with
+                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
+                    // grpc-message when an auth_fun rejects) — the generic
+                    // warn below would render as "failed:  (16)", which is
+                    // invisible as the fleet-wide forwarding outage it
+                    // actually is. Name the cause and the fix.
+                    if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+                        spdlog::error(
+                            "Gateway SendCommand for {} REJECTED by the gateway's "
+                            "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
+                            "server presents does not satisfy the gateway's "
+                            "mgmt_peer_pins posture (rotated leaf? BYO cert "
+                            "without repointing the pin, or without the "
+                            "serverAuth EKU?). The gateway log's reason atom "
+                            "names the exact cause. Command forwarding to "
+                            "gateway-connected agents is DOWN until the pin and "
+                            "the server leaf agree. Command dropped.",
+                            cmd_id);
+                        // #4672 (fixed post-Gate-2/3: security-guardian HIGH
+                        // + cpp-safety/cpp-expert independently confirmed) —
+                        // gate on `applied_terminal`: an earlier attempt, or
+                        // this same attempt's `Read()` loop, may already have
+                        // applied a real terminal frame before `Finish()`
+                        // surfaced this UNAUTHENTICATED status. Synthesizing
+                        // here anyway would silently overwrite that real
+                        // result (tracker last-write-wins) and insert a
+                        // duplicate response_store row.
+                        //
+                        // Gate 4 happy-path SHOULD (2026-09-21): the metric
+                        // increment is gated TOO, symmetric with the write —
+                        // a command that already resolved SUCCESS on an
+                        // earlier attempt must not also bump
+                        // {"status","unauthenticated"} on a later attempt's
+                        // Finish(), which would tell an operator a command
+                        // failed when it actually succeeded.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "unauthenticated"}})
+                                .increment();
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
+                                "Gateway REJECTED by the gateway's mgmt-plane peer pin "
+                                "(UNAUTHENTICATED) — command not delivered");
+                        }
+                        return; // config defect — retry cannot help
+                    }
+                    // Only retry on UNAVAILABLE (connection refused / not ready)
+                    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
+                        spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
+                                     status.error_message(),
+                                     static_cast<int>(status.error_code()));
+                        // #4672: same "resolve now, don't leave the
+                        // command_id stuck" posture as every other terminal
+                        // branch here — this one is not among the issue's
+                        // four named branches, but the shape (and the fix)
+                        // is identical, and leaving it unresolved while every
+                        // sibling branch resolves would just move the bug
+                        // rather than close it. Same `applied_terminal` guard
+                        // (write AND metric, see the UNAUTHENTICATED branch
+                        // above) as every other branch here.
+                        //
+                        // Gate 4 consistency-auditor SHOULD (2026-09-21): the
+                        // metric label ("other") intentionally does NOT match
+                        // the reason code ("gateway_forward_failed") below —
+                        // this branch covers every non-UNAVAILABLE grpc
+                        // status OTHER than UNAUTHENTICATED (which has its
+                        // own label/code pair above), so "other" is the
+                        // correct, deliberately generic metric bucket for a
+                        // more specific, per-occurrence reason code. Every
+                        // other branch's label and code DO match 1:1; this is
+                        // the one deliberate exception.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "other"}})
+                                .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
+                            // 2026-09-22): the raw status.error_message()
+                            // (peer addresses, TLS/HTTP2 transport text) is
+                            // already captured, unfiltered, in the spdlog::warn
+                            // a few lines up — the other four synthesis sites
+                            // all use a curated, static message; match that
+                            // convention here instead of persisting raw
+                            // transport text into error_detail. The numeric
+                            // grpc status code (already logged above too) is
+                            // enough to correlate a stored row back to the
+                            // server log line that has the full text.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_forward_failed",
+                                "Gateway SendCommand RPC failed with grpc status " +
+                                    std::to_string(static_cast<int>(status.error_code())) +
+                                    " — see server logs for the transport error detail");
+                        }
+                        return; // non-transient error — don't retry
+                    }
+                    spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
+                                 cmd_id, attempt + 1, status.error_message());
+                }
+                spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
+                // #4672: retries exhausted (3 attempts, exponential backoff)
+                // — a transient-LOOKING failure that has, for THIS dispatch,
+                // behaved exactly like a permanent one. Resolve the
+                // command_id terminally now. See forward_gateway_pending's
+                // own doc comment for why this is immediate-terminal rather
+                // than a durable outbox re-drive (granularity mismatch +
+                // #3279 — deliberately scoped out, not silently dropped;
+                // tracked as #4690).
+                // Same `applied_terminal` guard (write AND metric) as the two
+                // branches above — an earlier attempt in this same 3-try
+                // loop may have already applied a real terminal frame before
+                // a later attempt exhausted on UNAVAILABLE.
+                if (!applied_terminal) {
+                    metrics
+                        ->counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", cluster_label}, {"status", "unavailable"}})
+                        .increment();
+                    apply_gateway_forward_terminal_failure(
+                        svc, expected_agent_id, cmd_id, "gateway_unavailable",
+                        "Gateway unreachable after 3 attempts — command not delivered");
+                }
+            }).detach();
         }
     }
 
@@ -15646,14 +16184,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -15853,6 +16387,18 @@ private:
         // ready, degrading every `compare()` call to the AUTHORITATIVE nullopt.
         auto verify_api =
             make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
+        // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API seam —
+        // ONE instance backing the 9 GET /api/v1/dex/perf/* resources (minus
+        // /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/app-perf.
+        // Wired with the SAME `dex_perf_fn` closure (below) DexRoutes/the
+        // fragments already share, so the heartbeat-now denominator can never
+        // diverge between the seam and the fragments — mirrors DexApi's own
+        // FleetFn threading (dex_api, below). ADDITIONAL to app_perf_providers
+        // above (not a replacement): other consumers (the dashboard fragments)
+        // still read app_perf_providers directly until they migrate too.
+        auto dex_perf_api = make_local_dex_perf_api(
+            dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
+            app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -15890,10 +16436,10 @@ private:
         //
         // #4035: extracted into a named variable (was inline at the
         // DexRoutes::register_routes call site below) so the SAME provider is
-        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
-        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
-        // REST twins read the identical fleet snapshot the dashboard renders
-        // against, never a second independently-computed copy.
+        // also handed to make_local_dex_api's FleetFn — the DexApi behind the
+        // GET /api/v1/dex/{health,trends,overview,catalogue/group} REST twins
+        // (and their MCP twins) reads the identical fleet snapshot the
+        // dashboard renders against, never a second independently-computed copy.
         auto dex_fleet_fn = [this]() -> DexFleet {
             DexFleet f;
             const auto ids = registry_.all_ids();
@@ -15903,18 +16449,19 @@ private:
                     std::string os = s->os;
                     for (auto& c : os)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // starts_with, NOT find — "darwin" contains "win"
-                    // (G4 UP-1; pre-existing here, fixed with the sibling).
-                    if (os.starts_with("win"))
-                        ++f.windows_online;
+                    // The shared normalizer (dex_perf_rules.hpp) folds the
+                    // "darwin contains win" G4 UP-1 fix into one place instead
+                    // of a duplicate copy of the comment at every call site.
+                    const std::string norm_os = detail::dex_perf_os_from_session(os);
                     // Per-OS online denominators (#1746) — same coverage-honest
                     // count as windows_online, so the Catalogue's single-OS
                     // filter can score a family against THAT OS's own fleet.
-                    if (os.starts_with("lin"))
+                    if (norm_os == "windows")
+                        ++f.windows_online;
+                    else if (norm_os == "linux")
                         ++f.linux_online;
-                    if (os.starts_with("darwin") || os.starts_with("macos"))
-                        ++f.macos_online; // prefix, like win/lin — keep in
-                                          // step with the store's write canon
+                    else if (norm_os == "macos")
+                        ++f.macos_online;
                     // Distinct connected OS tokens → the Catalogue's "All
                     // connected" coverage scope (render normalises darwin→macos).
                     if (!os.empty() && std::find(f.connected_os.begin(),
@@ -16050,6 +16597,40 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        std::shared_ptr<yuzu::server::DexApi> dex_api;
+        if (guaranteed_state_store_)
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
+        // instance backing GET /fragments/schedules (WorkflowRoutes),
+        // GET /api/v1/schedules (also WorkflowRoutes), and MCP
+        // list_schedules, so the three can never disagree. Gated on store
+        // presence, same posture as dex_api above: `!schedule_api` reads as
+        // "engine not available" wherever a consumer checks it, matching the
+        // pre-seam `if (!schedule_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::ScheduleApi> schedule_api;
+        if (schedule_engine_)
+            schedule_api = make_local_schedule_api(*schedule_engine_);
+        // ADR-0031 WS-A4 (eighth family): the workflow-read API seam — ONE
+        // instance backing GET /api/v1/workflows[/{id}] and
+        // GET /api/v1/workflow-executions/{id} (WorkflowRoutes) and MCP
+        // list_workflows/get_workflow/get_workflow_execution, so the three
+        // can never disagree. Gated on store presence, same posture as
+        // schedule_api above: `!workflow_api` reads as "engine not
+        // available" wherever a consumer checks it, matching the pre-seam
+        // `if (!workflow_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
+        if (workflow_engine_)
+            workflow_api = make_local_workflow_api(*workflow_engine_);
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -17034,7 +17615,12 @@ private:
         };
         wf_deps.workflow_engine = workflow_engine_.get();
         wf_deps.execution_tracker = execution_tracker_.get();
-        wf_deps.schedule_engine = schedule_engine_.get();
+        // ADR-0031 WS-A4 (seventh family): the SAME schedule_api instance
+        // constructed above (shared with mcp_server_->set_schedule_api below).
+        wf_deps.schedule_api = schedule_api;
+        // ADR-0031 WS-A4 (eighth family): the SAME workflow_api instance
+        // constructed above (shared with mcp_server_->set_workflow_api below).
+        wf_deps.workflow_api = workflow_api;
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -18258,11 +18844,11 @@ private:
             // /fragments/create-group-form fragment cannot disagree on scope
             // for the same caller.
             response_visible_set_fn,
-            // #4035: the SAME DexFleet provider DexRoutes::register_routes
-            // above already received — see its doc comment (defined once,
-            // just above the DexRoutes registration) for why this must be
-            // the identical lambda, not a second copy.
-            dex_fleet_fn,
+            // ADR-0031 WS-A4 (fifth family): the former dex_fleet_fn arg is
+            // RETIRED — the DEX read handlers obtain the fleet through the
+            // DexApi seam's own FleetFn (wired into make_local_dex_api below),
+            // not through a register_routes param. The `dex_fleet_fn` local is
+            // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
             // #4035 review fix (colleague review, BLOCKING): a DEDICATED
             // GuaranteedState:Read-scoped resolver (defined above, see its
             // own doc comment) — NOT the SAME visible_set_fn
@@ -18279,7 +18865,20 @@ private:
             // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
             // above and MCP list_agents/get_agent_details below use, so all
             // three GET /api/v1/devices[/{id}] siblings never disagree.
-            device_api);
+            device_api,
+            // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
+            // signal/experience handlers require this and answer 503 when it is
+            // null (constructed above iff the store is present, so `!dex_api`
+            // is the exact readiness signal the old `!guaranteed_state_store`
+            // guard was).
+            dex_api,
+            // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API
+            // seam — the 9 GET /api/v1/dex/perf/* handlers + the per-device
+            // drill require this and answer 503 when it is null, the exact
+            // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+            // guards produced (app_perf_providers stays wired above too — this
+            // is additive until every consumer migrates).
+            dex_perf_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18471,11 +19070,50 @@ private:
             // preview_management_group_agent_count cannot disagree with its
             // REST/fragment siblings for the same caller.
             mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
-            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
-            // received above — see its doc comment (defined once, just above
-            // the DexRoutes registration) for why this must be the identical
-            // lambda, not a second copy.
-            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // ADR-0031 WS-A4 (fifth family): the MCP DEX signal tools obtain the
+            // fleet denominator through the DexApi seam's own FleetFn (wired into
+            // make_local_dex_api below), so the former mcp_server_->set_dex_fleet_fn
+            // wiring is retired — the tools no longer read a McpServer fleet member.
+            // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
+            // REST /api/v1/dex/* handlers use (constructed above, gated on
+            // store presence), so the MCP DEX signal tools and REST never
+            // disagree. nullptr when the store is absent → the tools' !dex_api_
+            // readiness guard answers "store unavailable" (byte-identical).
+            mcp_server_->set_dex_api(dex_api);
+            // ADR-0031 WS-A4 (sixth family): the SAME DexPerfApi seam instance
+            // the REST /api/v1/dex/perf/* handlers use (constructed above,
+            // additive alongside app_perf_providers), so the 9 MCP DEX
+            // app-perf tool twins + get_dex_device_app_perf never disagree
+            // with REST. Unlike dex_api above, dex_perf_api is constructed
+            // UNCONDITIONALLY — never nullptr — because each backing store
+            // pointer is checked individually INSIDE the impl (dex_perf_api.cpp),
+            // exactly matching the old per-lambda null-checks in
+            // app_perf_providers; the tools' !dex_perf_api_ guard therefore
+            // never fires in practice (dex_perf_api_local.hpp's own banner
+            // states this), but stays as defense-in-depth against a future
+            // wiring change, and every server's stores fail closed at boot
+            // regardless — behaviourally identical to the old direct calls.
+            mcp_server_->set_dex_perf_api(dex_perf_api);
+            // ADR-0031 WS-A4 (seventh family): the SAME schedule-read API
+            // seam instance WorkflowRoutes uses for GET /fragments/schedules
+            // and GET /api/v1/schedules (wired into wf_deps.schedule_api
+            // above), so MCP list_schedules can never disagree with either.
+            // Gated on store presence at construction (schedule_api is
+            // nullptr when schedule_engine_ was never opened); the tool's own
+            // !schedule_api_ guard then answers "engine unavailable",
+            // matching the pre-seam !schedule_engine guard exactly.
+            mcp_server_->set_schedule_api(schedule_api);
+            // ADR-0031 WS-A4 (eighth family): the SAME workflow-read API
+            // seam instance WorkflowRoutes uses for GET /api/v1/workflows
+            // [/{id}] and GET /api/v1/workflow-executions/{id} (wired into
+            // wf_deps.workflow_api above), so MCP list_workflows/
+            // get_workflow/get_workflow_execution can never disagree with
+            // REST v1. Gated on store presence at construction (workflow_api
+            // is nullptr when workflow_engine_ was never opened); the
+            // tools' own !workflow_api_ guard then answers "engine
+            // unavailable", matching the pre-seam !workflow_engine guard
+            // exactly.
+            mcp_server_->set_workflow_api(workflow_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see
@@ -19094,8 +19732,9 @@ private:
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
-    std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
-    std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
+    // HA WS-4 4.3: replaces the pre-4.3 single gw_mgmt_channel_/gw_mgmt_stub_
+    // pair — see the construction site's comment.
+    std::unique_ptr<yuzu::server::GatewayMgmtStubPool> gw_mgmt_pool_;
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;

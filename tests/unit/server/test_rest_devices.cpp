@@ -179,7 +179,8 @@ struct DeviceRestHarness {
             /*access_review_store=*/nullptr, /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{}, /*list_read_fn=*/{},
             std::move(fleet_read_fn), std::move(agents_fn), std::move(response_visible_set_fn),
-            /*dex_fleet_fn=*/{}, /*dex_visible_fn=*/{}, /*verify_api=*/{}, device_api);
+            /*dex_visible_fn=*/{}, /*verify_api=*/{}, /*device_api=*/device_api,
+            /*dex_api=*/{});
     }
 
     void add_agent(const std::string& id, const std::string& hostname) {

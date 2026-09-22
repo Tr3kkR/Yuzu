@@ -131,9 +131,13 @@ private:
 // can reach a caller by any route.
 [[nodiscard]] std::expected<void, std::string>
 watch_guarded(ISparkMechanism* mech, const std::string& key, const SparkParams& params,
-              BoundedMsg& err, const std::function<void(int)>& fault_hook) {
+              SparkIncarnation incarnation, BoundedMsg& err,
+              const std::function<void(int)>& fault_hook) {
     try {
-        return mech->watch(key, params);
+        // The engine ALWAYS calls watch_incarnation() (never the plain watch()) —
+        // see spark_mechanism.hpp's own doc comment on why the two are distinct
+        // names rather than an overload.
+        return mech->watch_incarnation(key, params, incarnation);
     } catch (const std::exception& e) {
         try {
             if (fault_hook)
@@ -237,6 +241,21 @@ void wait_teardown_leases_forever(const std::atomic<std::uint64_t>& count) noexc
     while (count.load(std::memory_order_acquire) != 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
+
+/// #2050: unconditional-fire-on-destruction guard, identical in shape to the ones in
+/// agent.cpp and server/core/src/api_token_store.cpp — a third copy of this trivial
+/// idiom rather than a shared header, because the type is five lines with no natural
+/// shared-header home spanning agent-core and server-core. Every use across all three
+/// files is a single local RAII variable, never copied or moved out of its declaring
+/// scope, so there is no double-fire hazard a deleted copy/move would need to guard
+/// against — that (separate) question is answered identically in the two sibling
+/// files' own comments. Conditional arming (run-or-don't) is the CALLER's job — the
+/// lambda handed in checks its own captured flag — not this type's.
+template <typename F> struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
+};
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // namespace
 
@@ -724,6 +743,13 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     ISparkMechanism* mech = nullptr;
     SparkParams watch_params;
     SubscriptionId id = 0;
+    // Rung 9c PR-6 item 1: this key's incarnation IF a live mechanism call is
+    // about to be made below (mech != nullptr) — captured from `fresh` inside
+    // the locked block, read after mu_ is released by the live gate and the
+    // watch_guarded() call. kNoSparkIncarnation is never actually read (every
+    // use is guarded by `if (mech)`), but a real default avoids an
+    // uninitialized-looking value in the meantime.
+    SparkIncarnation my_inc = kNoSparkIncarnation;
     // #2815 door 4/4 - the one the original design missed. This is not a TEARDOWN, but
     // it is the same window: `mech` and mech_ops_mu_by_type_.at(spec.type) are resolved
     // under mu_ and then used with mu_ RELEASED, so ~SparkEngine freeing those members
@@ -786,6 +812,12 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         if (existing == nullptr) {
             fresh.spec = spec;
             fresh.cadence_ms = *cadence;
+            // Rung 9c PR-6 item 1: mint a fresh incarnation + armed_at for
+            // EVERY brand-new key — H14: even a PRE-START arm gets this now,
+            // at arm time, not deferred to start(). NEVER minted on the dedup
+            // branch below, which shares the existing key's token unchanged.
+            fresh.incarnation = next_id_++;
+            fresh.armed_at = std::chrono::steady_clock::now();
             if (event_driven) {
                 // TRAP 1: event-driven sparks NEVER sit on the wheel — the wheel
                 // scan + `default: continue` assume it. A live engine arms the
@@ -795,6 +827,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 if (running_) {
                     mech = mechanisms_.at(spec.type).get();
                     watch_params = spec.params;
+                    my_inc = fresh.incarnation;
                     // The carriers this shape needs were built before the lock.
                 }
             } else {
@@ -902,7 +935,14 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         std::lock_guard ops(mech_ops_mu_by_type_.at(spec.type));
         {
             std::lock_guard lk(mu_);
-            if (!armed_.contains(key))
+            // E15/H1: an IDENTITY check, not a bare containment check —
+            // the key could be present again under a DIFFERENT (superseded)
+            // incarnation if a disarm+rearm raced us between our commit above
+            // and here (disarm's bookkeeping erase needs only mu_, not `ops`,
+            // so it can land here even while we hold `ops`). A stale watch()
+            // must never be submitted for a key that is no longer ours.
+            auto it = armed_.find(key);
+            if (it == armed_.end() || it->second.incarnation != my_inc)
                 return std::unexpected(std::move(disarmed_mid_arm_msg));
         }
         // A mechanism must RETURN std::unexpected on failure, not throw — but
@@ -913,7 +953,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         // caller — an std::expected-contract violation the caller can neither
         // observe nor disarm (governance UP-7). watch_guarded() turns a throw
         // into a returned failure so it falls into the whole-key teardown.
-        auto w = watch_guarded(mech, key, watch_params, watch_threw_msg,
+        auto w = watch_guarded(mech, key, watch_params, my_inc, watch_threw_msg,
                                arm_fault_hook_for_test_);
         if (!w) {
             // #2818 item (b), orphan reclamation: still under mech_ops_mu_by_type_[type],
@@ -958,8 +998,18 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 // drop_key_locked() call — the same #2270 discipline the rest of this
                 // function is built on ("losing a log line is strictly better than
                 // unwinding a live arm") applies equally to losing a notification.
+                //
+                // E14/H1: only if the entry is STILL OURS. A successor's fresh
+                // arm may have already replaced this key (their own watch_incarnation()
+                // call queued behind the `ops` we are still holding — the same race the
+                // live gate above guards) — in that case there is nothing here for US
+                // to drop or snapshot; touching it would tear down THEIR live watch
+                // instead of reporting the loss of one that never actually existed for
+                // them. The unconditional mech->unwatch(key) just above already
+                // prevents any resource leak from OUR failed watch either way.
                 auto it = armed_.find(key);
-                if (it != armed_.end()) {
+                const bool still_ours = (it != armed_.end() && it->second.incarnation == my_inc);
+                if (still_ours) {
                     try {
                         lost_ev.key = key;
                         lost_ev.type = spec.type;
@@ -971,15 +1021,26 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                     } catch (...) {
                         lost_subs.clear(); // contained: no notification, key still drops below
                     }
+                    drop_key_locked(key); // allocates nothing, cannot throw
                 }
-                drop_key_locked(key); // ALWAYS runs — allocates nothing, cannot throw
+                // Message reuse, deliberate. When the entry is no longer
+                // ours (a successor's fresh arm already superseded it), THIS
+                // caller's own subscription doesn't exist regardless of the
+                // mechanism's technical outcome — from this caller's view it was
+                // disarmed before its watch could be armed, the identical fact
+                // the live gate above reports. Reuse disarmed_mid_arm_msg (already
+                // built, above, before mu_ was ever taken) rather than complete a
+                // NEW string on this path for a mechanism error the caller's
+                // subscription no longer depends on. Bookkeeping is already clean
+                // either way; when still_ours, the message is completed from the
+                // pre-sized buffer — a mechanism error is caller-controlled in
+                // length, so concatenating it here would put an unbounded
+                // allocation past the commit and break the property the whole
+                // layer rests on.
+                watch_failed = true;
+                watch_fail_result =
+                    still_ours ? watch_fail_msg.finish(w.error()) : std::move(disarmed_mid_arm_msg);
             }
-            // Bookkeeping is already clean, but the message is still completed from
-            // the pre-sized buffer: a mechanism error is caller-controlled in length,
-            // so concatenating it here would put an unbounded allocation past the
-            // commit and break the property the whole layer rests on.
-            watch_failed = true;
-            watch_fail_result = watch_fail_msg.finish(w.error());
         }
     }
     if (watch_failed) {
@@ -1300,34 +1361,97 @@ void SparkEngine::start() {
     // their stop() ran, which would destroy them with live threads (Gate-4 UP-1).
     std::lock_guard life(lifecycle_mu_);
     std::size_t armed_count = 0;
-    std::vector<ISparkMechanism*> mechs;
+    // Paired with each mechanism's own SparkType (not just the bare pointer)
+    // so the set_established_sink refusal warning below can name which
+    // mechanism type failed to install (governance cpp-safety Gate-3 LOW).
+    std::vector<std::pair<SparkType, ISparkMechanism*>> mechs;
     struct Replay {
         ISparkMechanism* mech;
         std::string key;
         SparkParams params;
         SparkType type; // picks this type's mech-ops lock at replay
+        /// Rung 9c PR-6 item 1: the key's incarnation AT COLLECTION TIME —
+        /// checked at replay (identity, not bare containment — mirrors
+        /// arm_impl's live gate) so a disarm+rearm racing the collection pass
+        /// skips a now-superseded replay rather than submitting a stale watch.
+        SparkIncarnation incarnation;
         /// Built during collection so watch_guarded's error completion allocates
         /// nothing at replay time (#2270), the same buffer arm_impl hands it.
         /// SCOPE LIMIT: this does NOT make start() OOM-safe. running_ is already
-        /// latched and the wheel is up by the time this vector is built, so a
-        /// bad_alloc in the collection pass itself still escapes the void start(),
-        /// exactly as before. #2270 is about arm_impl's post-commit window; the
-        /// replay path shares the boundary, not the guarantee.
+        /// latched by the time this vector is built, but the wheel is NOT yet up —
+        /// wheel_thread_ spawns only after both this collection pass and the
+        /// mechanism-pointer collection below finish (see the wheel-spawn statement
+        /// a few lines down). A bad_alloc in the collection pass itself still
+        /// escapes start() — now via the #2050 rollback guard below, which tears the
+        /// partial startup back down to stopped before propagating, rather than
+        /// leaving `running_` latched true over nothing actually started. #2270 is
+        /// about arm_impl's post-commit window; the replay path shares the
+        /// boundary, not the guarantee.
         BoundedMsg err;
     };
     std::vector<Replay> replays;
+    // #2050: function-wide rollback guard for every fallible startup step below —
+    // Replay/mechanism-pointer collection, wheel-thread spawn (all three still
+    // inside `lk`), then sink install and mechanism start() (both after `lk`
+    // releases). Constructed DISABLED; armed only once the reject-check just below
+    // succeeds, so a rejected start() (already running/stopped) never tears down an
+    // engine this call didn't touch.
+    //
+    // EXACT SCOPE PLACEMENT, LOAD-BEARING: declared here — after `life`
+    // (lifecycle_mu_), BEFORE the `{ lk }` block that takes mu_ — so on unwind it
+    // destructs AFTER `lk` releases mu_ but BEFORE `life` releases lifecycle_mu_
+    // (LIFO: the last-constructed local destructs first). teardown_locked() calls
+    // mechanism stop()s, which may synchronously report_fault()/emit_event() —
+    // both of which take mu_ (see their definitions below). A guard declared
+    // *inside* the `lk` block would destruct *before* `lk` on unwind,
+    // running that rollback while mu_ is STILL held — self-deadlock the first time
+    // a mechanism's stop() reports synchronously. Declaring it out here means `lk`
+    // is always long gone before the guard ever runs. Do not move this declaration
+    // into the `lk` block, even for a specific narrower-looking failure site.
+    bool rollback_armed = false;
+    // Brace-init, not parens (Gate 3 cpp-expert, 2026-09-19): the two sibling
+    // ScopeExit copies (agent.cpp, api_token_store.cpp) both deliberately use
+    // `ScopeExit name{lambda}` rather than `ScopeExit name(lambda)` — parenthesized
+    // aggregate-init is a distinct C++20 feature (P0960) from the deduction guide
+    // itself, and this file has not yet been compiled on Windows/macOS. Brace-init
+    // has no such version dependency; match the established, verified-safe form.
+    ScopeExit rollback{[this, &rollback_armed]() noexcept {
+        if (!rollback_armed)
+            return;
+        // A destructor must never let an exception escape mid-unwind (std::terminate
+        // would convert a startup failure into a process crash — exactly what
+        // stop()'s own noexcept exists to prevent for the ordinary teardown path).
+        // teardown_locked() can throw, same as it always could inside stop()'s try;
+        // contain it here the same way stop()'s own catch does. teardown_complete_
+        // stays false either way, so the next stop() call (normally ~SparkEngine's)
+        // retries whatever this pass didn't finish.
+        try {
+            teardown_locked();
+        } catch (...) {
+            try {
+                spdlog::error(
+                    "SparkEngine::start(): rollback teardown threw after a startup "
+                    "failure — some mechanisms may not have released their OS "
+                    "resources yet; the next stop() (normally ~SparkEngine's) retries");
+            } catch (...) {
+            }
+        }
+    }};
     {
         std::lock_guard lk(mu_);
         if (running_ || stopped_) {
             spdlog::warn("SparkEngine::start() called while {} — ignored",
                          stopped_ ? "stopped" : "already running");
-            return;
+            return; // rollback stays disabled — nothing has been touched
         }
+        rollback_armed = true; // non-throwing; every fallible step from here is covered
         running_ = true;
         // Re-base deadlines on the start instant: an interval armed long before
         // start must not fire immediately; a startup spark fires now. Event-driven
         // sparks armed before start are collected for a watch() replay below.
         const auto now = std::chrono::steady_clock::now();
+        if (start_fault_hook_for_test_)
+            start_fault_hook_for_test_(kStartFaultPhaseReplayCollection);
         for (auto& [key, armed] : armed_) {
             if (armed.scheduled) {
                 armed.next_due = initial_due(armed.spec, armed.cadence_ms, now);
@@ -1335,22 +1459,44 @@ void SparkEngine::start() {
                 auto mit = mechanisms_.find(armed.spec.type);
                 if (mit != mechanisms_.end())
                     replays.push_back({mit->second.get(), key, armed.spec.params, armed.spec.type,
-                                       BoundedMsg(kWatchThrewPrefix)});
+                                       armed.incarnation, BoundedMsg(kWatchThrewPrefix)});
             }
         }
+        if (start_fault_hook_for_test_)
+            start_fault_hook_for_test_(kStartFaultPhaseMechCollection);
         for (auto& [type, m] : mechanisms_)
-            mechs.push_back(m.get());
+            mechs.push_back({type, m.get()});
         armed_count = armed_.size();
+        if (start_fault_hook_for_test_)
+            start_fault_hook_for_test_(kStartFaultPhaseWheelSpawn);
         wheel_thread_ = std::thread([this] { wheel_loop(); });
     }
-    // Start mechanisms (wire the emit + fault callbacks), THEN replay pre-start
-    // watches — both with mu_ released (handle setup blocks). Mechanisms are
-    // started before any watch() reaches them.
-    for (auto* m : mechs)
+    // Start mechanisms (wire the emit + fault + established callbacks), THEN
+    // replay pre-start watches — both with mu_ released (handle setup blocks).
+    // Mechanisms are started before any watch() reaches them. The
+    // establishment sink is installed BEFORE m->start() — a mechanism that
+    // implements it seals against further installation at its own start()
+    // (spark_mechanism.hpp's set_established_sink doc comment).
+    for (auto& [type, m] : mechs) {
+        if (!m->set_established_sink(
+                [this](const std::string& key, SparkIncarnation inc,
+                      std::chrono::steady_clock::time_point at, SparkCoverage cov) {
+                    report_established(key, inc, at, cov);
+                })) {
+            spdlog::debug("SparkEngine: set_established_sink refused for mechanism type {} — "
+                          "establishment reporting will be unavailable for this type",
+                          spark_type_token(type));
+        }
         m->start([this](const std::string& key, SparkData data) { emit_event(key, std::move(data)); },
                  [this](const std::string& key, bool faulted, std::string_view reason) {
                      report_fault(key, faulted, reason);
                  });
+    }
+    // Test seam (E13): fires once here, after every mechanism has started
+    // (and had its establishment sink sealed), before the replay loop below
+    // reads `replays`. No locks held.
+    if (on_start_hook_for_test_)
+        on_start_hook_for_test_();
     for (auto& r : replays) {
         // #2818 (cpp-safety Gate 3): `ops` must NOT still be held when report_fault()
         // runs below — report_fault() now calls deliver(), which can synchronously
@@ -1369,8 +1515,16 @@ void SparkEngine::start() {
             std::lock_guard ops(mech_ops_mu_by_type_.at(r.type));
             {
                 std::lock_guard lk(mu_);
-                if (!armed_.contains(r.key))
-                    continue; // disarmed before its pre-start replay could run
+                // E13: an IDENTITY check, not a bare containment check —
+                // a disarm+rearm between the collection pass above (mu_
+                // released since) and here leaves the key CONTAINS but under a
+                // NEWER incarnation; replaying against it would submit a
+                // stale watch for a key that already has (or is about to
+                // have) its own live arm handle this. Mirrors arm_impl's own
+                // live gate.
+                auto it = armed_.find(r.key);
+                if (it == armed_.end() || it->second.incarnation != r.incarnation)
+                    continue; // disarmed, or superseded, before its pre-start replay could run
             }
             // An escaping throw here would unwind out of the void start() AFTER
             // running_ is latched and the wheel + mechanisms are up, leaving this
@@ -1378,7 +1532,16 @@ void SparkEngine::start() {
             // watcher is running" violation UP-7 closed on the live arm_impl path.
             // watch_guarded() turns a throw into a returned failure; unlike arm_impl
             // we fault in place (subscribers already hold ids — do NOT roll back).
-            w = watch_guarded(r.mech, r.key, r.params, r.err, arm_fault_hook_for_test_);
+            //
+            // #2050 COVERAGE NOTE (Gate-3 quality-engineer): this loop runs with the
+            // startup rollback guard still armed, but has no fault-injection test
+            // exercising a throw escaping FROM here — deliberately, because
+            // watch_guarded()'s own contract (this comment, above) is that it never
+            // lets one escape. If that contract ever regresses, THIS is the untested
+            // path the rollback guard would have to cover; a future change to
+            // watch_guarded()'s throw behavior should add that coverage here.
+            w = watch_guarded(r.mech, r.key, r.params, r.incarnation, r.err,
+                              arm_fault_hook_for_test_);
         }
         if (!w) {
             // Pre-start replay failure leaves the spark armed-without-watcher —
@@ -1386,11 +1549,23 @@ void SparkEngine::start() {
             // silent log, mirroring the runtime fault channel. (The post-start
             // arm path rolls back instead; a pre-start replay's subscribers
             // already hold ids, so we keep the entry but flag it deaf.)
-            spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}", r.key,
-                          w.error());
+            // Wrapped (Gate-3 cpp-safety, #2050): this loop runs BEFORE
+            // `rollback_armed = false` below, so the rollback guard is still
+            // armed here — an allocation failure formatting this line must not
+            // trigger a full rollback of an engine that has, in substance,
+            // already started (mechanisms are running).
+            try {
+                spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}",
+                              r.key, w.error());
+            } catch (...) {
+            }
             report_fault(r.key, true, "pre-start replay watch failed");
         }
     }
+    // Substantive startup is complete: disarm BEFORE the log line below, not after —
+    // a throwing spdlog call must never trigger a full rollback of an engine that has
+    // already, in substance, started successfully (#2050).
+    rollback_armed = false;
     spdlog::info("SparkEngine started ({} spark(s) armed)", armed_count);
 }
 
@@ -1437,7 +1612,47 @@ void SparkEngine::stop() noexcept try {
     // SEQUENTIAL — the lock is released between them, and the second finds
     // teardown_complete_ set). The re-entry guard that once sat here existed only for the
     // signal-handler path and is deleted with it.
+    //
+    // #2050: the teardown body below now lives in teardown_locked(), factored out so
+    // start()'s own rollback guard can drive the identical sequence on a startup
+    // failure (that guard requires only that lifecycle_mu_ already be held — see
+    // teardown_locked()'s own doc comment in the header). stop() is otherwise
+    // unchanged in shape: acquire lifecycle_mu_ for the WHOLE operation, run the
+    // teardown, and never let an exception escape (the catch below).
     std::lock_guard life(lifecycle_mu_);
+    teardown_locked();
+} catch (...) {
+    // stop() is noexcept and is called from ~SparkEngine. A throwing teardown
+    // (std::system_error from a join, bad_alloc from the consumer map, or spdlog
+    // itself) must not std::terminate the agent for an observe-only subsystem —
+    // that would defeat the very degrade-to-no-spark guard in agent.cpp that this
+    // engine's boot failure path depends on (Gate-3 cpp-expert SHOULD-1).
+    //
+    // LOUD, not silent (Gate-8 security-guardian): a swallowed teardown failure means a
+    // mechanism may not have released its OS handles. teardown_complete_ stays FALSE, so
+    // the next caller re-runs the teardown rather than latching the failure away. The log
+    // is itself wrapped — spdlog can throw, and a throw from this last-resort handler
+    // would re-open the terminate hole we are closing.
+    //
+    // HONEST SCOPE OF THE RETRY (Gate-8 round 2): re-running stop() re-drives the wheel
+    // join (joinable()-guarded, so no double-join) and the mechanism stop()s (idempotent).
+    // It CANNOT re-drive the consumer phase: consumers_ is swapped into a local BEFORE the
+    // signal/await loops, so a throw there loses them and the retry finds nothing to await.
+    // At rung 1 that phase is a no-op (no consumer is ever registered), but the retry
+    // guarantee must not be over-claimed for rung 2, which is when consumers arrive.
+    try {
+        spdlog::error("SparkEngine::stop() threw during teardown — OS handles may not have "
+                      "been released; the wheel + mechanism teardown will be re-run on "
+                      "destruction (the consumer phase, if reached, cannot be re-run)");
+    } catch (...) {
+    }
+}
+
+void SparkEngine::teardown_locked() {
+    // Caller (stop(), or start()'s rollback guard) already holds lifecycle_mu_ for
+    // the whole of this call — see this function's doc comment in the header for the
+    // full contract, including why it may throw and how each of the two callers
+    // contains that.
 
     // 1) Stop the watcher side first so nothing new is produced.
     //
@@ -1463,9 +1678,11 @@ void SparkEngine::stop() noexcept try {
     }
     wheel_cv_.notify_all();
     // SELF-JOIN is unreachable: stop() never runs on a spark thread (see the caller
-    // inventory at the top of this function), so joining the wheel thread from itself —
-    // std::system_error(resource_deadlock_would_occur) out of a noexcept fn — cannot
-    // occur. joinable() guards the never-started and already-torn-down cases only.
+    // inventory at the top of stop()), and start()'s rollback guard runs on the same
+    // thread that called start() — never the wheel thread it just spawned — so
+    // joining the wheel thread from itself — std::system_error
+    // (resource_deadlock_would_occur) out of a noexcept fn — cannot occur. joinable()
+    // guards the never-started and already-torn-down cases only.
     if (wheel_thread_.joinable())
         wheel_thread_.join();
 
@@ -1524,13 +1741,45 @@ void SparkEngine::stop() noexcept try {
 
     // 2) Stop event-driven mechanisms (producers, like the wheel) BEFORE the
     // consumer threads they feed — a mechanism must quiesce before its downstream
-    // consumers. Iterating without mu_ is safe because lifecycle_mu_ (held above)
-    // excludes register_mechanism() — the ONLY writer of mechanisms_. The previous
-    // justification ("structurally stable post-start — no concurrent registration")
-    // was false during the boot window: the main thread registers while the SCM
-    // control thread can already be in stop(). Gate-4 UP-1.
-    for (auto& [type, m] : mechanisms_)
-        m->stop();
+    // consumers. Iterating without mu_ is safe because lifecycle_mu_ (held by the
+    // caller) excludes register_mechanism() — the ONLY writer of mechanisms_. The
+    // previous justification ("structurally stable post-start — no concurrent
+    // registration") was false during the boot window: the main thread registers
+    // while the SCM control thread can already be in stop(). Gate-4 UP-1.
+    //
+    // #2050: PER-ITERATION isolation. One mechanism's stop() throwing must not skip
+    // every mechanism after it in map order — the previous shape let a single
+    // throwing mechanism starve every other mechanism's teardown for the whole pass,
+    // not just its own. Each call is individually contained; a throw is counted
+    // (mechanisms_stopped_cleanly, below), logged (its own catch-all, so a logging
+    // failure cannot mask the original mechanism-stop failure or abort the remaining
+    // mechanisms), and the loop proceeds to the NEXT mechanism regardless.
+    // teardown_complete_ (step 3 below) is set ONLY when this whole pass — every
+    // mechanism included — completed without throwing, so a mechanism that failed
+    // here is retried (idempotently, per the interface contract) on the next pass.
+    //
+    // What this does NOT prove: producer quiescence. A caught exception from
+    // m->stop() says nothing about whether that mechanism's producer thread(s)
+    // actually stopped — emit_event()/report_fault() don't reject calls just because
+    // stopped_ is true. Positively resolving that is deliberately out of scope here;
+    // it is tracked as a separate follow-up (extending the F3 producer-thread
+    // counter to cover mechanism producer-thread lifetime, referencing #2050).
+    bool mechanisms_stopped_cleanly = true;
+    for (auto& [type, m] : mechanisms_) {
+        try {
+            m->stop();
+        } catch (...) {
+            mechanisms_stopped_cleanly = false;
+            try {
+                spdlog::error("SparkEngine::stop(): mechanism type {} threw during stop() — "
+                              "its OS handles may not have been released; continuing "
+                              "teardown of the remaining mechanisms, and this one will be "
+                              "retried on the next teardown pass",
+                              spark_type_token(type));
+            } catch (...) {
+            }
+        }
+    }
 
     // 3) Stop consumer dispatch threads (bounded join, detach-if-hung — UP-1;
     // leftovers dropped + counted).
@@ -1551,34 +1800,18 @@ void SparkEngine::stop() noexcept try {
         await_consumer(consumer, deadline);
     {
         std::lock_guard lk(mu_);
-        teardown_complete_ = true; // ONLY here — a throw above leaves it false, so the
-                                   // next stop() (the destructor's) retries the teardown
+        // ONLY here, and ONLY on a fully clean mechanism-teardown pass — a throw
+        // above (before reaching here) or a per-mechanism failure this pass (step 2)
+        // leaves this false, so the next stop() (in practice ~SparkEngine's) retries
+        // the teardown instead of latching an incomplete pass away as done.
+        if (mechanisms_stopped_cleanly)
+            teardown_complete_ = true;
     }
-    spdlog::info("SparkEngine stopped");
-} catch (...) {
-    // stop() is noexcept and is called from ~SparkEngine. A throwing teardown
-    // (std::system_error from a join, bad_alloc from the consumer map, or spdlog
-    // itself) must not std::terminate the agent for an observe-only subsystem —
-    // that would defeat the very degrade-to-no-spark guard in agent.cpp that this
-    // engine's boot failure path depends on (Gate-3 cpp-expert SHOULD-1).
-    //
-    // LOUD, not silent (Gate-8 security-guardian): a swallowed teardown failure means a
-    // mechanism may not have released its OS handles. teardown_complete_ stays FALSE, so
-    // the next caller re-runs the teardown rather than latching the failure away. The log
-    // is itself wrapped — spdlog can throw, and a throw from this last-resort handler
-    // would re-open the terminate hole we are closing.
-    //
-    // HONEST SCOPE OF THE RETRY (Gate-8 round 2): re-running stop() re-drives the wheel
-    // join (joinable()-guarded, so no double-join) and the mechanism stop()s (idempotent).
-    // It CANNOT re-drive the consumer phase: consumers_ is swapped into a local BEFORE the
-    // signal/await loops, so a throw there loses them and the retry finds nothing to await.
-    // At rung 1 that phase is a no-op (no consumer is ever registered), but the retry
-    // guarantee must not be over-claimed for rung 2, which is when consumers arrive.
-    try {
-        spdlog::error("SparkEngine::stop() threw during teardown — OS handles may not have "
-                      "been released; the wheel + mechanism teardown will be re-run on "
-                      "destruction (the consumer phase, if reached, cannot be re-run)");
-    } catch (...) {
+    if (mechanisms_stopped_cleanly) {
+        spdlog::info("SparkEngine stopped");
+    } else {
+        spdlog::warn("SparkEngine::stop(): teardown incomplete this pass — at least one "
+                     "mechanism failed to stop cleanly; the next stop() call retries");
     }
 }
 
@@ -1756,6 +1989,29 @@ void SparkEngine::report_fault(const std::string& key, bool faulted, std::string
     }
 }
 
+void SparkEngine::report_established(const std::string& key, SparkIncarnation incarnation,
+                                     std::chrono::steady_clock::time_point at,
+                                     SparkCoverage coverage) {
+    std::lock_guard lk(mu_);
+    auto it = armed_.find(key);
+    // Identity check FIRST (H1): a report whose incarnation no longer names
+    // this key's CURRENT watch is a stale report against a superseded or
+    // torn-down subscription — drop it silently. This is also the case a
+    // disarmed/never-armed key hits (it == end()).
+    if (it == armed_.end() || it->second.incarnation != incarnation)
+        return;
+    // Unconditional coverage assignment (round-4 MF1): the cache always
+    // reflects the mechanism's LAST-reported value, whatever it is — the
+    // mechanism side stages every transition unconditionally, so there is no
+    // "edge" to gate on here either.
+    it->second.coverage = coverage;
+    // First-wins established_at (spark.hpp's SubscriptionEstablishment doc
+    // comment): stamped once per incarnation, only on a Notification
+    // transition, never re-stamped by a later recovery.
+    if (coverage == SparkCoverage::Notification && !it->second.established_at)
+        it->second.established_at = at;
+}
+
 void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs) {
     for (const auto& sub : subs) {
         // #2818: one key-level condition fans out to potentially several
@@ -1896,6 +2152,19 @@ SubscriptionHealth SparkEngine::subscription_health(SubscriptionId id) const {
     return ait->second.faulted ? SubscriptionHealth::Faulted : SubscriptionHealth::Healthy;
 }
 
+std::optional<SubscriptionEstablishment>
+SparkEngine::subscription_establishment(SubscriptionId id) const {
+    std::lock_guard lk(mu_);
+    auto sit = sub_keys_.find(id);
+    if (sit == sub_keys_.end())
+        return std::nullopt;
+    auto ait = armed_.find(sit->second);
+    if (ait == armed_.end())
+        return std::nullopt;
+    return SubscriptionEstablishment{ait->second.armed_at, ait->second.established_at,
+                                     ait->second.coverage};
+}
+
 std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {
     // Same shape as the mech_* sum in stats() (lines above) but the SparkType key
     // is preserved instead of folded away. mu_-only (never shares a lock with
@@ -1937,8 +2206,16 @@ void SparkEngine::set_disarm_race_hook_for_test(std::function<void()> hook) {
     disarm_race_hook_for_test_ = std::move(hook);
 }
 
+void SparkEngine::set_on_start_hook_for_test(std::function<void()> hook) {
+    on_start_hook_for_test_ = std::move(hook);
+}
+
 void SparkEngine::set_arm_fault_hook_for_test(std::function<void(int)> hook) {
     arm_fault_hook_for_test_ = std::move(hook);
+}
+
+void SparkEngine::set_start_fault_hook_for_test(std::function<void(int)> hook) {
+    start_fault_hook_for_test_ = std::move(hook);
 }
 
 } // namespace yuzu::agent

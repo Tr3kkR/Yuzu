@@ -196,7 +196,11 @@ Verified safe to change now:
   `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; by
   inspection, the one documented inert case shows no delta - legacy fails identically
   there too - but the guarantee is narrower than this bullet's original wording
-  implied).
+  implied). A runtime-inert File worker or Registry sweeper (R5.7 (b)/(g), #4658) is a
+  second inert case and it DOES show a delta: the legacy File guard does not depend on
+  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode is
+  classified `Unsupported` and stays disarmed after recovery until the next reconcile or
+  restart (R5.7 (g)(1)).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.
@@ -692,75 +696,72 @@ two genuinely separate mechanisms, matching the two concerns ruling 14(b) folds
 together in prose but which do not share one signal in code:
 
 - **Adoption (does the late arm's subscription get committed).**
-  `GuardianSparkRuntime::on_arm_complete()` decides this per claim, not per
-  ledger. A retained-wedge head (`is_retained_wedge()`: dispatched, waiter-
-  abandoned, `ClaimEnd::WaiterTimedOutDispatched`) whose `RuleGeneration::active`
-  is still true is adopted exactly like an ordinary live claim's commit - one
-  watcher, live and enforcing - EXCEPT the claim's own `end`/`outcome` are left
-  untouched: the sticky-Wedged receipt (§R5.2, pinned by test) is a fact about
-  the ORIGINAL episode's timeout, not a live status of the rule, and adoption
-  never revises history. `rg->active` is the desired-state signal: it starts
-  true at attach and is flipped false ONLY by a withdrawal that can actually
-  reach the claim - `detach_rule_locked()`'s ordinary Case 0 FIFO scan
-  deliberately EXCLUDES a `waiter_abandoned` claim (it was already unreachable
-  through `index_`/`rules_` at abandonment time), so a dedicated locator,
-  `wedged_by_rule_` (rule_id -> the currently-wedged claim, populated the
-  instant a claim wedges, non-stopping only), is what lets
-  `detach_rule_locked()`/`detach_all()` find and deactivate it. The map has two
-  writers - `abandon_claim_locked()` (a claim just timed out) and
-  `attach_core()`'s Reobserved-restore branch (a still-wedged claim is
-  re-observed) - and both guard against a cross-key collision (the SAME
-  rule_id wedged on two different keys at once, an ordinary flip-flop
-  redeploy) in OPPOSITE directions, because the claim each is about to insert
-  carries opposite provenance; and `detach_rule_locked()`'s own deactivation
-  of this map's entry runs UNCONDITIONALLY, FIRST, before its Case 0 FIFO scan
-  even starts, rather than only when Case 0 falls through unmatched - the 5th
-  occurrence of this same fail-open class on this branch (rung 9c PR-5d, found
-  by this governance run's own Gate 4 unhappy-path pass) was Case 0's own
-  mid-loop `return nullptr;` skipping this cleanup whenever it matched a
-  DIFFERENT, still-live claim for the same rule_id on another key first. See
-  `wedged_by_rule_`'s own doc comment in `guardian_spark_runtime.hpp` and
-  `detach_rule_locked()`'s own header comment for the full mechanics, guard
-  proofs, and reachable interleavings - both are canonical here; this
-  paragraph is a summary, not a substitute. A genuine
-  reobservation (the SAME rule_id + spec re-attaching onto its own still-wedged
-  head) is hoisted to run BEFORE `detach_rule_locked(rule_id)`'s own
-  unconditional call in `attach_core()` - without that ordering, every
-  reobservation would transit the withdrawal lookup and deactivate its own
-  claim's `rg->active`, since `detach_rule_locked(rule_id)` runs on every
-  `attach_core()` call regardless of what the call turns out to be. **As
-  implemented after governance Gate 7 (rung 9c PR-5d /governance run, round
-  2):** an intervening `detach_all()` (a routine full-sync retry's own
-  teardown) deactivates `rg->active` and clears the `wedged_by_rule_` locator
-  for every currently-wedged claim UNCONDITIONALLY, including one whose rule
-  is still present in the replacement desired set - the hoisted Reobserved
-  branch is what restores candidacy for exactly that case, since reaching
-  Reobserved is itself proof the rule is still desired right now. The restore
-  writes the fallible, node-allocating `wedged_by_rule_.insert_or_assign()`
-  call BEFORE the (then-noexcept) `rg->active = true` write - matching the
-  file's own commit-or-rollback discipline (never an irreversible mutation
-  ahead of a fallible one) - so a throw there leaves `rg->active` untouched
-  and the NEXT reobservation retries, rather than permanently disabling
-  adoption for that rule (the shape governance Gate 2-4 found and Gate 7
-  closed). `on_arm_complete`'s own adoption branch additionally verifies,
-  rather than merely trusts, that nothing else has taken ownership of the
-  rule_id in the meantime: it refuses adoption outright (falling through to
-  the ordinary disarm path, counted via `wedge_adopt_stale_refused()` and
-  logged at INFO) if `rules_` already holds ANY entry for that rule_id. This
-  is NOT purely defense-in-depth against the fault-injection fix above -
-  governance Gate 8 found (and a regression test now pins) that this branch
-  is independently reachable via entirely ordinary desired-state churn, no
-  fault injection needed: rule R wedges on key A; R is redeployed to key B
-  (commits normally); R is redeployed BACK to key A while the ORIGINAL key-A
-  arm is still in flight - `is_retained_wedge()` never consults `rg->active`,
-  so the Reobserved-restore branch above legitimately reactivates the
-  still-outstanding key-A claim's candidacy even though `rules_[R]` is
-  correctly live on key B throughout. The guard handles both this common
-  churn case and the rarer true invariant-violation case identically and
-  safely (refuse, disarm the stale success, never touch the live generation)
-  - `wedge_adopt_stale_refused()`'s own doc comment states what a SUSTAINED,
-  climbing rate is worth investigating for, since an occasional nonzero count
-  is expected operational noise, not a bug signal.
+  `claims_` is the sole source of pending wedge adoption candidacy (#4508).
+  `is_wedge_candidate_locked(c)` means `is_retained_wedge(c) && c.rg &&
+  c.rg->active && !generation_committed_locked(c)`. `is_retained_wedge`, defined
+  in `guardian_spark_runtime.cpp`, accepts both Dispatching and Dispatched Arm
+  claims with `waiter_abandoned` and `end == WaiterTimedOutDispatched`.
+  Receipt history stays sticky-Wedged even after recovery: it records the
+  original timeout, not current desired state or current enforcement.
+
+  **W0 (ownership):** no candidacy writer changes `active` on a generation
+  owned by `rules_`. Adoption commits `rg` by shared ownership, so a retained,
+  unpublished claim can alias the live generation during publication failure.
+  `generation_committed_locked` compares the exact generation in `rules_`;
+  all four publication, receipt-recovery, recovery-status and fallback-outcome
+  sites share it. No independent adopted bit or completion locator is needed.
+  Ordinary commitment moves `rg` into a by-value parameter: a null claim `rg`
+  means commit was attempted, whether it succeeded or threw, and leaves no
+  generation eligible for adoption on that claim.
+
+  **W1 (uniqueness):** at most one candidate per rule_id, the most recently
+  attached or re-observed. Three allocation-free writer sites preserve it:
+  withdrawal sweeps matching candidates; hoisted Reobserved restore sweeps
+  other candidates before setting its own desire; abandonment deactivates its
+  incoming uncommitted generation if another candidate already exists. That
+  other candidate became desired after the incoming claim was created. A
+  timeout itself provides no fresh desired-state signal. Re-observation is
+  decided before ordinary attach withdrawal, and a committed generation is
+  excluded even when its retained claim is re-observed.
+
+  `detach_rule_locked` constructs its debug postcondition guard first, sweeps
+  candidates second, then calls `withdraw_rule_after_wedge_sweep_locked`.
+  Thus Case 0's early return and every throwing withdrawal path follow the
+  sweep. `detach_all` constructs the global guard and sweeps once immediately
+  after locking, then calls the same pre-swept helper in both its claimed-rule
+  and committed-rule loops. The postcondition checks absence of candidates,
+  including during unwind. The helper cannot create candidacy under that lock.
+
+  Completion ends candidacy through commitment or removal from `claims_`.
+  A receipt can retain a popped, refused claim with all candidate fields still
+  set, so its test accessor checks FIFO-front identity membership as well as
+  the predicate. The existing late-adoption policy remains: the runtime must
+  not be stopping, the claim must be desired, no live follower may take the
+  subscription, and `rules_` must not already contain that rule_id. Refusal
+  increments `wedge_adopt_stale_refused` and compensates the stale subscription
+  without touching the live generation. A re-observation after another key
+  commits can reach this refusal during ordinary desired-state churn.
+
+  **Cost:** let N be the total FIFO population, C the rule_ids with claims,
+  R the committed rules, f the largest FIFO, and R_idx/K_idx the ordered
+  index's rule/key counts. Each added global candidacy walk is linear in N,
+  with average O(1) hash work for relevant retained wedges. `detach_rule_locked`
+  adds one sweep and one debug walk; A attaches add O(A*N) work. Abandonment
+  adds O(N) per expiring wedge, on top of maintenance's existing O(N) collection.
+  `detach_all` adds two global walks, retaining the existing withdrawal cost:
+  O(N) + (C+R)*(f + log R_idx) + existing confirmed-path work. Case 0 scans a
+  key's FIFO for committed rules too; the (C+R)*f term is pre-existing.
+  `index_` uses ordered maps: rule lookups cost O(log R_idx), key lookups
+  O(log K_idx), and inner set lookups O(log S_k), where S_k is the number of
+  rules sharing the key. Under the index invariant those latter terms are
+  absorbed by O(log R_idx). Runtime maps use average O(1) hash lookups.
+  Retained-wedge heads satisfy W <= 10 + D, where D counts retained-wedge
+  heads awaiting compensation reservation, including heads in collected refill
+  batches. D has no bound supplied by the permit pool, executor quota, or
+  concurrent caller count. Executor quota is released before completion drain;
+  the ten compensation permits persist through it. Neither pool bounds N:
+  same-key followers and retained Disarm heads can accumulate. This trades
+  constant-time locator reads for linear candidacy walks without another cache.
 - **Arm-recovery telemetry (does the CURRENT application's `arm_failed`
   clear).** `GuardianArmAckLedger` retains the `ArmReceipt` for any receipt
   `drain_locked()` resolves to `Wedged` specifically (`Application::
@@ -1190,6 +1191,268 @@ completes and is not a valid proxy for it. The diagnostic script's completeness 
 own log line from that count, since a no-op returns the same `rules_size()` figure
 without a single real arm occurring.
 
+**Rung 9c PR-6 item 1 — an establishment-signal channel now exists (Service first;
+Registry and File followed under #4340), 2026-09-18.** R5.7 above still needs its own T2
+arm-confirmation timestamp from the runtime, but the raw fact it would need to read from is
+no longer entirely missing at the mechanism layer: `SparkEngine::subscription_establishment(id)`
+is a pull query returning `armed_at` / an optional `established_at` (first Notification-coverage
+report for the subscription's CURRENT incarnation, never re-stamped by a later recovery) /
+the mechanism's current tri-state `SparkCoverage` (`None`/`Notification`/`Poll`). Wired
+first for Service (both platforms: Linux sd-bus, Windows SCM); Registry and File followed
+under #4340 (Windows only). A Service watch's `watch()` call returning success carries zero
+information about establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged`
+registration is what this channel actually observes), so it was the mechanism with the most
+acute gap.
+**Registry and File: implemented under #4340 (2026-09-20).** Both mechanisms
+override `watch_incarnation()`/`set_established_sink()` the way Service does. They follow
+Service's shape (seal the sink first in `start()`, mark coverage transitions under `mu_`, stage
+in the sweep visit, dispatch in `run_off_lock()` with `mu_` released, established reports
+before that pass's emits/faults) minus these differences: no `key_epoch` (the staged
+incarnation is the identity check); no `Poll` state (Service only); no worker-death
+invalidation (Service invalidates every key to `None` when its worker throws; the Registry
+sweeper and the File worker survive an exception); a per-call try/catch plus an
+`established_failed` counter around the sink (Service has no per-call catch, so a throwing
+sink there reaches its `run()` catch); no Service-style `fired` guard on adoption (Registry
+re-reports the watch's raw coverage, so an adoption landing between the OS signal and
+`on_fire()` taking `mu_` can briefly report `Notification` for a watch that has already
+fired, with `None` following); and File keeps a per-KEY incarnation over per-DIRECTORY
+coverage.
+One asymmetry the two do NOT share with each other, load-bearing for any consumer comparing
+their `coverage` streams: Registry's `RegNotifyChangeKeyValue` is one-shot, so coverage
+genuinely FLAPS `Notification -> None -> Notification` on every consumed Target-mode fire (a
+real notify-then-rearm cycle, not a bug; Target mode means the watch sits on the requested key
+itself, Ancestor mode means the key is absent so the watch sits on its nearest existing
+ancestor until the key appears); a deletion fire ends at `None` (Target -> Ancestor, no
+`Notification` until the key reappears). File's `ReadDirectoryChangesW` reissue is
+synchronous on an ordinary fire, so its coverage stays `Notification` across it and only
+drops on a genuine backend failure (a failed read completion, reissue or re-probe) or loss of
+the watched (parent) directory; never on `unwatch()` or an orderly `stop()`, which are
+deliberately unreported (see R4). A consumer that assumes the two mechanisms' `coverage`
+streams mean the same thing is wrong without accounting for this.
+**established_at is per-INCARNATION, not per-key, carried forward for R5.7's own
+future use of this channel (and for any future detect-latency measurement built on it,
+#4606):** a fire-triggered re-arm on the SAME incarnation (Registry's ordinary fire path
+above) never re-stamps `established_at`, and `subscription_establishment()` is a pull query
+that is not guaranteed to observe the transient `None` mid-flap — Registry's `None`
+and the re-arm's `Notification` land on consecutive sweep passes when the re-arm
+probe resolves promptly (the sweep drains the `None` marker before it commits the
+re-arm, and the commit's own `Notification` marker is only picked up by the next
+pass, never the same one), and may then be too close together for a pull query to
+observe the transient `None`. A consumer that needs to observe "coverage was lost and
+regained across a re-arm cycle" must install a mechanism-direct `set_established_sink()`
+observer in its own harness — do not build that on polling `subscription_establishment()`
+for the re-arm half. Do not build it on disarm+arm either: a disarm of the LAST subscriber
+followed by an arm mints a fresh incarnation (a dedup arm onto an already-armed key shares
+the existing one), and when a concurrent re-arm lands before the engine's `unwatch()` the
+engine skips it and the mechanism ADOPTS the live watch under the new incarnation,
+re-reporting its CURRENT coverage stamped `now()` — a re-baseline, not an observation of
+loss and regain.
+**Timestamp semantics:** `established_at` is the mechanism's commit time, EXCEPT adoption
+and join reports (Registry adoption in `watch_incarnation()`; File join or coalesce onto an
+already-established directory), which are stamped `now()` at the adoption or join, so a
+first-wins `established_at` cannot predate its own incarnation's `armed_at`. For such a key the
+stamp is later than the watch's original establishment by up to the watch's whole age (not by
+one sweep pass), and arm-to-established reads about zero, because the stamp is taken during the
+arm itself, whatever the real establishment latency was. A latency measurement must therefore
+not use adopted or joined keys.
+**Ordering:** within ONE dispatch pass the establishment reports are delivered before that
+pass's own emits/faults. That is all it guarantees. A commit stages its synthetic Emit in the
+same visit but re-marks its `Notification` after that visit's drain, so the `Notification` is
+staged one pass AFTER the Emit; Registry's immediate emit from `on_fire()` is not covered
+either. It is not a general "the report is visible before any event" guarantee.
+**Ancestor mode:** the watch is on the nearest existing ancestor (the target is absent) and
+WILL detect the target's appearance, yet `coverage` is `None` — a stable NON-loss. An absent
+target's `established_at` therefore stays unset; a latency criterion must censor such
+subscriptions, not read them as deaf.
+**Latency caveat, carried forward for R5.7's own future use of this channel:**
+`established_at` is stamped by the MECHANISM at the point it commits successful
+notification coverage (adoption and join excepted, above), not at the moment
+`report_established` is dispatched to a consumer. All three slow paths poll on a 50 ms
+cadence (`kServicePollCadence`, `kRegSweepCadence`, `kFileSweepCadence`): each is a wait CAP
+the mechanism's own wait clamps to whenever a probe is outstanding (Pending) — not a fixed
+delay; a nudge (Registry, File) or a command or APC (Service) wakes it earlier. Dispatch of a
+report is bounded the same way on all three mechanisms.
+**Windows live-registration-retry blind spot, carried forward for R5.7's own
+future use of this channel:** on a live-registration failure that occurs
+AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
+post-`OpenServiceW`), Windows's `begin_probe`→`resolve_probe` retry loop has
+no status-poll fallback — it only re-learns the service's real state from a
+future successful Notify callback. Linux's equivalent failure
+(`sd_bus_match_signal` post-`LoadUnit`) DOES fall back to `read_state()` via
+its backstop reconcile. A service can flip Running↔Stopped **undetected** on
+Windows during this narrow retry window; it cannot on Linux. This asymmetry
+predates this channel (confirmed against the pre-PR base commit `7ff742f19`
+— the fallback was already absent) — this channel only made the gap
+OBSERVABLE (staging `SparkCoverage::None`, honestly, rather than leaving it
+invisible). A future R5.7 consumer treating Windows's `None` in this
+specific window as "confirmed absent" rather than "not yet re-confirmed"
+would be wrong; do not conflate the two without a discriminating signal
+Spark does not currently have (see also the `SparkCoverage::None` ambiguity
+note for Registry/File, implemented under #4340 — Registry's `None` is very often a
+genuine one-shot-notify-consumed flap rather than a Service-style "not yet
+re-confirmed" gap; a consumer must not conflate the two without checking
+which mechanism produced the report, per the asymmetry noted above).
+**R4 (stale-after-stop), carried forward from the delivery plan's own residual list:**
+after `SparkEngine::stop()`, `subscription_establishment(id)` keeps returning the
+subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A future
+R5.7 consumer that cares whether the engine is still live checks `is_running()` itself
+(the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
+post-stop `established_at`/`coverage` pair as current live coverage.
+
+**Consumer preconditions and known residuals (Registry and File, #4340).** (a) `coverage` is the
+LAST DELIVERED value, not an authoritative live state. (b) It can go stale with no signal a
+consumer can read. A dropped report (the sink threw; the production engine sink takes only the
+engine lock and cannot realistically throw) is not detectable by a consumer at all:
+`subscription_health()` reads `armed_.faulted`, which only a Fault report sets (a mechanism's
+Fault callback, or the engine's own pre-start replay failure), so
+once a deleted target's re-arm has resolved to the ancestor the watch is Healthy, `inert` is
+false, and the cache can still read `Notification` if the `None` report was dropped (the
+Registry test that characterises exactly this drops every `None` and deletes the target). A
+Registry sweeper or File worker in persistent failure also leaves a stale `Notification`, unflagged
+until it flips `inert` after three consecutive failed passes. Checking
+`!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows the Registry
+sweeper-failure and File worker-failure cases, and only once the flag has flipped (three
+consecutive failed passes for either, `kSweeperInertAfterFailures` /
+`kFileWorkerInertAfterFailures`); it does not cover a dropped report.
+(c) `Notification` means the mechanism holds the
+watch and issued the read (Registry: the key exists and the notify is armed; File: the parent
+directory handle is watched, even when the file itself is absent). It is a probe result, NOT an
+end-to-end detection guarantee; whether File's handle-based watch reports the rename of the
+watched directory as a loss is not verified. (d) `coverage == None` with `established_at` unset
+means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily deaf).
+With `established_at` set it means one of: the Registry one-shot flap (brief, on the order of
+one re-arm); a Registry target that has since been deleted (Target -> Ancestor: the watch now
+sits on the nearest existing ancestor and will detect the key's reappearance, which restores
+`Notification`; a stable `None`, not a deaf watch); or a genuine loss (a failed read completion,
+reissue or re-probe on File; a failed re-arm on Registry). The discriminators that exist are
+`subscription_health() == Faulted`, the age of `armed_at` (which bounds how long the
+subscription has existed; there is no last-transition timestamp, so telling a brief flap from a
+stable `None` means sampling `coverage` over time), and `nullopt` from
+`subscription_establishment()`, which means an unknown or already-disarmed subscription id (not
+an engine `stop()`: after `stop()` the query keeps returning last-known values, see R4 above).
+(e) The first
+production consumer, the detect-latency measurement tracked in #4606 (precondition list: #4659), must
+re-derive the stale-cache severity and cover these residuals itself: the check in (b) narrows only
+the Registry and File worker-failure cases, so there is no complete guard to copy. (f) There is no
+operator surface: a dropped report is counted in the `established_failed` debug counter (a test
+seam) and logged once (the first drop only). (g) File now has (b)'s narrowing (#4658): its
+worker counts each failed pass (test-visible only), backs off (doubling from `sweep_cadence`, 30 s
+cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive failed passes,
+clearing on the next success. Two residuals remain: a real directory notification during an
+episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
+rather than the backoff; and a single poison obligation fails the whole pass, starving the others
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open
+(#4685). The list below sets out that gap, the contract a consumer of `inert` needs and two
+further recorded limits.
+
+**R5.7 (g), continued: the File worker-failure contract (#4658).**
+
+1. KNOWN open gap, a precondition for the F14 flip. Tracked as issue #4685, with an entry in the
+   flip-gate risk-accept register (`docs/spark-flip-gate.md` section 5). While File is
+   runtime-inert, a Guardian reconcile (a full-sync policy push, for example) builds its capability
+   set without File (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File
+   rule it touches `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule
+   already armed through Spark and withdraws its legacy guard, and a full sync tears both backends
+   down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`).
+   Live File rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so
+   they stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
+   reconcile or an agent restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
+   has the same shape and predates #4658. `guardian_engine.cpp` is unchanged by #4658, so it is
+   cited by symbol.
+2. `inert` is a polled bit, not an event. Read it through `stats_by_type()`: it is not latched,
+   nothing announces a flip or a clear, and a heartbeat only sees an episode it happens to sample.
+   `SparkMechanismStats` cannot tell a boot-time inert (`start()` could not bind its OS facility,
+   so every `watch()` is refused) from a runtime one (watches are accepted but cannot be served
+   until a pass succeeds).
+3. File and Registry differ:
+   - Retry wake. File's wake IS its retry: an open episode always has a retry scheduled, at the
+     backoff deadline or at once if that deadline has already passed, so an otherwise idle worker
+     still retries. Registry waits out its backoff, then re-derives its next wake from the
+     obligations then due (`next_wake_locked()`, whose idle ceiling is one hour).
+   - Deadline stamp. File stamps the deadline in `note_pass_outcome_locked()`, before the pass's
+     off-lock tail (the log line and `FilePassWork` destruction), so it can already be stale when
+     the wait is computed; `wait_timeout_locked()` treats a passed deadline as retry-due-now.
+     Registry starts its backoff wait after its tail.
+   - Completion passes. A File pass run for a real IOCP completion counts toward the three
+     failures and is never throttled or absorbed; a successful one ends the episode.
+   - Clearing `inert`. File clears it on the first successful pass with no equivalent of
+     Registry's `if (core_)` check (Registry clears it only while its thread pool exists). The
+     File worker is the only writer of `inert` while it runs, so a recovery cannot clear a
+     boot-time inert.
+4. Latency and limits, at the default 50 ms cadence:
+   - `inert` flips after three consecutive failed passes, about 150 ms of backoff (50 ms, then
+     100 ms) after the first failure, and clears at the next successful pass. After the cause is
+     removed a quiet directory waits for the current backoff deadline, up to the 30 s cap; a real
+     notification in any watched directory runs a pass at once.
+   - A `watch()`/`unwatch()` control wake is absorbed until the deadline, but `watch()` does its
+     work inline: a directory that resolves within `kFileCallerWaitBudget` (50 ms) has its
+     directory read armed before `watch()` returns. What waits for a pass is that watch's
+     establishment report and its health and Fault edges, a probe that outlives the budget, and a
+     Deferred watch.
+   - The `worker pass failed (consecutive #1)` and `recovered` lines are logged on every episode;
+     the 1, 2, 4, 8 gate bounds only an unbroken one, so intermittent failure while directories
+     churn is not rate-limited across episodes (#4686).
+   - Only an exception that ESCAPES a pass counts: a throwing emit or fault sink is caught inside
+     the pass, counted in `emit_failed`/`fault_failed`, and does not count toward the three.
+   - Known limit: a retry pass that finds nothing due counts as a SUCCESS (it clears the failure
+     count, the backoff and `inert`) even when the cause persists, for example when an admission
+     attempt escalated past the deadline, or an unrelated real completion succeeds between
+     failures. An alternating failure/success pattern therefore never flips `inert`. Movement of
+     `pass_failed`, not `inert`, is the complete failure detector, and the #4606 harness must
+     read it.
+   - Known limit: a blocked or slow log sink stalls the mechanism's own worker thread while it
+     runs, for as long as the sink blocks; only agent shutdown is bounded (the 20 s
+     `ShutdownDeadlineGuard`, `kShutdownDeadlineGrace`, armed in `AgentImpl::stop()` and in
+     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). The two
+     mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
+     (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
+     IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
+     Registry's equivalent lines run WHILE `mu_` IS HELD: the recovery log
+     (`spark_registry.cpp:1895`) is released at `:1901` on the recovery path, and the failure and
+     inert-transition logs (`:1912`, `:1916`) are released at `:1919` on the failure path - two
+     different unlock points, neither reached from the other branch in the same pass. Either way
+     a stalled sink there stalls every other caller of
+     `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
+     draining. Tracked as its own issue, #4704 (not folded into this design record's own
+     acceptance, since it needs a fix decision of its own).
+5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
+   through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
+   signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
+   `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds`
+   and `spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
+   `yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no
+   alert on `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
+   precondition: it needs a `for:` hold of at least two heartbeats so a self-clearing episode does
+   not fire it, a paging alert wants at least 10 minutes, tuned on fleet data, and it compares
+   `_reporting` with the one mechanism's series, not the sum over mechanisms (see
+   `docs/user-manual/metrics.md`).
+
+**R5.7 as implemented (rung 9c PR-6 item 2, 2026-09-19)**: the re-measurement this section
+calls for is built and run. T2 is a new runtime-side log line at the LAST statement of
+`GuardianSparkRuntime::commit_new_generation_locked()` - never
+`subscription_establishment()` (that channel still has zero production callers) and never
+`SparkEngine`'s own "armed" log (fires before the OS watch call even runs, exactly as this
+section already says not to use it). Membership across repeated `#3990` diagnostic full_syncs
+is decided by an explicit APPLICATION FENCE, not by timestamp order: `detach_all()` stamps a
+monotonic `detach_epoch_` (bumped first, before any of its own mutation) and logs it in a new
+`Guardian spark: detach_all complete (epoch=, incarnation_floor=, ...)` line as its LAST
+statement; every T2 line then carries that epoch, so a stale in-flight commit from a PREVIOUS
+full_sync (which can land between the new `full_sync cleared` line and `detach_all()`, since
+both run under `registry_mu_`, not the engine's own `mtx_`) is rejected by epoch identity
+rather than by an insufficient timestamp check - a real gap an Astra adversarial review found
+in this item's own first design round, before implementation. `--spark-disable` never
+constructs `spark_runtime_` at all (`wire_spark_engine()`'s `spark_disabled_by_config` branch
+returns before that point) - legacy needs no fence in the first place, since its arms are
+synchronous on the same thread as T0/T1. Result: Phase B (baseline re-deploy) reached a
+pre-registered PASS on the current NonWaiting attach model; Phase B2 (bare rule-create,
+`#3990`'s own literal shape) is FAIL-RELIABILITY - a genuine spark arm failure on repeat 3
+(`applied=61, failed=1`, one rule) was initially misclassified as an instrument-invalid void by
+a driver bug (`/adversarial-review` found and fixed same-session; see the run doc's own
+"Correction" note under its Phase B2 section) and, once corrected, breaks the reliability gate
+outright regardless of the separate 2/3 floor miss. Full detail: `docs/spark-rebuild-baselines/
+3990-fullsync-blackout-run.md`'s own "R5.7 T2 re-run results" section; `docs/spark-flip-gate.md`'s
+`#3990` entry for the flip-gate framing.
+
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
 7.7b was first planned as one PR folding the #2237 send-path items and #2238 test
@@ -1271,9 +1534,11 @@ lost/coalesced edge can no longer leave the server's errored view stale forever
 (unhappy-path UP-1/2/4/11 closed); and (b) the **priority-lane eviction** -
 `pending_demote_sweeps`/`pending_demote_ms` (defaults 12 sweeps / 120 000 ms) demote a
 still-pending-initial rule off the 5 s priority lane to its normal type-lane cadence
-(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a COMMITTED
-Convergence-reason Unknown, counted on `yuzu.guardian_priority_demoted` - closing the *read*
-flood (UP-6) the edge-only fix left open. Demotion is per-rule, not per-key (a key with a
+(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a
+Convergence-reason Unknown READ (committed or outbox-rejected; the elapsed-time arm is
+checked on every Unknown pass regardless of reason or enqueue outcome - #2992), counted
+on `yuzu.guardian_priority_demoted` - closing the *read* flood (UP-6) the edge-only fix
+left open. Demotion is per-rule, not per-key (a key with a
 mixed demoted/non-demoted pending set still pays the read cost via its non-demoted sibling);
 the demoted rule keeps converging (and keeps re-arming errored_refresh_ms) at the slower
 cadence, so (a) backstops (b)'s resulting wire staleness. Both land in
@@ -1915,7 +2180,8 @@ distinguishes them; **owned by rung 1** (observe-only), not left open. (sre F3.)
 > every `watch()` would be refused: "looks healthy, can detect nothing".
 >
 > Rung 1 therefore ships an `inert` bit on `SparkMechanismStats`, set at `start()` by
-> each mechanism, and **excludes inert mechanisms from the `yuzu.spark_mechs` capability
+> each mechanism (File and Registry can also raise it at runtime, R5.7 (b)), and
+> **excludes inert mechanisms from the `yuzu.spark_mechs` capability
 > CSV** — so `yuzu_fleet_spark_mechanisms{os,mechanism}` now counts only mechanisms that
 > are registered **and functional**. Inert mechanisms still report their counters;
 > inertness suppresses the capability *claim*, not the telemetry.
@@ -2111,7 +2377,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
    **Shipped beyond the original rung-1 scope**, both added by the rung-1 governance
    rounds — the ladder must not be read as still deferring them:
    - **The `inert` bit** (§Inert-mechanism distinguishability). A mechanism that started
-     but could not bind its OS facility is excluded from the capability CSV. The earlier
+     but could not bind its OS facility is excluded from the capability CSV (File and
+     Registry can also raise it at runtime, R5.7 (b)). The earlier
      deferral to rung 2 was WITHDRAWN: inertness is known at `start()`, needs no arming,
      and deferring it shipped a live misreport on every containerised Linux agent
      (`libsystemd0` is installed, but a container has no system bus).

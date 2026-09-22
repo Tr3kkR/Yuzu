@@ -21,6 +21,7 @@
 #include "inventory_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
 #include "test_route_sink.hpp"
@@ -29,6 +30,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -42,9 +44,23 @@
 #include "../test_helpers.hpp"
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
+
+// Run a raw SQL statement against the test database on a second connection --
+// same idiom as test_result_set_store.cpp's own helper -- lets a test install
+// a trigger that simulates a concurrent delete racing heal_poisoned_payload's
+// own SELECT/UPDATE pair (#4540).
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
 
 // ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
 // "resultset" template key with test_result_set_store.cpp (identical setup).
@@ -430,6 +446,62 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][a
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // #4406 fix: body.value("sql", "") threw on a non-string sql rather than
+    // coercing. Same guard shape as the pre-existing include_empty check
+    // above, now applied to sql too.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'sql' is required") != std::string::npos);
+}
+
+TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // Adversarial-review finding: body.value("name", "") at the run_async call
+    // site threw the same way sql/instruction_id did before #4406's fix -
+    // missed in the first pass because name is passed inline as an argument,
+    // not extracted into a named local like the other guarded fields.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j =
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":123})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatched",
+          "[pg][result_set][async][tar][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["sql"] = "SELECT 1";
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
           "[pg][result_set][async][tar][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
@@ -658,6 +730,233 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s",
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // #4406 fix: body.value("instruction_id", "") threw on a non-string
+    // instruction_id rather than coercing - it now falls through to the
+    // pre-existing "is required" 400, same as an absent field.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j =
+        h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'instruction_id' is required") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // Adversarial-review finding, same as from-tar-query's sibling test above.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = 123;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized name is refused with 400, never "
+          "dispatched",
+          "[pg][result_set][async][instruction][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a non-object params is refused with 400, not "
+          "silently dispatched with an empty params map",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // Gate 4 unhappy-path fix: params gated on is_object() skipped every
+    // bound check AND the params-map-build loop, so a string/array/number
+    // params silently dispatched with an EMPTY map while persisting the
+    // wrong-shaped value verbatim and unbounded.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = std::string(4 * 1024 * 1024 - 100, 'A');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
+            std::string::npos);
+}
+
+// #4373-class fix, sibling-handler closure (flagged by governance Gate 2's
+// mandatory sibling-handler sweep, PR#4373 follow-on): from-instruction-result
+// had NO bound at all on instruction_id/params at creation time, unlike
+// re-eval which this PR bounds against a stored payload - closing that
+// smuggle-then-reeval path left the DIRECT one-step path open. These four
+// mirror re-eval's own bound-check coverage; each asserts the specific
+// message, since a bare 400+no-dispatch alone doesn't distinguish the NEW
+// bound check from the pre-existing "unknown instruction_id" 404 fallback's
+// neighbouring 400 paths (missing/empty instruction_id, invalid JSON).
+
+TEST_CASE("from-instruction-result: an oversized instruction_id is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(257, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a 256-byte instruction_id passes the "
+          "length guard and reaches the not-found fallback",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // The 256-byte boundary itself must be ACCEPTED (only >256 is rejected,
+    // per kInstructionIdMaxLen) - but InstructionStore caps a real
+    // definition id at 128 characters, so no registered instruction can
+    // ever be 256 bytes long. Proving acceptance-at-the-boundary therefore
+    // means proving the length check did NOT fire (no "must be at most 256
+    // bytes" message) and the request instead reaches the pre-existing
+    // INSTRUCTION_NOT_FOUND 404, not that it dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(256, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 404);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("INSTRUCTION_NOT_FOUND") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an over-keyed params object is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params[std::format("k{}", i)] = "v";
+    body["params"] = params;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params key is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{std::string(257, 'k'), "v"}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params value is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{"path", std::string(65537, 'z')}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: exact-boundary params are accepted and dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // Scoped to params (32 keys, each key/value padded to its exact byte
+    // cap) - a real registered instruction_id is a short generated string,
+    // never anywhere near the 256-byte instruction_id cap, so that
+    // boundary isn't exercisable on the accept side without a test-only
+    // custom-id seam InstructionStore doesn't have. The reject side
+    // (257 bytes, above) plus the `>` (never `>=`) comparator already
+    // prove that boundary.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 32; ++i)
+        // Fixed-width numeric prefix ("k000".."k031") keeps every key unique
+        // before the 'x' fill pads it to the exact 256-byte cap - a '0' fill
+        // on a bare "k{}" would collide (e.g. "k1"+zeros == "k10"+zeros),
+        // silently shrinking this to fewer than 32 distinct keys.
+        params[std::format("{:x<256}", std::format("k{:03d}", i))] = std::string(65536, 'v');
+    REQUIRE(params.size() == 32);
+    body["params"] = params;
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+}
+
 TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
           "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -729,6 +1028,382 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
     nlohmann::json payload;
     payload["sql"] = std::string(100001, 'x');
     cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+// #4373: the kInstructionResult branch was missing the equivalent recheck
+// entirely - a row minted via the uncapped POST /api/v1/result-sets (no
+// source_kind allowlist there) could carry an over-keyed or oversized
+// params object straight past MCP's own bounds (mcp_input_bounds.hpp) and
+// into a fleet-wide dispatch, or an oversized instruction_id straight into
+// instruction_store's lookup unbounded. The seven cases below (four bound
+// cases, two type-confusion cases, and one unparseable-payload case) cover
+// the ones reevaluate_result_set's own fix (PR #4394) already has plus one
+// more (cpp-safety Gate 3 finding on this PR), seeded directly in the
+// store the same way the SQL-cap test above is (never through
+// /from-instruction-result, which has no per-field bound of its own to
+// enforce the smuggled shape at creation time).
+
+TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // A REAL, registered instruction_id (never a made-up one): without the
+    // params bound this fix adds, the lookup below succeeds and the old
+    // code reaches run_async, so this proves the bound is what stops the
+    // dispatch, not merely that an unrelated "instruction unavailable" path
+    // happens to also 400.
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params["k" + std::to_string(i)] = "v";
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overkeyed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // #4478's stored-payload depth guard 400s+no-dispatches this same route
+    // before parse, so status==400 + h.calls.empty() alone does not
+    // distinguish this fix's params-count bound from that unrelated guard -
+    // the message is what proves THIS check fired.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: a non-object params smuggled onto an existing instruction_result "
+          "row is refused, not silently re-dispatched with an empty params map",
+          "[pg][result_set][async][reeval][security][4373]") {
+    // Gate 4 unhappy-path fix: the pre-fix code gated every params bound
+    // check (and the params-map-build loop) on is_object(), so a
+    // string/array/number params silently re-dispatched with an EMPTY map.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = std::string(1024, 'A');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-non-object-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // Real instruction_id, same reasoning as the over-keyed case above.
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{"k", std::string(65537, 'z')}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // Same distinguishing reasoning as the over-keyed case above: assert the
+    // message, not just the status, since #4478's depth guard 400s on this
+    // route too.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
+          "not skipped, smuggled onto an existing instruction_result row",
+          "[pg][result_set][async][reeval]") {
+    // Proves the value-size check measures dump() size for a non-string JSON
+    // value (an object/array), not merely `.is_string()`-gated away - the
+    // exact regression MCP's own reevaluate_result_set fix had a dedicated
+    // SECTION for. Real instruction_id, same reasoning as the two cases above.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{"k", {{"pad", std::string(65537, 'z')}}}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-nonstring-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // Same distinguishing reasoning as the two cases above: assert the
+    // message, since a bare 400+no-dispatch is also what #4478's depth
+    // guard produces on this route.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
+          "row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    // A bogus, non-existent instruction_id 400s regardless of length via the
+    // pre-existing "original instruction unavailable" fallback (dispatch
+    // needs a real matching InstructionDefinition either way), so status==400
+    // alone does not distinguish this fix's length check from that
+    // pre-existing path - both the fixed and unfixed handler return 400 here.
+    // Asserting the error message names the length bound is what actually
+    // proves the NEW check fired, not the old fallback.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(257, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
+}
+
+// Gate 8 follow-up (post-merge test-gap closure): the seven cases above cover
+// the count/value/instruction_id bounds and the two type-confusion cases, but
+// leave two gaps - no case ever sends a params KEY past its own bound, and no
+// case proves any of the four bounds accepts a request AT its boundary rather
+// than only rejecting past it. The three cases below close those gaps.
+
+TEST_CASE("re-eval: a 257-byte params key smuggled onto an existing "
+          "instruction_result row is refused with the bounds-specific error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{std::string(257, 'k'), "v"}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overlong-key";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an instruction_id of exactly 256 bytes passes the length "
+          "guard and falls through to instruction-unavailable",
+          "[pg][result_set][async][reeval]") {
+    // The 256-byte boundary itself must be ACCEPTED by this fix's length
+    // check (only >256 is rejected, per kInstructionIdMaxLen) - but
+    // InstructionStore::validate_and_prepare caps a real definition id at
+    // 128 characters, so no registered instruction can ever be 256 bytes
+    // long and this can never reach a successful dispatch. Proving
+    // acceptance-at-the-boundary therefore means proving the length check
+    // did NOT fire (no "must be at most 256 bytes" message) and the request
+    // instead reaches the pre-existing not-found fallback, not that it
+    // dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(256, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("original instruction unavailable") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: params at the exact per-field bounds (32 keys, a "
+          "256-byte key, a 65536-byte value) pass and the request dispatches",
+          "[pg][result_set][async][reeval]") {
+    // The positive-boundary twin of the count/key/value rejection cases
+    // above - proves 32 keys, a 256-byte key, and a 65536-byte value are all
+    // ACCEPTED (not merely that 33/257/65537 are rejected), and that an
+    // otherwise-valid request still reaches dispatch once every bound
+    // clears. Real, registered instruction_id (short - InstructionStore
+    // caps ids at 128 bytes, so the instruction_id bound's own accept-side
+    // boundary is covered separately above, not here).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    params[std::string(256, 'k')] = std::string(65536, 'v');
+    for (int i = 0; i < 31; ++i)
+        params["k" + std::to_string(i)] = "v";
+    REQUIRE(params.size() == 32);
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].plugin == "filehash");
+    REQUIRE(h.calls[0].action == "check");
+    REQUIRE(h.calls[0].params.at(std::string(256, 'k')) == std::string(65536, 'v'));
+    REQUIRE(j["data"]["source_kind"] == "instruction_result");
+}
+
+TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
+          "400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    // nlohmann::json::value("sql", "") throws json::type_error on a type
+    // mismatch rather than coercing - #4373's second finding. Proves the
+    // type-confusion guard actually fires, not merely that the comment says
+    // it should.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["sql"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-sql";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a type-mismatched instruction_id value on an "
+          "instruction_result row is a clean 400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an unparseable source_payload on an instruction_result row "
+          "is a clean 400, never an uncaught exception",
+          "[pg][result_set][async][reeval]") {
+    // orig->source_payload is parsed with nlohmann::json::parse(..., nullptr,
+    // false), which discards (rather than throws) on invalid JSON - proves
+    // that discarded-value path degrades safely on the kInstructionResult
+    // branch too: sp.is_object() is false for a discarded value, so every
+    // field read below falls through to "absent", not a crash.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-unparseable-payload";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = "not json";
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
 
@@ -1023,6 +1698,26 @@ TEST_CASE("from-inventory-query: an ordinary authorized caller still reaches the
     CHECK(status == 503);
 }
 
+TEST_CASE("from-inventory-query: an oversized name is refused with 400, never "
+          "reaches the inventory-store gate",
+          "[pg][result_set][async][inventory][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap. The
+    // check runs before store availability, so this 400s even with no
+    // inventory store wired (unlike the 503 case just above).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -
@@ -1085,14 +1780,24 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
 // test_inventory_eval.cpp, which is the actual code under test and proves
 // reachability directly). "exists" matches on presence alone, so it is
 // answered TRUE for the poisoned record's "field1" whether the guard runs
-// or not, making device_count the deciding, guard-dependent signal here too
-// (2 without the guard, 1 with it). Real structural nesting, NOT brackets
-// inside a string literal: json_exceeds_depth deliberately does not count
-// bracket characters inside a string value as structure. Reachability-proxy
-// depth (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack
-// depth.
-TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from matching "
-          "membership, a healthy matching agent is still included, no crash",
+// or not, making the response status the deciding, guard-dependent signal
+// here too (a crash without the guard, a clean 503 with it). Real structural
+// nesting, NOT brackets inside a string literal: json_exceeds_depth
+// deliberately does not count bracket characters inside a string value as
+// structure. Reachability-proxy depth (36 > kMcpMaxJsonDepth's 32), never
+// the real ~100,000-level attack depth.
+//
+// #4496: this producer MATERIALISES its match set into a durable result set
+// other operators/dispatches consume later, so poison-exclusion is folded
+// into the SAME M1 dispatch-targeting-invariant refusal as a byte-capped read
+// (see "from-inventory-query refuses a byte-capped read without creating a
+// set" above, the direct precedent) rather than a flag on a 201 - a flag on
+// this response would never reach a downstream consumer of the created set.
+// This test previously asserted the OPPOSITE (a 201 with the poisoned agent
+// silently dropped from membership); #4496 replaces that silent narrowing
+// with an explicit refusal.
+TEST_CASE("from-inventory-query: a poisoned stored data_json refuses the request rather "
+          "than silently materialising a narrowed set, no crash",
           "[pg][result_set][async][inventory][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1123,18 +1828,401 @@ TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from ma
     AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
 
     int status = 0;
-    auto body = h.post(
+    h.post(
         "/api/v1/result-sets/from-inventory-query",
         R"({"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
         status);
-    REQUIRE(status == 201); // no crash
+    REQUIRE(status == 503); // no crash, and no silently-narrowed set either
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("poison_excluded") != std::string::npos)
+            saw_poison_failure = true;
+    CHECK(saw_poison_failure);
+}
+
+// #4496: the healthy-only sibling of the test above - proves the refusal is
+// specific to an actual poisoned record, not a false-positive that fires on
+// every from-inventory-query call after this fix.
+TEST_CASE("from-inventory-query: no poisoned record present -- matching membership is "
+          "materialised normally",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"depth-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 201);
     CHECK(body["data"]["device_count"] == 1);
-    // Confirm identity, not just count: the created set must contain the
-    // healthy agent and MUST NOT contain the poisoned one.
     std::string next;
     auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
     REQUIRE(members.size() == 1);
     CHECK(members[0] == "agent-healthy");
+}
+
+// #4496 follow-up: the sibling of the poisoned-record test above, for the
+// OTHER cause evaluate_inventory() can exclude a record for -- a genuine
+// JSON parse error rather than over-nesting. Seeded directly via SQL
+// (bypassing the gateway write-side guard, which checks nesting depth only,
+// not general JSON validity) to prove this read-side guard independently.
+// Uses "exists" for the same discriminating reason as the poisoned test: a
+// caller who wrote "==" could not tell a guarded exclusion from an ordinary
+// no-match.
+TEST_CASE("from-inventory-query: a malformed stored data_json refuses the request rather "
+          "than silently materialising a narrowed set, no crash",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"parse-error-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 503); // no crash, and no silently-narrowed set either
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_parse_error_failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("parse_error_excluded") != std::string::npos)
+            saw_parse_error_failure = true;
+    CHECK(saw_parse_error_failure);
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// refusal is specific to an actual malformed record, not a false-positive
+// that fires on every from-inventory-query call after this fix.
+TEST_CASE("from-inventory-query: no malformed record present -- matching membership is "
+          "materialised normally",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"parse-error-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 201);
+    CHECK(body["data"]["device_count"] == 1);
+    std::string next;
+    auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
+// #4541 review (Important finding 2): both producer tests above seed only
+// ONE excluded cause at a time. `evaluate_inventory()` checks poison BEFORE
+// parse-error (see its own excluded_by_depth/excluded_by_parse_error
+// ordering), so a record set carrying BOTH problems must always report
+// poison_excluded and never parse_error_excluded - a caller-facing contract
+// docs/user-manual/rest-api.md states explicitly ("a caller is always told
+// which cause remains, never that both have cleared at once"). Only a
+// unit-level test (test_inventory_eval.cpp's "excluded_by_depth and
+// excluded_by_parse_error accumulate independently") asserted the two
+// out-param counts directly; this proves the actual 503 body, audit detail
+// AND metric reason at the route layer, when both fire in the same call.
+TEST_CASE("from-inventory-query: a poisoned AND a malformed record in the same call reports "
+          "poison_excluded, never parse_error_excluded",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"combined-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 503);
+    REQUIRE(body.contains("error"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("nesting too deeply") != std::string::npos);
+    CHECK(message.find("failing to parse") == std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    bool saw_parse_error_failure = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "failure") {
+            if (a.detail.find("poison_excluded") != std::string::npos)
+                saw_poison_failure = true;
+            if (a.detail.find("parse_error_excluded") != std::string::npos)
+                saw_parse_error_failure = true;
+        }
+    }
+    CHECK(saw_poison_failure);
+    CHECK_FALSE(saw_parse_error_failure);
+    // #4541 review minor: assert the metric counter reason too, not just
+    // status/audit - kReasonPoisonExcluded/kReasonParseErrorExcluded
+    // (dispatch_target_shape.hpp) label yuzu_server_dispatch_target_rejected_total.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"}, {"reason", "poison_excluded"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"},
+                        {"reason", "parse_error_excluded"}})
+              .value() == 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4496: POST /api/v1/inventory/evaluate -- the read-only third caller of
+// evaluate_inventory(). Unlike the two producers above, this route is a
+// synchronous READ (no durable artifact materialised downstream), so it
+// surfaces poison-exclusion as a `results_excluded_by_poison` count on the
+// response rather than refusing the request. This harness's `fleet_read_fn`
+// gates the same route as from-inventory-query above, so AsyncHarness is
+// reused rather than a new fixture.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("POST /api/v1/inventory/evaluate: a poisoned record is flagged via "
+          "results_excluded_by_poison, a healthy matching agent is still returned",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200); // no crash, no refusal on this read-only route
+    REQUIRE(body["data"].is_array());
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["agent_id"] == "agent-healthy");
+    CHECK(body["results_excluded_by_poison"] == 1);
+}
+
+// #4496: the healthy-only sibling of the test above - proves the field is
+// absent, not merely 0-but-present-as-a-false-positive, when nothing was
+// excluded (same "absent when zero" convention as `result_truncated_by_cap`
+// on this route).
+TEST_CASE("POST /api/v1/inventory/evaluate: no poisoned record present -- "
+          "results_excluded_by_poison is absent from the response",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200);
+    REQUIRE(body["data"].size() == 1);
+    CHECK_FALSE(body.contains("results_excluded_by_poison"));
+}
+
+// #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests
+// above, for the OTHER exclusion cause -- a genuine JSON parse error.
+TEST_CASE("POST /api/v1/inventory/evaluate: a malformed record is flagged via "
+          "results_excluded_by_parse_error, a healthy matching agent is still returned",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200); // no crash, no refusal on this read-only route
+    REQUIRE(body["data"].is_array());
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["agent_id"] == "agent-healthy");
+    CHECK(body["results_excluded_by_parse_error"] == 1);
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// field is absent, not merely 0-but-present-as-a-false-positive, when
+// nothing was excluded.
+TEST_CASE("POST /api/v1/inventory/evaluate: no malformed record present -- "
+          "results_excluded_by_parse_error is absent from the response",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200);
+    REQUIRE(body["data"].size() == 1);
+    CHECK_FALSE(body.contains("results_excluded_by_parse_error"));
 }
 
 TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
@@ -1218,6 +2306,82 @@ TEST_CASE("POST /api/v1/result-sets: a body nested past the depth limit is rejec
         nested_array(40) + "}}";
     h.post("/api/v1/result-sets", body, status);
     CHECK(status == 400);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    // Gate 8 sibling-sweep finding: this generic create route has the same
+    // unguarded body.value("name", "") shape as from-tar-query/
+    // from-instruction-result did before #4406's fix, but was never part of
+    // that sweep since it's a synchronous direct-create path, not one of the
+    // three async producers.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched source_kind is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":"x","source_kind":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized name is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized source_kind is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: same missing length cap as name, above, for
+    // kResultSetSourceKindMaxLen (64 bytes, MCP's own enforced value).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = "x";
+    body["source_kind"] = std::string(65, 'k');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be at most 64 bytes") !=
+          std::string::npos);
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
@@ -1325,4 +2489,132 @@ TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refus
     h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
+
+    // #4493: this attempt still cannot proceed (the original query is
+    // unrecoverably gone), but the row itself must come out of this call
+    // HEALED so it is never a live grenade for a future read again. Status
+    // stays Materialized (the row's real, empty-but-legitimate membership is
+    // untouched) - only the poisoned payload is replaced.
+    auto healed = get_ok(*h.store, seeded->id);
+    REQUIRE(healed.has_value());
+    CHECK(healed->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse(healed->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+
+    // Governance Gate 2/4 finding (#4493 re-review): the heal is a real
+    // write to an otherwise immutable-by-design row and must leave durable
+    // evidence, not just a status code -- same "refusal is durable evidence"
+    // discipline as the other audited-denial tests in this file.
+    const bool heal_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "success";
+        });
+    CHECK(heal_audited);
+}
+
+// #4540 (Important finding 2): documented in the OpenAPI description for this
+// route -- a poisoned row's FIRST re-eval heals it in place and reports the
+// depth-guard rejection; a SECOND re-eval on the now-healed row hits a
+// different, less-specific refusal ("no re-runnable source") rather than
+// repeating the same depth error. Pins today's actual fallthrough behavior so
+// a future change to the error path cannot silently drift from what the docs
+// promise with nothing in CI to catch it.
+TEST_CASE("re-eval: a second re-eval on an already-healed row gets a "
+          "different, less-specific error than the first",
+          "[pg][result_set][async][reeval][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "poisoned-twice-reevaled";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status1 = 0;
+    auto body1 = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status1);
+    CHECK(status1 == 400);
+    REQUIRE(body1.contains("error"));
+    const std::string msg1 = body1["error"]["message"].get<std::string>();
+    CHECK(msg1.find("has been discarded") != std::string::npos);
+
+    // The row is healed now (a live-but-empty {"note": ...} payload with no
+    // "sql" key), so this second call takes a completely different refusal
+    // path -- "original carries no SQL", never the depth guard again.
+    int status2 = 0;
+    auto body2 = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status2);
+    CHECK(status2 == 400);
+    REQUIRE(body2.contains("error"));
+    const std::string msg2 = body2["error"]["message"].get<std::string>();
+    CHECK(msg2.find("carries no SQL") != std::string::npos);
+
+    CHECK(msg1 != msg2);
+}
+
+// #4540 (BLOCKING finding 2 route-level coverage): the /re-eval route must
+// never claim the poisoned payload "has been discarded" when the underlying
+// heal_poisoned_payload write did not actually happen. Simulated the same
+// way as the dedicated store-level race test (test_result_set_store.cpp): a
+// BEFORE UPDATE trigger deletes the row instead of letting heal's own UPDATE
+// apply, so from the route's own depth-check read the row looks present and
+// poisoned, and by the time the store's UPDATE runs it is already gone -- the
+// same window a real concurrent delete_set/GC sweep opens.
+TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
+          "different 400 body and a result_set.heal|failure audit, never success",
+          "[pg][result_set][async][reeval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "vanishes-mid-heal";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    exec_sql(db.dsn(),
+             "CREATE OR REPLACE FUNCTION test_4540_route_vanish_mid_heal() RETURNS trigger AS $$ "
+             "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+             "END; $$ LANGUAGE plpgsql");
+    exec_sql(db.dsn(), "CREATE TRIGGER test_4540_route_vanish_mid_heal BEFORE UPDATE ON "
+                        "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                        "test_4540_route_vanish_mid_heal()");
+
+    int status = 0;
+    auto body = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    // Distinct wording from the successful-heal 400 above ("has been
+    // discarded") -- the caller must never be told a write happened that
+    // didn't.
+    REQUIRE(body.contains("error"));
+    REQUIRE(body["error"].contains("message"));
+    CHECK(body["error"]["message"].get<std::string>().find("heal attempt failed") !=
+          std::string::npos);
+
+    exec_sql(db.dsn(),
+             "DROP TRIGGER test_4540_route_vanish_mid_heal ON result_set_store.result_sets");
+    exec_sql(db.dsn(), "DROP FUNCTION test_4540_route_vanish_mid_heal()");
+
+    // The row is genuinely gone -- the trigger's own DELETE really ran.
+    CHECK_FALSE(get_ok(*h.store, seeded->id).has_value());
+
+    const bool heal_failure_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "failure";
+        });
+    CHECK(heal_failure_audited);
+    const bool heal_success_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "success";
+        });
+    CHECK_FALSE(heal_success_audited);
 }
