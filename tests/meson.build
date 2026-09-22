@@ -1335,6 +1335,7 @@ if build_server
       'unit/server/test_pg_migration_skip_predicate.cpp',
       'unit/server/test_pg_template_cleanup.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
+      'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_vuln_finding_store.cpp',

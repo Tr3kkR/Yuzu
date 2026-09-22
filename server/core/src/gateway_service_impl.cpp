@@ -19,6 +19,7 @@
 #include "typed_inventory_sources.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: remove_if_session on disconnect
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -1841,6 +1842,13 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // clear call is needed here.
         registry_.clear_stream_if_session(agent_id, session_id);
         registry_.remove_agent_if_session(agent_id, session_id);
+        // HA WS-5 (ADR-2002 §7a): same session-guarded mirror as the direct
+        // path (agent_service_impl.cpp) — keeps a gateway-fronted agent's
+        // graceful disconnect from leaving a stale presence row matched by
+        // scope evaluation until the TTL expires.
+        if (heartbeat_ingestion_)
+            if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
+                offline->remove_if_session(agent_id, session_id);
         // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing
         // directory too — session-guarded (gateway_route_store.hpp), so a
         // DIFFERENT, superseded session's DISCONNECTED can't tear down a newer

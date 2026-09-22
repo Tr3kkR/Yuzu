@@ -45,6 +45,22 @@ struct OfflineEndpoint {
     std::string arch;
 };
 
+/// One agent's identity as known to a DIFFERENT replica, for cross-replica
+/// scope-evaluation visibility (HA WS-5, ADR-2002 §7a — see
+/// `AgentRegistry::evaluate_scope`/`all_ids()`, which merge this in for ids
+/// not in that replica's own local live registry, local always winning on
+/// conflict). Deliberately excludes `session_id` and plugin capability: a
+/// merge caller has no session concept of its own (that's WS-4's fenced
+/// `GatewayRouteStore`), and plugin-capability cross-replica visibility
+/// (`ids_missing_plugin`) is out of this slice's scope — see WS-5's plan doc.
+struct PresenceIdentity {
+    std::string agent_id;
+    std::string hostname;
+    std::string os;
+    std::string agent_version;
+    std::string arch;
+};
+
 class OfflineEndpointStore {
 public:
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
@@ -73,7 +89,8 @@ public:
     /// earlier heartbeat for the same agent.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
-                std::string_view agent_version = {}, std::string_view arch = {});
+                std::string_view agent_version = {}, std::string_view arch = {},
+                std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
     /// first. The viz handler renders those NOT currently online as stale
@@ -81,6 +98,29 @@ public:
     /// eventually stops cluttering the view. Empty on error (fail-soft: the
     /// page still renders the live fleet).
     [[nodiscard]] std::vector<OfflineEndpoint> query_stale_within(std::chrono::seconds window);
+
+    /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
+    /// DATABASE clock (`now()` in-SQL, never the replica's own
+    /// `system_clock` — the #3715 precedent), for cross-replica
+    /// scope-evaluation visibility. Fail-soft: empty on any read error —
+    /// presence only WIDENS visibility (it grants no dispatch authority; see
+    /// `AgentRegistry::evaluate_scope`), so a degraded read just means "see
+    /// local agents only" for that one call, never a hard failure.
+    [[nodiscard]] std::vector<PresenceIdentity> query_live_ids(std::chrono::seconds ttl);
+
+    /// Session-guarded delete (HA WS-5): removes the row ONLY when its
+    /// stored `session_id` matches — mirrors
+    /// `AgentRegistry::remove_agent_if_session`, so a stale/superseded
+    /// session's disconnect can never delete a NEWER session's presence
+    /// row. Called on graceful disconnect so a departed agent's row does
+    /// not linger for the full liveness window — needed to keep the
+    /// single-replica monolith's `evaluate_scope` outcome unchanged from
+    /// pre-WS-5 behavior (an agent gone from the local registry must also
+    /// be gone from presence, not just eventually-stale). Best-effort like
+    /// `upsert()`: a failure here just means the row lingers until TTL
+    /// expiry, which is always safe (over-inclusion never grants dispatch
+    /// authority).
+    bool remove_if_session(std::string_view agent_id, std::string_view session_id);
 
 private:
     pg::PgPool& pool_;

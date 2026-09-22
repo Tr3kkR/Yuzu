@@ -16,6 +16,7 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -1412,13 +1413,37 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 }
 
 std::vector<std::string> AgentRegistry::all_ids() const {
+    // HA WS-5: the presence query is a Postgres round trip and must run OFF
+    // mu_ — the same rule the evaluate_scope preloads follow. A null
+    // presence_store_ (unconfigured) makes this call cost nothing beyond the
+    // pointer check, byte-identical to pre-WS-5 behavior.
+    std::vector<PresenceIdentity> presence;
+    if (presence_store_)
+        presence = presence_store_->query_live_ids(presence_ttl_);
+
     std::lock_guard lock(mu_);
     std::vector<std::string> ids;
-    ids.reserve(agents_.size());
+    ids.reserve(agents_.size() + presence.size());
     for (const auto& id : agents_ | std::views::keys) {
         ids.push_back(id);
     }
+    // Local always wins: a presence row for an id this replica already knows
+    // locally adds nothing (and must not duplicate it).
+    for (const auto& p : presence) {
+        if (!agents_.contains(p.agent_id))
+            ids.push_back(p.agent_id);
+    }
     return ids;
+}
+
+std::size_t AgentRegistry::local_agent_count() const {
+    std::lock_guard lock(mu_);
+    return agents_.size();
+}
+
+void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
+    presence_store_ = store;
+    presence_ttl_ = ttl;
 }
 
 std::string AgentRegistry::find_agent_by_stream(
@@ -1637,6 +1662,14 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         }
     }
 
+    // HA WS-5 (ADR-2002 §7a): preload cross-replica presence OFF mu_, same
+    // rule as the from_result_set:/props./tag: preloads above — merged
+    // below (after the local loop) for ids this replica has no local
+    // session for; local always wins.
+    std::vector<PresenceIdentity> presence_rows;
+    if (presence_store_)
+        presence_rows = presence_store_->query_live_ids(presence_ttl_);
+
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
@@ -1701,6 +1734,60 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         };
         if (yuzu::scope::evaluate(expr, resolver)) {
             matched.push_back(id);
+        }
+    }
+
+    // HA WS-5: extend the iteration domain with presence for ids NOT in the
+    // local registry (an id in both wins via the loop above and is never
+    // considered twice). tag:/props. already resolve correctly for these
+    // ids — tag_values/props_values are id-keyed bulk preloads from
+    // Postgres, not scoped to local agents_ — so only
+    // ostype/hostname/arch/agent_version need a presence-sourced stand-in
+    // (no AgentSession exists for a remote-only id). scopable_tags has no
+    // presence-backed fallback (that field is agent-self-reported, kept only
+    // in-memory on the replica the agent is actually connected to; the
+    // store-first tag_values preload above is the one source presence-only
+    // ids can resolve tag: through).
+    for (const auto& p : presence_rows) {
+        if (agents_.contains(p.agent_id))
+            continue;
+        auto resolver = [&](std::string_view attr) -> std::string {
+            auto key = std::string(attr);
+            if (key.starts_with("from_result_set:")) {
+                auto it = rs_members.find(key.substr(16));
+                return (it != rs_members.end() && it->second.contains(p.agent_id)) ? "true" : "";
+            }
+            if (key == "ostype")
+                return p.os;
+            if (key == "hostname")
+                return p.hostname;
+            if (key == "arch")
+                return p.arch;
+            if (key == "agent_version")
+                return p.agent_version;
+            if (key.starts_with("tag:")) {
+                auto tag_key = key.substr(4);
+                if (auto agent_it = tag_values.find(p.agent_id); agent_it != tag_values.end()) {
+                    if (auto tag_it = agent_it->second.find(tag_key);
+                        tag_it != agent_it->second.end())
+                        return tag_it->second;
+                }
+                return {};
+            }
+            if (key.starts_with("props.")) {
+                auto prop_key = key.substr(6);
+                auto agent_it = props_values.find(p.agent_id);
+                if (agent_it != props_values.end()) {
+                    auto prop_it = agent_it->second.find(prop_key);
+                    if (prop_it != agent_it->second.end())
+                        return prop_it->second;
+                }
+                return {};
+            }
+            return {};
+        };
+        if (yuzu::scope::evaluate(expr, resolver)) {
+            matched.push_back(p.agent_id);
         }
     }
     return matched;

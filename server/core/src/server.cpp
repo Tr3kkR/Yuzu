@@ -5195,6 +5195,17 @@ public:
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
 
+            // HA WS-5 (ADR-2002 §7a): wire cross-replica presence into scope
+            // evaluation / all_ids(). Same window `reap_stale_sessions` uses
+            // for local liveness (cfg_.session_timeout), so a single
+            // replica's presence-derived liveness window matches its own
+            // local one — see AgentRegistry::configure_presence's doc
+            // comment. A null offline_endpoint_store_ (construction failed —
+            // ADR-0007 fails the server closed before reaching here in
+            // production) leaves presence unconfigured: local-only behavior,
+            // unchanged from pre-WS-5.
+            registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
+
             // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
             // applied policy generation on every heartbeat; if it trails the
             // current generation it missed a push (was offline when the push fired,
@@ -9522,6 +9533,16 @@ public:
         // never built these tears down cleanly too.
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        // HA WS-5: same discipline as the heartbeat_ingestion_ line above —
+        // registry_ outlives offline_endpoint_store_ (it is torn down much
+        // later, if ever, as part of this object's own member destruction),
+        // and unlike the gRPC-handler-only heartbeat path, evaluate_scope()/
+        // all_ids() are also reachable from the policy-evaluator background
+        // thread and REST/dashboard/MCP handlers whose own drains are not
+        // all guaranteed to have completed by this exact point — null the
+        // borrowed pointer before the store it points to is destroyed, never
+        // rely on drain ordering alone for a cross-cutting read path.
+        registry_.configure_presence(nullptr, cfg_.session_timeout);
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
@@ -11645,7 +11666,8 @@ private:
             },
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
-            }};
+            },
+            [this] { return registry_.local_agent_count(); }};
     }
 
     /// #881: the ONE place a `ContainmentGate` is built. Called once per
@@ -19599,7 +19621,15 @@ private:
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
             [&] { return registry_.send_to_all(*classified); },
-            [&] { return registry_.all_ids(); }};
+            [&] { return registry_.all_ids(); },
+            /*prepare_route_fallback=*/nullptr,
+            // HA WS-5: wired (unlike prepare_route_fallback above, which this
+            // Broadcast-only forwarder deliberately omits) so the unfiltered
+            // fast path stays available when presence adds nothing — see
+            // ConfinedDispatchSink::local_agent_count's own doc comment for
+            // why an unwired one would otherwise force the slow path on
+            // every call once presence is configured fleet-wide.
+            [&] { return registry_.local_agent_count(); }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves

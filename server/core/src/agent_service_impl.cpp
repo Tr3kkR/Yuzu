@@ -30,6 +30,7 @@
 #include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: remove_if_session on disconnect
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
@@ -1472,6 +1473,14 @@ grpc::Status AgentServiceImpl::Subscribe(
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
     registry_.remove_agent_if_session(agent_id, session_id);
+    // HA WS-5 (ADR-2002 §7a): mirror the departure into the durable presence
+    // row too, session-guarded — so a graceful disconnect on a single
+    // replica leaves scope-evaluation's outcome unchanged from pre-WS-5
+    // behavior (the row would otherwise linger, matched, until the presence
+    // TTL expires; see evaluate_scope's presence merge in agent_registry.cpp).
+    if (heartbeat_ingestion_)
+        if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
+            offline->remove_if_session(agent_id, session_id);
     // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
     // Without this, deregistered agents render as ghost cubes
     // indefinitely from the cached last-known-good snapshot.

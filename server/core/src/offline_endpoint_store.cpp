@@ -49,6 +49,17 @@ const std::vector<pg::PgMigration>& migrations() {
         {2,
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS arch TEXT NOT NULL DEFAULT '';"},
+        // HA WS-5 (ADR-2002 §7a): `session_id` guards a targeted delete on
+        // graceful disconnect (remove_if_session) so a stale session's
+        // teardown can't clobber a newer re-registration's row; `last_seen_at`
+        // is a PG-authored (`now()` in-SQL) liveness clock, separate from the
+        // pre-existing `last_heartbeat_ms` replica-clock column (which stays
+        // exactly as-is for the viz path — see query_stale_within).
+        {3,
+         "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL "
+         "DEFAULT now();"
+         "CREATE INDEX IF NOT EXISTS endpoints_last_seen_idx ON endpoints (last_seen_at);"},
     };
     return kMigrations;
 }
@@ -80,7 +91,7 @@ OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
 bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view hostname,
                                   std::string_view os, std::int64_t last_heartbeat_ms,
                                   std::int64_t agent_ts, std::string_view agent_version,
-                                  std::string_view arch) {
+                                  std::string_view arch, std::string_view session_id) {
     if (!open_ || agent_id.empty())
         return false;
     // Bounded acquire (gov UP-1): on a saturated pool, give up fast rather than
@@ -97,28 +108,108 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     // agent_version/arch: a blank incoming value preserves the existing column
     // (CASE ... THEN endpoints.x) — see the header doc comment — while
     // hostname/os/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
-    // write (pre-v2 behaviour, unchanged).
+    // write (pre-v2 behaviour, unchanged). session_id (HA WS-5) is likewise
+    // unconditional EXCLUDED — an empty incoming value (a heartbeat that raced
+    // session lookup, same race the agent_version/arch blank-preserve comment
+    // above describes) blanking a previously-known session_id is harmless:
+    // `remove_if_session` only ever matches a NON-empty caller-supplied value
+    // against it, so a blanked column just means the NEXT disconnect's
+    // session-guarded delete no-ops and the row waits out the TTL instead —
+    // always safe (over-inclusion grants no dispatch authority). last_seen_at
+    // is PG-authored (`now()` in-SQL, never the replica's `system_clock` —
+    // the #3715 precedent) on every call, whether the row is new or existing.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO endpoint_state.endpoints "
-        "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch) "
-        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7) "
+        "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, session_id, "
+        "last_seen_at) "
+        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  hostname = EXCLUDED.hostname, os = EXCLUDED.os, "
         "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
         "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "
         "                       ELSE EXCLUDED.agent_version END, "
-        "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END "
+        "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END, "
+        "  session_id = EXCLUDED.session_id, last_seen_at = EXCLUDED.last_seen_at "
         "RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(hostname), std::string(os),
                                  std::to_string(last_heartbeat_ms), std::to_string(agent_ts),
-                                 std::string(agent_version), std::string(arch)});
+                                 std::string(agent_version), std::string(arch),
+                                 std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: upsert failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
         return false;
     }
     return true;
+}
+
+std::vector<PresenceIdentity> OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
+    std::vector<PresenceIdentity> out;
+    if (!open_)
+        return out;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("OfflineEndpointStore: query_live_ids skipped, no connection in time ({})",
+                      pool_.last_error());
+        return out;
+    }
+    // DATABASE-clock filter (`now()` in-SQL) — never the replica's own
+    // `system_clock` (#3715 precedent) — so every replica agrees on which
+    // rows are live regardless of local clock skew. LIMIT bounds the
+    // materialised set the same way query_stale_within does.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, hostname, os, agent_version, arch FROM endpoint_state.endpoints "
+        "WHERE last_seen_at >= now() - ($1::bigint * interval '1 second') "
+        "ORDER BY last_seen_at DESC LIMIT $2::bigint",
+        std::vector<std::string>{std::to_string(ttl.count()), std::to_string(kQueryRowCap)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: query_live_ids failed: {}", PQerrorMessage(lease.get()));
+        return out;
+    }
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        PresenceIdentity p;
+        p.agent_id = PQgetvalue(res.get(), i, 0);
+        p.hostname = PQgetvalue(res.get(), i, 1);
+        p.os = PQgetvalue(res.get(), i, 2);
+        p.agent_version = PQgetvalue(res.get(), i, 3);
+        p.arch = PQgetvalue(res.get(), i, 4);
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
+bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
+                                             std::string_view session_id) {
+    if (!open_ || agent_id.empty() || session_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kUpsertAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("OfflineEndpointStore: remove_if_session skipped, no connection in time ({})",
+                      pool_.last_error());
+        return false;
+    }
+    // RETURNING, not a bare DELETE: a DELETE with a WHERE clause that matches
+    // ZERO rows (the session mismatch this method exists to guard against)
+    // still reports PGRES_COMMAND_OK — "the command succeeded" is not "a row
+    // was deleted". RETURNING turns this into a TUPLES_OK read whose row
+    // count is the actual outcome, the same idiom upsert() already uses and
+    // the #1033-banning rule this codebase holds generally (never infer a
+    // mutation's effect from the command status alone).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM endpoint_state.endpoints WHERE agent_id = $1 AND session_id = $2 "
+        "RETURNING agent_id",
+        std::vector<std::string>{std::string(agent_id), std::string(session_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: remove_if_session failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return PQntuples(res.get()) > 0;
 }
 
 std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {

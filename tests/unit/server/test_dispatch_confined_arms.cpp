@@ -59,6 +59,12 @@ struct RecordingSink {
     std::vector<std::string> reached;
     bool unfiltered_broadcast_used = false;
     std::vector<std::string> fleet{"dev-A", "dev-B", "dev-C"};
+    // HA WS-5: override point for a test that simulates presence widening
+    // known_agent_ids() beyond the local registry — nullopt (the default)
+    // means "no presence", i.e. local_agent_count() == fleet.size(), exactly
+    // as it did before this field existed.
+    std::optional<std::size_t> local_count_override;
+    std::optional<std::vector<std::string>> route_fallback_candidates;
 
     ConfinedDispatchSink make() {
         return ConfinedDispatchSink{
@@ -70,7 +76,12 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            [this](const std::vector<std::string>& candidates) {
+                route_fallback_candidates = candidates;
+                return false; // never degraded, in this mock
+            },
+            [this] { return local_count_override.value_or(fleet.size()); }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
@@ -242,6 +253,41 @@ TEST_CASE("Broadcast arm: present-EMPTY reaches nobody and never falls back to s
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
+}
+
+// HA WS-5 (ADR-2002 §7a): once known_agent_ids() can include presence-only
+// (remote) ids, an unfiltered Broadcast is no longer safe to answer with the
+// local-only fast path — it must fall through to the per-id walk so a
+// remote id gets a directory-fallback consult via prepare_route_fallback
+// before send_to. This is the exact bug class WS-4 hit twice (a
+// wired-but-behaviorally-dead reader) — see ConfinedDispatchSink::
+// local_agent_count's doc comment.
+TEST_CASE("Broadcast arm: presence widening known_agent_ids skips the unfiltered fast path "
+          "and consults the route fallback",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.fleet = {"dev-A", "dev-B", "dev-C", "remote-only"}; // presence added "remote-only"
+    sink.local_count_override = 3;                          // local registry still has 3
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK_FALSE(sink.unfiltered_broadcast_used); // fast path correctly skipped
+    REQUIRE(sink.route_fallback_candidates.has_value());
+    CHECK(sink.reached_exactly(*sink.route_fallback_candidates));
+    CHECK(sent == 4);
+    CHECK(sink.reached_exactly({"dev-A", "dev-B", "dev-C", "remote-only"}));
+}
+
+TEST_CASE("Broadcast arm: presence adding nothing beyond local keeps the unfiltered fast path",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.local_count_override = sink.fleet.size(); // presence configured, adds nothing this call
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK(sink.unfiltered_broadcast_used);
+    CHECK_FALSE(sink.route_fallback_candidates.has_value()); // fast path never calls it
+    CHECK(sent == 3);
 }
 
 // --------------------------------------------------------------- None arm ---

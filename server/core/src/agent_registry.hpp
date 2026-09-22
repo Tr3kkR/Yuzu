@@ -37,6 +37,7 @@ class TagStore;
 class CustomPropertiesStore;
 class ResultSetStore;
 class DeviceTokenStore;
+class OfflineEndpointStore;
 /// PLAN (p8/PR1.9c): forward-declared so `ClassifiedCommand` below can name
 /// it as the only PRODUCTION friend able to construct one — the full
 /// definition lives entirely in server.cpp (`ServerImpl` has no separate
@@ -923,8 +924,28 @@ public:
     // Render command palette instruction results as HTML.
     std::string palette_html(std::string_view query) const;
 
-    // Get list of all agent IDs.
+    // Get list of all agent IDs. HA WS-5 (ADR-2002 §7a): merges in any
+    // cross-replica presence row (see configure_presence below) for an id
+    // this replica has no local session for — local ids always take
+    // precedence, no id is ever duplicated. Unconfigured (no presence store
+    // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
+
+    // Local-only agent count, under the SAME lock all_ids() uses — never
+    // includes presence. HA WS-5: lets a caller (dispatch_confined_arms's
+    // Broadcast fast path) tell whether all_ids()/known_agent_ids() actually
+    // added anything beyond what this replica knows locally.
+    [[nodiscard]] std::size_t local_agent_count() const;
+
+    // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
+    // that all_ids()/evaluate_scope() merge in for ids absent from the local
+    // live registry. `ttl` bounds how stale a presence row may be and still
+    // count as live — pass the same window `reap_stale_sessions` uses
+    // (`cfg_.session_timeout`), so a single replica's presence-derived
+    // liveness window matches its own local one. Called once during server
+    // wiring; unset (default) = local-only behavior, unchanged from
+    // pre-WS-5. Non-owning — the caller (ServerImpl) outlives this registry.
+    void configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl);
 
     // Look up the agent_id that was registered for a given Subscribe call.
     std::string find_agent_by_stream(
@@ -970,8 +991,12 @@ public:
     // one (e.g. an operator-authored rule scope) must treat nullopt as
     // "unresolvable here — match nothing" (governance H1, 2026-07-29).
     // Aliases must be pre-resolved
-    // to canonical ids by the caller. Stale members (offline / decommissioned
-    // agents not in the live registry) drop silently.
+    // to canonical ids by the caller. A genuinely offline/decommissioned
+    // agent (absent from BOTH the local live registry and — HA WS-5,
+    // ADR-2002 §7a — cross-replica presence, when configured via
+    // configure_presence) drops silently; an agent connected to a DIFFERENT
+    // replica no longer drops merely for that reason — see
+    // configure_presence's doc comment.
     //
     // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract,
     // widened per governance H1 2026-07-29, and again per ADR-0045) in FIVE
@@ -1013,6 +1038,15 @@ private:
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
+
+    /// HA WS-5 (ADR-2002 §7a). Non-owning; null = presence unconfigured
+    /// (local-only behavior, unchanged from pre-WS-5). Set once via
+    /// configure_presence during server wiring, read (without mu_ held — a
+    /// Postgres round trip must never run under the same lock
+    /// register_agent/send_to/evaluate_scope contend on) by all_ids() and
+    /// evaluate_scope().
+    OfflineEndpointStore* presence_store_{nullptr};
+    std::chrono::seconds presence_ttl_{90};
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
 
