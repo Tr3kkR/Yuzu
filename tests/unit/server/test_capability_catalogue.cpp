@@ -32,6 +32,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "command_capability.hpp"
 
@@ -141,6 +142,7 @@ struct LabeledSpan {
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
+        {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
@@ -150,7 +152,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, sixteen sources exactly as a live composition site would use.
+    // literally, seventeen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -166,6 +168,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::core_dispatch_capabilities(),
     };
@@ -266,6 +269,26 @@ TEST_CASE("capability catalogue: autoruns.list and autoruns.catalog pin their ex
         CHECK(it->mutability == Mutability::None);
         CHECK(it->securable == "Security");
         CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
+/// Exact-row pin for `app_control` (Wave 8): both read-only posture actions, so a silent
+/// reclassification (e.g. ReadOnly -> Mutating) fails here rather than passing the generic gates.
+TEST_CASE("capability catalogue: app_control.wdac_policy and app_control.applocker_policy pin "
+          "their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_app_control();
+    for (const auto action : {"wdac_policy", "applocker_policy"}) {
+        const auto it = std::find_if(rows.begin(), rows.end(),
+                                     [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Security");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(it->system_reserved);
         CHECK(it->execute_gate == ExecuteGate::None);
     }
 }

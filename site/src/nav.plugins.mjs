@@ -4,6 +4,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/agent_actions/README', slug: 'plugins/agent_actions', title: 'agent_actions' },
   { file: 'agents/plugins/agent_logging/README', slug: 'plugins/agent_logging', title: 'agent_logging' },
   { file: 'agents/plugins/antivirus/README', slug: 'plugins/antivirus', title: 'antivirus' },
+  { file: 'agents/plugins/app_control/README', slug: 'plugins/app_control', title: 'app_control' },
   { file: 'agents/plugins/app_usage/README', slug: 'plugins/app_usage', title: 'app_usage' },
   { file: 'agents/plugins/asset_tags/README', slug: 'plugins/asset_tags', title: 'asset_tags' },
   { file: 'agents/plugins/autoruns/README', slug: 'plugins/autoruns', title: 'autoruns' },

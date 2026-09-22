@@ -64,10 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/175 done (74%) (21 partial)
-Future       [=========-----------------------]  10/35 done  (29%) (3 partial)
+Advanced     [========================--------]  129/175 done  (74%) (21 partial)
+Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done (72%) (25 partial)
+Overall      [=======================---------]  194/269 done  (72%) (26 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -80,7 +80,7 @@ Overall      [=======================---------]  194/269 done (72%) (25 partial)
 | 6. User and Session Management | 5 | 5 | 0 | 0 |
 | 7. Software and Application Management | 6 | 4 | 1 | 1 |
 | 8. Patch and Update Management | 9 | 3 | 4 | 2 |
-| 9. Security and Compliance | 10 | 8 | 1 | 1 |
+| 9. Security and Compliance | 10 | 8 | 2 | 0 |
 | 10. File System Operations | 15 | 13 | 0 | 2 |
 | 11. Script and Command Execution | 4 | 4 | 0 | 0 |
 | 12. Registry and System Configuration | 7 | 5 | 0 | 2 |
@@ -111,6 +111,7 @@ Overall      [=======================---------]  194/269 done (72%) (25 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
+| **TOTAL** | **265** | **194** | **26** | **45** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
 | **TOTAL** | **269** | **194** | **25** | **50** |
 
@@ -581,9 +582,9 @@ collisions possible; vendor precision pending ADR-0018). See
 
 `QuarantineStore` (PostgreSQL backend, schema `quarantine_store`, ADR-0047). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
 
-### 9.10 Application Whitelisting :x: `T3`
+### 9.10 Application Whitelisting :large_orange_diamond: `T3`
 
-Not implemented. Modify allow/block lists on endpoint security products.
+Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` Issue 12.11). `app_control` plugin with `wdac_policy` and `applocker_policy` actions reports the configured Windows application-control posture: WDAC via the registry (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` values plus the active `.cip` policy files and the legacy `SiPolicy.p7b`, by presence) and AppLocker via a bounded CIM query of `MSFT_ApplockerPolicy` (`agents/shared/wmi_bounded.hpp`) with a `SrpV2` registry fallback; a mode is what the policy is configured to do, not proof that rules apply (the Application Identity service is not read). Windows-only: Linux and macOS declare `unsupported`. **Not implemented:** modifying allow/block lists (`add_rule` / `remove_rule`), `get_blocked_events`, and a Linux fapolicyd leg — #282 stays open for them. This reads an OS-native control's state; it is not EDR-class telemetry (`docs/roadmap.md` Phase 18 "Out of scope").
 
 ---
 
@@ -1639,6 +1640,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | autoruns | Y | Y | Y | Security |
 | app_usage | Y | Y | Y | Security |
 | execution_artifacts | Y | - | - | Security |
+| app_control | Y | - | - | Security |
 | firmware_posture | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
@@ -1661,9 +1663,8 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | example | Y | Y | Y | Test/Debug |
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
-| app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**56 plugins** (+ 2 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55; Wave 8 PR8.4 adds `firmware_posture`, 58 directories and 56). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**57 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 57 directories, minus `example` + `chargen` = 55; Wave 8 PR8.4 adds `firmware_posture` and PR8.6 adds `app_control`, 59 directories and 57). This recount also catches up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

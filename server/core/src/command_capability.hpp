@@ -153,7 +153,14 @@ public:
     /// programmer error — fail loud via an exception, never silently drop a
     /// fragment (a dropped fragment would make every one of its rows
     /// `Unclassified`, indistinguishable from an honest miss).
-    static constexpr std::size_t kMaxSources = 16;
+    /// Raised 16 -> 24 (#4719 merge, two sibling Wave 8 plugins --
+    /// firmware_posture and app_control -- each shipping its own fragment
+    /// file landed the live source count at 17, past the old ceiling): the
+    /// prior value was already at capacity with zero headroom, contrary to
+    /// its own "generous, not a tight fit" contract. 24 gives room for
+    /// several more individually-fragmented plugins before this needs
+    /// raising again.
+    static constexpr std::size_t kMaxSources = 24;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {
