@@ -192,6 +192,68 @@ TEST_CASE("asset_tags store: a planted file at the old fixed temp path is left u
     CHECK(extra.size() == 2);
 }
 
+TEST_CASE("asset_tags store: a planted file at the ACTUAL temp path fails the exclusive create",
+          "[agent][asset_tags_store]") {
+    // The previous "old fixed temp path" case above only ever plants at the
+    // retired `<dest>.tmp` name, which production code never opens (it opens
+    // `<dest>.tmp.<16 hex>`) -- so it cannot falsify a regression that keeps
+    // the random naming but drops O_EXCL|O_NOFOLLOW (adversarial-review,
+    // twice-confirmed coverage gap). `forced_temp_suffix` (a test-only seam;
+    // see its doc comment) pins the exact path the write will try to create,
+    // so this planted file sits where the real O_CREAT|O_EXCL open actually
+    // lands.
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    std::error_code ec;
+    fs::create_directories(dir.path, ec); // TempDir only reserves the name
+    REQUIRE_FALSE(ec);
+
+    const auto dest = dir.path / "asset_tags.json";
+    const auto canary = dir.path / "canary.txt";
+    const auto forced_tmp = fs::path{dest.string() + ".tmp.forced"};
+    const std::string sentinel = "SENTINEL-DO-NOT-TOUCH";
+
+    {
+        std::ofstream f(canary, std::ios::binary);
+        f << sentinel;
+    }
+
+#ifndef _WIN32
+    fs::create_symlink(canary, forced_tmp, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(fs::is_symlink(forced_tmp));
+#else
+    {
+        std::ofstream f(forced_tmp, std::ios::binary);
+        f << sentinel;
+    }
+#endif
+
+    auto r = write_state_file_atomic(dest, "PAYLOAD", "forced");
+    REQUIRE_FALSE(r.has_value());
+    CHECK_FALSE(r.error().message.empty());
+
+    // The exclusive create failed, so TempFileGuard was never armed: nothing
+    // was removed, and the planted file is exactly as it was planted.
+#ifndef _WIN32
+    CHECK(fs::is_symlink(forced_tmp));
+    std::ifstream canary_after(canary, std::ios::binary);
+    std::string canary_content{std::istreambuf_iterator<char>(canary_after),
+                               std::istreambuf_iterator<char>()};
+    CHECK(canary_content == sentinel); // untouched
+#else
+    std::ifstream planted_after(forced_tmp, std::ios::binary);
+    std::string planted_content{std::istreambuf_iterator<char>(planted_after),
+                                std::istreambuf_iterator<char>()};
+    CHECK(planted_content == sentinel); // untouched
+#endif
+
+    CHECK_FALSE(fs::exists(dest)); // the rename never ran
+    // dir holds exactly: canary.txt and the planted forced-name temp --
+    // nothing else appeared or disappeared.
+    auto extra = unexpected_entries(dir.path, dest);
+    CHECK(extra.size() == 2);
+}
+
 TEST_CASE("asset_tags store: restart recovery", "[agent][asset_tags_store]") {
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
     const auto dest = dir.path / "asset_tags.json";

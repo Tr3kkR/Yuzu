@@ -18,19 +18,33 @@
  * O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600 directly (no ofstream, no umask
  * window — the file is 0600 from the instant it exists); Windows opens it
  * with `std::ios::noreplace` (C++23 P2467R1; CREATE_NEW semantics). Either
- * way, a file already at the temp path — planted or left over — makes the
- * create FAIL; the write never follows a symlink and never overwrites
- * something it did not create. The guard that removes the temp on a later
- * failure is armed only AFTER that exclusive create succeeds, so a failed
- * create (because something is already there) never deletes a path this
- * process did not create. Once written, the temp is renamed over `dest`.
+ * way, a file already at the exclusive-create temp path — planted or left
+ * over — makes the create FAIL, rather than being followed or overwritten.
+ * The guard that removes the temp on a later failure is armed only AFTER
+ * that exclusive create succeeds, so a failed create (because something is
+ * already there) never deletes a path this process did not create. Once
+ * written, the temp is renamed over `dest`.
  *
  * Permissions: on POSIX the exclusive create already leaves the temp at
- * 0600; it is re-tightened once more before the rename (checked; a failure
- * is reported as a WriteWarning but does not block persistence) purely so
- * the on-disk mode stays deterministic under an unusual umask, mirroring
- * agent_csr.cpp's write_private_key. The Windows DACL is not tightened —
- * the same documented follow-up as agent_csr.cpp's write_private_key.
+ * 0600; it is re-tightened once more, via `fchmod` on the still-open fd
+ * before it closes (adversarial-review round 2, F1 — the mode step is now
+ * fd-bound, not addressed by path, so it cannot race a writer that has
+ * already unlinked and replanted the temp's path), purely so the on-disk
+ * mode stays deterministic under an unusual umask, mirroring
+ * agent_csr.cpp's write_private_key. A failure here is reported as a
+ * WriteWarning but does not block persistence. The Windows DACL is not
+ * tightened — the same documented follow-up as agent_csr.cpp's
+ * write_private_key.
+ *
+ * Residual: after the fd closes, the rename below still addresses the temp
+ * by path (`fs::rename(tmp, dest)`), so a writer already inside the agent's
+ * private data directory can race it — unlink the temp and replant
+ * something else at that exact path before the rename resolves it. Bounded:
+ * the payload this process wrote is never corrupted, no partially-written
+ * file ever lands at `dest`, and the next successful sync's write self-heals
+ * it. Tracked, together with the identical shape in agent_csr.cpp's write
+ * helpers and a related unverified Windows dangling-symlink CREATE_NEW
+ * question, in #4723 — not fixed here.
  */
 
 #include <atomic>
@@ -50,6 +64,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -151,9 +166,19 @@ read_state_file(const std::filesystem::path& p) {
 /// The temp is created EXCLUSIVELY at a random, unpredictable sibling name
 /// (detail::temp_suffix()) — a pre-existing file at that path, planted or
 /// left over, fails the create instead of being followed or overwritten —
-/// and never outlives a failure.
+/// and never outlives a failure. The post-create rename is by path; see the
+/// class comment above for that residual window.
+///
+/// `forced_temp_suffix` is a TEST SEAM ONLY: empty (the default, and the only
+/// value any production caller passes) means the real unpredictable
+/// `detail::temp_suffix()`; a non-empty value is used verbatim so a test can
+/// plant something at the exact path the write will open. The suffix's
+/// unpredictability is not itself the security boundary — the boundary is
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` (or Windows `std::ios::noreplace`) refusing to
+/// follow or overwrite whatever is already there, forced path or not.
 [[nodiscard]] inline std::expected<std::optional<WriteWarning>, IoError>
-write_state_file_atomic(const std::filesystem::path& dest, std::string_view bytes) {
+write_state_file_atomic(const std::filesystem::path& dest, std::string_view bytes,
+                         std::string_view forced_temp_suffix = {}) {
     namespace fs = std::filesystem;
 
     std::error_code ec;
@@ -169,11 +194,17 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
 
     fs::path tmp = dest;
     tmp += ".tmp.";
-    tmp += detail::temp_suffix();
+    tmp += forced_temp_suffix.empty() ? detail::temp_suffix() : std::string(forced_temp_suffix);
 
     // Armed only once the exclusive create below has actually created this
     // file — see the class comment.
     std::optional<detail::TempFileGuard> temp_guard;
+
+    // Engaged only when the POSIX chmod-to-0600 re-assertion below failed;
+    // the file is still replaced. Declared here (rather than after the
+    // platform block) so the POSIX block below can set it on the open fd,
+    // before the fd closes and the temp can only be addressed by path.
+    std::optional<WriteWarning> warning;
 
 #ifndef _WIN32
     {
@@ -202,6 +233,15 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
             p += n;
             remaining -= static_cast<std::size_t>(n);
         }
+        // Re-assert 0600 on the still-open fd, before close: the exclusive
+        // create above already left the temp at 0600, but re-tightening here
+        // (rather than by path after close) keeps the mode step fd-bound, so
+        // it cannot race a writer that has already unlinked and replanted the
+        // temp's path (adversarial-review round 2, F1). A failure here is a
+        // warning, not a write failure — the file is still replaced.
+        if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0)
+            warning = WriteWarning{"could not restrict " + tmp.string() + " to 0600: " +
+                                    std::strerror(errno)};
         if (::close(fd) != 0)
             ok = false;
         if (!ok)
@@ -220,17 +260,6 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
         if (!out)
             return std::unexpected(IoError{"write to " + tmp.string() + " failed"});
     }
-#endif
-
-    std::optional<WriteWarning> warning;
-#ifndef _WIN32
-    // The exclusive create above already left the temp at 0600; re-assert it
-    // once more so the on-disk mode stays deterministic under an unusual
-    // umask (agent_csr.cpp's write_private_key does the same).
-    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace,
-                    ec);
-    if (ec)
-        warning = WriteWarning{"could not restrict " + tmp.string() + " to 0600: " + ec.message()};
 #endif
 
     std::error_code rename_ec;
