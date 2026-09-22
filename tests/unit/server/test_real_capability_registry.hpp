@@ -1,7 +1,7 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same fifteen capability-declaration spans the production site
+// composed from the same sixteen capability-declaration spans the production site
 // composes, for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
@@ -35,6 +35,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 
 #include <string_view>
@@ -61,6 +62,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
     return reg;

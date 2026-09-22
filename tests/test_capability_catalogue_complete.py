@@ -2,13 +2,13 @@
 """test_capability_catalogue_complete.py — PR1.9's cross-fragment drift gate.
 
 The capability catalogue (`server/core/src/command_capability.hpp`'s
-`CommandCapability` rows) is authored as FIFTEEN independent, hand-written
-sources: the fourteen per-plugin-group fragment headers listed in
+`CommandCapability` rows) is authored as SIXTEEN independent, hand-written
+sources: the fifteen per-plugin-group fragment headers listed in
 FRAGMENT_FILES below (each owned by a different package) plus the
 core-owned `capability_decls/core_dispatch_capabilities.hpp` (the four
 system-initiated dispatches a plugin never receives from a caller —
 `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`, `__sync__.now`). Nobody
-mechanically checks that these fifteen sources, taken together, actually
+mechanically checks that these sixteen sources, taken together, actually
 match what the plugins declare via their `actions()` override. This script
 is that check.
 
@@ -16,12 +16,12 @@ It parses every `actions()` override under `agents/plugins/*/src/*.cpp`
 (each plugin's `name()` override gives the plugin half of the pair; the
 literal strings inside the `static const char* acts[] = {...}` array give
 the action half) and cross-references the result against every
-`.plugin = "..."` / `.action = "..."` pair declared across the fifteen
+`.plugin = "..."` / `.action = "..."` pair declared across the sixteen
 capability-catalogue headers. It fails, naming the exact offending
 `plugin.action`, when:
 
   1. A plugin declares an action that has no catalogue row anywhere across
-     the fifteen sources (a MISSING row) — a plugin ships a capability the
+     the sixteen sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
   2. One of the fourteen per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
@@ -83,6 +83,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

@@ -32,6 +32,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -140,6 +141,7 @@ struct LabeledSpan {
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
+        {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -148,7 +150,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, fifteen sources exactly as a live composition site would use.
+    // literally, sixteen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -164,6 +166,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -328,4 +331,28 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
     auto other = registry.classify("content_dist", "list_staged");
     REQUIRE(other.has_value());
     CHECK(other->dispatch_class == DispatchClass::ReadOnly);
+}
+
+/// Exact-row pin for `browser_inventory` (Wave 10 Forensics-class plugin,
+/// P2a-3), the same way `kReversibleDestructive` protects
+/// `power_health.set_power_plan`'s fields and the autoruns pin above
+/// protects autoruns' — a field-for-field copy of execution_artifacts'
+/// Forensics/AdminOrApproval boundary (see the catalogue fragment's file
+/// header) must not silently drift.
+TEST_CASE("capability catalogue: browser_inventory's three actions pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_browser_inventory();
+    for (const auto action : {"browsers", "profiles", "extensions"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Forensics");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::High);
+        CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(it->system_reserved);
+    }
 }
