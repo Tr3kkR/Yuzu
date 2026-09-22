@@ -57,14 +57,19 @@ bool property_text(CFTypeRef v, std::string& out) {
 DtNode read_node(const char* path, std::initializer_list<const char*> keys) {
     DtNode node;
     yuzu::agent::ScopedIOObject entry(IORegistryEntryFromPath(kIOMainPortDefault, path));
-    // KNOWN LIMITATION (not silent -- disclosed here and in README caveat 6): Apple's own
-    // IOKitLib.h documents IORegistryEntryFromPath's contract as "a handle to the entry ...
-    // or MACH_PORT_NULL on failure" -- one return value, no distinct error code, so a node
-    // genuinely absent and a transient IOKit-level failure (sandboxing, mach-port exhaustion)
-    // are indistinguishable at this call and both read as absent here. This is the same
-    // absent-vs-unreadable risk fixed as FV-CODEX-01 on the Windows leg, but not fixable
-    // here: unlike WMI/SMBIOS, this API surface exposes nothing else to check.
-    if (!entry) return node; // no such node, OR an indistinguishable IOKit-level failure: absent
+    // Apple's own IOKitLib.h documents IORegistryEntryFromPath's contract as "a handle to the
+    // entry ... or MACH_PORT_NULL on failure" -- one return value, no distinct error code, so a
+    // node genuinely absent and a transient IOKit-level failure (sandboxing, mach-port
+    // exhaustion) are indistinguishable AT THIS CALL. Unlike WMI/SMBIOS, this API surface
+    // exposes nothing else to check here -- so this shell only records the raw fact
+    // (lookup_failed) and leaves the absent-vs-unreadable decision to select_macos_firmware(),
+    // one layer up in the pure core, which resolves it with hw.model as a second signal (only
+    // /rom failing on an Apple Silicon Mac is architecturally expected absence; the same
+    // absent-vs-unreadable class was fixed as FV-CODEX-01 on the Windows leg).
+    if (!entry) {
+        node.lookup_failed = true;
+        return node;
+    }
     for (const char* key : keys) {
         yuzu::agent::ScopedCFRef<CFStringRef> k(
             CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8));
@@ -108,10 +113,23 @@ int collect_firmware_macos(yuzu::CommandContext& ctx) {
     const DtNode root = read_node(kDtRoot.data(), {"manufacturer"});
     const Field model = sysctl_hw_model();
 
-    report.add_all(macos_rows(select_macos_firmware(rom, chosen, root), model));
+    report.add_all(macos_rows(select_macos_firmware(rom, chosen, root, model), model));
     for (const DtNode* n : {&rom, &chosen, &root})
         for (const auto& k : n->undecodable)
             report.note_failure("iokit:" + k + ":undecodable");
+    // A node whose own IORegistryEntryFromPath lookup failed gets its own failure token here,
+    // UNLESS that specific node's absence is architecturally expected (only /rom on Apple
+    // Silicon) -- same architecture gate select_macos_firmware() uses for the row's `unreadable`
+    // flag, so the token and the row state never disagree.
+    const bool apple_silicon = model.value && is_apple_silicon_model(*model.value);
+    struct NodeRef {
+        const DtNode* n;
+        std::string_view path;
+    };
+    for (const NodeRef& r :
+         {NodeRef{&rom, kDtRom}, NodeRef{&chosen, kDtChosen}, NodeRef{&root, kDtRoot}})
+        if (r.n->lookup_failed && !node_absence_is_expected(r.path, apple_silicon))
+            report.note_failure("iokit:" + std::string(r.path) + ":lookup_failed");
     if (model.unreadable) report.note_failure("sysctl:hw_model:unreadable");
     return finish_report(ctx, report);
 }

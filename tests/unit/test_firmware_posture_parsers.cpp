@@ -74,8 +74,11 @@ std::map<std::string, std::map<std::string, Bytes>> read_dt_capture() {
     return out;
 }
 
-DtNode dt_node(const std::map<std::string, Bytes>* props) {
+// `lookup_failed` defaults false (a node the capture/shape genuinely reached, however empty);
+// pass true to model an IORegistryEntryFromPath call that itself returned MACH_PORT_NULL.
+DtNode dt_node(const std::map<std::string, Bytes>* props, bool lookup_failed = false) {
     DtNode n;
+    n.lookup_failed = lookup_failed;
     for (const auto& [k, v] : props ? *props : std::map<std::string, Bytes>{}) {
         if (auto s = decode_dt_string(v)) n.props.emplace(k, *s);
         else n.undecodable.push_back(k);
@@ -496,14 +499,20 @@ TEST_CASE("select_macos_firmware: REAL CAPTURE Apple Silicon takes /chosen syste
           "[firmware_posture][macos]") {
     const auto cap = read_dt_capture();
     REQUIRE(cap.at("IODeviceTree:/rom").empty()); // /rom is absent on this host
-    const auto s = select_macos_firmware(dt_node(nullptr), dt_node(&cap.at("IODeviceTree:/chosen")),
-                                         dt_node(&cap.at("IODeviceTree:/")));
+    Field model;
+    model.value = "Mac16,10";
+    // /rom's IORegistryEntryFromPath call itself returned MACH_PORT_NULL on this real Apple
+    // Silicon host (per the header doc comment) -- lookup_failed=true models that fact.
+    // Fails under: losing the hw.model architecture gate and treating this the same as an
+    // unexplained failure on /chosen or / (which the next test case covers).
+    const auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true),
+                                         dt_node(&cap.at("IODeviceTree:/chosen")),
+                                         dt_node(&cap.at("IODeviceTree:/")), model);
     CHECK(*s.version.value == "mBoot-18000.161.10");
     CHECK(s.version_source == "IODeviceTree:/chosen#system-firmware-version");
     CHECK(*s.vendor.value == "Apple Inc.");
+    // The architecturally-expected /rom absence must never surface as unreadable.
     CHECK((!s.release_date.value.has_value() && !s.release_date.unreadable));
-    Field model;
-    model.value = "Mac16,10";
     const auto rows = macos_rows(s, model);
     REQUIRE(rows.size() == 5);
     CHECK(row_str(rows[0]) == "firmware|vendor|Apple Inc.|iokit");
@@ -513,12 +522,75 @@ TEST_CASE("select_macos_firmware: REAL CAPTURE Apple Silicon takes /chosen syste
     CHECK(row_str(rows[4]) == "firmware|model|Mac16,10|sysctl");
 }
 
+// The reviewer's HIGH finding: a genuine IOKit lookup failure on /chosen or / must never read the
+// same as an architecturally-expected absence, on ANY architecture -- those two nodes exist on
+// every real Mac. Fails under: dropping the node_absence_is_expected gate so any lookup_failed
+// node falls through to plain absent again.
+TEST_CASE("select_macos_firmware: a failed /chosen or / lookup is always unreadable, never absent",
+          "[firmware_posture][macos]") {
+    Field apple_silicon_model;
+    apple_silicon_model.value = "Mac16,10";
+
+    // /chosen lookup failure on Apple Silicon: still unreadable, NOT absent -- /chosen is never
+    // legitimately missing on any real Mac, so the architecture gate must not cover it.
+    {
+        const auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true),
+                                             dt_node(nullptr, /*lookup_failed=*/true), DtNode{},
+                                             apple_silicon_model);
+        CHECK((!s.version.value.has_value() && s.version.unreadable));
+    }
+    // / (root) lookup failure: vendor becomes unreadable, not absent, even with a valid /rom
+    // vendor fallback absent too.
+    {
+        DtNode rom;
+        rom.props = {{"version", "MBP141.88Z.F000.B00.1904"}};
+        const auto s = select_macos_firmware(rom, DtNode{}, dt_node(nullptr, /*lookup_failed=*/true),
+                                             Field{});
+        CHECK((!s.vendor.value.has_value() && s.vendor.unreadable));
+    }
+    // /rom lookup failure on an INTEL Mac (or an unreadable/absent hw.model) is NOT
+    // architecturally expected -- unlike the Apple Silicon case above, this must be unreadable.
+    {
+        Field intel_model;
+        intel_model.value = "MacBookPro16,1";
+        auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true), DtNode{}, DtNode{},
+                                       intel_model);
+        CHECK((!s.version.value.has_value() && s.version.unreadable));
+        // hw.model itself unreadable: treated as non-Apple-Silicon (never misclassified as the
+        // architecturally-expected case on a signal we don't actually have).
+        Field unreadable_model;
+        unreadable_model.unreadable = true;
+        s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true), DtNode{}, DtNode{},
+                                  unreadable_model);
+        CHECK((!s.version.value.has_value() && s.version.unreadable));
+    }
+}
+
+TEST_CASE("is_apple_silicon_model: bare Mac+digits only, not an Intel product family",
+          "[firmware_posture][macos]") {
+    CHECK(is_apple_silicon_model("Mac16,10"));
+    CHECK(is_apple_silicon_model("Mac14,2"));
+    CHECK_FALSE(is_apple_silicon_model("MacBookPro16,1")); // Intel: family word before the digits
+    CHECK_FALSE(is_apple_silicon_model("Macmini8,1"));     // Intel
+    CHECK_FALSE(is_apple_silicon_model("MacPro7,1"));      // Intel
+    CHECK_FALSE(is_apple_silicon_model(""));
+    CHECK_FALSE(is_apple_silicon_model("Mac"));  // no digits at all
+    CHECK_FALSE(is_apple_silicon_model("Macx")); // 4th char not a digit
+}
+
+TEST_CASE("node_absence_is_expected: only /rom, only on Apple Silicon", "[firmware_posture][macos]") {
+    CHECK(node_absence_is_expected(kDtRom, /*apple_silicon=*/true));
+    CHECK_FALSE(node_absence_is_expected(kDtRom, /*apple_silicon=*/false));
+    CHECK_FALSE(node_absence_is_expected(kDtChosen, /*apple_silicon=*/true));
+    CHECK_FALSE(node_absence_is_expected(kDtRoot, /*apple_silicon=*/true));
+}
+
 // ASSUMED SHAPE, not a capture: an Intel Mac's /rom keys (version, release-date, vendor).
 TEST_CASE("select_macos_firmware: Intel /rom wins; undecodable and missing are distinct", "[firmware_posture][macos]") {
     DtNode rom, chosen;
     rom.props = {{"version", "MBP141.88Z.F000.B00.1904"}, {"release-date", "04/03/2019"}, {"vendor", "Apple Inc."}};
     chosen.props = {{"system-firmware-version", "mBoot-1"}};
-    auto s = select_macos_firmware(rom, chosen, DtNode{});
+    auto s = select_macos_firmware(rom, chosen, DtNode{}, Field{});
     CHECK(*s.version.value == "MBP141.88Z.F000.B00.1904");
     CHECK(s.version_source == "IODeviceTree:/rom#version");
     CHECK(row_str(macos_rows(s, Field{})[2]) == "firmware|release_date|2019-04-03|iokit");
@@ -526,14 +598,14 @@ TEST_CASE("select_macos_firmware: Intel /rom wins; undecodable and missing are d
     // Fails under: a present-but-undecodable key reading as `absent`.
     chosen.props.clear();
     chosen.undecodable = {"system-firmware-version", "firmware-version"};
-    s = select_macos_firmware(DtNode{}, chosen, DtNode{});
+    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, Field{});
     CHECK(row_str(macos_rows(s, Field{})[1]) == "firmware|version|unreadable|iokit");
-    s = select_macos_firmware(DtNode{}, DtNode{}, DtNode{});
+    s = select_macos_firmware(DtNode{}, DtNode{}, DtNode{}, Field{});
     CHECK((s.version_source == "absent" && row_str(macos_rows(s, Field{})[1]) == "firmware|version|absent|iokit"));
     // a later readable candidate clears an earlier unreadable one
     chosen.undecodable = {"system-firmware-version"};
     chosen.props = {{"firmware-version", "mBoot-2"}};
-    s = select_macos_firmware(DtNode{}, chosen, DtNode{});
+    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, Field{});
     CHECK((*s.version.value == "mBoot-2" && !s.version.unreadable));
     CHECK(s.version_source == "IODeviceTree:/chosen#firmware-version");
 }

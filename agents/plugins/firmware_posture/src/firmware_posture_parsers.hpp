@@ -526,10 +526,36 @@ struct FwupdRows {
     return {"update_pending", std::string{kUnavailable}, std::string{kSrcFwupd}};
 }
 
-struct DtNode { // one IODeviceTree node; a node that does not exist is a default DtNode
+struct DtNode {
     std::map<std::string, std::string> props; // properties that decoded to text
     std::vector<std::string> undecodable;     // present but not text (wrong type / binary)
+    // true when IORegistryEntryFromPath itself returned MACH_PORT_NULL: the node either does not
+    // exist, or an indistinguishable IOKit-level failure occurred (see select_macos_firmware --
+    // this flag is how the two are told apart, using hw.model as the second signal). A node that
+    // was found but is simply empty (no properties at all) is NOT this case and carries `false`.
+    bool lookup_failed = false;
 };
+
+inline constexpr std::string_view kDtRom = "IODeviceTree:/rom";
+inline constexpr std::string_view kDtChosen = "IODeviceTree:/chosen";
+inline constexpr std::string_view kDtRoot = "IODeviceTree:/";
+
+/// Apple Silicon model identifiers are bare "Mac" + digits, e.g. "Mac16,10". Every Intel model name
+/// has a product-family word between "Mac" and the digits: "MacBookPro16,1", "Macmini8,1",
+/// "MacPro7,1". An empty or unrecognised string (including a genuinely unreadable hw.model) can't
+/// be classified either way and returns false -- the caller then treats it like Intel, so an
+/// unexplained failure is never misread as an architecturally-expected absence.
+[[nodiscard]] inline bool is_apple_silicon_model(std::string_view model) {
+    return model.size() > 3 && model.substr(0, 3) == "Mac" &&
+           model[3] >= '0' && model[3] <= '9';
+}
+
+/// Whether a failed node lookup is the architecturally-expected case (Apple Silicon has no /rom)
+/// rather than a real, unexplained IOKit failure. /chosen and / (device-tree root) exist on every
+/// real Mac of either architecture, so only /rom on Apple Silicon is ever legitimately absent.
+[[nodiscard]] inline bool node_absence_is_expected(std::string_view node_path, bool apple_silicon) {
+    return node_path == kDtRom && apple_silicon;
+}
 
 /// A device-tree property is OSData holding text, NUL-terminated and often NUL-padded (the
 /// `firmware-version` property is a 256-byte buffer). Text = leading printable bytes then only
@@ -546,10 +572,6 @@ struct DtNode { // one IODeviceTree node; a node that does not exist is a defaul
     return std::string(reinterpret_cast<const char*>(b.data()), n);
 }
 
-inline constexpr std::string_view kDtRom = "IODeviceTree:/rom";
-inline constexpr std::string_view kDtChosen = "IODeviceTree:/chosen";
-inline constexpr std::string_view kDtRoot = "IODeviceTree:/";
-
 struct MacosSelection {
     Field vendor, version, release_date;
     std::string version_source; // "<node>#<key>" that carried the version, or "absent"
@@ -558,33 +580,39 @@ struct MacosSelection {
 /// Intel (`/rom`: version, release-date, vendor) is preferred; Apple Silicon has no `/rom`, its
 /// firmware version is `/chosen` `system-firmware-version` (else `firmware-version`) and its
 /// vendor is the device-tree root `manufacturer`. A key that exists but did not decode as text
-/// makes that field `unreadable`, never `absent`.
+/// makes that field `unreadable`, never `absent` -- and so does a node whose own lookup failed,
+/// UNLESS that specific node's absence is architecturally expected (only `/rom` on Apple Silicon;
+/// `/chosen` and `/` are never legitimately absent on any real Mac). `hw_model` is the second
+/// signal a bare failed `IORegistryEntryFromPath` call can't provide on its own.
 [[nodiscard]] inline MacosSelection select_macos_firmware(const DtNode& rom, const DtNode& chosen,
-                                                          const DtNode& root) {
+                                                          const DtNode& root, const Field& hw_model) {
     MacosSelection s;
     s.version_source = std::string{kAbsent};
+    const bool apple_silicon =
+        hw_model.value && is_apple_silicon_model(*hw_model.value);
     auto has = [](const std::vector<std::string>& v, const char* k) {
         return std::find(v.begin(), v.end(), k) != v.end();
     };
-    auto take = [&](Field& f, const DtNode& n, const char* key) {
+    auto take = [&](Field& f, const DtNode& n, std::string_view node_path, const char* key) {
         if (f.value) return;
         auto it = n.props.find(key);
-        if (it != n.props.end()) f.value = it->second;
-        else if (has(n.undecodable, key)) f.unreadable = true;
+        if (it != n.props.end()) { f.value = it->second; return; }
+        if (has(n.undecodable, key)) { f.unreadable = true; return; }
+        if (n.lookup_failed && !node_absence_is_expected(node_path, apple_silicon)) f.unreadable = true;
     };
     struct Src { const DtNode* n; std::string_view path; const char* key; };
     for (const Src& c : {Src{&rom, kDtRom, "version"}, Src{&chosen, kDtChosen, "system-firmware-version"},
                          Src{&chosen, kDtChosen, "firmware-version"}}) {
-        take(s.version, *c.n, c.key);
+        take(s.version, *c.n, c.path, c.key);
         if (s.version.value) {
             s.version_source = std::string{c.path} + '#' + c.key;
             s.version.unreadable = false;
             break;
         }
     }
-    take(s.release_date, rom, "release-date");
-    take(s.vendor, rom, "vendor");
-    take(s.vendor, root, "manufacturer");
+    take(s.release_date, rom, kDtRom, "release-date");
+    take(s.vendor, rom, kDtRom, "vendor");
+    take(s.vendor, root, kDtRoot, "manufacturer");
     if (s.vendor.value) s.vendor.unreadable = false;
     if (s.release_date.value) s.release_date.unreadable = false;
     return s;
