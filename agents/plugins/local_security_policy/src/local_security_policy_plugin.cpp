@@ -1,7 +1,8 @@
 /**
  * local_security_policy_plugin.cpp -- password / lockout / audit policy posture and
- * sudoers content (read-only). Portable TU; the only target-OS #if is the dispatch to
- * a leg (local_security_policy_{linux,macos,win}.cpp behind local_security_policy_legs.hpp).
+ * sudoers content (read-only). Portable TU; the only target-OS #ifs are the Windows
+ * sudoers short-circuit and the dispatch to a leg (local_security_policy_{linux,macos,
+ * win}.cpp behind local_security_policy_legs.hpp).
  * Row shapes and failure semantics: local_security_policy_parsers.hpp. Reads are
  * unprivileged except /etc/sudoers (0440) and /etc/audit/audit.rules (0640): a refused
  * read reports permission_denied, never an empty result.

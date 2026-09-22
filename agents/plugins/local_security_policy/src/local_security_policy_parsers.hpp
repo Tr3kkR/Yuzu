@@ -112,6 +112,8 @@ inline std::optional<std::string> decode_utf16le_bom(std::span<const std::uint8_
 
 /// `[Section]` / `key = value` INI (secedit .inf). `;` comments and lines
 /// before the first section are ignored; a repeated key keeps the last value.
+/// std::map, not unordered: secedit_policy_rows iterates `[Event Audit]`
+/// directly, so the key order IS the audit_policy row order on the wire.
 using InfSections = std::map<std::string, std::map<std::string, std::string>>;
 
 inline InfSections parse_inf_sections(std::string_view text) {
@@ -431,7 +433,10 @@ inline PolicyStatus select_status(std::size_t readable, std::size_t denied, std:
 
 inline std::string join_row(std::string_view head, std::initializer_list<std::string_view> fields) {
     std::string r{head};
-    for (auto f : fields) r += '|', r += yuzu::util::safe_output_field(f);
+    for (auto f : fields) {
+        r += '|';
+        r += yuzu::util::safe_output_field(f);
+    }
     return r;
 }
 
@@ -469,13 +474,19 @@ inline LocalPolicyAction parse_local_policy_action(std::string_view a) {
     if (a == "sudoers") return LocalPolicyAction::Sudoers;
     return LocalPolicyAction::Unknown;
 }
+/// Exhaustive rather than defaulted: a `default:` arm here mapped Unknown to
+/// "sudoers", silently labelling rows with a prefix whose contract is 7 fields,
+/// not 4. Unreachable today (execute() rejects Unknown before any leg runs), but
+/// the compiler now enforces that a new action gets a deliberate answer.
 inline std::string_view action_row_prefix(LocalPolicyAction a) {
     switch (a) {
     case LocalPolicyAction::Password: return "password_policy";
     case LocalPolicyAction::Lockout: return "lockout_policy";
     case LocalPolicyAction::Audit: return "audit_policy";
-    default: return "sudoers";
+    case LocalPolicyAction::Sudoers: return "sudoers";
+    case LocalPolicyAction::Unknown: break;
     }
+    return "";
 }
 
 inline constexpr std::size_t kMaxFileBytes = 256 * 1024;
@@ -590,6 +601,13 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
                                      const FileReader& rd, const DirLister& ls) {
     detail::Tally t;
     const auto prefix = action_row_prefix(action);
+    // The Password/Lockout arms below read Linux paths and never consult `flavor`;
+    // on macOS those two actions come from pwpolicy and the leg returns before it
+    // gets here. Enforced at the seam rather than one file away, so relaxing that
+    // early return cannot silently start reading /etc/login.defs on a Mac.
+    if (flavor == FileFlavor::Macos &&
+        (action == LocalPolicyAction::Password || action == LocalPolicyAction::Lockout))
+        return {};
     switch (action) {
     case LocalPolicyAction::Password: {
         detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsPasswordKeys);
