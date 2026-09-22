@@ -318,4 +318,59 @@ classify_gateway_forward_response(const ::yuzu::server::v1::SendCommandResponse&
     return GatewayForwardOutcome::kApply;
 }
 
+/// pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22): a pure,
+/// independently-testable predicate for whether an applied `CommandResponse`
+/// resolves its command_id, extracted so the guard `forward_gateway_pending`
+/// uses to suppress synthetic terminal-failure writes can be tested WITHOUT
+/// a live gRPC stream. Only a status other than RUNNING counts -- a RUNNING
+/// frame is real progress, not a resolution, and must never suppress a
+/// later synthetic terminal write for the same command if the stream then
+/// faults and every retry is exhausted (the exact bug this predicate's
+/// absence caused: a single RUNNING frame followed by 3 exhausted
+/// UNAVAILABLE finishes previously left the command_id stuck at RUNNING
+/// forever, since `applied_response` — now `applied_terminal` — was set
+/// unconditionally on ANY applied frame, RUNNING included).
+[[nodiscard]] inline bool
+is_terminal_command_status(::yuzu::agent::v1::CommandResponse::Status status) {
+    return status != ::yuzu::agent::v1::CommandResponse::RUNNING;
+}
+
+/// #4672: pure builder for the synthetic terminal FAILURE `CommandResponse`
+/// `forward_gateway_pending` applies (via `process_gateway_response`) on each
+/// of its terminal-failure branches (`unauthenticated`, exhausted
+/// `unavailable`, `unknown_cluster`, a stream that produced no legitimate
+/// resolution for the targeted agent) — extracted here, alongside
+/// `classify_gateway_forward_response`, for the SAME reason that function's
+/// own doc comment gives: unit-testable without a live gRPC connection or a
+/// running server. `exit_code` is fixed at -1, matching the `not_connected`
+/// sentinel shape `classify_gateway_forward_response` above already
+/// recognizes elsewhere in this forwarding path (a synthetic, non-agent-
+/// reported terminal status).
+///
+/// pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22): `error().code()`
+/// IS set below, but nothing under `server/core/src` ever reads it back --
+/// `process_gateway_response`'s every call site (this one included) copies
+/// only `error().message()` into `StoredResponse.error_detail`/the tracker
+/// row/analytics/webhooks, the SAME pattern this whole file already uses for
+/// every other response type. Rather than special-case gateway-forward
+/// responses in that shared, heavily-reused path, the reason code is
+/// prefixed onto the MESSAGE itself here -- the field that actually gets
+/// persisted and served -- so `docs/user-manual/server-admin.md`'s "a
+/// specific error.code you can use to diagnose the cause" claim is true for
+/// what an operator/agentic worker actually sees. `error().code()` is left
+/// set too, for any future consumer that reads the structured field
+/// directly.
+[[nodiscard]] inline ::yuzu::agent::v1::CommandResponse
+build_gateway_forward_terminal_failure(const std::string& command_id,
+                                       const std::string& reason_code,
+                                       const std::string& detail) {
+    ::yuzu::agent::v1::CommandResponse synth;
+    synth.set_command_id(command_id);
+    synth.set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+    synth.set_exit_code(-1);
+    synth.mutable_error()->set_code(reason_code);
+    synth.mutable_error()->set_message("[" + reason_code + "] " + detail);
+    return synth;
+}
+
 } // namespace yuzu::server

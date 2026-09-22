@@ -60,6 +60,7 @@
 #include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
+#include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
 #include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
@@ -750,6 +751,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
 #include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
+#include "workflow_api_local.hpp"       // ADR-0031 WS-A4 (eighth family): wire the real WorkflowApi seam
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -949,6 +951,18 @@ struct McpTestServer {
     /// path unconditionally). Default nullptr preserves that prior
     /// behaviour for tests that don't opt in.
     yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
+
+    /// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: an
+    /// injected test double, INDEPENDENT of workflow_engine_for_test above --
+    /// mirrors verify_api_for_test's pattern. Lets a test prove the three MCP
+    /// tools call the WorkflowApi seam and not the raw engine even while a
+    /// real (differently-answering) engine is ALSO wired via
+    /// workflow_engine_for_test, closing the mutation-testing gap the round
+    /// found: reverting a tool body to call workflow_engine directly used to
+    /// pass every existing test, because workflow_api_ was always DERIVED
+    /// from the same engine both doors shared. Takes precedence over the
+    /// workflow_engine_for_test-derived seam below when set.
+    std::shared_ptr<const yuzu::server::WorkflowApi> workflow_api_for_test;
 
     /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
     /// definition_id/enabled_only filters can be exercised end-to-end.
@@ -1600,6 +1614,28 @@ private:
         if (schedule_engine_for_test)
             mcp.set_schedule_api(
                 yuzu::server::make_local_schedule_api(*schedule_engine_for_test));
+
+        // ADR-0031 WS-A4 (eighth family): wire the REAL WorkflowApi seam
+        // over this test's workflow_engine_for_test — same setter idiom as
+        // set_schedule_api above (`build_handler`'s own `WorkflowEngine*
+        // workflow_engine` param below is now unused inside
+        // list_workflows/get_workflow/get_workflow_execution, kept for
+        // signature stability). Gated on workflow_engine_for_test's
+        // presence, mirroring production's workflow_engine_-gated
+        // construction: unwired -> null seam -> the tools' `!workflow_api_`
+        // guard answers "Workflow engine unavailable", preserving every
+        // pre-seam test's default behaviour. adversarial-review round finding:
+        // workflow_api_for_test (an injected test double) takes precedence over
+        // the engine-derived seam, so a test can wire a REAL, differently-
+        // answering engine via workflow_engine_for_test AND a distinguishing
+        // seam double at once, proving the three tools call the seam and not
+        // the raw engine (see workflow_api_for_test's own doc comment).
+        if (workflow_api_for_test) {
+            mcp.set_workflow_api(workflow_api_for_test);
+        } else if (workflow_engine_for_test) {
+            mcp.set_workflow_api(
+                yuzu::server::make_local_workflow_api(*workflow_engine_for_test));
+        }
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -11051,6 +11087,143 @@ TEST_CASE("MCP get_workflow_execution: unconfined caller still sees the full "
     REQUIRE(sc["steps"].size() == 1);
     REQUIRE(sc["steps"][0]["result"].contains("agents_reached"));
     CHECK(sc["steps"][0]["result"]["agents_reached"] == 2);
+}
+
+// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: a
+// mutation run reverting list_workflows/get_workflow/get_workflow_execution
+// to call `workflow_engine` directly (instead of `workflow_api_`) passed
+// every pre-existing MCP test unchanged -- consumer TUs are
+// INSPECTED-NOT-ENFORCED by check-seam-closure.py, so nothing else caught
+// it. These three tests wire a REAL WorkflowEngine (via
+// workflow_engine_for_test, so a revert-to-raw-engine still finds a live,
+// answerable store) AND a DISTINGUISHING FnWorkflowApi double (via the
+// independent workflow_api_for_test override) at the same time, so the two
+// doors answer DIFFERENTLY -- a revert to the raw engine flips these tests
+// from pass to fail, closing the gap the mutation run found.
+
+TEST_CASE("MCP list_workflows: answers via the WorkflowApi seam, not the raw "
+          "engine, when both are wired",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    REQUIRE(workflows
+                .create_workflow("kind: Workflow\nmetadata:\n  displayName: "
+                                 "engine-real-name\nspec:\n  steps:\n    - "
+                                 "instruction: def-x\n")
+                .has_value());
+
+    yuzu::server::Workflow seam_only;
+    seam_only.id = "seam-wf-1";
+    seam_only.name = "seam-double-name";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        [seam_only](const yuzu::server::WorkflowQuery&)
+            -> std::expected<std::vector<yuzu::server::Workflow>, std::string> {
+            return std::vector<yuzu::server::Workflow>{seam_only};
+        },
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":900,"params":{"name":"list_workflows"}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["workflows"];
+    REQUIRE(sc.is_array());
+    REQUIRE(sc.size() == 1);
+    CHECK(sc[0]["name"] == "seam-double-name");
+    for (const auto& w : sc)
+        CHECK(w["name"] != "engine-real-name");
+}
+
+TEST_CASE("MCP get_workflow: answers via the WorkflowApi seam, not the raw "
+          "engine, even for a valid real-engine id",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    auto real_id = workflows.create_workflow(
+        "kind: Workflow\nmetadata:\n  displayName: engine-real-detail\nspec:\n"
+        "  steps:\n    - instruction: def-y\n");
+    REQUIRE(real_id.has_value());
+
+    yuzu::server::Workflow seam_only;
+    seam_only.id = *real_id; // same id the real engine actually has, deliberately
+    seam_only.name = "seam-double-detail";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [seam_only](const std::string&)
+            -> std::expected<std::optional<yuzu::server::Workflow>, std::string> {
+            return seam_only;
+        },
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    ts.start();
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":901,)"
+                    R"("params":{"name":"get_workflow","arguments":{"workflow_id":")") +
+        *real_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["name"] == "seam-double-detail");
+}
+
+TEST_CASE("MCP get_workflow_execution: answers via the WorkflowApi seam, not "
+          "the raw engine, even for a valid real-engine id",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    auto wf_id = workflows.create_workflow(
+        "kind: Workflow\nmetadata:\n  displayName: engine-real-exec\nspec:\n"
+        "  steps:\n    - instruction: def-z\n");
+    REQUIRE(wf_id.has_value());
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(R"({"status":"dispatched","command_id":"cmd-mcp-wf3"})");
+    };
+    auto real_exec_id = workflows.execute(*wf_id, {"agent-Z"}, dispatch_fn);
+    REQUIRE(real_exec_id.has_value());
+
+    yuzu::server::WorkflowExecution seam_only;
+    seam_only.id = *real_exec_id; // same id the real engine actually has, deliberately
+    seam_only.workflow_id = *wf_id;
+    seam_only.status = "seam-double-status";
+    seam_only.agent_ids_json = "[]";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        [seam_only](const std::string&)
+            -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+            return seam_only;
+        });
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    // fleet_read_fn_for_test left unwired -- defaults to unconfined admit, same
+    // as the "unconfined caller" test above, so workflow_execution_visible()
+    // passes regardless of seam_only's (empty) agent_ids_json.
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":902,)"
+                    R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+        *real_exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["status"] == "seam-double-status");
 }
 
 // #1634: execution rows carry no single agent_id, so a confined caller is
