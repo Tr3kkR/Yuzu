@@ -192,6 +192,7 @@
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
+#include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -16344,6 +16345,17 @@ private:
         std::shared_ptr<yuzu::server::ScheduleApi> schedule_api;
         if (schedule_engine_)
             schedule_api = make_local_schedule_api(*schedule_engine_);
+        // ADR-0031 WS-A4 (eighth family): the workflow-read API seam — ONE
+        // instance backing GET /api/v1/workflows[/{id}] and
+        // GET /api/v1/workflow-executions/{id} (WorkflowRoutes) and MCP
+        // list_workflows/get_workflow/get_workflow_execution, so the three
+        // can never disagree. Gated on store presence, same posture as
+        // schedule_api above: `!workflow_api` reads as "engine not
+        // available" wherever a consumer checks it, matching the pre-seam
+        // `if (!workflow_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
+        if (workflow_engine_)
+            workflow_api = make_local_workflow_api(*workflow_engine_);
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -17331,6 +17343,9 @@ private:
         // ADR-0031 WS-A4 (seventh family): the SAME schedule_api instance
         // constructed above (shared with mcp_server_->set_schedule_api below).
         wf_deps.schedule_api = schedule_api;
+        // ADR-0031 WS-A4 (eighth family): the SAME workflow_api instance
+        // constructed above (shared with mcp_server_->set_workflow_api below).
+        wf_deps.workflow_api = workflow_api;
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -18813,6 +18828,17 @@ private:
             // !schedule_api_ guard then answers "engine unavailable",
             // matching the pre-seam !schedule_engine guard exactly.
             mcp_server_->set_schedule_api(schedule_api);
+            // ADR-0031 WS-A4 (eighth family): the SAME workflow-read API
+            // seam instance WorkflowRoutes uses for GET /api/v1/workflows
+            // [/{id}] and GET /api/v1/workflow-executions/{id} (wired into
+            // wf_deps.workflow_api above), so MCP list_workflows/
+            // get_workflow/get_workflow_execution can never disagree with
+            // REST v1. Gated on store presence at construction (workflow_api
+            // is nullptr when workflow_engine_ was never opened); the
+            // tools' own !workflow_api_ guard then answers "engine
+            // unavailable", matching the pre-seam !workflow_engine guard
+            // exactly.
+            mcp_server_->set_workflow_api(workflow_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see

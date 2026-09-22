@@ -6,10 +6,11 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers seven families — `network`, `verify`, `compliance`, `device`, `dex`,
-`dex_perf`, `schedule` (see FAMILIES below; this docstring previously read
-"five", already stale by `dex_perf` before the `schedule` family was added —
-corrected here, not merely for `schedule`).
+covers eight families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule`, `workflow` (see FAMILIES below; this docstring previously
+read "five", already stale by `dex_perf` before the `schedule` family was
+added, then stale again at "seven" once `workflow` landed — corrected here
+each time, not merely for the family that caught it).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -80,8 +81,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks seven families — `network`, `verify`, `compliance`,
-`device`, `dex`, `dex_perf` and `schedule` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks eight families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf`, `schedule` and `workflow` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -200,6 +201,7 @@ IMPL_TUS = [
     "server/core/src/dex_api.cpp",
     "server/core/src/dex_perf_api.cpp",
     "server/core/src/schedule_api.cpp",
+    "server/core/src/workflow_api.cpp",
     # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
     # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
@@ -234,6 +236,7 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/dex_api.hpp",
     "server/core/src/dex_perf_api.hpp",
     "server/core/src/schedule_api.hpp",
+    "server/core/src/workflow_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -428,6 +431,40 @@ FAMILIES = {
             "server/core/src/schedule_model.cpp",
             "server/core/src/schedule_api.hpp",
             "server/core/src/schedule_api_local.hpp",
+        ],
+    },
+    # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
+    # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
+    # /api/v1/workflow-executions/{id}, MCP list_workflows/get_workflow/
+    # get_workflow_execution). Header-only posture, same reason as
+    # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the legacy unversioned GET routes and
+    # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and MCP ARE rewired (server.cpp / mcp_server.cpp both call the
+    # seam). `workflow_types.hpp` was relocated out of `workflow_engine.hpp`;
+    # `workflow_model.hpp` was made genuinely pure by pointing it at
+    # `workflow_types.hpp` instead of the store-coupled `workflow_engine.
+    # hpp` (it needed no FURTHER split by this eighth family — it DID
+    # originally bundle another family's builder, `schedule_row_json`, but
+    # the seventh family's own PR already split that out into
+    # `schedule_model.hpp`, so by the time `workflow` landed there was
+    # nothing left to carve out). The legacy unversioned GET
+    # routes and every `POST`/`DELETE`/`.../execute` mutator
+    # (`workflow_routes.cpp`) are a SEPARATE, deliberately untouched
+    # capability with no public REST v1/MCP twin of their own (the
+    # mutators) or sharing the SAME store call as their v1 twin without
+    # themselves being the versioned resource (the legacy GETs) — nothing
+    # to carve out of this family's enforced set, unlike `compliance`'s
+    # WS-A3 mutator gap.
+    "workflow": {
+        "tus": [
+            "server/core/src/workflow_types.hpp",
+            "server/core/src/workflow_model.hpp",
+            "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_api.hpp",
+            "server/core/src/workflow_api_local.hpp",
         ],
     },
 }

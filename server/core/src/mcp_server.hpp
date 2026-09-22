@@ -62,7 +62,8 @@
 #include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
-#include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
+#include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
 // #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
 // TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -717,6 +718,22 @@ public:
     /// pre-seam `!schedule_engine` guard's behaviour exactly.
     void set_schedule_api(std::shared_ptr<const ScheduleApi> a) { schedule_api_ = std::move(a); }
 
+    /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
+    /// seam the REST `GET /api/v1/workflows[/{id}]` and
+    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
+    /// `get_workflow_execution` can never disagree with REST v1.
+    /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
+    /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
+    /// parameter is now unused inside these three tool bodies (superseded by
+    /// this seam) but is kept, unremoved, for constructor-signature
+    /// stability — a bounded, disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `workflow` family row). Unset (default-
+    /// constructed null) ⇒ the tools' own `!workflow_api_` readiness guard
+    /// answers "Workflow engine unavailable", matching the pre-seam
+    /// `!workflow_engine` guard's behaviour exactly.
+    void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1172,6 +1189,8 @@ private:
     DexVisibleFn dex_visible_fn_;
     // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
     std::shared_ptr<const ScheduleApi> schedule_api_;
+    // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
+    std::shared_ptr<const WorkflowApi> workflow_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
