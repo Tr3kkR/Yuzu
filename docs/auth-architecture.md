@@ -1845,12 +1845,19 @@ call site uses — a hand-built format would silently miss every token for a
 principal built the "wrong" way).
 
 **The ~60s residual, stated honestly.** A previously-issued API/MCP token
-may keep *validating* for up to `ApiTokenStore`'s in-memory validate-cache
+may keep *validating* for up to `ApiTokenStore`'s validate-cache
 TTL (~60s) after the underlying `revoke_for_principal` call has already
-persisted — the revoke is durable, but a concurrent request racing the
-cache eviction can still see the old cached "valid" answer for that window.
-Add the (irreducible) IdP→SCIM propagation lag on top. **Cookie sessions are
-revoked immediately** (in-memory, no cache layer). The honest guarantee is
+persisted. The revoke is durable, but that cache is **process-local**
+(`token_cache_` / `revoke_generation_`), and `revoke_token` /
+`revoke_for_principal` invalidate only on the replica that served the call —
+so on that replica this is a narrow race against the eviction, while on every
+*other* replica holding a cached entry it is a deterministic window lasting
+out that replica's own TTL. Add the (irreducible) IdP→SCIM propagation lag on
+top. **Cookie sessions are not instant either, since HA WS-1a**:
+`validate_session` routes to `validate_session_durable`, a generation-gated
+cache bounded by the 1 s generation refresh (`kSessionGenRefreshMs`) and
+widening to the 30 s stale-serve ceiling (`kSessionGenStaleServeBoundMs`) for
+as long as a Postgres brownout blocks refreshes. The honest guarantee is
 **"revoked within ~60s of the deprovision reaching Yuzu,"** not instant —
 do not describe this as instantaneous revocation.
 
