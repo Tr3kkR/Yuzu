@@ -1,8 +1,0 @@
-pwpolicy_getaccountpolicies.txt -- REAL CAPTURE, macOS 26.6.2 (25G83), uid 501, unmanaged, 2026-09-21:
-  /usr/bin/pwpolicy -getaccountpolicies > file      (raw stdout; note the non-plist first line)
-  Trim: 39 non-English <key>xx</key><string> pairs removed from policyContentDescription (localised text,
-  not read); everything else byte-for-byte. Full output was 100 lines.
-pwpolicy_managed_assumed_shape.plist, audit_control_assumed_shape.txt -- ASSUMED SHAPE, not captures (see the
-  files' first lines): no managed policy or audit_control exists on this host and neither is readable/creatable
-  without root. Observed on this host: `ls -la /etc/security` shows only audit_control.example (0400 root);
-  /etc/sudoers is -r--r----- root:wheel.

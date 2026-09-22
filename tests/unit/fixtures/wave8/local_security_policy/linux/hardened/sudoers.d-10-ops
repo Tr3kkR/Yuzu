@@ -1,5 +1,0 @@
-User_Alias OPS = alice, bob
-Cmnd_Alias WEB = /usr/bin/systemctl restart nginx, /usr/bin/systemctl status nginx
-Defaults:OPS !requiretty
-OPS ALL=(root) NOPASSWD: WEB, PASSWD: /usr/bin/journalctl
-%wheel ALL=(ALL) ALL

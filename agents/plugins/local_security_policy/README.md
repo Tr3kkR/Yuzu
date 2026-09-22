@@ -245,6 +245,6 @@ sudoers|/etc/sudoers.d|absent|-|-|-|-
 - Plugin: `agents/plugins/local_security_policy/src/local_security_policy_legs.hpp` · `agents/plugins/local_security_policy/src/local_security_policy_linux.cpp` · `agents/plugins/local_security_policy/src/local_security_policy_macos.cpp` · `agents/plugins/local_security_policy/src/local_security_policy_parsers.hpp` · `agents/plugins/local_security_policy/src/local_security_policy_plugin.cpp` · `agents/plugins/local_security_policy/src/local_security_policy_scratch_identity.hpp` · `agents/plugins/local_security_policy/src/local_security_policy_scratch_sweep.hpp` · `agents/plugins/local_security_policy/src/local_security_policy_win.cpp`
 - Definitions: `content/definitions/local_security_policy.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp`
-- Tests: `tests/unit/test_local_security_policy_local_dispatcher.cpp` · `tests/unit/test_local_security_policy_parsers.cpp` · `tests/unit/test_local_security_policy_scratch_sweep.cpp` · `tests/unit/test_local_security_policy_win_local.cpp`
+- Tests: none found by name
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
