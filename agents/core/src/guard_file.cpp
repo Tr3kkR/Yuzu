@@ -336,7 +336,13 @@ void FileGuard::run() try {
         return read_pending;
     };
 
-    // (Re)issue the directory-name-only read on the given (already-open) P block.
+    // (Re)issue the directory-name-only read on the given (already-open) P block. Note for the
+    // retain path (bind()'s arm 2, below): if an extended-record reissue fails here, p.p_ex
+    // flips to false and the fallback plain-record read is issued on the SAME generation — the
+    // block stays bound to the same x, x_leaf/x_id are untouched and still valid, but
+    // parent_change_is_ours now matches by leaf name only for the rest of this generation
+    // (mirrors the one-time extended-to-plain fallback bind()'s rebuild arm already has on a
+    // fresh open; this is that same fallback reachable mid-generation via a reissue instead).
     auto issue_p_read = [&](ParentIo& p) -> bool {
         if (!p.dir)
             return false;
@@ -836,9 +842,9 @@ void FileGuard::run() try {
             break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
         }
     }
-    // RAII: dir_event / h_dir / ancestor_event released by their destructors; pio's
-    // ParentIoRelease drains-or-abandons any in-flight P read (sec-1) before pio itself
-    // is destroyed.
+    // RAII: dir_event / h_dir / ancestor_event released by their destructors; pio's destructor
+    // invokes ParentIoRelease, which drains-or-abandons any in-flight P read (sec-1) as part of
+    // that same release.
 } catch (const std::exception& e) {
     spdlog::error("Guardian FileGuard[{}]: watch thread exception: {} — watch stopping", cfg_.rule_id,
                   e.what());
