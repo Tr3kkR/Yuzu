@@ -1407,8 +1407,11 @@ further recorded limits.
      mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
      (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
      IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
-     Registry's equivalent lines run WHILE `mu_` IS HELD (`spark_registry.cpp:1895`, `:1912`,
-     `:1916`; unlocked only at `:1919`), so a stalled sink there stalls every other caller of
+     Registry's equivalent lines run WHILE `mu_` IS HELD: the recovery log
+     (`spark_registry.cpp:1895`) is released at `:1901` on the recovery path, and the failure and
+     inert-transition logs (`:1912`, `:1916`) are released at `:1919` on the failure path - two
+     different unlock points, neither reached from the other branch in the same pass. Either way
+     a stalled sink there stalls every other caller of
      `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
      draining. Tracked as its own issue, #4704 (not folded into this design record's own
      acceptance, since it needs a fix decision of its own).

@@ -1607,8 +1607,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   agent reports itself converged and the server's heartbeat reconcile does not re-push
   (`agent_gen >= current`, `server.cpp`; see the recovery-path note in the
   `#2815 + #2818 + #2833 + #2839` entry above), and the Unsupported branch's own comment says
-  `get_status()` is deliberately untouched and reports every stored rule as `errored`
-  (`guardian_engine.cpp`), so it cannot tell this state from any other.
+  `get_status()` is deliberately untouched; `get_status()` itself (`guardian_engine.cpp`) reports
+  every stored rule as `errored` unconditionally, so it cannot tell this state from any other.
   After the mechanism has recovered, re-run the reconcile on the affected host, narrowest
   first: restart that agent (`start_local()` re-arms its cached rules through
   `reconcile_rule_locked`), or send the scoped push in `docs/user-manual/guaranteed-state.md`
