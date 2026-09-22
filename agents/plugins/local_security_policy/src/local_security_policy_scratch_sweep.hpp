@@ -14,12 +14,56 @@
  * machine's policy under agent.data_dir. Every dispatch sweeps stale
  * `local_security_policy-<32 hex>` directories BEFORE spawning.
  *
- * The selection policy is a PLUGIN-LOCAL COPY of execution_artifacts'
- * (prefix + 32 hex + strict age, same unconditional caps); not lifted into
- * agents/shared until a second consumer exists. The one-hour floor is not a
- * data-safety guard: a live directory is protected by the dispatch holding it
- * open without FILE_SHARE_DELETE; the floor only covers the create-to-open
- * window of a concurrent dispatch.
+ * The selection policy is shaped after execution_artifacts' (prefix + 32 hex +
+ * strict age + unconditional caps). It is a plugin-local COPY, not a lift into
+ * agents/shared: that root takes zero-dependency leaves only and this package
+ * needs agents/core (confined_fs's WinHandle, via the identity header), so the
+ * real destination is agents/core/include/yuzu/agent/ beside confined_fs.hpp.
+ * Tracked for extraction as its own change; until then a fix to either copy
+ * MUST be applied to both.
+ *
+ * ---- Clock-guarded-retention adoption (docs/clock-guarded-retention.md,
+ *      parts 1-7) -- DELIBERATE, PARTIAL adoption, decided here -------------
+ * This is a wall-clock-cutoff reclaim pass, so the routed concern applies, and
+ * it is the RECORDED reasoning that satisfies it -- copying a guard without
+ * deciding is itself the defect the concern names. The doc's shape exists to
+ * stop a wrong wall clock destroying real operator data that cannot be
+ * recreated. Nothing here is that: the only thing this sweep can touch is a
+ * `secedit /export` output THIS PLUGIN staged into its own scratch directory,
+ * a regenerable copy of the host's own policy that the next dispatch
+ * reproduces exactly. A wrong clock can reclaim such a directory early or
+ * late; it can destroy nothing.
+ *   - Parts 1 (probe by OUTCOME) and 2 (compare against a PERSISTED reading):
+ *     NOT adopted -- nothing to probe for, and no prior reading worth
+ *     persisting when what ages out is disposable scratch space.
+ *   - Parts 3 (SANITISE the reading) and 4 (SUPPRESS only a repeat of the SAME
+ *     anomaly): NOT adopted -- they exist to stop a transient clock glitch
+ *     mass-wiping records across passes, and the caps below leave no mass-wipe
+ *     blast radius for that machinery to protect.
+ *   - Part 5 (cap every accepted pass UNCONDITIONALLY): ADOPTED, via the five
+ *     kScratchSweep* constants -- root entries enumerated, removals per pass,
+ *     FAILURES per pass, one wall deadline computed once for the whole pass,
+ *     and entries per candidate. A truncated enumeration or a spent budget is
+ *     reported as `deferred`, never as done.
+ *   - Part 6 (decide deliberately what a missing anchor means): NOT adopted --
+ *     there is no persisted anchor here to be missing. Single-process by
+ *     construction.
+ *   - Part 7 (thresholds ABSOLUTE, never relative to a shrinking remainder):
+ *     HOLDS -- is_stale compares now - mtime against one fixed threshold.
+ * CONSTANTS ARE RE-DERIVED, NOT INHERITED (the concern forbids copying the
+ * numbers in either direction): kScratchSweepMaxDirEntries is 64 because a real
+ * export directory holds exactly ONE file (policy.inf), where the sibling sizes
+ * for a hive plus its sidecars; kScratchSweepMaxFailures has no counterpart in
+ * the sibling at all, and exists so a run of persistent failures cannot starve
+ * a later removable orphan. The remaining caps and the one-hour floor are
+ * deliberately the same numbers, because the substrate is the same (Windows
+ * filesystem, agent process, the same confined_fs primitives) and the window
+ * they cover is identical. This adoption is also recorded in
+ * docs/clock-guarded-retention.md's own per-store adoption register.
+ *
+ * The one-hour floor is not a data-safety guard: a live directory is protected
+ * by the dispatch holding it open without FILE_SHARE_DELETE; the floor only
+ * covers the create-to-open window of a concurrent dispatch.
  */
 
 #include <cstddef>
