@@ -12,7 +12,12 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <yuzu/agent/scoped_fd.hpp>
@@ -58,6 +63,9 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 /// if a future file-source failure is ever counted WITHOUT emitting its row,
 /// this fallback would write a 4-field row into a 7-field contract. Keep the
 /// pairing, or give this function the action-shaped fallback before you break it.
+/// The pairing is pinned by "sudoers.d: a dir-level failure is a row, never only
+/// a reason" in test_local_security_policy_parsers.cpp; the `sudoers.d` truncation
+/// arm was the one site that counted without emitting, and it no longer does.
 inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
                            std::string_view action_prefix) {
     for (const auto& r : c.rows) ctx.write_output(r);
@@ -87,8 +95,17 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 
 /// Bounded regular-file read. Symlinks ARE followed: /etc/pam.d/system-auth is a symlink
 /// into /etc/authselect on RHEL-family hosts (real capture, fedora:40); all paths are under /etc.
+///
+/// O_NONBLOCK is LOAD-BEARING, the same way certificates_linux_store.hpp's
+/// read_cert_entry and guardian_state_reader.cpp's state read say it is: open(2)
+/// on a FIFO with no writer blocks forever, and the S_ISREG check below cannot
+/// run until open returns, so a blocking open would wedge the dispatch thread
+/// before the type filter ever got to reject the node. Symlinks are followed
+/// here by design, so the node need not sit under /etc itself. Once fstat proves
+/// S_ISREG the flag is inert (POSIX: reads of a regular file never block), so
+/// nothing clears it afterwards and no real host behaves differently.
 inline FileRead posix_read_file(const std::string& path) {
-    yuzu::agent::ScopedFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    yuzu::agent::ScopedFd fd(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
     if (!fd) return {errno, {}};
     struct stat st{};
     if (::fstat(fd.get(), &st) != 0) return {errno, {}};
@@ -162,7 +179,10 @@ inline std::optional<std::string> cf_scalar_text(CFTypeRef v) {
     if (CFGetTypeID(v) == CFNumberGetTypeID()) {
         const auto n = static_cast<CFNumberRef>(v);
         long long i = 0;
-        CFNumberGetValue(n, kCFNumberLongLongType, &i);
+        // Returns false for a value that does not convert losslessly (a plist <real>),
+        // leaving `i` truncated. Emitting that would be a quietly-wrong number; nullopt
+        // reaches the caller as "unmodelled", which is the honest answer.
+        if (!CFNumberGetValue(n, kCFNumberLongLongType, &i)) return std::nullopt;
         return std::to_string(i);
     }
     return std::nullopt;
@@ -227,6 +247,10 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
 
 #else
 
+/// Off macOS there is no CFPropertyList. The stub exists so the unguarded parsers
+/// test TU compiles and links on every OS (the platform-guarded-TU-hides-a-dead-leg
+/// rule); it reports failure rather than guessing a shape, and its only caller maps
+/// that to `pwpolicy:plist_unparseable`.
 inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::string_view) {
     return std::nullopt;
 }
