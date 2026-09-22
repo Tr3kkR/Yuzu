@@ -345,7 +345,9 @@ cluster unit; intra-zone scale is more nodes.
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
 `#4324` per-home stream-generation fence done; 4.3a (intra-cluster routing) done; `#4555` (gateway
 multi-node cluster formation) done; 4.4 (`gateway_node` convergence + `#4246` #6 session writeback,
-§7c) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+§7c) done; rest of 4.3 (cross-cluster gateway fan-out, §7d) done.** The remaining WS-4 gate item is
+WS-5 (durable cross-replica session lookup / shared presence). The fenced agent→cluster routing
+directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
 gateway-upstream connect/disconnect/heartbeat paths. **The directory is no longer literally INERT** —
 Task C wired `GatewayRouteStore::lookup_routes` into confined dispatch as a FALLBACK-ONLY consult
@@ -1117,6 +1119,117 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
 not a WS-4 gate item.
+
+### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
+
+**Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
+different node within one Erlang mesh); this closes the CROSS-cluster case §7's model requires —
+multiple independently-meshed gateway clusters, one per trust zone/region, never merged into one mesh
+(Erlang distribution must never span a DMZ/WAN). Core dialed exactly one gateway mgmt endpoint
+(`gw_mgmt_stub_`, one CLI flag) for every command regardless of which cluster the target agent was
+actually behind; `GatewayPendingCmd::cluster_id` was added in 4.2b Task C specifically "carried
+through for 4.3, inert until then."
+
+**Scope: core-side (C++), plus one small, required Erlang fix.** The gateway's own intra-cluster
+fan-out (4.3a's `pg`-group routing) already handles "every agent in this cluster" correctly and needed
+no change for cross-cluster dispatch itself — the job is entirely "core picks the right cluster to
+dial." The one Erlang change (below) is a response-correlation fix a pre-implementation Fable
+adversarial review surfaced, not a routing change.
+
+**What shipped:**
+- **`AgentSession` gains `cluster_id`**, published by `set_gateway_route` in the SAME call, under the
+  SAME `stream_mu` lock as `gateway_node`/capabilities/`stream_home_id` (mirrors `#4324`'s own
+  addition of `stream_home_id` to this call). Previously only the 4.2b directory-fallback path
+  (`send_via_directory`, fired only on a local-registry miss) carried a `cluster_id` onto
+  `GatewayPendingCmd`; the far more common `send_to`/`send_to_all` gateway-session path (fired whenever
+  the agent IS known locally) always left it `nullopt`. Without this, most gateway dispatches in a
+  multi-cluster deployment would still silently target whatever the "default" cluster happened to be.
+- **`GatewayMgmtStubPool`** (`gateway_mgmt_stub_pool.hpp`) — an EAGER, immutable map of
+  `ManagementService::Stub`s, one per configured cluster, built once at server construction (replacing
+  the pre-4.3 single `gw_mgmt_channel_`/`gw_mgmt_stub_` pair). `grpc::CreateChannel` is itself
+  lazy-connecting, so eager construction costs nothing and needs no lock on the dispatch hot path. One
+  shared credentials object is reused across every cluster's channel — the mgmt-plane peer pin (#1422)
+  lives per-cluster on the GATEWAY side, not something core varies its own identity for.
+- **Resolution rule — two modes, not a uniform "empty means default, non-empty unmapped means drop."**
+  The latter (the plan's original design) would have been a BREAKING CHANGE on upgrade: every existing
+  gateway build announces a non-empty `cluster_id` (`YUZU_GW_CLUSTER_ID`, defaulting to the literal
+  `"default"` when unset, `yuzu_gw_upstream.erl`), never an empty string. Corrected rule:
+  **single-cluster mode** (`--gateway-cluster-addr` unset, the default) ignores whatever `cluster_id` a
+  command carries entirely and always resolves to `gateway_command_address` — byte-for-byte the pre-4.3
+  behavior, zero migration required. **Multi-cluster mode** (the flag IS configured) auto-aliases the
+  key `"default"` to `gateway_command_address` (if set and not already an explicit key) and resolves
+  every `cluster_id` against the configured map; an unmapped id is a real config defect (dropped,
+  logged, counted `status="unknown_cluster"`), never a silent fallback to the wrong cluster. A
+  CONNECTED-time early warning fires once per unmapped id in multi-cluster mode, before the first drop.
+- **Config:** `--gateway-cluster-addr cluster_id=host:port` (repeatable/comma-separated,
+  `YUZU_GATEWAY_CLUSTER_ADDR`), parsed by a pure `parse_gateway_cluster_addrs` helper and validated
+  BEFORE `Server::create()` — a malformed/duplicate entry is a CLI exit, not a lenient boot-time
+  warning (unlike `--trusted-nat-cidr`'s own lenient-parse precedent — this is a routing-correctness
+  input, not an advisory allowlist).
+- **Response-agent guard — closes ONE forgery shape, not cross-trust-zone forgery in general (post-
+  governance Fable review, pre-push, caught a false-assurance doc claim in this bullet's original
+  wording).** `forward_gateway_pending` sends exactly one `agent_id` per request but previously applied
+  `resp.agent_id()` from the wire with no check against the request's own target. Single-cluster, this
+  already let a compromised gateway forge a response for any agent it named. Now refused and counted
+  (`status="agent_mismatch"`) rather than applied — but this ONLY catches "cluster Y answers as agent B
+  while core is dialing it for agent A." It does NOT catch, and this slice does NOT close, the more
+  severe shape: **cluster Y first CLAIMS agent A's own identity, then legitimately answers commands core
+  sends for A** — at which point `resp.agent_id()` genuinely matches and the guard never fires.
+  `ProxyRegister` (`gateway_service_impl.cpp`'s "Fast path: agent already enrolled from a prior
+  connection") re-registers ANY already-approved `agent_id` with no per-agent secret — the enrollment
+  token is checked only on a NOT-yet-approved agent — and `register_fresh`'s guarded upsert mints a
+  NEWER epoch for the claimant, so the real agent's later `announce_connected` LOSES the race and is the
+  one that gets treated as stale. `NotifyStreamStatus.cluster_id` is gateway-asserted with nothing
+  binding it to the peer's identity, and it is the sole input to `GatewayMgmtStubPool::resolve()`. Net:
+  pre-4.3, a session hijack by a rogue gateway was at worst a DoS (every command still went to the one
+  configured address, so a hijacked-but-wrong-cluster agent just got `not_connected`). Post-4.3, in
+  MULTI-CLUSTER MODE ONLY, the SAME pre-existing weakness upgrades to command-payload interception
+  (instruction parameters, secrets) and forged terminal results for an agent nominally in a different
+  trust zone — because core now genuinely dials the claimant's own cluster. **Multi-cluster mode does
+  NOT yet provide trust-zone isolation** — do not describe it that way to an operator, and do not treat
+  this guard as the security boundary between clusters; it is a narrow, correct check on a narrower
+  claim than "cross-trust-zone forgery." Tracked as `#4669` (agent↔cluster affinity in
+  `GatewayRouteStore` + per-cluster peer-identity binding at the gateway-upstream listener) — not
+  blocking this slice per the reviewing pass's own recommendation (multi-cluster mode is opt-in with no
+  production deployments today), but must close before multi-cluster mode is presented as providing
+  trust-zone isolation.
+- **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
+  RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
+  after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a
+  bounded-length but still attacker-influenced string remains a metric-cardinality risk.
+- **The one Erlang fix:** `yuzu_gw_mgmt_service.erl`'s `stream_responses/3` (was `/2`) now threads the
+  request's own `CommandId` through and stamps it on a `command_error`-derived response, instead of a
+  hardcoded `command_id => <<>>`. A gateway-side "agent not connected on this cluster" error therefore
+  now correlates to a real command (`forward_gateway_pending` counts it distinctly,
+  `status="not_connected"`, rather than folding it into `"ok"` — `Finish()` still returns `OK` for a
+  streamed error response). This was previously invisible end-to-end (`resolve_execution_id("")` →
+  `nullopt`, no tracker terminal, an orphan response-store row) for a rare case (a genuinely
+  disconnected agent); multi-cluster fan-out makes "agent not connected on the cluster core just
+  dialed" the PRIMARY signal of a stale/wrong cluster resolution, so it had to be correlatable. The
+  `command_error` message tuple itself is unchanged — only what `stream_responses` renders onto the
+  wire — so no other sender/receiver/test needed touching.
+
+**Found by the pre-implementation Fable adversarial review** (same pattern as `#4555` and 4.4 — a
+design-review pass before any code was written): the resolution-rule upgrade-breakage above, the
+response-agent-forgery gap, the metric-label cardinality risk, the pool's original lazy-cache design
+being unnecessary complexity for a closed boot-time config set (switched to eager), and the `1a` Erlang
+fix. All five folded into the shipped design before implementation started, rather than caught in a
+later review round.
+
+**Deliberately unchanged by this slice:** the command-outbox/retry contract. `forward_gateway_pending`
+remains fire-and-forget past `AgentRegistry::gw_pending_` for every terminal-failure branch
+(`unauthenticated`, exhausted `unavailable` retries, and the new `unknown_cluster`/`agent_mismatch`
+branches) — none synthesize a terminal FAILED status the tracker or an API caller can see, only a log
++ counter. §7's own design note ("an undeliverable command stays `pending` in the outbox and is
+re-driven") is therefore only HALF satisfied by WS-4 as a whole: the "dial the owning cluster" half is
+done, the "durable re-drive on failure" half is a pre-existing gap this slice inherits rather than
+introduces. Not filed as a new issue — it is the same shape as the outbox work WS-3 3.3 already owns
+for the leader-driven plane; a future pass wiring gateway-forward failures into that same durable
+outbox is the natural closure, not a bespoke retry mechanism here.
+
+**Remaining WS-4 gate items:** WS-5 (durable cross-replica session lookup / shared presence — this is
+also what makes the 4.2b directory-fallback reader BEHAVIORALLY live, not merely wired, since only then
+can a directory row outlive the writing replica's own in-memory registry).
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:

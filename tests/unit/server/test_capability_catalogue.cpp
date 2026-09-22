@@ -213,6 +213,13 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversib
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
 }};
+// `printing.clear_queue` is deliberately NOT allowlisted here: it is
+// Destructive+Irreversible. Cancelling a job has no compensating Yuzu
+// dispatch (`command_capability.hpp`:42-46's "undone by a subsequent
+// dispatch of the same or a compensating action" contract) — a human
+// re-printing the document from their own application is real-world
+// recoverability, not a `printing.*` action, unlike `set_power_plan`'s
+// genuine second-dispatch undo above.
 
 TEST_CASE("capability catalogue: every Destructive row is Irreversible unless explicitly "
           "allowlisted",

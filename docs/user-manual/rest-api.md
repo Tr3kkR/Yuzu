@@ -5479,6 +5479,38 @@ route's parsing, where any presence of `enabled_only` is treated as true regardl
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
 
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "sched-1", "name": "nightly-scan", "frequency_type": "interval", "enabled": true }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The underlying query is hard-capped at `kScheduleListCap` (100) rows with no `limit`/cursor
+parameter on this route (ADR-0031 WS-A4 schedule seam). When the cap drops rows,
+`pagination.result_truncated_by_cap` is added (`true`) — note this sits under `pagination`, **not**
+nested inside `data` the way the `/executions/{id}/children` cap flag above does; the two routes
+chose different envelope placements and a caller should not assume one shape from the other:
+
+```json
+{
+  "data": [ { "id": "sched-1", "name": "nightly-scan", "frequency_type": "interval", "enabled": true } ],
+  "pagination": { "total": 100, "start": 0, "page_size": 50, "result_truncated_by_cap": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The dashboard fragment (`GET /fragments/schedules`) and the MCP twin (`list_schedules`) share this
+same cap and the same underlying query, and each surfaces the truncation in its own shape: the
+fragment renders a partial-list HTML notice, MCP's `structuredContent` carries its own
+`result_truncated_by_cap` field. See [Dashboard UI — Schedules
+tab](instructions.md#13-dashboard-ui) for the fragment's rendered behaviour.
+
 ---
 
 ### Command/Instruction Responses — v1 read twins (#2146 A2-R2)
@@ -9131,13 +9163,66 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
+#### `GET /api/v1/approvals`
+
+REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below is a separate, unmigrated implementation that emits the same field set today by convention, not by construction. **Permission:** bare `Approval:Read` — approval requests carry no per-agent axis for the ADR-0017 admit-then-filter `fleet_read_fn` chokepoint to confine against (same rationale as `GET /api/v1/schedules` above), so this list is fleet-wide for anyone holding the permission; a reviewer approving or rejecting a ticket needs to see the ticket's full `scope_expression` to make that decision, so confinement-filtering this list would break the maker-checker function itself. Accepts `status` and `submitted_by` query parameters, same as the legacy route. **Omitting `status` returns ALL statuses** — unlike MCP `list_pending_approvals`, which defaults to `pending`-only when its own `status` argument is omitted; a caller wiring both a REST dashboard and an MCP agent against the same queue with no filter gets two different result sets. A supplied `status` outside `pending`/`approved`/`rejected`/`expired` is rejected with `400` (governance fix — previously silently produced an empty result, indistinguishable from a genuinely empty match). The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
+
+**Response (200):**
+
+```json
+{
+  "data": [
+    {
+      "id": "…",
+      "definition_id": "…",
+      "status": "pending",
+      "submitted_by": "alice",
+      "submitted_at": 1735689600,
+      "reviewed_by": "",
+      "reviewed_at": 0,
+      "review_comment": "",
+      "scope_expression": "tag:prod"
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `400` (invalid `status` value); `503` (a genuine store failure, never a false empty list — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
+
+#### `GET /api/v1/approvals/pending/count`
+
+REST v1 twin of the legacy unversioned `GET /api/approvals/pending/count` below and the new MCP `get_pending_approval_count` tool. Requires `Approval:Read`.
+
+**Response (200):**
+
+```json
+{
+  "data": { "count": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `503` (a genuine store failure, never a false zero count — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
+
 #### `GET /api/approvals`
 
-List approvals. Accepts `status` and `submitted_by` as query parameters.
+List approvals. Accepts `status` and `submitted_by` as query parameters. Response shape:
+`{"approvals": [...]}` — a bare array under one key, not the v1 `{data, pagination, meta}`
+envelope above. **Not migrated onto the checked read path**: on a genuine Postgres failure this
+route silently returns `{"approvals": []}` — indistinguishable from a real empty queue — rather
+than a `503`; prefer `GET /api/v1/approvals` or MCP `list_pending_approvals` for failure-honest
+polling. `status` is validated against the same enum as the v1/MCP twins — an unrecognized value
+is rejected with `400` (#2146 A2-R4).
 
 #### `GET /api/approvals/pending/count`
 
-Return the count of instructions awaiting approval.
+Return the count of instructions awaiting approval. Response shape: bare `{"count": N}`, not the
+v1 `{data, meta}` envelope above. **Not migrated onto the checked read path**: on a genuine
+Postgres failure this route silently returns `{"count": 0}` — indistinguishable from a genuinely
+empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count` or MCP
+`get_pending_approval_count` for failure-honest polling.
 
 #### `POST /api/approvals/{id}/approve`
 
@@ -10139,6 +10224,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+| `get_pending_approval_count` | Count pending approval requests |
 
 `query_inventory`, `list_inventory_tables`, and `get_agent_inventory` read the Postgres-backed generic `InventoryStore` (ADR-0037) and now return a JSON-RPC internal-error response (code `-32603`) when the store is unavailable or degraded (previously a silent empty result).
 

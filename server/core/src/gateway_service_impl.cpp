@@ -9,6 +9,7 @@
 #include "audit_store.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
+#include "gateway_mgmt_stub_pool.hpp" // kUnknownGatewayClusterLabel
 #include "grpc_audit_signal.hpp"
 #include "grpc_on_behalf_enforce.hpp"
 #include "guaranteed_state_store.hpp"
@@ -73,6 +74,10 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
 // comparing/storing the oversized value — see the CONNECTED/DISCONNECTED
 // branches below.
 constexpr std::size_t kMaxStreamHomeIdLen = 64;
+
+// HA WS-4 4.3: kMaxClusterIdLen is declared in gateway_service_impl.hpp, not
+// here — see that declaration's comment for why (main.cpp's CLI parser needs
+// it too).
 
 // HA WS-4 slice 4.1 / 4.2b Task B: shared log+metric helper for a degraded
 // GatewayRouteStore write (gateway_route_store.hpp). This function ONLY logs
@@ -239,6 +244,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "announce_connected"}, {"outcome", "malformed_home_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "deregister"}, {"outcome", "malformed_home_id"}});
+        // HA WS-4 4.3: cluster_id ingest clamp, same shape as stream_home_id
+        // above.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "malformed_cluster_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
@@ -1398,6 +1407,32 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             record_directory_desync(metrics_, "announce_connected", "malformed_home_id");
             stream_home_id.clear();
         }
+        // HA WS-4 4.3: cluster_id is gateway-asserted, untrusted input, same
+        // as stream_home_id above — see kMaxClusterIdLen's comment. Clamp
+        // once, here, before it reaches set_gateway_route/announce_connected
+        // (Fable pre-implementation review, 4.3 plan) — it is later used as
+        // a Prometheus metric label's resolution key in
+        // forward_gateway_pending (server.cpp), so an unbounded value is
+        // both a routing-correctness and a metrics-cardinality risk.
+        std::string cluster_id = request->cluster_id();
+        if (cluster_id.size() > kMaxClusterIdLen) {
+            record_directory_desync(metrics_, "announce_connected", "malformed_cluster_id");
+            // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD 2): clamping
+            // to EMPTY made a malformed value indistinguishable from
+            // "legitimately never set" — empty resolves to the "default"
+            // cluster in GatewayMgmtStubPool::resolve() (the correct
+            // behavior for the real "gateway never announced one" case),
+            // so an oversized/malformed cluster_id was silently routed to
+            // whatever cluster "default" happens to be, contradicting
+            // "never a silent fallback to the wrong cluster". Clamp to the
+            // reserved kUnknownGatewayClusterLabel sentinel instead — in
+            // multi-cluster mode this can never match a real configured
+            // key (parse_gateway_cluster_addrs rejects it as a config
+            // value, see main.cpp/gateway_mgmt_stub_pool.hpp), so it
+            // resolves to the genuine unknown_cluster/unmapped_cluster_seen
+            // path instead of a silent default.
+            cluster_id = std::string(yuzu::server::kUnknownGatewayClusterLabel);
+        }
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
         // BLOCKER 2): the session check just above (gateway_sessions_) only
         // proves `session_id` is SOME live entry for this agent — multiple
@@ -1411,7 +1446,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // CONNECTED outright rather than publishing a stale route or
         // continuing to the (now-meaningless) announce_connected write.
         if (!registry_.set_gateway_route(agent_id, session_id, request->gateway_node(),
-                                         std::move(wire_capabilities), stream_home_id)) {
+                                         std::move(wire_capabilities), stream_home_id,
+                                         cluster_id)) {
             spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) is "
                         "no longer the currently-installed session — rejecting the publish "
                         "rather than clobbering a newer registration's placement",
@@ -1451,12 +1487,76 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                              "register_fresh epoch race — skipping directory announce_connected",
                              session_id);
             } else if (auto res = gateway_route_store_->announce_connected(
-                           agent_id, session_id, request->cluster_id(), request->gateway_node(),
+                           agent_id, session_id, cluster_id, request->gateway_node(),
                            kGatewayRouteLeaseTtlSecs, stream_home_id);
                        !res) {
                 record_route_store_failure(metrics_, "announce_connected", res.error());
             } else if (!res->matched) {
                 record_directory_desync(metrics_, "announce_connected", "session_mismatch");
+            }
+        }
+        // HA WS-4 4.3 (Fable pre-implementation review, finding 3): in
+        // multi-cluster mode (known_gateway_clusters_ set), warn once per
+        // unmapped cluster_id so an operator learns a session accepted with
+        // an unroutable cluster BEFORE the first dispatch to it silently
+        // drops, rather than only from the drop itself. nullptr
+        // (single-cluster mode, the default) skips this entirely — every
+        // cluster_id resolves to the legacy stub regardless of its value.
+        if (known_gateway_clusters_ && !cluster_id.empty() &&
+            !known_gateway_clusters_->contains(cluster_id)) {
+            bool first_warning = false;
+            bool cap_reached_transition = false;
+            {
+                std::lock_guard lock(unmapped_clusters_warned_mu_);
+                // sre Gate 3: unmapped_clusters_warned_ is per-entry bounded
+                // (kMaxClusterIdLen) but was previously unbounded in COUNT — a
+                // session cycling through many distinct malformed/misconfigured
+                // cluster_id values grew it indefinitely. Capped the entry
+                // count (below kMaxUnmappedClustersWarned).
+                //
+                // unhappy-path Gate 4 finding (UP-6): the FIRST version of this
+                // cap fix bounded memory correctly but let LOGGING degrade to
+                // unbounded — past the cap, every occurrence of any distinct
+                // id not already in the set re-warned (never inserted, so
+                // "first" every time). A gateway peer already past the
+                // mgmt-plane's mTLS+peer-pin auth (#1422) but varying its
+                // announced cluster_id across reconnects — compromised,
+                // misconfigured, or simply buggy — could still drive an
+                // unbounded per-connect WARN rate (a log/disk-pressure DoS,
+                // distinct from the memory growth the cap already fixed).
+                // Fixed: past the cap, do NOT log per-occurrence at all — only
+                // the metric below (unconditional, every occurrence) keeps
+                // counting. `cap_reached_transition` fires the ONE explicit
+                // "we've stopped logging individually" notice, exactly once,
+                // at the moment the cap is first reached.
+                if (unmapped_clusters_warned_.size() >= kMaxUnmappedClustersWarned) {
+                    first_warning = false;
+                } else {
+                    auto [_, inserted] = unmapped_clusters_warned_.insert(cluster_id);
+                    first_warning = inserted;
+                    cap_reached_transition =
+                        inserted && unmapped_clusters_warned_.size() == kMaxUnmappedClustersWarned;
+                }
+            }
+            if (first_warning) {
+                spdlog::warn("[gateway] Agent {} connected announcing cluster_id '{}', which is "
+                             "not in --gateway-cluster-addr's configured map — commands for this "
+                             "agent (and any other agent on this cluster) will be dropped as "
+                             "unknown_cluster until it is added",
+                             agent_id, cluster_id);
+            }
+            if (cap_reached_transition) {
+                spdlog::warn("[gateway] unmapped cluster_id tracking reached its cap ({} "
+                             "distinct ids) — further distinct unmapped cluster_id values will "
+                             "still be counted (yuzu_server_gateway_forward_total{{status="
+                             "\"unmapped_cluster_seen\"}}) but no longer individually logged",
+                             kMaxUnmappedClustersWarned);
+            }
+            if (metrics_) {
+                metrics_->counter("yuzu_server_gateway_forward_total",
+                                  {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                   {"status", "unmapped_cluster_seen"}})
+                    .increment();
             }
         }
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
