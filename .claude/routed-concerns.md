@@ -1,11 +1,10 @@
 <!-- The "Routed concerns" table of CLAUDE.md (repo root), pulled in by its
      @-import — loaded every session, same authority as CLAUDE.md itself. This
-     file holds the platform/product/data/observability concerns; auth,
-     access-control and request-admission live in the sibling
-     `routed-concerns-access-control.md`; Forensics/per-user-data concerns
-     live in the sibling `routed-concerns-software-estate.md`. Row
-     discipline: catastrophic-if-violated invariants + doc pointers ONLY —
-     detail goes in the routed doc. -->
+     file holds the platform/product/data/observability concerns; siblings
+     `routed-concerns-access-control.md` and `routed-concerns-software-estate.md`
+     hold the rest (CLAUDE.md's own table names each). Row discipline:
+     catastrophic-if-violated invariants + doc pointers ONLY — detail goes
+     in the routed doc. -->
 
 | Concern | Doc | Loaded by |
 |---|---|---|
