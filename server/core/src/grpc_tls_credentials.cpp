@@ -8,6 +8,31 @@
 
 namespace yuzu::server::detail {
 
+namespace {
+
+// #4722 F1: zero the private key material on every exit path, not just the
+// success path. `raw_key` covers the pre-move early returns (missing/unreadable
+// cert or key); once `ssl_opts` exists, `opts` covers the post-move early
+// returns (CA unreadable; no CA and no insecure opt-in) and the success path
+// alike, so the explicit success-path loop this used to require is gone.
+struct KeyZeroGuard {
+    std::string& raw_key;
+    grpc::SslServerCredentialsOptions* opts = nullptr;
+    explicit KeyZeroGuard(std::string& k) : raw_key(k) {}
+    ~KeyZeroGuard() {
+        yuzu::secure_zero(raw_key);
+        if (opts) {
+            for (auto& kc : opts->pem_key_cert_pairs) {
+                yuzu::secure_zero(kc.private_key);
+            }
+        }
+    }
+    KeyZeroGuard(const KeyZeroGuard&) = delete;
+    KeyZeroGuard& operator=(const KeyZeroGuard&) = delete;
+};
+
+} // namespace
+
 std::shared_ptr<grpc::ServerCredentials>
 build_server_tls_credentials(const std::filesystem::path& cert_path,
                               const std::filesystem::path& key_path,
@@ -25,12 +50,14 @@ build_server_tls_credentials(const std::filesystem::path& cert_path,
 
     auto cert = detail::read_file_contents(cert_path);
     auto key = detail::read_file_contents(key_path);
+    KeyZeroGuard key_guard(key);
     if (cert.empty() || key.empty()) {
         spdlog::error("Failed to read {} TLS cert/key files", listener_name);
         return nullptr;
     }
 
     grpc::SslServerCredentialsOptions ssl_opts;
+    key_guard.opts = &ssl_opts;
     grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
     key_cert.private_key = std::move(key);
     key_cert.cert_chain = std::move(cert);
@@ -63,11 +90,7 @@ build_server_tls_credentials(const std::filesystem::path& cert_path,
                      listener_name);
     }
 
-    auto creds = grpc::SslServerCredentials(ssl_opts);
-    for (auto& kc : ssl_opts.pem_key_cert_pairs) {
-        yuzu::secure_zero(kc.private_key);
-    }
-    return creds;
+    return grpc::SslServerCredentials(ssl_opts);
 }
 
 std::shared_ptr<grpc::ChannelCredentials>

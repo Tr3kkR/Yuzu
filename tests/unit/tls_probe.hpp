@@ -432,7 +432,7 @@ public:
             },
             nullptr);
 
-        accept_bio_.reset(BIO_new_accept("0"));
+        accept_bio_.reset(BIO_new_accept("127.0.0.1:0"));
         if (accept_bio_) {
             BIO_set_bind_mode(accept_bio_.get(), BIO_BIND_REUSEADDR);
             if (BIO_do_accept(accept_bio_.get()) > 0) {

@@ -7774,22 +7774,23 @@ public:
         start_web_server();
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
-        // startup_failed_ (SCIM boot failure) and return before launching
-        // the web listener, but by this point the agent/management gRPC
-        // listeners are already live (BuildAndStart above). Re-check here,
-        // before spinning up any more threads or reaching
-        // agent_server_->Wait() below, so a SCIM boot failure genuinely
-        // halts the process instead of serving on the gRPC ports with a
-        // broken web/SCIM surface. stop() is safe to call this early — every
-        // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by the
-        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
-        // it here and letting the destructor run again afterward is a deliberate
-        // no-op the second time (same thread, sequential — not a wait).
+        // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
+        // failure) and return before launching the web listener, but by this
+        // point the agent/management gRPC listeners are already live
+        // (BuildAndStart above). Re-check here, before spinning up any more
+        // threads or reaching agent_server_->Wait() below, so a startup
+        // failure genuinely halts the process instead of serving on the gRPC
+        // ports with a broken web/SCIM surface. stop() is safe to call this
+        // early — every thread/store it joins or resets is
+        // joinable()/nullptr-guarded, and it also runs from ~ServerImpl
+        // (guarded against double-entry by the lifecycle_mu_/teardown_complete_
+        // completion barrier — #3007), so calling it here and letting the
+        // destructor run again afterward is a deliberate no-op the second
+        // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure); stopping the already-started agent/management "
-                         "gRPC listeners.");
+                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
+                         "error); stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }
