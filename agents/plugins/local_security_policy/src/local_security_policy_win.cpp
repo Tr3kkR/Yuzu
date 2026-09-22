@@ -85,7 +85,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -101,9 +100,17 @@ static_assert(kWin32AccessDenied == ERROR_ACCESS_DENIED);
 
 constexpr std::string_view kSecedit = "C:\\Windows\\System32\\secedit.exe";
 
+/// The leading `constrained` is this leg's GENERIC failure-row tag, not a mirror
+/// of `status` -- a PERMISSION_DENIED result also writes `constrained|<token>`,
+/// with the typed status and the token (`secedit:access_denied`) carrying the
+/// distinction. That shape is the declared one (README "Outputs", and the
+/// `row_kind` enum in all four definitions). Built through join_row so the token
+/// passes the same escaper every other row in this plugin uses: today every token
+/// is a literal or a `std::to_string`d integer, and this keeps that a property of
+/// the code rather than of the current token list.
 int emit_failure(yuzu::CommandContext& ctx, YuzuResultStatus status, const std::string& token) {
     ctx.set_result_status(status, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
-    ctx.write_output("constrained|" + token);
+    ctx.write_output(join_row("constrained", {token}));
     return 1;
 }
 
@@ -140,6 +147,13 @@ NtOpenFileFn resolve_ntopenfile() {
 cfs::WinHandle open_candidate_relative(HANDLE root, const std::wstring& wide_name) {
     const NtOpenFileFn fn = resolve_ntopenfile();
     if (fn == nullptr)
+        return {};
+    // An empty ObjectName with RootDirectory set is the NT "reopen the parent"
+    // form, which would hand the sweep a handle to data_dir itself. Unreachable
+    // (the name has already passed is_scratch_dir_name, so it is ASCII and
+    // to_wide cannot empty it), but confined_fs_win.cpp's to_wide_checked refuses
+    // it explicitly and this mirrors that primitive.
+    if (wide_name.empty())
         return {};
     if (wide_name.size() * sizeof(wchar_t) > (std::numeric_limits<USHORT>::max)())
         return {};
@@ -346,14 +360,13 @@ ExportBytes read_export(const std::wstring& file) {
         out.failure = classify_export_read_error(GetLastError());
         return out;
     }
-    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
-        out.failure = ExportReadFailure{false, "secedit:output_not_regular"};
-        return out;
-    }
     const std::uint64_t size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) |
                                info.nFileSizeLow;
-    if (size > kExportMaxBytes) {
-        out.failure = ExportReadFailure{false, "secedit:output_oversized"};
+    if (auto bad = classify_export_object(
+            (info.dwFileAttributes &
+             (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0,
+            size)) {
+        out.failure = std::move(bad);
         return out;
     }
     out.bytes.resize(static_cast<std::size_t>(size));
@@ -371,6 +384,10 @@ ExportBytes read_export(const std::wstring& file) {
         got += n;
     }
     out.bytes.resize(got);
+    if (auto bad = classify_export_read_length(size, got); !bad.empty()) {
+        out.bytes.clear();
+        out.failure = ExportReadFailure{false, std::move(bad)};
+    }
     return out;
 }
 
@@ -391,21 +408,6 @@ RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
         break;
     }
     return RunEnd::Other; // line_limit cannot occur here (no stop_after_max_lines)
-}
-
-/// decode_utf16le_bom may report failure as an optional-like or as an empty
-/// string; both mean "not a usable export" (a real export is never empty).
-template <class R>
-std::optional<std::string> usable_text(R&& r) {
-    if constexpr (requires { r.has_value(); }) {
-        if (!r.has_value())
-            return std::nullopt;
-        std::string s(*r);
-        return s.empty() ? std::nullopt : std::optional<std::string>{std::move(s)};
-    } else {
-        std::string s(std::forward<R>(r));
-        return s.empty() ? std::nullopt : std::optional<std::string>{std::move(s)};
-    }
 }
 
 } // namespace
@@ -429,10 +431,17 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 
     // 128-bit random name, CREATE_NEW, owner-only DACL.
     char scratch_utf8[512]{};
-    if (yuzu_create_temp_dir(std::string{kScratchDirPrefix}.c_str(),
-                             std::string{data_dir}.c_str(), scratch_utf8,
-                             sizeof(scratch_utf8)) != 0)
-        return emit_constrained(ctx, "dest_dir_create_" + std::to_string(GetLastError()));
+    // Named locals, not temporaries in the condition: both would be destroyed at the
+    // end of the full expression, and freeing a non-SSO std::string can itself clobber
+    // GetLastError() before the token is built. temp_file.cpp takes the same precaution
+    // internally and says why.
+    const std::string prefix{kScratchDirPrefix};
+    const std::string parent{data_dir};
+    if (yuzu_create_temp_dir(prefix.c_str(), parent.c_str(), scratch_utf8,
+                             sizeof(scratch_utf8)) != 0) {
+        const DWORD err = GetLastError();
+        return emit_constrained(ctx, "dest_dir_create_" + std::to_string(err));
+    }
 
     ScratchDirGuard scratch(yuzu::win::to_wide(scratch_utf8)); // declared BEFORE the handle
     detail::ScopedHandle dir_handle = open_scratch_dir_handle(scratch.path());
@@ -460,14 +469,13 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
                    : emit_constrained(ctx, exported.failure->token);
     }
 
-    const auto text = usable_text(decode_utf16le_bom(std::span<const std::uint8_t>{
-        exported.bytes.data(), exported.bytes.size()}));
-    if (!text)
-        return emit_constrained(ctx, "secedit:decode_failed");
+    const auto text = decode_utf16le_bom(
+        std::span<const std::uint8_t>{exported.bytes.data(), exported.bytes.size()});
+    if (const auto bad = classify_decoded_export(text); !bad.empty())
+        return emit_constrained(ctx, bad);
 
-    // ASSUMED P83-1 seam (parsers.hpp): SeceditRows secedit_policy_rows(
-    // std::string_view action, const InfSections&) with {rows, failure_token};
-    // reconciled at Phase 4b integration -- adapt THIS call site, never re-add a mapper here.
+    // The INI -> rows mapping is the parsers header's (the one mapper the real-capture
+    // fixture test covers); never re-add a second mapper in this TU.
     const SeceditRows built = secedit_policy_rows(action, parse_inf_sections(*text));
     if (!built.failure_token.empty())
         return emit_constrained(ctx, built.failure_token);

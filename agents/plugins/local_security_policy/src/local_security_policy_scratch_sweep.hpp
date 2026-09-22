@@ -169,4 +169,33 @@ struct ExportReadFailure {
     return {false, "secedit:read_" + std::to_string(win32_error)};
 }
 
+/// The exported object's shape, decided before any byte is read; nullopt = usable.
+/// Lives here rather than in the leg TU so all six `secedit:` wire tokens are
+/// decided by one pure layer and tested on every OS, not just the three that were.
+[[nodiscard]] inline std::optional<ExportReadFailure>
+classify_export_object(bool reparse_or_directory, std::uint64_t size_bytes) {
+    if (reparse_or_directory)
+        return ExportReadFailure{false, "secedit:output_not_regular"};
+    if (size_bytes > kExportMaxBytes)
+        return ExportReadFailure{false, "secedit:output_oversized"};
+    return std::nullopt;
+}
+
+/// A short read is never a complete export: the file is smaller than the size
+/// the handle just reported, so what decoded is a prefix. A truncated-but-
+/// even-length UTF-16LE prefix still decodes and can still carry `[System
+/// Access]`, which would report `absent` for keys the export really holds --
+/// a wrong answer with status OK. Empty string = complete.
+[[nodiscard]] inline std::string classify_export_read_length(std::uint64_t expected,
+                                                             std::uint64_t got) {
+    return got == expected ? std::string{} : "secedit:output_short_read";
+}
+
+/// A real export is never empty, so an empty decode is a failed decode, exactly
+/// like a decode that did not happen. Empty string = usable.
+[[nodiscard]] inline std::string
+classify_decoded_export(const std::optional<std::string>& text) {
+    return (!text || text->empty()) ? "secedit:decode_failed" : std::string{};
+}
+
 } // namespace yuzu::local_security_policy

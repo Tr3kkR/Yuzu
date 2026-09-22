@@ -107,3 +107,39 @@ TEST_CASE("classify_export_read_error: denied vs missing vs other",
     CHECK(kExportMaxBytes == 1048576);
     CHECK(kExportDeadlineMs == 30000);
 }
+
+// Fails under: a shape decision drifting back into the leg TU, where nothing off
+// Windows can observe it. These three tokens are as much of the documented wire
+// contract as the three above; they were the ones minted inline in read_export
+// and collect_windows_policy, so no OS tested them.
+TEST_CASE("classify_export_object: a reparse point or an oversized export is refused",
+          "[local_security_policy][secedit]") {
+    CHECK_FALSE(classify_export_object(false, 0).has_value());           // empty but well-shaped
+    CHECK_FALSE(classify_export_object(false, kExportMaxBytes).has_value()); // exactly at the cap
+    const auto not_regular = classify_export_object(true, 10);
+    REQUIRE(not_regular.has_value());
+    CHECK_FALSE(not_regular->permission_denied);
+    CHECK(not_regular->token == "secedit:output_not_regular");
+    const auto oversized = classify_export_object(false, kExportMaxBytes + 1);
+    REQUIRE(oversized.has_value());
+    CHECK_FALSE(oversized->permission_denied);
+    CHECK(oversized->token == "secedit:output_oversized");
+    // Shape is decided before size: a reparse point is refused as such whatever it measures.
+    REQUIRE(classify_export_object(true, kExportMaxBytes + 1).has_value());
+    CHECK(classify_export_object(true, kExportMaxBytes + 1)->token == "secedit:output_not_regular");
+}
+
+TEST_CASE("classify_export_read_length: a prefix of the export is never a complete one",
+          "[local_security_policy][secedit]") {
+    CHECK(classify_export_read_length(0, 0).empty());
+    CHECK(classify_export_read_length(1274, 1274).empty());
+    CHECK(classify_export_read_length(1274, 1273) == "secedit:output_short_read");
+    CHECK(classify_export_read_length(1274, 0) == "secedit:output_short_read");
+}
+
+TEST_CASE("classify_decoded_export: a failed decode and an empty one are the same answer",
+          "[local_security_policy][secedit]") {
+    CHECK(classify_decoded_export(std::string{"[System Access]\r\n"}).empty());
+    CHECK(classify_decoded_export(std::nullopt) == "secedit:decode_failed");
+    CHECK(classify_decoded_export(std::string{}) == "secedit:decode_failed"); // a real export is never empty
+}
