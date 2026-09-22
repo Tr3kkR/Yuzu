@@ -5,6 +5,21 @@
 // (test_grpc_tls_policy.cpp) can drive the exact production credential
 // construction instead of building its own parallel copy.
 
+// Belt-and-suspenders for whichever TU includes this file: grpc's own port_platform.h defines
+// NOMINMAX before its own windows.h include, but only protects THAT include -- if some earlier,
+// unrelated header in the SAME translation unit already pulled in an unguarded windows.h, the
+// resulting min/max macros stay live for the rest of the file no matter what this header does.
+// Defining them here first is a no-op when the includer already guarded (both branches are
+// idempotent #ifndef), and closes the gap for any includer that doesn't.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/security/server_credentials.h>
 

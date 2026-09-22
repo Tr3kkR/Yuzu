@@ -5,6 +5,21 @@
 // Inner classes extracted: agent_registry, agent_service_impl, gateway_service_impl, event_bus
 // Pre-existing extractions: rest_api_v1, mcp_server
 
+// #4722: this TU's own pre-existing includes pull in <windows.h> transitively somewhere ahead
+// of grpc_tls_credentials.hpp's new grpcpp/security/*.h includes (grpc's own port_platform.h
+// self-guards, but that's no help if windows.h was already fully processed earlier in THIS TU --
+// once min/max are defined by an unguarded windows.h, they stay defined for the rest of the file
+// regardless of what any later header does). Must be first, before any other include: matches
+// key_provider.cpp's established guard, just applied at file scope instead of one include site.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
