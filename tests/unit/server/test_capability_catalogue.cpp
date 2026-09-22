@@ -336,6 +336,10 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
 /// Exact-row pin for the four `local_security_policy` rows (Wave 8): read-only posture
 /// class, so `Security` (the antivirus/bitlocker/firewall/autoruns class), never Inventory.
 /// Literals, not derived from the fragment, so a securable/gate/tier change fails here.
+/// `sudoers` alone pins Medium, not Low (owner decision, 2026-09-22, co-01): its rows carry the
+/// NOPASSWD flag and command allowlist -- a map of where a compromised or careless
+/// account could already run something as root without a password, the same
+/// "gaps in coverage" shape antivirus.av_exclusions' Medium tier is based on.
 TEST_CASE("capability catalogue: local_security_policy rows pin their exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_local_security_policy();
@@ -350,7 +354,8 @@ TEST_CASE("capability catalogue: local_security_policy rows pin their exact clas
         CHECK(row.mutability == Mutability::None);
         CHECK(row.securable == "Security");
         CHECK(row.operation == authz::Operation::Read);
-        CHECK(row.risk_tier == authz::RiskTier::Low);
+        const bool is_sudoers = std::string_view{expected[i]} == "sudoers";
+        CHECK(row.risk_tier == (is_sudoers ? authz::RiskTier::Medium : authz::RiskTier::Low));
         CHECK_FALSE(row.system_reserved);
         CHECK(row.execute_gate == ExecuteGate::None);
     }

@@ -66,7 +66,13 @@ inline constexpr std::array<CommandCapability, 4> kPluginActionCatalogueLocalSec
         .mutability = Mutability::None,
         .securable = "Security",
         .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
+        // Medium, not Low (owner decision, 2026-09-22, co-01): sudoers rows carry the NOPASSWD flag and
+        // the command allowlist -- a map of where a compromised or careless account could
+        // already run something as root without a password, the same "gaps in coverage"
+        // shape antivirus.av_exclusions' Medium tier is based on. Operator-triage metadata
+        // only (no production code branches on risk_tier today), but published verbatim via
+        // yuzu://plugin-docs.
+        .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
     },

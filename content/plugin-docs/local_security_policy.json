@@ -836,7 +836,7 @@
       "execute_gate": "None",
       "mutability": "None",
       "operation": "Read",
-      "risk_tier": "Low",
+      "risk_tier": "Medium",
       "securable": "Security"
     }
   ],
