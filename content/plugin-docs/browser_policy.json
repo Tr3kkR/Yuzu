@@ -225,7 +225,7 @@
     {
       "grant": "None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them",
       "if_refused": "`CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, and the result never reads as \"no policy configured\"",
-      "measured": "Not yet measured; the post-integration capture records it (`docs/samples/linux.txt`)",
+      "measured": "Measured 2026-09-22 in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as euid 501, not by a service-account run on a real host",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
     }
@@ -240,7 +240,7 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap`, `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined)",
+      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined)",
       "status": "`CONSTRAINED`",
       "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, nesting depth) was hit"
     },
@@ -276,18 +276,23 @@
             "provenance": "",
             "status": "OK"
           },
-          "row_count": 0,
-          "rows": [],
+          "row_count": 4,
+          "rows": [
+            "policy|chrome|mandatory|machine|ExtensionInstallForcelist|list|[\"aaaabbbbccccddddeeeeffffgggghhhh;https://clients2.google.com/service/update2/crx\"]|/etc/opt/chrome/policies/managed/seeded.json|-",
+            "policy|chrome|mandatory|machine|HomepageLocation|string|https://intranet.example.com/|/etc/opt/chrome/policies/managed/seeded.json|-",
+            "policy|chrome|mandatory|machine|RestoreOnStartup|int|4|/etc/opt/chrome/policies/managed/seeded.json|-",
+            "policy|chrome|recommended|machine|BookmarkBarEnabled|bool|true|/etc/opt/chrome/policies/recommended/seeded.json|-"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-21",
+        "date": "2026-09-22",
         "host_class": "container",
         "leg_hash": "3349c5d2765b",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
-        "privilege": "euid 0"
+        "privilege": "euid 0 (container seeded with two synthetic Chrome policy files for this capture; see the note under the samples)"
       }
     },
     "macos": {
