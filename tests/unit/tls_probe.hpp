@@ -26,12 +26,15 @@
  * wire (SSL_R_UNEXPECTED_EOF_WHILE_READING — gRPC's TLS stack does not
  * always emit an alert record before closing on a certificate-verification
  * failure or an incompatible legacy protocol version); test callers combine
- * both (see `refused_by_peer` in test_grpc_tls_policy.cpp), together with
- * `connect_ok`, which rules out "the probe never reached the peer at all".
- * A purely local failure (e.g. this probe's own ctx never even offered a
- * compatible protocol) would satisfy "handshake_ok == false" too, but
- * proves nothing about server behaviour — which is why connect_ok is
- * always checked first.
+ * both (see `refused_by_peer` in test_grpc_tls_policy.cpp). A purely local
+ * failure (e.g. this probe's own ctx never even offered a compatible
+ * protocol) would satisfy "handshake_ok == false" too, but proves nothing
+ * about server behaviour, so callers guard against it first: on the
+ * inbound (client-probes-server) direction that guard is `connect_ok`,
+ * which rules out "the probe never reached the peer at all"; on the
+ * outbound (RawTlsServer observes a gRPC client) direction `connect_ok` is
+ * never set, and the equivalent guard is `wait_for_transient_failure`
+ * actually reaching TRANSIENT_FAILURE before `refused_by_peer` is read.
  */
 
 #include <openssl/bio.h>
@@ -474,11 +477,10 @@ public:
         started_ = false;
         if (!accepted_.exchange(true)) {
             // Nobody connected yet — poison-connect to unblock BIO_do_accept.
-            BIO* poison = BIO_new_connect(("127.0.0.1:" + std::to_string(port_)).c_str());
-            if (poison) {
-                BIO_do_connect(poison);
-                BIO_free_all(poison);
-            }
+            std::unique_ptr<BIO, decltype(&BIO_free_all)> poison(
+                BIO_new_connect(("127.0.0.1:" + std::to_string(port_)).c_str()), &BIO_free_all);
+            if (poison)
+                BIO_do_connect(poison.get());
         }
         if (thread_.joinable())
             thread_.join();

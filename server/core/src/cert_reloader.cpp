@@ -144,39 +144,38 @@ CertReloader::build_validation_context(const std::string& cert_pem, const std::s
 
     // Load cert into the validation context.
     {
-        auto* bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
-        auto* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
-        if (!x509 || SSL_CTX_use_certificate(ctx.get(), x509) != 1)
+        std::unique_ptr<BIO, decltype(&BIO_free)> bio(
+            BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size())), &BIO_free);
+        std::unique_ptr<X509, decltype(&X509_free)> x509(
+            bio ? PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr) : nullptr, &X509_free);
+        if (!x509 || SSL_CTX_use_certificate(ctx.get(), x509.get()) != 1)
             ok = false;
-        if (x509)
-            X509_free(x509);
 
         // Load chain certs. SSL_CTX_add_extra_chain_cert takes ownership of
-        // `chain` on success (it must NOT be freed here in that case).
+        // `chain` on success (release() must NOT free it in that case).
         if (bio && ok) {
-            X509* chain = nullptr;
-            while ((chain = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
-                if (SSL_CTX_add_extra_chain_cert(ctx.get(), chain) != 1) {
-                    X509_free(chain);
-                    break;
-                }
+            X509* chain_raw = nullptr;
+            while ((chain_raw = PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)) !=
+                   nullptr) {
+                std::unique_ptr<X509, decltype(&X509_free)> chain(chain_raw, &X509_free);
+                if (SSL_CTX_add_extra_chain_cert(ctx.get(), chain.get()) == 1)
+                    chain.release(); // ownership transferred to ctx
+                else
+                    break; // chain frees itself on scope exit
             }
             ERR_clear_error();
         }
-        if (bio)
-            BIO_free(bio);
     }
 
     // Load key into the validation context.
     if (ok) {
-        auto* bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
-        auto* pkey = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
-        if (!pkey || SSL_CTX_use_PrivateKey(ctx.get(), pkey) != 1)
+        std::unique_ptr<BIO, decltype(&BIO_free)> bio(
+            BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size())), &BIO_free);
+        std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+            bio ? PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr) : nullptr,
+            &EVP_PKEY_free);
+        if (!pkey || SSL_CTX_use_PrivateKey(ctx.get(), pkey.get()) != 1)
             ok = false;
-        if (pkey)
-            EVP_PKEY_free(pkey);
-        if (bio)
-            BIO_free(bio);
     }
 
     // Verify cert/key match in the validation context.
@@ -290,7 +289,19 @@ bool CertReloader::try_reload() {
     // discarded — validating it is the point, not reusing it.
     auto validated = build_validation_context(cert_pem, key_pem);
     if (!validated) {
-        spdlog::error("cert-reload: {}; keeping current certificate", validated.error());
+        // Preserve the exact pre-#4722 operator-facing log text for the two
+        // failure causes that existed before this PR (ops runbooks/dashboards
+        // sometimes grep exact log text); the cipher-policy-application
+        // failure is a genuinely new cause this PR introduces, so it gets its
+        // own line rather than being folded into either legacy string.
+        if (validated.error() == "SSL_CTX_new failed") {
+            spdlog::error("cert-reload: SSL_CTX_new failed");
+        } else if (validated.error() == "SSL context test validation rejected") {
+            spdlog::error("cert-reload: test SSL_CTX validation failed; keeping current "
+                          "certificate");
+        } else {
+            spdlog::error("cert-reload: {}; keeping current certificate", validated.error());
+        }
         ++failure_count_;
         yuzu::secure_zero(key_pem);
         yuzu::secure_zero(cert_pem);

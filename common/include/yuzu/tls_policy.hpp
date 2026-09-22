@@ -115,6 +115,28 @@ enum class CipherPolicyError {
     no_tls12_ciphers,    ///< The list applied but resolved to zero TLS 1.2 ciphers.
 };
 
+/// The exact critical-startup message for each `CipherPolicyError` cause, as
+/// a pure function so the enum-to-message mapping is testable without
+/// needing to actually trigger the underlying OpenSSL failure (in
+/// particular, `context_unavailable` is an OOM-class condition that cannot
+/// be forced in a unit test). The caller (main.cpp) still owns the
+/// `spdlog::critical(...)` call and the `EXIT_FAILURE` decision.
+[[nodiscard]] inline std::string
+describe_cipher_policy_error(CipherPolicyError err, std::string_view list = kTls12CipherList) {
+    switch (err) {
+    case CipherPolicyError::context_unavailable:
+        return "TLS policy: could not create an OpenSSL context to resolve the cipher "
+               "policy — refusing to start";
+    case CipherPolicyError::list_rejected:
+        return std::string("TLS policy: cipher list '") + std::string(list) +
+               "' was rejected outright by this OpenSSL build — refusing to start";
+    case CipherPolicyError::no_tls12_ciphers:
+        return std::string("TLS policy: cipher list '") + std::string(list) +
+               "' resolves to zero TLS 1.2 ciphers in this OpenSSL build — refusing to start";
+    }
+    return "TLS policy: unknown cipher policy error — refusing to start";
+}
+
 /// Resolve `list` against a throwaway `SSL_CTX` and partition the resulting
 /// cipher set by protocol version. Fails if the context could not be
 /// created, the list failed to apply, or it resolved to zero usable TLS 1.2

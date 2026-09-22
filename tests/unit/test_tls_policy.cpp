@@ -89,6 +89,33 @@ TEST_CASE("tls_policy: resolve_cipher_policy rejects an unresolvable or empty li
     CHECK(tls13_only.error() == yuzu::tls::CipherPolicyError::list_rejected);
 }
 
+TEST_CASE("tls_policy: describe_cipher_policy_error gives each cause a distinct message",
+          "[tls_policy]") {
+    // Pure mapping test -- context_unavailable is an OOM-class SSL_CTX_new
+    // failure that cannot be forced here, so this tests the enum-to-message
+    // function directly rather than end-to-end through resolve_cipher_policy().
+    using yuzu::tls::CipherPolicyError;
+    const auto context_msg = yuzu::tls::describe_cipher_policy_error(
+        CipherPolicyError::context_unavailable);
+    const auto list_msg =
+        yuzu::tls::describe_cipher_policy_error(CipherPolicyError::list_rejected, "SOME-LIST");
+    const auto zero_msg = yuzu::tls::describe_cipher_policy_error(
+        CipherPolicyError::no_tls12_ciphers, "SOME-LIST");
+
+    CHECK(context_msg.find("could not create an OpenSSL context") != std::string::npos);
+    CHECK(list_msg.find("was rejected outright") != std::string::npos);
+    CHECK(list_msg.find("SOME-LIST") != std::string::npos);
+    CHECK(zero_msg.find("resolves to zero TLS 1.2 ciphers") != std::string::npos);
+    CHECK(zero_msg.find("SOME-LIST") != std::string::npos);
+
+    // All three distinct -- the whole point of the enum over a single
+    // generic message (an SSL_CTX allocation failure must not be reported
+    // as "your cipher list is bad").
+    CHECK(context_msg != list_msg);
+    CHECK(context_msg != zero_msg);
+    CHECK(list_msg != zero_msg);
+}
+
 TEST_CASE("tls_policy: tls_policy_report_lines names both protocol versions",
           "[tls][tls_policy]") {
     auto r = yuzu::tls::resolve_cipher_policy();
