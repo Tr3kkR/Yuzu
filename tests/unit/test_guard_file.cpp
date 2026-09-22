@@ -671,6 +671,46 @@ void run_retain_across_rearm() {
     CHECK(rig.col().wait_for_detected("<absent>", 30s));
 }
 
+// Regression for sec-1 (the memory-safety fix this branch's whole redesign exists for):
+// ParentIoRelease's abandon-rather-than-free branch, forced deterministically via the
+// test-only hook rather than a genuinely delayed kernel completion (not reproducible from
+// user mode on local NTFS - directory-notify IRP cleanup normally completes synchronously,
+// which is exactly why this hazard needed a dedicated seam rather than a timing-based test).
+// By the time wait_count(1, ...) returns, arm_watch() has already run and P has a genuinely
+// outstanding read (bind()'s successful arm always ends with pending=true), so stop()'s
+// teardown reaches ParentIoRelease with p->pending == true, and the hook forces the drain to
+// report unconfirmed. This asserts the two properties a black-box test CAN give for a hazard
+// whose actual failure mode (a late kernel write into freed memory) is not itself observable
+// from user mode: stop() still returns promptly (the fix's whole point - abandon-not-free must
+// never become a hang) and the process does not crash. It intentionally leaks one ~32KB block
+// (the abandoned ParentIo) - the same accepted, capped trade-off kParentIoAbandonLimit exists
+// for in production, exercised here exactly once. Scoped to the single, definitely-reachable
+// teardown case; the rarer mid-run rebuild-while-genuinely-pending race (a D-triggered rebuild
+// catching an unconsumed P completion) would need a second, more invasive seam to force
+// deterministically and is not attempted here.
+void run_parent_drain_forced_abandon() {
+    yuzu::test::TempDir root("yuzu_test_fgabandon_");
+    fs::create_directories(root.path / "D");
+    const fs::path target = root.path / "D" / "f.txt";
+    write_file(target, "base-content");
+
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-abandon";
+    cfg.path = target.string();
+    cfg.expect_present = true;
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard guard(cfg, [col](const GuardDrift& d) { col->push(d); });
+    guard.set_parent_drain_fail_hook_for_test([] { return true; }); // force every drain to fail
+    REQUIRE(guard.start());
+    REQUIRE(col->wait_count(1, 30s)); // armed + initial compliant report
+
+    const auto t0 = std::chrono::steady_clock::now();
+    guard.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 5s);
+}
+
 // Parks the guard thread inside its first report so notifications pile up unread.
 struct SinkGate {
     std::mutex m;
@@ -774,6 +814,12 @@ TEST_CASE("FileGuard rename: parent watch is retained (not rebuilt) across ordin
           "and sibling churn before a rename",
           "[guardian][guard][file][rename]") {
     run_retain_across_rearm();
+}
+
+TEST_CASE("FileGuard rename: a forced non-drain at teardown is abandoned, not freed, and stop() "
+          "still returns promptly",
+          "[guardian][guard][file][rename]") {
+    run_parent_drain_forced_abandon();
 }
 
 TEST_CASE("FileGuard rename: rename or move alone reports the absent state (file-exists)",

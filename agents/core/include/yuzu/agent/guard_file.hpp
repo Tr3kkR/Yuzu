@@ -112,6 +112,17 @@ public:
 
     const std::string& rule_id() const override { return cfg_.rule_id; }
 
+    /// Test-only. When set, forces the parent-directory watch's teardown (whether a
+    /// mid-run rebuild or run()'s own exit) to treat an otherwise-confirmed cancel
+    /// drain as UNCONFIRMED — i.e. deterministically exercises the abandon-rather-
+    /// than-free path (sec-1) without depending on a real, timing-dependent delayed
+    /// kernel completion, which cannot be forced on local NTFS from user mode. Never
+    /// overrides a genuinely-unconfirmed drain the other way. No-op when unset
+    /// (default; production is unaffected). Set before start().
+    void set_parent_drain_fail_hook_for_test(std::function<bool()> hook) {
+        parent_drain_fail_hook_for_test_ = std::move(hook);
+    }
+
 private:
     void run();
 
@@ -120,6 +131,7 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
     void* stop_event_{nullptr}; ///< HANDLE (void* keeps windows.h out of this header)
+    std::function<bool()> parent_drain_fail_hook_for_test_; ///< test seam; see setter doc
 };
 
 } // namespace yuzu::agent

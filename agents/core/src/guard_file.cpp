@@ -236,6 +236,11 @@ void FileGuard::run() try {
         bool* disabled;
         const std::string* rule_id;
         const std::string* path;
+        // Test-only (see FileGuard::set_parent_drain_fail_hook_for_test's doc). Checked ONLY
+        // when the real drain just confirmed true — never used to fabricate a confirmation out
+        // of a real false, so this can only route execution down the SAME abandon branch a
+        // genuinely wedged driver would take, never invent a new one.
+        const std::function<bool()>* drain_fail_hook;
 
         void operator()(ParentIo* p) const noexcept {
             if (!p)
@@ -245,6 +250,8 @@ void FileGuard::run() try {
                 bool drained = WaitForSingleObject(p->ev.get(), kCancelDrainMs) == WAIT_OBJECT_0;
                 if (!drained) // one bounded extension, matches this file's existing drain convention
                     drained = WaitForSingleObject(p->ev.get(), kCancelDrainMs) == WAIT_OBJECT_0;
+                if (drained && drain_fail_hook && *drain_fail_hook && (*drain_fail_hook)())
+                    drained = false; // test-forced: model a drain that never confirmed
                 if (drained) {
                     DWORD bytes = 0;
                     // Consume the completion so the kernel's bookkeeping settles; the content
@@ -292,7 +299,8 @@ void FileGuard::run() try {
     int p_abandon_count = 0; // consecutive parent-block cancel-drain failures (sec-1)
     bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit
     std::unique_ptr<ParentIo, ParentIoRelease> pio(
-        nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path});
+        nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path,
+                                  &parent_drain_fail_hook_for_test_});
     bool p_logged = false; // the "no parent watch" note is logged once per guard
     int p_failures = 0;    // consecutive failed P completions (handle_p_wake's degraded-cadence
                            // trigger — distinct from p_abandon_count, which counts teardown
