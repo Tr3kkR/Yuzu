@@ -16,11 +16,17 @@
  * path in this header could put one on the wire. See
  * test_browser_inventory_parsers.cpp for a fixture that carries those keys
  * in its input and asserts they never reach a row.
- * EXCEPTION (decided 2026-09-22, not part of this contract): the Linux
- * leg's wire-row builder (browser_inventory_linux_parsers.hpp) prepends
- * the LOCAL OS/home-directory username to disambiguate profiles across
- * users sharing a machine -- that value never passes through this header
- * or BrowserProfileRow, and is not a browsing-account identifier.
+ * TWO EXCEPTIONS (decided 2026-09-22, not part of this contract): (1) the
+ * Linux leg's wire-row builder (browser_inventory_linux_parsers.hpp)
+ * prepends the LOCAL OS/home-directory username to disambiguate profiles
+ * across users sharing a machine -- that value never passes through this
+ * header or BrowserProfileRow, and is not a browsing-account identifier.
+ * (2) BrowserProfileRow.display_name IS a field of this header's row
+ * model, sourced verbatim from info_cache[dir].name -- Chromium-family
+ * browsers commonly auto-populate it from the signed-in account's real
+ * name, so it CAN legitimately carry a personal name; this is an accepted
+ * residual risk (see BrowserProfileRow's own doc comment and the plugin
+ * README's PRIVACY CONTRACT), not something this header filters.
  * No file inside a profile directory ("Preferences", "Secure Preferences",
  * "History", "Cookies", ...) is read by any caller of this header in this
  * release; the per-profile `extensions` action follows as its own PR.
@@ -51,8 +57,13 @@ namespace yuzu::browser_inventory {
 struct BrowserProfileRow {
     std::string profile_dir;  // the info_cache key, e.g. "Default", "Profile 1"
     std::string display_name; // info_cache[dir].name -- a user-editable
-                               // label ("Profile 1", "Work"), never an
-                               // account/real name field. "-" if absent.
+                               // label. Often a generic default ("Profile 1",
+                               // "Work"), but Chromium-family browsers
+                               // commonly auto-populate it from the
+                               // signed-in account's real name -- this CAN
+                               // legitimately be a personal name (accepted
+                               // exception, see the file banner's PRIVACY
+                               // CONTRACT; not filtered). "-" if absent.
     bool active{false};       // dir == profile.last_used
     bool ephemeral{false};    // info_cache[dir].is_ephemeral, default false
 };
@@ -93,30 +104,47 @@ profiles_from_local_state(std::string_view local_state_text) {
     if (!parsed.has_value())
         return std::vector<BrowserProfileRow>{}; // absent file
 
-    std::vector<BrowserProfileRow> rows;
-    const auto& root = *parsed;
-    if (!root.is_object() || !root.contains("profile") || !root["profile"].is_object())
-        return rows;
-    const auto& profile = root["profile"];
-    const std::string last_used = profile.value("last_used", std::string{});
-    if (!profile.contains("info_cache") || !profile["info_cache"].is_object())
-        return rows;
+    // Valid JSON with a schema-drifted type (e.g. a numeric "last_used" or
+    // "name") makes nlohmann::json's typed .value<T>() throw type_error --
+    // syntactically valid input the try_parse() step above cannot catch,
+    // since it only guards the parse itself. Adversarial-review finding
+    // (2026-09-22): this whole semantic-extraction pass is now wrapped so
+    // a type-drifted field reports the SAME documented contract as
+    // malformed JSON (CONSTRAINED/local_state_malformed at the caller),
+    // never an uncaught exception across the plugin ABI (the daemon's own
+    // outer catch, agent.cpp, would still stop it from crashing the
+    // agent, but the operator would see a generic "plugin threw
+    // exception" message instead of the typed status this plugin
+    // otherwise always provides).
+    try {
+        std::vector<BrowserProfileRow> rows;
+        const auto& root = *parsed;
+        if (!root.is_object() || !root.contains("profile") || !root["profile"].is_object())
+            return rows;
+        const auto& profile = root["profile"];
+        const std::string last_used = profile.value("last_used", std::string{});
+        if (!profile.contains("info_cache") || !profile["info_cache"].is_object())
+            return rows;
 
-    // nlohmann::json's default object type is ordered by key (std::map),
-    // so this iteration -- and therefore row order -- is deterministic.
-    for (const auto& [dir, info] : profile["info_cache"].items()) {
-        if (!info.is_object())
-            continue;
-        BrowserProfileRow row;
-        row.profile_dir = dir;
-        row.display_name = info.value("name", std::string{});
-        if (row.display_name.empty())
-            row.display_name = "-";
-        row.active = (dir == last_used);
-        row.ephemeral = info.value("is_ephemeral", false);
-        rows.push_back(std::move(row));
+        // nlohmann::json's default object type is ordered by key
+        // (std::map), so this iteration -- and therefore row order -- is
+        // deterministic.
+        for (const auto& [dir, info] : profile["info_cache"].items()) {
+            if (!info.is_object())
+                continue;
+            BrowserProfileRow row;
+            row.profile_dir = dir;
+            row.display_name = info.value("name", std::string{});
+            if (row.display_name.empty())
+                row.display_name = "-";
+            row.active = (dir == last_used);
+            row.ephemeral = info.value("is_ephemeral", false);
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt; // type-drifted field -- same contract as malformed JSON
     }
-    return rows;
 }
 
 } // namespace yuzu::browser_inventory

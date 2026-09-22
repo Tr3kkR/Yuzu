@@ -58,6 +58,23 @@ TEST_CASE("profiles_from_local_state: malformed JSON returns std::nullopt (parse
     CHECK_FALSE(rows.has_value());
 }
 
+TEST_CASE("profiles_from_local_state: syntactically valid JSON with a schema-drifted field type "
+          "returns std::nullopt, not an uncaught exception",
+          "[browser_inventory][profiles]") {
+    // Adversarial-review finding (2026-09-22): a numeric "last_used" (or
+    // any other typed field mismatch) previously threw nlohmann::json::
+    // type_error uncaught out of this function. MUTATION: removing the
+    // try/catch around the semantic-extraction pass makes this test throw
+    // instead of returning nullopt (Catch2 reports an uncaught exception
+    // as a failure either way, but the point is the documented
+    // CONSTRAINED/local_state_malformed contract, not merely "doesn't
+    // crash").
+    const auto text = std::string{R"({"profile":{"last_used":12345,)"} +
+                       R"("info_cache":{"Default":{"name":"X"}}}})";
+    const auto rows = profiles_from_local_state(text);
+    CHECK_FALSE(rows.has_value());
+}
+
 TEST_CASE("profiles_from_local_state: REAL CAPTURE (Edge) — one profile, 'Default', marked "
           "active, display name is the generic profile label",
           "[browser_inventory][profiles][fixture]") {
@@ -94,6 +111,25 @@ TEST_CASE("profiles_from_local_state: REAL CAPTURE (Edge) — the row never carr
     // No further members exist to reference -- adding one here that reads
     // row.user_name or row.gaia_id is precisely the change that should
     // fail review, not this test.
+}
+
+TEST_CASE("profiles_from_local_state: display_name deliberately passes through a real-name-shaped "
+          "value -- the accepted exception, not a leak",
+          "[browser_inventory][profiles][privacy]") {
+    // Adversarial-review decision (2026-09-22): unlike user_name/gaia_id
+    // (which the struct structurally cannot carry, see the sibling REAL
+    // CAPTURE privacy test above), display_name IS a BrowserProfileRow
+    // field and Chromium-family browsers commonly auto-populate it from
+    // the signed-in account's real name -- this is an accepted residual
+    // risk, not filtered. This inline (not a committed fixture) literal
+    // documents that the parser forwards it as-is, matching the plugin
+    // README's PRIVACY CONTRACT second exception.
+    const auto text = std::string{R"({"profile":{"info_cache":{"Default":{)"} +
+                       R"("name":"Jordan Smith"}}}})";
+    const auto rows = profiles_from_local_state(text);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().display_name == "Jordan Smith");
 }
 
 TEST_CASE("profiles_from_local_state: SYNTHETIC (Chrome) — two profiles, second is ephemeral "

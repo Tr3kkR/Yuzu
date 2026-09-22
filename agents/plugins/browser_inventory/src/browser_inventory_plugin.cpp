@@ -9,8 +9,10 @@
  *                  browser's "Local State" file. Never emits a
  *                  browsing-account identifier -- see
  *                  browser_inventory_parsers.hpp's PRIVACY CONTRACT. The
- *                  Linux leg's row does carry the LOCAL OS username (see
- *                  below), a deliberate, documented exception.
+ *                  Linux leg's row does carry the LOCAL OS username, and
+ *                  every leg's row carries a browser-supplied display
+ *                  name that may be a real name (see below), two
+ *                  deliberate, documented exceptions.
  *   The per-profile "extensions" action follows as its own PR (Secure
  *   Preferences / Preferences settings-map read).
  *
@@ -22,13 +24,16 @@
  * e-mail addresses, Chromium info_cache user_name/gaia_name, browsing
  * history, cookies or bookmarks in any row. Enforced structurally in
  * browser_inventory_parsers.hpp -- BrowserProfileRow simply has no such
- * fields. EXCEPTION (decided 2026-09-22): the Linux leg's wire-row builder
- * (browser_inventory_linux_parsers.hpp) prepends the LOCAL OS/home-
- * directory username to disambiguate profiles across users sharing a
- * machine -- machine-local, not a browsing-account identifier, and never
- * a BrowserProfileRow field. No file inside a profile directory is opened
- * by any leg in this release; the per-profile `extensions` action follows
- * as its own PR.
+ * fields. TWO EXCEPTIONS (decided 2026-09-22): (1) the Linux leg's
+ * wire-row builder (browser_inventory_linux_parsers.hpp) prepends the
+ * LOCAL OS/home-directory username to disambiguate profiles across users
+ * sharing a machine -- machine-local, not a browsing-account identifier,
+ * and never a BrowserProfileRow field. (2) BrowserProfileRow.display_name
+ * (sourced from info_cache[dir].name) CAN legitimately carry the
+ * signed-in account's real name -- Chromium-family browsers commonly
+ * auto-populate it that way; emitted as-is, an accepted residual risk, not
+ * filtered. No file inside a profile directory is opened by any leg in
+ * this release; the per-profile `extensions` action follows as its own PR.
  *
  * WAVE 1 (this package, P2a-1): plugin scaffold + descriptor (2 actions x
  * 3 OS legs, all declared unconditionally per the capability-matrix

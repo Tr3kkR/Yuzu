@@ -36,13 +36,15 @@
  * PRIVACY: every JSON-derived field this leg writes onto the wire comes
  * from BrowserProfileRow (browser_inventory_parsers.hpp), which
  * structurally carries no gaia_id/e-mail/info_cache user_name — see that
- * header's PRIVACY CONTRACT. This leg's OWN row builder additionally
- * prepends the LOCAL OS/home-directory name (the walk's "user") ahead of
- * every profile row — a deliberate, documented exception (decided
- * 2026-09-22, see the plugin's README "PRIVACY CONTRACT"): it disambiguates
- * profiles across users sharing a machine, is machine-local, and is never
- * a browsing-account identifier. Nothing inside a profile directory is
- * opened by this leg.
+ * header's PRIVACY CONTRACT (including its display_name exception:
+ * BrowserProfileRow.display_name, forwarded here as-is, CAN legitimately
+ * carry the signed-in account's real name). This leg's OWN row builder
+ * additionally prepends the LOCAL OS/home-directory name (the walk's
+ * "user") ahead of every profile row — a second deliberate, documented
+ * exception (decided 2026-09-22, see the plugin's README "PRIVACY
+ * CONTRACT"): it disambiguates profiles across users sharing a machine,
+ * is machine-local, and is never a browsing-account identifier. Nothing
+ * inside a profile directory is opened by this leg.
  *
  * WIRE GRAMMAR: every dynamic string field (home-directory name, profile
  * directory name, display name)
@@ -202,6 +204,61 @@ inline DirOpenOutcome open_dir_no_follow_at_checked(int parent_fd, const char* n
         ::openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW));
 }
 
+/// Outcome of a hop-by-hop, O_NOFOLLOW-confined multi-component presence
+/// check: whether the leaf exists as a REGULAR file, plus whether a real
+/// constraint (as opposed to benign absence) occurred anywhere along the
+/// walk.
+struct RegularFilePresence {
+    bool present = false;
+    bool constrained = false;
+    std::string reason;
+};
+
+/// Presence-checks `root / rel_path` (a fixed, '/'-joined relative path;
+/// `rel_path` is always a compile-time literal in this file, never
+/// caller-influenced) one component at a time via openat(..., O_NOFOLLOW),
+/// exactly like every other multi-component open in this file — unlike a
+/// single joined-path `::stat()`, an intermediate component swapped for a
+/// symlink cannot escape confinement to the previously-verified parent.
+/// The leaf itself is `fstatat(..., AT_SYMLINK_NOFOLLOW)`, never followed
+/// either (adversarial-review finding, 2026-09-22: the `browsers` leg's
+/// presence probe previously used a single `::stat()` on the whole joined
+/// path, the one open in this file NOT sharing this discipline).
+inline RegularFilePresence
+regular_file_present_no_follow_at(const std::filesystem::path& root, std::string_view rel_path) {
+    DirOpenOutcome cur = open_dir_no_follow_checked(root.string());
+    if (!cur.handle.valid())
+        return cur.constrained ? RegularFilePresence{false, true, cur.reason}
+                                : RegularFilePresence{false, false, {}};
+
+    // Split rel_path on '/'; every component but the last is a directory
+    // hop, the last is the leaf file to stat.
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= rel_path.size(); ++i) {
+        if (i == rel_path.size() || rel_path[i] == '/') {
+            if (i > start) parts.emplace_back(rel_path.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (parts.empty()) return RegularFilePresence{false, false, {}};
+
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+        cur = open_dir_no_follow_at_checked(::dirfd(cur.handle.get()), parts[i].c_str());
+        if (!cur.handle.valid())
+            return cur.constrained ? RegularFilePresence{false, true, cur.reason}
+                                    : RegularFilePresence{false, false, {}};
+    }
+
+    struct stat st {};
+    if (::fstatat(::dirfd(cur.handle.get()), parts.back().c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        const int err = errno;
+        if (is_benign_absent_errno(err)) return RegularFilePresence{false, false, {}};
+        return RegularFilePresence{false, true, dir_open_constraint_token(err)};
+    }
+    return RegularFilePresence{S_ISREG(st.st_mode), false, {}};
+}
+
 /// Outcome of a bounded per-file read: whether a REAL failure (as opposed
 /// to a benign absence) occurred, and its reason token.
 struct FileReadOutcome {
@@ -282,18 +339,18 @@ void walk_browser_profile_roots(const std::filesystem::path& root,
 
     // A per-user home this agent's own (unprivileged) account cannot enter
     // (EACCES -- e.g. root's 0700 home, or any other account's private
-    // home on a real multi-user host) is expected, routine least-privilege
-    // behaviour, NOT a constraint this leg reports: an unprivileged agent
-    // denied another account's home is not this leg failing to read
-    // something it should have been able to. Folded in with
-    // is_benign_absent_errno's ENOENT case at these two specific call
-    // sites only -- everywhere else (inside a home this leg DID enter --
-    // ~/.config, a browser config dir, a profile dir, a profile file) an
-    // EACCES remains a real constraint, since getting that far means the
-    // parent was readable and a wall deeper in is anomalous, not routine.
-    auto is_benign_home_entry_denial = [](const DirOpenOutcome& outcome) {
-        return outcome.constrained && outcome.reason == "linux:browser_inventory:permission_denied";
-    };
+    // home on a real multi-user host) IS reported as a constraint, like
+    // every other denied open this leg makes (decided 2026-09-22, adversarial
+    // review: an earlier draft treated this specific EACCES as benign/
+    // routine and silently skipped the user, which directly contradicted
+    // this plugin's own docs/agent-privilege-model.md row -- "never a
+    // silently empty result"). Yes, this means CONSTRAINED is the common,
+    // expected status on most real multi-user hosts, since an unprivileged
+    // agent normally cannot read another account's 0700 home -- that is
+    // the honest signal: "profiles" could not fully check every home, not
+    // "no profiles exist." ENOENT (no such home at all) is a different,
+    // genuinely benign case, unaffected by this and still folded into
+    // is_benign_absent_errno inside open_dir_no_follow_at_checked itself.
 
     DirOpenOutcome homes_open = open_dir_no_follow_checked((root / "home").string());
     if (homes_open.constrained) acc.add_failure(homes_open.reason);
@@ -303,8 +360,7 @@ void walk_browser_profile_roots(const std::filesystem::path& root,
             homes_open.handle.get(), kMaxHomeEntries, [&](const struct dirent* entry) {
                 const std::string user(entry->d_name);
                 DirOpenOutcome home_open = open_dir_no_follow_at_checked(homes_fd, entry->d_name);
-                if (home_open.constrained && !is_benign_home_entry_denial(home_open))
-                    acc.add_failure(home_open.reason);
+                if (home_open.constrained) acc.add_failure(home_open.reason);
                 if (home_open.handle.valid()) visit_home(user, ::dirfd(home_open.handle.get()));
                 return true;
             });
@@ -313,8 +369,7 @@ void walk_browser_profile_roots(const std::filesystem::path& root,
     }
 
     DirOpenOutcome root_home_open = open_dir_no_follow_checked((root / "root").string());
-    if (root_home_open.constrained && !is_benign_home_entry_denial(root_home_open))
-        acc.add_failure(root_home_open.reason);
+    if (root_home_open.constrained) acc.add_failure(root_home_open.reason);
     if (root_home_open.handle.valid())
         visit_home("root", ::dirfd(root_home_open.handle.get()));
 }
@@ -331,17 +386,10 @@ linux_browser_rows_at(const std::filesystem::path& root, std::optional<std::stri
     std::vector<std::string> rows;
     yuzu::shared::ConstraintAccumulator acc;
     for (const auto& spec : detail::kBrowserBinaries) {
-        const std::string full = (root / spec.rel_path).string();
-        struct stat st {};
-        if (::stat(full.c_str(), &st) == 0) {
-            rows.push_back(std::string{"browser|"} + spec.browser + "|" +
-                           (S_ISREG(st.st_mode) ? "1" : "0") + "|-");
-        } else {
-            const int err = errno;
-            if (!detail::is_benign_absent_errno(err))
-                acc.add_failure(detail::dir_open_constraint_token(err));
-            rows.push_back(std::string{"browser|"} + spec.browser + "|0|-");
-        }
+        const auto presence = detail::regular_file_present_no_follow_at(root, spec.rel_path);
+        if (presence.constrained) acc.add_failure(presence.reason);
+        rows.push_back(std::string{"browser|"} + spec.browser + "|" +
+                       (presence.present ? "1" : "0") + "|-");
     }
     if (acc.any_failure()) failure_token = acc.reason();
     return rows;

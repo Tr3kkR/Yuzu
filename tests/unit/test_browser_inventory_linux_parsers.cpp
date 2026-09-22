@@ -425,9 +425,10 @@ TEST_CASE("browser_inventory linux: a chmod-000 browser config dir reports const
     REQUIRE(materialize_browser_inventory_tree(dir.path, error));
 
     // alice's Edge config dir exists but cannot be opened: a wall INSIDE a
-    // home this leg did enter (~/.config was readable), which
-    // walk_browser_profile_roots reports as a real constraint -- unlike a
-    // denied home itself, which is routine least-privilege behaviour.
+    // home this leg did enter (~/.config was readable). walk_browser_
+    // profile_roots reports this as a real constraint -- and, since
+    // 2026-09-22, so does a denied home directory itself (see the sibling
+    // "a chmod-000 home directory" case below).
     const auto browser_dir = dir.path / "home" / "alice" / ".config" / "microsoft-edge";
     REQUIRE(::chmod(browser_dir.string().c_str(), 0000) == 0);
 
@@ -444,6 +445,54 @@ TEST_CASE("browser_inventory linux: a chmod-000 browser config dir reports const
     // bob/chrome's rows are unaffected by alice's chmod -- a real failure
     // on one (user, browser) pair never silently absorbs a sibling's
     // successful read -- and alice's rows are absent, not substituted.
+    const bool found_bob = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
+        return row_starts_with(r, "profile|bob|chrome|");
+    });
+    CHECK(found_bob);
+    const bool found_alice = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
+        return row_starts_with(r, "profile|alice|");
+    });
+    CHECK_FALSE(found_alice);
+#endif // !defined(_WIN32)
+}
+
+TEST_CASE("browser_inventory linux: a chmod-000 home directory reports constrained + a reason "
+          "token, not a silent zero-row success",
+          "[browser_inventory][linux][walk]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    // Adversarial-review finding (2026-09-22): a home directory this agent's
+    // own unprivileged account cannot enter was previously treated as
+    // benign/routine and silently skipped -- CONSTRAINED, never a silently
+    // empty result, is docs/agent-privilege-model.md's binding promise for
+    // this plugin, and this case locks that in for the common real-host
+    // shape (an ordinary least-privilege denial on another user's home).
+    using namespace yuzu::browser_inventory::lnx;
+    if (::geteuid() == 0) {
+        SUCCEED("running as root (or CAP_DAC_OVERRIDE) -- permission bits are not enforced, skipping");
+        return;
+    }
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_homechmod000_"};
+    std::string error;
+    REQUIRE(materialize_browser_inventory_tree(dir.path, error));
+
+    const auto alice_home = dir.path / "home" / "alice";
+    REQUIRE(::chmod(alice_home.string().c_str(), 0000) == 0);
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+
+    // Restore permissions before TempDir's destructor tries to remove it.
+    ::chmod(alice_home.string().c_str(), 0700);
+
+    // MUTATION: reintroducing an is_benign_home_entry_denial-style
+    // exemption around the home-entry add_failure calls in
+    // walk_browser_profile_roots fails this REQUIRE.
+    REQUIRE(token.has_value());
+    CHECK(token->find("linux:browser_inventory:permission_denied") != std::string::npos);
+    // bob/chrome is a sibling home, unaffected by alice's denial.
     const bool found_bob = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
         return row_starts_with(r, "profile|bob|chrome|");
     });
