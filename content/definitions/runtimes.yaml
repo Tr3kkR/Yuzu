@@ -8,7 +8,7 @@
 ##            and sdk/<version> directory walk (dotnet);
 ##            /usr/lib/jvm/*/release + /opt/java/*/release file reads (jvm).
 ##
-## macOS AND WINDOWS: planned — follows as its own PR (peripherals PR9.1a2 precedent).
+## macOS AND WINDOWS: planned; the action answers a single unsupported status row on this OS.
 ## Until then every action on those hosts answers a single
 ## `status|<action>|unsupported|<macos|windows>:planned` row. The planned mechanisms
 ## are declared in the plugin descriptor (runtimes_plugin.cpp):
@@ -37,9 +37,9 @@ metadata:
     roots (flavour, version, install path), from directory names only — no
     `dotnet` process is started. A `supported` status with no rows means none
     is installed; a `constrained` status means a read failed and the list may
-    be incomplete. macOS and Windows: planned — follows as its own PR
-    (peripherals PR9.1a2 precedent); those hosts answer a single
-    `status|dotnet|unsupported|<macos|windows>:planned` row.
+    be incomplete. macOS and Windows: planned; the action answers a single
+    unsupported status row on this OS
+    (`status|dotnet|unsupported|<macos|windows>:planned`).
   tags: [runtimes, dotnet, inventory]
 
 spec:
@@ -121,8 +121,8 @@ metadata:
     tells an OpenJDK build from an Oracle JDK). No `java` process is started.
     A `supported` status with no rows means none is installed; a `constrained`
     status means a read failed and the list may be incomplete. macOS and Windows:
-    planned — follows as its own PR (peripherals PR9.1a2 precedent); those hosts
-    answer a single `status|jvm|unsupported|<macos|windows>:planned` row.
+    planned; the action answers a single unsupported status row on this OS
+    (`status|jvm|unsupported|<macos|windows>:planned`).
   tags: [runtimes, jvm, inventory]
 
 spec:
@@ -156,7 +156,7 @@ spec:
         platforms: [linux]
       - name: version
         type: string
-        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION; "-" when neither is present. Status rows: the level (supported, constrained or unsupported).'
+        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint. Status rows: the level (supported, constrained or unsupported).'
         example: 17.0.20
         platforms: [linux]
       - name: install_path

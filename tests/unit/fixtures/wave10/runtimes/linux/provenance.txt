@@ -1,8 +1,10 @@
 Directory: tests/unit/fixtures/wave10/runtimes/linux/
-Package: P1b-1 (runtimes pure parsers). One directory-level provenance file; every
-fixture below is labelled. All three are REAL CAPTURE from command-only Docker
-containers (no long-running service, nothing installed beyond the stated apt packages);
-none is invented or reconstructed.
+Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
+three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest).
+One directory-level provenance file; every fixture below is labelled. The three capture
+files are REAL CAPTURE from command-only Docker containers (no long-running service,
+nothing installed beyond the stated apt packages); tree.manifest carries per-section
+labels, including two RECONSTRUCTION lines named in the file itself.
 
 host:      Docker Desktop (linux/arm64 containers) on macOS
 identity:  root inside the container (the images' default)
@@ -32,3 +34,11 @@ command:   cd /usr/share/dotnet && find shared -mindepth 2 -maxdepth 2 | sort
 note:      the runtime image has no sdk/ directory; the `sdk/<version>` shape is covered
            by inline strings in the test, not by a capture.
 lines:     1 (budget 5)
+
+-- tree.manifest --
+status:    REAL CAPTURE structure (the two release files above verbatim as T: payloads; the
+           /usr/share/dotnet listing above as a D: entry) with two RECONSTRUCTION lines
+           labelled in the manifest: the java-1.17.0-openjdk-arm64 alias being a symlink,
+           and the empty contents of the dotnet version directory.
+loaded by: tests/unit/test_runtimes_linux_parsers.cpp (materialized under a yuzu_test_
+           TempDir per case)

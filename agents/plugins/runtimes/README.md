@@ -23,7 +23,7 @@ flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[runtimes.execute]
   EX --> LIN[Linux leg<br/>no-follow directory walks + release file reads]
-  EX --> PLN[macOS and Windows legs<br/>planned status row]
+  EX --> PLN[macOS and Windows legs<br/>status row only: <os>:planned]
   LIN & PLN --> ROWS[status row + runtime rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
@@ -47,9 +47,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a — leg planned | n/a | n/a | `status\|<action>\|unsupported\|windows:planned`, result status `UNAVAILABLE` |
-| macOS | n/a — leg planned | n/a | n/a | `status\|<action>\|unsupported\|macos:planned`, result status `UNAVAILABLE` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`) | None — the install roots and `release` files are world-readable on stock distributions | container captures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture is `docs/samples/linux.txt` | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
+| Windows | n/a — the leg reads nothing (caveat 1) | n/a | n/a | `status\|<action>\|unsupported\|windows:planned`, result status `UNAVAILABLE` |
+| macOS | n/a — the leg reads nothing (caveat 1) | n/a | n/a | `status\|<action>\|unsupported\|macos:planned`, result status `UNAVAILABLE` |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`) | None expected — stock install trees under `/usr` and `/opt` are world-readable (0755 directories, 0644 `release` files); not measured as `yuzu` (see Measured) | fixture captures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture `docs/samples/linux.txt` ran as `euid 0` in a container, so the unprivileged read is asserted from file modes, not observed | `status\|<action>\|constrained\|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it |
 
 No external binaries, no subprocesses, no shell-out, no network use: the plugin opens directories and reads files only. Every directory is opened `O_NOFOLLOW` hop by hop and enumerated with a per-directory entry cap; the `release` read is bounded to 64 KiB.
 
@@ -122,7 +122,7 @@ status|jvm|supported|-
 
 ## Caveats and known gaps
 
-1. **macOS and Windows legs planned — each follows as its own PR.** Only the Linux leg ships here; on macOS and Windows every action answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with those legs, and the flavour vocabulary above is the Linux subset until then.
+1. **macOS and Windows legs are planned.** Only the Linux leg ships; on macOS and Windows every action reads nothing and answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with the Windows leg, and the flavour vocabulary above is the Linux subset until then.
 2. **Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
 3. **Only standard locations are walked.** A runtime installed elsewhere (a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles.
 

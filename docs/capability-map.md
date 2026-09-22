@@ -1569,7 +1569,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | discovery | Y | Y | Y | Network |
 | netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
-| runtimes | - | Y | - | Software | *Linux leg only; Windows and macOS legs planned — each follows as its own PR* |
+| runtimes | - | Y | - | Software | *Linux leg only; Windows and macOS legs planned* |
 | msi_packages | Y | - | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
