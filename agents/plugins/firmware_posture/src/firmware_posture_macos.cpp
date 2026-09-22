@@ -57,7 +57,14 @@ bool property_text(CFTypeRef v, std::string& out) {
 DtNode read_node(const char* path, std::initializer_list<const char*> keys) {
     DtNode node;
     yuzu::agent::ScopedIOObject entry(IORegistryEntryFromPath(kIOMainPortDefault, path));
-    if (!entry) return node; // no such node: absent
+    // KNOWN LIMITATION (not silent -- disclosed here and in README caveat 6): Apple's own
+    // IOKitLib.h documents IORegistryEntryFromPath's contract as "a handle to the entry ...
+    // or MACH_PORT_NULL on failure" -- one return value, no distinct error code, so a node
+    // genuinely absent and a transient IOKit-level failure (sandboxing, mach-port exhaustion)
+    // are indistinguishable at this call and both read as absent here. This is the same
+    // absent-vs-unreadable risk fixed as FV-CODEX-01 on the Windows leg, but not fixable
+    // here: unlike WMI/SMBIOS, this API surface exposes nothing else to check.
+    if (!entry) return node; // no such node, OR an indistinguishable IOKit-level failure: absent
     for (const char* key : keys) {
         yuzu::agent::ScopedCFRef<CFStringRef> k(
             CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8));
