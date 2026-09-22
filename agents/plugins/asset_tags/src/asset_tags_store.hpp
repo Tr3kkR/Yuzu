@@ -8,31 +8,50 @@
  * failure path, restart reload) is unit-testable without loading the plugin.
  * The pure (de)serialisation lives in asset_tags_parsers.hpp.
  *
- * Write path: sibling `<dest>.tmp`, written and CLOSED (and checked) in its
- * own scope, then renamed over the target. The stream must be closed before
- * anything else touches the temp: an open handle makes the Windows rename
- * fail with a sharing violation. The caller serialises writers (the plugin
- * holds its state mutex across serialise + write), which is what makes the
- * fixed temp name race-free.
+ * Write path (adversarial-review round 1, F1): sibling
+ * `<dest>.tmp.<16 hex>`, the suffix a process-unique random value from
+ * `detail::temp_suffix()` (mirrors agents/core/src/agent_csr.cpp's
+ * random_suffix() and agents/shared/win_reg_handle.hpp's
+ * unique_hive_mount_name() — neither is reachable from a plugin, so this is a
+ * deliberate third copy of the small idiom rather than a new agents/shared
+ * primitive). The temp is created EXCLUSIVELY: POSIX opens it with
+ * O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600 directly (no ofstream, no umask
+ * window — the file is 0600 from the instant it exists); Windows opens it
+ * with `std::ios::noreplace` (C++23 P2467R1; CREATE_NEW semantics). Either
+ * way, a file already at the temp path — planted or left over — makes the
+ * create FAIL; the write never follows a symlink and never overwrites
+ * something it did not create. The guard that removes the temp on a later
+ * failure is armed only AFTER that exclusive create succeeds, so a failed
+ * create (because something is already there) never deletes a path this
+ * process did not create. Once written, the temp is renamed over `dest`.
  *
- * Permissions: on POSIX the closed temp is tightened to 0600 before the
- * rename (checked; a failure is reported as a WriteWarning but does not block
- * persistence). There is a short window between create and chmod where the
- * temp carries the umask-derived mode; accepted because the file holds
- * non-secret operator tags (see the plugin README's sensitivity note). The
- * Windows DACL is not tightened — the same documented follow-up as
- * agent_csr.cpp's write_public_file.
+ * Permissions: on POSIX the exclusive create already leaves the temp at
+ * 0600; it is re-tightened once more before the rename (checked; a failure
+ * is reported as a WriteWarning but does not block persistence) purely so
+ * the on-disk mode stays deterministic under an unusual umask, mirroring
+ * agent_csr.cpp's write_private_key. The Windows DACL is not tightened —
+ * the same documented follow-up as agent_csr.cpp's write_private_key.
  */
 
+#include <atomic>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace yuzu::asset_tags {
 
@@ -49,9 +68,38 @@ struct WriteWarning {
 
 namespace detail {
 
+/// A process-unique, cross-process-unpredictable 16-hex-digit suffix for a
+/// staging temp name: a one-time random_device base (seeded once — no
+/// per-call random_device fd churn) XORed with a monotonic atomic counter.
+/// Unique within the process and unpredictable across processes, without
+/// depending solely on random_device entropy (which can degrade on some
+/// virtualised hosts). Mirrors agents/core/src/agent_csr.cpp's
+/// random_suffix() and agents/shared/win_reg_handle.hpp's
+/// unique_hive_mount_name() byte for byte; neither is reachable from a
+/// plugin (agents/core isn't linked into plugins; win_reg_handle.hpp is
+/// Windows-registry-specific), so this is a small, deliberate third copy —
+/// promoting the idiom into agents/shared is a separate-PR primitive.
+inline std::string temp_suffix() {
+    static constexpr char kHex[] = "0123456789abcdef";
+    static const std::uint64_t base = [] {
+        std::random_device rd;
+        return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+    }();
+    static std::atomic<std::uint64_t> counter{0};
+    std::uint64_t v = base ^ counter.fetch_add(1, std::memory_order_relaxed);
+    std::string s;
+    for (int i = 0; i < 16; ++i) {
+        s += kHex[v & 0xFU];
+        v >>= 4;
+    }
+    return s;
+}
+
 /// Removes the staged temp file on every exit path until dismissed (after
-/// the rename has consumed it). Declared before the stream that creates the
-/// temp, so it runs after that stream is closed.
+/// the rename has consumed it). Constructed by the caller only AFTER the
+/// exclusive create of that path has succeeded — never before: a failed
+/// exclusive create means something is already at that path (planted or
+/// left over) that this process did not create, and must never be deleted.
 class TempFileGuard {
 public:
     explicit TempFileGuard(std::filesystem::path p) : path_(std::move(p)) {}
@@ -97,10 +145,13 @@ read_state_file(const std::filesystem::path& p) {
     return content;
 }
 
-/// Atomically replace `dest` with `bytes` (temp + rename). On success the
-/// value is an optional WriteWarning (engaged only when the POSIX chmod to
-/// 0600 failed; the file was still replaced). The temp never outlives a
-/// failure.
+/// Atomically replace `dest` with `bytes` (exclusive-create temp + rename).
+/// On success the value is an optional WriteWarning (engaged only when the
+/// POSIX chmod-to-0600 re-assertion failed; the file was still replaced).
+/// The temp is created EXCLUSIVELY at a random, unpredictable sibling name
+/// (detail::temp_suffix()) — a pre-existing file at that path, planted or
+/// left over, fails the create instead of being followed or overwritten —
+/// and never outlives a failure.
 [[nodiscard]] inline std::expected<std::optional<WriteWarning>, IoError>
 write_state_file_atomic(const std::filesystem::path& dest, std::string_view bytes) {
     namespace fs = std::filesystem;
@@ -117,22 +168,65 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
     }
 
     fs::path tmp = dest;
-    tmp += ".tmp";
-    detail::TempFileGuard temp_guard{tmp};
+    tmp += ".tmp.";
+    tmp += detail::temp_suffix();
 
+    // Armed only once the exclusive create below has actually created this
+    // file — see the class comment.
+    std::optional<detail::TempFileGuard> temp_guard;
+
+#ifndef _WIN32
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        const int fd =
+            ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd < 0)
+            return std::unexpected(
+                IoError{"cannot create " + tmp.string() + ": " + std::strerror(errno)});
+        temp_guard.emplace(tmp);
+
+        const char* p = bytes.data();
+        std::size_t remaining = bytes.size();
+        bool ok = true;
+        while (remaining > 0) {
+            const ssize_t n = ::write(fd, p, remaining);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue; // interrupted before any byte written -- retry
+                ok = false;
+                break;
+            }
+            if (n == 0) {
+                ok = false;
+                break;
+            }
+            p += n;
+            remaining -= static_cast<std::size_t>(n);
+        }
+        if (::close(fd) != 0)
+            ok = false;
+        if (!ok)
+            return std::unexpected(IoError{"write to " + tmp.string() + " failed"});
+    }
+#else
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc | std::ios::noreplace);
         if (!out)
-            return std::unexpected(IoError{"cannot open " + tmp.string() + " for writing"});
+            return std::unexpected(IoError{"cannot create " + tmp.string() + " for writing"});
+        temp_guard.emplace(tmp);
+
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         out.flush();
         out.close();
         if (!out)
             return std::unexpected(IoError{"write to " + tmp.string() + " failed"});
     }
+#endif
 
     std::optional<WriteWarning> warning;
 #ifndef _WIN32
+    // The exclusive create above already left the temp at 0600; re-assert it
+    // once more so the on-disk mode stays deterministic under an unusual
+    // umask (agent_csr.cpp's write_private_key does the same).
     fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace,
                     ec);
     if (ec)
@@ -144,7 +238,7 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
     if (rename_ec)
         return std::unexpected(IoError{"cannot rename " + tmp.string() + " over " + dest.string() +
                                        ": " + rename_ec.message()});
-    temp_guard.dismiss();
+    temp_guard->dismiss();
     return warning;
 }
 

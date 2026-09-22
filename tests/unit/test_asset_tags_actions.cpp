@@ -324,6 +324,11 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
             "asset_tags",
             {{"agent.data_dir", data_dir.string()}, {"asset_tags.check_interval", "30x"}});
         REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+        // shutdown() joins the plugin's check thread; run it on every exit
+        // from this block, including a fatal REQUIRE below, or an unwound
+        // cycle leaves that thread alive in a dlclose'd library (PluginHandle
+        // dlcloses on destruction) -- a crash, not a leak.
+        yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
 
         auto rows = captured_rows(run(*plugin, "status").captured);
         REQUIRE(rows.size() == 8);
@@ -368,8 +373,6 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(has_row(rows, "tag|role|web"));
         rows = captured_rows(run(*plugin, "status").captured);
         CHECK(has_row(rows, "tag|role|web"));
-
-        plugin->descriptor->shutdown(ctx.get());
     }
 
     // ── Cycle 2: a valid snapshot and a below-floor interval load. ─────────
@@ -387,6 +390,7 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
             "asset_tags",
             {{"agent.data_dir", data_dir.string()}, {"asset_tags.check_interval", "10"}});
         REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+        yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
 
         auto rows = captured_rows(run(*plugin, "status").captured);
         REQUIRE(rows.size() == 8);
@@ -398,7 +402,5 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[5] == "stale|false");
         CHECK(rows[6] == "check_interval|30"); // floored
         CHECK(rows[7] == "change_count|2");
-
-        plugin->descriptor->shutdown(ctx.get());
     }
 }

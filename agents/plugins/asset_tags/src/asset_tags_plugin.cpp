@@ -100,7 +100,10 @@ void check_thread_fn() {
             (now - g_state.last_sync_epoch) > g_check_interval_s.load(std::memory_order_relaxed)) {
             if (!g_state.stale) {
                 g_state.stale = true;
-                // Save updated stale flag
+                // In-memory only, deliberately not persisted: `status` reports
+                // it live, the next `sync` writes `stale=false` to disk, and
+                // after a restart the flag re-derives from `last_sync_epoch`
+                // on the next check tick.
             }
         }
     }
@@ -215,7 +218,12 @@ private:
         {
             // One critical section: mutate, snapshot, and persist under the
             // same lock so the file is always one consistent state and
-            // successive syncs' writes are ordered (S21).
+            // successive syncs' writes are ordered (S21). Readers
+            // (do_status/do_get/do_changes) and the staleness check thread
+            // take the same lock, so a stalled data_dir filesystem stalls
+            // every action of this plugin, not just sync -- accepted: a
+            // small local file, and the alternative serialises the same I/O
+            // behind more code (M3).
             std::lock_guard lock(g_mu);
             new_changes = apply_sync(g_state, values, now);
 
