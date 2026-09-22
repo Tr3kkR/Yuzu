@@ -393,6 +393,7 @@ TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware
     CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.NameHasNoOwner", 0) == FwupdOutcome::unavailable);
     CHECK(classify_fwupd_error("org.freedesktop.fwupd.NothingToDo", 0) == FwupdOutcome::no_devices);
     CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.AccessDenied", 0) == FwupdOutcome::denied);
+    CHECK(classify_fwupd_error("org.freedesktop.fwupd.PermissionDenied", 0) == FwupdOutcome::denied);
     CHECK(classify_fwupd_error("", 2) == FwupdOutcome::unavailable); // no bus socket
     CHECK(classify_fwupd_error("", 13) == FwupdOutcome::denied);
     CHECK(classify_fwupd_error("", 5) == FwupdOutcome::failed);
