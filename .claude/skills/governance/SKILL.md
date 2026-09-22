@@ -337,7 +337,7 @@ IMPACT/EXPOSURE and they always gate:
     tuning doc
   - a violation of an explicit MUST / never / catastrophic-if-violated invariant.
     CLOSED to three sources, so floor membership is not a judgement call: a
-    catastrophic-if-violated clause in a row of any of the three `.claude/routed-concerns*.md` tables; a
+    catastrophic-if-violated clause in a row of any of the four `.claude/routed-concerns*.md` tables; a
     CLAUDE.md sentence inside a standing-rule or invariant block; an accepted
     ADR's normative requirements. NARRATIVE prose does not qualify — an ADR
     saying a thing "never landed" is history, not a contract. If you cannot
@@ -433,7 +433,7 @@ and nothing else:
   4. `CLAUDE.md` or a routed-concern row, for a new architectural invariant, store,
      ABI pattern or release gate
   5. an audit-action, permission or error-code table the change's contract touches
-  6. a doc a row of any of the three `.claude/routed-concerns*.md` tables names as an **update obligation for
+  6. a doc a row of any of the four `.claude/routed-concerns*.md` tables names as an **update obligation for
      the changed surface** — whether operator-facing (a user-manual page for a
      changed feature) or author-facing (a migration ladder, a capability registry,
      a per-surface invariants doc that records each change as it lands). What it is
