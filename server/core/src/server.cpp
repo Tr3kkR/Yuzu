@@ -12129,7 +12129,114 @@ private:
         }
     }
 
+    /// #4672: synthesize and apply a terminal FAILURE `CommandResponse` for a
+    /// gateway-forwarded command whose delivery will never otherwise resolve
+    /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
+    /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
+    /// `agent_mismatch` branches — see that function's own comments). Routes
+    /// through `process_gateway_response` — the SAME mechanism every real
+    /// gateway response already takes at this function's other call sites —
+    /// so the command_id resolves via the one established
+    /// `notify_exec_tracker` terminal-write path (executions-history-ladder
+    /// routed concern: exactly once, never a bespoke second mechanism).
+    ///
+    /// STATIC and takes `svc` explicitly (never `this`) ON PURPOSE: every
+    /// call site inside `forward_gateway_pending`'s detached per-command
+    /// thread reaches this through the ALREADY-captured `svc = &agent_service_`
+    /// raw pointer — that thread is `std::thread(...).detach()`ed and,
+    /// per #3279 (see the block a few hundred lines up this file, "KNOWN GAP,
+    /// filed as #3279, NOT fixed here"), is untracked by every shutdown
+    /// drain/quiesce mechanism this server has. #3279's own destruction-order
+    /// analysis is scoped to the raw pointers ALREADY captured there
+    /// (`svc`/`metrics`/the resolved `Stub*`); widening that detached thread's
+    /// reach with a fresh `this` capture — which this synthesis could
+    /// otherwise be tempted to take, to reach `command_outbox_store_`/
+    /// `leader_elector_` for a durable-outbox re-drive — would extend a
+    /// KNOWN, separately-tracked, human-adjudicated lifetime hazard rather
+    /// than closing this issue's own scope. See `forward_gateway_pending`'s
+    /// doc comment for the resulting, deliberate design boundary: every
+    /// branch here resolves IMMEDIATELY rather than rescheduling.
+    static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
+                                                        const std::string& agent_id,
+                                                        const std::string& command_id,
+                                                        const std::string& reason_code,
+                                                        const std::string& detail_msg) {
+        svc->process_gateway_response(
+            agent_id, yuzu::server::build_gateway_forward_terminal_failure(
+                          command_id, reason_code, detail_msg));
+    }
+
     /// Forward any commands queued for gateway-connected agents.
+    ///
+    /// #4672 (durable resolution of the terminal-failure branches — this
+    /// function's own catastrophic-if-violated gap before this change: a
+    /// command hitting `unauthenticated`, exhausted `unavailable`,
+    /// `unknown_cluster`, `agent_mismatch`, or a generic non-UNAVAILABLE
+    /// grpc status ("other") was logged, counted, and dropped — the
+    /// dispatching operator's command_id then NEVER resolved, silently,
+    /// forever). Every one of those FIVE branches (pr-rev finding
+    /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
+    /// said "four", undercounting the pre-existing "other" branch this same
+    /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
+    /// now calls `apply_gateway_forward_terminal_failure` exactly once
+    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// unresolved command_id ALWAYS eventually reaches a terminal state —
+    /// "ALWAYS" describes the per-command retry loop below; the null/empty
+    /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
+    /// a clean `Finish()` with zero frames (#4691, still open), are the
+    /// two paths outside that loop the same claim must also hold for or be
+    /// scoped around — the former is now resolved through the same helper
+    /// (see that branch's own comment); the latter is not, and is tracked.
+    ///
+    /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
+    /// ALL FIVE branches — including the transient-looking exhausted-
+    /// `unavailable` case, which ADR-2002 §7's design note originally
+    /// intended to "stay pending... and be re-driven [with backoff]" the way
+    /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
+    /// does for `route_unreadable`/`containment_unreadable`. Two independent
+    /// reasons that mechanism cannot be safely reused here without a
+    /// SEPARATE, dedicated change (tracked as a documented follow-up, not
+    /// silently deferred):
+    ///
+    ///   1. GRANULARITY MISMATCH. `command_outbox_store`'s producer API
+    ///      (`claim_and_enqueue`) is epoch-fenced and its ONLY existing
+    ///      producer (`ScheduleRunner`) runs strictly inside a
+    ///      `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the whole
+    ///      point of the fence is that only a caller who has ALREADY
+    ///      confirmed leadership calls it. `forward_gateway_pending` is
+    ///      reachable from every replica via ordinary operator-synchronous
+    ///      dispatch (REST/MCP/dashboard), never gated on leadership, so an
+    ///      enqueue attempt here would silently no-op on a non-leader
+    ///      replica (`LeaderElector::epoch()` returns `nullopt` — there is no
+    ///      epoch to embed) — an inconsistent, replica-dependent retry that
+    ///      is worse than today's uniform drop. And `command_outbox_delivery`'s
+    ///      own "sent" means "the confined-dispatch resolution QUEUED it"
+    ///      (`ConfinedDispatchOutcome::sent`), not "the gateway RPC actually
+    ///      completed" — reusing its generic `DispatchFn` path for a
+    ///      redelivery would mark the occurrence `sent`/terminal in the
+    ///      outbox the instant `send_to` re-queues it, racing and swallowing
+    ///      the very gateway failure this redelivery exists to observe.
+    ///
+    ///   2. #3279 (see the KNOWN GAP block documented a few hundred lines up
+    ///      this file). This function's own detached per-command
+    ///      `std::thread(...).detach()` is untracked by every shutdown
+    ///      drain/quiesce mechanism this server has, and its raw-pointer
+    ///      capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+    ///      carefully-scoped, individually-justified exception to that gap —
+    ///      not a precedent to extend. A durable-retry producer would need
+    ///      that thread to ALSO touch `command_outbox_store_`/
+    ///      `leader_elector_`, widening #3279's reach into two more
+    ///      ServerImpl-owned stores with no existing destruction-order
+    ///      analysis covering them. #3279 is explicitly "deferred to Dave to
+    ///      adjudicate" — expanding its blast radius as a side effect of this
+    ///      issue would be scope creep into a separately-tracked, human-owned
+    ///      decision, not a fix for it.
+    ///
+    /// `docs/adr/2002-high-availability-architecture.md` §7 is updated
+    /// alongside this change to describe the gateway-forwarding path
+    /// accurately: immediate terminal resolution today, with the durable
+    /// re-drive this function's comment above describes as a documented,
+    /// scoped-out follow-up (blocked on #3279).
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
         if (gw_pending.empty())
@@ -12159,6 +12266,22 @@ private:
                              {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
                               {"status", "unavailable"}})
                     .increment(static_cast<double>(gw_pending.size()));
+                // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+                // the metric/log above previously left every drained command's
+                // command_id unresolved -- the exact "stuck forever" shape
+                // #4672 exists to close, just reached via a different branch
+                // (an unusable pool/stub rather than a per-command RPC
+                // failure). Resolve each one through the SAME helper the
+                // per-command retry loop below uses, so this path is no
+                // longer a silent exception to the "always reaches a
+                // terminal state" contract.
+                for (auto& gp : gw_pending) {
+                    apply_gateway_forward_terminal_failure(
+                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
+                        "Gateway command forwarding is configured but not usable "
+                        "(mutual-TLS credential construction likely failed at boot) "
+                        "— command not delivered");
+                }
             }
             return;
         }
@@ -12182,6 +12305,20 @@ private:
                     .counter("yuzu_server_gateway_forward_total",
                              {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
                     .increment();
+                // #4672: a definite config gap (this cluster_id has no
+                // configured mgmt address AT ALL, resolved deterministically
+                // against boot-time config) — not a degraded read, so this is
+                // the "answered no" case dispatch_confined_arms.hpp's
+                // route_unreadable doc comment distinguishes from "the read
+                // itself could not answer", and not worth a durable backoff
+                // retry: it self-heals only via an operator adding
+                // --gateway-cluster-addr, which time alone does not fix.
+                // Resolve the command_id terminally now rather than leaving
+                // it stuck forever.
+                apply_gateway_forward_terminal_failure(
+                    &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
+                    "No configured mgmt address for cluster '" +
+                        gp.cluster_id.value_or("<none>") + "' — command not delivered");
                 continue;
             }
             auto* stub = resolution.stub;
@@ -12197,6 +12334,28 @@ private:
                 req.add_agent_ids(gp.agent_id);
                 *req.mutable_command() = gp.cmd;
                 req.set_timeout_seconds(300);
+
+                // #4672 Gate-2/Gate-3 fix (security-guardian HIGH + cpp-safety
+                // BLOCKING, independently confirmed): this MUST live outside
+                // the retry loop, not per-attempt. `process_gateway_response`
+                // is not idempotent — a second terminal write for the same
+                // command_id is a silent tracker overwrite plus a duplicate
+                // response_store row, not a safe no-op. A real terminal frame
+                // can be legitimately applied in one attempt (e.g. `Read()`
+                // delivers it) and THAT SAME attempt's `Finish()` can still
+                // report a transport-level non-OK status (stream fault after
+                // the last frame, before a clean close) or an earlier attempt
+                // can apply a response while a LATER attempt independently
+                // hits UNAUTHENTICATED/other/exhausted-UNAVAILABLE. Every
+                // synthesizing call site below must be gated on this,
+                // cumulative across the whole command's attempts — only the
+                // `agent_mismatch` site (status.ok() branch) was gated
+                // before this fix; the other three (UNAUTHENTICATED, the
+                // generic "other" branch, and exhausted-retries) were not,
+                // which could clobber an already-applied real SUCCESS/FAILURE
+                // with a synthetic FAILURE — a worse defect than the
+                // stuck-forever bug this issue set out to close.
+                bool applied_terminal = false;
 
                 // Retry up to 3 times on transient connection failures
                 for (int attempt = 0; attempt < 3; ++attempt) {
@@ -12271,10 +12430,34 @@ private:
                                 auto repaired = resp.response();
                                 repaired.set_command_id(cmd_id);
                                 svc->process_gateway_response(resp.agent_id(), repaired);
+                                // kNotConnected's classify_gateway_forward_response
+                                // contract guarantees this repaired frame is ALWAYS
+                                // FAILURE (exit_code=-1, output="not_connected"/
+                                // "agent_disconnected") -- unconditionally terminal,
+                                // safe to mark without a status() check.
+                                applied_terminal = true;
                                 continue;
                             }
                         }
+                        // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER,
+                        // 2026-09-22, empirically confirmed by both
+                        // reviewers independently): a kApply frame is NOT
+                        // guaranteed terminal -- `process_gateway_response`
+                        // also accepts a RUNNING progress frame. The
+                        // previous unconditional `applied_terminal = true`
+                        // here meant a single RUNNING frame, followed by a
+                        // stream fault and exhausted retries, permanently
+                        // suppressed every synthetic terminal-failure site
+                        // below (all four gate on `!applied_terminal`) --
+                        // the command_id stayed RUNNING forever, exactly
+                        // the bug #4672 exists to close, reintroduced via
+                        // this guard's own over-broad predicate. Only a
+                        // TERMINAL status (anything but RUNNING) may
+                        // suppress the synthetic-failure sites; a RUNNING
+                        // frame is real progress, not a resolution.
                         svc->process_gateway_response(resp.agent_id(), resp.response());
+                        if (yuzu::server::is_terminal_command_status(resp.response().status()))
+                            applied_terminal = true;
                     }
                     auto status = reader->Finish();
                     if (status.ok()) {
@@ -12290,6 +12473,20 @@ private:
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label}, {"status", "ok"}})
                                 .increment();
+                        } else if (!applied_terminal) {
+                            // #4672: every frame this stream carried (if any)
+                            // was agent_mismatch — never not_connected/apply,
+                            // both of which already resolve the command_id
+                            // above. Nothing legitimate ever answered for
+                            // OUR agent. Treated as a security-relevant
+                            // anomaly (possible cross-cluster response
+                            // forgery / stale cluster resolution), not a
+                            // transient condition worth retrying — resolve
+                            // now rather than leaving the command_id stuck.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_agent_mismatch",
+                                "Gateway forwarding produced no legitimate response for this "
+                                "agent (agent mismatch) — command not delivered");
                         }
                         return; // success — done
                     }
@@ -12311,11 +12508,34 @@ private:
                             "gateway-connected agents is DOWN until the pin and "
                             "the server leaf agree. Command dropped.",
                             cmd_id);
-                        metrics
-                            ->counter("yuzu_server_gateway_forward_total",
-                                     {{"cluster_id", cluster_label},
-                                      {"status", "unauthenticated"}})
-                            .increment();
+                        // #4672 (fixed post-Gate-2/3: security-guardian HIGH
+                        // + cpp-safety/cpp-expert independently confirmed) —
+                        // gate on `applied_terminal`: an earlier attempt, or
+                        // this same attempt's `Read()` loop, may already have
+                        // applied a real terminal frame before `Finish()`
+                        // surfaced this UNAUTHENTICATED status. Synthesizing
+                        // here anyway would silently overwrite that real
+                        // result (tracker last-write-wins) and insert a
+                        // duplicate response_store row.
+                        //
+                        // Gate 4 happy-path SHOULD (2026-09-21): the metric
+                        // increment is gated TOO, symmetric with the write —
+                        // a command that already resolved SUCCESS on an
+                        // earlier attempt must not also bump
+                        // {"status","unauthenticated"} on a later attempt's
+                        // Finish(), which would tell an operator a command
+                        // failed when it actually succeeded.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "unauthenticated"}})
+                                .increment();
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
+                                "Gateway REJECTED by the gateway's mgmt-plane peer pin "
+                                "(UNAUTHENTICATED) — command not delivered");
+                        }
                         return; // config defect — retry cannot help
                     }
                     // Only retry on UNAVAILABLE (connection refused / not ready)
@@ -12323,20 +12543,75 @@ private:
                         spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
                                      status.error_message(),
                                      static_cast<int>(status.error_code()));
-                        metrics
-                            ->counter("yuzu_server_gateway_forward_total",
-                                     {{"cluster_id", cluster_label}, {"status", "other"}})
-                            .increment();
+                        // #4672: same "resolve now, don't leave the
+                        // command_id stuck" posture as every other terminal
+                        // branch here — this one is not among the issue's
+                        // four named branches, but the shape (and the fix)
+                        // is identical, and leaving it unresolved while every
+                        // sibling branch resolves would just move the bug
+                        // rather than close it. Same `applied_terminal` guard
+                        // (write AND metric, see the UNAUTHENTICATED branch
+                        // above) as every other branch here.
+                        //
+                        // Gate 4 consistency-auditor SHOULD (2026-09-21): the
+                        // metric label ("other") intentionally does NOT match
+                        // the reason code ("gateway_forward_failed") below —
+                        // this branch covers every non-UNAVAILABLE grpc
+                        // status OTHER than UNAUTHENTICATED (which has its
+                        // own label/code pair above), so "other" is the
+                        // correct, deliberately generic metric bucket for a
+                        // more specific, per-occurrence reason code. Every
+                        // other branch's label and code DO match 1:1; this is
+                        // the one deliberate exception.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "other"}})
+                                .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
+                            // 2026-09-22): the raw status.error_message()
+                            // (peer addresses, TLS/HTTP2 transport text) is
+                            // already captured, unfiltered, in the spdlog::warn
+                            // a few lines up — the other four synthesis sites
+                            // all use a curated, static message; match that
+                            // convention here instead of persisting raw
+                            // transport text into error_detail. The numeric
+                            // grpc status code (already logged above too) is
+                            // enough to correlate a stored row back to the
+                            // server log line that has the full text.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_forward_failed",
+                                "Gateway SendCommand RPC failed with grpc status " +
+                                    std::to_string(static_cast<int>(status.error_code())) +
+                                    " — see server logs for the transport error detail");
+                        }
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
                                  cmd_id, attempt + 1, status.error_message());
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                metrics
-                    ->counter("yuzu_server_gateway_forward_total",
-                             {{"cluster_id", cluster_label}, {"status", "unavailable"}})
-                    .increment();
+                // #4672: retries exhausted (3 attempts, exponential backoff)
+                // — a transient-LOOKING failure that has, for THIS dispatch,
+                // behaved exactly like a permanent one. Resolve the
+                // command_id terminally now. See forward_gateway_pending's
+                // own doc comment for why this is immediate-terminal rather
+                // than a durable outbox re-drive (granularity mismatch +
+                // #3279 — deliberately scoped out, not silently dropped;
+                // tracked as #4690).
+                // Same `applied_terminal` guard (write AND metric) as the two
+                // branches above — an earlier attempt in this same 3-try
+                // loop may have already applied a real terminal frame before
+                // a later attempt exhausted on UNAVAILABLE.
+                if (!applied_terminal) {
+                    metrics
+                        ->counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", cluster_label}, {"status", "unavailable"}})
+                        .increment();
+                    apply_gateway_forward_terminal_failure(
+                        svc, expected_agent_id, cmd_id, "gateway_unavailable",
+                        "Gateway unreachable after 3 attempts — command not delivered");
+                }
             }).detach();
         }
     }

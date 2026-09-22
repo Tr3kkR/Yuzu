@@ -328,7 +328,11 @@ cluster unit; intra-zone scale is more nodes.
 - **Northbound (server→gateway):** the minting server reads the directory and dials the owning
   cluster; an undeliverable command (cluster unreachable, stale/expired lease, agent mid-migration)
   stays `pending` in the outbox (§6) and is re-driven — with receiver dedup absorbing any double
-  delivery during a re-home race.
+  delivery during a re-home race. **Scoped by §7e (#4672):** this design note describes the
+  LEADER-DRIVEN background plane's `route_unreadable` reschedule (§6/WS-3 3.3). The
+  `forward_gateway_pending` detached-thread forwarding path specifically does NOT enqueue into that
+  outbox — see §7e for why and what it does instead (immediate terminal resolution, never a durably
+  re-driven `pending` row).
 - **`gateway_node` convergence is a first-class requirement (finding 6b).** Today an agent's
   proxied-vs-direct routing hinges on `gateway_node` being populated by a **single `NotifyStreamStatus`
   gRPC call** succeeding (`GatewayUpstreamServiceImpl::NotifyStreamStatus`, which calls
@@ -1216,20 +1220,98 @@ being unnecessary complexity for a closed boot-time config set (switched to eage
 fix. All five folded into the shipped design before implementation started, rather than caught in a
 later review round.
 
-**Deliberately unchanged by this slice:** the command-outbox/retry contract. `forward_gateway_pending`
-remains fire-and-forget past `AgentRegistry::gw_pending_` for every terminal-failure branch
-(`unauthenticated`, exhausted `unavailable` retries, and the new `unknown_cluster`/`agent_mismatch`
-branches) — none synthesize a terminal FAILED status the tracker or an API caller can see, only a log
-+ counter. §7's own design note ("an undeliverable command stays `pending` in the outbox and is
-re-driven") is therefore only HALF satisfied by WS-4 as a whole: the "dial the owning cluster" half is
-done, the "durable re-drive on failure" half is a pre-existing gap this slice inherits rather than
-introduces. Not filed as a new issue — it is the same shape as the outbox work WS-3 3.3 already owns
-for the leader-driven plane; a future pass wiring gateway-forward failures into that same durable
-outbox is the natural closure, not a bespoke retry mechanism here.
+**Deliberately unchanged by this slice, closed by #4672 (§7e below):** at the time this slice merged,
+`forward_gateway_pending` was fire-and-forget past `AgentRegistry::gw_pending_` for every
+terminal-failure branch (`unauthenticated`, exhausted `unavailable` retries, and the new
+`unknown_cluster`/`agent_mismatch` branches) — none synthesized a terminal FAILED status the tracker or
+an API caller could see, only a log + counter. This slice's own text originally disclosed the gap here
+without filing a tracking issue; #4672 is that issue, and §7e records how it closed.
 
 **Remaining WS-4 gate items:** WS-5 (durable cross-replica session lookup / shared presence — this is
 also what makes the 4.2b directory-fallback reader BEHAVIORALLY live, not merely wired, since only then
 can a directory row outlive the writing replica's own in-memory registry).
+
+### 7e. `forward_gateway_pending` terminal-failure resolution (#4672, 2026-09-21)
+
+**Status: CLOSED — immediate terminal resolution; durable outbox re-drive explicitly deferred, not
+silently dropped.** §7d's own text disclosed a gap without filing a tracking issue: none of
+`forward_gateway_pending`'s terminal-failure branches (`unauthenticated`, exhausted `unavailable`
+retries, `unknown_cluster`, and a stream that produced no legitimate response for the targeted agent —
+"agent_mismatch") ever resolved the dispatching operator's `command_id`. Each logged, incremented
+`yuzu_server_gateway_forward_total`, and dropped the command — the executions drawer and any API caller
+polling that `command_id` saw it idle at RUNNING (or unresolved) forever.
+
+**What shipped:** every one of those branches, plus the pre-existing (unnamed by #4672, but same shape)
+`"other"` grpc-status branch, now synthesizes a terminal `FAILURE` `CommandResponse`
+(`build_gateway_forward_terminal_failure`, `gateway_mgmt_stub_pool.hpp` — a pure, unit-tested builder)
+and applies it through `process_gateway_response` — the SAME mechanism a real gateway response already
+used on every other line of this function. This keeps command_id resolution to the ONE established
+`notify_exec_tracker` terminal-write path (executions-history-ladder routed concern) rather than a
+bespoke second mechanism.
+
+**Exactly-once guard (post-Gate-2/3 correction):** the first cut of this fix scoped the double-resolve
+guard to the `agent_mismatch` branch only, tracking whether a legitimate frame was applied *within a
+single attempt*. Gate 2/3 governance (security-guardian HIGH, cpp-safety/cpp-expert independently
+confirming) caught that this left the OTHER three synthesizing branches — `unauthenticated`, the generic
+`"other"` branch, and exhausted-retries `unavailable` — able to clobber an already-applied real terminal
+response with a synthetic FAILURE, either within one attempt (a legitimate frame applied, then that same
+attempt's `Finish()` still reports a non-OK transport status) or across attempts (an earlier attempt
+resolves the command while a later attempt independently hits a different terminal-failure branch). The
+shipped guard is a single `applied_response` bool (renamed `applied_terminal`, post-pr-rev correction
+below), declared ONCE before the 3-attempt retry loop (not per-attempt, not per-branch) and consulted by
+ALL FIVE synthesizing call sites — `agent_mismatch`, `unauthenticated`, `"other"`, exhausted-`unavailable`,
+and `unknown_cluster` — so a real TERMINAL response (a genuine terminal apply, or a repaired
+`not_connected` frame, itself always FAILURE by `classify_gateway_forward_response`'s own contract) applied
+at ANY point across the whole command's attempts suppresses every later synthetic write for that same
+command_id.
+
+**Second correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically confirmed by both
+reviewers independently):** the guard above was itself over-broad through PR review — `applied_response`
+was set to `true` by ANY applied frame, including a non-terminal RUNNING progress update, not only a
+terminal one. A gateway streaming a single RUNNING frame, then faulting before a clean close with every
+retry exhausted UNAVAILABLE, left the guard already tripped, so the exhausted-retry synthesis was
+suppressed and the command_id stayed at RUNNING forever — the exact defect #4672 exists to close,
+reintroduced by this guard's own predicate. Fixed: the flag (renamed `applied_terminal`) is now set only
+when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_status`,
+`gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
+unconditionally terminal by its classifier's own contract and needs no such check.
+
+**Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
+re-drive), for two independent, load-bearing reasons — not silently, this time:**
+
+1. **Granularity mismatch with WS-3 3.3's `command_outbox_store`/`command_outbox_delivery`.** That
+   store's producer API (`claim_and_enqueue`) is epoch-fenced, and its one existing producer
+   (`ScheduleRunner`) runs strictly inside a `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the
+   fence exists on the assumption that only a caller who has ALREADY confirmed leadership calls it.
+   `forward_gateway_pending` is reachable from every replica via ordinary operator-synchronous dispatch,
+   never gated on leadership, so an enqueue attempt from inside it would silently no-op on a non-leader
+   replica (`LeaderElector::epoch()` returns `nullopt` there — there is no epoch to embed), producing an
+   inconsistent, replica-dependent retry strictly worse than today's uniform resolution. Separately,
+   `command_outbox_delivery`'s own `sent` means "the confined-dispatch resolution QUEUED the command"
+   (`ConfinedDispatchOutcome::sent`), never "the gateway RPC actually completed" — reusing its generic
+   `DispatchFn` re-dispatch path for a redelivery would mark the occurrence terminal in the outbox the
+   instant `send_to` re-queues it into `gw_pending_`, racing and swallowing the very gateway failure a
+   redelivery would exist to observe.
+2. **#3279** (named in `server.cpp`, "KNOWN GAP, filed as #3279, NOT fixed here"). This function's
+   detached per-command `std::thread(...).detach()` is untracked by every shutdown drain/quiesce
+   mechanism this server has; its raw-pointer capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+   carefully-scoped, individually-justified exception to that gap, not a precedent to extend. A durable
+   retry producer would need that same thread to ALSO touch `command_outbox_store_`/`leader_elector_`,
+   widening #3279's reach into two more `ServerImpl`-owned stores with no existing destruction-order
+   analysis covering them. #3279 is explicitly deferred to a human owner to adjudicate; widening its
+   blast radius as a side effect of #4672 would be scope creep into that separately-tracked decision, not
+   a fix for it.
+
+A durable gateway-forward re-drive therefore stays a documented, scoped-out follow-up — real once #3279
+gives `forward_gateway_pending` its own pooling/draining story (so a retry producer has a safe place to
+touch `command_outbox_store_`), not before. Until then, §7's "stays pending... and is re-driven" design
+note is accurate for the LEADER-DRIVEN background plane (schedule fires, via `route_unreadable`) and
+inaccurate for the gateway-forwarding path specifically — which instead resolves terminally, immediately,
+for every command that reaches the per-command retry loop below, including the previously-silent
+unusable-pool short-circuit above it (now resolved through the same helper, pr-rev finding
+FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, not silently: a clean
+`Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
+every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
