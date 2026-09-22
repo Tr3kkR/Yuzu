@@ -97,6 +97,7 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 | `UNAVAILABLE` | `PARTIAL` | `linux:owned_by_installed_apps` | Linux `packages`: unsupported by design; `installed_apps` owns the Linux package roster. |
 | `UNAVAILABLE` | `PARTIAL` | `linux:planned` | Linux `managers`: the leg reads nothing and emits only `status\|managers\|unsupported\|linux:planned` (caveat 3). |
 | `UNAVAILABLE` | `PARTIAL` | `windows:planned` | Windows, either action: the leg reads nothing and emits only `status\|<action>\|unsupported\|windows:planned` (caveat 5). |
+| `UNAVAILABLE` | `PARTIAL` | `pkg_inventory:exception` | Either action, either OS: a leg threw during a read; `execute()` catches it, reports this fixed token, and never lets the exception cross the plugin ABI. |
 
 ### Where the data goes
 
@@ -108,7 +109,7 @@ Pipe-delimited rows written via `write_output()`, two shapes per stream discrimi
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 57448de65bb7
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 · leg-hash 57448de65bb7
 
 ```
 == action=managers
@@ -133,7 +134,7 @@ package|homebrew|cmake|4.4.2|formula
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 57448de65bb7
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 57448de65bb7
 
 ```
 == action=managers

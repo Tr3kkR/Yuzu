@@ -341,6 +341,12 @@
       "provenance": "`windows:planned`",
       "status": "`UNAVAILABLE`",
       "when": "Windows, either action: the leg reads nothing and emits only `status|<action>|unsupported|windows:planned` (caveat 5)."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`pkg_inventory:exception`",
+      "status": "`UNAVAILABLE`",
+      "when": "Either action, either OS: a leg threw during a read; `execute()` catches it, reports this fixed token, and never lets the exception cross the plugin ABI."
     }
   ],
   "samples": {
@@ -380,7 +386,7 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-21",
+        "date": "2026-09-22",
         "host_class": "container",
         "leg_hash": "57448de65bb7",
         "os": "linux",
@@ -429,7 +435,7 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-21",
+        "date": "2026-09-22",
         "host_class": "bare-metal",
         "leg_hash": "57448de65bb7",
         "os": "macos",
