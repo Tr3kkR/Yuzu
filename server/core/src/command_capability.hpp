@@ -146,13 +146,22 @@ enum class ClassificationError : uint8_t {
 /// `std::string` materialization.
 class CommandCapabilityRegistry {
 public:
-    /// A handful of fragments compose here (five per-group headers plus this
-    /// package's own `core_dispatch_capabilities()`); `kMaxSources` is a
-    /// generous ceiling, not a tight fit, so an additional fragment group
-    /// does not silently overflow it. Exceeding it is a construction-time
-    /// programmer error — fail loud via an exception, never silently drop a
-    /// fragment (a dropped fragment would make every one of its rows
-    /// `Unclassified`, indistinguishable from an honest miss).
+    /// Fragments compose here (the per-group headers, the per-plugin headers,
+    /// plus this package's own `core_dispatch_capabilities()`). Exceeding
+    /// `kMaxSources` is a construction-time programmer error — fail loud via an
+    /// exception, never silently drop a fragment (a dropped fragment would make
+    /// every one of its rows `Unclassified`, indistinguishable from an honest
+    /// miss).
+    ///
+    /// **This is no longer the generous ceiling it was written as.** The live
+    /// composition in `ServerImpl` is at 16 of 16, so the NEXT fragment added
+    /// here must also carry the 16 -> 32 raise, together with the two
+    /// hand-maintained span counts that mirror it
+    /// (`test_dispatch_destructive_gate.cpp`'s `std::array<..., 16>` and the
+    /// prose in `test_capability_catalogue.cpp` /
+    /// `test_real_capability_registry.hpp`). The array is ill-formed with a
+    /// 17th initialiser, so CI reddens before a server that cannot construct
+    /// could ship — but it reddens in a file whose name does not suggest why.
     static constexpr std::size_t kMaxSources = 16;
 
     explicit CommandCapabilityRegistry(
