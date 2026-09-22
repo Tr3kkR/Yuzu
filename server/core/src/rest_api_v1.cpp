@@ -1487,7 +1487,7 @@ const std::string& openapi_spec() {
     },
     "/result-sets": {
       "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}}},
-      "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON, stored verbatim"}, "parent_id": {"type": "string", "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS)"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
+      "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS)"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
     },
     "/result-sets/from-inventory-query": {
       "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set)"}}}
@@ -1508,7 +1508,7 @@ const std::string& openapi_spec() {
         // #3992 F2 split just below.
         R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's source_kind is unsupported for re-eval (RESULT_SET_REEVAL_UNSUPPORTED) - checked ahead of the parent-gone guard below (#4306 follow-up) so a crafted scope_input_id on an unsupported source_kind can never be misreported as parent_gone; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), or a re-run field exceeds its bound (#4373)"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -10127,8 +10127,20 @@ void RestApiV1::register_routes(
             cr.owner_principal = session->username;
             cr.name = body.value("name", "");
             cr.source_kind = body.value("source_kind", std::string(source_kind::kManualCurate));
-            cr.source_payload = body.contains("source_payload") ? body["source_payload"].dump()
-                                                                : std::string("{}");
+            // #4306 follow-up (Kimi/Codex adversarial review): this generic
+            // route accepts an UNRESTRICTED source_kind/source_payload (no
+            // allowlist) plus a caller-supplied parent_id, so a row minted
+            // here is otherwise indistinguishable at re-eval time from a
+            // genuinely parentless original once its parent is deleted (ON
+            // DELETE SET NULL) -- the same #4306/#2500 target-erasure shape
+            // the dedicated from-tar-query/from-instruction-result producers
+            // below are already protected against. Parse into a mutable
+            // object so scope_input_id can be merged in below, once
+            // parent_id's owner-check has run -- mirrors those producers'
+            // identical payload["scope_input_id"] = ... pattern.
+            nlohmann::json payload = body.contains("source_payload")
+                                          ? body["source_payload"]
+                                          : nlohmann::json::object();
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
                 !body["parent_id"].get<std::string>().empty()) {
                 auto pid = body["parent_id"].get<std::string>();
@@ -10138,7 +10150,10 @@ void RestApiV1::register_routes(
                 if (!load_owned(req, pid, session->username, res))
                     return; // load_owned wrote 404
                 cr.parent_id = pid;
+                if (payload.is_object())
+                    payload["scope_input_id"] = pid;
             }
+            cr.source_payload = payload.dump();
 
             std::vector<std::string> members;
             if (body.contains("device_ids") && body["device_ids"].is_array()) {
@@ -10336,7 +10351,19 @@ void RestApiV1::register_routes(
                       cr.owner_principal = session->username;
                       cr.name = body.value("name", "");
                       cr.source_kind = std::string(source_kind::kInventoryQuery);
-                      cr.source_payload = body.dump();
+                      // #4306 governance follow-up (Gate 2 security-guardian LOW): this
+                      // route also accepts a caller-supplied, owner-checked parent_id --
+                      // like the generic create route, a row minted here was
+                      // indistinguishable at re-eval time from a genuinely parentless
+                      // original once its parent was deleted. Inert TODAY only because
+                      // re-eval's source_kind allowlist refuses kInventoryQuery outright
+                      // before the parent-gone guard ever runs -- but a future widening
+                      // of that allowlist would silently reopen the #4306/#2500
+                      // target-erasure shape here. `body` is already validated as a JSON
+                      // object earlier in this handler, so merge scope_input_id in
+                      // before dumping, mirroring the identical
+                      // payload["scope_input_id"] = pid pattern the other three
+                      // creation paths use.
                       if (body.contains("parent_id") && body["parent_id"].is_string() &&
                           !body["parent_id"].get<std::string>().empty()) {
                           auto pid = body["parent_id"].get<std::string>();
@@ -10344,6 +10371,7 @@ void RestApiV1::register_routes(
                           if (!parent)
                               return; // load_owned already wrote 404
                           cr.parent_id = pid;
+                          body["scope_input_id"] = pid;
                           std::unordered_set<std::string> ms;
                           std::string cur;
                           while (true) {
@@ -10360,6 +10388,7 @@ void RestApiV1::register_routes(
                           }
                           parent_members = std::move(ms);
                       }
+                      cr.source_payload = body.dump();
 
                       InventoryQuery iq;
                       iq.limit = 5000;
@@ -10816,12 +10845,85 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                      // #4306 follow-up (adversarial review, Kimi+Codex): the
+                      // source_kind support check must run BEFORE the
+                      // parent-gone / scope_input_id guard below, or a
+                      // manual_curate (or any other unsupported-source_kind)
+                      // row minted via the generic create route with a
+                      // crafted source_payload={"scope_input_id":"..."} but
+                      // no real parent gets misclassified as
+                      // RESULT_SET_BAD_REQUEST (reason=parent_gone) instead of
+                      // RESULT_SET_REEVAL_UNSUPPORTED. Both outcomes are 400
+                      // refusals with nothing dispatched either way (not a
+                      // dispatch-safety bug -- an error/audit-reason
+                      // correctness bug), but the unsupported-kind rejection
+                      // takes priority: it depends on nothing computed below
+                      // (no synth, no reeval_name), so hoist it to an early
+                      // return right after sp is parsed.
+                      if (orig->source_kind != source_kind::kTarQuery &&
+                          orig->source_kind != source_kind::kInstructionResult) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                 "lands in PR-G");
+                          return;
+                      }
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
                       // against the same candidate scope, today's estate).
                       nlohmann::json synth;
-                      if (orig->parent_id && !orig->parent_id->empty())
-                          synth["parent_id"] = *orig->parent_id;
+                      if (orig->parent_id && !orig->parent_id->empty()) {
+                          synth["parent_id"] = *orig->parent_id; // live parent: canonical, exact
+                      } else if (sp.is_object() && sp.contains("scope_input_id") &&
+                                 sp["scope_input_id"].is_string() &&
+                                 !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
+                          // #4306 / #2500-class target erasure: the original was
+                          // NARROWED at creation (scope_input_id was persisted into
+                          // source_payload by the from-tar-query/from-instruction-
+                          // result producers, OR by the generic POST /api/v1/
+                          // result-sets route -- #4306 follow-up, both mirror the
+                          // same payload["scope_input_id"] = pid pattern), but its
+                          // live parent_id FK is now null — schema: `parent_id ... ON DELETE SET NULL`
+                          // (result_set_store.cpp) — because the parent set was
+                          // deleted since. An absent parent_id reaching run_async
+                          // below reads as "omitted -> broadcast to __all__" (the
+                          // SAME rule run_async's own parent_id-empty guard applies
+                          // to a caller-supplied empty string), so "re-ask the same
+                          // narrow question" would silently become "ask the whole
+                          // visible fleet".
+                          //
+                          // Deliberately NOT re-resolving scope_input_id as a fresh
+                          // alias lookup: it is the RAW caller-supplied value at
+                          // creation time and may be an ALIAS, not a canonical rs_
+                          // id. resolve_owned_parent routes a non-rs_-prefixed
+                          // string through resolve_alias(), whose SQL is `ORDER BY
+                          // created_at DESC LIMIT 1` — newest-wins — so the alias
+                          // may since have been re-bound to a DIFFERENT, newer set.
+                          // Resolving it now would retarget the dispatch to
+                          // whatever the alias means TODAY, not what it meant when
+                          // this original was created: a precision regression, not
+                          // a fix. Refuse instead, before run_async / exec_visible
+                          // derivation — nothing is dispatched, no execution row is
+                          // created, nothing needs cancelling.
+                          bool audit_ok = true;
+                          if (audit_fn)
+                              audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
+                                                   id,
+                                                   "reason=parent_gone source_kind=" +
+                                                       audit_token(orig->source_kind) +
+                                                       " scope_input_id=" +
+                                                       audit_token(sp["scope_input_id"]
+                                                                       .get<std::string>()));
+                          if (!audit_ok)
+                              res.set_header("Sec-Audit-Failed", "true");
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
+                                 "exists; re-eval cannot reconstruct its target scope -- create "
+                                 "a new set from the intended parent instead");
+                          return;
+                      }
+                      // else: genuinely parentless original (no scope_input_id was
+                      // ever recorded) -> broadcast, today's behaviour, unchanged
+                      // (an omitted parent_id is deliberately "the whole fleet").
                       // Skip the suffix if it's already there, else repeated
                       // re-evals of a sibling grow "foo (re-eval) (re-eval) …"
                       // unboundedly (review finding bug_014).
@@ -10954,11 +11056,10 @@ void RestApiV1::register_routes(
                           run_async(req, res, *session, def->plugin, def->action, params,
                                     source_kind::kInstructionResult, orig->source_payload,
                                     orig->matcher, synth, reeval_name);
-                      } else {
-                          rs_err(res, 400,
-                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
-                                 "lands in PR-G");
                       }
+                      // else: unreachable -- the early return above already
+                      // refused every source_kind other than kTarQuery/
+                      // kInstructionResult before we got here.
                   });
 
         // GET /api/v1/result-sets/{id}

@@ -211,6 +211,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
+
+**What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
+previously synthesised the sibling's dispatch scope from the original's live, nullable
+`parent_id` foreign key. If the original's parent result set was later deleted (`parent_id ...
+ON DELETE SET NULL`), the column read as absent, and an absent `parent_id` reaching dispatch
+synthesis meant "broadcast to `__all__`" — silently turning "re-ask the same narrow question"
+into "ask the whole visible fleet." Both routes now refuse (`400 RESULT_SET_BAD_REQUEST`,
+`reason=parent_gone`) when the live parent is gone but the original's persisted `source_payload`
+shows it was narrowed at creation, instead of broadcasting.
+
+**Who this affects.** Any caller (REST or MCP) whose automation re-evaluates a result set that
+was originally narrowed to a `parent_id`, where that parent set has since been deleted.
+Previously such a call silently succeeded with a `202` (REST) or a materialized/pending result
+(MCP) dispatched to the entire visible fleet; it now refuses instead -- REST returns `400
+RESULT_SET_BAD_REQUEST`, MCP returns a JSON-RPC error (`kInvalidParams`) over HTTP 200, per that
+transport's existing error-shape convention. No legitimate caller should have been relying on the
+fleet-wide broadcast — this was the target-erasure defect being fixed — but any automation
+catching only success responses on this route should add handling for the new `400
+reason=parent_gone` case: create a fresh result set from the intended parent instead of
+re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
+at creation) still broadcasts on re-eval, unchanged.
+
 ### vNEXT — new `Guardian T_*` diagnostic log lines at `info` level (#4606; NOT breaking)
 
 **What changed.** The server now writes one `info`-level line for every Guardian event it stores for an ordinary rule (ruleless DEX observations are excluded):
@@ -273,6 +296,49 @@ reclaim activity rather than instant convergence, and (2) a replay refused
 because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
+
+### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
+
+New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
+
+Before this change, a rogue or compromised gateway process could re-register an agent identity that was already approved and live on a DIFFERENT cluster (`ProxyRegister` needs no per-agent secret for an already-approved agent), then legitimately answer for it — intercepting command payloads and forging terminal results for that agent, despite each `--gateway-cluster-addr` entry conceptually representing a separate trust zone.
+
+**What changes:** each agent now durably binds to the first cluster that legitimately confirms its connection (trust-on-first-use). A later claim from a DIFFERENT cluster for an already-bound agent is refused — for the ordinary case, before anything is published to the routing directory or the in-memory dispatch path; on a definitive conflict caught only at the durable write (a rare defense-in-depth case — the fast pre-check missed it, e.g. under a transient store hiccup), an in-memory placement already published moments earlier is reverted rather than left live — and the refusal is audited (`gateway.cluster_affinity_violation`, see [audit-log.md](audit-log.md)) and counted (`yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="cluster_affinity_violation"}`, alerted via `YuzuGatewayClusterAffinityViolation`). An agent's affinity re-binds when the previously-bound cluster has been genuinely unreachable for the full stale-route grace window **and no session is currently claiming the row** — a single rogue registration alone (with no completed connection) parks the row instead, preserving its affinity, precisely so a rogue cannot force a re-home just by registering (an operator-forced re-home route is tracked as a follow-up, `#4696` — not available in this release).
+
+**Rollout window — read this if you run multi-cluster gateway mode today.** Every agent that was already connected before you upgrade to this version has NO bound affinity until its NEXT `CONNECTED` notification — until then, that agent is still open to a same-shape claim from any cluster, exactly as before this fix. Long-lived gateway↔agent connections may not reconnect on their own for a long time. **To close this window immediately across your whole fleet, restart your gateway processes (or otherwise force your agents to reconnect) after upgrading** — each forced reconnect binds that agent's affinity right away rather than waiting on an organic reconnect.
+
+This does not provide full trust-zone isolation between clusters — a gateway's claimed `cluster_id` is still not cryptographically bound to its actual identity (mitigation 2, tracked separately, not implemented). Do not present multi-cluster gateway mode as providing that guarantee. Multi-cluster gateway mode has no production deployments as of this release.
+
+### vNEXT — a command forwarded to a gateway-connected agent always resolves instead of getting stuck at RUNNING (#4672; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, a command dispatched to a gateway-fronted agent (multi-cluster gateway
+mode — see [ha-postgres.md](ha-postgres.md) and ADR-2002 §7) could get stuck at `RUNNING`
+forever with no terminal signal if the forward itself failed: the gateway's mgmt-plane peer
+pin rejecting this server's certificate, the gateway staying unreachable after retries, a
+target cluster with no configured `--gateway-cluster-addr`, or a response that could not be
+attributed to the intended agent. The executions drawer and any API caller polling that
+command's status saw it idle indefinitely.
+
+**What changes:** every one of those cases now resolves the command to a terminal `FAILURE`,
+at most once, with `error_detail` (the field the REST/MCP response surfaces — there is no
+separate structured `error.code`) prefixed with a specific reason code you can use to
+diagnose the cause, e.g. `[gateway_unavailable] Gateway unreachable after 3 attempts —
+command not delivered`:
+
+| Reason code prefix | Meaning | What to check |
+|---|---|---|
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
+| `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
+| `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
+| `gateway_forward_failed` | Any other gateway `SendCommand` RPC failure | The gateway's own logs for the specific gRPC error |
+
+**Recovery:** there is no automatic re-drive for a gateway-forward failure — re-dispatch the
+command once the underlying cause is fixed. Automatic durable retry is tracked as a follow-up
+in #4690. One case is not yet covered by this fix: a gateway response stream that closes
+cleanly with zero frames still leaves the command stuck at RUNNING (tracked separately, #4691).
 
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 

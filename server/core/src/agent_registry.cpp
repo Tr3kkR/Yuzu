@@ -459,6 +459,27 @@ bool AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     return true;
 }
 
+bool AgentRegistry::unpublish_gateway_route(const std::string& agent_id,
+                                            const std::string& session_id) {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return false;
+        session = it->second;
+    }
+    // Same lock domain as set_gateway_route, for the same M1 reason: a
+    // reader (send_to/send_to_all) must never observe a torn intermediate
+    // state between clearing these four fields.
+    std::lock_guard slock(session->stream_mu);
+    session->gateway_node.clear();
+    session->gateway_wire_capabilities.clear();
+    session->gateway_stream_home_id.clear();
+    session->cluster_id.clear();
+    return true;
+}
+
 std::optional<std::string>
 AgentRegistry::gateway_stream_home_id(const std::string& agent_id,
                                       const std::string& session_id) const {
