@@ -47,7 +47,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder (the registry probe below is evidence, not a measurement of this plugin) | n/a - the placeholder reports `UNAVAILABLE` with `windows:planned` and reads nothing |
 | macOS | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder | n/a - the placeholder reports `UNAVAILABLE` with `macos:planned` and reads nothing |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them | Not yet measured; the post-integration capture records it (`docs/samples/linux.txt`) | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, and the result never reads as "no policy configured" |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them | Measured 2026-09-22 in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as euid 501, not by a service-account run on a real host | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, and the result never reads as "no policy configured" |
 
 No external binaries, no subprocesses, no shell-out and no network use: the Linux leg is an in-process, bounded read of local files.
 
@@ -88,7 +88,7 @@ Every row is pipe-delimited and has nine fields; field 0 is always the literal `
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `OK` | `FULL` | (empty) | Linux: every read completed, populated or genuinely empty |
-| `CONSTRAINED` | `PARTIAL` | `linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap`, `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined) | Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, nesting depth) was hit |
+| `CONSTRAINED` | `PARTIAL` | `linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined) | Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, nesting depth) was hit |
 | `UNAVAILABLE` | `PARTIAL` | `windows:planned` | Windows: the leg is a placeholder; zero rows |
 | `UNAVAILABLE` | `PARTIAL` | `macos:planned` | macOS: the leg is a placeholder; zero rows |
 | `UNAVAILABLE` | `PARTIAL` | `windows:leg:exception` / `macos:leg:exception` / `linux:leg:exception` | a leg threw; reported instead of unwinding across the plugin boundary |
@@ -118,7 +118,7 @@ Every row is pipe-delimited and has nine fields; field 0 is always the literal `
 ```
 <!-- END GENERATED -->
 
-A Linux host with no `/etc/opt/chrome`, `/etc/chromium` or `/etc/opt/edge` policy files reports zero rows with `OK`/`FULL`, and the Linux capture is taken from a real Debian container with no such files; the populated row shape is covered by the fixture-driven unit tests over `tests/unit/fixtures/wave10/browser_policy/linux`. The planned legs are status-only: the macOS capture shows the placeholder status alone (`UNAVAILABLE`/`PARTIAL`, `macos:planned`, zero rows), and there is no Windows capture.
+The Linux capture is taken from a real Debian container that was seeded, for the capture only, with two SYNTHETIC Chrome policy files (Alex sign-off 2026-09-21; the image ships no browser): `/etc/opt/chrome/policies/managed/seeded.json` holding `ExtensionInstallForcelist`, `HomepageLocation` and `RestoreOnStartup`, and `/etc/opt/chrome/policies/recommended/seeded.json` holding `BookmarkBarEnabled`, so the sample shows the shipping leg reading real files through the production root. The same container with no policy files reports zero rows with `OK`/`FULL`. Every failure token and the caps are covered by the fixture-driven unit tests over `tests/unit/fixtures/wave10/browser_policy/linux`. The planned legs are status-only: the macOS capture shows the placeholder status alone (`UNAVAILABLE`/`PARTIAL`, `macos:planned`, zero rows), and there is no Windows capture.
 
 ## Caveats and known gaps
 
