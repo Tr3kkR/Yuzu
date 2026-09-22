@@ -1,4 +1,4 @@
-# browser_inventory — Chromium-family browser/profile/extension inventory
+# browser_inventory — Chromium-family browser/profile inventory
 # (Forensics securable, default-off). Multi-TU shape follows
 # agents/plugins/peripherals/meson.build: one portable plugin TU plus three
 # per-OS leg TUs, each #ifdef-gated internally for its own target so all

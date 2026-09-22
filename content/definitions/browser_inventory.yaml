@@ -1,21 +1,21 @@
 ## Browser Inventory Definitions
-## Chromium-family browser, profile and extension inventory. Read-only on
+## Chromium-family browser and profile inventory. Read-only on
 ## every platform; never emits an account identifier, browsing history,
 ## cookies or bookmarks -- see agents/plugins/browser_inventory/src/
 ## browser_inventory_parsers.hpp's PRIVACY CONTRACT.
-## Plugin: browser_inventory | Actions: browsers, profiles, extensions
+## Plugin: browser_inventory | Actions: browsers, profiles
 ##
 ## Sources by platform:
-##   Linux:   ~/.config/{google-chrome,microsoft-edge} directory presence
-##            (browsers), Local State JSON (profiles), Secure
-##            Preferences/Preferences extensions.settings JSON (extensions),
-##            walked across every discoverable user.
+##   Linux:   system-wide binary presence (browsers) and each browser's
+##            Local State JSON under ~/.config/{google-chrome,chromium,
+##            microsoft-edge} (profiles), walked across every discoverable
+##            user. No file inside a profile directory is read.
 ##   macOS:   PLANNED -- follows as its own PR (see the descriptor's
 ##            PLANNED mechanism string).
 ##   Windows: PLANNED -- follows as its own PR (see the descriptor's
 ##            PLANNED mechanism string).
-## Firefox and Safari are out of scope for this plugin's initial legs and
-## follow separately.
+## The per-profile `extensions` action follows as its own PR; Firefox and
+## Safari are out of scope for this plugin's initial legs and follow separately.
 ##
 ## Gated behind the Forensics securable, Administrator-only. Same enforced
 ## boundary as execution_artifacts and app_usage (Forensics:Read +
@@ -29,7 +29,7 @@
 ## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
 ## (`PluginConfigStore::seed_kill_switch_default_off`) -- an operator must
 ## explicitly `PUT /api/v1/plugin-config/browser_inventory/kill-switch
-## {"enabled":true}` before any of these three actions will dispatch.
+## {"enabled":true}` before either of these two actions will dispatch.
 ##
 ## Every action's wire stream leads with a `status|<action>|<supported|
 ## constrained>|<reason>` row before any data row (CC-07 typed status
@@ -187,109 +187,6 @@ spec:
         - count
 
   readablePayload: "List browser profiles"
-
-  gather:
-    ttlSeconds: 300
-
-  approval:
-    mode: role-gated
-
-  permissions:
-    executeRoles: [admin]
-    authorRoles: [content-author]
-
-  compatibility:
-    minAgentVersion: 1.0.0
-    requiredPlugins: [browser_inventory]
-
-status:
-  phase: active
-
----
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: crossplatform.browser_inventory.extensions
-  displayName: Browser Inventory - Extensions
-  version: 1.0.0
-  description: >
-    Per-profile extension install/enable state, read from each profile's
-    "Secure Preferences" (preferred) or "Preferences" (fallback) file --
-    see the plugin README for which file actually carries
-    extensions.settings on each browser. Never emits an account
-    identifier, browsing history, cookies or bookmarks -- see the plugin
-    README's PRIVACY CONTRACT. Linux this wave; macOS and Windows legs are
-    PLANNED and follow as their own PR.
-  tags: [forensics, browser, inventory]
-
-spec:
-  type: question
-  platforms: [windows, linux, darwin]
-
-  execution:
-    plugin: browser_inventory
-    action: extensions
-    concurrency: per-device
-
-  parameters:
-    type: object
-    properties: {}
-
-  result:
-    # Two row shapes on one stream, discriminated by field 0:
-    #   status|<action>|<supported|constrained>|<reason>
-    #   extension|<user>|<browser>|<profile_dir>|<extension_id>|<version>|
-    #             <name>|<state>|<from_webstore>
-    columns:
-      - name: row_kind
-        type: string
-        description: Discriminates the row shape - "status" or "extension".
-        example: "extension"
-      - name: field_1
-        type: string
-        description: >
-          status row: the action name ("extensions"). extension row: the
-          owning OS user.
-        example: "jdoe"
-      - name: field_2
-        type: string
-        description: >
-          status row: "supported" or "constrained". extension row: the
-          browser identifier.
-        example: "google-chrome"
-      - name: field_3
-        type: string
-        description: >
-          status row: the constraint reason, "-" when supported.
-          extension row: the profile directory name.
-        example: "Default"
-      - name: field_4
-        type: string
-        description: "status row: empty. extension row: the extension id."
-        example: "aapocclcgogkmnckokdopfmhonfmgoek"
-      - name: field_5
-        type: string
-        description: "status row: empty. extension row: the extension version, \"-\" if absent."
-        example: "1.2.3"
-      - name: field_6
-        type: string
-        description: "status row: empty. extension row: the extension name, \"-\" if absent."
-        example: "Example Extension"
-      - name: field_7
-        type: string
-        description: "status row: empty. extension row: the extension's enable state."
-        example: "enabled"
-      - name: field_8
-        type: string
-        description: "status row: empty. extension row: whether the extension was installed from the web store."
-        example: "true"
-    aggregation:
-      groupBy:
-        - row_kind
-      operations:
-        - count
-
-  readablePayload: "List browser extensions"
 
   gather:
     ttlSeconds: 300

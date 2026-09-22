@@ -279,76 +279,20 @@ TEST_CASE("browser_inventory linux: linux_profile_rows_at finds alice/edge and b
 
     for (const auto& r : rows) CHECK(row_starts_with(r, "profile|"));
 
-    const bool found_alice_edge_default = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "profile|alice|edge|Default|");
-    });
-    CHECK(found_alice_edge_default);
-
-    const bool found_bob_chrome = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "profile|bob|chrome|");
-    });
-    CHECK(found_bob_chrome);
+    // Exact rows, real values (X11 mutation anchors): the Edge REAL CAPTURE
+    // Local State names its one profile "Profile 1"; the SYNTHETIC Chrome one
+    // names two. MUTATION: dropping the Local State read, the display_name
+    // field or the "root"/"home" walk fails these; "-" placeholders do not pass.
+    CHECK(std::find(rows.begin(), rows.end(), "profile|alice|edge|Default|Profile 1") != rows.end());
+    CHECK(std::find(rows.begin(), rows.end(), "profile|bob|chrome|Default|Person 1") != rows.end());
+    CHECK(std::find(rows.begin(), rows.end(), "profile|bob|chrome|Profile 2|Work (synthetic)") != rows.end());
+    CHECK(rows.size() == 3); // nothing else in the fixture tree yields a profile row
 
     // Every field-5 row parses cleanly under the escape-aware split.
     for (const auto& r : rows) {
         const auto fields = split_fields_escape_aware(r);
         REQUIRE(fields.size() == 5);
     }
-#endif // !defined(_WIN32)
-}
-
-TEST_CASE("browser_inventory linux: linux_extension_rows_at resolves state from Secure Preferences "
-         "for alice/edge and reports bob/chrome's rows",
-         "[browser_inventory][linux][walk]") {
-#if defined(_WIN32)
-    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
-        "X2) -- not compiled on Windows");
-#else
-    using namespace yuzu::browser_inventory::lnx;
-    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_extensions_"};
-    std::string error;
-    REQUIRE(materialize_browser_inventory_tree(dir.path, error));
-
-    std::optional<std::string> token;
-    const auto rows = linux_extension_rows_at(dir.path, token);
-    CHECK_FALSE(token.has_value());
-    REQUIRE_FALSE(rows.empty());
-
-    for (const auto& r : rows) {
-        CHECK(row_starts_with(r, "extension|"));
-        const auto fields = split_fields_escape_aware(r);
-        REQUIRE(fields.size() == 9);
-    }
-
-    // alice/edge/Default: >=1 enabled row, resolved from Secure Preferences
-    // (edge/provenance.txt: 14 of 53 entries have state=1; Preferences
-    // carries no extensions.settings at all on this real capture).
-    const bool found_alice_enabled =
-        std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-            if (!row_starts_with(r, "extension|alice|edge|Default|")) return false;
-            const auto f = split_fields_escape_aware(r);
-            return f[7] == "enabled" && f[6] != "-"; // name resolved
-        });
-    CHECK(found_alice_enabled);
-
-    // bob/chrome/Default: the synthetic fixture's three states are covered
-    // (enabled, disabled, unmodelled -- chrome/Default/Secure Preferences'
-    // provenance.txt).
-    const bool found_bob_enabled = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "extension|bob|chrome|Default|") &&
-              r.find("|enabled|") != std::string::npos;
-    });
-    const bool found_bob_disabled = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "extension|bob|chrome|Default|") &&
-              r.find("|disabled|") != std::string::npos;
-    });
-    const bool found_bob_unmodelled = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "extension|bob|chrome|Default|") &&
-              r.find("|unmodelled|") != std::string::npos;
-    });
-    CHECK(found_bob_enabled);
-    CHECK(found_bob_disabled);
-    CHECK(found_bob_unmodelled);
 #endif // !defined(_WIN32)
 }
 
@@ -364,10 +308,7 @@ TEST_CASE("browser_inventory linux: no row carries the fixtures' redaction/fabri
     REQUIRE(materialize_browser_inventory_tree(dir.path, error));
 
     std::optional<std::string> profile_token;
-    std::optional<std::string> extension_token;
-    auto rows = linux_profile_rows_at(dir.path, profile_token);
-    const auto extension_rows = linux_extension_rows_at(dir.path, extension_token);
-    rows.insert(rows.end(), extension_rows.begin(), extension_rows.end());
+    const auto rows = linux_profile_rows_at(dir.path, profile_token);
     REQUIRE_FALSE(rows.empty());
 
     // edge/provenance.txt's redaction placeholder (profile.info_cache.*'s
@@ -399,11 +340,6 @@ TEST_CASE("browser_inventory linux: an absent root is supported with zero rows, 
     CHECK(profile_rows.empty());
     CHECK_FALSE(profile_token.has_value());
 
-    std::optional<std::string> extension_token;
-    const auto extension_rows = linux_extension_rows_at(dir.path, extension_token);
-    CHECK(extension_rows.empty());
-    CHECK_FALSE(extension_token.has_value());
-
     std::optional<std::string> browser_token;
     const auto browser_rows = linux_browser_rows_at(dir.path, browser_token);
     CHECK_FALSE(browser_token.has_value());
@@ -412,7 +348,7 @@ TEST_CASE("browser_inventory linux: an absent root is supported with zero rows, 
 #endif // !defined(_WIN32)
 }
 
-TEST_CASE("browser_inventory linux: a chmod-000 profile dir reports constrained + a reason token",
+TEST_CASE("browser_inventory linux: a chmod-000 browser config dir reports constrained + a reason token",
           "[browser_inventory][linux][walk]") {
 #if defined(_WIN32)
     SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
@@ -427,23 +363,33 @@ TEST_CASE("browser_inventory linux: a chmod-000 profile dir reports constrained 
     std::string error;
     REQUIRE(materialize_browser_inventory_tree(dir.path, error));
 
-    const auto profile_dir = dir.path / "home" / "alice" / ".config" / "microsoft-edge" / "Default";
-    REQUIRE(::chmod(profile_dir.string().c_str(), 0000) == 0);
+    // alice's Edge config dir exists but cannot be opened: a wall INSIDE a
+    // home this leg did enter (~/.config was readable), which
+    // walk_browser_profile_roots reports as a real constraint -- unlike a
+    // denied home itself, which is routine least-privilege behaviour.
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "microsoft-edge";
+    REQUIRE(::chmod(browser_dir.string().c_str(), 0000) == 0);
 
     std::optional<std::string> token;
-    const auto rows = linux_extension_rows_at(dir.path, token);
+    const auto rows = linux_profile_rows_at(dir.path, token);
 
     // Restore permissions before TempDir's destructor tries to remove it.
-    ::chmod(profile_dir.string().c_str(), 0700);
+    ::chmod(browser_dir.string().c_str(), 0700);
 
+    // MUTATION: dropping `acc.add_failure(browser_open.reason)` in
+    // walk_browser_profile_roots' visit_home fails the REQUIRE.
     REQUIRE(token.has_value());
     CHECK(token->find("linux:browser_inventory:permission_denied") != std::string::npos);
     // bob/chrome's rows are unaffected by alice's chmod -- a real failure
-    // on one (user, browser, profile) triple never silently absorbs a
-    // sibling's successful read.
+    // on one (user, browser) pair never silently absorbs a sibling's
+    // successful read -- and alice's rows are absent, not substituted.
     const bool found_bob = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
-        return row_starts_with(r, "extension|bob|chrome|Default|");
+        return row_starts_with(r, "profile|bob|chrome|");
     });
     CHECK(found_bob);
+    const bool found_alice = std::any_of(rows.begin(), rows.end(), [](const std::string& r) {
+        return row_starts_with(r, "profile|alice|");
+    });
+    CHECK_FALSE(found_alice);
 #endif // !defined(_WIN32)
 }

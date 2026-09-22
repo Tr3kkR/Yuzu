@@ -8,15 +8,16 @@
 
 /// @file plugin_action_catalogue_browser_inventory.hpp
 /// One fragment of the command capability catalogue: `browser_inventory`'s
-/// three actions (`agents/plugins/browser_inventory/src/
+/// two actions (`agents/plugins/browser_inventory/src/
 /// browser_inventory_plugin.cpp`). Classified by READING the
 /// implementation, per this package's spec.
 ///
-/// All three actions (`browsers`, `profiles`, `extensions`) are
-/// ReadOnly/None — the plugin only ever reads browser installation state,
-/// `Local State`/`Secure Preferences` JSON and never mutates host state on
-/// any platform; per browser_inventory_parsers.hpp's PRIVACY CONTRACT, no
-/// row ever carries an account identifier, browsing history or cookie.
+/// Both actions (`browsers`, `profiles`) are ReadOnly/None — the plugin
+/// only ever reads browser installation state and `Local State` JSON and
+/// never mutates host state on any platform; per
+/// browser_inventory_parsers.hpp's PRIVACY CONTRACT, no row ever carries an
+/// account identifier, browsing history or cookie. The per-profile
+/// `extensions` action follows as its own PR and adds its row then.
 ///
 /// Grouped under the `Forensics` securable P0 seeds
 /// (server/core/src/rbac_store.cpp's `seed_defaults()` `types[]` array,
@@ -27,7 +28,7 @@
 /// plugin_action_catalogue_execution_artifacts.hpp's precedent (that
 /// plugin's own Forensics/AdminOrApproval boundary) — see that file's
 /// header comment for the fuller rationale, which applies unchanged here:
-/// `browser_inventory` reads per-user browser profile and extension state
+/// `browser_inventory` reads per-user browser profile state
 /// for a SINGLE named machine, the kind of evidence a rogue or compromised
 /// operator identity could otherwise use to fingerprint a target's activity
 /// undetected. Single-target, audited, and Administrator-gated dispatch
@@ -46,7 +47,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueBrowserInventory{{
+inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueBrowserInventory{{
     {
         .plugin = "browser_inventory",
         .action = "browsers",
@@ -69,17 +70,6 @@ inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueBrowserI
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
-    {
-        .plugin = "browser_inventory",
-        .action = "extensions",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Forensics",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::High,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::AdminOrApproval,
-    },
 }};
 
 // #1398: every row in kPluginActionCatalogueBrowserInventory must author
@@ -93,16 +83,14 @@ static_assert(
 
 // The Forensics securable is P0's seed string, not this package's own —
 // this static_assert only pins that this fragment's literal matches ITSELF
-// across all three rows (a copy/paste divergence within the fragment); the
+// across both rows (a copy/paste divergence within the fragment); the
 // cross-package byte-for-byte match against rbac_store.cpp's seeded
 // `types[]` entry is what test_capability_catalogue's
 // kSeededSecurableTypes check verifies at wave-1 integration, after P0
 // lands (this package has no way to see P0's file at engineer time).
 static_assert(kPluginActionCatalogueBrowserInventory[0].securable ==
-                  kPluginActionCatalogueBrowserInventory[1].securable &&
-              kPluginActionCatalogueBrowserInventory[1].securable ==
-                  kPluginActionCatalogueBrowserInventory[2].securable,
-              "browser_inventory's three rows must share one securable literal");
+                  kPluginActionCatalogueBrowserInventory[1].securable,
+              "browser_inventory's two rows must share one securable literal");
 
 } // namespace detail
 

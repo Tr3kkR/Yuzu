@@ -1,6 +1,6 @@
 /**
- * browser_inventory_plugin.cpp — Chromium-family browser, profile and
- * extension inventory for Yuzu agents.
+ * browser_inventory_plugin.cpp — Chromium-family browser and profile
+ * inventory for Yuzu agents.
  *
  * Actions:
  *   "browsers"   — which Chromium-family browsers (Chrome, Edge, ...) are
@@ -9,10 +9,8 @@
  *                  browser's "Local State" file. Never emits an account
  *                  identifier -- see browser_inventory_parsers.hpp's
  *                  PRIVACY CONTRACT.
- *   "extensions" — per-profile extension install/enable state, read from
- *                  "Default/Secure Preferences" (preferred) or
- *                  "Default/Preferences" (fallback) -- see that header for
- *                  which file actually carries extensions.settings.
+ *   The per-profile "extensions" action follows as its own PR (Secure
+ *   Preferences / Preferences settings-map read).
  *
  * Securable: Forensics, default-off via the server-side kill switch
  * (PluginConfigStore::seed_kill_switch_default_off, execution_artifacts'
@@ -21,11 +19,11 @@
  * PRIVACY CONTRACT (binding for every leg, every OS): never emit
  * user_name, gaia_id, e-mail addresses, browsing history, cookies or
  * bookmarks in any row. Enforced structurally in
- * browser_inventory_parsers.hpp -- BrowserProfileRow and ExtensionStateRow
- * simply have no such fields. The Secure Preferences HMAC/`protection`
- * tree is never read, let alone validated.
+ * browser_inventory_parsers.hpp -- BrowserProfileRow simply has no such
+ * fields. No file inside a profile directory is opened by any leg in this
+ * release; the per-profile `extensions` action follows as its own PR.
  *
- * WAVE 1 (this package, P2a-1): plugin scaffold + descriptor (3 actions x
+ * WAVE 1 (this package, P2a-1): plugin scaffold + descriptor (2 actions x
  * 3 OS legs, all declared unconditionally per the capability-matrix
  * generator's contract), the pure JSON parsers, and a COMPILING STUB for
  * the Linux leg. macOS and Windows legs are FINAL ~20-line placeholders
@@ -54,17 +52,17 @@
 
 namespace {
 
-// The nine per-action per-OS legs (three actions x three OSes) are FIXED
-// and never wrapped in a preprocessor conditional -- a single-OS build
-// still declares the full per-OS shape, per the capability-matrix
-// generator's contract (peripherals_plugin.cpp's precedent comment).
+// The six per-action per-OS legs (two actions x three OSes) are FIXED and
+// never wrapped in a preprocessor conditional -- a single-OS build still
+// declares the full per-OS shape, per the capability-matrix generator's
+// contract (peripherals_plugin.cpp's precedent comment).
 //
 // Linux: "browsers" is CONSTRAINED (presence-only detection, no
-// version/channel probe in this package); "profiles"/"extensions" are
-// SUPPORTED -- both backed by a real JSON read once P2a-2 lands the leg
-// body (this package ships only the pure parsers + a compiling stub, see
-// the file banner). macOS and Windows: PLANNED on all three actions this
-// wave, mechanism strings name the follow-up PR's plan.
+// version/channel probe in this package); "profiles" is SUPPORTED (a real
+// Local State JSON read, browser_inventory_linux_parsers.hpp). macOS and
+// Windows: PLANNED on both actions this wave, mechanism strings name the
+// follow-up PR's plan. The "extensions" action follows as its own PR and
+// has no row here until it lands.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "browsers",
@@ -97,23 +95,6 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs",
          "follows as its own PR"},
     },
-    {
-        /* .action      = */ "extensions",
-        /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1,
-         "Default/Secure Preferences (fallback Default/Preferences) extensions.settings JSON "
-         "read",
-         nullptr},
-        /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "/Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application "
-         "Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers",
-         "follows as its own PR"},
-        /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs",
-         "follows as its own PR"},
-    },
 };
 
 } // namespace
@@ -123,11 +104,11 @@ public:
     std::string_view name() const noexcept override { return "browser_inventory"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Chromium-family browser, profile and extension inventory";
+        return "Chromium-family browser and profile inventory";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"browsers", "profiles", "extensions", nullptr};
+        static const char* acts[] = {"browsers", "profiles", nullptr};
         return acts;
     }
 

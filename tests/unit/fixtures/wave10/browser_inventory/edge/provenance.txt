@@ -1,6 +1,8 @@
 REAL CAPTURE (reduced + redacted)
 =================================
-Subject: Microsoft Edge (Chromium) profile files - Local State, Default/Preferences, Default/Secure Preferences and one installed extension's manifest.json.
+Subject: Microsoft Edge (Chromium) profile file "Local State" (browser root). The same rig session also captured Default/Preferences, Default/Secure Preferences and one
+installed extension's manifest.json; those three files are the inputs of the per-profile `extensions` action, which follows as its own PR and commits them (with their own
+reduction/redaction record) then. They are NOT in this directory and nothing in this tree reads them.
 These fixtures are a REDUCED (subtrees dropped) and REDACTED (values replaced) copy of a real capture. The full raw copies are not published and are not in the ~/.claude mirror.
 CORRECTION (Architect arbitration, ws-10.2b P2b-2 R1, 2026-09-21): the raw copies were pulled to the Mac BEFORE redaction and sat in raw/ INSIDE the run-dir copy of this
 directory (mode 700/600, Mac only) - this breached the workstream boundary "no unredacted Edge data leaves the rig". raw/ is now chmod 000 pending Alex's authorised
@@ -14,8 +16,8 @@ Identity .......... the account the ssh session runs as (an ordinary named local
 Edge version ...... installed binary  C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe  ProductVersion 153.0.4234.48;
                      'Last Version' file in the User Data dir: 150.0.4078.65 (the version that last ran this profile);
                      Local State browser.browser_build_version: 149.0.4022.98.
-                     File LastWriteTimes on the rig: Local State 2026-07-15 13:10:17 +01:00; Default/Preferences 2026-07-15 15:08:02 +01:00; Default/Secure Preferences 2026-07-15 13:09:26 +01:00;
-                     manifest.json 2026-03-23 18:38:09 UTC. The profile predates the currently installed Edge build, so the captured files describe an older Edge, not 153.0.4234.48.
+                     File LastWriteTime on the rig: Local State 2026-07-15 13:10:17 +01:00. The profile predates the currently installed Edge build, so the captured
+                     file describes an older Edge, not 153.0.4234.48.
 Capture date ...... 2026-09-21, local time +01:00 (BST): recon 19:11, Edge copy 19:13:55, files pulled 19:17, redaction built on the Mac afterwards.
 
 COMMANDS (rig side, run as the account above; script edge_copy.ps1, output in rig log edge_copy.log)
@@ -23,74 +25,35 @@ COMMANDS (rig side, run as the account above; script edge_copy.ps1, output in ri
   Test-Path / Get-Item -LiteralPath <file>          (existence, Length, LastWriteTime; errors would be logged verbatim - none occurred)
   [IO.File]::Open(<src>, Open, Read, ReadWrite|Delete)  ->  CopyTo([IO.File]::Create(D:\w10-edge-capture\raw\<same relative name>))   (share-read copy; nothing written on C:)
   Get-FileHash -Algorithm SHA256 <copy>
-  Get-ChildItem <Default\Extensions> -Directory        (ids/versions listed; the first id/version that holds a manifest.json was copied)
   Get-Content 'Last Version'                           (one-line version string, logged not copied)
-Lock/share errors: none (Edge not running). Files copied: 4; nothing in the profile was modified or deleted.
+Lock/share errors: none (Edge not running). Files copied in the session: 4 (one published here); nothing in the profile was modified or deleted.
 Pull to the Mac:  scp -r the-rig:/D:/w10-edge-capture/raw <RUN>/captures/edge/   (umask 077; dir chmod 700, files chmod 600). sha256 recomputed on the Mac = the rig-side values below.
 Mac side:  jq (facts below), then  python3 redact_edge.py <raw> <out> <user> <host>  and  python3 scan_edge.py <out> <user> <host>  (scripts kept in the session evidence, rig-scripts/).
 
-RAW FILES (not published) - relative name, bytes, sha256
+RAW FILES (not published) - relative name, bytes, sha256 (the whole session's capture; only Local State is published in this directory)
   Local State                                                                                             45645  9519a603e6a0e6252c746c8a078e014eb29525b56349d88f58bea1c25dd7558a
   Default/Preferences                                                                                    761593  edf3a6a319afaadb25bcefc5ba53dc577e737b72dc39ef31559f7b1a1ea59f4e
   Default/Secure Preferences                                                                              61216  1626ea8575ec3f22f2e64a21237ac507742d6296d92993998fb10dadcc16f225
   Default/Extensions/ghbmnnjooekpmoecnnnilnnbdlolhkhi/1.102.1_0/manifest.json                              2526  1d444f0d789be1b384c8681bcd814d4eb0c3a30b131d1c3ddf4901aa0981a4c5
 
-EXTENSION DIRECTORIES FOUND under Default\Extensions: 2  ->  ghbmnnjooekpmoecnnnilnnbdlolhkhi\1.102.1_0 (manifest.json present)  and  jmjflgjpcpepeafmmgdpfkogkghcpiha\1.2.1_0 (manifest.json present).
-COPIED (first id in sorted order): ghbmnnjooekpmoecnnnilnnbdlolhkhi  version dir 1.102.1_0  (manifest name key '__MSG_extName__', version 1.102.1; Secure Preferences entry name 'Google Docs Offline', location 6, from_webstore true, state 0).
-
-JQ FACTS ON THE RAW FILES (key names and counts only)
+JQ FACTS ON THE RAW FILE (key names and counts only)
 ---------------------------------------------------
-## Default/Preferences
-$ jq 'has("extensions")' "Default/Preferences"
-true
-$ jq -c '.extensions | keys' "Default/Preferences"
-["alerts","chrome_url_overrides","cws_info_fetch_error_timestamp","edge_default_installed_cws_extensions_update_frequency","install_signature","last_chrome_version","microsoft_install_signature","pdf_upsell_triggered","pinned_extension_migration","pinned_extensions"]
-$ jq '.extensions.settings | length' "Default/Preferences"
-0
-$ jq -c '.extensions.settings | keys' "Default/Preferences"
-jq: error (at Default/Preferences:0): null (null) has no keys
-## Default/Secure Preferences
-$ jq 'has("extensions")' "Default/Secure Preferences"
-true
-$ jq -c '.extensions | keys' "Default/Secure Preferences"
-["settings"]
-$ jq '.extensions.settings | length' "Default/Secure Preferences"
-53
-$ jq -c '.extensions.settings | keys' "Default/Secure Preferences"
-["ahfgeienlihckogmohjhadlkjgocpleb","ahokoikenoafgppiblgpenaaaolecifn","ampmimodbocknpfehkbdjolnnbongejb","bhmhibnbialendcafinliemndanacfaj","bobbggphonhgdonfdibkfipfepfcildj","ceaifoolopnigfpidlheoagpheiplgii","cjneempfhkonkkbcmnfdibgobmhbagaj","dabfebgaghanlbehmkmaflipiohdimmc","dcaajljecejllikfgbhjdgeognacjkkp","dgiklkfkllikcanfonkcabmbdfmgleag","dmbljphlfghcnbohaoffiedmodfmkmol","ehlmnljdoejdahfjdfobmpfancoibmig","eijpepilkjkofamihbmjcnihgpbebafj","enkoeamdnimieoooocohgbdajhhkajko","epdpgaljfdjmcemiaplofbiholoaepem","fikbjbembnmfhppjfnmfkahdhfohhjmg","fjngpfnaikknjdhkckmncgicobbkcnle","fogppepbgmgkpdkinbojbibkhoffpief","gbihlnbpmfkodghomcinpblknjhneknc","gbmoeijgfngecijpcnbooedokgafmmji","gecfnmoodchdkebjjffmdcmeghkflpib","gekagaaiohabmaknhkbaofhhedhelemf","ghbmnnjooekpmoecnnnilnnbdlolhkhi","ghglcnachgghkhbafjogogiggghcpjig","hciemgmhplhpinoohcjpafmncmjapioh","hfmgbegjielnmfghmoohgmplnpeehike","hloomjjkinpbjldhobfkfdamkmikjmdo","hmlhageoffiiefnmojcgoagebofoifpl","iglcjdemknebjbklcgkfaebgojjphkec","ihmafllikibpmigkcoadcmckbfhibefp","jbleckejnaboogigodiafflhkajdmpcl","jdiccldimpdaibmpdkjnbmckianbfold","jmjflgjpcpepeafmmgdpfkogkghcpiha","jpfjdekhebcolnfkpicpciaknbgcdcbm","kfihiegbjaloebkmglnjnljoljgkkchm","khffkadolmfbdgahbabbhipadklfmhgf","kieiaeokhmlbffedbdfgbdcnhgpcckkn","kjncpkplfnolibapodobnnjfgmjmiaba","kkobcodijbdelbnhbfkkfncbeildnpie","kmendfapggjehodndflmmgagdbamhnfd","kmojgmpmopiiagdfbilgognmlegkonbk","mhjfbmdgcfjbbpaeojofohoefgiehjai","ncbjelpjchkpbikbpkcchkhkblodoama","ndcpkimcihhghdcddljkfmmjccdmcmof","nkbndigcebkoaejohleckhekfmcecfja","nkeimhogjdpnpccoofpliimaahmaaome","nnpnekncnhiglbokoiffmejlimgmgoam","ofefcgjbeghpigppfmkologfjadafddi","olkdlefmaniacnmgofabnpmomgcpdaip","olmhchkiafniffcaiciiomfdplnmklak","pencekojiebcjhifbkfdncgmmooepclc","piilhopgoheagglmepbmkpodfceclmab","ppnnjfpaneghjbcepgedmlcgmfgkjhah"]
-
-## which file carries extensions.settings
-  Default/Secure Preferences: .extensions has exactly one key, "settings", with 53 entries (14 with state 1, 38 with state 0, 1 with no state; location: 38 absent, 13 = 5, 1 = 6, 1 = 10;
-  from_webstore: true 1, false 14, absent 38; 15 entries carry a full 'manifest' object).
-  Default/Preferences: has .extensions but NO .extensions.settings (length 0; `keys` on the null value errors: "jq: error (at Default/Preferences:0): null (null) has no keys").
-  => the install/ownership records for extensions live in Secure Preferences only; Preferences carries only extension UI/signature scalars.
-
-## top-level key list of each raw JSON file
+## top-level key list
 $ jq -c 'keys' "Local State"
 ["abusive_adblocker_etag","accessibility","app_defaults","apps_count_check_time","autofill","background_tracing","breadcrumbs","browser","cloud_config_service_v2","continuous_migration","data_use_measurement","default_browser","default_search_provider","desktop_mode","desktop_session_duration_tracker","domain_actions_config","dual_engine","edge","edge_activation","edge_autolaunch","edge_ci","edge_cloud_messaging","edge_copilot","edge_copilot_mode_enabled_state","edge_llm","edge_mouse_gesture","edge_operation_config","edge_standalone_sidebar","edge_web_content_filtering","edgel_llm","fre","hardware_acceleration_mode_previous","host_package_checked_on_browser_version","identity_combined_status","ie_react","invalidation","last_pin_migration_on_edge_version","last_pin_migration_on_os_version","last_pinned_sites_migration_type","last_pinned_sites_migration_version","legacy","local","management","metrics","microsoft","migration","network_primary_browser","network_time","new_device_fre","ntp","nurturing","optimization_guide","os_crypt","password_manager","performance_intervention","policy","private_key_encrypted_data","profile","profiles","sentinel_creation_time","session_id_generator_last_value","shortcut_migration_failed","shutdown","signin","site_pinning","smart_switch","smartscreen","startup_boost","subresource_filter","tab_stats","telemetry_client","ukm","uninstall_metrics","updateclientdata","updateclientlastupdatecheckerror","updateclientlastupdatecheckerrorcategory","updateclientlastupdatecheckerrorextracode1","user_experience_metrics","variations_compressed_seed","variations_config_ids","variations_country","variations_crash_streak","variations_failed_to_fetch_seed_streak","variations_google_groups","variations_last_fetch_time","variations_last_runtime_fetch_time","variations_permanent_consistency_country","variations_runtime_compressed_seed","variations_runtime_config_ids","variations_safe_compressed_seed","variations_safe_seed_date","variations_safe_seed_fetch_time","variations_safe_seed_locale","variations_safe_seed_milestone","variations_safe_seed_permanent_consistency_country","variations_safe_seed_session_consistency_country","variations_safe_seed_signature","variations_seed_client_version_at_store","variations_seed_date","variations_seed_etag","variations_seed_milestone","variations_seed_runtime_etag","variations_seed_runtime_serial_number","variations_seed_serial_number","variations_seed_signature","variations_sticky_studies","was","web_widget","whnew","windows_welcome"]
-$ jq -c 'keys' "Default/Preferences"
-["aadc_info","accessibility","account_info","account_level_sync_consent_recorded","account_tracker_service_last_update","alternate_error_pages","appdefaults_partner_code","apps","arbitration_experiences","arbitration_last_notification_shown","arbitration_using_experiment_config","autocomplete","autofill","bookmark","browser","browser_content_container_height","browser_content_container_width","browser_content_container_x","browser_content_container_y","cached_fonts","collections","commerce_daily_metrics_last_update_time","continuous_migration","countryid_at_install","custom_links","default_apps_install_state","default_search_provider","devtools","dns_prefetching","domain_diversity","download","dual_engine","edge","edge_cloud_messaging","edge_commercial_copilot","edge_fundamentals_appdefaults","edge_journeys","edge_pinning_campaign","edge_rewards","edge_sync_profile","edge_triggering","edge_ux_config","edge_vpn","edge_wallet","enterprise_profile_guid","enterprise_reporting","ess_kv_states","extension","extensions","family_safety","fsd","funsec_app_defaults","gaia_cookie","google","history_clusters","import_items_failure_state","in_product_help","intl","kodiak","language_dwell_time_average","language_model_counters","language_usage_count","local_browser_data_share","media","media_router","migrated_user_scripts_toggle","muid","ntp","nurturing","omnibox","open_save_as_awareness_ui","optimization_guide","partition","password_manager","personalization_data_consent","pinned_sites","plugin","printing","privacy_sandbox","profile","profile_network_context_service","profiles","protection","protocol_handler","reset_prepopulated_engines","safebrowsing","safety_hub","saved_tab_groups","segmentation_platform","sessions","settings","shopping","should_read_incoming_syncing_theme_prefs","signin","smart_explore","spawn_ntp","spellcheck","sync","sync_consent_recorded","syncing_theme_prefs_migrated_to_non_syncing","tab_groups","tab_search","third_party_search","toolbar","toolbar_declutter","total_passwords_available_for_account","total_passwords_available_for_profile","tracking_protection","translate_ignored_count_for_language","translate_site_blacklist","translate_site_blacklist_with_time","translate_site_blocklist_with_time","typosquatting","updateclientdata","user_experience_metrics","visual_search","web_app","web_apps","zerosuggest"]
-$ jq -c 'keys' "Default/Secure Preferences"
-["edge","edge_fundamentals_appdefaults","ess_kv_states","extensions","google","pinned_tabs","protection","schedule_to_flush_to_disk"]
-
-## protection key (raw)
-$ jq -c '.protection | keys' Default/Preferences Default/Secure Preferences
-["macs"]
-["macs","super_encrypted_hash","super_mac"]
 
 REDUCTION AND REDACTION (key names only; no value is printed in this file except fixed placeholders)
 -----------------------------------------------------------------------------------------------------
 Method: structure-preserving JSON edits with redact_edge.py (python3 json, key order preserved), then re-serialized with 2-space indent, ensure_ascii off, trailing newline
 (so byte layout differs from Edge's compact one-line output; every kept number/string/bool is unchanged unless listed below). verify_redaction.py compared every leaf
-of each output file with the raw file at the same path: only the placeholders listed below differ (Local State 41 identical + 12 placeholders + 1 leaf under the dotted key
-'signin.with_credential_provider' checked by hand, false = false; Preferences 18 + 5; Secure Preferences 1262 + 17; manifest 47 + 1).
+of the output file with the raw file at the same path: only the placeholders listed below differ (Local State 41 identical + 12 placeholders + 1 leaf under the dotted key
+'signin.with_credential_provider' checked by hand, false = false).
 
 Local State
   KEPT : top-level 'profile' (info_cache.Default, last_active_profiles, last_used, metrics.next_bucket_index, profile_counts_reported, profiles_order) and 'browser' version scalars
          (browser_build_version, browser_version_of_last_seen_whats_new, build_version_for_update_tracker, last_seen_whats_new_page_version).
   DROPPED: 108 of 110 top-level keys - every key except profile and browser, in particular: os_crypt (encrypted key blob), private_key_encrypted_data, variations_* (all),
-         user_experience_metrics, optimization_guide, signin, sync-related and edge_* telemetry keys. Full list of dropped top-level keys:
-         abusive_adblocker_etag, accessibility, app_defaults, apps_count_check_time, autofill, background_tracing, breadcrumbs, cloud_config_service_v2, continuous_migration, data_use_measurement, default_browser, default_search_provider, desktop_mode, desktop_session_duration_tracker, domain_actions_config, dual_engine, edge, edge_activation, edge_autolaunch, edge_ci, edge_cloud_messaging, edge_copilot, edge_copilot_mode_enabled_state, edge_llm, edge_mouse_gesture, edge_operation_config, edge_standalone_sidebar, edge_web_content_filtering, edgel_llm, fre, hardware_acceleration_mode_previous, host_package_checked_on_browser_version, identity_combined_status, ie_react, invalidation, last_pin_migration_on_edge_version, last_pin_migration_on_os_version, last_pinned_sites_migration_type, last_pinned_sites_migration_version, legacy, local, management, metrics, microsoft, migration, network_primary_browser, network_time, new_device_fre, ntp, nurturing, optimization_guide, os_crypt, password_manager, performance_intervention, policy, private_key_encrypted_data, profiles, sentinel_creation_time, session_id_generator_last_value, shortcut_migration_failed, shutdown, signin, site_pinning, smart_switch, smartscreen, startup_boost, subresource_filter, tab_stats, telemetry_client, ukm, uninstall_metrics, updateclientdata, updateclientlastupdatecheckerror, updateclientlastupdatecheckerrorcategory, updateclientlastupdatecheckerrorextracode1, user_experience_metrics, variations_compressed_seed, variations_config_ids, variations_country, variations_crash_streak, variations_failed_to_fetch_seed_streak, variations_google_groups, variations_last_fetch_time, variations_last_runtime_fetch_time, variations_permanent_consistency_country, variations_runtime_compressed_seed, variations_runtime_config_ids, variations_safe_compressed_seed, variations_safe_seed_date, variations_safe_seed_fetch_time, variations_safe_seed_locale, variations_safe_seed_milestone, variations_safe_seed_permanent_consistency_country, variations_safe_seed_session_consistency_country, variations_safe_seed_signature, variations_seed_client_version_at_store, variations_seed_date, variations_seed_etag, variations_seed_milestone, variations_seed_runtime_etag, variations_seed_runtime_serial_number, variations_seed_serial_number, variations_seed_signature, variations_sticky_studies, was, web_widget, whnew, windows_welcome
+         user_experience_metrics, optimization_guide, signin, sync-related and edge_* telemetry keys (the full raw key list is the jq output above).
          Within 'browser': last_browser_update_time and last_redirect_origin dropped (not version-ish scalars).
   REDACTED (string value -> "REDACTED") in profile.info_cache.Default, 12 values: edge_account_cid, edge_account_environment_string, edge_account_first_name, edge_account_last_name,
          edge_account_oid, edge_account_tenant_id, gaia_id, gaia_name, shortcut_name, user_name  (the keys the brief names), plus two beyond the brief's list,
@@ -101,108 +64,17 @@ Local State
          resource name containing no user name); display 'name' ('Profile 1' - a generic name, no personal name, so no 'Person 1' replacement was needed).
   Note: the profile record shows a signed-in Edge account (booleans/ints above); every identifying string about it is redacted.
 
-Default/Preferences
-  KEPT : 'extensions' subtree (alerts, chrome_url_overrides, cws_info_fetch_error_timestamp, edge_default_installed_cws_extensions_update_frequency, install_signature,
-         last_chrome_version, microsoft_install_signature, pdf_upsell_triggered, pinned_extension_migration, pinned_extensions) and 'protection' with macs = {}.
-  DROPPED: the other 117 top-level keys (site engagement, zoom, history_clusters, browser, profile, sync, account_info, ... everything not named above).
-  MAC TREE DROPPED: protection.macs replaced by {} (the raw tree had 1 key; it is not validated by the consumer).
-  REDACTED: extensions.install_signature.salt, .signature and extensions.microsoft_install_signature.salt, .signature (token-shaped base64) -> "REDACTED". No path, e-mail or URL edits (0).
-
-Default/Secure Preferences
-  KEPT : 'extensions' subtree (extensions.settings: 53 entries, each with its structural keys - state, disable_reasons, from_webstore, location, manifest.*, path, install times,
-         active_permissions, granted_permissions, withholding_permissions, commands, events, ...) and 'protection' with macs = {}.
-  DROPPED: the 6 other top-level keys (edge, edge_fundamentals_appdefaults, ess_kv_states, google, pinned_tabs, schedule_to_flush_to_disk).
-  MAC TREE DROPPED: protection.macs replaced by {} (raw tree: 20 keys; not validated by the consumer). Also dropped: protection.super_mac and protection.super_encrypted_hash
-         (HMAC/hash strings, token-shaped; outside the requested 'macs' value).
-  REDACTED in extensions.settings.*: 15 x manifest.key (base64 public key, > 32 chars, token-shaped) -> "REDACTED"; 1 x manifest.author.email of ghbmnnjooekpmoecnnnilnnbdlolhkhi
-         (a publisher e-mail address) -> "REDACTED-EMAIL".
-  path values: 15 present (13 absolute, all under the Edge install dir C:\Program Files (x86)\Microsoft\Edge\Application\<version>\resources\..., 2 relative <id>\<ver>);
-         0 contained a Windows user name -> the user-name -> jsmith rule matched 0 times. URLs carrying a user name or a real query string: 0.
-  KEPT ON PURPOSE: 4 extension URL match patterns ending in '?*' (scriptable_host x2 and content_scripts[0].matches x2 of the built-in extension 'Suppress Consent Prompt'):
-         a bare wildcard query in a publisher-defined match pattern is structure, not data (the redactor's rule treats only a real query string as a redaction trigger).
-
-Default/Extensions/ghbmnnjooekpmoecnnnilnnbdlolhkhi/1.102.1_0/manifest.json
-  Publisher-supplied and public: kept as is except 1 e-mail-shaped value (author.email) -> "REDACTED-EMAIL" (so the file was re-serialized like the others).
-  The manifest 'key' (the extension's public key) is kept, as the brief allows for manifests; it is a base64 run and is listed in the scan results.
-
-RESIDUAL SCANS (scan_edge.py over every file in this directory; raw/ excluded; extension ids (32 chars a-p) exempt from the base64 rule)
------------------------------------------------------------------------------------------------------------------------------------
-Files scanned for ALL patterns: the four fixtures and winget-version.txt (5 files). provenance.txt (this file) was scanned for the personal-identifier patterns and the base64 rule;
-it is excluded from the five word patterns because it necessarily names them (its own scan lines are the only hits there).
-Counts (fixtures + winget-version.txt):
-  account/profile-folder name      0
-  host name                        0
-  at-sign (e-mail shaped)          0
-  SID prefix                       0
-  gaia                             6
-  token                            9
-  password                         0
-  secret                           0
-  cookie                           0
-  base64-looking 20+ run           35
+RESIDUAL SCANS (scan_edge.py at capture time over the whole published bundle; the lines below are the subset for the file in this directory. raw/ excluded.)
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+Counts for Local State: account/profile-folder name 0; host name 0; at-sign (e-mail shaped) 0; SID prefix 0; gaia 6; token 0; password 0; secret 0; cookie 0; base64-looking 20+ run 0.
 Every remaining hit (file:line: text) and its justification:
-  HIT [base64-looking 20+ run] Default/Extensions/ghbmnnjooekpmoecnnnilnnbdlolhkhi/1.102.1_0/manifest.json:57: run-len=392 in: "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ…(public key, truncated here)
-  HIT [base64-looking 20+ run] Default/Extensions/ghbmnnjooekpmoecnnnilnnbdlolhkhi/1.102.1_0/manifest.json:70: run-len=23 in: "update_url": "https://clients2.google.com/service/update2/crx",
-  HIT [token] Default/Secure Preferences:1450: "cryptotokenPrivate",
-  HIT [token] Default/Secure Preferences:1502: "cryptotokenorigincheck.js",
-  HIT [token] Default/Secure Preferences:1503: "cryptotokenapprovedorigins.js",
-  HIT [token] Default/Secure Preferences:1507: "cryptotokenbackground.js"
-  HIT [token] Default/Secure Preferences:1510: "description": "CryptoToken Component Extension",
-  HIT [token] Default/Secure Preferences:1522: "name": "CryptoTokenExtension",
-  HIT [token] Default/Secure Preferences:1524: "cryptotokenPrivate",
-  HIT [token] Default/Secure Preferences:1532: "path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\89.0.774.68\\resources\\cryptotoken",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:381: run-len=21 in: "mediaInternalsPrivate"
-  HIT [base64-looking 20+ run] Default/Secure Preferences:643: run-len=23 in: "update_url": "https://clients2.google.com/service/update2/crx",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:822: run-len=31 in: "edgeInternetConnectivityPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:948: run-len=28 in: "voiceList/voiceListRequester.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:949: run-len=28 in: "voiceList/voiceListSingleton.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:950: run-len=20 in: "voiceList/voiceModel.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:957: run-len=24 in: "wordBoundaryEventManager.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1342: run-len=32 in: "update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1502: run-len=22 in: "cryptotokenorigincheck.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1503: run-len=26 in: "cryptotokenapprovedorigins.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1506: run-len=26 in: "googlecorpindividualattest.js",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1507: run-len=21 in: "cryptotokenbackground.js"
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1522: run-len=20 in: "name": "CryptoTokenExtension",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1570: run-len=24 in: "edgeLearningToolsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1573: run-len=23 in: "edgeCertVerifierPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1611: run-len=24 in: "edgeLearningToolsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1671: run-len=22 in: "webrtcInternalsPrivate"
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1690: run-len=24 in: "edgeCopilotBridgePrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1692: run-len=22 in: "edgeNtpSettingsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1693: run-len=29 in: "edgeCopilotToolActionsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1694: run-len=24 in: "edgeCopilotCoworkPrivate"
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1732: run-len=24 in: "edgeCopilotBridgePrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1733: run-len=24 in: "edgeCopilotCoworkPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1734: run-len=29 in: "edgeCopilotToolActionsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1735: run-len=22 in: "edgeNtpSettingsPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1750: run-len=20 in: "copilotBridgePrivate.notify.onNotification",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1751: run-len=20 in: "copilotBridgePrivate.qvMessaging.onSendQuickViewPrompt",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1751: run-len=21 in: "copilotBridgePrivate.qvMessaging.onSendQuickViewPrompt",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1752: run-len=20 in: "copilotBridgePrivate.qvMessaging.onUpdateAppMode",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1782: run-len=20 in: "webrtcLoggingPrivate",
-  HIT [base64-looking 20+ run] Default/Secure Preferences:1826: run-len=20 in: "webrtcLoggingPrivate"
   HIT [gaia] Local State:32: "gaia_given_name": "",
   HIT [gaia] Local State:33: "gaia_id": "REDACTED",
   HIT [gaia] Local State:34: "gaia_name": "REDACTED",
   HIT [gaia] Local State:35: "gaia_picture_file_name": "REDACTED",
   HIT [gaia] Local State:41: "last_downloaded_gaia_picture_url_with_size": "REDACTED",
   HIT [gaia] Local State:48: "use_gaia_picture": true,
-  HIT [token] winget-version.txt:9: (a) INTERACTIVE USER - the account the ssh session runs as (name withheld); elevated administrator token (High Mandatory Level)
-  HIT [base64-looking 20+ run] winget-version.txt:42: run-len=24 in: | Get-Command ERROR: System.Management.Automation.CommandNotFoundException: The term 'winget' is not recognize
-  HIT [base64-looking 20+ run] winget-version.txt:44: run-len=24 in: ('not recognized'), Get-Command throws CommandNotFoundException. No attempt was made to locate a winget.exe el
-  JUSTIFICATION:
-   - the 6 hits of the Google-account word are KEY NAMES under Local State profile.info_cache.Default (gaia_given_name, gaia_id, gaia_name, gaia_picture_file_name,
-     last_downloaded_gaia_picture_url_with_size, use_gaia_picture); their string values are "REDACTED" or empty, use_gaia_picture is a boolean.
-   - 8 of the 9 hits of the word 'token' are the built-in component extension CryptoTokenExtension in Secure Preferences: its API permission name cryptotokenPrivate (x2), script
-     file names cryptotoken*.js (x3), its name/description, and its install path ...\resources\cryptotoken. Public browser-shipped metadata, no credential.
-     The 9th is the phrase 'administrator token' in winget-version.txt line 9 (a description of the process identity, not a token value).
-   - base64-looking runs: (1) manifest.json 'key' = the extension's public key, publisher-supplied, kept per the manifest rule (the same value is redacted in Secure Preferences);
-     (2) camelCase extension API/permission identifiers such as edgeCopilotBridgePrivate, webrtcLoggingPrivate, mediaInternalsPrivate; (3) script file names/paths
-     (voiceList/voiceListRequester.js, cryptotoken*.js, wordBoundaryEventManager.js); (4) the exception class name CommandNotFoundException (24 chars, x2, in winget-version.txt) and public update-URL paths (clients2.google.com/service/update2/crx,
-     edge.microsoft.com/extensionwebstorebase/v1/crx); (5) the sha256 digests recorded in this file (64 hex characters each). None is a secret or a personal value.
-   - account/profile-folder name, host name, at-sign, SID prefix, password, secret, cookie: 0 hits in every file.
+  JUSTIFICATION: the 6 hits of the Google-account word are KEY NAMES under profile.info_cache.Default; their string values are "REDACTED" or empty, use_gaia_picture is a boolean.
 
-SELF-SCAN OF THIS FILE (provenance.txt): personal-identifier patterns (account name, host name, at-sign, SID prefix) 0 hits; the five word patterns are skipped for this file (see above).
-Base64-looking runs of 20+ characters: 60, all of four kinds: the 4 sha256 digests above; key names in the dropped-key lists and jq key lists (e.g. the long updateclient... key names);
-verbatim copies of the fixture hits listed above; and prose repeating those same identifiers. No secret or personal value.
+SELF-SCAN OF THIS FILE (provenance.txt): personal-identifier patterns (account name, host name, at-sign, SID prefix) 0 hits; the word patterns are skipped for this file because
+it necessarily names them. Base64-looking runs of 20+ characters: the 4 sha256 digests above and long key names in the jq key list. No secret or personal value.

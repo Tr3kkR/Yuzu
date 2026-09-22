@@ -1,7 +1,7 @@
 /**
  * test_browser_inventory_parsers.cpp — pure browser_inventory_parsers.hpp
  * tests. No plugin load, no OS call: everything here exercises
- * profiles_from_local_state() and extension_state_from_prefs() directly
+ * profiles_from_local_state() directly
  * against committed fixture files (real Edge capture + synthetic Chrome,
  * see tests/unit/fixtures/wave10/browser_inventory/{edge,chrome}/
  * provenance.txt) and small inline JSON literals for presence combinations
@@ -36,12 +36,6 @@ std::string read_fixture(const fs::path& rel) {
     std::ostringstream ss;
     ss << f.rdbuf();
     return ss.str();
-}
-
-const ExtensionStateRow* find_id(const std::map<std::string, ExtensionStateRow>& m,
-                                 const std::string& id) {
-    auto it = m.find(id);
-    return it == m.end() ? nullptr : &it->second;
 }
 
 } // namespace
@@ -131,160 +125,4 @@ TEST_CASE("profiles_from_local_state: no 'profile' key, or 'profile' not an obje
     CHECK(profiles_from_local_state(R"({"profile": "not-an-object"})")->empty());
     CHECK(profiles_from_local_state(R"({"profile": {}})")->empty());
     CHECK(profiles_from_local_state(R"({"profile": {"info_cache": {}}})")->empty());
-}
-
-// ──────────────────────────────────────── extension_state_from_prefs ─────
-
-TEST_CASE("extension_state_from_prefs: neither file present -> empty map, not nullopt",
-          "[browser_inventory][extensions]") {
-    const auto m = extension_state_from_prefs("", "");
-    REQUIRE(m.has_value());
-    CHECK(m->empty());
-}
-
-TEST_CASE("extension_state_from_prefs: REAL CAPTURE (Edge) secure-only — the copied "
-          "extension's real, unredacted structural fields come through",
-          "[browser_inventory][extensions][fixture]") {
-    const auto secure = read_fixture("edge/Default/Secure Preferences");
-    const auto m = extension_state_from_prefs(secure, /*prefs=*/"");
-    REQUIRE(m.has_value());
-    CHECK(m->size() == 53); // provenance.txt: extensions.settings has 53 entries
-
-    // Mutation-survival anchor (X11): a real captured value, not a "not
-    // empty"/count-only check. ghbmnnjooekpmoecnnnilnnbdlolhkhi is "Google
-    // Docs Offline", disable_reasons non-empty and state 0 in the raw
-    // capture -> "disabled"; from_webstore true -> "yes".
-    const auto* row = find_id(*m, "ghbmnnjooekpmoecnnnilnnbdlolhkhi");
-    REQUIRE(row != nullptr);
-    CHECK(row->state == "disabled");
-    CHECK(row->from_webstore == "yes");
-    CHECK(row->name == "Google Docs Offline");
-    CHECK(row->version == "1.102.1");
-}
-
-TEST_CASE("extension_state_from_prefs: REAL CAPTURE (Edge) — Preferences alone carries no "
-          "extensions.settings (confirmed in provenance.txt's jq facts), so prefs-only "
-          "yields an empty map",
-          "[browser_inventory][extensions][fixture]") {
-    const auto prefs = read_fixture("edge/Default/Preferences");
-    const auto m = extension_state_from_prefs(/*secure=*/"", prefs);
-    REQUIRE(m.has_value());
-    CHECK(m->empty());
-}
-
-TEST_CASE("extension_state_from_prefs: REAL CAPTURE (Edge) — both files present, Secure "
-          "Preferences still supplies the 53 entries, Preferences contributing nothing to "
-          "merge (matches its empty settings map)",
-          "[browser_inventory][extensions][fixture]") {
-    const auto secure = read_fixture("edge/Default/Secure Preferences");
-    const auto prefs = read_fixture("edge/Default/Preferences");
-    const auto m = extension_state_from_prefs(secure, prefs);
-    REQUIRE(m.has_value());
-    CHECK(m->size() == 53);
-}
-
-TEST_CASE("extension_state_from_prefs: precedence — an id present in both files takes the "
-          "Secure Preferences entry",
-          "[browser_inventory][extensions][precedence]") {
-    constexpr std::string_view secure = R"({
-        "extensions": {"settings": {
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
-                "state": 1, "from_webstore": true,
-                "manifest": {"name": "From Secure", "version": "9.9.9"}
-            }
-        }}
-    })";
-    constexpr std::string_view prefs = R"({
-        "extensions": {"settings": {
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
-                "state": 0, "from_webstore": false,
-                "manifest": {"name": "From Preferences", "version": "1.1.1"}
-            }
-        }}
-    })";
-    const auto m = extension_state_from_prefs(secure, prefs);
-    REQUIRE(m.has_value());
-    REQUIRE(m->size() == 1);
-    const auto* row = find_id(*m, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    REQUIRE(row != nullptr);
-    CHECK(row->name == "From Secure");
-    CHECK(row->state == "enabled");
-    CHECK(row->from_webstore == "yes");
-}
-
-TEST_CASE("extension_state_from_prefs: an id present only in Preferences (fallback) still "
-          "surfaces",
-          "[browser_inventory][extensions][precedence]") {
-    constexpr std::string_view prefs = R"({
-        "extensions": {"settings": {
-            "dddddddddddddddddddddddddddddddd": {
-                "state": 1,
-                "manifest": {"name": "Prefs Only", "version": "3.0.0"}
-            }
-        }}
-    })";
-    const auto m = extension_state_from_prefs(/*secure=*/"", prefs);
-    REQUIRE(m.has_value());
-    REQUIRE(m->size() == 1);
-    const auto* row = find_id(*m, "dddddddddddddddddddddddddddddddd");
-    REQUIRE(row != nullptr);
-    CHECK(row->name == "Prefs Only");
-    CHECK(row->state == "enabled");
-    CHECK(row->from_webstore == "-"); // field absent in this literal
-}
-
-TEST_CASE("extension_state_from_prefs: SYNTHETIC (Chrome) — state enabled/disabled/"
-          "unmodelled cover exactly the three values this parser distinguishes",
-          "[browser_inventory][extensions][fixture]") {
-    const auto secure = read_fixture("chrome/Default/Secure Preferences");
-    const auto m = extension_state_from_prefs(secure, /*prefs=*/"");
-    REQUIRE(m.has_value());
-    REQUIRE(m->size() == 3);
-
-    const auto* enabled = find_id(*m, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    REQUIRE(enabled != nullptr);
-    CHECK(enabled->state == "enabled");
-    CHECK(enabled->from_webstore == "yes");
-    CHECK(enabled->name == "Synthetic Enabled Extension");
-    CHECK(enabled->version == "1.0.0");
-
-    const auto* disabled = find_id(*m, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    REQUIRE(disabled != nullptr);
-    CHECK(disabled->state == "disabled");
-    CHECK(disabled->from_webstore == "-"); // field absent on this entry
-
-    const auto* unmodelled = find_id(*m, "cccccccccccccccccccccccccccccccc");
-    REQUIRE(unmodelled != nullptr);
-    CHECK(unmodelled->state == "unmodelled"); // no "state" key at all on this entry
-}
-
-TEST_CASE("extension_state_from_prefs: malformed Secure Preferences with no Preferences "
-          "fallback -> std::nullopt",
-          "[browser_inventory][extensions]") {
-    const auto m = extension_state_from_prefs("{not valid json", /*prefs=*/"");
-    CHECK_FALSE(m.has_value());
-}
-
-TEST_CASE("extension_state_from_prefs: malformed Secure Preferences but a valid Preferences "
-          "fallback still yields data, not nullopt",
-          "[browser_inventory][extensions]") {
-    constexpr std::string_view prefs = R"({
-        "extensions": {"settings": {
-            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {"state": 1, "manifest": {"name": "Ok", "version": "1"}}
-        }}
-    })";
-    const auto m = extension_state_from_prefs("{not valid json", prefs);
-    REQUIRE(m.has_value());
-    CHECK(m->size() == 1);
-}
-
-TEST_CASE("extension_state_from_prefs: no 'extensions' key, or 'extensions.settings' not an "
-          "object, yields an empty map (not nullopt) — the file parsed fine, it just has no "
-          "extension state",
-          "[browser_inventory][extensions]") {
-    CHECK(extension_state_from_prefs(R"({"unrelated": 1})", "")->empty());
-    CHECK(extension_state_from_prefs(R"({"extensions": "not-an-object"})", "")->empty());
-    CHECK(extension_state_from_prefs(R"({"extensions": {}})", "")->empty());
-    CHECK(extension_state_from_prefs(R"({"extensions": {"settings": "not-an-object"}})", "")
-              ->empty());
 }

@@ -21,16 +21,15 @@
 
 namespace yuzu::browser_inventory {
 
-/// The three actions this package covers. One value per `actions()` entry
+/// The two actions this package covers. One value per `actions()` entry
 /// (browser_inventory_plugin.cpp) -- see action_name/parse_action for the
 /// string<->enum mapping the dispatcher and the descriptor rely on.
-enum class Action { browsers, profiles, extensions };
+enum class Action { browsers, profiles };
 
 [[nodiscard]] constexpr std::string_view action_name(Action a) noexcept {
     switch (a) {
     case Action::browsers:   return "browsers";
     case Action::profiles:   return "profiles";
-    case Action::extensions: return "extensions";
     }
     return "browsers";
 }
@@ -41,7 +40,6 @@ enum class Action { browsers, profiles, extensions };
 [[nodiscard]] constexpr std::optional<Action> parse_action(std::string_view action) noexcept {
     if (action == "browsers") return Action::browsers;
     if (action == "profiles") return Action::profiles;
-    if (action == "extensions") return Action::extensions;
     return std::nullopt;
 }
 

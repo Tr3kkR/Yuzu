@@ -144,10 +144,10 @@ std::optional<LoadedPlugin> load_browser_inventory_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-/// The three actions and their real (non-status) row shapes: `kind` is the
+/// The two actions and their real (non-status) row shapes: `kind` is the
 /// leading token, `field_count` its exact escape-aware field count once
-/// split -- browser_inventory_linux_parsers.hpp's linux_{browser,profile,
-/// extension}_rows_at() formatters are the one place these are built.
+/// split -- browser_inventory_linux_parsers.hpp's linux_{browser,profile}_
+/// rows_at() formatters are the one place these are built.
 struct ActionShape {
     const char* action;
     const char* kind;
@@ -156,7 +156,6 @@ struct ActionShape {
 constexpr ActionShape kActions[] = {
     {"browsers", "browser", 4},
     {"profiles", "profile", 5},
-    {"extensions", "extension", 9},
 };
 
 } // namespace
@@ -250,7 +249,7 @@ TEST_CASE("browser_inventory plugin: macOS/Windows report exactly the PLANNED st
 #if defined(__linux__)
 // This package's own leg (P2a-2): on a host with no Chromium-family
 // browser installed (the common CI case), every action reports SUPPORTED
-// -- a genuinely absent browser/profile/extension is not a constraint (see
+// -- a genuinely absent browser/profile is not a constraint (see
 // browser_inventory_linux_parsers.hpp's FAILURE CONTRACT banner).
 TEST_CASE("browser_inventory plugin: Linux reports supported, not constrained, when Chromium is "
          "absent",

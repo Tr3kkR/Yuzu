@@ -4606,7 +4606,7 @@ public:
         }
 
         // Wave 10: browser_inventory (Forensics class, per-user browser
-        // profile/extension data) ships default-off — an operator must
+        // profile data) ships default-off — an operator must
         // explicitly enable it via PUT
         // /api/v1/plugin-config/browser_inventory/kill-switch. Seeded
         // immediately after the store is constructed and open; ON CONFLICT

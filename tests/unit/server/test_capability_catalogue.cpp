@@ -339,11 +339,11 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
 /// protects autoruns' — a field-for-field copy of execution_artifacts'
 /// Forensics/AdminOrApproval boundary (see the catalogue fragment's file
 /// header) must not silently drift.
-TEST_CASE("capability catalogue: browser_inventory's three actions pin their exact "
+TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact "
           "classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_browser_inventory();
-    for (const auto action : {"browsers", "profiles", "extensions"}) {
+    for (const auto action : {"browsers", "profiles"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());

@@ -454,17 +454,17 @@ TEST_CASE("app_usage.summary (real fragment): Forensics single-target rule — 1
 
 // Wave 10 P2a-3 — pins the REAL browser_inventory fragment (not the
 // hand-built kForensicsFixture above) through the same Forensics
-// single-target rule: browser_inventory's three rows are ReadOnly/
+// single-target rule: browser_inventory's two rows are ReadOnly/
 // AdminOrApproval under the Forensics securable (field-for-field copy of
 // execution_artifacts'), so they must be targeted exactly as
 // execution_artifacts is.
 TEST_CASE("browser_inventory (real fragment): Forensics single-target rule — 1 agent Targeted, "
-          "2 agents RefuseUntargeted for all three actions",
+          "2 agents RefuseUntargeted for both actions",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_browser_inventory()};
 
-    for (const char* action : {"browsers", "profiles", "extensions"}) {
+    for (const char* action : {"browsers", "profiles"}) {
         auto classified = registry.classify("browser_inventory", action);
         REQUIRE(classified.has_value());
         CHECK(classified->securable == kForensicsSecurable);

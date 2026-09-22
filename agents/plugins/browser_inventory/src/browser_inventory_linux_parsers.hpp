@@ -17,16 +17,11 @@
  * fixed `<root>/root` home (root's own login shell). For each home, each of
  * the three known Chromium-family config dirs (~/.config/{google-chrome,
  * chromium,microsoft-edge}) is opened (absent -> nothing for that browser,
- * not a failure). Within an opened browser root: "Local State" (1 MiB cap)
- * -> profiles_from_local_state() -> the profile directory list; per profile
- * dir, "Secure Preferences" + "Preferences" (8 MiB cap each, either may be
- * absent) -> extension_state_from_prefs(); and, only when that call left a
- * name/version unresolved (extensions.settings carried no embedded
- * `manifest` object for that id — the real Edge capture's own finding: 38
- * of 53 entries have none, see edge/provenance.txt "which file carries
- * extensions.settings"), a best-effort fallback read of
- * "Extensions/<id>/<ver>/manifest.json" (256 KiB cap, first readable
- * version dir wins).
+ * not a failure). Within an opened browser root exactly ONE file is read:
+ * "Local State" (1 MiB cap) -> profiles_from_local_state() -> the profile
+ * rows. No profile directory is opened and no file inside one is read --
+ * the per-profile `extensions` action follows as its own PR (it reads Secure
+ * Preferences / Preferences / Extensions/<id>/<ver>/manifest.json).
  *
  * FAILURE CONTRACT (autoruns' AC4, shared via yuzu::shared::
  * ConstraintAccumulator per this repo's binding brief): ENOENT anywhere in
@@ -34,18 +29,17 @@
  * read failure (EACCES from a chmod'd-000 profile dir, EBUSY, a refused
  * symlink, a non-regular leaf) is accumulated and surfaces as the leg's
  * `status|<action>|constrained|<reason>` row (browser_inventory_linux.cpp).
- * A malformed JSON file (profiles_from_local_state/extension_state_from_
- * prefs returning std::nullopt) is treated the same way — a real
+ * A malformed JSON file (profiles_from_local_state returning std::nullopt)
+ * is treated the same way — a real
  * acquisition failure, never silently folded into "zero rows".
  *
  * PRIVACY: every field this leg writes onto the wire comes from
- * BrowserProfileRow/ExtensionStateRow (browser_inventory_parsers.hpp),
- * which structurally carry no user_name/gaia_id/e-mail — see that header's
- * PRIVACY CONTRACT. The Secure Preferences `protection` (HMAC) tree is
- * never read here either.
+ * BrowserProfileRow (browser_inventory_parsers.hpp), which structurally
+ * carries no user_name/gaia_id/e-mail — see that header's PRIVACY
+ * CONTRACT. Nothing inside a profile directory is opened by this leg.
  *
  * WIRE GRAMMAR: every dynamic string field (home-directory name, profile
- * directory name, display name, extension id, version, extension name)
+ * directory name, display name)
  * goes through yuzu::util::safe_output_field before being joined with `|` —
  * server/core/src/result_parsing.hpp's shared decoder treats an unescaped
  * trailing backslash or embedded pipe specially (routed-concerns.md "Wire
@@ -70,8 +64,6 @@
 #include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
 
-#include <nlohmann/json.hpp>
-
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -91,9 +83,6 @@ namespace detail {
 
 constexpr std::size_t kMaxHomeEntries = 4096;
 constexpr std::size_t kMaxLocalStateBytes = 1024 * 1024;      // 1 MiB
-constexpr std::size_t kMaxPrefsBytes = 8 * 1024 * 1024;       // 8 MiB
-constexpr std::size_t kMaxManifestBytes = 256 * 1024;         // 256 KiB
-constexpr std::size_t kMaxExtensionVersionDirs = 64;
 
 /// Chromium-family ~/.config dir name -> this plugin's browser identifier.
 struct BrowserConfigSpec {
@@ -324,57 +313,6 @@ void walk_browser_profile_roots(const std::filesystem::path& root,
         visit_home("root", ::dirfd(root_home_open.handle.get()));
 }
 
-/// name/version resolved from an extension's own on-disk manifest.json.
-struct ManifestNameVersion {
-    std::string name;
-    std::string version;
-};
-
-/// Reads `Extensions/<id>/*/manifest.json` (the first readable version dir,
-/// in readdir order) and extracts just `name`/`version` -- the ONLY fields
-/// this leg still needs once extensions.settings' own embedded `manifest`
-/// object (extract_settings, browser_inventory_parsers.hpp) is absent (the
-/// real Edge capture: 38 of 53 entries carry no embedded manifest — see
-/// edge/provenance.txt). Best-effort: absence at any level contributes
-/// nothing (std::nullopt), never a constraint — this is an enrichment of a
-/// row that already exists from extensions.settings, not this leg's
-/// primary read, so a missing/unreadable manifest.json does not degrade
-/// the action's overall status.
-inline std::optional<ManifestNameVersion> resolve_manifest_name_version(int profile_dir_fd,
-                                                                        const std::string& id) {
-    DirOpenOutcome ext_open = open_dir_no_follow_at_checked(profile_dir_fd, "Extensions");
-    if (!ext_open.handle.valid()) return std::nullopt;
-    DirOpenOutcome id_open = open_dir_no_follow_at_checked(::dirfd(ext_open.handle.get()), id.c_str());
-    if (!id_open.handle.valid()) return std::nullopt;
-    const int id_fd = ::dirfd(id_open.handle.get());
-
-    std::optional<ManifestNameVersion> found;
-    yuzu::shared::walk_dir_capped(
-        id_open.handle.get(), kMaxExtensionVersionDirs, [&](const struct dirent* entry) {
-            DirOpenOutcome ver_open = open_dir_no_follow_at_checked(id_fd, entry->d_name);
-            if (!ver_open.handle.valid()) return true;
-            std::string manifest_text;
-            FileReadOutcome outcome;
-            if (!read_file_bounded_at(::dirfd(ver_open.handle.get()), "manifest.json",
-                                      kMaxManifestBytes, manifest_text, outcome))
-                return true;
-            nlohmann::json parsed;
-            try {
-                parsed = nlohmann::json::parse(manifest_text);
-            } catch (...) {
-                return true;
-            }
-            if (!parsed.is_object()) return true;
-            ManifestNameVersion mv;
-            mv.name = parsed.value("name", std::string{});
-            mv.version = parsed.value("version", std::string{});
-            if (mv.name.empty() && mv.version.empty()) return true;
-            found = std::move(mv);
-            return false; // first hit wins
-        });
-    return found;
-}
-
 } // namespace detail
 
 /// "browsers" action: presence-only detection of the three known Chromium-
@@ -430,79 +368,6 @@ linux_profile_rows_at(const std::filesystem::path& root, std::optional<std::stri
                                std::string{browser} + "|" +
                                yuzu::util::safe_output_field(p.profile_dir) + "|" +
                                yuzu::util::safe_output_field(p.display_name));
-            }
-        });
-    if (acc.any_failure()) failure_token = acc.reason();
-    return rows;
-}
-
-/// "extensions" action: one row per extension id resolved from each
-/// present profile's Secure Preferences (preferred)/Preferences, across
-/// every profile directory "Local State" names, across every user this leg
-/// discovers.
-[[nodiscard]] inline std::vector<std::string>
-linux_extension_rows_at(const std::filesystem::path& root, std::optional<std::string>& failure_token) {
-    failure_token.reset();
-    std::vector<std::string> rows;
-    yuzu::shared::ConstraintAccumulator acc;
-    detail::walk_browser_profile_roots(
-        root, acc, [&](const std::string& user, std::string_view browser, int browser_root_fd) {
-            std::string local_state_text;
-            detail::FileReadOutcome ls_outcome;
-            detail::read_file_bounded_at(browser_root_fd, "Local State", detail::kMaxLocalStateBytes,
-                                         local_state_text, ls_outcome);
-            if (ls_outcome.constrained) {
-                acc.add_failure(ls_outcome.reason);
-                return;
-            }
-            auto profiles = profiles_from_local_state(local_state_text);
-            if (!profiles.has_value()) {
-                acc.add_failure("linux:browser_inventory:local_state_malformed");
-                return;
-            }
-            for (const auto& p : *profiles) {
-                detail::DirOpenOutcome profile_open =
-                    detail::open_dir_no_follow_at_checked(browser_root_fd, p.profile_dir.c_str());
-                if (profile_open.constrained) {
-                    acc.add_failure(profile_open.reason);
-                    continue;
-                }
-                if (!profile_open.handle.valid()) continue; // raced deletion
-                const int profile_fd = ::dirfd(profile_open.handle.get());
-
-                std::string secure_text;
-                std::string prefs_text;
-                detail::FileReadOutcome secure_outcome;
-                detail::FileReadOutcome prefs_outcome;
-                detail::read_file_bounded_at(profile_fd, "Secure Preferences", detail::kMaxPrefsBytes,
-                                             secure_text, secure_outcome);
-                if (secure_outcome.constrained) acc.add_failure(secure_outcome.reason);
-                detail::read_file_bounded_at(profile_fd, "Preferences", detail::kMaxPrefsBytes,
-                                             prefs_text, prefs_outcome);
-                if (prefs_outcome.constrained) acc.add_failure(prefs_outcome.reason);
-
-                auto states = extension_state_from_prefs(secure_text, prefs_text);
-                if (!states.has_value()) {
-                    acc.add_failure("linux:browser_inventory:extensions_prefs_malformed");
-                    continue;
-                }
-                for (const auto& [id, row] : *states) {
-                    std::string name = row.name;
-                    std::string version = row.version;
-                    if (name == "-" || version == "-") {
-                        if (auto mv = detail::resolve_manifest_name_version(profile_fd, id)) {
-                            if (name == "-" && !mv->name.empty()) name = mv->name;
-                            if (version == "-" && !mv->version.empty()) version = mv->version;
-                        }
-                    }
-                    rows.push_back(std::string{"extension|"} + yuzu::util::safe_output_field(user) +
-                                   "|" + std::string{browser} + "|" +
-                                   yuzu::util::safe_output_field(p.profile_dir) + "|" +
-                                   yuzu::util::safe_output_field(id) + "|" +
-                                   yuzu::util::safe_output_field(version) + "|" +
-                                   yuzu::util::safe_output_field(name) + "|" + row.state + "|" +
-                                   row.from_webstore);
-                }
             }
         });
     if (acc.any_failure()) failure_token = acc.reason();

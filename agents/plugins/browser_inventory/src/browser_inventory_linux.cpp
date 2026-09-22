@@ -57,7 +57,6 @@ int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::pat
     switch (a) {
     case Action::browsers:   rows = lnx::linux_browser_rows_at(root, failure_token); break;
     case Action::profiles:   rows = lnx::linux_profile_rows_at(root, failure_token); break;
-    case Action::extensions: rows = lnx::linux_extension_rows_at(root, failure_token); break;
     }
     emit(ctx, a, rows, failure_token);
     return 0;
