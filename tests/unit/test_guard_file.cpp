@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -77,14 +78,16 @@ struct FileDriftCollector {
         std::lock_guard lk(m);
         return events.size();
     }
-    // Drift = a NON-compliant report. Slice B added the guard.compliant edge (one on
-    // arm / baseline, and one on each drift-clear), so "no drift" intent must count
-    // drifts, not raw events.
+    // Drift = a NON-compliant, NON-health report. Slice B added the guard.compliant
+    // edge (one on arm / baseline, and one on each drift-clear); this PR adds the
+    // health report (guard.unhealthy), which also defaults compliant=false — a
+    // health report must NOT be counted as drift, or the two arms (missed
+    // detection vs. reported-but-degraded) become indistinguishable to a test.
     std::size_t drift_count() {
         std::lock_guard lk(m);
         std::size_t n = 0;
         for (const auto& e : events)
-            if (!e.compliant)
+            if (!e.compliant && e.health == GuardDrift::Health::None)
                 ++n;
         return n;
     }
@@ -93,15 +96,15 @@ struct FileDriftCollector {
         return cv.wait_for(lk, to, [&] {
             std::size_t n = 0;
             for (const auto& e : events)
-                if (!e.compliant)
+                if (!e.compliant && e.health == GuardDrift::Health::None)
                     ++n;
             return n >= min;
         });
     }
-    GuardDrift last_drift() { // most-recent non-compliant report
+    GuardDrift last_drift() { // most-recent non-compliant, non-health report
         std::lock_guard lk(m);
         for (auto it = events.rbegin(); it != events.rend(); ++it)
-            if (!it->compliant)
+            if (!it->compliant && it->health == GuardDrift::Health::None)
                 return *it;
         return {};
     }
@@ -109,9 +112,35 @@ struct FileDriftCollector {
         std::unique_lock lk(m);
         return cv.wait_for(lk, to, [&] {
             for (const auto& e : events)
-                if (e.compliant)
+                if (e.compliant && e.health == GuardDrift::Health::None)
                     return true;
             return false;
+        });
+    }
+    std::size_t compliant_count() {
+        std::lock_guard lk(m);
+        std::size_t n = 0;
+        for (const auto& e : events)
+            if (e.compliant && e.health == GuardDrift::Health::None)
+                ++n;
+        return n;
+    }
+    std::size_t health_count() {
+        std::lock_guard lk(m);
+        std::size_t n = 0;
+        for (const auto& e : events)
+            if (e.health != GuardDrift::Health::None)
+                ++n;
+        return n;
+    }
+    bool wait_health_count(std::size_t min, std::chrono::milliseconds to) {
+        std::unique_lock lk(m);
+        return cv.wait_for(lk, to, [&] {
+            std::size_t n = 0;
+            for (const auto& e : events)
+                if (e.health != GuardDrift::Health::None)
+                    ++n;
+            return n >= min;
         });
     }
 };
@@ -753,6 +782,7 @@ void run_ancestor_created_chain_hits_abandon_limit() {
     cfg.path = target.string();
     cfg.expect_present = true; // absent throughout: only directories are created, never the file
     cfg.event_debounce_ms = 0; // every wake's report must be counted, not collapsed
+    cfg.parent_unhealthy_refresh_ms = 0; // edge-only: the refresh timer is a separate, own test
 
     // Counts FORCED abandons only. A genuine (not test-forced) drain exceeding kCancelDrainMs on
     // a loaded/contended runner would still advance the real p_abandon_count without incrementing
@@ -779,22 +809,133 @@ void run_ancestor_created_chain_hits_abandon_limit() {
     REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F"));
     REQUIRE(col->wait_drift_count(4, 30s));
     CHECK(hook_calls.load() == 3); // 3rd abandon: kParentIoAbandonLimit reached, P now disabled
+    REQUIRE(col->wait_health_count(1, 30s)); // on_parent_disabled() fired in this same reconcile,
+        // synchronously right after the pio.reset() that just tripped the limit
 
     REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F" / "G"));
     REQUIRE(col->wait_drift_count(5, 30s)); // the ancestor wake on F (recursive, catches G being
         // created) drives this reconcile, exactly like drifts #2-#4; this same reconcile also
         // newly arms h_dir on G (the configured parent now exists) - armed, but not yet exercised
     CHECK(hook_calls.load() == 3); // unchanged: bind() short-circuited on p_disabled, no drain
+    CHECK(col->health_count() == 1); // unchanged: the top-of-bind() short-circuit does not re-fire
+        // on_parent_disabled() — it already fired once, at the transition, above
 
     write_file(target, "content"); // exercises h_dir itself (armed, not fired, above): the
-        // file's own detection must survive P's permanent disable
-    REQUIRE(col->wait_compliant(30s));
+        // file's own detection continues, but its edge into compliant is now GATED — this is the
+        // exact false-green (100% compliant while rename detection is dead) this PR's blocking
+        // fix removes. Was `REQUIRE(col->wait_compliant(30s))` before this fix.
+    REQUIRE(col->wait_health_count(2, 30s)); // report_compliant()'s gate substitutes a 2nd
+        // unhealthy report for the would-be compliant publication
+    CHECK(col->compliant_count() == 0); // never shown green while P stays permanently disabled
+    CHECK(col->drift_count() == 5);
     CHECK(hook_calls.load() == 3); // still unchanged: h_dir's own content channel never touches P
 
     const auto t0 = std::chrono::steady_clock::now();
     guard.stop();
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < 5s); // pio is already null (abandoned, not freed) - nothing to drain here
+}
+
+// Drives P to permanent disable via the same 3-level forced-fail ancestor chain as
+// run_ancestor_created_chain_hits_abandon_limit above (the only deterministic in-run path
+// to p_disabled), leaving `target`/`root`/`col`/`guard` positioned right after the edge
+// health report so a caller can drive further scenarios from there.
+struct DisabledGuardFixture {
+    yuzu::test::TempDir root;
+    fs::path target;
+    std::shared_ptr<FileDriftCollector> col = std::make_shared<FileDriftCollector>();
+    std::unique_ptr<FileGuard> guard;
+
+    explicit DisabledGuardFixture(std::uint64_t refresh_ms, GuardSink extra_sink = {})
+        : root("yuzu_test_fgdisabled_") {
+        fs::create_directories(root.path / "A");
+        target = root.path / "A" / "D" / "E" / "F" / "f.txt";
+
+        FileGuard::Config cfg;
+        cfg.rule_id = "fg-disabled-fixture";
+        cfg.path = target.string();
+        cfg.expect_present = true;
+        cfg.event_debounce_ms = 0;
+        cfg.parent_unhealthy_refresh_ms = refresh_ms;
+
+        auto* col_ptr = col.get();
+        guard = std::make_unique<FileGuard>(cfg, [col_ptr, extra_sink](const GuardDrift& d) {
+            col_ptr->push(d);
+            if (extra_sink)
+                extra_sink(d); // may throw — must run AFTER push so the event is still recorded
+        });
+        guard->set_parent_drain_fail_hook_for_test([] { return true; });
+        REQUIRE(guard->start());
+        REQUIRE(col->wait_drift_count(1, 30s)); // initial eval: absent, x=A, P on root
+        REQUIRE(fs::create_directory(root.path / "A" / "D"));
+        REQUIRE(col->wait_drift_count(2, 30s));
+        REQUIRE(fs::create_directory(root.path / "A" / "D" / "E"));
+        REQUIRE(col->wait_drift_count(3, 30s));
+        REQUIRE(fs::create_directory(root.path / "A" / "D" / "E" / "F"));
+        REQUIRE(col->wait_health_count(1, 30s)); // p_disabled transition: the edge report
+    }
+};
+
+// The disabled-parent-watch unhealthy report is a lost-edge backstop, not a one-shot: with a
+// short refresh cadence configured, it must keep re-asserting on its own with no filesystem
+// activity at all, since the legacy sink drops events on disconnect with no retry.
+void run_parent_unhealthy_refresh_cadence() {
+    DisabledGuardFixture fx(250); // 250ms refresh
+    REQUIRE(fx.col->wait_health_count(3, 5s)); // edge + >=2 refresh ticks, no fs activity at all
+}
+
+// The mirror case: refresh_ms == 0 must NOT arm a timer — the health count must stay at the
+// single edge report indefinitely while quiet.
+void run_parent_unhealthy_refresh_disabled_when_zero() {
+    DisabledGuardFixture fx(0);
+    std::this_thread::sleep_for(1500ms); // several would-be refresh periods, quiet otherwise
+    CHECK(fx.col->health_count() == 1); // no timer armed: stays at the edge count
+}
+
+// Health publication must be best-effort (Finding: a synchronous sink call inside bind() is a
+// new exit point from run()'s outer catch). A sink that throws only on a health report must
+// not end the worker — report_parent_unhealthy()'s own try/catch must swallow it, both at the
+// edge and on the gated re-fire that replaces a would-be compliant publication.
+void run_health_report_sink_throw_is_best_effort() {
+    auto throwing_sink = [](const GuardDrift& d) {
+        if (d.health != GuardDrift::Health::None)
+            throw std::runtime_error("simulated health-sink failure");
+    };
+    DisabledGuardFixture fx(0, throwing_sink); // the ctor's own edge report already throws once
+    write_file(fx.target, "content"); // presence flips true: a gated compliant edge -> a 2nd
+        // health report, which also throws
+    REQUIRE(fx.col->wait_health_count(2, 30s)); // proves the worker is still alive and servicing
+        // the wait loop after the first throw was swallowed
+    CHECK(fx.col->compliant_count() == 0);
+}
+
+// last_compliant is a single edge-cache shared by the real compliant path and the gated-health
+// substitution: once true (whichever publication actually fired), report_compliant() must not
+// re-evaluate at all on a same-state re-notify — no redundant gated report — but a genuine
+// drift->compliant transition afterward must re-arm the gate and fire exactly one more.
+void run_compliant_edge_gated_by_health_no_redundant_refire() {
+    DisabledGuardFixture fx(0);
+
+    write_file(fx.target, "content"); // presence flips true: edge into compliant, but gated
+    REQUIRE(fx.col->wait_health_count(2, 30s));
+    CHECK(fx.col->compliant_count() == 0);
+
+    write_file(fx.target, "content"); // same-state rewrite: still present; last_compliant is
+        // already true, so report_compliant()'s own early-return fires before the gate is even
+        // reached — no redundant gated report
+    std::this_thread::sleep_for(500ms);
+    CHECK(fx.col->health_count() == 2); // unchanged
+    CHECK(fx.col->compliant_count() == 0);
+
+    REQUIRE(fs::remove(fx.target)); // presence flips false: a genuine drift (report(), never
+        // gated) resets last_compliant
+    REQUIRE(fx.col->wait_drift_count(4, 30s)); // fixture's own setup already produced 3 (initial
+        // absent + 2 ancestor-chain rebuilds); this is the 4th
+
+    write_file(fx.target, "content"); // presence flips true again: a NEW edge into compliant,
+        // still disabled — the gate must re-fire
+    REQUIRE(fx.col->wait_health_count(3, 30s));
+    CHECK(fx.col->compliant_count() == 0); // never shown green for this instance's whole lifetime
 }
 
 // Parks the guard thread inside its first report so notifications pile up unread.
@@ -908,10 +1049,36 @@ TEST_CASE("FileGuard rename: a forced non-drain at teardown is abandoned, not fr
     run_parent_drain_forced_abandon();
 }
 
-TEST_CASE("FileGuard rename: an ancestor-triggered rebuild chain reaches the abandon limit and "
-          "disables the parent watch, without affecting the file's own detection",
+TEST_CASE("FileGuard rename: an ancestor-triggered rebuild chain reaches the abandon limit, "
+          "disables the parent watch and reports it unhealthy, and withholds the file's own "
+          "compliant edge while disabled (detection itself is unaffected)",
           "[guardian][guard][file][rename]") {
     run_ancestor_created_chain_hits_abandon_limit();
+}
+
+TEST_CASE("FileGuard rename: the disabled-parent-watch unhealthy report keeps re-asserting on "
+          "a configured refresh cadence with no filesystem activity at all",
+          "[guardian][guard][file][rename]") {
+    run_parent_unhealthy_refresh_cadence();
+}
+
+TEST_CASE("FileGuard rename: a zero refresh cadence never arms the backstop timer — the "
+          "unhealthy report stays edge-only",
+          "[guardian][guard][file][rename]") {
+    run_parent_unhealthy_refresh_disabled_when_zero();
+}
+
+TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and never ends the "
+          "watch thread",
+          "[guardian][guard][file][rename]") {
+    run_health_report_sink_throw_is_best_effort();
+}
+
+TEST_CASE("FileGuard rename: the compliant edge cache is shared with the gated health "
+          "substitution — no redundant report on a same-state re-notify, but a genuine "
+          "drift-then-recompliant cycle re-arms the gate",
+          "[guardian][guard][file][rename]") {
+    run_compliant_edge_gated_by_health_no_redundant_refire();
 }
 
 TEST_CASE("FileGuard rename: rename or move alone reports the absent state (file-exists)",
