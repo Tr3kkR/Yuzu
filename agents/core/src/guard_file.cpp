@@ -577,6 +577,34 @@ void FileGuard::run() try {
         return false;
     };
 
+    // A completed P read: named so the D branch below can also service an already-signalled P
+    // without waiting for a later wait call (D is always the lowest-indexed handle).
+    auto handle_p_wake = [&] {
+        DWORD bytes = 0;
+        const BOOL got = GetOverlappedResult(p_dir.get(), &p_ov, &bytes, FALSE);
+        const DWORD p_err = got ? ERROR_SUCCESS : GetLastError();
+        if (got == FALSE && p_err == ERROR_IO_INCOMPLETE)
+            return; // spurious signal: the read is still in flight
+        p_pending = false;
+        p_failures = got ? 0 : p_failures + 1;
+        if (p_failures > kParentFailureLimit) {
+            if (p_failures == kParentFailureLimit + 1) // once per entry into this state
+                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} failing "
+                             "repeatedly (err={}) - degraded re-arm in {}ms",
+                             cfg_.rule_id, cfg_.path, p_err, kArmFailRetryMs);
+            p_reset();
+            arm_retry = true; // repeated failures: bounded degraded re-arm, not a rebuild loop
+        } else if (got == FALSE || parent_change_is_ours(bytes)) {
+            arm_watch(); // X named / overflow / failed read: re-resolve X, then evaluate
+            if (hash_mode)
+                begin_settle(); // NOT an immediate hash: an overflow flood must not cost one each
+            else
+                eval_exists();
+        } else if (!issue_p_read()) {
+            arm_retry = true; // could not re-issue: one bounded degraded re-arm, no spin
+        }
+    };
+
     spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [resilient]", cfg_.rule_id, cfg_.path,
                  hash_mode ? "hash-equals"
                            : (cfg_.expect_present ? "expect present" : "expect absent"));
@@ -653,6 +681,12 @@ void FileGuard::run() try {
                 arm_watch(); // existence: re-resolve + evaluate now
                 eval_exists();
             }
+            // D is always the lowest-indexed handle, so sustained D activity must not starve an
+            // already-signalled P completion until a later wait call: check it non-blockingly now.
+            // p_pending (not the idx_p computed at loop entry) is read here: the D branch above may
+            // itself have re-armed or reset P, and only a currently live read is safe to check.
+            if (p_pending && WaitForSingleObject(p_event.get(), 0) == WAIT_OBJECT_0)
+                handle_p_wake();
         } else if (idx_anc != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_anc) {
             arm_watch();
             if (hash_mode)
@@ -660,29 +694,7 @@ void FileGuard::run() try {
             else
                 eval_exists();
         } else if (idx_p != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_p) {
-            DWORD bytes = 0;
-            const BOOL got = GetOverlappedResult(p_dir.get(), &p_ov, &bytes, FALSE);
-            const DWORD p_err = got ? ERROR_SUCCESS : GetLastError();
-            if (got == FALSE && p_err == ERROR_IO_INCOMPLETE)
-                continue; // spurious signal: the read is still in flight
-            p_pending = false;
-            p_failures = got ? 0 : p_failures + 1;
-            if (p_failures > kParentFailureLimit) {
-                if (p_failures == kParentFailureLimit + 1) // once per entry into this state
-                    spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} failing "
-                                 "repeatedly (err={}) - degraded re-arm in {}ms",
-                                 cfg_.rule_id, cfg_.path, p_err, kArmFailRetryMs);
-                p_reset();
-                arm_retry = true; // repeated failures: bounded degraded re-arm, not a rebuild loop
-            } else if (got == FALSE || parent_change_is_ours(bytes)) {
-                arm_watch(); // X named / overflow / failed read: re-resolve X, then evaluate
-                if (hash_mode)
-                    begin_settle(); // NOT an immediate hash: an overflow flood must not cost one each
-                else
-                    eval_exists();
-            } else if (!issue_p_read()) {
-                arm_retry = true; // could not re-issue: one bounded degraded re-arm, no spin
-            }
+            handle_p_wake();
         } else {
             spdlog::error("Guardian FileGuard[{}]: WaitForMultipleObjects failed (r={}, err={}) — "
                           "watch stopping",
