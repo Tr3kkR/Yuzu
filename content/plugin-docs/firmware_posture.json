@@ -314,7 +314,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/wave8-pr84-firmware_posture.added.md"
+    ],
     "definitions": [
       "content/definitions/firmware_posture.yaml"
     ],
@@ -328,6 +330,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_firmware_posture_definition.py",
       "tests/unit/test_firmware_posture_local_dispatcher.cpp",
       "tests/unit/test_firmware_posture_parsers.cpp"
     ]

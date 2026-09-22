@@ -152,6 +152,7 @@ firmware|update_pending|unavailable|fwupd
 - Plugin: `agents/plugins/firmware_posture/src/firmware_posture_legs.hpp` · `agents/plugins/firmware_posture/src/firmware_posture_linux.cpp` · `agents/plugins/firmware_posture/src/firmware_posture_macos.cpp` · `agents/plugins/firmware_posture/src/firmware_posture_parsers.hpp` · `agents/plugins/firmware_posture/src/firmware_posture_plugin.cpp` · `agents/plugins/firmware_posture/src/firmware_posture_win.cpp`
 - Definitions: `content/definitions/firmware_posture.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp`
-- Tests: `tests/unit/test_firmware_posture_local_dispatcher.cpp` · `tests/unit/test_firmware_posture_parsers.cpp`
+- Tests: `tests/test_firmware_posture_definition.py` · `tests/unit/test_firmware_posture_local_dispatcher.cpp` · `tests/unit/test_firmware_posture_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wave8-pr84-firmware_posture.added.md`
 <!-- END GENERATED -->
