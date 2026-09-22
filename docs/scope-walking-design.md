@@ -229,11 +229,19 @@ re-resolving `scope_input_id` or broadcasting. Re-resolution is deliberately not
 `ORDER BY created_at DESC LIMIT 1` means the alias may since have been re-bound to a different,
 newer set; resolving it at re-eval time would retarget the dispatch to whatever the alias means
 *today*, not what it meant when the original was created. `scope_input_id` is recorded whenever
-`parent_id` was supplied at creation, via *either* the dedicated `from-tar-query`/
-`from-instruction-result` producers above *or* the generic `POST /api/v1/result-sets` / MCP
-`create_result_set` create routes -- both mirror the identical `payload["scope_input_id"] = ...`
-persistence (#4306 follow-up), closing the gap those UNRESTRICTED (no `source_kind`/
-`source_payload` allowlist) routes otherwise left in the same target-erasure shape. A genuinely
+`parent_id` was supplied at creation, on all four creation paths -- the dedicated
+`from-tar-query`/`from-instruction-result`/`from-inventory-query` producers (which always build a
+well-formed JSON object payload themselves) and the generic `POST /api/v1/result-sets` / MCP
+`create_result_set` create routes (#4306 follow-up), all mirroring the identical
+`payload["scope_input_id"] = ...` persistence -- **except** that the two generic routes only merge
+the marker when the caller's `source_payload` was itself supplied as a JSON object; a non-object
+`source_payload` (a string/array/number) skips the merge. This is safe today: the same
+`is_object()` predicate independently gates the `sql`/`instruction_id`-presence check at re-eval
+time on the identical stored value, so a non-object payload is refused ("no re-runnable source")
+before ever reaching dispatch, regardless of whether `scope_input_id` was recorded. This is a
+coincidence rather than a documented joint invariant (a regression test locks it down --
+`tests/unit/server/test_rest_result_sets_async.cpp`/`test_mcp_server.cpp`, `#4306` governance
+follow-up), so a future change to either check in isolation should re-verify the other. A genuinely
 parentless original -- no `parent_id` was ever supplied at creation, by *any* creation path -- still
 broadcasts on re-eval, unchanged, existing behaviour for a deliberately fleet-wide original. The
 refusal happens before `run_async`/`rs_run_async` — no execution row is created, nothing is
@@ -323,7 +331,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind>`, target_id=`<original id>`. `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up so the erased target is still forensically identifiable after the originating row TTL-expires). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |

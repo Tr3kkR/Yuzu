@@ -6012,8 +6012,12 @@ rule the parent_id-empty guard above enforces for a caller-supplied empty string
 letting that happen here would silently turn "re-ask the same narrow question" into "ask
 the whole visible fleet". If the live parent is gone **and** the original's stored
 `source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id` --
-recorded by every result-set create route that accepts `parent_id`, both `from-tar-query`/
-`from-instruction-result` and the generic `POST /api/v1/result-sets`, #4306 follow-up), the
+recorded by every result-set create route that accepts `parent_id` — `from-tar-query`/
+`from-instruction-result`/`from-inventory-query` (which always build a well-formed object
+payload) and the generic `POST /api/v1/result-sets` (#4306 follow-up), except when the
+generic route's caller-supplied `source_payload` is itself not a JSON object, in which case
+re-eval's own sql/instruction_id-presence check independently refuses such a row before
+dispatch regardless), the
 call is refused rather than re-resolved (the recorded value may be an alias that has since
 been re-bound to a different, newer set) or silently broadcast. A genuinely parentless
 original (no `parent_id` was ever supplied, by any creation path) still broadcasts on
@@ -6292,7 +6296,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 |---|---|---|---|
 | `name` | string | No | Human-readable name |
 | `source_kind` | string | No | Defaults to `manual_curate` |
-| `source_payload` | object | No | Stored as JSON; defaults to `{}` |
+| `source_payload` | object | No | Stored as JSON; defaults to `{}` — if `parent_id` is also supplied AND `source_payload` is itself a JSON object, a `scope_input_id` key recording it is merged in (overwriting any caller-supplied key of that name), #4306 |
 | `parent_id` | string | No | Must reference a set the caller owns (else `404`) |
 | `device_ids` | array of string | No | The initial member set |
 

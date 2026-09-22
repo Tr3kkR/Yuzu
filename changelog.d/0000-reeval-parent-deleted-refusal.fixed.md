@@ -1,4 +1,4 @@
-- **`re-eval` no longer broadcasts fleet-wide when its recorded parent set was deleted (#4306).**
+- **Breaking — `re-eval` no longer broadcasts fleet-wide when its recorded parent set was deleted (#4306).**
   `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set` synthesised the
   sibling's dispatch scope from the original's *live* `parent_id` FK, which is nulled
   (`ON DELETE SET NULL`) once the parent set is deleted — turning "re-ask the same narrow
