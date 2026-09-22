@@ -51,7 +51,7 @@ Name: "core"; Description: "Yuzu Agent core"; Types: full minimal custom; Flags:
 Name: "plugins"; Description: "Agent plugins"; Types: full custom
 Name: "plugins\system"; Description: "System info (OS, hardware, storage, users)"; Types: full custom
 Name: "plugins\network"; Description: "Network (config, diagnostics, actions, WiFi, WoL)"; Types: full custom
-Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall)"; Types: full custom
+Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall, exploit-mitigation posture)"; Types: full custom
 Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
 Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan, quarantine)"; Types: full custom
