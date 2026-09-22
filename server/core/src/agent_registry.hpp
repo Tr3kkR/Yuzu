@@ -693,6 +693,30 @@ public:
                                          std::string stream_home_id = {},
                                          std::string cluster_id = {});
 
+    /// pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22): the
+    /// #4669 affinity pre-check (`has_cluster_affinity_conflict`,
+    /// `gateway_service_impl.cpp`) is READ-ONLY and fails OPEN on a degraded
+    /// read, so `set_gateway_route` can publish a claimed placement BEFORE
+    /// the durable `announce_connected` write gets a chance to definitively
+    /// refuse it as a `cluster_affinity_violation`. Before this method, that
+    /// definitive refusal only emitted a metric+audit — the ALREADY-PUBLISHED
+    /// in-memory placement (the actual dispatch target `send_to`/`send_to_all`
+    /// read) was never rolled back, so a rogue's cluster could persist as the
+    /// live dispatch target indefinitely with no reconciliation, even though
+    /// the durable store correctly refused to record it. This reverts EXACTLY
+    /// what `set_gateway_route` just published for `session_id` — ALL FOUR
+    /// fields it sets together (`gateway_node`/`gateway_wire_capabilities`/
+    /// `gateway_stream_home_id`/`cluster_id`), back to the "no confirmed
+    /// placement yet" state — session-guarded the SAME way `set_gateway_route`
+    /// is, under the SAME lock, so a legitimate LATER publish for a newer
+    /// session can never be the one accidentally reverted. Returns `false`
+    /// (no-op) when `agent_id` is unknown or `session_id` no longer matches
+    /// the currently-installed session (already superseded — nothing to
+    /// revert). Call this ONLY in direct response to a definitive
+    /// `cluster_affinity_violation` on the write that follows the publish
+    /// this same call sequence made; it is not a general-purpose clear.
+    bool unpublish_gateway_route(const std::string& agent_id, const std::string& session_id);
+
     /// HA WS-4 #4324: the `stream_home_id` most recently published for
     /// `agent_id` via `set_gateway_route`, IFF the presented `session_id`
     /// still matches the CURRENTLY installed session — mirrors
