@@ -1841,12 +1841,17 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // live to route a dispatch-tagged command through, so no separate
         // clear call is needed here.
         registry_.clear_stream_if_session(agent_id, session_id);
-        registry_.remove_agent_if_session(agent_id, session_id);
+        const bool removed_current_session =
+            registry_.remove_agent_if_session(agent_id, session_id);
         // HA WS-5 (ADR-2002 §7a): same session-guarded mirror as the direct
         // path (agent_service_impl.cpp) — keeps a gateway-fronted agent's
         // graceful disconnect from leaving a stale presence row matched by
-        // scope evaluation until the TTL expires.
-        if (heartbeat_ingestion_)
+        // scope evaluation until the TTL expires. Gated on
+        // removed_current_session — see agent_service_impl.cpp's sibling
+        // call for the full false-negative rationale (external review
+        // finding, 2026-09-22): an unconditional delete here could remove a
+        // LIVE agent's presence row on an ordinary same-replica reconnect.
+        if (removed_current_session && heartbeat_ingestion_)
             if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
                 offline->remove_if_session(agent_id, session_id);
         // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing

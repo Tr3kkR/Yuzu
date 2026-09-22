@@ -121,6 +121,7 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     if (!lease) {
         spdlog::debug("OfflineEndpointStore: upsert skipped, no connection in time ({})",
                       pool_.last_error());
+        record_presence_store_failure(metrics_, "upsert", /*had_lease=*/false);
         return false;
     }
     // Single-statement autocommit upsert; RETURNING carries the result in the
@@ -159,6 +160,7 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: upsert failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "upsert", /*had_lease=*/true);
         return false;
     }
     return true;

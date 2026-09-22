@@ -218,7 +218,12 @@ TEST_CASE("HA WS-5: live_presence() caches within its TTL window", "[pg][ha][pre
     auto ids_second = registry.all_ids();
     CHECK_FALSE(contains(ids_second, "cache-agent-2"));
 
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    // 6s against a 3s TTL — a wider margin than the original 4s (external
+    // review finding, 2026-09-22: 1s of margin is tight under contended CI
+    // load, e.g. the 20-way concurrent-shard contention already observed on
+    // this PR's own CI runs). A fake-clock injection would be the more
+    // robust fix; not done this round — this is a low-risk mitigation.
+    std::this_thread::sleep_for(std::chrono::seconds(6));
     auto ids_after_ttl = registry.all_ids();
     CHECK(contains(ids_after_ttl, "cache-agent-2"));
 }
@@ -249,4 +254,102 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     auto matched = registry.evaluate_scope(*parsed, nullptr);
     REQUIRE(matched.has_value());
     CHECK_FALSE(contains(*matched, "departed-agent"));
+}
+
+// External review hardening (2026-09-22, @Doomgoose) — 3 more BLOCKING bugs
+// in the same "silently narrower dispatch target set" class, found after the
+// first governance round. Direct coverage for the two AgentRegistry-level
+// fixes (has_any_reachable, remove_agent_if_session's gated durable delete);
+// forward_legacy_command's route_unreadable branch fix is HTTP-handler-level
+// and shares the same already-tested dispatch_confined_arms machinery, so is
+// not independently re-tested here.
+
+TEST_CASE("HA WS-5: has_any_reachable() checks presence, unlike has_any()",
+          "[pg][ha][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+
+    SECTION("zero local, zero presence: both report false") {
+        CHECK_FALSE(registry.has_any());
+        CHECK_FALSE(registry.has_any_reachable());
+    }
+
+    SECTION("zero local, but presence shows a live remote agent: has_any() misses it, "
+            "has_any_reachable() does not") {
+        REQUIRE(store.upsert("remote-only", "h", "linux", 0, 0, "", "", "sess-remote"));
+        CHECK_FALSE(registry.has_any());
+        CHECK(registry.has_any_reachable());
+    }
+
+    SECTION("a local agent alone: both report true") {
+        (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+        CHECK(registry.has_any());
+        CHECK(registry.has_any_reachable());
+    }
+}
+
+TEST_CASE("HA WS-5: remove_agent_if_session reports whether it removed the CURRENT session",
+          "[ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    // session_id is not part of AgentInfo — it's assigned server-side via
+    // map_session() once the Subscribe handshake completes, mirroring
+    // production (register_agent, then map_session).
+    (void)registry.register_agent(make_agent_info("agent-x", "linux", "host-x"));
+    registry.map_session("sess-1", "agent-x");
+
+    SECTION("a matching session_id removes it and returns true") {
+        CHECK(registry.remove_agent_if_session("agent-x", "sess-1"));
+        CHECK_FALSE(registry.has_any());
+    }
+
+    SECTION("a stale/mismatched session_id no-ops and returns false — "
+            "the exact case the durable-presence-delete gate depends on") {
+        // Simulates: agent-x reconnects under a NEW session (sess-2) on the
+        // SAME replica before sess-1's disconnect handler runs. sess-1's
+        // late cleanup must not report "removed" (which would otherwise
+        // trigger a durable presence delete for a still-live agent).
+        (void)registry.register_agent(make_agent_info("agent-x", "linux", "host-x"));
+        registry.map_session("sess-2", "agent-x");
+
+        CHECK_FALSE(registry.remove_agent_if_session("agent-x", "sess-1"));
+        // agent-x is still registered, under sess-2.
+        CHECK(registry.has_any());
+    }
+}
+
+TEST_CASE("HA WS-5: has_remote_presence — direct single-lock membership check",
+          "[pg][ha][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+
+    SECTION("every id in the list is locally known: false (no widening)") {
+        CHECK_FALSE(registry.has_remote_presence({"local-agent"}));
+    }
+
+    SECTION("a candidate list containing an id NOT in the local registry: true") {
+        CHECK(registry.has_remote_presence({"local-agent", "remote-only"}));
+    }
+
+    SECTION("empty candidate list: false") {
+        CHECK_FALSE(registry.has_remote_presence({}));
+    }
 }

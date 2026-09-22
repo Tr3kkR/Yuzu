@@ -343,3 +343,87 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
     INFO("offline_endpoint_store_.reset() at server.cpp:" << reset_line);
     CHECK(null_wire_line < reset_line);
 }
+
+// HA WS-5 governance hardening (external review finding, 2026-09-22): the
+// PR's own body records that a THIRD production ConfinedDispatchSink
+// construction site (dispatch_scope_ladder.hpp) was missed by the initial
+// diff and found only on a second architect pass — the exact class of bug
+// a source-scan guard exists to catch structurally, not rely on a human
+// re-read to catch a second time. This scans EVERY production
+// ConfinedDispatchSink{...} literal (server.cpp AND dispatch_scope_ladder.hpp
+// — the two files known to construct one) and asserts each one wires BOTH
+// the presence-widening check (has_remote_presence, the field that replaced
+// the original racy local_agent_count design) and the gateway-directory
+// fallback (prepare_route_fallback) — a sink missing either silently
+// reintroduces the exact bug class this slice's governance rounds found
+// three times (the missing third site, the un-fallback'd legacy forwarder,
+// the un-widened fast path). A hardcoded count (not just "at least one")
+// catches a site being REMOVED too, mirroring this file's own #3261
+// presence-pin rationale above.
+TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
+          "ConfinedDispatchSink wires has_remote_presence AND prepare_route_fallback (HA WS-5)",
+          "[wiring_order][ha]") {
+    const std::string server_text = strip_line_comments(read_server_cpp());
+    const fs::path ladder_path = fs::path(YUZU_SERVER_SRC_DIR) / "dispatch_scope_ladder.hpp";
+    REQUIRE(fs::is_regular_file(ladder_path));
+    std::string ladder_text;
+    {
+        std::ifstream in(ladder_path, std::ios::binary);
+        REQUIRE(in.is_open());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        ladder_text = strip_line_comments(ss.str());
+    }
+
+    // Group 1 (optional): a `->` immediately before the type name means this
+    // is a lambda's trailing-return-type annotation (e.g.
+    // make_confined_dispatch_sink_fn's `-> yuzu::server::ConfinedDispatchSink
+    // {` forwarding closure) — that opening brace starts a function BODY,
+    // not an aggregate-init literal, and has none of the fields this test
+    // checks for. Anchoring the arrow directly against the type name (not a
+    // wide lookback window) avoids false-excluding a real construction that
+    // merely has an UNRELATED `->` somewhere nearby (e.g. `this->registry_`
+    // in a preceding statement/comment) — extremely common in this codebase.
+    // The optional `\w+\s*` before the final `\{` covers the named-variable
+    // form (`ConfinedDispatchSink sink{`, used at 2 of the 3 real sites) as
+    // well as the anonymous return-expression form (`ConfinedDispatchSink{`,
+    // used at the third) and the lambda return-type annotation this test
+    // must still exclude (`-> ConfinedDispatchSink {`, no name either).
+    static const std::regex sink_re(
+        R"((->\s*)?(?:yuzu::server::)?ConfinedDispatchSink\s*(?:\w+\s*)?\{)");
+    // Bounded window per literal: large enough to span every known sink's
+    // 5-field aggregate init (measured: the largest, forward_legacy_command's,
+    // runs ~700 chars after its opening brace) without risking a window that
+    // spills into the NEXT unrelated construct in the file.
+    constexpr std::size_t kWindow = 1200;
+
+    int total_sites = 0;
+    auto check_file = [&](const std::string& text, const char* label) {
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), sink_re);
+             it != std::sregex_iterator(); ++it) {
+            if ((*it)[1].matched) // trailing-return-type annotation, not a construction
+                continue;
+            ++total_sites;
+            const std::size_t start = static_cast<std::size_t>(it->position(0));
+            const std::string window = text.substr(start, std::min(kWindow, text.size() - start));
+            const int line = line_of(text, start);
+            INFO(label << ":" << line << " — ConfinedDispatchSink construction");
+            CHECK(window.find("has_remote_presence") != std::string::npos);
+            // The `prepare_route_fallback` FIELD is positional (plain
+            // aggregate-init, no designated-initializer field names written
+            // at any of these 3 sites) — its NAME never appears in the
+            // construction text. Its lambda body's `->prepare(candidates)`
+            // call is the stable, present-at-every-real-site marker instead.
+            CHECK(window.find("->prepare(") != std::string::npos);
+        }
+    };
+    check_file(server_text, "server.cpp");
+    check_file(ladder_text, "dispatch_scope_ladder.hpp");
+
+    // Sanity floor+ceiling (not just ">= 1"): exactly 3 production sites as
+    // of this slice (make_confined_dispatch_sink, forward_legacy_command,
+    // wire_and_dispatch_confined). A 4th site added later without updating
+    // this count is flagged for review, not silently passed; a site removed
+    // is caught the same way.
+    CHECK(total_sites == 3);
+}

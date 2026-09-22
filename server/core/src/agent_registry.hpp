@@ -628,8 +628,27 @@ public:
     void remove_agent(const std::string& agent_id);
 
     /// Remove an agent only if its current session_id matches (prevents stale
-    /// Subscribe cleanup from clobbering a newer reconnection).
-    void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
+    /// Subscribe cleanup from clobbering a newer reconnection). Returns true
+    /// iff the CURRENT session was removed, false on a session mismatch
+    /// (no-op — a newer connection has already taken over).
+    ///
+    /// HA WS-5 governance hardening (external review finding, 2026-09-22):
+    /// the return value is load-bearing for the caller's durable-presence
+    /// mirror (agent_service_impl.cpp / gateway_service_impl.cpp), which
+    /// must fire OfflineEndpointStore::remove_if_session ONLY when this
+    /// returns true. The durable row's own session_id column is
+    /// heartbeat-driven, not registration-driven (see heartbeat_ingestion.cpp)
+    /// — so on an ordinary same-replica reconnect (S1 disconnects, S2
+    /// registers, S2 hasn't heartbeated yet), the durable row can still read
+    /// S1's session_id even though S1 is already locally superseded by S2.
+    /// A caller that fires the durable delete unconditionally (using S1's
+    /// own session_id, which still legitimately matches the stale row) would
+    /// delete a LIVE agent's presence row — a false-negative other replicas'
+    /// evaluate_scope()/all_ids() would silently inherit. Bool was `void`
+    /// before this fix; every caller was already local to this repo (grep
+    /// verified two call sites, both updated in the same change).
+    [[nodiscard]] bool remove_agent_if_session(const std::string& agent_id,
+                                               const std::string& session_id);
 
     /// HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): remove an agent ONLY
     /// if the CURRENTLY installed session is the exact object `install` returned — pointer
@@ -900,6 +919,20 @@ public:
     std::vector<GatewayPendingCmd> drain_gateway_pending();
 
     bool has_any() const;
+
+    // HA WS-5 governance hardening (external review finding, 2026-09-22):
+    // has_any() above is LOCAL-ONLY (!agents_.empty()) and predates presence
+    // entirely — two REST dispatch entrypoints (command_routes.cpp,
+    // server.cpp's forward_legacy_command) use it as a cheap pre-dispatch
+    // 503-short-circuit, which on a replica holding zero local sessions but
+    // a healthy presence-visible fleet (the ordinary HA topology this slice
+    // exists to support) rejected every dispatch with "no agent connected"
+    // BEFORE all_ids()/evaluate_scope() or any presence lookup ever ran —
+    // deterministic, not a race. This is the presence-aware replacement:
+    // local_any first (cheap, matches has_any()'s existing fast path when
+    // true), then live_presence() (already cached, kPresenceCacheTtl) only
+    // when the fleet looks empty locally.
+    [[nodiscard]] bool has_any_reachable() const;
 
     std::string display_name(const std::string& agent_id) const;
 

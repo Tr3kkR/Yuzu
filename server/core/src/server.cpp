@@ -11527,6 +11527,24 @@ private:
     /// sites (only the reconcile path metered anything, and only its success).
     /// `sent` means the registry accepted the frame — for a gateway-attached
     /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
+    ///
+    /// HA WS-5 KNOWN LIMITATION (external review, 2026-09-22, accepted —
+    /// not fixed this slice): callers (Guardian rule push, TAR fleet
+    /// snapshot) can select a target `agent_id` from a presence-widened
+    /// candidate set (`AgentRegistry::all_ids()`/`evaluate_scope()`), but
+    /// this helper calls `registry_.send_to` directly with NO
+    /// `GatewayRouteFallback` directory consult — a presence-only
+    /// (cross-replica) target is always `undelivered` here, never queued via
+    /// the directory the way the 3 real `ConfinedDispatchSink` sites do.
+    /// Deliberately NOT treated as blocking: the failure is COUNTED (never
+    /// swallowed — see the metric below), and both callers' own
+    /// heartbeat-reconcile paths compare the same durable policy-generation
+    /// counter on the agent's NEXT heartbeat (wherever it lands), so this
+    /// self-heals rather than leaving a device silently unenforced
+    /// indefinitely. Fixing it properly needs the same "batch-prepare the
+    /// fallback BEFORE the per-id loop" restructuring every other consult in
+    /// this codebase uses — out of scope for a single-id helper; tracked as
+    /// a follow-up, not filed as a separate issue this round.
     [[nodiscard]] bool send_system_reserved(const std::string& agent_id,
                                             const detail::ClassifiedCommand& cmd,
                                             yuzu::server::SystemReservedPush push) {
@@ -19548,7 +19566,13 @@ private:
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.
     void forward_legacy_command(const httplib::Request& req, const std::string& plugin,
                                 const std::string& action, httplib::Response& res) {
-        if (!registry_.has_any()) {
+        // HA WS-5 governance hardening (external review finding, 2026-09-22):
+        // has_any() alone is LOCAL-ONLY — see command_routes.cpp's sibling
+        // check for the full rationale. has_any_reachable() checks presence
+        // too, so a replica with zero local sessions but a healthy
+        // presence-visible fleet no longer rejects every legacy dispatch
+        // before all_ids()/evaluate_scope() ever runs.
+        if (!registry_.has_any_reachable()) {
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",
@@ -19699,18 +19723,30 @@ private:
                                       command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same four-way split as /api/command (command_routes.cpp as of
+            // Same five-way split as /api/command (command_routes.cpp as of
             // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
-            // operator to the wrong subsystem. NO `route_unreadable` branch
-            // here (WS-4 4.2b Task D) — this Broadcast-only sink never wires
-            // `prepare_route_fallback` (see the sink's own comment above),
-            // so `result.route_unreadable` is always false at this site.
+            // operator to the wrong subsystem.
+            //
+            // HA WS-5 governance hardening (external review finding,
+            // 2026-09-22): this comment used to say this sink never wires
+            // `prepare_route_fallback` and so `route_unreadable` could never
+            // be set here — FALSE as of this same slice's own fix a few
+            // lines above (the sink literal now DOES wire it, the same
+            // BLOCKING bug that fix closed). This branch was the missing
+            // consumer: `result.route_unreadable` being true here means a
+            // degraded gateway-directory read, not a per-agent connectivity
+            // fact, and must not fall through to the generic catch-all
+            // below — mirrors command_routes.cpp's identical branch.
             res.status = 503;
             if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.route_unreadable) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the gateway routing directory could not be read for one or more targets — dispatch is failing closed rather than guessing where to route","reason":"route_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (result.denied_quarantined_count > 0) {
                 res.set_content(

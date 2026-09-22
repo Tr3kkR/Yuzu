@@ -122,7 +122,7 @@ this counter covers.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_server_agent_presence_store_failed_total` | counter | A presence-store operation that degraded instead of succeeding, labeled `op` (`query_live_ids`\|`remove_if_session`) and `reason` (`store_unavailable`\|`db_error`). Both operations are fail-soft by design (a read degrade leaves `evaluate_scope`/`all_ids()` local-only for the cache window; a delete degrade leaves a departed agent's row to expire via the ordinary TTL filter instead of an immediate delete) — this counter exists so fail-soft does not also mean fail-invisible. A legitimate session-mismatch result from `remove_if_session` (zero rows matched `RETURNING`) is NOT counted here, only a genuine store-unavailable/query-error path. |
+| `yuzu_server_agent_presence_store_failed_total` | counter | A presence-store operation that degraded instead of succeeding, labeled `op` (`upsert`\|`query_live_ids`\|`remove_if_session`) and `reason` (`store_unavailable`\|`db_error`). All three operations are fail-soft by design (a degraded `upsert` just means this heartbeat's identity/liveness refresh didn't land, self-healing on the next heartbeat; a degraded read leaves `evaluate_scope`/`all_ids()` local-only for the cache window; a degraded delete leaves a departed agent's row to expire via the ordinary TTL filter instead of an immediate delete) — this counter exists so fail-soft does not also mean fail-invisible. A legitimate session-mismatch result from `remove_if_session` (zero rows matched `RETURNING`) is NOT counted here, only a genuine store-unavailable/query-error path. |
 
 There is deliberately no success/rate counter and no dedicated alert rule yet
 — same posture as `yuzu_server_gateway_route_desync_total` below: a

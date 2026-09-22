@@ -355,7 +355,7 @@ void AgentRegistry::remove_agent(const std::string& agent_id) {
     spdlog::info("Agent removed: id={}", agent_id);
 }
 
-void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
+bool AgentRegistry::remove_agent_if_session(const std::string& agent_id,
                                             const std::string& session_id) {
     {
         std::lock_guard lock(mu_);
@@ -365,7 +365,7 @@ void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
             spdlog::debug("Cleanup skipped: session mismatch for agent {} (old={}, current={})",
                           agent_id, session_id,
                           it != agents_.end() ? it->second->session_id : "<gone>");
-            return;
+            return false;
         }
         session_to_agent_.erase(session_id);
         agents_.erase(it);
@@ -373,6 +373,7 @@ void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-offline", agent_id);
     spdlog::info("Agent removed: id={} (session={})", agent_id, session_id);
+    return true;
 }
 
 void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
@@ -787,6 +788,17 @@ std::vector<AgentRegistry::GatewayPendingCmd> AgentRegistry::drain_gateway_pendi
 bool AgentRegistry::has_any() const {
     std::lock_guard lock(mu_);
     return !agents_.empty();
+}
+
+bool AgentRegistry::has_any_reachable() const {
+    if (has_any())
+        return true;
+    // Local fleet looks empty — check presence before declaring genuinely
+    // nothing reachable. live_presence() is the same short-TTL cache
+    // all_ids()/evaluate_scope() already share, so this costs nothing beyond
+    // has_any()'s own lock in the common (non-empty) case above, and at most
+    // one cached-or-fresh presence read otherwise.
+    return !live_presence().empty();
 }
 
 std::string AgentRegistry::display_name(const std::string& agent_id) const {
