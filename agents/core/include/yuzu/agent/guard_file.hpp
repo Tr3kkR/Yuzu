@@ -30,6 +30,7 @@
 #include <yuzu/agent/guard.hpp>   // IGuard, GuardDrift, GuardSink
 
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -120,6 +121,8 @@ public:
     /// overrides a genuinely-unconfirmed drain the other way. No-op when unset
     /// (default; production is unaffected). Set before start().
     void set_parent_drain_fail_hook_for_test(std::function<bool()> hook) {
+        assert((!hook || !thread_.joinable()) &&
+               "set_parent_drain_fail_hook_for_test: arm before start()");
         parent_drain_fail_hook_for_test_ = std::move(hook);
     }
 

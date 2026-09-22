@@ -115,11 +115,14 @@ constexpr DWORD kCancelDrainMs = 1000;
 // degraded re-arm cadence (no rebuild loop against a watch that fails at once).
 constexpr int kParentFailureLimit = 3;
 
-// Consecutive parent-block cancel-drain failures tolerated before permanently disabling
-// the parent-directory watch for this guard instance (sec-1): an unconfirmed drain
-// abandons the heap block rather than freeing it (see ParentIoRelease in run()), so an
-// uncapped count would leak without bound against a persistently wedged filesystem
-// driver. Matches this file's existing kParentFailureLimit convention.
+// Parent-block cancel-drain failures tolerated, over this run() invocation's whole
+// lifetime, before permanently disabling the parent-directory watch for this guard
+// instance (sec-1): an unconfirmed drain abandons the heap block rather than freeing
+// it (see ParentIoRelease below). Deliberately NOT reset on an intervening confirmed
+// drain (unlike kParentFailureLimit/p_failures, which does reset on success) — a
+// driver that stalls every other rebuild would never trip a reset-on-success cap,
+// leaking one abandoned block per stall indefinitely, which is exactly the unbounded
+// leak this cap exists to prevent.
 constexpr int kParentIoAbandonLimit = 3;
 
 // Low 64 bits of a directory handle's FileId (what the extended notify record carries);
@@ -296,7 +299,8 @@ void FileGuard::run() try {
     // abandon_count/disabled are declared BEFORE `pio` so `pio`'s destructor (which reads/writes
     // them via ParentIoRelease) runs BEFORE they are destroyed, on every exit from run() —
     // normal, the WAIT_FAILED/WAIT_ABANDONED break, or exception unwind (mandatory ordering).
-    int p_abandon_count = 0; // consecutive parent-block cancel-drain failures (sec-1)
+    int p_abandon_count = 0; // parent-block cancel-drain failures this run() (sec-1); does
+                             // NOT reset on a confirmed drain — see kParentIoAbandonLimit
     bool p_disabled = false; // permanently disabled once p_abandon_count reaches the limit
     std::unique_ptr<ParentIo, ParentIoRelease> pio(
         nullptr, ParentIoRelease{&p_abandon_count, &p_disabled, &cfg_.rule_id, &cfg_.path,
@@ -408,18 +412,24 @@ void FileGuard::run() try {
             }
             return false;
         }
-        ParentIo* fresh = new ParentIo();
+        // Owned by a unique_ptr from the moment of allocation (sharing pio's own deleter, so
+        // both instances read/write the SAME abandon_count/disabled/hook state) rather than a
+        // bare `new`/manual `delete` — a throwing fs::path/wstring operation anywhere in this
+        // sequence (bad_alloc; low-probability but real, and NOT "trivial" the way a Win32 call
+        // is) then unwinds through ParentIoRelease exactly like any other exit, draining-or-
+        // abandoning correctly instead of silently leaking a possibly-already-pending read.
+        std::unique_ptr<ParentIo, ParentIoRelease> fresh(new ParentIo(), pio.get_deleter());
         fresh->ev.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         fresh->ov.hEvent = fresh->ev.get();
         if (!fresh->ev) {
-            delete fresh; // nothing issued yet: nothing pending, safe to free directly
             if (!p_logged) {
                 p_logged = true;
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
                              "(event creation failed)",
                              cfg_.rule_id, cfg_.path);
             }
-            return false; // leave P unbound; no arm_retry (finding 4) — retried on the next bind()
+            return false; // fresh destructs here: pending==false, freed directly; P stays
+                          // unbound, no arm_retry (finding 4) — retried on the next bind()
         }
         fresh->dir.reset(CreateFileW(x.parent_path().wstring().c_str(), FILE_LIST_DIRECTORY,
                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -430,18 +440,18 @@ void FileGuard::run() try {
         if (fresh->dir && !issue_p_read(*fresh))
             err = GetLastError();
         if (!fresh->pending) {
-            delete fresh; // never issued: nothing pending, safe to free directly
             if (!p_logged) {
                 p_logged = true;
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
                              "(err={})",
                              cfg_.rule_id, cfg_.path, err);
             }
-            return false; // leave P unbound; no arm_retry (finding 4) — retried on the next bind()
+            return false; // fresh destructs here: pending==false, freed directly; P stays
+                          // unbound, no arm_retry (finding 4) — retried on the next bind()
         }
         fresh->bound_x = x;
         x_leaf = x.filename().wstring();
-        pio.reset(fresh); // transfers ownership; pio's ParentIoRelease now owns `fresh`
+        pio = std::move(fresh); // transfers ownership; fresh is now null, no double-teardown
         return true;
     };
 
