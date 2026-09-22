@@ -598,6 +598,13 @@ void run_rename_recreate_then_rename_again(RigMode m) {
     rig.recreate_and_write();
     CHECK(rig.wait_detected(30s));
     const auto after_first = rig.col().drift_count();
+    // Clear the sink's event_debounce_ms (50ms, RenameRig's ctor) before inducing the second
+    // cycle: in tripwire mode the second cycle's own eval_exists() can land within a few ms of
+    // the first (no settle delay), and report()'s debounce would then silently fold its emission
+    // into the first's — a test-timing artifact, not evidence the second rename went undetected
+    // (measured on real Windows hardware: the guard's own log line for the second detection
+    // still fires immediately, inside eval_exists(), before the debounce check ever runs).
+    std::this_thread::sleep_for(100ms);
 
     rig.move(rig.dir(), rig.root() / "D3"); // second rename of the rebuilt directory
     rig.recreate_and_write();
