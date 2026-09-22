@@ -43,7 +43,9 @@
 
 #include <constraint_accumulator.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -131,7 +133,29 @@ count_marker(const std::filesystem::path& root, std::string_view prefix, std::st
 count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerState& state,
            const Limits& lim, yuzu::shared::ConstraintAccumulator& acc) {
     constexpr std::string_view source = "homebrew_taps";
-    auto opened = posix::open_dir_no_follow(under(root, std::string{prefix} + "/Library/Taps"));
+    // Walk Library then Taps component-by-component (openat + O_NOFOLLOW at
+    // each hop) rather than opening the joined "<prefix>/Library/Taps" string
+    // in one call: a single joined-path open only guards the FINAL component
+    // (Taps) -- the kernel still resolves the intermediate "Library" through
+    // normal, symlink-following path resolution, so an attacker-owned
+    // "Library" symlink escapes confinement (mirrors autoruns_macos.cpp's
+    // open_dir_no_follow_at_checked chain for the identical reason). The
+    // prefix root itself is opened as one string: it is the trusted injected
+    // root plus a fixed literal, not attacker-controlled (every other
+    // prefix-root open in this file does the same).
+    auto prefix_dir = posix::open_dir_no_follow(under(root, prefix));
+    if (prefix_dir.absent) return std::size_t{0};
+    if (!prefix_dir.detail.empty()) {
+        acc.add_failure(make_token(kOs, source, prefix_dir.detail));
+        return std::nullopt;
+    }
+    auto library_dir = posix::open_dir_no_follow_at(prefix_dir.dir, "Library");
+    if (library_dir.absent) return std::size_t{0};
+    if (!library_dir.detail.empty()) {
+        acc.add_failure(make_token(kOs, source, library_dir.detail));
+        return std::nullopt;
+    }
+    auto opened = posix::open_dir_no_follow_at(library_dir.dir, "Taps");
     if (opened.absent) return std::size_t{0};
     state.exists = true;
     if (!opened.detail.empty()) {
@@ -168,13 +192,36 @@ count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerSta
     return taps;
 }
 
+/// Whole-ACTION entries + wall-clock budget for macos_package_rows_at's walk,
+/// threaded by reference through every append_package_rows call for both
+/// prefixes x Cellar/Caskroom (constructed once, before that loop). Not
+/// agents/core/include/yuzu/agent/confined_fs_rules.hpp's `EnumBudget`: that
+/// type is scoped, by its own banner, to confined recursive DELETE (a
+/// different subsystem) -- this is a small pkg_inventory-local equivalent of
+/// the same shape/idea, not a shared import.
+struct WalkBudget {
+    std::size_t remaining_entries;
+    std::chrono::steady_clock::time_point deadline;
+
+    [[nodiscard]] bool exhausted() const noexcept {
+        return remaining_entries == 0 || std::chrono::steady_clock::now() >= deadline;
+    }
+    void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
+};
+
 /// Appends one package row per <container>/<name>/<version> directory under
 /// <prefix>/<rel> (rel = "Cellar" or "Caskroom"). Stops at lim.max_package_rows
-/// (`row_cap`).
+/// (`row_cap`) or, first, at `budget` (`walk_budget`): each directory listing
+/// (top-level id names AND every per-id version listing) is bounded on its
+/// own by lim.max_entries_per_dir, but nothing else bounds how many such
+/// listings the whole action performs -- a tree with max_entries_per_dir
+/// id-directories x max_entries_per_dir version-entries-each (or a Cellar
+/// full of plain files that never classify as a version directory, so
+/// row_cap never trips) is otherwise read in full every call.
 inline void append_package_rows(const std::filesystem::path& root, std::string_view prefix,
                                 std::string_view rel, std::string_view source, PackageKind kind,
                                 const Limits& lim, std::vector<std::string>& rows,
-                                yuzu::shared::ConstraintAccumulator& acc) {
+                                yuzu::shared::ConstraintAccumulator& acc, WalkBudget& budget) {
     auto top = posix::open_dir_no_follow(under(root, std::string{prefix} + "/" + std::string{rel}));
     if (top.absent) return;
     if (!top.detail.empty()) {
@@ -183,6 +230,7 @@ inline void append_package_rows(const std::filesystem::path& root, std::string_v
     }
     const auto names = posix::list_names(top.dir, lim.max_entries_per_dir);
     posix::note_listing(acc, kOs, source, names);
+    budget.charge(names.names.size());
     for (const auto& id : names.names) {
         if (!version_dir_name_ok(id)) continue;
         const auto cls = posix::classify_entry(top.dir, id.c_str());
@@ -191,6 +239,14 @@ inline void append_package_rows(const std::filesystem::path& root, std::string_v
             continue;
         }
         if (cls.kind != posix::EntryKind::directory) continue;
+        if (budget.exhausted()) {
+            // Stop before starting the next id-directory's version listing --
+            // rows already appended below (from ids already fully walked)
+            // stay: this is a constraint, not a discard.
+            acc.add_failure(make_token(kOs, source, "walk_budget"));
+            acc.mark_incomplete();
+            return;
+        }
         auto id_dir = posix::open_dir_no_follow_at(top.dir, id.c_str());
         if (!id_dir.dir.valid()) {
             if (!id_dir.absent) acc.add_failure(make_token(kOs, source, id_dir.detail));
@@ -198,6 +254,7 @@ inline void append_package_rows(const std::filesystem::path& root, std::string_v
         }
         const auto versions = posix::list_names(id_dir.dir, lim.max_entries_per_dir);
         posix::note_listing(acc, kOs, source, versions);
+        budget.charge(versions.names.size());
         for (const auto& version : versions.names) {
             if (!version_dir_name_ok(version)) continue;
             const auto vcls = posix::classify_entry(id_dir.dir, version.c_str());
@@ -277,7 +334,8 @@ macos_manager_rows_at(const std::filesystem::path& root, std::optional<std::stri
 
 /// One `package|homebrew|<id>|<version>|<formula|cask>` row per
 /// Cellar/<formula>/<version> and Caskroom/<cask>/<version> directory, over
-/// both prefixes, capped at lim.max_package_rows (`row_cap`). Sorted within
+/// both prefixes, capped at lim.max_package_rows (`row_cap`) and, whole-action,
+/// at lim.max_walk_entries/max_walk_seconds (`walk_budget`). Sorted within
 /// each (prefix, kind) block, so output is deterministic.
 [[nodiscard]] inline std::vector<std::string>
 macos_package_rows_at(const std::filesystem::path& root, std::optional<std::string>& token,
@@ -285,11 +343,15 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
     token.reset();
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
+    detail::WalkBudget budget{lim.max_walk_entries, std::chrono::steady_clock::now() +
+                                                         std::chrono::seconds(lim.max_walk_seconds)};
     for (const auto prefix : detail::kPrefixes) {
+        if (budget.exhausted()) break;
         detail::append_package_rows(root, prefix, "Cellar", "homebrew_cellar", PackageKind::formula,
-                                    lim, rows, acc);
+                                    lim, rows, acc, budget);
+        if (budget.exhausted()) break;
         detail::append_package_rows(root, prefix, "Caskroom", "homebrew_caskroom",
-                                    PackageKind::cask, lim, rows, acc);
+                                    PackageKind::cask, lim, rows, acc, budget);
     }
     if (acc.any_failure()) token = acc.reason();
     return rows;

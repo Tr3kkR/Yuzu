@@ -57,13 +57,25 @@ inline constexpr std::size_t kMaxEntriesPerDir = 4096;
 /// Whole-action package row cap (Homebrew): beyond it the walk stops and the
 /// status carries `row_cap`.
 inline constexpr std::size_t kMaxPackageRows = 20000;
+/// Whole-ACTION entries budget across the entire `packages` walk (both
+/// prefixes x Cellar/Caskroom): each directory's own listing is bounded by
+/// kMaxEntriesPerDir and rows are bounded by kMaxPackageRows, but neither
+/// bounds the walk as a whole -- a tree with kMaxEntriesPerDir id-directories
+/// x kMaxEntriesPerDir version-entries-each (or a Cellar full of plain files
+/// that never trip the row cap) is otherwise read in full every call. Sized
+/// generously for a real large Homebrew install.
+inline constexpr std::size_t kMaxPackageWalkEntries = 200000;
+/// Whole-action wall-clock budget (seconds) for the same walk.
+inline constexpr std::size_t kMaxPackageWalkSeconds = 10;
 
-/// The two resource bounds as ONE injectable value. Production always uses
+/// The resource bounds as ONE injectable value. Production always uses
 /// the defaults above; the unit suite passes small values so each bound (and its
 /// failure token) is exercised at cap and cap+1 without building 4096 entries.
 struct Limits {
     std::size_t max_entries_per_dir = kMaxEntriesPerDir;
     std::size_t max_package_rows = kMaxPackageRows;
+    std::size_t max_walk_entries = kMaxPackageWalkEntries;
+    std::size_t max_walk_seconds = kMaxPackageWalkSeconds;
 };
 
 // ── fixed vocabularies (emitted verbatim, never through safe_output_field) ──

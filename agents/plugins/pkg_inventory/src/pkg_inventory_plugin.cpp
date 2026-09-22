@@ -43,6 +43,7 @@
 
 #include <yuzu/string_utils.hpp>
 
+#include <exception>
 #include <string>
 #include <string_view>
 
@@ -82,6 +83,18 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
+/// The exception-firewall constrained row + typed status pkg_inventory
+/// reports when execute() catches an exception it cannot otherwise recover
+/// from. The provenance token is fixed, never the exception's own text (which
+/// could embed a path or other untrusted-walk-observed content).
+int report_execute_exception(yuzu::CommandContext& ctx, std::string_view action) {
+    ctx.write_output(yuzu::pkg_inventory::format_status_row(
+        action, yuzu::pkg_inventory::StatusLevel::constrained, "pkg_inventory:exception"));
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          "pkg_inventory:exception");
+    return 1;
+}
+
 } // namespace
 
 class PkgInventoryPlugin final : public yuzu::Plugin {
@@ -111,26 +124,36 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        const auto parsed = yuzu::pkg_inventory::parse_action(action);
-        if (!parsed) {
-            // `action` is request-supplied and lands in a pipe-delimited stream, so
-            // it goes through the shared escaper. Deliberately NOT a row (no
-            // leading kind token): an unknown action has no status row.
-            ctx.write_output(std::string{"unknown action: "} +
-                             yuzu::util::safe_output_field(action));
-            return 1;
-        }
+        // The WHOLE body -- the unknown-action diagnostic row included -- is
+        // inside this try: a walk exception thrown anywhere below must still
+        // report pkg_inventory's own typed status/provenance row rather than
+        // propagate past this frozen ABI seam unannotated.
+        try {
+            const auto parsed = yuzu::pkg_inventory::parse_action(action);
+            if (!parsed) {
+                // `action` is request-supplied and lands in a pipe-delimited stream, so
+                // it goes through the shared escaper. Deliberately NOT a row (no
+                // leading kind token): an unknown action has no status row.
+                ctx.write_output(std::string{"unknown action: "} +
+                                 yuzu::util::safe_output_field(action));
+                return 1;
+            }
 
-        // Yuzu targets exactly windows/linux/macos (CLAUDE.md "Target
-        // architecture"), so there is deliberately no fourth branch.
+            // Yuzu targets exactly windows/linux/macos (CLAUDE.md "Target
+            // architecture"), so there is deliberately no fourth branch.
 #if defined(_WIN32)
-        return yuzu::pkg_inventory::run_windows(ctx, *parsed);
+            return yuzu::pkg_inventory::run_windows(ctx, *parsed);
 #elif defined(__linux__)
-        return yuzu::pkg_inventory::run_linux(ctx, *parsed);
+            return yuzu::pkg_inventory::run_linux(ctx, *parsed);
 #elif defined(__APPLE__)
-        return yuzu::pkg_inventory::run_macos(ctx, *parsed);
+            return yuzu::pkg_inventory::run_macos(ctx, *parsed);
 #endif
-        return 1; // unreachable on a supported build
+            return 1; // unreachable on a supported build
+        } catch (const std::exception&) {
+            return report_execute_exception(ctx, action);
+        } catch (...) {
+            return report_execute_exception(ctx, action);
+        }
     }
 };
 

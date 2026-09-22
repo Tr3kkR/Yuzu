@@ -436,6 +436,71 @@ TEST_CASE("pkg_inventory macos: an unreadable Cellar is constrained, never a fal
     CHECK(*token == "macos:homebrew_cellar:permission_denied");
 }
 
+TEST_CASE("pkg_inventory macos: a symlinked Library component is refused, never silently counted",
+          "[pkg_inventory][macos][walk]") {
+    using namespace yuzu::pkg_inventory;
+    // A symlinked "Library" component is refused by the O_NOFOLLOW openat on
+    // every POSIX host, root included (no chmod, so no euid-0 SKIP).
+    // MUTATION: opening "<prefix>/Library/Taps" as one joined-path string
+    // (instead of walking Library then Taps component-by-component, each its
+    // own O_NOFOLLOW openat) lets the kernel resolve "Library" through normal,
+    // symlink-following path resolution and silently count the planted tap
+    // below -- this case must see neither a fabricated taps count nor the
+    // attacker's tap name.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_library_symlink_"};
+    fs::create_directories(dir.path / "elsewhere/Taps/attacker-org/attacker-repo");
+    fs::create_directories(dir.path / "opt/homebrew/Caskroom");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "opt/homebrew/Library", ec);
+    REQUIRE_FALSE(ec);
+
+    std::optional<std::string> token;
+    const auto rows = mac::macos_manager_rows_at(dir.path, token);
+
+    REQUIRE(token.has_value());
+    CHECK(token->rfind("macos:homebrew_taps:", 0) == 0); // symlink_refused (ELOOP) by construction
+    // Homebrew is still reported present (Caskroom reads fine); the refused
+    // Taps marker's fact is OMITTED (never a fabricated non-zero count), and
+    // the attacker's tap name never reaches the row.
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "manager|homebrew|present|-|/opt/homebrew|formulae=0;casks=0|-");
+    CHECK(rows[0].find("attacker") == std::string::npos);
+}
+
+TEST_CASE("pkg_inventory macos: a whole-action walk budget stops a breadth-distributed tree, rows kept",
+          "[pkg_inventory][macos][walk]") {
+    using namespace yuzu::pkg_inventory;
+    // Breadth DISTRIBUTED across several id-directories (not one huge
+    // directory -- that would only re-test the pre-existing per-directory
+    // cap): four id-directories, two version entries each, over a
+    // test-local 6-entry budget. The top-level listing (4 ids) plus the
+    // first id-directory's version listing (2) exhausts it before the
+    // second id-directory is even opened.
+    // MUTATION: dropping the whole-action budget check (or checking only the
+    // pre-existing per-directory cap) reads all four id-directories and
+    // returns 8 rows instead of 2.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_walk_budget_"};
+    for (const std::string& id : {"pkg-a", "pkg-b", "pkg-c", "pkg-d"}) {
+        fs::create_directories(dir.path / "opt/homebrew/Cellar" / id / "1.0.0");
+        fs::create_directories(dir.path / "opt/homebrew/Cellar" / id / "1.0.1");
+    }
+
+    Limits lim;
+    lim.max_walk_entries = 6;
+
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token, lim);
+
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_cellar:walk_budget");
+    // Only the first (alphabetically sorted) id-directory's rows survive: the
+    // budget stopped BEFORE pkg-b's version listing started, so what pkg-a
+    // already produced is a constraint, not a discard.
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0] == "package|homebrew|pkg-a|1.0.0|formula");
+    CHECK(rows[1] == "package|homebrew|pkg-a|1.0.1|formula");
+}
+
 // MUTATION: crossing the Action -> walk switch in run_macos_at (managers <->
 // packages), or reporting a non-OK/FULL typed status on a clean read, fails the
 // exact rows and the OK/FULL asserts below.
