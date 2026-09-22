@@ -9323,7 +9323,7 @@ call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
 matched-agent set cannot drift between transports. A `tag:<key>` atom in the
 expression resolves from the persistent tag store **only** — unlike a real
 dispatch, which also falls back to a connected agent's own live self-report —
-see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+see [Tag source precedence](../asset-tagging-guide.md). **`from_result_set:<id>`
 and `props.*` atoms are not resolved by this preview** - the resolver only
 populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
 (including `from_result_set:`, this feature's own headline scope-walking

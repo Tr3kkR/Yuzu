@@ -2772,7 +2772,7 @@ Never upgrade agents before the server -- the server must understand the agent's
 
 Before upgrading any component:
 
-- [ ] Back up all data (see [Server Administration](server-administration.md))
+- [ ] Back up all data (see [Server Administration](server-admin.md))
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
