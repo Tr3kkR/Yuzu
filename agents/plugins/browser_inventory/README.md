@@ -3,11 +3,11 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Chromium-family browser, profile and extension inventory |
+| **What it does** | Chromium-family browser and profile inventory |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.browser_inventory.browsers, crossplatform.browser_inventory.profiles, crossplatform.browser_inventory.extensions) |
+| **Kind** | Collector · read-only · gathered (crossplatform.browser_inventory.browsers, crossplatform.browser_inventory.profiles) |
 | **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
-| **Actions** | `browsers` (definition `crossplatform.browser_inventory.browsers`) · `extensions` (definition `crossplatform.browser_inventory.extensions`) · `profiles` (definition `crossplatform.browser_inventory.profiles`) |
+| **Actions** | `browsers` (definition `crossplatform.browser_inventory.browsers`) · `profiles` (definition `crossplatform.browser_inventory.profiles`) |
 | **Security** | securable `Forensics` · operation Read · risk High · dispatch ReadOnly · approval gate AdminOrApproval |
 | **Roles** | execute: admin · author: content-author |
 <!-- END GENERATED -->
@@ -36,7 +36,6 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `browsers` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | 🟡 constrained · rung 1 · ~/.config/{google-chrome,microsoft-edge} directory presence |
-| `extensions` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | ✅ supported · rung 1 · Default/Secure Preferences (fallback Default/Preferences) extensions.settings JSON read |
 | `profiles` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | ✅ supported · rung 1 · ~/.config/{google-chrome,microsoft-edge}/Local State JSON read |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -44,8 +43,6 @@ flowchart LR
 - **`browsers` / Windows** — follows as its own PR
 - **`browsers` / macOS** — follows as its own PR
 - **`browsers` / Linux** — presence-only; no version/channel detection in this package
-- **`extensions` / Windows** — follows as its own PR
-- **`extensions` / macOS** — follows as its own PR
 - **`profiles` / Windows** — follows as its own PR
 - **`profiles` / macOS** — follows as its own PR
 <!-- END GENERATED -->
@@ -65,7 +62,7 @@ No external binaries, no subprocesses, no network access on the Linux leg — ev
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-No action takes parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -81,20 +78,6 @@ Pipe-delimited rows. Every action's stream leads with a `status|<action>|<suppor
 | `field_1` | string | - | all | `google-chrome` | status row: the action name ("browsers"). browser row: the browser identifier. |
 | `field_2` | string | - | all | `1` | status row: "supported" or "constrained". browser row: "1" if the binary is present, "0" otherwise. |
 | `field_3` | string | - | all | `-` | status row: the constraint reason, "-" when supported. browser row: version, always "-" this wave (no version/channel probe). |
-
-**`crossplatform.browser_inventory.extensions` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7|field_8`**
-
-| Field | Type | Values | Available | Example | Description |
-|---|---|---|---|---|---|
-| `row_kind` | string | - | all | `extension` | Discriminates the row shape - "status" or "extension". |
-| `field_1` | string | - | all | `jdoe` | status row: the action name ("extensions"). extension row: the owning OS user. |
-| `field_2` | string | - | all | `google-chrome` | status row: "supported" or "constrained". extension row: the browser identifier. |
-| `field_3` | string | - | all | `Default` | status row: the constraint reason, "-" when supported. extension row: the profile directory name. |
-| `field_4` | string | - | all | `aapocclcgogkmnckokdopfmhonfmgoek` | status row: empty. extension row: the extension id. |
-| `field_5` | string | - | all | `1.2.3` | status row: empty. extension row: the extension version, "-" if absent. |
-| `field_6` | string | - | all | `Example Extension` | status row: empty. extension row: the extension name, "-" if absent. |
-| `field_7` | string | - | all | `enabled` | status row: empty. extension row: the extension's enable state. |
-| `field_8` | string | - | all | `true` | status row: empty. extension row: whether the extension was installed from the web store. |
 
 **`crossplatform.browser_inventory.profiles` — `row_kind|field_1|field_2|field_3|field_4`**
 
@@ -126,7 +109,7 @@ Pipe-delimited rows. Every action's stream leads with a `status|<action>|<suppor
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 6f27c480065b
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 4bbe3a481e62
 
 ```
 == action=browsers
@@ -138,10 +121,6 @@ browser|chromium|0|-
 
 == action=profiles
 status|profiles|supported|-
-[result_status] OK / FULL
-
-== action=extensions
-status|extensions|supported|-
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
