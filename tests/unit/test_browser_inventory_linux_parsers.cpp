@@ -35,6 +35,14 @@
 
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
+// Direct, not transitive: browser_inventory_linux_parsers.hpp is wrapped whole in
+// `#if !defined(_WIN32)` (its own Linux-only walk logic), so on Windows the
+// `#include <yuzu/string_utils.hpp>` it carries compiles away with everything else in
+// that header. This TU is UNGUARDED and this one wire-grammar test case calls
+// yuzu::util::safe_output_field directly, so it needs the include itself rather than
+// relying on getting it through a header that disappears on the platform that needs it.
+#include <yuzu/string_utils.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
