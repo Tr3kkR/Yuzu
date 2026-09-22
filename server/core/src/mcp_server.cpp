@@ -11885,7 +11885,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = std::string(source_kind::kInventoryQuery);
-                cr.source_payload = args.dump();
+                // #4306 governance follow-up (Gate 2 security-guardian LOW): mirrors
+                // the identical REST fix on POST /api/v1/result-sets/from-inventory-query
+                // (rest_api_v1.cpp) -- see that comment for the full rationale. `args`
+                // is not read anywhere below this point in this handler.
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     // Length already checked above, ahead of the store gates.
@@ -11894,6 +11897,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return;
                     cr.parent_id = pid;
+                    args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
                     std::string cur;
                     while (true) {
@@ -11906,6 +11910,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     parent_members = std::move(ms);
                 }
+                cr.source_payload = args.dump();
                 InventoryQuery iq;
                 iq.limit = 5000;
                 bool inv_truncated = false;
@@ -12387,7 +12392,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // cancelling.
                     const bool audit_ok = audit_fn(
                         req, "result_set.create", "denied", "ResultSet", rs_id,
-                        "reason=parent_gone source_kind=" + orig->source_kind);
+                        "reason=parent_gone source_kind=" + orig->source_kind +
+                            " scope_input_id=" + sp["scope_input_id"].get<std::string>());
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "RESULT_SET_BAD_REQUEST: the original's parent set no longer "

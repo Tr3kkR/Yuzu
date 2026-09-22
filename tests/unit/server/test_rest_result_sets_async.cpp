@@ -1162,6 +1162,56 @@ TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("re-eval: a non-object source_payload on a GENERIC-create original with a "
+          "real parent_id never reaches dispatch after the parent is deleted (#4306 "
+          "governance follow-up -- locks the is_object() joint invariant between the "
+          "create-time scope_input_id merge and the re-eval-time sql/instruction_id "
+          "extraction, currently a coincidence rather than a documented contract)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Both the create-time scope_input_id merge (generic create routes) and the
+    // re-eval-time sql/instruction_id extraction independently gate on
+    // source_payload.is_object() -- a caller supplying a non-object source_payload
+    // (a bare JSON string here) alongside a real, owned parent_id skips the
+    // scope_input_id merge at creation, but the SAME predicate also blocks the
+    // sql/instruction_id extraction at re-eval time, so the row 400s "no
+    // re-runnable source" before ever reaching dispatch. Currently safe only by
+    // this coincidence (Gate 4/5 governance) -- this test locks it down.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-nonobject", {"a1"});
+    int status = 0;
+    // source_payload is a bare JSON STRING, not an object.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":"not-an-object",)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Confirm the marker was NOT recorded (is_object() gate skipped the merge).
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE_FALSE(sp.is_object());
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    // Refused for lack of a re-runnable "sql" field (the coincidental gate),
+    // NOT the parent_gone message -- confirms it fell into the "genuinely
+    // parentless" branch (no scope_input_id found) and was THEN stopped by the
+    // separate sql-presence check, never reaching run_async.
+    CHECK(re["error"]["message"].get<std::string>().find("no SQL") != std::string::npos);
+    REQUIRE(h.calls.empty());
+}
+
 TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

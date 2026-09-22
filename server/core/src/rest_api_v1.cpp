@@ -10351,7 +10351,19 @@ void RestApiV1::register_routes(
                       cr.owner_principal = session->username;
                       cr.name = body.value("name", "");
                       cr.source_kind = std::string(source_kind::kInventoryQuery);
-                      cr.source_payload = body.dump();
+                      // #4306 governance follow-up (Gate 2 security-guardian LOW): this
+                      // route also accepts a caller-supplied, owner-checked parent_id --
+                      // like the generic create route, a row minted here was
+                      // indistinguishable at re-eval time from a genuinely parentless
+                      // original once its parent was deleted. Inert TODAY only because
+                      // re-eval's source_kind allowlist refuses kInventoryQuery outright
+                      // before the parent-gone guard ever runs -- but a future widening
+                      // of that allowlist would silently reopen the #4306/#2500
+                      // target-erasure shape here. `body` is already validated as a JSON
+                      // object earlier in this handler, so merge scope_input_id in
+                      // before dumping, mirroring the identical
+                      // payload["scope_input_id"] = pid pattern the other three
+                      // creation paths use.
                       if (body.contains("parent_id") && body["parent_id"].is_string() &&
                           !body["parent_id"].get<std::string>().empty()) {
                           auto pid = body["parent_id"].get<std::string>();
@@ -10359,6 +10371,7 @@ void RestApiV1::register_routes(
                           if (!parent)
                               return; // load_owned already wrote 404
                           cr.parent_id = pid;
+                          body["scope_input_id"] = pid;
                           std::unordered_set<std::string> ms;
                           std::string cur;
                           while (true) {
@@ -10375,6 +10388,7 @@ void RestApiV1::register_routes(
                           }
                           parent_members = std::move(ms);
                       }
+                      cr.source_payload = body.dump();
 
                       InventoryQuery iq;
                       iq.limit = 5000;
@@ -10895,7 +10909,8 @@ void RestApiV1::register_routes(
                               audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
                                                    id,
                                                    "reason=parent_gone source_kind=" +
-                                                       orig->source_kind);
+                                                       orig->source_kind + " scope_input_id=" +
+                                                       sp["scope_input_id"].get<std::string>());
                           if (!audit_ok)
                               res.set_header("Sec-Audit-Failed", "true");
                           rs_err(res, 400,

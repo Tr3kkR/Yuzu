@@ -27378,6 +27378,87 @@ TEST_CASE("MCP reevaluate_result_set: refused when a GENERIC-create original's "
     CHECK_FALSE(dispatched);
 }
 
+TEST_CASE("MCP reevaluate_result_set: a non-object source_payload on a "
+          "GENERIC-create original with a real parent_id never reaches dispatch "
+          "after the parent is deleted (#4306 governance follow-up -- locks the "
+          "is_object() joint invariant between the create-time scope_input_id "
+          "merge and the re-eval-time sql/instruction_id extraction, currently a "
+          "coincidence rather than a documented contract)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // Both the create-time scope_input_id merge (generic create tools) and the
+    // re-eval-time sql/instruction_id extraction independently gate on
+    // source_payload.is_object() -- a caller supplying a non-object
+    // source_payload (a bare JSON string here) alongside a real, owned
+    // parent_id skips the scope_input_id merge at creation, but the SAME
+    // predicate also blocks the sql/instruction_id extraction at re-eval time,
+    // so the row 400s "no re-runnable source" before ever reaching dispatch.
+    // Currently safe only by this coincidence (Gate 4/5 governance) -- this
+    // test locks it down.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "narrow-target-nonobject";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "");
+
+    // source_payload is a bare JSON STRING, not an object.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":"not-an-object","parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id =
+        created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    // Confirm the marker was NOT recorded (is_object() gate skipped the merge).
+    auto orig_row = rs_bundle.get()->get(orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE(orig_row->has_value());
+    auto sp = nlohmann::json::parse((*orig_row)->source_payload, nullptr, false);
+    REQUIRE_FALSE(sp.is_object());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig_id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    // Refused for lack of a re-runnable "sql" field (the coincidental gate),
+    // NOT the parent_gone message -- confirms it fell into the "genuinely
+    // parentless" branch (no scope_input_id found) and was THEN stopped by the
+    // separate sql-presence check, never reaching dispatch.
+    CHECK(body["error"]["message"].get<std::string>().find("no SQL") != std::string::npos);
+    CHECK_FALSE(dispatched);
+}
+
 TEST_CASE("MCP reevaluate_result_set: an unsupported source_kind is refused as "
           "RESULT_SET_REEVAL_UNSUPPORTED even when a crafted scope_input_id would "
           "otherwise trip the parent-gone guard (#4306 follow-up misclassification fix)",
