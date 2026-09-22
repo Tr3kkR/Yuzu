@@ -70,10 +70,23 @@ TEST_CASE("tls_policy: resolve_cipher_policy resolves the default list in order"
 
 TEST_CASE("tls_policy: resolve_cipher_policy rejects an unresolvable or empty list",
           "[tls][tls_policy]") {
-    CHECK_FALSE(yuzu::tls::resolve_cipher_policy("NO-SUCH-CIPHER").has_value());
-    CHECK_FALSE(yuzu::tls::resolve_cipher_policy("").has_value());
-    // A TLS-1.3-only name has no TLS 1.2 match, so tls12 comes back empty.
-    CHECK_FALSE(yuzu::tls::resolve_cipher_policy("TLS_AES_128_GCM_SHA256").has_value());
+    // An unknown cipher name and an empty list are both rejected outright by
+    // SSL_CTX_set_cipher_list itself, before any partitioning happens.
+    auto no_such = yuzu::tls::resolve_cipher_policy("NO-SUCH-CIPHER");
+    REQUIRE_FALSE(no_such.has_value());
+    CHECK(no_such.error() == yuzu::tls::CipherPolicyError::list_rejected);
+
+    auto empty = yuzu::tls::resolve_cipher_policy("");
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error() == yuzu::tls::CipherPolicyError::list_rejected);
+
+    // A TLS-1.3-only name is not valid `SSL_CTX_set_cipher_list` syntax at
+    // all (TLS 1.3 ciphersuites are configured through the separate
+    // SSL_CTX_set_ciphersuites API) -- confirmed against this OpenSSL build,
+    // it is rejected outright rather than resolving to an empty TLS 1.2 set.
+    auto tls13_only = yuzu::tls::resolve_cipher_policy("TLS_AES_128_GCM_SHA256");
+    REQUIRE_FALSE(tls13_only.has_value());
+    CHECK(tls13_only.error() == yuzu::tls::CipherPolicyError::list_rejected);
 }
 
 TEST_CASE("tls_policy: tls_policy_report_lines names both protocol versions",

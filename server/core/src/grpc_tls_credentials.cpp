@@ -1,10 +1,10 @@
 #include "grpc_tls_credentials.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include "file_utils.hpp"
 
 #include <yuzu/secure_zero.hpp>
-
-#include <spdlog/spdlog.h>
 
 namespace yuzu::server::detail {
 
@@ -76,14 +76,16 @@ build_mtls_client_credentials(const std::filesystem::path& ca_path,
                                const std::filesystem::path& key_path,
                                std::string_view plane_name) {
     if (cert_path.empty() || key_path.empty()) {
-        spdlog::error("Gateway command plane: TLS is enabled but the server has no "
+        spdlog::error("{}: TLS is enabled but the server has no "
                       "client cert/key to present for mutual TLS — command forwarding "
-                      "DISABLED (fail-closed). Provide server certs or --no-tls.");
+                      "DISABLED (fail-closed). Provide server certs or --no-tls.",
+                      plane_name);
         return nullptr;
     }
     if (ca_path.empty()) {
-        spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
-                      "to verify the gateway — command forwarding DISABLED (fail-closed).");
+        spdlog::error("{}: TLS is enabled but no CA cert is configured "
+                      "to verify the gateway — command forwarding DISABLED (fail-closed).",
+                      plane_name);
         return nullptr;
     }
     if (!detail::validate_key_file_permissions(key_path, plane_name)) {
@@ -95,8 +97,9 @@ build_mtls_client_credentials(const std::filesystem::path& ca_path,
     ssl_opts.pem_private_key = detail::read_file_contents(key_path);
     if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
         ssl_opts.pem_private_key.empty()) {
-        spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
-                      "command forwarding DISABLED (fail-closed).");
+        spdlog::error("{}: failed to read CA/cert/key for mutual TLS — "
+                      "command forwarding DISABLED (fail-closed).",
+                      plane_name);
         yuzu::secure_zero(ssl_opts.pem_private_key);
         return nullptr;
     }

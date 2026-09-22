@@ -50,16 +50,16 @@
  * alongside `shutdown_watcher.hpp`.
  */
 
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-
 #include <array>
 #include <cstdlib>
+#include <expected>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 namespace yuzu::tls {
 
@@ -80,7 +80,8 @@ inline constexpr std::array<std::string_view, 6> kTls12CipherNames{
     "ECDHE-RSA-AES128-GCM-SHA256",   "ECDHE-RSA-CHACHA20-POLY1305",
 };
 
-/// The environment variable gRPC's ConfigVars reads on first use.
+/// The environment variable gRPC's ConfigVars reads on first use. NUL-
+/// terminated string literal -- `.data()` is safe as a C string.
 inline constexpr std::string_view kGrpcCipherSuitesEnvVar = "GRPC_SSL_CIPHER_SUITES";
 
 /// Pin `GRPC_SSL_CIPHER_SUITES` to `kTls12CipherList` in this process's
@@ -105,23 +106,32 @@ struct CipherResolution {
     std::vector<std::string> tls13;
 };
 
+/// Why `resolve_cipher_policy` failed to produce a usable TLS 1.2 cipher
+/// set. Kept distinct (rather than collapsed to nullopt) so a caller can
+/// report the actual cause instead of a single generic message.
+enum class CipherPolicyError {
+    context_unavailable, ///< SSL_CTX_new failed.
+    list_rejected,       ///< SSL_CTX_set_cipher_list rejected the list outright.
+    no_tls12_ciphers,    ///< The list applied but resolved to zero TLS 1.2 ciphers.
+};
+
 /// Resolve `list` against a throwaway `SSL_CTX` and partition the resulting
-/// cipher set by protocol version. Returns nullopt if the context could not
-/// be created, the list failed to apply, or it resolved to zero usable TLS
-/// 1.2 ciphers (an allow-list that silently resolves to nothing is refused
+/// cipher set by protocol version. Fails if the context could not be
+/// created, the list failed to apply, or it resolved to zero usable TLS 1.2
+/// ciphers (an allow-list that silently resolves to nothing is refused
 /// rather than treated as "no policy").
-[[nodiscard]] inline std::optional<CipherResolution>
+[[nodiscard]] inline std::expected<CipherResolution, CipherPolicyError>
 resolve_cipher_policy(std::string_view list = kTls12CipherList) {
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_method()),
                                                            &SSL_CTX_free);
     if (!ctx) {
         ERR_clear_error();
-        return std::nullopt;
+        return std::unexpected(CipherPolicyError::context_unavailable);
     }
 
     if (SSL_CTX_set_cipher_list(ctx.get(), std::string(list).c_str()) != 1) {
         ERR_clear_error();
-        return std::nullopt;
+        return std::unexpected(CipherPolicyError::list_rejected);
     }
 
     CipherResolution result;
@@ -143,7 +153,7 @@ resolve_cipher_policy(std::string_view list = kTls12CipherList) {
     ERR_clear_error();
 
     if (result.tls12.empty())
-        return std::nullopt;
+        return std::unexpected(CipherPolicyError::no_tls12_ciphers);
     return result;
 }
 

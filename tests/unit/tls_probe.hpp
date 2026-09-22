@@ -20,11 +20,18 @@
  * no detached threads for client probes.
  *
  * WHAT `alert_received` MEANS: the TLS alert DESCRIPTION the PEER sent,
- * captured via SSL_set_info_callback on SSL_CB_ALERT|SSL_CB_READ. Every
- * negative test case asserts on it, not merely on failure, because a
- * received alert is the SERVER's verdict; a purely local failure (e.g. this
- * probe's own ctx never even offered a compatible protocol) would satisfy
- * "handshake_ok == false" too, but proves nothing about server behaviour.
+ * captured via SSL_set_info_callback on SSL_CB_ALERT|SSL_CB_READ. A genuine
+ * peer refusal is either a received alert OR the peer closing the TCP
+ * connection outright after our ClientHello/Certificate was already on the
+ * wire (SSL_R_UNEXPECTED_EOF_WHILE_READING — gRPC's TLS stack does not
+ * always emit an alert record before closing on a certificate-verification
+ * failure or an incompatible legacy protocol version); test callers combine
+ * both (see `refused_by_peer` in test_grpc_tls_policy.cpp), together with
+ * `connect_ok`, which rules out "the probe never reached the peer at all".
+ * A purely local failure (e.g. this probe's own ctx never even offered a
+ * compatible protocol) would satisfy "handshake_ok == false" too, but
+ * proves nothing about server behaviour — which is why connect_ok is
+ * always checked first.
  */
 
 #include <openssl/bio.h>
@@ -35,8 +42,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -173,22 +182,21 @@ struct ProbeResult {
     }
 
     if (!opt.client_cert_pem.empty() && !opt.client_key_pem.empty()) {
-        auto* cbio = BIO_new_mem_buf(opt.client_cert_pem.data(),
-                                     static_cast<int>(opt.client_cert_pem.size()));
-        auto* cert = cbio ? PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr) : nullptr;
-        if (cbio)
-            BIO_free(cbio);
-        auto* kbio = BIO_new_mem_buf(opt.client_key_pem.data(),
-                                     static_cast<int>(opt.client_key_pem.size()));
-        auto* pkey = kbio ? PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr) : nullptr;
-        if (kbio)
-            BIO_free(kbio);
-        bool ok = cert && pkey && SSL_CTX_use_certificate(ctx.get(), cert) == 1 &&
-                 SSL_CTX_use_PrivateKey(ctx.get(), pkey) == 1;
-        if (cert)
-            X509_free(cert);
-        if (pkey)
-            EVP_PKEY_free(pkey);
+        std::unique_ptr<BIO, decltype(&BIO_free)> cbio(
+            BIO_new_mem_buf(opt.client_cert_pem.data(),
+                            static_cast<int>(opt.client_cert_pem.size())),
+            &BIO_free);
+        std::unique_ptr<X509, decltype(&X509_free)> cert(
+            cbio ? PEM_read_bio_X509(cbio.get(), nullptr, nullptr, nullptr) : nullptr, &X509_free);
+        std::unique_ptr<BIO, decltype(&BIO_free)> kbio(
+            BIO_new_mem_buf(opt.client_key_pem.data(),
+                            static_cast<int>(opt.client_key_pem.size())),
+            &BIO_free);
+        std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+            kbio ? PEM_read_bio_PrivateKey(kbio.get(), nullptr, nullptr, nullptr) : nullptr,
+            &EVP_PKEY_free);
+        bool ok = cert && pkey && SSL_CTX_use_certificate(ctx.get(), cert.get()) == 1 &&
+                 SSL_CTX_use_PrivateKey(ctx.get(), pkey.get()) == 1;
         if (!ok) {
             ERR_clear_error();
             return result;
@@ -293,45 +301,44 @@ struct PlaintextResult {
     ensure_winsock();
     PlaintextResult result;
 
-    BIO* bio = BIO_new(BIO_s_connect());
+    std::unique_ptr<BIO, decltype(&BIO_free_all)> bio(BIO_new(BIO_s_connect()), &BIO_free_all);
     if (!bio)
         return result;
     std::string hostport = "127.0.0.1:" + std::to_string(port);
-    BIO_set_conn_hostname(bio, hostport.c_str());
+    BIO_set_conn_hostname(bio.get(), hostport.c_str());
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool timed_out = false;
     int rc = detail::bounded_bio_retry(
-        bio, [&] { return BIO_do_connect(bio); }, deadline, timed_out);
+        bio.get(), [&] { return BIO_do_connect(bio.get()); }, deadline, timed_out);
     if (rc <= 0) {
         result.timed_out = timed_out;
         ERR_clear_error();
-        BIO_free_all(bio);
         return result;
     }
     result.connect_ok = true;
 
     int fd = -1;
-    BIO_get_fd(bio, &fd);
+    BIO_get_fd(bio.get(), &fd);
     if (fd >= 0)
         (void)set_socket_deadline(fd, 5);
 
     static const char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     static const unsigned char kEmptySettings[9] = {0, 0, 0, 0x04, 0, 0, 0, 0, 0};
 
-    int n1 = BIO_write(bio, kPreface, static_cast<int>(sizeof(kPreface) - 1));
-    int n2 = BIO_write(bio, kEmptySettings, static_cast<int>(sizeof(kEmptySettings)));
+    int n1 = BIO_write(bio.get(), kPreface, static_cast<int>(sizeof(kPreface) - 1));
+    int n2 = BIO_write(bio.get(), kEmptySettings, static_cast<int>(sizeof(kEmptySettings)));
     result.wrote_all =
         n1 == static_cast<int>(sizeof(kPreface) - 1) && n2 == static_cast<int>(sizeof(kEmptySettings));
 
     char buf[256];
     while (result.response.size() < sizeof(buf)) {
-        int n = BIO_read(bio, buf, static_cast<int>(sizeof(buf)));
+        int n = BIO_read(bio.get(), buf, static_cast<int>(sizeof(buf)));
         if (n > 0) {
             result.response.append(buf, static_cast<size_t>(n));
             continue;
         }
-        if (BIO_should_retry(bio) && std::chrono::steady_clock::now() < deadline)
+        if (BIO_should_retry(bio.get()) && std::chrono::steady_clock::now() < deadline)
             continue;
         if (n == 0)
             result.closed = true;
@@ -340,7 +347,6 @@ struct PlaintextResult {
         break;
     }
     ERR_clear_error();
-    BIO_free_all(bio);
 
     if (!result.response.empty() && static_cast<unsigned char>(result.response[0]) == 0x15)
         result.saw_tls_alert = true;
@@ -363,7 +369,8 @@ public:
                 int max_version = TLS1_3_VERSION, const std::string& cipher_list = "")
         : ctx_(SSL_CTX_new(TLS_server_method()), &SSL_CTX_free) {
         ensure_winsock();
-        REQUIRE_CTX();
+        if (!ctx_)
+            return;
         SSL_CTX_set_max_proto_version(ctx_.get(), max_version);
         if (!cipher_list.empty()) {
             bool ok = SSL_CTX_set_cipher_list(ctx_.get(), cipher_list.c_str()) == 1;
@@ -373,35 +380,35 @@ public:
             ctx_cipher_ok_ = true;
         }
 
-        auto* cbio =
-            BIO_new_mem_buf(server_cert_pem.data(), static_cast<int>(server_cert_pem.size()));
-        auto* cert = cbio ? PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr) : nullptr;
-        if (cbio)
-            BIO_free(cbio);
-        auto* kbio =
-            BIO_new_mem_buf(server_key_pem.data(), static_cast<int>(server_key_pem.size()));
-        auto* pkey = kbio ? PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr) : nullptr;
-        if (kbio)
-            BIO_free(kbio);
-        if (cert)
-            SSL_CTX_use_certificate(ctx_.get(), cert);
-        if (pkey)
-            SSL_CTX_use_PrivateKey(ctx_.get(), pkey);
-        if (cert)
-            X509_free(cert);
-        if (pkey)
-            EVP_PKEY_free(pkey);
+        {
+            std::unique_ptr<BIO, decltype(&BIO_free)> cbio(
+                BIO_new_mem_buf(server_cert_pem.data(), static_cast<int>(server_cert_pem.size())),
+                &BIO_free);
+            std::unique_ptr<X509, decltype(&X509_free)> cert(
+                cbio ? PEM_read_bio_X509(cbio.get(), nullptr, nullptr, nullptr) : nullptr,
+                &X509_free);
+            std::unique_ptr<BIO, decltype(&BIO_free)> kbio(
+                BIO_new_mem_buf(server_key_pem.data(), static_cast<int>(server_key_pem.size())),
+                &BIO_free);
+            std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+                kbio ? PEM_read_bio_PrivateKey(kbio.get(), nullptr, nullptr, nullptr) : nullptr,
+                &EVP_PKEY_free);
+            if (cert)
+                SSL_CTX_use_certificate(ctx_.get(), cert.get());
+            if (pkey)
+                SSL_CTX_use_PrivateKey(ctx_.get(), pkey.get());
+        }
 
         if (!trust_ca_pem.empty()) {
             auto* store = SSL_CTX_get_cert_store(ctx_.get());
-            auto* tbio = BIO_new_mem_buf(trust_ca_pem.data(), static_cast<int>(trust_ca_pem.size()));
+            std::unique_ptr<BIO, decltype(&BIO_free)> tbio(
+                BIO_new_mem_buf(trust_ca_pem.data(), static_cast<int>(trust_ca_pem.size())),
+                &BIO_free);
             if (tbio) {
-                auto* ca = PEM_read_bio_X509(tbio, nullptr, nullptr, nullptr);
-                if (ca) {
-                    X509_STORE_add_cert(store, ca);
-                    X509_free(ca);
-                }
-                BIO_free(tbio);
+                std::unique_ptr<X509, decltype(&X509_free)> ca(
+                    PEM_read_bio_X509(tbio.get(), nullptr, nullptr, nullptr), &X509_free);
+                if (ca)
+                    X509_STORE_add_cert(store, ca.get());
             }
             SSL_CTX_set_verify(ctx_.get(),
                                require_client_cert
@@ -451,6 +458,16 @@ public:
         thread_ = std::thread([this] { accept_once(); });
     }
 
+    /// Block until accept_once() has recorded `observed` (or `timeout`
+    /// elapses). Event-driven replacement for a fixed sleep before stop():
+    /// stop()'s poison-connect races a slow-but-genuine accept, so a fixed
+    /// sleep can turn a positive case into a false failure. CHECK this
+    /// (never REQUIRE) so stop() still runs and joins the thread either way.
+    [[nodiscard]] bool wait_for_handshake(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(done_mu_);
+        return done_cv_.wait_for(lk, timeout, [this] { return done_; });
+    }
+
     void stop() {
         if (!started_)
             return;
@@ -470,9 +487,19 @@ public:
     ProbeResult observed;
 
 private:
-    void REQUIRE_CTX() {} // ctor asserts via ctx_ being non-null below in callers via port()==0 check
-
+    // Runs accept_once_impl(), then unconditionally marks `done_` on every
+    // exit path (including an early return inside the impl) so
+    // wait_for_handshake() never blocks past the actual accept finishing.
     void accept_once() {
+        accept_once_impl();
+        {
+            std::lock_guard<std::mutex> lk(done_mu_);
+            done_ = true;
+        }
+        done_cv_.notify_all();
+    }
+
+    void accept_once_impl() {
         if (!accept_bio_)
             return;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -486,27 +513,31 @@ private:
             ERR_clear_error();
             return;
         }
-        BIO* client = BIO_pop(accept_bio_.get());
+        std::unique_ptr<BIO, decltype(&BIO_free_all)> client(BIO_pop(accept_bio_.get()),
+                                                              &BIO_free_all);
         if (!client)
             return;
         int fd = -1;
-        BIO_get_fd(client, &fd);
+        BIO_get_fd(client.get(), &fd);
         if (fd >= 0)
             (void)set_socket_deadline(fd, 5);
 
-        SSL* ssl = SSL_new(ctx_.get());
-        SSL_set_bio(ssl, client, client);
+        std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx_.get()), &SSL_free);
+        if (!ssl)
+            return;
+        SSL_set_bio(ssl.get(), client.get(), client.get());
+        client.release(); // the SSL now owns this BIO (freed by SSL_free)
         int alert_slot = -1;
-        SSL_set_app_data(ssl, &alert_slot);
-        SSL_set_info_callback(ssl, detail::record_peer_alert);
+        SSL_set_app_data(ssl.get(), &alert_slot);
+        SSL_set_info_callback(ssl.get(), detail::record_peer_alert);
 
         auto hs_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         int r = 0;
         do {
-            r = SSL_accept(ssl);
+            r = SSL_accept(ssl.get());
             if (r > 0)
                 break;
-            int err = SSL_get_error(ssl, r);
+            int err = SSL_get_error(ssl.get(), r);
             if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
                 break;
         } while (std::chrono::steady_clock::now() < hs_deadline);
@@ -514,8 +545,8 @@ private:
         observed.alert_received = alert_slot;
         if (r > 0) {
             observed.handshake_ok = true;
-            observed.version = SSL_get_version(ssl);
-            const SSL_CIPHER* c = SSL_get_current_cipher(ssl);
+            observed.version = SSL_get_version(ssl.get());
+            const SSL_CIPHER* c = SSL_get_current_cipher(ssl.get());
             observed.cipher = c ? SSL_CIPHER_get_name(c) : "";
         } else {
             observed.err_reason = ERR_GET_REASON(ERR_peek_last_error());
@@ -524,7 +555,6 @@ private:
             observed.err_text = buf;
         }
         ERR_clear_error();
-        SSL_free(ssl); // frees `client` BIO too
     }
 
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx_{nullptr, &SSL_CTX_free};
@@ -532,6 +562,9 @@ private:
     bool ctx_cipher_ok_ = false;
     int port_ = 0;
     bool started_ = false;
+    std::mutex done_mu_;
+    std::condition_variable done_cv_;
+    bool done_ = false;
     std::atomic<bool> accepted_{false};
     std::thread thread_;
 };

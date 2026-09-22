@@ -1227,9 +1227,24 @@ int main(int argc, char* argv[]) {
     {
         const auto tls_policy = yuzu::tls::resolve_cipher_policy();
         if (!tls_policy) {
-            spdlog::critical("TLS policy: cipher list '{}' resolves to zero TLS 1.2 ciphers in "
-                             "this OpenSSL build — refusing to start",
-                             yuzu::tls::kTls12CipherList);
+            switch (tls_policy.error()) {
+            case yuzu::tls::CipherPolicyError::context_unavailable:
+                spdlog::critical(
+                    "TLS policy: could not create an OpenSSL context to resolve the cipher "
+                    "policy — refusing to start");
+                break;
+            case yuzu::tls::CipherPolicyError::list_rejected:
+                spdlog::critical(
+                    "TLS policy: cipher list '{}' was rejected outright by this OpenSSL "
+                    "build — refusing to start",
+                    yuzu::tls::kTls12CipherList);
+                break;
+            case yuzu::tls::CipherPolicyError::no_tls12_ciphers:
+                spdlog::critical("TLS policy: cipher list '{}' resolves to zero TLS 1.2 ciphers "
+                                 "in this OpenSSL build — refusing to start",
+                                 yuzu::tls::kTls12CipherList);
+                break;
+            }
             return EXIT_FAILURE;
         }
         for (const auto& line : yuzu::tls::tls_policy_report_lines(*tls_policy))

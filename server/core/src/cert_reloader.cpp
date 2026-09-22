@@ -119,6 +119,83 @@ bool CertReloader::files_changed() {
     return cert_mtime != last_cert_mtime_ || key_mtime != last_key_mtime_;
 }
 
+// ── Validation context (#4722) ───────────────────────────────────────────────
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+std::expected<CertReloader::SslCtxPtr, std::string>
+CertReloader::build_validation_context(const std::string& cert_pem, const std::string& key_pem) {
+    SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()), &SSL_CTX_free);
+    if (!ctx) {
+        ERR_clear_error();
+        return std::unexpected("SSL_CTX_new failed");
+    }
+
+    // #4722: the validation context must carry the same cipher pin as the
+    // live listener so a hot-swapped cert/key pair is validated under the
+    // production policy. (The live ctx keeps its ctx-level cipher list
+    // across SSL_CTX_use_certificate_chain_file below — test_cert_reloader.cpp
+    // asserts it; this guards the validation path.)
+    if (!yuzu::tls::apply_tls12_cipher_list(ctx.get())) {
+        ERR_clear_error();
+        return std::unexpected("cipher policy could not be applied");
+    }
+
+    bool ok = true;
+
+    // Load cert into the validation context.
+    {
+        auto* bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+        auto* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
+        if (!x509 || SSL_CTX_use_certificate(ctx.get(), x509) != 1)
+            ok = false;
+        if (x509)
+            X509_free(x509);
+
+        // Load chain certs. SSL_CTX_add_extra_chain_cert takes ownership of
+        // `chain` on success (it must NOT be freed here in that case).
+        if (bio && ok) {
+            X509* chain = nullptr;
+            while ((chain = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+                if (SSL_CTX_add_extra_chain_cert(ctx.get(), chain) != 1) {
+                    X509_free(chain);
+                    break;
+                }
+            }
+            ERR_clear_error();
+        }
+        if (bio)
+            BIO_free(bio);
+    }
+
+    // Load key into the validation context.
+    if (ok) {
+        auto* bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+        auto* pkey = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
+        if (!pkey || SSL_CTX_use_PrivateKey(ctx.get(), pkey) != 1)
+            ok = false;
+        if (pkey)
+            EVP_PKEY_free(pkey);
+        if (bio)
+            BIO_free(bio);
+    }
+
+    // Verify cert/key match in the validation context.
+    if (ok && SSL_CTX_check_private_key(ctx.get()) != 1)
+        ok = false;
+
+    ERR_clear_error();
+
+    if (!ok)
+        return std::unexpected("SSL context test validation rejected");
+    return ctx;
+}
+#else
+std::expected<CertReloader::SslCtxPtr, std::string>
+CertReloader::build_validation_context(const std::string&, const std::string&) {
+    return std::unexpected("OpenSSL not available");
+}
+#endif
+
 // ── Core reload logic ────────────────────────────────────────────────────────
 
 bool CertReloader::try_reload() {
@@ -207,89 +284,17 @@ bool CertReloader::try_reload() {
         return false;
     }
 
-    // Build a temporary SSL_CTX to validate cert+chain+key together BEFORE
-    // touching the live context. If anything fails here, the live server is
-    // completely unaffected.
-    SSL_CTX* test_ctx = SSL_CTX_new(TLS_server_method());
-    if (!test_ctx) {
-        spdlog::error("cert-reload: SSL_CTX_new failed");
-        ERR_clear_error();
+    // Build+validate cert+chain+key together under the production cipher
+    // policy BEFORE touching the live context. If anything fails here, the
+    // live server is completely unaffected. The returned context (if any) is
+    // discarded — validating it is the point, not reusing it.
+    auto validated = build_validation_context(cert_pem, key_pem);
+    if (!validated) {
+        spdlog::error("cert-reload: {}; keeping current certificate", validated.error());
         ++failure_count_;
         yuzu::secure_zero(key_pem);
         yuzu::secure_zero(cert_pem);
-        log_audit("Failed: SSL_CTX_new failed", "failure");
-        return false;
-    }
-
-    // #4722: the validation context must carry the same cipher pin as the
-    // live listener so a hot-swapped cert/key pair is validated under the
-    // production policy. (The live ctx keeps its ctx-level cipher list
-    // across SSL_CTX_use_certificate_chain_file below — test_cert_reloader.cpp
-    // asserts it; this guards the validation path.)
-    if (!yuzu::tls::apply_tls12_cipher_list(test_ctx)) {
-        spdlog::error(
-            "cert-reload: failed to pin the TLS 1.2 cipher list on the validation context; "
-            "keeping current certificate");
-        SSL_CTX_free(test_ctx);
-        ERR_clear_error();
-        ++failure_count_;
-        yuzu::secure_zero(key_pem);
-        yuzu::secure_zero(cert_pem);
-        log_audit("Failed: cipher policy could not be applied", "failure");
-        return false;
-    }
-
-    bool test_ok = true;
-
-    // Load cert into test context
-    {
-        auto* bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
-        auto* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
-        if (!x509 || SSL_CTX_use_certificate(test_ctx, x509) != 1)
-            test_ok = false;
-        if (x509)
-            X509_free(x509);
-
-        // Load chain certs
-        if (bio && test_ok) {
-            X509* chain = nullptr;
-            while ((chain = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
-                if (SSL_CTX_add_extra_chain_cert(test_ctx, chain) != 1) {
-                    X509_free(chain);
-                    break;
-                }
-            }
-            ERR_clear_error();
-        }
-        if (bio)
-            BIO_free(bio);
-    }
-
-    // Load key into test context
-    if (test_ok) {
-        auto* bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
-        auto* pkey = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
-        if (!pkey || SSL_CTX_use_PrivateKey(test_ctx, pkey) != 1)
-            test_ok = false;
-        if (pkey)
-            EVP_PKEY_free(pkey);
-        if (bio)
-            BIO_free(bio);
-    }
-
-    // Verify cert/key match in the test context
-    if (test_ok && SSL_CTX_check_private_key(test_ctx) != 1)
-        test_ok = false;
-
-    SSL_CTX_free(test_ctx);
-    ERR_clear_error();
-
-    if (!test_ok) {
-        spdlog::error("cert-reload: test SSL_CTX validation failed; keeping current certificate");
-        ++failure_count_;
-        yuzu::secure_zero(key_pem);
-        yuzu::secure_zero(cert_pem);
-        log_audit("Failed: SSL context test validation rejected", "failure");
+        log_audit("Failed: " + validated.error(), "failure");
         return false;
     }
 

@@ -125,6 +125,24 @@ void write_pem_files(const std::filesystem::path& cert_path,
 #endif
 }
 
+// The TLS 1.2 cipher names an SSL_CTX currently carries. TLS 1.3 ciphersuites
+// are enumerated by SSL_CTX_get_ciphers too (they're not controlled by
+// SSL_CTX_set_cipher_list at all) -- filter to the TLS 1.2 subset the #4722
+// pin actually governs, same partition yuzu::tls::resolve_cipher_policy()
+// does. Shared by the live-reload test and the build_validation_context
+// tests below.
+std::vector<std::string> cipher_names(SSL_CTX* c) {
+    std::vector<std::string> names;
+    STACK_OF(SSL_CIPHER)* ciphers = SSL_CTX_get_ciphers(c);
+    int n = ciphers ? sk_SSL_CIPHER_num(ciphers) : 0;
+    for (int i = 0; i < n; ++i) {
+        const SSL_CIPHER* sc = sk_SSL_CIPHER_value(ciphers, i);
+        if (sc && std::string_view(SSL_CIPHER_get_version(sc)) != "TLSv1.3")
+            names.emplace_back(SSL_CIPHER_get_name(sc));
+    }
+    return names;
+}
+
 } // namespace
 
 TEST_CASE("validate_pem_pair: valid cert+key", "[cert-reload][pem]") {
@@ -274,21 +292,6 @@ TEST_CASE("CertReloader: try_reload succeeds against a live SSLServer and keeps 
     auto* ctx = static_cast<SSL_CTX*>(ssl_server.tls_context());
     REQUIRE(yuzu::tls::apply_tls12_cipher_list(ctx));
 
-    auto cipher_names = [](SSL_CTX* c) {
-        std::vector<std::string> names;
-        STACK_OF(SSL_CIPHER)* ciphers = SSL_CTX_get_ciphers(c);
-        int n = ciphers ? sk_SSL_CIPHER_num(ciphers) : 0;
-        for (int i = 0; i < n; ++i) {
-            const SSL_CIPHER* sc = sk_SSL_CIPHER_value(ciphers, i);
-            // TLS 1.3 ciphersuites are enumerated by SSL_CTX_get_ciphers too
-            // (they're not controlled by SSL_CTX_set_cipher_list at all) --
-            // filter to the TLS 1.2 subset this pin actually governs, same
-            // partition yuzu::tls::resolve_cipher_policy() does.
-            if (sc && std::string_view(SSL_CIPHER_get_version(sc)) != "TLSv1.3")
-                names.emplace_back(SSL_CIPHER_get_name(sc));
-        }
-        return names;
-    };
     auto names_before = cipher_names(ctx);
 
     // Overwrite the same files with a SECOND self-signed pair for the reload.
@@ -310,6 +313,31 @@ TEST_CASE("CertReloader: try_reload succeeds against a live SSLServer and keeps 
     auto expected = yuzu::tls::resolve_cipher_policy();
     REQUIRE(expected.has_value());
     CHECK(names_after == expected->tls12);
+}
+
+// #4722: try_reload()'s pass/fail outcome does not depend on the cipher pin
+// applying to the validation context (the pin has no effect on cert/key
+// loading or SSL_CTX_check_private_key) -- these two cases are the only way
+// to observe build_validation_context's own contract directly.
+TEST_CASE("CertReloader::build_validation_context applies the cipher pin and validates cert/key",
+         "[cert-reload][tls]") {
+    auto pair = generate_self_signed();
+    auto validated = CertReloader::build_validation_context(pair.cert, pair.key);
+    REQUIRE(validated.has_value());
+
+    auto names = cipher_names(validated->get());
+    auto expected = yuzu::tls::resolve_cipher_policy();
+    REQUIRE(expected.has_value());
+    CHECK(names == expected->tls12);
+}
+
+TEST_CASE("CertReloader::build_validation_context rejects a mismatched cert/key pair",
+         "[cert-reload][tls]") {
+    auto pair_a = generate_self_signed();
+    auto pair_b = generate_self_signed();
+    auto validated = CertReloader::build_validation_context(pair_a.cert, pair_b.key);
+    REQUIRE_FALSE(validated.has_value());
+    CHECK(validated.error() == "SSL context test validation rejected");
 }
 
 #endif // CPPHTTPLIB_OPENSSL_SUPPORT

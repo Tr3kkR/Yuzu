@@ -137,11 +137,13 @@ openssl s_client -connect 127.0.0.1:50051 -tls1_2 -cipher ECDHE-ECDSA-CHACHA20-P
 
 The production-entrypoint ordering (the pin running before gRPC's first
 use in the real `yuzu-server` binary, as opposed to the test executable's
-own independent static-initialiser pin) is verified manually above, not by
-an automated test — the unit test executable pins from its own static
-initialiser and cannot observe `main.cpp`'s ordering. An automated
-assertion is tracked as a follow-up issue against the `scripts/integration-test.sh`
-TLS mode (roadmap PR 1).
+own independent static-initialiser pin) and the HTTPS listener's direct
+cipher application are both verified manually above, not by an automated
+test — the unit test executable pins from its own static initialiser and
+cannot observe `main.cpp`'s ordering, and no test performs a real handshake
+against `start_web_server()`'s listener. An automated assertion for both is
+tracked as [#4740](https://github.com/Tr3kkR/Yuzu/issues/4740) against the
+`scripts/integration-test.sh` TLS mode (roadmap PR 1).
 
 Part B of this work pins `agents/core`'s own gRPC client the same way and
 reuses `tests/unit/tls_probe.hpp` unchanged.

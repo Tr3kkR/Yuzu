@@ -14,17 +14,17 @@
  * integration-test.sh assertion.
  */
 
-#include <catch2/catch_test_macros.hpp>
-
-#include <grpcpp/grpcpp.h>
-#include <grpcpp/security/server_credentials.h>
-
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <thread>
+
+#include <catch2/catch_test_macros.hpp>
+#include <grpcpp/grpcpp.h>
+#include <grpcpp/security/server_credentials.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #include "agent.grpc.pb.h"
 #include "grpc_tls_credentials.hpp"
@@ -32,9 +32,6 @@
 
 #include "../test_helpers.hpp"
 #include "../tls_probe.hpp"
-
-#include <openssl/err.h>
-#include <openssl/ssl.h>
 
 #include <yuzu/tls_policy.hpp>
 
@@ -191,22 +188,22 @@ struct PolicyHarness {
             server_paths.cert, server_paths.key, server_paths.ca,
             /*insecure_skip_client_verify=*/false, /*require_client_cert=*/true,
             "test agent listener");
-    std::unique_ptr<grpc::Server> server_;
-    int port_ = 0;
+    std::unique_ptr<grpc::Server> server;
+    int port = 0;
 
     PolicyHarness() {
         REQUIRE(creds);
         grpc::ServerBuilder b;
-        b.AddListeningPort("127.0.0.1:0", creds, &port_);
+        b.AddListeningPort("127.0.0.1:0", creds, &port);
         b.RegisterService(&noop_svc);
-        server_ = b.BuildAndStart();
-        REQUIRE(server_);
-        REQUIRE(port_ != 0);
+        server = b.BuildAndStart();
+        REQUIRE(server);
+        REQUIRE(port != 0);
     }
 
     ~PolicyHarness() {
-        if (server_)
-            server_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        if (server)
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     }
 };
 
@@ -214,21 +211,21 @@ struct PolicyHarness {
 /// the plaintext probe can recognise a REAL plaintext HTTP/2 server.
 struct PlaintextHarness {
     apb::AgentService::Service noop_svc;
-    std::unique_ptr<grpc::Server> server_;
-    int port_ = 0;
+    std::unique_ptr<grpc::Server> server;
+    int port = 0;
 
     PlaintextHarness() {
         grpc::ServerBuilder b;
-        b.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
+        b.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         b.RegisterService(&noop_svc);
-        server_ = b.BuildAndStart();
-        REQUIRE(server_);
-        REQUIRE(port_ != 0);
+        server = b.BuildAndStart();
+        REQUIRE(server);
+        REQUIRE(port != 0);
     }
 
     ~PlaintextHarness() {
-        if (server_)
-            server_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        if (server)
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     }
 };
 
@@ -266,7 +263,7 @@ TEST_CASE("grpc tls policy: positive TLS 1.2 via a suite outside gRPC's default"
     opt.client_cert_pem = h.client_pki.leaf_cert;
     opt.client_key_pem = h.client_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK(r.handshake_ok);
@@ -281,7 +278,7 @@ TEST_CASE("grpc tls policy: positive TLS 1.3 with the suite asserted", "[tls][ha
     opt.client_cert_pem = h.client_pki.leaf_cert;
     opt.client_key_pem = h.client_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK(r.handshake_ok);
@@ -294,7 +291,7 @@ TEST_CASE("grpc tls policy: full round-trip through the production mTLS client b
           "[tls][handshake]") {
     PolicyHarness h;
     auto channel = channel_via_production_builder(h.server_paths.ca, h.client_paths.cert,
-                                                  h.client_paths.key, h.port_);
+                                                  h.client_paths.key, h.port);
     REQUIRE(channel);
     CHECK(channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(10)));
 }
@@ -310,7 +307,7 @@ TEST_CASE("grpc tls policy: negative TLS 1.0 only", "[tls][handshake]") {
     opt.client_cert_pem = h.client_pki.leaf_cert;
     opt.client_key_pem = h.client_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK_FALSE(r.handshake_ok);
@@ -318,6 +315,17 @@ TEST_CASE("grpc tls policy: negative TLS 1.0 only", "[tls][handshake]") {
     CHECK(r.version.empty());
     INFO("alert=" << r.alert_received << " reason=" << r.err_reason << " text=" << r.err_text);
     CHECK(refused_by_peer(r));
+
+    // Positive control: the SAME harness accepts TLS 1.2, isolating the
+    // refusal above to the offered protocol version rather than something
+    // else about the probe/harness.
+    gtls::ProbeOptions control = opt;
+    control.security_level = -1;
+    control.min_version = control.max_version = TLS1_2_VERSION;
+    control.cipher_list.clear();
+    auto rc = gtls::raw_tls_probe(h.port, control);
+    CHECK(rc.handshake_ok);
+    CHECK(rc.version == "TLSv1.2");
 }
 
 TEST_CASE("grpc tls policy: negative TLS 1.1 only", "[tls][handshake]") {
@@ -329,7 +337,7 @@ TEST_CASE("grpc tls policy: negative TLS 1.1 only", "[tls][handshake]") {
     opt.client_cert_pem = h.client_pki.leaf_cert;
     opt.client_key_pem = h.client_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK_FALSE(r.handshake_ok);
@@ -337,6 +345,15 @@ TEST_CASE("grpc tls policy: negative TLS 1.1 only", "[tls][handshake]") {
     CHECK(r.version.empty());
     INFO("alert=" << r.alert_received << " reason=" << r.err_reason << " text=" << r.err_text);
     CHECK(refused_by_peer(r));
+
+    // Positive control: same shape as the TLS 1.0 case above.
+    gtls::ProbeOptions control = opt;
+    control.security_level = -1;
+    control.min_version = control.max_version = TLS1_2_VERSION;
+    control.cipher_list.clear();
+    auto rc = gtls::raw_tls_probe(h.port, control);
+    CHECK(rc.handshake_ok);
+    CHECK(rc.version == "TLSv1.2");
 }
 
 // ── Negative: non-allow-listed cipher ────────────────────────────────────────
@@ -350,7 +367,7 @@ TEST_CASE("grpc tls policy: negative non-allow-listed but ECDSA-compatible ciphe
     opt.client_cert_pem = h.client_pki.leaf_cert;
     opt.client_key_pem = h.client_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK_FALSE(r.handshake_ok);
@@ -361,7 +378,7 @@ TEST_CASE("grpc tls policy: negative non-allow-listed but ECDSA-compatible ciphe
     // succeed, isolating the refusal above to the cipher choice.
     gtls::ProbeOptions control = opt;
     control.cipher_list = "ECDHE-ECDSA-AES128-GCM-SHA256";
-    auto rc = gtls::raw_tls_probe(h.port_, control);
+    auto rc = gtls::raw_tls_probe(h.port, control);
     REQUIRE(rc.ctx_setup_ok);
     REQUIRE(rc.connect_ok);
     CHECK(rc.handshake_ok);
@@ -376,7 +393,7 @@ TEST_CASE("grpc tls policy: negative certless client is refused", "[tls][handsha
     opt.max_version = TLS1_2_VERSION;
     // No client_cert_pem/client_key_pem set.
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK_FALSE(r.handshake_ok);
@@ -386,7 +403,7 @@ TEST_CASE("grpc tls policy: negative certless client is refused", "[tls][handsha
     gtls::ProbeOptions control = opt;
     control.client_cert_pem = h.client_pki.leaf_cert;
     control.client_key_pem = h.client_pki.leaf_key;
-    auto rc = gtls::raw_tls_probe(h.port_, control);
+    auto rc = gtls::raw_tls_probe(h.port, control);
     REQUIRE(rc.ctx_setup_ok);
     REQUIRE(rc.connect_ok);
     CHECK(rc.handshake_ok);
@@ -397,7 +414,7 @@ TEST_CASE("grpc tls policy: negative certless client is refused", "[tls][handsha
 TEST_CASE("grpc tls policy: negative plaintext client on the TLS listener",
           "[tls][handshake]") {
     PolicyHarness h;
-    auto r = gtls::raw_plaintext_probe(h.port_);
+    auto r = gtls::raw_plaintext_probe(h.port);
     REQUIRE(r.connect_ok);
     REQUIRE(r.wrote_all);
     CHECK_FALSE(r.timed_out);
@@ -408,7 +425,7 @@ TEST_CASE("grpc tls policy: negative plaintext client on the TLS listener",
     // server must recognise its SETTINGS frame, proving the refusal above
     // is distinguishable from "the probe can't tell either way".
     PlaintextHarness plain;
-    auto rp = gtls::raw_plaintext_probe(plain.port_);
+    auto rp = gtls::raw_plaintext_probe(plain.port);
     CHECK(rp.saw_h2_settings);
 }
 
@@ -423,7 +440,7 @@ TEST_CASE("grpc tls policy: negative wrong-CA client certificate", "[tls][handsh
     opt.client_cert_pem = h.foreign_pki.leaf_cert;
     opt.client_key_pem = h.foreign_pki.leaf_key;
 
-    auto r = gtls::raw_tls_probe(h.port_, opt);
+    auto r = gtls::raw_tls_probe(h.port, opt);
     REQUIRE(r.ctx_setup_ok);
     REQUIRE(r.connect_ok);
     CHECK_FALSE(r.handshake_ok);
@@ -433,13 +450,13 @@ TEST_CASE("grpc tls policy: negative wrong-CA client certificate", "[tls][handsh
     gtls::ProbeOptions control = opt;
     control.client_cert_pem = h.client_pki.leaf_cert;
     control.client_key_pem = h.client_pki.leaf_key;
-    auto rc = gtls::raw_tls_probe(h.port_, control);
+    auto rc = gtls::raw_tls_probe(h.port, control);
     CHECK(rc.handshake_ok);
 
     // gRPC twin: the production client credentials with the foreign leaf
     // must land the channel in TRANSIENT_FAILURE.
     auto channel = channel_via_production_builder(h.server_paths.ca, h.foreign_paths.cert,
-                                                  h.foreign_paths.key, h.port_);
+                                                  h.foreign_paths.key, h.port);
     REQUIRE(channel);
     CHECK(wait_for_transient_failure(channel, std::chrono::system_clock::now() +
                                                   std::chrono::seconds(5)));
@@ -479,7 +496,7 @@ TEST_CASE("grpc tls policy: negative wrong-CA gateway impersonator (outbound)",
     // Never asserted on the channel's final state (raw server speaks no
     // HTTP/2) -- only the raw server's own observation matters here.
     good_channel->GetState(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(good.wait_for_handshake(std::chrono::seconds(5)));
     good.stop();
     CHECK(good.observed.handshake_ok);
 }
@@ -499,7 +516,7 @@ TEST_CASE("grpc tls policy: positive outbound builder forced to TLS 1.2 on a pin
                                                   h.server_paths.key, server.port());
     REQUIRE(channel);
     channel->GetState(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(server.wait_for_handshake(std::chrono::seconds(5)));
     server.stop();
 
     CHECK(server.observed.handshake_ok);
