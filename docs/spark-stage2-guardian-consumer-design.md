@@ -1400,12 +1400,18 @@ further recorded limits.
      failures. An alternating failure/success pattern therefore never flips `inert`. Movement of
      `pass_failed`, not `inert`, is the complete failure detector, and the #4606 harness must
      read it.
-   - Known limit: a blocked or slow log sink stalls the File worker (`log_pass_outcome()` runs on
-     the worker, off `mu_`), and with it IOCP draining and the worker join in `stop()`. While the
-     agent runs, the stall lasts as long as the sink blocks. On the shutdown path a blocked
-     agent-wide sink is bounded by the 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`,
-     armed in `AgentImpl::stop()` and in `run()`'s teardown), which ends in `hard_exit(4)`: it is
-     not an indefinite hang.
+   - Known limit: a blocked or slow log sink stalls the mechanism's own worker thread while it
+     runs, for as long as the sink blocks; only agent shutdown is bounded (the 20 s
+     `ShutdownDeadlineGuard`, `kShutdownDeadlineGrace`, armed in `AgentImpl::stop()` and in
+     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). The two
+     mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
+     (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
+     IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
+     Registry's equivalent lines run WHILE `mu_` IS HELD (`spark_registry.cpp:1895`, `:1912`,
+     `:1916`; unlocked only at `:1919`), so a stalled sink there stalls every other caller of
+     `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
+     draining. Tracked as its own issue, #4704 (not folded into this design record's own
+     acceptance, since it needs a fix decision of its own).
 5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
    through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,

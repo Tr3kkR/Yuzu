@@ -1821,7 +1821,9 @@ not re-reconciled on recovery) must be fixed or closed first; see its section 5 
 per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
 detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
 the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
-on the section 5 query.**
+on the section 5 query. #4704 (a blocked log sink stalls the File worker or, worse, the Registry
+sweeper's `mu_`) must be fixed or accepted as a limit before the flip as well, since the flip is
+what makes these mechanism workers live.**
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
