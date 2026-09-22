@@ -278,6 +278,57 @@ groups:
             agent it never held. Check the cluster_id label and the
             corresponding gateway's logs. See ADR-2002 §7d.
 
+      # #4669 — agent<->cluster affinity (ADR-2002 §7d). Same "any occurrence
+      # is actionable" posture as YuzuGatewayResponseAgentMismatch above, no
+      # `for:` — this is a durable refusal, not a background-rate class: the
+      # code's own comment (gateway_service_impl.cpp) calls it "the ONE
+      # exception to 'benign, don't page'" among this file's desync outcomes.
+      - alert: YuzuGatewayClusterAffinityViolation
+        expr: |
+          increase(yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="cluster_affinity_violation"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway cluster-affinity violation refused ({{ $value }} in 1h)"
+          description: >-
+            A session-matched CONNECTED claimed a cluster_id different from
+            the agent's durably-bound home_cluster_id and was refused
+            fail-closed (#4669). Any occurrence is actionable: check the
+            audit log (gateway.cluster_affinity_violation) for the
+            agent_id/cluster_id pair, and the offending gateway's logs —
+            this is either a cluster_id rename/misconfiguration or a
+            rogue-gateway claim attempt. See ADR-2002 §7d.
+
+      # #4669 — a leading indicator for the fail-open pre-check's exposure
+      # window: has_cluster_affinity_conflict (the pre-check) degrading WHILE
+      # announce_connected (the enforcement of record) is ALSO degrading is
+      # the compound condition under which a rogue's claimed placement could
+      # briefly reach the in-memory dispatch registry before the durable
+      # store gets a chance to refuse it. Neither counter alone implies this
+      # window; the AND does. Shorter `for:` than YuzuGatewayRouteWriteFailed
+      # (5m) since this is a narrower, more time-sensitive signal — the
+      # window's actual duration is exactly what this alert measures.
+      - alert: YuzuGatewayClusterAffinityCheckDegradedDuringWrite
+        expr: |
+          (sum(rate(yuzu_server_gateway_route_write_failed_total{op="cluster_affinity_check"}[5m])) > bool 0)
+          * (sum(rate(yuzu_server_gateway_route_write_failed_total{op="announce_connected"}[5m])) > bool 0)
+          == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway cluster-affinity pre-check AND its enforcing write are both degrading"
+          description: >-
+            The read-only cluster-affinity pre-check (has_cluster_affinity_conflict)
+            is failing open WHILE announce_connected's own guarded write —
+            the actual enforcement of record — is also degrading. In this
+            compound window a rogue's claimed cluster placement could
+            briefly reach the in-memory dispatch registry before the durable
+            store refuses it (#4669). Check Postgres pool health
+            (yuzu_server_gateway_route_write_failed_total{reason}) — this is
+            very likely a Postgres degradation, not an attack, but the
+            exposure window lasts exactly as long as this alert is firing.
+            See ADR-2002 §7d.
       # #4672 (Gate 6 sre SHOULD, 2026-09-21) — before this fix,
       # unauthenticated/unknown_cluster gateway-forward failures were logged
       # and counted but never resolved the dispatching operator's command_id
