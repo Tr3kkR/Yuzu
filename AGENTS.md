@@ -88,14 +88,15 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 ## Routed concerns (read the doc, not this file)
 
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
-two files solely for the per-file ceiling: the first holds platform/product/data/observability
-concerns, the second auth, access-control, and request-admission chokepoints. Same authority as this
-file.
+three files solely for the per-file ceiling: the first holds platform/product/data/observability
+concerns, the second auth, access-control, and request-admission chokepoints, the third Forensics /
+per-user-software-data concerns. Same authority as this file.
 
-**OPEN AND READ BOTH FILES — they are not auto-loaded on this leg:**
+**OPEN AND READ ALL THREE FILES — they are not auto-loaded on this leg:**
 
 - `.claude/routed-concerns.md`
 - `.claude/routed-concerns-access-control.md`
+- `.claude/routed-concerns-software-estate.md`
 
 Match them row by row against the paths your change touches. **This file deliberately does NOT carry
 its own copy of the tables.** It used to, and that copy drifted badly — it still described `CaStore`

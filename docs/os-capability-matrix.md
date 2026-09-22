@@ -99,6 +99,7 @@ duplicates.
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | autoruns | ✅ | ✅ | ✅ | Linux: file reads of cron/anacron/at/systemd unit dirs/XDG autostart, `systemctl list-timers` argv fallback only when no unit dir is readable. macOS: `CFPropertyListCreateWithData` over launchd plists, `/etc/periodic`, `/etc/emond.d`; Login Items CONSTRAINED (private BTM database, no public read API). Windows: `Reg*W` over HKLM + every HKU via `win_profiles` `with_user_hive`, ITaskService COM, bounded WMI `root\subscription` query — zero spawn primitives (no `schtasks.exe`/`wmic.exe`/PowerShell); real-hardware LocalSystem probe in `tests/unit/fixtures/wave7/probes/the-rig-probe-findings.md` |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
+| browser_inventory | 🔜 | 🟡 | 🔜 | Chromium-family browser/profile/extension inventory. Forensics securable, default-off via the server plugin-config kill switch, single-target. Linux this wave: `browsers` presence-only, `profiles`/`extensions` real reads over `~/.config/{google-chrome,microsoft-edge}` (Local State / Secure Preferences JSON). macOS/Windows legs are PLANNED — each follows as its own PR; see `agents/plugins/browser_inventory/README.md` |
 | certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain reads via a pre-split argv through the bounded runner (rung 2, #3406 — the former Decision-7 governed-shell path is retired); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS. `execute_staged` on Linux is CONSTRAINED, not unconditional: shebang-interpreted (`#!`) staged payloads are rejected (B6 fd-exec is incompatible with the kernel's binfmt_script re-open) — native executables only. Per-action detail: the generated plugin-action table below |
@@ -190,6 +191,13 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
+<!-- TODO(orchestrator, Wave 10 P2a-3): the generated block below does not
+     yet carry browser_inventory's rows -- regenerate on Linux (the
+     canonical host) with `tools/capmatrix-gen` against the compiled
+     browser_inventory .so once one exists; this package's own kActionDescriptors
+     (agents/plugins/browser_inventory/src/browser_inventory_plugin.cpp) is
+     the source of truth it reads from. Engineers do not compile, so this
+     block is left untouched rather than hand-edited. -->
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |

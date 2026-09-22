@@ -4,8 +4,8 @@ and the instruction-file standard (docs/instruction-file-standard.md).
 
 Invariants that must hold on every platform:
 
-1. The four ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
-   two routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
+1. The five ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
+   three routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
    character budget, behind the 48,000 hard cap. Counted UTF-8-decoded in
    Python deliberately: these files are dense with multi-byte punctuation, so
    byte counts (`wc -c`, and `wc -m` on Windows Git Bash, which degrades to
@@ -75,6 +75,7 @@ INSTRUCTION_FILE_BUDGET = 40_000
 ROUTED_CONCERN_FILES = (
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 INSTRUCTION_FILES = (
@@ -82,6 +83,7 @@ INSTRUCTION_FILES = (
     "AGENTS.md",
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 # <!-- EXPIRES: YYYY-MM-DD owner:@who -->
