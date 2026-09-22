@@ -122,6 +122,12 @@ FRAGMENT_FILES = [
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (firmware_posture) = 210.
+# Wave 9 PR9.1b: +2 printing (printers/jobs).
+# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue.
+# Running total: 194 (base, already includes __sync__.now — see above) +
+# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
+# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
+# 1 (printing.clear_queue) = 210.
 EXPECTED_TOTAL_ROWS = 210
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
