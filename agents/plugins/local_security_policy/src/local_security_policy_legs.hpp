@@ -38,8 +38,20 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
                            std::string_view data_dir);
 
 /// Writes the rows and the one status every leg reports (PERMISSION_DENIED only
-/// when nothing existing was readable -- see select_status).
-inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c) {
+/// when nothing existing was readable -- see select_status). `action_prefix` is
+/// this action's row prefix (`action_row_prefix(...)`), needed only for the
+/// fallback row below -- every OTHER row already carries it via `c.rows`.
+/// A non-OK status with no collected rows (every source failed before producing
+/// one, e.g. a pwpolicy spawn error) still writes ONE fallback row naming the
+/// reason, in this plugin's own 4-field `<action>|status|<state>|<reason>` shape
+/// (matching every other row this plugin emits -- NOT the Windows leg's separate
+/// 2-field `constrained|<token>` diagnostic shape, which is a different wire
+/// contract for a leg that never goes through this function). The routed
+/// concern's "a refused read is permission_denied, never an empty result"
+/// applies to the wire output, not just the status field, and every sibling
+/// plugin in this diff pairs a non-OK status with an explicit row.
+inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
+                           std::string_view action_prefix) {
     for (const auto& r : c.rows) ctx.write_output(r);
     switch (c.status) {
     case PolicyStatus::Ok:
@@ -49,11 +61,15 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c) {
         spdlog::warn("local_security_policy: permission denied ({})", c.reason);
         ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               c.reason);
+        if (c.rows.empty())
+            ctx.write_output(format_kv_row(action_prefix, "status", "permission_denied", c.reason));
         break;
     case PolicyStatus::Constrained:
         spdlog::warn("local_security_policy: degraded read ({})", c.reason);
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               c.reason);
+        if (c.rows.empty())
+            ctx.write_output(format_kv_row(action_prefix, "status", "constrained", c.reason));
         break;
     }
     return 0;
@@ -108,10 +124,17 @@ inline DirList posix_list_dir(const std::string& path) {
 
 namespace detail {
 
-inline std::string cf_to_utf8(CFStringRef s) {
-    char buf[1024];
-    return CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8) ? std::string{buf}
-                                                                          : std::string{};
+// nullopt only on a genuine CFStringGetCString conversion failure -- never on a
+// merely-long string. The buffer is sized from the string itself (same pattern
+// as macos_console_user.hpp / peripherals_macos.cpp), so a real policy string
+// longer than a fixed 1024-byte guess can no longer be silently truncated away.
+inline std::optional<std::string> cf_to_utf8(CFStringRef s) {
+    const CFIndex len = CFStringGetLength(s);
+    if (len == 0) return std::string{};
+    const CFIndex max_size = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    std::string buf(static_cast<std::size_t>(max_size), '\0');
+    if (!CFStringGetCString(s, buf.data(), max_size, kCFStringEncodingUTF8)) return std::nullopt;
+    return std::string{buf.c_str()};
 }
 
 /// Scalar CF value -> text; nullopt for a nested/unknown type (never guessed).
@@ -136,7 +159,8 @@ inline std::vector<std::pair<std::string, CFTypeRef>> cf_dict_entries(CFDictiona
     CFDictionaryGetKeysAndValues(d, keys.data(), vals.data());
     for (CFIndex i = 0; i < n; ++i)
         if (CFGetTypeID(static_cast<CFTypeRef>(keys[i])) == CFStringGetTypeID())
-            out.emplace_back(cf_to_utf8(static_cast<CFStringRef>(keys[i])), static_cast<CFTypeRef>(vals[i]));
+            out.emplace_back(cf_to_utf8(static_cast<CFStringRef>(keys[i])).value_or("unmodelled"),
+                             static_cast<CFTypeRef>(vals[i]));
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     return out;
 }
@@ -168,8 +192,13 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
             if (CFGetTypeID(el) != CFDictionaryGetTypeID()) continue;
             PwPolicyItem it{category, "", "", {}};
             for (const auto& [k, v] : detail::cf_dict_entries(static_cast<CFDictionaryRef>(el))) {
-                if (k == "policyIdentifier") it.identifier = detail::cf_scalar_text(v).value_or("");
-                else if (k == "policyContent") it.content = detail::cf_scalar_text(v).value_or("");
+                // "unmodelled" only on a genuine conversion failure (nullopt) -- a real
+                // empty string from CF still comes back as an empty std::string, not
+                // nullopt, so this never mislabels a genuinely-empty value.
+                if (k == "policyIdentifier")
+                    it.identifier = detail::cf_scalar_text(v).value_or("unmodelled");
+                else if (k == "policyContent")
+                    it.content = detail::cf_scalar_text(v).value_or("unmodelled");
                 else if (k == "policyParameters" && CFGetTypeID(v) == CFDictionaryGetTypeID())
                     for (const auto& [pk, pv] : detail::cf_dict_entries(static_cast<CFDictionaryRef>(v)))
                         it.params.emplace_back(pk, detail::cf_scalar_text(pv).value_or("unmodelled"));
