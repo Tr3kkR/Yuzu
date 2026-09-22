@@ -430,7 +430,7 @@ implementation is.
 | http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
 | installed_apps | list | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
-| installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner | - |
+| installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner + native CFBundle enrichment | - |
 | installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | installed_apps | query | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
 | installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
