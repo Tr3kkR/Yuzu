@@ -2,7 +2,9 @@
  * local_security_policy_macos.cpp -- macOS leg.
  *
  * password_policy / lockout_policy: `pwpolicy -getaccountpolicies` is the RUNG-2 argv leaf (no
- * public OpenDirectory global-policy API, ADR-3002 K10). One spawn per action; the XML goes
+ * public OpenDirectory global-policy API -- ADR-3002 Decision 1's "no interface exists"
+ * category; OpenDirectory exposes per-node/per-record policy, never the global set).
+ * One spawn per action; the XML goes
  * through CFPropertyListCreateWithData and the pure extractor. The tool prints a non-plist
  * banner line before the XML; strip_to_xml removes it (raw stdout fails to parse on every host).
  *
@@ -29,7 +31,9 @@ Collected constrained(std::string token) {
 
 Collected collect_pwpolicy(LocalPolicyAction action) {
     // sink: local_security_policy/do_password_policy#1
-    // rung 2: no public OD global-policy API exists (ADR-3002 K10), so the tool's XML output is read.
+    // rung 2 on ADR-3002 Decision 1's "no interface exists" evidence category: OpenDirectory
+    // publishes per-node and per-record policy, never the GLOBAL account-policy set this action
+    // reports, so there is no rung-1 API to pass over. The tool's XML output is read instead.
     const auto run = yuzu::agent::run_bounded_subprocess(
         {"/usr/bin/pwpolicy", "-getaccountpolicies"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
