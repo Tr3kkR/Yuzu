@@ -795,7 +795,13 @@ TEST_CASE("FileGuard rename: a target under an unavailable drive root does not h
     cfg.path = std::string(1, static_cast<char>(letter)) + ":\\yuzu_test_fgrename_root\\f.txt";
     cfg.event_debounce_ms = 50;
     auto col = std::make_shared<FileDriftCollector>();
-    auto* guard = new FileGuard(cfg, [col](const GuardDrift& d) { col->push(d); });
+    // unique_ptr (not a bare `new`/`delete`): on the normal path the destructor calls stop()
+    // automatically (stop() is idempotent — already-joined threads/closed handles are a no-op,
+    // the same double-stop() every other test in this file relies on); on the timeout/leak
+    // branch below, release() hands ownership to the deliberately-detached helper thread. This
+    // also closes an unconditional leak on any exception thrown between construction and the
+    // if/else (e.g. a REQUIRE/wait_for_detected/thread-construction throw).
+    auto guard = std::make_unique<FileGuard>(cfg, [col](const GuardDrift& d) { col->push(d); });
     REQUIRE(guard->start());
     // file-exists with the default expectation: the first evaluation reports the absent target,
     // and it only runs once arming has returned.
@@ -807,8 +813,8 @@ TEST_CASE("FileGuard rename: a target under an unavailable drive root does not h
         bool done = false;
     };
     auto st = std::make_shared<StopState>();
-    std::thread stopper([guard, st] {
-        guard->stop();
+    std::thread stopper([g = guard.get(), st] {
+        g->stop();
         {
             std::lock_guard lk(st->m);
             st->done = true;
@@ -821,10 +827,10 @@ TEST_CASE("FileGuard rename: a target under an unavailable drive root does not h
         stopped = st->cv.wait_for(lk, 10s, [&] { return st->done; });
     }
     if (stopped) {
-        stopper.join();
-        delete guard;
+        stopper.join(); // guard destructs normally at scope exit below
     } else {
-        stopper.detach(); // leak the guard and its spinning thread rather than hang the suite
+        guard.release(); // leak the guard and its spinning thread rather than hang the suite
+        stopper.detach();
     }
     CHECK(armed);
     CHECK(stopped);
