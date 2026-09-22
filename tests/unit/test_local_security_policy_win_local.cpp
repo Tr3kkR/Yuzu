@@ -10,10 +10,14 @@
  * (test_execution_artifacts_win_local.cpp), which solved the identical gap for `amcache`.
  *
  * Same loading harness as test_local_security_policy_local_dispatcher.cpp -- LocalDispatcher over
- * the ACTUAL built local_security_policy.dylib/.so/.dll, never a mock. UNGUARDED TU (compiles and
- * runs on every OS, matching the platform-guarded-TU-hides-a-dead-leg lesson): non-Windows hosts
- * assert nothing here beyond the plugin loading (the file's whole body past that is
- * `#if defined(_WIN32)`), Windows hosts get the two cases below.
+ * the ACTUAL built local_security_policy.dylib/.so/.dll, never a mock. UNGUARDED TU: it is listed
+ * unconditionally in tests/meson.build and compiles on every OS, so it can never become a file
+ * nobody builds (the platform-guarded-TU-hides-a-dead-leg lesson). Be precise about what that
+ * buys off Windows, though: the entire body is `#if defined(_WIN32)`, so a non-Windows run
+ * registers NO test case from this file at all -- it is compiled, not exercised. The pure
+ * decisions behind this leg are covered on every OS by
+ * test_local_security_policy_scratch_sweep.cpp; what is Windows-only here is the live spawn and
+ * the scratch-dir lifecycle, which no other host can run.
  */
 #include <catch2/catch_test_macros.hpp>
 

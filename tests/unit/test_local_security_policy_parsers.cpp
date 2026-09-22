@@ -38,10 +38,13 @@ struct FakeFs {
     std::map<std::string, std::string> files;
     std::map<std::string, std::vector<std::string>> dirs;
     std::vector<std::string> denied;
+    std::vector<std::string> oversized; // read returns kReadOversized (over kMaxFileBytes)
     bool dirs_truncated = false; // drives DirList::truncated (walk_dir_capped hit kMaxDirEntries)
     FileReader reader() const {
         return [this](const std::string& p) -> FileRead {
             if (std::find(denied.begin(), denied.end(), p) != denied.end()) return {EACCES, {}};
+            if (std::find(oversized.begin(), oversized.end(), p) != oversized.end())
+                return {kReadOversized, {}};
             const auto it = files.find(p);
             if (it == files.end()) return {ENOENT, {}};
             return {0, it->second[0] == '@' ? it->second.substr(1) : fixture("linux/" + set + "/" + it->second)};
@@ -98,8 +101,13 @@ std::vector<std::uint8_t> utf16le_bom(const std::u16string& s, bool bom = true) 
 
 // Fails under: dropped BOM check, wrong shift/mask, surrogate pairing removed, odd-length accepted.
 TEST_CASE("decode_utf16le_bom: UTF-8 out, and every malformed buffer is nullopt", "[local_security_policy][parsers]") {
-    CHECK(*decode_utf16le_bom(utf16le_bom(u"[System Access]\r\n")) == "[System Access]\r\n");
-    CHECK(*decode_utf16le_bom(utf16le_bom(u"\u00e9\u20ac\U0001F600")) == "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80");
+    // REQUIRE before every deref: a disengaged optional is UB here, not a failed assertion.
+    const auto ascii = decode_utf16le_bom(utf16le_bom(u"[System Access]\r\n"));
+    REQUIRE(ascii.has_value());
+    CHECK(*ascii == "[System Access]\r\n");
+    const auto wide = decode_utf16le_bom(utf16le_bom(u"\u00e9\u20ac\U0001F600"));
+    REQUIRE(wide.has_value());
+    CHECK(*wide == "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80");
     CHECK(decode_utf16le_bom(utf16le_bom(u"")) == std::string{}); // BOM only: empty, not failure
     CHECK_FALSE(decode_utf16le_bom(utf16le_bom(u"abc", false)).has_value()); // BOM-less
     auto odd = utf16le_bom(u"abc");
@@ -266,10 +274,23 @@ TEST_CASE("parse_sudoers: a multi-principal Runas_List is unmodelled, not silent
 TEST_CASE("classify_read_errno and select_status pin the failure contract", "[local_security_policy][parsers]") {
     CHECK(classify_read_errno(ENOENT).cls == ReadClass::Absent);
     CHECK(classify_read_errno(ENOTDIR).cls == ReadClass::Absent);
+    // .cls on EVERY arm, not just the token: the class is what decides denied-vs-failed
+    // and, more importantly, failure-vs-absent. Pinning the token alone left two live
+    // mutations green -- kReadOversized -> Absent (an oversized /etc/sudoers reporting
+    // `absent` with status OK, i.e. a failure reading as absent, the one thing this
+    // plugin's contract forbids) and EPERM -> Failed (a refusal reporting CONSTRAINED
+    // instead of PERMISSION_DENIED). Both are killed now.
     CHECK(classify_read_errno(EACCES).cls == ReadClass::Denied);
+    CHECK(classify_read_errno(EACCES).token == "permission_denied");
+    CHECK(classify_read_errno(EPERM).cls == ReadClass::Denied);
     CHECK(classify_read_errno(EPERM).token == "permission_denied");
+    CHECK(classify_read_errno(ELOOP).cls == ReadClass::Failed);
+    CHECK(classify_read_errno(ELOOP).token == "symlink_loop"); // reachable: the reader follows symlinks
+    CHECK(classify_read_errno(EIO).cls == ReadClass::Failed);
     CHECK(classify_read_errno(EIO).token == "io_error");
+    CHECK(classify_read_errno(kReadOversized).cls == ReadClass::Failed);
     CHECK(classify_read_errno(kReadOversized).token == "oversized");
+    CHECK(classify_read_errno(kReadNotRegular).cls == ReadClass::Failed);
     CHECK(classify_read_errno(kReadNotRegular).token == "not_regular");
     CHECK(classify_read_errno(EINVAL).token == "errno_" + std::to_string(EINVAL));
     CHECK(classify_read_errno(EINVAL).cls == ReadClass::Failed);
@@ -298,6 +319,9 @@ TEST_CASE("Linux default host (debian:12): exact rows", "[local_security_policy]
         "lockout_policy|FAILLOG_ENAB|yes|/etc/login.defs", "lockout_policy|LOGIN_RETRIES|5|/etc/login.defs",
         "lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs"});
     const auto au = run(fs, LocalPolicyAction::Audit).rows;
+    // REQUIRE, not CHECK: a regression that drops a row makes front()/back() read past
+    // the end, aborting the whole agent test binary instead of failing here by name.
+    REQUIRE(au.size() == 5); // rules / watch_rules / syscall_rules / unmodelled_lines / enabled
     CHECK(au.front() == "audit_policy|rules|4|/etc/audit/audit.rules");
     CHECK(au.back() == "audit_policy|enabled|unset|/etc/audit/audit.rules");
     const auto su = run(fs, LocalPolicyAction::Sudoers);
@@ -327,6 +351,7 @@ TEST_CASE("Linux hardened host (fedora:40): exact rows", "[local_security_policy
         "lockout_policy|pam.auth.pam_faillock.so|required authfail|/etc/pam.d/password-auth",
         "lockout_policy|pam.account.pam_faillock.so|required|/etc/pam.d/password-auth"});
     const auto au = run(fs, LocalPolicyAction::Audit).rows;
+    REQUIRE(au.size() == 5); // au[4] below reads past the end otherwise
     CHECK(au[0] == "audit_policy|rules|7|/etc/audit/audit.rules");
     CHECK(au[1] == "audit_policy|watch_rules|2|/etc/audit/audit.rules");
     CHECK(au[2] == "audit_policy|syscall_rules|3|/etc/audit/audit.rules");
@@ -378,6 +403,7 @@ TEST_CASE("sudoers.d: names sudo ignores are listed as `ignored`, not read", "[l
     auto fs = hardened_fs();
     fs.dirs["/etc/sudoers.d"] = {"10-ops", "10-ops.bak", "old~"}; // the last two are synthetic
     const auto rows = run(fs, LocalPolicyAction::Sudoers).rows;
+    REQUIRE(rows.size() >= 2); // `rows.size() - 2` underflows to SIZE_MAX otherwise
     CHECK(rows[rows.size() - 2] == "sudoers|/etc/sudoers.d/10-ops.bak|ignored|-|-|-|name_ignored_by_sudo");
     CHECK(rows.back() == "sudoers|/etc/sudoers.d/old~|ignored|-|-|-|name_ignored_by_sudo");
 }
@@ -390,6 +416,13 @@ TEST_CASE("failure semantics: absent is a row and no failure; denied/failed neve
     CHECK(absent.status == PolicyStatus::Ok);
     CHECK(absent.reason.empty());
     CHECK(absent.rows[4] == "password_policy|source_state|absent|/etc/security/pwquality.conf");
+
+    fs = default_fs();
+    fs.oversized = {"/etc/login.defs"}; // a FAILED read, not a missing file
+    const auto over = run(fs, LocalPolicyAction::Password);
+    CHECK(over.status == PolicyStatus::Constrained);
+    CHECK(over.reason == "/etc/login.defs:oversized");
+    CHECK(over.rows.front() == "password_policy|source_state|unreadable:oversized|/etc/login.defs");
 
     fs = default_fs();
     fs.denied = {"/etc/sudoers"}; // nothing readable -> PERMISSION_DENIED
@@ -477,11 +510,21 @@ TEST_CASE("classify_pwpolicy_run pins each failure token", "[local_security_poli
 }
 
 TEST_CASE("pwpolicy_min_length reads only `.{N,}`", "[local_security_policy][pwpolicy]") {
-    CHECK(*pwpolicy_min_length("policyAttributePassword matches '.{4,}+'") == 4);
-    CHECK(*pwpolicy_min_length("x matches '.{12,}'") == 12);
+    const auto four = pwpolicy_min_length("policyAttributePassword matches '.{4,}+'");
+    REQUIRE(four.has_value()); // REQUIRE before the deref, not CHECK
+    CHECK(*four == 4);
+    const auto twelve = pwpolicy_min_length("x matches '.{12,}'");
+    REQUIRE(twelve.has_value());
+    CHECK(*twelve == 12);
     CHECK_FALSE(pwpolicy_min_length("x matches '^(?=.*[0-9]).*'").has_value());
     CHECK_FALSE(pwpolicy_min_length("x matches '.{,}'").has_value());
     CHECK_FALSE(pwpolicy_min_length("x matches '.{4}'").has_value());
+    // The 6-digit cap must REFUSE, never return a truncated prefix of the number: a
+    // silently-shortened minimum length is a wrong answer presented as a real one.
+    CHECK_FALSE(pwpolicy_min_length("x matches '.{1234567,}'").has_value());
+    const auto widest = pwpolicy_min_length("x matches '.{123456,}'");
+    REQUIRE(widest.has_value());
+    CHECK(*widest == 123456); // the last accepted width
 }
 
 // Real capture shape (hand-built items equal to the fixture's one policy) -- runs on every OS.
