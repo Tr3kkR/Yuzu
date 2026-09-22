@@ -1,8 +1,10 @@
 /**
  * test_platform_security_win_parsers.cpp -- pure tests for platform_security_win_parsers.hpp; no
  * platform guard, no OS call. Inputs: fixtures/wave8/platform_security/windows/<name>.reg (UTF-16LE
- * `reg export`; REQUIRE(exists), never skipped): ci_policy.reg is a REAL CAPTURE, the others are
- * RECONSTRUCTIONS (see .provenance.txt); inline RECONSTRUCTION strings cover malformed input and
+ * `reg export`; REQUIRE(exists), never skipped): secureboot_state.reg and deviceguard_real.reg are
+ * REAL CAPTURE; ci_policy.reg's four values are REAL (a `reg query` capture) but its `reg export`
+ * serialisation is RECONSTRUCTION; deviceguard.reg is a full RECONSTRUCTION (see each
+ * .provenance.txt for exact status). Inline RECONSTRUCTION strings cover malformed input and
  * Win32 failures. Expected rows are pinned as literals.
  */
 #include "platform_security_win_parsers.hpp"
