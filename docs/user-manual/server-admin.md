@@ -287,9 +287,12 @@ attributed to the intended agent. The executions drawer and any API caller polli
 command's status saw it idle indefinitely.
 
 **What changes:** every one of those cases now resolves the command to a terminal `FAILURE`,
-at most once, with a specific `error.code` you can use to diagnose the cause:
+at most once, with `error_detail` (the field the REST/MCP response surfaces — there is no
+separate structured `error.code`) prefixed with a specific reason code you can use to
+diagnose the cause, e.g. `[gateway_unavailable] Gateway unreachable after 3 attempts —
+command not delivered`:
 
-| `error.code` | Meaning | What to check |
+| Reason code prefix | Meaning | What to check |
 |---|---|---|
 | `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
 | `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
@@ -299,7 +302,8 @@ at most once, with a specific `error.code` you can use to diagnose the cause:
 
 **Recovery:** there is no automatic re-drive for a gateway-forward failure — re-dispatch the
 command once the underlying cause is fixed. Automatic durable retry is tracked as a follow-up
-in #4690.
+in #4690. One case is not yet covered by this fix: a gateway response stream that closes
+cleanly with zero frames still leaves the command stuck at RUNNING (tracked separately, #4691).
 
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 

@@ -285,6 +285,15 @@ groups:
       # makes them visible here for the first time. Both are config-class
       # defects, not transient blips — same "any occurrence is actionable"
       # posture as YuzuGatewayResponseAgentMismatch above, no `for:`.
+      #
+      # pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22):
+      # increase(...[1h]) > 0 on BOTH rules below misses an event whose
+      # counter first exports already at 1 before this process's first
+      # post-boot scrape (a genuine but rare startup-window false negative,
+      # not a steady-state gap) — the label sets are pre-seeded
+      # unconditionally (configured clusters + "default" + "unknown",
+      # server.cpp's metrics-registration block), so both series DO exist
+      # and CAN fire; only that one boundary sample can be missed.
       - alert: YuzuGatewayForwardUnauthenticated
         expr: |
           increase(yuzu_server_gateway_forward_total{status="unauthenticated"}[1h]) > 0
@@ -300,6 +309,8 @@ groups:
             DOWN until the pin and the server's leaf certificate agree. See
             ADR-2002 §7e and docs/user-manual/server-admin.md's `#4672`
             vNEXT entry for the `gateway_unauthenticated` reason code.
+            Caveat: an occurrence in the ~1h window right after this
+            process started may be missed (increase() startup-window gap).
 
       - alert: YuzuGatewayForwardUnknownCluster
         expr: |
@@ -315,6 +326,8 @@ groups:
             when an operator adds the missing flag. See ADR-2002 §7e and
             docs/user-manual/server-admin.md's `#4672` vNEXT entry for the
             `gateway_unknown_cluster` reason code.
+            Caveat: an occurrence in the ~1h window right after this
+            process started may be missed (increase() startup-window gap).
 
       # HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b).
       # Fail-open boot semantics (a node that resolves zero peers still boots

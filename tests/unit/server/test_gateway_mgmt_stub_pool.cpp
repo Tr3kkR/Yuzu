@@ -342,7 +342,11 @@ TEST_CASE("build_gateway_forward_terminal_failure: sets command_id, FAILURE stat
     CHECK(resp.exit_code() == -1);
     REQUIRE(resp.has_error());
     CHECK(resp.error().code() == "gateway_unauthenticated");
-    CHECK(resp.error().message() == "rejected by mgmt-plane peer pin");
+    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+    // error().code() is never read back anywhere under server/core/src, so
+    // the reason code is ALSO prefixed onto the persisted message — the
+    // field that actually reaches an operator/agentic worker.
+    CHECK(resp.error().message() == "[gateway_unauthenticated] rejected by mgmt-plane peer pin");
 }
 
 TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason codes "
@@ -371,4 +375,18 @@ TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason
         CHECK(resp.error().code() == reason);
         CHECK(resp.status() == ::yuzu::agent::v1::CommandResponse::FAILURE);
     }
+}
+
+TEST_CASE("is_terminal_command_status: RUNNING is the ONLY non-terminal status "
+          "(pr-rev finding FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22)",
+          "[server][gateway_mgmt_stub_pool][4672]") {
+    // The exact guard matrix requested by the review: every CommandResponse::
+    // Status value, and whether applying a frame carrying it should suppress
+    // a later synthetic terminal-failure write. Only RUNNING must not.
+    using S = ::yuzu::agent::v1::CommandResponse;
+    CHECK_FALSE(yuzu::server::is_terminal_command_status(S::RUNNING));
+    CHECK(yuzu::server::is_terminal_command_status(S::SUCCESS));
+    CHECK(yuzu::server::is_terminal_command_status(S::FAILURE));
+    CHECK(yuzu::server::is_terminal_command_status(S::TIMEOUT));
+    CHECK(yuzu::server::is_terminal_command_status(S::REJECTED));
 }

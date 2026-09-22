@@ -1257,11 +1257,24 @@ confirming) caught that this left the OTHER three synthesizing branches — `una
 response with a synthetic FAILURE, either within one attempt (a legitimate frame applied, then that same
 attempt's `Finish()` still reports a non-OK transport status) or across attempts (an earlier attempt
 resolves the command while a later attempt independently hits a different terminal-failure branch). The
-shipped guard is a single `applied_response` bool, declared ONCE before the 3-attempt retry loop (not
-per-attempt, not per-branch) and consulted by ALL FOUR synthesizing call sites — `agent_mismatch`,
-`unauthenticated`, `"other"`, and exhausted-`unavailable` — so a real response (a genuine apply, or a
-repaired `not_connected` frame) applied at ANY point across the whole command's attempts suppresses
-every later synthetic write for that same command_id.
+shipped guard is a single `applied_response` bool (renamed `applied_terminal`, post-pr-rev correction
+below), declared ONCE before the 3-attempt retry loop (not per-attempt, not per-branch) and consulted by
+ALL FIVE synthesizing call sites — `agent_mismatch`, `unauthenticated`, `"other"`, exhausted-`unavailable`,
+and `unknown_cluster` — so a real TERMINAL response (a genuine terminal apply, or a repaired
+`not_connected` frame, itself always FAILURE by `classify_gateway_forward_response`'s own contract) applied
+at ANY point across the whole command's attempts suppresses every later synthetic write for that same
+command_id.
+
+**Second correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically confirmed by both
+reviewers independently):** the guard above was itself over-broad through PR review — `applied_response`
+was set to `true` by ANY applied frame, including a non-terminal RUNNING progress update, not only a
+terminal one. A gateway streaming a single RUNNING frame, then faulting before a clean close with every
+retry exhausted UNAVAILABLE, left the guard already tripped, so the exhausted-retry synthesis was
+suppressed and the command_id stayed at RUNNING forever — the exact defect #4672 exists to close,
+reintroduced by this guard's own predicate. Fixed: the flag (renamed `applied_terminal`) is now set only
+when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_status`,
+`gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
+unconditionally terminal by its classifier's own contract and needs no such check.
 
 **Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
 re-drive), for two independent, load-bearing reasons — not silently, this time:**
@@ -1294,7 +1307,11 @@ gives `forward_gateway_pending` its own pooling/draining story (so a retry produ
 touch `command_outbox_store_`), not before. Until then, §7's "stays pending... and is re-driven" design
 note is accurate for the LEADER-DRIVEN background plane (schedule fires, via `route_unreadable`) and
 inaccurate for the gateway-forwarding path specifically — which instead resolves terminally, immediately,
-every time.
+for every command that reaches the per-command retry loop below, including the previously-silent
+unusable-pool short-circuit above it (now resolved through the same helper, pr-rev finding
+FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, not silently: a clean
+`Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
+every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:

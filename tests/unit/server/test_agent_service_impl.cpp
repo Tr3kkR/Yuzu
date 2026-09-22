@@ -354,9 +354,12 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
+    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22): the
+    // reason code is now prefixed onto the persisted message (see
+    // build_gateway_forward_terminal_failure's updated doc comment).
     CHECK(rows[0].error_detail ==
-         "Gateway REJECTED by the gateway's mgmt-plane peer pin (UNAUTHENTICATED) — command "
-         "not delivered");
+         "[gateway_unauthenticated] Gateway REJECTED by the gateway's mgmt-plane peer pin "
+         "(UNAUTHENTICATED) — command not delivered");
     CHECK(rows[0].execution_id == "exec-gwfwd");
     CHECK(rows[0].agent_id == "agent-1");
     CHECK(rows[0].instruction_id == "cmd-gwfwd");
@@ -394,7 +397,8 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1); // updated in place, not a second orphaned row
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
-    CHECK(rows[0].error_detail == "Gateway unreachable after 3 attempts — command not delivered");
+    CHECK(rows[0].error_detail ==
+         "[gateway_unavailable] Gateway unreachable after 3 attempts — command not delivered");
 }
 
 TEST_CASE("process_gateway_response: each of the five #4672 reason codes produces a distinct, "
@@ -431,7 +435,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
         const auto& by_cmd = *by_cmd_opt;
         REQUIRE(by_cmd.size() == 1);
         CHECK(by_cmd[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
-        CHECK(by_cmd[0].error_detail == c.reason);
+        CHECK(by_cmd[0].error_detail == std::string("[") + c.reason + "] " + c.reason);
     }
 }
 

@@ -12170,14 +12170,25 @@ private:
     /// #4672 (durable resolution of the terminal-failure branches — this
     /// function's own catastrophic-if-violated gap before this change: a
     /// command hitting `unauthenticated`, exhausted `unavailable`,
-    /// `unknown_cluster`, or `agent_mismatch` was logged, counted, and
-    /// dropped — the dispatching operator's command_id then NEVER resolved,
-    /// silently, forever). Every one of those four branches now calls
-    /// `apply_gateway_forward_terminal_failure` exactly once before giving
-    /// up, so the command_id ALWAYS reaches a terminal state.
+    /// `unknown_cluster`, `agent_mismatch`, or a generic non-UNAVAILABLE
+    /// grpc status ("other") was logged, counted, and dropped — the
+    /// dispatching operator's command_id then NEVER resolved, silently,
+    /// forever). Every one of those FIVE branches (pr-rev finding
+    /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
+    /// said "four", undercounting the pre-existing "other" branch this same
+    /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
+    /// now calls `apply_gateway_forward_terminal_failure` exactly once
+    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// unresolved command_id ALWAYS eventually reaches a terminal state —
+    /// "ALWAYS" describes the per-command retry loop below; the null/empty
+    /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
+    /// a clean `Finish()` with zero frames (#4691, still open), are the
+    /// two paths outside that loop the same claim must also hold for or be
+    /// scoped around — the former is now resolved through the same helper
+    /// (see that branch's own comment); the latter is not, and is tracked.
     ///
     /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
-    /// ALL FOUR branches — including the transient-looking exhausted-
+    /// ALL FIVE branches — including the transient-looking exhausted-
     /// `unavailable` case, which ADR-2002 §7's design note originally
     /// intended to "stay pending... and be re-driven [with backoff]" the way
     /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
@@ -12254,6 +12265,22 @@ private:
                              {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
                               {"status", "unavailable"}})
                     .increment(static_cast<double>(gw_pending.size()));
+                // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+                // the metric/log above previously left every drained command's
+                // command_id unresolved -- the exact "stuck forever" shape
+                // #4672 exists to close, just reached via a different branch
+                // (an unusable pool/stub rather than a per-command RPC
+                // failure). Resolve each one through the SAME helper the
+                // per-command retry loop below uses, so this path is no
+                // longer a silent exception to the "always reaches a
+                // terminal state" contract.
+                for (auto& gp : gw_pending) {
+                    apply_gateway_forward_terminal_failure(
+                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
+                        "Gateway command forwarding is configured but not usable "
+                        "(mutual-TLS credential construction likely failed at boot) "
+                        "— command not delivered");
+                }
             }
             return;
         }
@@ -12327,7 +12354,7 @@ private:
                 // which could clobber an already-applied real SUCCESS/FAILURE
                 // with a synthetic FAILURE — a worse defect than the
                 // stuck-forever bug this issue set out to close.
-                bool applied_response = false;
+                bool applied_terminal = false;
 
                 // Retry up to 3 times on transient connection failures
                 for (int attempt = 0; attempt < 3; ++attempt) {
@@ -12402,12 +12429,34 @@ private:
                                 auto repaired = resp.response();
                                 repaired.set_command_id(cmd_id);
                                 svc->process_gateway_response(resp.agent_id(), repaired);
-                                applied_response = true;
+                                // kNotConnected's classify_gateway_forward_response
+                                // contract guarantees this repaired frame is ALWAYS
+                                // FAILURE (exit_code=-1, output="not_connected"/
+                                // "agent_disconnected") -- unconditionally terminal,
+                                // safe to mark without a status() check.
+                                applied_terminal = true;
                                 continue;
                             }
                         }
+                        // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER,
+                        // 2026-09-22, empirically confirmed by both
+                        // reviewers independently): a kApply frame is NOT
+                        // guaranteed terminal -- `process_gateway_response`
+                        // also accepts a RUNNING progress frame. The
+                        // previous unconditional `applied_terminal = true`
+                        // here meant a single RUNNING frame, followed by a
+                        // stream fault and exhausted retries, permanently
+                        // suppressed every synthetic terminal-failure site
+                        // below (all four gate on `!applied_terminal`) --
+                        // the command_id stayed RUNNING forever, exactly
+                        // the bug #4672 exists to close, reintroduced via
+                        // this guard's own over-broad predicate. Only a
+                        // TERMINAL status (anything but RUNNING) may
+                        // suppress the synthetic-failure sites; a RUNNING
+                        // frame is real progress, not a resolution.
                         svc->process_gateway_response(resp.agent_id(), resp.response());
-                        applied_response = true;
+                        if (yuzu::server::is_terminal_command_status(resp.response().status()))
+                            applied_terminal = true;
                     }
                     auto status = reader->Finish();
                     if (status.ok()) {
@@ -12423,7 +12472,7 @@ private:
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label}, {"status", "ok"}})
                                 .increment();
-                        } else if (!applied_response) {
+                        } else if (!applied_terminal) {
                             // #4672: every frame this stream carried (if any)
                             // was agent_mismatch — never not_connected/apply,
                             // both of which already resolve the command_id
@@ -12460,7 +12509,7 @@ private:
                             cmd_id);
                         // #4672 (fixed post-Gate-2/3: security-guardian HIGH
                         // + cpp-safety/cpp-expert independently confirmed) —
-                        // gate on `applied_response`: an earlier attempt, or
+                        // gate on `applied_terminal`: an earlier attempt, or
                         // this same attempt's `Read()` loop, may already have
                         // applied a real terminal frame before `Finish()`
                         // surfaced this UNAUTHENTICATED status. Synthesizing
@@ -12475,7 +12524,7 @@ private:
                         // {"status","unauthenticated"} on a later attempt's
                         // Finish(), which would tell an operator a command
                         // failed when it actually succeeded.
-                        if (!applied_response) {
+                        if (!applied_terminal) {
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},
@@ -12499,7 +12548,7 @@ private:
                         // four named branches, but the shape (and the fix)
                         // is identical, and leaving it unresolved while every
                         // sibling branch resolves would just move the bug
-                        // rather than close it. Same `applied_response` guard
+                        // rather than close it. Same `applied_terminal` guard
                         // (write AND metric, see the UNAUTHENTICATED branch
                         // above) as every other branch here.
                         //
@@ -12513,14 +12562,27 @@ private:
                         // more specific, per-occurrence reason code. Every
                         // other branch's label and code DO match 1:1; this is
                         // the one deliberate exception.
-                        if (!applied_response) {
+                        if (!applied_terminal) {
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label}, {"status", "other"}})
                                 .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
+                            // 2026-09-22): the raw status.error_message()
+                            // (peer addresses, TLS/HTTP2 transport text) is
+                            // already captured, unfiltered, in the spdlog::warn
+                            // a few lines up — the other four synthesis sites
+                            // all use a curated, static message; match that
+                            // convention here instead of persisting raw
+                            // transport text into error_detail. The numeric
+                            // grpc status code (already logged above too) is
+                            // enough to correlate a stored row back to the
+                            // server log line that has the full text.
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_forward_failed",
-                                "Gateway SendCommand RPC failed: " + status.error_message());
+                                "Gateway SendCommand RPC failed with grpc status " +
+                                    std::to_string(static_cast<int>(status.error_code())) +
+                                    " — see server logs for the transport error detail");
                         }
                         return; // non-transient error — don't retry
                     }
@@ -12536,11 +12598,11 @@ private:
                 // than a durable outbox re-drive (granularity mismatch +
                 // #3279 — deliberately scoped out, not silently dropped;
                 // tracked as #4690).
-                // Same `applied_response` guard (write AND metric) as the two
+                // Same `applied_terminal` guard (write AND metric) as the two
                 // branches above — an earlier attempt in this same 3-try
                 // loop may have already applied a real terminal frame before
                 // a later attempt exhausted on UNAVAILABLE.
-                if (!applied_response) {
+                if (!applied_terminal) {
                     metrics
                         ->counter("yuzu_server_gateway_forward_total",
                                  {{"cluster_id", cluster_label}, {"status", "unavailable"}})
