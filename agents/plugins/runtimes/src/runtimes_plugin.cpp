@@ -16,9 +16,8 @@
  * (rung 1); no `java` or `dotnet` process is ever started.
  *
  * SHIPPED LEGS. Linux only. The macOS and Windows legs are declared PLANNED
- * in the table below (mechanism names the plan) and each follows as its own
- * PR (peripherals PR9.1a2 precedent); until then they report
- * `status|<action>|unsupported|<macos|windows>:planned`.
+ * in the table below (the mechanism string names the planned read); until
+ * they ship they report `status|<action>|unsupported|<macos|windows>:planned`.
  *
  * This TU is portable except for its single dispatch #if, which selects the
  * one host leg to call -- so a single-OS build never links the other two
@@ -41,7 +40,7 @@ namespace {
 
 // The six per-action per-OS legs (two actions x three OSes) are FIXED and
 // never wrapped in a preprocessor conditional.
-constexpr const char* kPlannedNote = "follows as its own PR (peripherals PR9.1a2 precedent)";
+constexpr const char* kPlannedNote = "planned; the action answers a single unsupported status row on this OS";
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -101,16 +100,16 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
         const auto a = yuzu::runtimes::parse_action(action);
-        if (!a) {
-            // `action` is request-supplied and lands in a pipe-delimited stream, so
-            // it goes through the shared escaper. Deliberately NOT a row.
-            ctx.write_output(std::string{"unknown action: "} +
-                             yuzu::util::safe_output_field(action));
-            return 1;
-        }
-
-        // No exception may cross the plugin ABI on any leg.
+        // No exception may cross the plugin ABI on any leg: the whole body, the
+        // unknown-action diagnostic included, runs inside the try.
         try {
+            if (!a) {
+                // `action` is request-supplied and lands in a pipe-delimited stream, so
+                // it goes through the shared escaper. Deliberately NOT a row.
+                ctx.write_output(std::string{"unknown action: "} +
+                                 yuzu::util::safe_output_field(action));
+                return 1;
+            }
             // Leg failure tokens match ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$;
             // the catch-all's `internal_error` is the one OS-neutral token. Yuzu targets
             // exactly these three OSes, so there is deliberately no fourth branch.
@@ -122,6 +121,7 @@ public:
             return yuzu::runtimes::run_macos(ctx, *a);
 #endif
         } catch (...) {
+            if (!a) return 1; // the refusal diagnostic itself failed; rc 1 still reports it
             ctx.write_output(yuzu::runtimes::format_status_row(
                 yuzu::runtimes::action_name(*a), yuzu::runtimes::StatusLevel::constrained,
                 "internal_error"));

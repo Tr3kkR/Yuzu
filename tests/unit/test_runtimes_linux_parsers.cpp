@@ -24,8 +24,13 @@
  * earlier failure" case red; dropping O_NOFOLLOW on `release` surfaces the
  * planted target as a row; following symlinked entries duplicates rows; dropping
  * the 64 KiB bound or the nullopt-row check loses the oversize/unparsable tokens;
- * discarding the rows before emit_read in run_linux_at (or reporting OK/FULL
- * regardless of the accumulator) turns the run_linux_at CommandContext case red.
+ * discarding the rows before emit_read in run_linux_at turns the clean
+ * CommandContext case red; reporting OK/FULL regardless of the accumulator turns
+ * the forced-constraint CommandContext case red; requiring an alias target to
+ * OPEN turns the dangling-alias case red. The two chmod-000 cases SKIP at euid 0;
+ * the constrained path stays covered there by the symlink, cap and oversize
+ * cases and by the forced-constraint CommandContext case, none of which needs
+ * permission bits.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -233,15 +238,6 @@ TEST_CASE("runtimes linux: join_logical avoids a doubled slash",
           "[runtimes][linux][parsers]") {
     CHECK(lnx::join_logical("/", "usr") == "/usr");
     CHECK(lnx::join_logical("/usr", "bin") == "/usr/bin");
-}
-
-TEST_CASE("runtimes linux: push_unique collapses identical rows only",
-          "[runtimes][linux][parsers]") {
-    std::vector<std::string> rows;
-    lnx::push_unique(rows, "a");
-    lnx::push_unique(rows, "b");
-    lnx::push_unique(rows, "a");
-    CHECK(rows == std::vector<std::string>{"a", "b"});
 }
 
 // == walks over the fixture tree (POSIX) =================================================
@@ -544,6 +540,42 @@ TEST_CASE("runtimes linux: a symlinked intermediate component is not followed",
     CHECK(rows[0] == "dotnet|sdk|8.0.100|/usr/lib/dotnet/sdk/8.0.100|-");
 }
 
+TEST_CASE("runtimes linux: a dangling in-set candidate alias is genuine absence, not constrained "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk]") {
+    // Arch: /usr/lib64 -> lib on EVERY host, here with no .NET installed. The candidate
+    // /usr/lib64/dotnet stops at the lib64 alias; its target /usr/lib/dotnet is another candidate
+    // that is simply absent, so the family is absent: supported + zero rows. MUTATION:
+    // alias_is_covered requiring the target to OPEN (== OpenStatus::opened) records
+    // symlink_refused here and reports a stock host as constrained.
+    yuzu::test::TempDir with_lib{"yuzu_test_runtimes_dangling_"};
+    make_dir(with_lib.path / "usr/lib"); // exists, holds no dotnet
+    yuzu::test::TempDir without_lib{"yuzu_test_runtimes_dangling2_"};
+    make_dir(without_lib.path / "usr"); // no usr/lib at all
+    for (const fs::path& root : {with_lib.path, without_lib.path}) {
+        INFO("root: " << root.string());
+        std::error_code ec;
+        fs::create_symlink("lib", root / "usr/lib64", ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        CHECK(lnx::dotnet_rows_at(root, acc).empty());
+        CHECK_FALSE(acc.any_failure());
+        const auto out = rt::compose_output("dotnet", {}, acc);
+        REQUIRE(out.size() == 1);
+        CHECK(out[0] == "status|dotnet|supported|-");
+    }
+
+    // jvm: /opt/java -> ../usr/lib/jvm with no JVM installed anywhere.
+    yuzu::test::TempDir jvm{"yuzu_test_runtimes_dangling_jvm_"};
+    make_dir(jvm.path / "opt");
+    std::error_code ec;
+    fs::create_symlink("../usr/lib/jvm", jvm.path / "opt/java", ec);
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(jvm.path, acc).empty());
+    CHECK_FALSE(acc.any_failure());
+}
+
 TEST_CASE("runtimes linux: a refused symlink with no alternative candidate is constrained, not "
           "an empty success (SYNTHETIC)",
           "[runtimes][linux][walk]") {
@@ -767,8 +799,8 @@ TEST_CASE("runtimes linux: run_linux_at emits the populated rows and OK/FULL thr
     // the emission seam (action_rows_at): the host-independent replacement for a host-guaranteed
     // populated-row assertion (a CI runner may have no JVM or .NET installed).
     // MUTATION: discarding the rows before emit_read in run_linux_at (`emit_read(ctx, a, {}, acc)`)
-    // leaves only the status row and fails the exact-row assertions below; reporting OK/FULL
-    // regardless of the accumulator or dropping the status row fails the status assertions.
+    // leaves only the status row and fails the exact-row assertions below; dropping the status
+    // row fails them too. The CONSTRAINED arm of emit_read is pinned by the next case.
     yuzu::test::TempDir dir{"yuzu_test_runtimes_leg_"};
     std::string err;
     REQUIRE(materialize_manifest(dir.path, err));
@@ -787,6 +819,45 @@ TEST_CASE("runtimes linux: run_linux_at emits the populated rows and OK/FULL thr
     CHECK(dn.status == YUZU_RESULT_STATUS_OK);
     CHECK(dn.completeness == YUZU_RESULT_COMPLETENESS_FULL);
     CHECK(dn.provenance.empty());
+}
+
+TEST_CASE("runtimes linux: run_linux_at reports a forced constraint through BOTH the status row "
+          "and the typed status of a real CommandContext",
+          "[runtimes][linux][walk][wire]") {
+    // The failure source is a planted symlink, refused by O_NOFOLLOW on every POSIX host, root
+    // included -- no chmod, so no euid-0 SKIP: this case runs everywhere. The real rows are
+    // still read, so one run pins "rows survive" AND "the typed status degrades".
+    // MUTATION (an orchestrator probe confirmed it survived before this case existed): making
+    // emit_read report OK/FULL regardless of the accumulator turns every status/completeness/
+    // provenance assertion below red while the status ROW still says `constrained`.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_leg_constrained_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    std::error_code ec;
+    // jvm: a symlinked `release` in an extra home; the two captured homes are still read.
+    write_text(dir.path / "elsewhere/release", "JAVA_VERSION=\"21.0.1\"\nIMAGE_TYPE=\"JDK\"\n");
+    make_dir(dir.path / "usr/lib/jvm/evil");
+    fs::create_symlink(dir.path / "elsewhere/release", dir.path / "usr/lib/jvm/evil/release", ec);
+    REQUIRE_FALSE(ec);
+    // dotnet: a symlinked fixed `sdk` subdirectory is refused outright; shared/ is still read.
+    fs::create_symlink("../../../srv/sdk", dir.path / "usr/share/dotnet/sdk", ec);
+    REQUIRE_FALSE(ec);
+
+    const auto jvm = run_leg(rt::Action::jvm, dir.path);
+    CHECK(jvm.rc == 0); // a degraded read is never a failed command
+    CHECK(jvm.rows == std::vector<std::string>{
+              "status|jvm|constrained|linux:runtimes:symlink_refused", kDebianRow, kTemurinRow});
+    CHECK(jvm.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(jvm.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(jvm.provenance == std::string{lnx::kTokSymlinkRefused}); // one seam, two views
+
+    const auto dn = run_leg(rt::Action::dotnet, dir.path);
+    CHECK(dn.rc == 0);
+    CHECK(dn.rows == std::vector<std::string>{
+              "status|dotnet|constrained|linux:runtimes:symlink_refused", kDotnetRow});
+    CHECK(dn.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(dn.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(dn.provenance == std::string{lnx::kTokSymlinkRefused});
 }
 
 #endif // !defined(_WIN32)

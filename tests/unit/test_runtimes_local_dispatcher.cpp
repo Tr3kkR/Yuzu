@@ -181,6 +181,33 @@ TEST_CASE("runtimes plugin: the status row is always first and well-formed",
     }
 }
 
+TEST_CASE("runtimes plugin: an unknown action is refused, not silently ignored",
+          "[runtimes][actions]") {
+    auto plugin = load_runtimes_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "no_such_action");
+    CHECK(result.rc != 0);
+    // Deliberately not a data or status row: an unknown action has no status row. The
+    // diagnostic is pinned. MUTATION: deleting or corrupting the `unknown action:` write in
+    // runtimes_plugin.cpp, or falling through to a leg, fails here.
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "unknown action: no_such_action");
+
+    // The request-supplied name goes through safe_output_field: a pipe and a trailing
+    // backslash can neither open a second field nor swallow the separator of what follows.
+    const auto hostile = dispatcher.run(plugin->descriptor, "no|such\\");
+    CHECK(hostile.rc != 0);
+    const auto hrows = captured_rows(hostile.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "unknown action: no\\|such/");
+    CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
+}
+
 #if defined(_WIN32) || defined(__APPLE__)
 
 TEST_CASE("runtimes plugin: the planned legs emit exactly the planned status row",
@@ -223,8 +250,9 @@ TEST_CASE("runtimes plugin: the Linux leg reads the host and never reports unsup
         REQUIRE_FALSE(rows.empty());
         const auto st = split_fields_escape_aware(rows[0]);
         REQUIRE(st.size() == 4);
-        // The wave-1 stub said `unsupported|linux:leg:not_implemented`; the real leg is either
-        // `supported` (with `-`) or `constrained` (with reason tokens).
+        // The real leg is either `supported` (with `-`) or `constrained` (with reason tokens).
+        // No shipped code path emits a `<os>:leg:not_implemented` placeholder: the check below is
+        // the build-completeness tripwire the peripherals TU also carries.
         CHECK((st[2] == "supported" || st[2] == "constrained"));
         CHECK(rows[0].find(":leg:not_implemented") == std::string::npos);
         if (st[2] == "supported") {

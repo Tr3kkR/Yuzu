@@ -9,7 +9,7 @@
 /// @file plugin_action_catalogue_runtimes.hpp
 /// One fragment of the command capability catalogue: `runtimes`'s two
 /// read-only actions (`agents/plugins/runtimes/src/runtimes_plugin.cpp`).
-/// Classified by READING the implementation, per this package's spec.
+/// Classified by READING the implementation.
 ///
 /// `dotnet`/`jvm` are ReadOnly/None on every leg: each is a
 /// directory-name or metadata-file read (rung 1, zero subprocess) that

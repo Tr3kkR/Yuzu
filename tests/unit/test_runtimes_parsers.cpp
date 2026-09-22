@@ -171,6 +171,20 @@ TEST_CASE("runtimes: jvm_row falls back to JAVA_RUNTIME_VERSION and rejects a ve
     CHECK_FALSE(rt::jvm_row(rt::parse_release_file("MODULES=\"java.base\"\n"), "/opt/j").has_value());
 }
 
+TEST_CASE("runtimes: a release value carrying a control character is ignored, never a row field",
+          "[runtimes]") {
+    // write_output crosses the C ABI as a C string, so an embedded NUL would truncate the
+    // wire row after it. MUTATION: dropping the has_control_char reject in
+    // parse_release_file makes java_version below non-empty and yields a row.
+    std::string text = "JAVA_VERSION=\"17.0";
+    text += '\0';
+    text += ".20\"\nIMPLEMENTOR=\"Eclipse Adoptium\"\n";
+    const auto f = rt::parse_release_file(text);
+    CHECK(f.java_version.empty());
+    CHECK(f.implementor == "Eclipse Adoptium");
+    CHECK_FALSE(rt::jvm_row(f, "/opt/j").has_value()); // versionless: the leg records a constraint
+}
+
 // -- dotnet ---------------------------------------------------------------------------
 
 TEST_CASE("runtimes: dotnet_entry_from_dir handles the real runtime-image listing", "[runtimes]") {

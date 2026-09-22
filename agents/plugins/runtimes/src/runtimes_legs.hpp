@@ -6,9 +6,8 @@
  * entry-point declarations, and (c) the two result-emission helpers every
  * leg calls, so no leg picks a status/completeness pairing by hand.
  *
- * Status of the legs in THIS PR: Linux is the only shipped leg (filled in by
- * the Linux-leg package); macOS and Windows are PLANNED placeholders that
- * emit `status|<action>|unsupported|<macos|windows>:planned`.
+ * Shipped legs: Linux. macOS and Windows are PLANNED placeholders that emit
+ * `status|<action>|unsupported|<macos|windows>:planned`.
  */
 #pragma once
 

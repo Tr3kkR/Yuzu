@@ -22,21 +22,24 @@
  * never used. A symlink is never followed.
  *
  * A REFUSED SYMLINK IS NEVER AN EMPTY SUCCESS. A symlink at a candidate root
- * (or on the way to one) is a silent ALIAS only when its target lexically
- * names ANOTHER candidate of the same action AND that candidate opens directly,
- * with no symlink hop of its own (Fedora /usr/share/dotnet -> ../lib64/dotnet,
- * Arch /usr/lib64 -> lib): the real directory is then read through its own
- * path. Any other refused candidate -- target outside the candidate set, a
- * cycle, an unreadable link, a symlinked root -- records `symlink_refused`
- * (constrained), as does a symlinked fixed `shared` / `sdk` subdirectory, a
- * symlink swapped in between listing and open (ELOOP) and a symlinked
- * `release` file.
+ * (or on the way to one) is a silent ALIAS only when its link text lexically
+ * names ANOTHER candidate of the same action and that candidate is not itself
+ * a symlink: whatever is there (a real directory, nothing at all, or an
+ * unreadable directory that is then reported) is reached through that
+ * candidate's own path, so the alias adds nothing (Fedora /usr/share/dotnet ->
+ * ../lib64/dotnet; Arch /usr/lib64 -> lib, with or without a .NET install).
+ * Any other refused candidate -- target outside the candidate set, a cycle or
+ * a chain of aliases, an unreadable link, a symlinked injected root -- records
+ * `symlink_refused` (constrained), as does a symlinked fixed `shared` / `sdk`
+ * subdirectory and a symlinked `release` file.
  *
  * ENUMERATED ENTRY SYMLINKS ARE SKIPPED SILENTLY (a framework, version or JVM
- * home that is itself a symlink): distribution alias entries
- * (Debian default-java and java-1.17.0-openjdk-*, Fedora java -> /etc/alternatives)
- * are pervasive and their real directory is a sibling entry. Documented gap: a
- * runtime reachable ONLY through such an entry symlink is not inventoried.
+ * home that is itself a symlink, including one swapped in between listing and
+ * open, which the O_NOFOLLOW open classifies as an alias): distribution alias
+ * entries (Debian default-java and java-1.17.0-openjdk-*, Fedora java ->
+ * /etc/alternatives) are pervasive and their real directory is a sibling
+ * entry. Documented gap: a runtime reachable ONLY through such an entry
+ * symlink is not inventoried.
  *
  * FAILURE NEVER READS AS ABSENT. A genuinely absent directory (ENOENT) is
  * `supported` + zero rows; any other failed open/stat/read records a
@@ -62,6 +65,8 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd (agents/core; POSIX-only header)
+
 #include <posix_dir_walk.hpp> // yuzu::shared::walk_dir_capped (agents/shared)
 
 #include <dirent.h>
@@ -190,14 +195,6 @@ inline constexpr std::array<std::string_view, 2> kJvmRoots{"usr/lib/jvm", "opt/j
     return normalize_rel(joined);
 }
 
-/// Appends `row` unless an identical row is already present (a symlink alias
-/// and its target both legitimately map to one runtime).
-inline void push_unique(std::vector<std::string>& rows, std::string row) {
-    for (const auto& r : rows)
-        if (r == row) return;
-    rows.push_back(std::move(row));
-}
-
 // -- POSIX walk shell ------------------------------------------------------------
 
 #if !defined(_WIN32)
@@ -234,21 +231,6 @@ private:
     DIR* dir_ = nullptr;
 };
 
-/// Move-only RAII owner for a plain fd.
-class FdHandle {
-public:
-    explicit FdHandle(int fd) noexcept : fd_(fd) {}
-    ~FdHandle() {
-        if (fd_ >= 0) ::close(fd_);
-    }
-    FdHandle(const FdHandle&) = delete;
-    FdHandle& operator=(const FdHandle&) = delete;
-    [[nodiscard]] int get() const noexcept { return fd_; }
-
-private:
-    int fd_;
-};
-
 /// Outcome of one directory open: `opened`, `absent` (ENOENT), `alias` (the
 /// component is a symlink -- skipped, never followed) or `failed` (+ token).
 enum class OpenStatus { opened, absent, alias, failed };
@@ -280,14 +262,15 @@ inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
         o.token = dir_open_errno_token(err).value_or(kTokDirOpenFailed);
         return o;
     }
-    DIR* d = ::fdopendir(fd);
+    yuzu::agent::ScopedFd owned{fd}; // closed on the failure path below
+    DIR* d = ::fdopendir(owned.get());
     if (d == nullptr) {
-        const int err = errno;
-        ::close(fd);
+        const int err = errno; // read before ScopedFd's close can disturb it
         o.status = OpenStatus::failed;
         o.token = dir_open_errno_token(err).value_or(kTokDirOpenFailed);
         return o;
     }
+    (void)owned.release(); // fdopendir() succeeded: the DIR* owns the fd now
     o.dir = DirHandle{d};
     o.status = OpenStatus::opened;
     return o;
@@ -359,10 +342,14 @@ inline PathWalk walk_path(const std::string& root, std::string_view rel) {
 }
 
 /// True iff the symlink `w` stopped at is a benign alias: its link text
-/// lexically names ANOTHER candidate in `candidates` and that candidate opens
-/// directly (no symlink hop), so the inventory reaches the same directory
-/// through its own path. Anything else (unreadable or truncated link, a target
-/// outside the candidate set, a cycle) is not covered.
+/// lexically names ANOTHER candidate in `candidates` and that candidate is not
+/// itself a symlink, so whatever is (or is not) there is reached, and any
+/// failure reported, through that candidate's own walk. Anything else
+/// (unreadable or truncated link, a target outside the candidate set, a cycle
+/// or a chain of aliases) is not covered. MUTATION: requiring the target to
+/// OPEN (`== OpenStatus::opened`) turns a dangling in-set alias -- Arch's
+/// /usr/lib64 -> lib with no .NET installed -- into a false `constrained`; the
+/// dangling-alias case in test_runtimes_linux_parsers.cpp pins this.
 inline bool alias_is_covered(const std::string& root, const PathWalk& w, std::string_view rel,
                              std::span<const std::string_view> candidates) {
     if (!w.parent || w.comp.empty()) return false; // a symlinked injected root is never an alias
@@ -374,7 +361,7 @@ inline bool alias_is_covered(const std::string& root, const PathWalk& w, std::st
     if (!target || *target == rel) return false;
     if (std::find(candidates.begin(), candidates.end(), std::string_view{*target}) == candidates.end())
         return false;
-    return walk_path(root, *target).status == OpenStatus::opened;
+    return walk_path(root, *target).status != OpenStatus::alias;
 }
 
 /// Opens candidate root <root>/<rel> (a member of `candidates`). Absent and a
@@ -404,25 +391,21 @@ struct EntryInfo {
 /// The real entries of an open directory, sorted by name (readdir order is
 /// unspecified, and rows must be deterministic), reading at most `max_entries`
 /// real entries (production: kMaxDirEntries; a parameter so the cap and its
-/// `truncated` propagation are testable without 16k files). `keep(name)` filters BEFORE
-/// the per-entry fstatat, so a large directory costs one stat per candidate
-/// name, not per file. A vanished entry (ENOENT) is skipped; any other stat
-/// failure, a hit cap and a readdir I/O error are recorded.
-template <typename Keep>
+/// `truncated` propagation are testable without 16k files). A vanished entry
+/// (ENOENT) is skipped; any other stat failure, a hit cap and a readdir I/O
+/// error are recorded.
 inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc,
-                                           std::size_t max_entries, Keep&& keep) {
+                                           std::size_t max_entries) {
     std::vector<EntryInfo> out;
     const int fd = ::dirfd(d);
     const auto res = yuzu::shared::walk_dir_capped(d, max_entries, [&](const struct dirent* e) {
-        const std::string_view name{e->d_name};
-        if (!keep(name)) return true;
         struct stat st{};
         if (::fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             if (const auto tok = stat_errno_token(errno)) acc.add_failure(*tok);
             return true;
         }
         EntryInfo info;
-        info.name = std::string{name};
+        info.name = std::string{e->d_name};
         info.type = S_ISDIR(st.st_mode)   ? EntryType::directory
                     : S_ISLNK(st.st_mode) ? EntryType::symlink
                                           : EntryType::other;
@@ -434,11 +417,6 @@ inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc,
     std::sort(out.begin(), out.end(),
               [](const EntryInfo& a, const EntryInfo& b) { return a.name < b.name; });
     return out;
-}
-
-inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc,
-                                           std::size_t max_entries) {
-    return list_entries(d, acc, max_entries, [](std::string_view) { return true; });
 }
 
 enum class ReadStatus { ok, absent, failed };
@@ -463,7 +441,7 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
         r.token = *tok;
         return r;
     }
-    const FdHandle guard{fd};
+    const yuzu::agent::ScopedFd guard{fd};
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
         r.status = ReadStatus::failed;
@@ -534,7 +512,7 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
                     if (auto row = dotnet_row(fw.name, ver.name,
                                               join_logical(join_logical(logical + "/shared", fw.name),
                                                            ver.name)))
-                        push_unique(rows, std::move(*row));
+                        rows.push_back(std::move(*row));
                 }
             }
         }
@@ -543,7 +521,7 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
             for (const auto& ver : list_entries(sdk.get(), acc, max_entries)) {
                 if (ver.type != EntryType::directory) continue;
                 if (auto row = dotnet_row("sdk", ver.name, join_logical(logical + "/sdk", ver.name)))
-                    push_unique(rows, std::move(*row));
+                    rows.push_back(std::move(*row));
             }
         }
     }
@@ -578,7 +556,7 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
                 acc.add_failure(kTokReleaseUnparsable);
                 continue;
             }
-            push_unique(rows, *row);
+            rows.push_back(*row);
         }
     }
     return rows;

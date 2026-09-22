@@ -29,9 +29,8 @@
  * from "no data" (which is an empty optional / no row):
  *   dotnet  core | sdk | unmodelled
  *   jvm     jdk | jre | unmodelled
- * This PR ships only the Linux legs, so the vocabulary is the Linux subset;
- * the macOS and Windows legs (each its own PR) add their own flavours
- * (.NET Framework) with those legs.
+ * Only the Linux legs ship today, so the vocabulary is the Linux subset; the
+ * planned macOS and Windows legs add their own flavours (.NET Framework).
  *
  * Free-text fields (version, path, vendor) are untrusted OS-supplied text and
  * go through yuzu::util::safe_output_field, so a value containing '|' or
@@ -125,6 +124,15 @@ namespace detail {
     return true;
 }
 
+/// True when `s` carries a control character (NUL, C0, DEL). A recognised
+/// `release` value with one is malformed and its line is ignored: NUL would
+/// truncate the wire row at the C-string boundary write_output crosses.
+[[nodiscard]] inline bool has_control_char(std::string_view s) noexcept {
+    for (const unsigned char c : s)
+        if (c < 0x20 || c == 0x7f) return true;
+    return false;
+}
+
 } // namespace detail
 
 // -- JVM `release` metadata file --------------------------------------------
@@ -140,8 +148,9 @@ struct ReleaseFields {
 
 /// Parses the text of a `release` file (`KEY="value"` lines; the quotes are
 /// stripped; unquoted values are accepted; CRLF tolerated; unknown keys, lines
-/// without '=' and lines with an unbalanced quote ignored). Never throws on
-/// malformed input: garbage yields a ReleaseFields with empty members. The
+/// without '=', lines with an unbalanced quote and values carrying a control
+/// character ignored). Never throws on malformed input: garbage yields a
+/// ReleaseFields with empty members. The
 /// caller bounds the read size (64 KiB for a real `release` file).
 [[nodiscard]] inline ReleaseFields parse_release_file(std::string_view text) {
     ReleaseFields out;
@@ -161,6 +170,7 @@ struct ReleaseFields {
                 continue; // unbalanced quote: malformed line, ignored
             val = val.substr(1, val.size() - 2);
         }
+        if (detail::has_control_char(val)) continue; // malformed value (NUL would truncate the row)
         if (key == "JAVA_VERSION") out.java_version = std::string{val};
         else if (key == "IMPLEMENTOR") out.implementor = std::string{val};
         else if (key == "JAVA_RUNTIME_VERSION") out.java_runtime_version = std::string{val};
@@ -264,8 +274,7 @@ struct DotnetEntry {
 }
 
 /// The planned-leg placeholder: status|<action>|unsupported|<os_token>, where
-/// os_token is a string literal `macos:planned` / `windows:planned` (or the
-/// Linux wave-1 stub token).
+/// os_token is a string literal `macos:planned` / `windows:planned`.
 [[nodiscard]] inline std::string format_planned_status_row(std::string_view action,
                                                            std::string_view os_token) {
     return format_status_row(action, StatusLevel::unsupported, os_token);
