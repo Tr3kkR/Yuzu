@@ -81,6 +81,36 @@ private:
     sqlite3* db_{nullptr};
 };
 
+/// RAII owner for a prepared statement -- CDX-P1-007: the previous manual
+/// `sqlite3_finalize` only at the end of the success path leaked `raw_stmt` (and left the
+/// connection outstanding when `DbHandle::~DbHandle` ran `sqlite3_close`) on any exception
+/// thrown while building a row between prepare and that single finalize call. Same shape as
+/// `DbHandle` in this file and `detail::Stmt` in app_usage_parsers.hpp/`StmtPtr` in tar_db.cpp.
+class StmtHandle {
+public:
+    StmtHandle() noexcept = default;
+    explicit StmtHandle(sqlite3_stmt* stmt) noexcept : stmt_(stmt) {}
+    ~StmtHandle() {
+        if (stmt_) sqlite3_finalize(stmt_);
+    }
+    StmtHandle(const StmtHandle&) = delete;
+    StmtHandle& operator=(const StmtHandle&) = delete;
+    StmtHandle(StmtHandle&& o) noexcept : stmt_(o.stmt_) { o.stmt_ = nullptr; }
+    StmtHandle& operator=(StmtHandle&& o) noexcept {
+        if (this != &o) {
+            if (stmt_) sqlite3_finalize(stmt_);
+            stmt_ = o.stmt_;
+            o.stmt_ = nullptr;
+        }
+        return *this;
+    }
+    [[nodiscard]] sqlite3_stmt* get() const noexcept { return stmt_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return stmt_ != nullptr; }
+
+private:
+    sqlite3_stmt* stmt_{nullptr};
+};
+
 /// Opens `db_path` (default: the real TCC.db) read-only. `err_msg` is filled from
 /// sqlite3_errmsg() on failure -- the real, observed diagnostic, not a guessed one (the plan's
 /// acceptance criterion for this leg is recording the ACTUAL denied/constrained outcome, not
@@ -158,28 +188,28 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
             std::string{"tcc_db:prepare_failed:"} + sqlite3_errmsg(db.get()), acc, false));
         return emit_rows(ctx, rows, acc, false);
     }
+    StmtHandle stmt{raw_stmt}; // owns it from here -- finalized on every path, incl. an exception
 
     bool any_row_found = false;
     for (const auto& svc : kTccServices) {
-        sqlite3_reset(raw_stmt);
-        sqlite3_bind_text(raw_stmt, 1, svc.service.data(), static_cast<int>(svc.service.size()),
+        sqlite3_reset(stmt.get());
+        sqlite3_bind_text(stmt.get(), 1, svc.service.data(), static_cast<int>(svc.service.size()),
                           SQLITE_STATIC);
         for (;;) {
-            const int step_rc = sqlite3_step(raw_stmt);
+            const int step_rc = sqlite3_step(stmt.get());
             if (step_rc == SQLITE_DONE) break;
             if (step_rc != SQLITE_ROW) {
                 acc.add_failure(std::string{svc.category} + ":query_step_failed");
                 break;
             }
             any_row_found = true;
-            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(raw_stmt, 1));
-            const int auth_value = sqlite3_column_int(raw_stmt, 2);
+            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+            const int auth_value = sqlite3_column_int(stmt.get(), 2);
             rows.push_back({"macos", client ? client : "-", svc.category,
                             decode_auth_value(auth_value), std::to_string(auth_value), "-", "-",
                             false});
         }
     }
-    sqlite3_finalize(raw_stmt);
 
     if (rows.empty()) {
         // Query ran cleanly but found nothing for any of the four mapped services -- a

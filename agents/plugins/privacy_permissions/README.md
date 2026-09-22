@@ -1,6 +1,15 @@
 # privacy_permissions
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.privacy_permissions.permissions) |
+| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 constrained |
+| **Actions** | `permissions` (definition `crossplatform.privacy_permissions.permissions`) |
+| **Security** | securable `Forensics` · operation Read · risk High · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -24,6 +33,9 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `permissions` | ✅ supported · rung 1 · HKCU/HKLM SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore registry walk | 🟡 constrained · rung 1 · TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected to read denied | 🟡 constrained · rung 1 · xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session bus; unavailable (no daemon/no session) on most non-sandboxed desktops |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -41,6 +53,7 @@ Binaries/subprocesses: none -- every leg is an in-process read (SQLite, the Wind
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -48,6 +61,17 @@ Binaries/subprocesses: none -- every leg is an in-process read (SQLite, the Wind
 One row per app per category, or one whole-read-failure row (`app_id`/`category` both `-`) when the mechanism itself couldn't be reached at all (TCC.db wouldn't open, ConsentStore's root key is missing for a reason other than "not there", the portal bus call failed outright). A category absent from a host's mechanism entirely (e.g. `full_disk_access` on Linux, which has no single-boolean portal equivalent) is `unsupported`, never silently omitted or misreported as `absent`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.privacy_permissions.permissions` — `os|app_id|category|state|raw|last_used_start|last_used_stop`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `os` | string | `macos` `windows` `linux` | Windows, Linux, macOS | `macos` | The reporting OS. |
+| `app_id` | string | - | Windows, Linux, macOS | `com.example.App` | Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path or Package Family Name (Windows), a portal-reported app id (Linux). "-" when the row reports the capability's own global default rather than a specific app, or when the whole read failed before any app-level row could be produced. |
+| `category` | string | `camera` `microphone` `location` `full_disk_access` | Windows, Linux, macOS | `camera` | The fixed cross-OS permission category. "-" only on a whole-read-failed row. |
+| `state` | string | `allowed` `denied` `prompt_undetermined` `absent` `unreadable` `unsupported` | Windows, Linux, macOS | `allowed` | allowed/denied: a real, decoded grant. prompt_undetermined: the mechanism reported a value this plugin doesn't map to allowed/denied (never guessed). absent: no record for this app+category -- the app never asked, not a failure. unreadable: the read itself failed. unsupported: no mechanism reaches this category on this OS/host (e.g. no portal daemon running). |
+| `raw` | string | - | Windows, Linux, macOS | `2` | The mechanism-native value behind `state` (a TCC auth_value integer, a ConsentStore Value string, a joined portal permission list) -- "-" when nothing meaningful beyond the state itself. |
+| `last_used_start` | string | - | Windows | `1700000000000` | Windows ConsentStore LastUsedTimeStart, epoch milliseconds. "-" elsewhere. |
+| `last_used_stop` | string | - | Windows | `1700000100000` | Windows ConsentStore LastUsedTimeStop, epoch milliseconds. "-" elsewhere. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -68,6 +92,25 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner) · leg-hash fe9aa1c1d5d5
+
+```
+== action=permissions
+permissions|macos|/usr/libexec/sshd-keygen-wrapper|full_disk_access|allowed|2|-|-
+permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-
+permissions|macos|com.nordvpn.macos|full_disk_access|denied|0|-|-
+permissions|macos|com.spotify.client|full_disk_access|denied|0|-|-
+permissions|macos|net.whatsapp.WhatsApp|full_disk_access|denied|0|-|-
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash fe9aa1c1d5d5
+
+```
+== action=permissions
+permissions|linux|-|-|unsupported|-|-|-
+[result_status] UNAVAILABLE / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -81,4 +124,10 @@ One row per app per category, or one whole-read-failure row (`app_id`/`category`
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/privacy_permissions/src/privacy_permissions_legs.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_linux.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_macos.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_win_parsers.hpp`
+- Definitions: `content/definitions/privacy_permissions.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp`
+- Tests: `tests/unit/test_privacy_permissions_local_dispatcher.cpp` · `tests/unit/test_privacy_permissions_macos_internals.cpp` · `tests/unit/test_privacy_permissions_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wave8-pr85-privacy_permissions.added.md`
 <!-- END GENERATED -->
