@@ -202,6 +202,8 @@ void FileGuard::run() try {
     bool p_ex = false;       // extended records (carry a FileId) in use for this generation
     bool p_logged = false;   // the "no parent watch" note is logged once per guard
     int p_failures = 0;      // consecutive failed P completions
+    bool p_drain_pending = false; // a cancelled P read whose completion is not yet confirmed;
+                                   // p_buf/p_ov must not be reused for a new read while this holds
     std::wstring x_leaf;     // leaf name of X
     std::optional<std::uint64_t> x_id; // low 64 bits of X's FileId, when known
     const ReadDirChangesExFn read_ex = resolve_read_dir_changes_ex();
@@ -239,17 +241,27 @@ void FileGuard::run() try {
         return read_pending;
     };
 
-    // Close P's handle. A pending read is cancelled and waited out first so the cancelled
-    // completion cannot land on the OVERLAPPED/buffer of the next generation.
+    // Close P's handle. A pending read is cancelled and waited out (bounded, with one extension)
+    // so the cancelled completion cannot land on the OVERLAPPED/buffer of the next generation. A
+    // drain that is still unconfirmed from an EARLIER call is rechecked here too (non-blocking):
+    // p_buf/p_ov stay off-limits for a new read until a wait actually confirms the old one landed.
     auto p_reset = [&] {
+        if (p_drain_pending && WaitForSingleObject(p_event.get(), 0) == WAIT_OBJECT_0)
+            p_drain_pending = false;
         if (p_dir && p_pending) {
             CancelIoEx(p_dir.get(), &p_ov);
-            WaitForSingleObject(p_event.get(), kCancelDrainMs);
+            bool drained = WaitForSingleObject(p_event.get(), kCancelDrainMs) == WAIT_OBJECT_0;
+            if (!drained) // one bounded extension before giving up
+                drained = WaitForSingleObject(p_event.get(), kCancelDrainMs) == WAIT_OBJECT_0;
+            if (!drained) {
+                p_drain_pending = true; // still not confirmed: deferred until a later opportunistic check
+                spdlog::warn("Guardian FileGuard[{}]: parent-directory watch cancel for {} did not "
+                             "drain within {}ms - deferring re-arm",
+                             cfg_.rule_id, cfg_.path, kCancelDrainMs * 2);
+            }
         }
         p_dir.reset();
         p_pending = false;
-        if (p_event)
-            ResetEvent(p_event.get());
     };
 
     // (Re)issue the directory-name-only read on the open P handle.
@@ -274,6 +286,11 @@ void FileGuard::run() try {
         p_reset();
         x_leaf.clear();
         x_id.reset();
+        if (p_drain_pending) {
+            arm_retry = true; // prior cancelled read not yet confirmed drained: leave p_buf/p_ov
+                               // untouched this generation; the existing degraded cadence retries P later
+            return;
+        }
         if (!p_event) {
             if (!p_logged) {
                 p_logged = true;
