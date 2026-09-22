@@ -1,7 +1,15 @@
 # browser_inventory
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+| | |
+|---|---|
+| **What it does** | Chromium-family browser, profile and extension inventory |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.browser_inventory.browsers, crossplatform.browser_inventory.profiles, crossplatform.browser_inventory.extensions) |
+| **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
+| **Actions** | `browsers` (definition `crossplatform.browser_inventory.browsers`) · `extensions` (definition `crossplatform.browser_inventory.extensions`) · `profiles` (definition `crossplatform.browser_inventory.profiles`) |
+| **Security** | securable `Forensics` · operation Read · risk High · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -26,7 +34,21 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `browsers` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | 🟡 constrained · rung 1 · ~/.config/{google-chrome,microsoft-edge} directory presence |
+| `extensions` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | ✅ supported · rung 1 · Default/Secure Preferences (fallback Default/Preferences) extensions.settings JSON read |
+| `profiles` | 🟡 planned · rung 1 · ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | 🟡 planned · rung 1 · /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | ✅ supported · rung 1 · ~/.config/{google-chrome,microsoft-edge}/Local State JSON read |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`browsers` / Windows** — follows as its own PR
+- **`browsers` / macOS** — follows as its own PR
+- **`browsers` / Linux** — presence-only; no version/channel detection in this package
+- **`extensions` / Windows** — follows as its own PR
+- **`extensions` / macOS** — follows as its own PR
+- **`profiles` / Windows** — follows as its own PR
+- **`profiles` / macOS** — follows as its own PR
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -44,7 +66,7 @@ No external binaries, no subprocesses, no network access on the Linux leg — ev
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -52,7 +74,38 @@ No external binaries, no subprocesses, no network access on the Linux leg — ev
 Pipe-delimited rows. Every action's stream leads with a `status|<action>|<supported|constrained>|<reason>` row (CC-07 typed-status pairing), followed by zero or more data rows discriminated by their own leading tag (`browser|...`, `profile|...`, `extension|...`); every untrusted string field (usernames, profile display names, extension names/ids/versions) is escaped through `safe_output_field`. A directory or file that cannot be opened or read anywhere in the walk (`ConstraintAccumulator`) sets the action's `status` row to `constrained` with the accumulated reason — a genuinely absent browser install or user directory is never treated as a failure, only as fewer rows.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+**`crossplatform.browser_inventory.browsers` — `row_kind|field_1|field_2|field_3`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | - | all | `browser` | Discriminates the row shape - "status" or "browser". |
+| `field_1` | string | - | all | `google-chrome` | status row: the action name ("browsers"). browser row: the browser identifier. |
+| `field_2` | string | - | all | `1` | status row: "supported" or "constrained". browser row: "1" if the binary is present, "0" otherwise. |
+| `field_3` | string | - | all | `-` | status row: the constraint reason, "-" when supported. browser row: version, always "-" this wave (no version/channel probe). |
+
+**`crossplatform.browser_inventory.extensions` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7|field_8`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | - | all | `extension` | Discriminates the row shape - "status" or "extension". |
+| `field_1` | string | - | all | `jdoe` | status row: the action name ("extensions"). extension row: the owning OS user. |
+| `field_2` | string | - | all | `google-chrome` | status row: "supported" or "constrained". extension row: the browser identifier. |
+| `field_3` | string | - | all | `Default` | status row: the constraint reason, "-" when supported. extension row: the profile directory name. |
+| `field_4` | string | - | all | `aapocclcgogkmnckokdopfmhonfmgoek` | status row: empty. extension row: the extension id. |
+| `field_5` | string | - | all | `1.2.3` | status row: empty. extension row: the extension version, "-" if absent. |
+| `field_6` | string | - | all | `Example Extension` | status row: empty. extension row: the extension name, "-" if absent. |
+| `field_7` | string | - | all | `enabled` | status row: empty. extension row: the extension's enable state. |
+| `field_8` | string | - | all | `true` | status row: empty. extension row: whether the extension was installed from the web store. |
+
+**`crossplatform.browser_inventory.profiles` — `row_kind|field_1|field_2|field_3|field_4`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | - | all | `profile` | Discriminates the row shape - "status" or "profile". |
+| `field_1` | string | - | all | `jdoe` | status row: the action name ("profiles"). profile row: the owning OS user, redacted per the sample-capture convention in non-sample contexts this is the real local username. |
+| `field_2` | string | - | all | `google-chrome` | status row: "supported" or "constrained". profile row: the browser identifier. |
+| `field_3` | string | - | all | `Default` | status row: the constraint reason, "-" when supported. profile row: the profile directory name (the Local State info_cache key), e.g. "Default", "Profile 1". |
+| `field_4` | string | - | all | `Work` | status row: empty. profile row: the profile's user-editable display name. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -74,7 +127,24 @@ Pipe-delimited rows. Every action's stream leads with a `status|<action>|<suppor
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 6f27c480065b
+
+```
+== action=browsers
+status|browsers|supported|-
+browser|chrome|0|-
+browser|edge|0|-
+browser|chromium|0|-
+[result_status] OK / FULL
+
+== action=profiles
+status|profiles|supported|-
+[result_status] OK / FULL
+
+== action=extensions
+status|extensions|supported|-
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -88,5 +158,9 @@ Pipe-delimited rows. Every action's stream leads with a `status|<action>|<suppor
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-<!-- TODO(orchestrator): run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` after docs/os-capability-matrix.md's generated block carries browser_inventory's rows (Linux capmatrix-gen regen against the compiled .so) -- this fence renders empty/undeclared until then. -->
+- Plugin: `agents/plugins/browser_inventory/src/browser_inventory_legs.hpp` · `agents/plugins/browser_inventory/src/browser_inventory_linux.cpp` · `agents/plugins/browser_inventory/src/browser_inventory_linux_parsers.hpp` · `agents/plugins/browser_inventory/src/browser_inventory_macos.cpp` · `agents/plugins/browser_inventory/src/browser_inventory_parsers.hpp` · `agents/plugins/browser_inventory/src/browser_inventory_plugin.cpp` · `agents/plugins/browser_inventory/src/browser_inventory_win.cpp`
+- Definitions: `content/definitions/browser_inventory.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp`
+- Tests: `tests/unit/test_browser_inventory_linux_parsers.cpp` · `tests/unit/test_browser_inventory_local_dispatcher.cpp` · `tests/unit/test_browser_inventory_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

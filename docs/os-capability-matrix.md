@@ -191,13 +191,6 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
-<!-- TODO(orchestrator, Wave 10 P2a-3): the generated block below does not
-     yet carry browser_inventory's rows -- regenerate on Linux (the
-     canonical host) with `tools/capmatrix-gen` against the compiled
-     browser_inventory .so once one exists; this package's own kActionDescriptors
-     (agents/plugins/browser_inventory/src/browser_inventory_plugin.cpp) is
-     the source of truth it reads from. Engineers do not compile, so this
-     block is left untouched rather than hand-edited. -->
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
@@ -253,6 +246,15 @@ implementation is.
 | bitlocker | state | linux | supported | 1 | libblkid+sysfs | - |
 | bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
+| browser_inventory | browsers | linux | constrained | 1 | ~/.config/{google-chrome,microsoft-edge} directory presence | presence-only; no version/channel detection in this package |
+| browser_inventory | browsers | macos | planned | 1 | /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | follows as its own PR |
+| browser_inventory | browsers | windows | planned | 1 | ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | follows as its own PR |
+| browser_inventory | profiles | linux | supported | 1 | ~/.config/{google-chrome,microsoft-edge}/Local State JSON read | - |
+| browser_inventory | profiles | macos | planned | 1 | /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | follows as its own PR |
+| browser_inventory | profiles | windows | planned | 1 | ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | follows as its own PR |
+| browser_inventory | extensions | linux | supported | 1 | Default/Secure Preferences (fallback Default/Preferences) extensions.settings JSON read | - |
+| browser_inventory | extensions | macos | planned | 1 | /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | follows as its own PR |
+| browser_inventory | extensions | windows | planned | 1 | ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | follows as its own PR |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
 | certificates | list | macos | supported | 2 | SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
