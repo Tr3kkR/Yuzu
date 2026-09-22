@@ -11,7 +11,8 @@
   `GuaranteedStateStore::list_rules`/`get_rule`/`query_events` and the five shared
   `guardian_model.hpp` functions unmodified. `GuaranteedStateRuleRow`/`GuaranteedStateEventRow`/
   `GuaranteedStateEventQuery`/`GuaranteedStateReadError` relocated out of
-  `guaranteed_state_store.hpp`, and the five pre-existing pure result structs relocated out of
+  `guaranteed_state_store.hpp`, and the six pre-existing pure result structs (including the nested
+  `GuardianDeviceComplianceGuardRow`) relocated out of
   `guardian_model.hpp`, into a pure `guardian_types.hpp`. Both backing stores are nullable at the
   seam (seven of the eight methods need only `GuaranteedStateStore`; only `device_compliance` needs
   `BaselineStore` too), each method degrading individually when its own dependency is absent — the
