@@ -108,7 +108,7 @@
   "caveats": [
     "**No documented business driver.** The priority for this plugin is asserted from a capability-gap reading, not evidenced by any tracked demand (see \"How it works\"); there is no capability-map requirement, named customer, SOC 2 control or CVE behind it.",
     "**Configuration, not evaluation.** Linux and macOS report what the files state, not what PAM or sudo would decide: `pwquality.conf.d` and `faillock` drop-ins are not read, `sudoers` include directives are listed and not followed, `audit.rules` counts are of the file and not the live kernel rules, and a `pwpolicy` expression is reported verbatim (only `minimum_length` is derived from it).",
-    "**The Windows leg is unmeasured on real hardware at this writing.** It is rung 2 by design, and its fixtures, sample and the `SeSecurityPrivilege` sufficiency probe are pending the Windows rig session; until they land, the Windows rows and the Windows privilege cell are the code's declared behaviour, not a captured one.",
+    "**The Windows leg is measured on real hardware.** It is rung 2 by design; a rig session captured a real `secedit /export` as LocalSystem, confirming `SeSecurityPrivilege` suffices with the privilege in its default Disabled state (fixture, sample and the `RIG PROBE` banner in `local_security_policy_win.cpp` all reflect this).",
     "**Privileged files read as `unreadable` for an unprivileged agent.** `/etc/sudoers` (`0440`), `/etc/sudoers.d/*` and Linux `/etc/audit/audit.rules` (`0640`) need root or a read-override capability; without it the action reports `PERMISSION_DENIED`, never an empty list. macOS `audit_control` is absent by default and reads `absent`.",
     "**Global scope only.** macOS `pwpolicy` is queried for the global account policies, not per-user policies, and the Windows export covers the local security policy area only (no domain policy resultant set, no `auditpol` subcategories beyond `[Event Audit]`)."
   ],
@@ -488,9 +488,9 @@
   },
   "privileges": [
     {
-      "grant": "`secedit /export` needs an elevated token. The agent already holds `SeSecurityPrivilege` (`scripts/install-agent-user.ps1`, granted for the Security event log); whether that privilege alone suffices is **not yet measured**: the probe is the `RIG PROBE` banner in `local_security_policy_win.cpp`, still marked pending, and no `docs/samples/windows.txt` exists yet",
+      "grant": "`secedit /export` needs an elevated token. The agent already holds `SeSecurityPrivilege` (`scripts/install-agent-user.ps1`, granted for the Security event log); measured on the-rig as LocalSystem: `SeSecurityPrivilege` suffices with the privilege in its default **Disabled** state, nothing else was granted or needed (the `RIG PROBE` banner in `local_security_policy_win.cpp`, `docs/samples/windows.txt`)",
       "if_refused": "`ERROR_ACCESS_DENIED` reading the export reports `PERMISSION_DENIED` with `secedit:access_denied`; a non-zero `secedit` exit reports `CONSTRAINED` with `secedit:exit_<n>`; the action returns 1 with the row `constrained|<token>`",
-      "measured": "Not yet: no Windows capture and no real `secedit` export fixture is committed, so the Windows leg's real-host behaviour is unverified",
+      "measured": "Yes: a real `secedit` export from the-rig (12828 bytes, UTF-16LE) is committed as `tests/unit/fixtures/wave8/local_security_policy/windows/secedit_export.inf`",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
