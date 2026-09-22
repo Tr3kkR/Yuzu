@@ -494,6 +494,11 @@ agent_test_exe = executable(
                                                 # row/parameter parsers (agents/shared, agent-core primitive)
     'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
                                                 # dylib/.so/.dll driven end to end via LocalDispatcher
+    'unit/test_app_control_parsers.cpp',         # Wave 8 PR8.6: pure app_control mappers/row formatters/dump
+                                                # parsers over the-rig REAL CAPTURE fixtures (REQUIRE(exists))
+    'unit/test_app_control_local_dispatcher.cpp', # Wave 8 PR8.6: real app_control dylib/.so/.dll driven end to
+                                                # end via LocalDispatcher (unguarded: non-Windows asserts the
+                                                # exact unsupported row)
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -684,6 +689,7 @@ agent_test_exe = executable(
                 app_usage_plugin_lib,  # Wave 7b PR7b.3
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
+                app_control_plugin_lib,  # Wave 8 PR8.6
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
