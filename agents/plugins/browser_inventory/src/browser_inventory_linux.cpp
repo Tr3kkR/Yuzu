@@ -8,13 +8,12 @@
  * all (it only builds on __linux__, matching peripherals_linux.cpp's
  * precedent shape).
  *
- * Replaces P2a-1's compiling stub (mark_stub_linux): every action now does
- * a real read via the injected-root leg functions below, and reports
- * through the SAME `status|<action>|...` wire shape and CC-07 typed-status
- * pairing browser_inventory_legs.hpp's mark_planned/mark_stub_linux already
- * established for the placeholder legs -- so a `status` row appears first
- * for every action on every OS, not just the still-PLANNED macOS/Windows
- * legs.
+ * Replaces P2a-1's compiling stub: every action now does a real read via
+ * the injected-root leg functions below, and reports through the SAME
+ * `status|<action>|...` wire shape and CC-07 typed-status pairing
+ * browser_inventory_legs.hpp's mark_planned already established for the
+ * placeholder legs -- so a `status` row appears first for every action on
+ * every OS, not just the still-PLANNED macOS/Windows legs.
  */
 #include "browser_inventory_legs.hpp"
 #include "browser_inventory_linux_parsers.hpp"

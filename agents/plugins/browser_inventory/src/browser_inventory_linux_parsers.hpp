@@ -33,10 +33,16 @@
  * is treated the same way — a real
  * acquisition failure, never silently folded into "zero rows".
  *
- * PRIVACY: every field this leg writes onto the wire comes from
- * BrowserProfileRow (browser_inventory_parsers.hpp), which structurally
- * carries no user_name/gaia_id/e-mail — see that header's PRIVACY
- * CONTRACT. Nothing inside a profile directory is opened by this leg.
+ * PRIVACY: every JSON-derived field this leg writes onto the wire comes
+ * from BrowserProfileRow (browser_inventory_parsers.hpp), which
+ * structurally carries no gaia_id/e-mail/info_cache user_name — see that
+ * header's PRIVACY CONTRACT. This leg's OWN row builder additionally
+ * prepends the LOCAL OS/home-directory name (the walk's "user") ahead of
+ * every profile row — a deliberate, documented exception (decided
+ * 2026-09-22, see the plugin's README "PRIVACY CONTRACT"): it disambiguates
+ * profiles across users sharing a machine, is machine-local, and is never
+ * a browsing-account identifier. Nothing inside a profile directory is
+ * opened by this leg.
  *
  * WIRE GRAMMAR: every dynamic string field (home-directory name, profile
  * directory name, display name)

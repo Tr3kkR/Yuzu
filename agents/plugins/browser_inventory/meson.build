@@ -3,9 +3,8 @@
 # agents/plugins/peripherals/meson.build: one portable plugin TU plus three
 # per-OS leg TUs, each #ifdef-gated internally for its own target so all
 # four are listed unconditionally. No OS-framework dependency this wave --
-# the macOS/Windows legs are FINAL placeholders and the Linux leg is a
-# compiling stub (P2a-2 adds the real read, still pure filesystem + JSON,
-# no IOKit/SetupAPI).
+# the macOS/Windows legs are FINAL placeholders; the Linux leg is a real
+# read (pure filesystem + JSON, no IOKit/SetupAPI).
 browser_inventory_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep]
 
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this

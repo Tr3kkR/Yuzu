@@ -62,29 +62,18 @@ int run_macos(yuzu::CommandContext& ctx, Action a);
 int run_windows(yuzu::CommandContext& ctx, Action a);
 
 /// Shared wire shape for a PLANNED leg this wave (macOS, Windows -- and the
-/// Linux stub reuses the row shape, though it reports CONSTRAINED rather
-/// than UNAVAILABLE, see browser_inventory_linux.cpp): one row,
-/// `status|<action>|unsupported|<os_tag>:planned`, plus a typed status of
-/// UNAVAILABLE/PARTIAL naming the same reason. `os_tag` is one of
-/// "macos"/"windows" (never "linux" here -- the Linux leg is CONSTRAINED
-/// per its own descriptor rung, not PLANNED, so it reports itself; see
-/// mark_stub_linux below).
+/// (P2a-1's Linux compiling stub reused this row shape via mark_stub_linux,
+/// reporting CONSTRAINED rather than UNAVAILABLE; P2a-2 replaced the stub
+/// with a real leg -- browser_inventory_linux.cpp -- and mark_stub_linux is
+/// gone with it.) One row, `status|<action>|unsupported|<os_tag>:planned`,
+/// plus a typed status of UNAVAILABLE/PARTIAL naming the same reason.
+/// `os_tag` is one of "macos"/"windows" -- the real Linux leg reports
+/// itself, never through this helper.
 inline void mark_planned(yuzu::CommandContext& ctx, Action a, std::string_view os_tag) {
     ctx.write_output(std::string{"status|"} + std::string{action_name(a)} + "|unsupported|" +
                      std::string{os_tag} + ":planned");
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                           std::string{os_tag} + " leg is PLANNED, not implemented in this package");
-}
-
-/// Wire shape for the Linux compiling stub: CONSTRAINED (the leg exists and
-/// is dispatchable, unlike a PLANNED leg, but this package's body is a
-/// placeholder P2a-2 replaces) rather than UNAVAILABLE.
-inline void mark_stub_linux(yuzu::CommandContext& ctx, Action a) {
-    ctx.write_output(std::string{"status|"} + std::string{action_name(a)} +
-                     "|unsupported|linux:stub_not_implemented");
-    ctx.set_result_status(
-        YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-        "linux leg is a compiling stub in this package (P2a-1); P2a-2 fills the real body");
 }
 
 } // namespace yuzu::browser_inventory

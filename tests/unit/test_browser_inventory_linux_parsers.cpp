@@ -296,6 +296,67 @@ TEST_CASE("browser_inventory linux: linux_profile_rows_at finds alice/edge and b
 #endif // !defined(_WIN32)
 }
 
+TEST_CASE("browser_inventory linux: linux_browser_rows_at reports the fixture's two present "
+          "candidates and the absent third as such",
+          "[browser_inventory][linux][walk]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_browsers_"};
+    std::string error;
+    REQUIRE(materialize_browser_inventory_tree(dir.path, error));
+
+    std::optional<std::string> token;
+    const auto rows = linux_browser_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 3);
+
+    // tree.manifest's two presence-marker files (opt/google/chrome/chrome,
+    // opt/microsoft/msedge/msedge) must report present (the positive "1"
+    // path); chromium has no marker and must report absent. MUTATION: a
+    // regression that reports every candidate absent regardless of the
+    // marker files (Codex adversarial-review finding, ws-10.2a gate 6.1)
+    // leaves this green only if "1" degrades to "0" -- this case is that
+    // discriminator.
+    CHECK(std::find(rows.begin(), rows.end(), "browser|chrome|1|-") != rows.end());
+    CHECK(std::find(rows.begin(), rows.end(), "browser|edge|1|-") != rows.end());
+    CHECK(std::find(rows.begin(), rows.end(), "browser|chromium|0|-") != rows.end());
+#endif // !defined(_WIN32)
+}
+
+TEST_CASE("browser_inventory linux: profile rows deliberately carry the local OS username, never "
+          "a browsing-account identifier",
+          "[browser_inventory][linux][privacy]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    // Locks in the 2026-09-22 decision (README "PRIVACY CONTRACT", routed-
+    // concerns-software-estate.md): the LOCAL OS/home-directory username is
+    // a deliberate, permitted exception to the no-account-identifier
+    // invariant -- it disambiguates profiles across users sharing a
+    // machine and is machine-local, never a browsing-account identifier
+    // (gaia_id/e-mail/info_cache user_name, which the sibling privacy case
+    // below still proves absent). This case exists so a future reader
+    // finding "alice"/"bob" in a wire row does not mistake presence for a
+    // regression -- absence would be the actual regression.
+    using namespace yuzu::browser_inventory::lnx;
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_username_"};
+    std::string error;
+    REQUIRE(materialize_browser_inventory_tree(dir.path, error));
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    REQUIRE_FALSE(rows.empty());
+    CHECK(std::any_of(rows.begin(), rows.end(),
+                       [](const std::string& r) { return r.starts_with("profile|alice|"); }));
+    CHECK(std::any_of(rows.begin(), rows.end(),
+                       [](const std::string& r) { return r.starts_with("profile|bob|"); }));
+#endif // !defined(_WIN32)
+}
+
 TEST_CASE("browser_inventory linux: no row carries the fixtures' redaction/fabrication placeholders",
           "[browser_inventory][linux][privacy]") {
 #if defined(_WIN32)

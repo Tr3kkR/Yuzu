@@ -126,9 +126,9 @@ resolved even on the author's own machine.
 
 `tests/test_issue_docs.py`, run by `.github/workflows/docs-lint.yml` and the `docs` Meson suite:
 
-1. **Budget** — each of the four files under 40,000 characters, and the 48,000 hard cap.
+1. **Budget** — each of the five files under 40,000 characters, and the 48,000 hard cap.
 2. **Expiry** — no `EXPIRES:` date in the past.
-3. **Dead pointers** — every backticked citation in the four files resolves: a path-shaped one
+3. **Dead pointers** — every backticked citation in the five files resolves: a path-shaped one
    (with a directory component) must exist exactly, and a bare filename must match some tracked
    file's name. `STREAM.md` was cited for months and existed nowhere.
 4. **Routed-concern table structure** — every row has three populated columns, and no row's

@@ -63,11 +63,11 @@ CLAUDE_MD_CHAR_CAP = 48_000
 INSTRUCTION_FILE_BUDGET = 40_000
 
 # Every file here loads into an agent session before any work starts: CLAUDE.md
-# and AGENTS.md directly, the two routed-concern tables via CLAUDE.md's
+# and AGENTS.md directly, the three routed-concern tables via CLAUDE.md's
 # @-imports. Only CLAUDE.md was measured before; the routed-concern tables had
 # reached 38,545 and 37,808 unmeasured, and AGENTS.md 49,859 -- already 25% over
 # the cap nothing was applying to it.
-# The two routed-concern tables, checked for column structure as well as size.
+# The three routed-concern tables, checked for column structure as well as size.
 # A cell containing an unescaped "|" silently shifts every column to its right,
 # which is how a CATASTROPHIC row's "Loaded by" agent list was once overwritten
 # by a copy of its own "Doc" column -- leaving a credential-revocation surface

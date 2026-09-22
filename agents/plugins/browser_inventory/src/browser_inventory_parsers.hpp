@@ -8,13 +8,19 @@
  * _win.cpp) own locating and reading those files; this header owns
  * interpreting their bytes.
  *
- * PRIVACY CONTRACT (binding for this whole plugin): a row emitted from
- * these parsers NEVER carries an account identifier -- no user_name, no
- * gaia_id, no e-mail address, no browsing history, no cookies, no
- * bookmarks. This is enforced structurally: BrowserProfileRow simply has
- * no user_name/gaia_id field, so there is no code path that could put one
- * on the wire. See test_browser_inventory_parsers.cpp for a fixture that
- * carries those keys in its input and asserts they never reach a row.
+ * PRIVACY CONTRACT (binding for this whole plugin): a row built from this
+ * header's parsers NEVER carries a browsing-account identifier -- no
+ * gaia_id, no e-mail address, no Chromium info_cache user_name/gaia_name,
+ * no browsing history, no cookies, no bookmarks. This is enforced
+ * structurally: BrowserProfileRow simply has no such field, so no code
+ * path in this header could put one on the wire. See
+ * test_browser_inventory_parsers.cpp for a fixture that carries those keys
+ * in its input and asserts they never reach a row.
+ * EXCEPTION (decided 2026-09-22, not part of this contract): the Linux
+ * leg's wire-row builder (browser_inventory_linux_parsers.hpp) prepends
+ * the LOCAL OS/home-directory username to disambiguate profiles across
+ * users sharing a machine -- that value never passes through this header
+ * or BrowserProfileRow, and is not a browsing-account identifier.
  * No file inside a profile directory ("Preferences", "Secure Preferences",
  * "History", "Cookies", ...) is read by any caller of this header in this
  * release; the per-profile `extensions` action follows as its own PR.
@@ -38,8 +44,10 @@
 
 namespace yuzu::browser_inventory {
 
-/// One row of the "profiles" action. Deliberately has no user_name/gaia_id
-/// field -- see the file banner's PRIVACY CONTRACT.
+/// One row of the "profiles" action. Deliberately has no gaia_id/e-mail/
+/// info_cache user_name field -- see the file banner's PRIVACY CONTRACT.
+/// (The Linux leg's wire row separately carries the LOCAL OS username --
+/// added by browser_inventory_linux_parsers.hpp, never a field here.)
 struct BrowserProfileRow {
     std::string profile_dir;  // the info_cache key, e.g. "Default", "Profile 1"
     std::string display_name; // info_cache[dir].name -- a user-editable

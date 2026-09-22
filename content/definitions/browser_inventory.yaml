@@ -1,8 +1,10 @@
 ## Browser Inventory Definitions
 ## Chromium-family browser and profile inventory. Read-only on
-## every platform; never emits an account identifier, browsing history,
-## cookies or bookmarks -- see agents/plugins/browser_inventory/src/
-## browser_inventory_parsers.hpp's PRIVACY CONTRACT.
+## every platform; never emits a browsing-account identifier, browsing
+## history, cookies or bookmarks -- the Linux profiles row does carry the
+## LOCAL OS username (a deliberate exception) -- see
+## agents/plugins/browser_inventory/src/browser_inventory_parsers.hpp's
+## PRIVACY CONTRACT and the plugin README.
 ## Plugin: browser_inventory | Actions: browsers, profiles
 ##
 ## Sources by platform:
@@ -126,10 +128,10 @@ metadata:
   version: 1.0.0
   description: >
     Per-browser profile directories, read from each browser's "Local
-    State" file, across every user this leg discovers. Never emits an
-    account identifier -- see the plugin README's PRIVACY CONTRACT. Linux
-    this wave; macOS and Windows legs are PLANNED and follow as their own
-    PR.
+    State" file, across every user this leg discovers. Each row names the
+    local OS user it belongs to; never emits a browsing-account identifier
+    -- see the plugin README's PRIVACY CONTRACT. Linux this wave; macOS
+    and Windows legs are PLANNED and follow as their own PR.
   tags: [forensics, browser, inventory]
 
 spec:

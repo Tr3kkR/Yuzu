@@ -23,14 +23,14 @@ capability-catalogue headers. It fails, naming the exact offending
   1. A plugin declares an action that has no catalogue row anywhere across
      the sixteen sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
-  2. One of the fourteen per-group fragments declares a `plugin.action` no
+  2. One of the fifteen per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
      catalogue data, or a typo that silently shadows the real action. (The
      core-owned fragment is exempt from this direction only:
      `__guard__.push_rules` is a real, intentional row with no backing
      plugin — Guardian's rule-push is a server-internal dispatch, not
      something any plugin's `actions()` ever lists.)
-  3. The same `plugin.action` is declared by more than one of the fifteen
+  3. The same `plugin.action` is declared by more than one of the sixteen
      sources (a DUPLICATE row) — two independently-authored fragments
      racing to classify the same dispatch, which `CommandCapabilityRegistry
      ::classify` resolves as `Ambiguous`, never first-wins (see

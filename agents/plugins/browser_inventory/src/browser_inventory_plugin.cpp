@@ -6,9 +6,11 @@
  *   "browsers"   — which Chromium-family browsers (Chrome, Edge, ...) are
  *                  installed on this host.
  *   "profiles"   — per-browser profile directories, read from each
- *                  browser's "Local State" file. Never emits an account
- *                  identifier -- see browser_inventory_parsers.hpp's
- *                  PRIVACY CONTRACT.
+ *                  browser's "Local State" file. Never emits a
+ *                  browsing-account identifier -- see
+ *                  browser_inventory_parsers.hpp's PRIVACY CONTRACT. The
+ *                  Linux leg's row does carry the LOCAL OS username (see
+ *                  below), a deliberate, documented exception.
  *   The per-profile "extensions" action follows as its own PR (Secure
  *   Preferences / Preferences settings-map read).
  *
@@ -16,12 +18,17 @@
  * (PluginConfigStore::seed_kill_switch_default_off, execution_artifacts'
  * precedent) -- the seed call itself is wired by P2a-3, not this package.
  *
- * PRIVACY CONTRACT (binding for every leg, every OS): never emit
- * user_name, gaia_id, e-mail addresses, browsing history, cookies or
- * bookmarks in any row. Enforced structurally in
+ * PRIVACY CONTRACT (binding for every leg, every OS): never emit gaia_id,
+ * e-mail addresses, Chromium info_cache user_name/gaia_name, browsing
+ * history, cookies or bookmarks in any row. Enforced structurally in
  * browser_inventory_parsers.hpp -- BrowserProfileRow simply has no such
- * fields. No file inside a profile directory is opened by any leg in this
- * release; the per-profile `extensions` action follows as its own PR.
+ * fields. EXCEPTION (decided 2026-09-22): the Linux leg's wire-row builder
+ * (browser_inventory_linux_parsers.hpp) prepends the LOCAL OS/home-
+ * directory username to disambiguate profiles across users sharing a
+ * machine -- machine-local, not a browsing-account identifier, and never
+ * a BrowserProfileRow field. No file inside a profile directory is opened
+ * by any leg in this release; the per-profile `extensions` action follows
+ * as its own PR.
  *
  * WAVE 1 (this package, P2a-1): plugin scaffold + descriptor (2 actions x
  * 3 OS legs, all declared unconditionally per the capability-matrix
