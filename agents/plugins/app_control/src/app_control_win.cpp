@@ -42,7 +42,8 @@
  * never rendered as absent. ERROR_ACCESS_DENIED -> PERMISSION_DENIED, anything else ->
  * CONSTRAINED/PARTIAL; exit code 0 only on OK. The only "absent" outputs are a genuine
  * ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND of a key, a value (EnforcementMode) or a directory,
- * and a directory read cleanly that held no policy file.
+ * a directory read cleanly that held no policy file, and a stat of SiPolicy.p7b (or a missing
+ * parent) reporting not-found.
  */
 #if defined(_WIN32)
 

@@ -543,7 +543,7 @@ TEST_CASE("app_control srpv2_collection_step: absent is a row, unreadable is ski
 // failure or rows, a refusal not becoming PERMISSION_DENIED, an OK run naming the wrong source, the
 // SrpV2 walk running (or not running) against the CIM outcome. It drives the real settle_applocker,
 // the function the Windows shell calls, with only the registry walk stubbed.
-TEST_CASE("app_control finish_applocker: the CIM x SrpV2 product never reads a failure as absent",
+TEST_CASE("app_control settle_applocker: the CIM x SrpV2 product never reads a failure as absent",
           "[app_control][parsers]") {
     struct Cim {
         const char* name;
