@@ -226,6 +226,28 @@ TEST_CASE("parse_sudoers: a non-NOPASSWD/PASSWD tag is preserved verbatim, not d
     CHECK(e[1].commands == "SETENV: /usr/bin/bar");
 }
 
+// Fails under: the tag scan halting on the first tag it cannot decode. sudoers(5) lets a
+// Tag_Spec carry its tags in ANY order, so NOPASSWD: reached only AFTER another tag must
+// still be decoded -- stopping early reports `nopasswd|false` for a genuinely passwordless
+// root grant, with status OK and no failure token, which is a wrong answer presented as a
+// correct one in the single most security-relevant column this plugin emits.
+TEST_CASE("parse_sudoers: NOPASSWD: is decoded whatever its position in the Tag_Spec",
+          "[local_security_policy][parsers]") {
+    const auto e = parse_sudoers("web1 web = (root) SETENV: NOPASSWD: /usr/bin/foo\n"
+                                 "web2 web = (root) NOEXEC: NOPASSWD: /usr/bin/bar\n"
+                                 "web3 web = (root) LOG_INPUT: LOG_OUTPUT: NOPASSWD: /bin/su\n"
+                                 "web4 web = (root) SETENV: PASSWD: /usr/bin/baz\n");
+    REQUIRE(e.size() == 4);
+    CHECK(e[0].nopasswd == "true"); // NOPASSWD: behind SETENV: is still NOPASSWD:
+    CHECK(e[0].commands == "SETENV: /usr/bin/foo"); // and SETENV: still survives verbatim
+    CHECK(e[1].nopasswd == "true");
+    CHECK(e[1].commands == "NOEXEC: /usr/bin/bar");
+    CHECK(e[2].nopasswd == "true"); // every undecoded tag is skipped over, not just one
+    CHECK(e[2].commands == "LOG_INPUT: LOG_OUTPUT: /bin/su");
+    CHECK(e[3].nopasswd == "false"); // PASSWD: behind a tag is decoded the same way
+    CHECK(e[3].commands == "SETENV: /usr/bin/baz");
+}
+
 // Fails under: split_unescaped_commas gaining paren-nesting awareness (which would change this
 // row's shape) without a matching test update. Not a data-loss bug -- documents the existing,
 // safe fallback: a comma inside a Runas_List paren group is not comma-aware, so the whole line

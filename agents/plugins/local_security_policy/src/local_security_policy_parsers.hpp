@@ -316,24 +316,33 @@ inline bool parse_user_spec(std::string_view line, std::vector<SudoersEntry>& ou
             next_runas = std::string{trim_ws(it.substr(1, close - 1))};
             it = trim_ws(it.substr(close + 1));
         }
+        // sudoers(5) lets a Tag_Spec carry its tags in ANY order, so the scan must not
+        // stop at the first tag it does not decode: `SETENV: NOPASSWD: /usr/bin/bar`
+        // grants passwordless root exactly as `NOPASSWD: SETENV: ...` does, and halting
+        // on SETENV: would report nopasswd `false` for it -- the one field of this row a
+        // reader most needs to be right, inverted, with status OK and no failure token.
+        // Only NOPASSWD:/PASSWD: are decoded into the typed column; every OTHER tag
+        // (SETENV: and NOEXEC: among them, both sudo privilege-escalation vectors) is
+        // carried into the stored command text verbatim -- the same "never dropped"
+        // treatment unmodelled_parameter gets elsewhere in this file -- so neither
+        // property is ever traded for the other.
+        std::string kept_tags;
         for (;;) {
             const auto w = it.substr(0, it.find_first_of(" \t"));
             if (!is_tag_word(w)) break;
-            // Only NOPASSWD:/PASSWD: are semantically decoded; any other recognized tag
-            // (SETENV:, NOEXEC:, a known sudo privilege-escalation vector among them) is
-            // left in place rather than silently consumed -- it survives verbatim as part
-            // of the stored command text, matching the "never dropped" treatment
-            // unmodelled_parameter already gets elsewhere in this file.
             if (w == "NOPASSWD:") next_nopw = "true";
             else if (w == "PASSWD:") next_nopw = "false";
-            else break;
+            else {
+                kept_tags.append(w);
+                kept_tags.push_back(' ');
+            }
             it = trim_ws(it.substr(w.size()));
         }
         if (it.empty()) return false;
         if (next_runas != runas || next_nopw != nopasswd) flush();
         runas = std::move(next_runas);
         nopasswd = std::move(next_nopw);
-        run.emplace_back(it);
+        run.emplace_back(kept_tags + std::string{it});
     }
     flush();
     return true;
