@@ -119,6 +119,14 @@ Every action writes one or more pipe-delimited lines via `ctx.write_output`. The
 | `OK` | full | (empty) | `sync`: the new state was written to `<data_dir>/asset_tags.json`, or no data dir is configured and there is nothing to write |
 | `CONSTRAINED` | partial | `asset_tags:persist_failed` | `sync`: the temp-file write or the rename over `asset_tags.json` failed (data dir not creatable, not a directory, disk error, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log |
 
+**Recovery.** Persistence and load are both self-healing — there is nothing to manually clean up.
+A repeated `CONSTRAINED`/`persist_failed` means the underlying OS-level condition (disk full, a
+permissions/ownership change on `data_dir`, an antivirus lock) needs fixing; once it is, the next
+`sync` writes cleanly with no restart or file deletion required. A corrupt or unreadable state file
+is similarly rejected and replaced automatically by the next successful `sync` (see "Where the data
+goes" below) — deleting it by hand is never necessary and only loses the in-memory `changes` history
+a moment sooner than the next write would anyway.
+
 ### Where the data goes
 
 - **Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`, same as any other plugin.

@@ -46,7 +46,12 @@ namespace yuzu::asset_tags {
 inline constexpr std::array<std::string_view, 4> kCategoryKeys = {"role", "environment", "location",
                                                                   "service"};
 
-/// Maximum entries kept in the change log, in memory and on disk (S19).
+/// Maximum entries kept in the change log, in memory and on disk (S19). A
+/// round number, not derived from a byte/retention budget like
+/// kMaxValueBytes below -- the log is a local diagnostic trail (`changes`
+/// action), not the authoritative tag state (that's the server's TagStore),
+/// so an exact figure isn't load-bearing; chosen to comfortably cover a
+/// single sync's worth of category+key changes with headroom.
 inline constexpr std::size_t kMaxChangeLog = 50;
 
 /// Maximum bytes of a stored tag value. Matches the server's

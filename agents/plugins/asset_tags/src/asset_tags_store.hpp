@@ -15,8 +15,10 @@
  * unique_hive_mount_name() — neither is reachable from a plugin, so this is a
  * deliberate third copy of the small idiom rather than a new agents/shared
  * primitive). The temp is created EXCLUSIVELY: POSIX opens it with
- * O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600 directly (no ofstream, no umask
- * window — the file is 0600 from the instant it exists); Windows opens it
+ * O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600 directly (no ofstream, no separate
+ * chmod-after-open window — under a normal umask the file is 0600 from the
+ * instant it exists; an unusual umask can only narrow that, never widen it,
+ * which is what the fchmod re-tightening below is for); Windows opens it
  * with `std::ios::noreplace` (C++23 P2467R1; CREATE_NEW semantics). Either
  * way, a file already at the exclusive-create temp path — planted or left
  * over — makes the create FAIL, rather than being followed or overwritten.
@@ -33,8 +35,11 @@
  * mode stays deterministic under an unusual umask, mirroring
  * agent_csr.cpp's write_private_key. A failure here is reported as a
  * WriteWarning but does not block persistence. The Windows DACL is not
- * tightened — the same documented follow-up as agent_csr.cpp's
- * write_private_key.
+ * tightened here at all — a narrower gap than agent_csr.cpp's
+ * write_private_key, which at least makes the same (Windows-ineffective)
+ * fs::permissions call agent_csr.cpp does; both are the same open,
+ * documented follow-up in practice, since neither actually restricts the
+ * Windows ACL.
  *
  * Residual: after the fd closes, the rename below still addresses the temp
  * by path (`fs::rename(tmp, dest)`), so a writer already inside the agent's
@@ -249,6 +254,10 @@ write_state_file_atomic(const std::filesystem::path& dest, std::string_view byte
     }
 #else
     {
+        // First use of std::ios::noreplace (P2467R1) in this codebase, and its
+        // exclusive-create behavior on real MSVC is unverified from this host (no
+        // Windows toolchain available here) -- tracked for real-hardware
+        // verification alongside issue #4723's Windows dangling-symlink question.
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc | std::ios::noreplace);
         if (!out)
             return std::unexpected(IoError{"cannot create " + tmp.string() + " for writing"});
