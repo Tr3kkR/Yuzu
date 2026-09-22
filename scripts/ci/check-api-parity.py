@@ -136,7 +136,27 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # class as the pre-existing device-live/run and device-live/result rows they
 # sit alongside; inventory-software-devices -- a fleet-wide software search
 # fragment with no REST twin proposed yet) -- net +3 untwinned, 206 -> 209.
-BASELINE_UNTWINNED = 209
+#
+# #2146 A2-R1 (merged into dev's 209 by the #4581-region dev-catch-up merge):
+# get.api-executions-param-children flipped planned:#2146 -> twinned (GET
+# /api/v1/executions/{id}/children + MCP get_execution_children) -- value
+# below reconciled post-merge against the actual measured count (208), not
+# hand-picked from either side's stale pre-merge number (212 vs 209).
+#
+# #2146 A2-R2 (merged into dev's 208 as #4652): response-query REST v1 + MCP
+# twins land, flipping three legacy rows in scripts/ci/api-parity/other.json
+# (GET /api/responses/{param}, .../aggregate, .../export) to "twinned"
+# against the new /api/v1/responses/{id}, .../aggregate, .../export routes
+# + their MCP twins (query_responses, aggregate_responses; export has no
+# MCP twin) -- measured post-build at 205 (208 - 3), not hand-picked.
+#
+# #2146 A2-R4 (this dev-catch-up merge, on top of dev's 205): approval-review
+# REST v1/MCP parity flips 2 other.json rows to "twinned" (GET /api/approvals
+# -> GET /api/v1/approvals + list_pending_approvals; GET
+# /api/approvals/pending/count -> GET /api/v1/approvals/pending/count +
+# get_pending_approval_count) -- measured post-build at 203 (205 - 2), not
+# hand-picked.
+BASELINE_UNTWINNED = 203
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

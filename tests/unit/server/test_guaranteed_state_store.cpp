@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -447,10 +448,27 @@ TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted a
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     auto e = make_event("evt-r", "rule-1", "agent-A");
-    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+    const std::int64_t before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+    const auto inserted = store.insert_event_classified(e);
+    const std::int64_t after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+    CHECK(inserted.outcome == EventInsertOutcome::Inserted);
+    // #4606 criterion-10 T_server: a fresh Inserted result carries a real, recent
+    // wall-clock commit instant (benchmark-diagnostic field, not a precision
+    // assertion) — bounded between the timestamps taken immediately either side
+    // of the call, with generous slack for scheduler jitter.
+    CHECK(inserted.committed_wall_ns > 0);
+    CHECK(inserted.committed_wall_ns >= before_ns);
+    CHECK(inserted.committed_wall_ns <= after_ns + std::chrono::nanoseconds(std::chrono::seconds(5)).count());
 
     // Exact redelivery: identical row, same event_id.
-    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+    const auto redelivered = store.insert_event_classified(e);
+    CHECK(redelivered.outcome == EventInsertOutcome::Redelivered);
+    // committed_wall_ns is populated for Inserted only — 0 for every other outcome.
+    CHECK(redelivered.committed_wall_ns == 0);
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
     CHECK(store.events_redelivered_total() == 1);

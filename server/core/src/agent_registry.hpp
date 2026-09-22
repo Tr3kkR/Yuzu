@@ -507,6 +507,17 @@ struct AgentSession {
     std::vector<PluginMeta> plugin_meta;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
+    /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
+    /// `StreamStatusNotification` announced (`request.cluster_id()`),
+    /// published by `set_gateway_route` under `stream_mu` alongside
+    /// `gateway_node`/capabilities/`gateway_stream_home_id` — same lock,
+    /// same call, for the same atomic-publish reason (see `gateway_node`'s
+    /// sibling comments). Read by `send_to`/`send_to_all` to stamp
+    /// `GatewayPendingCmd::cluster_id` so `forward_gateway_pending` dials the
+    /// owning cluster instead of always the single legacy stub. Empty for a
+    /// direct (non-gateway) agent, or a gateway build predating 4.3 that
+    /// never sets `StreamStatusNotification.cluster_id`.
+    std::string cluster_id;
 
     // Stream pointer -- valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -654,9 +665,33 @@ public:
     /// `AgentSession::gateway_stream_home_id`'s comment. Defaults to empty so
     /// every pre-#4324 call site (tests, any caller not yet threading the
     /// wire field through) keeps compiling and behaving exactly as before.
-    void set_gateway_route(const std::string& agent_id, const std::string& node,
-                           std::vector<std::string> capabilities,
-                           std::string stream_home_id = {});
+    ///
+    /// `cluster_id` (HA WS-4 4.3) is published in the SAME call, under the
+    /// SAME lock, for the SAME reason — see `AgentSession::cluster_id`'s
+    /// comment. Defaults to empty so every pre-4.3 call site keeps compiling
+    /// and behaving exactly as before (empty means "single-cluster / legacy
+    /// stub", see `forward_gateway_pending`).
+    ///
+    /// HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    /// BLOCKER 2): `session_id` is now REQUIRED and checked against the
+    /// currently-installed session before anything is written — mirroring
+    /// `gateway_stream_home_id`'s own guard two members below, which already
+    /// had this check while this setter did not. Without it, a delayed
+    /// CONNECTED for a session already superseded by a genuine newer
+    /// registration (`NotifyStreamStatus`'s OWN session check only confirms
+    /// `session_id` is SOME live entry for this `agent_id` in
+    /// `gateway_sessions_`, not that it is the CURRENT one) could clobber the
+    /// live session's `gateway_node`/capabilities/`stream_home_id` before the
+    /// durable store even had a chance to reject the corresponding
+    /// `announce_connected` write. Returns `false` (no-op, nothing written)
+    /// when `agent_id` is unknown OR its currently-installed session's id
+    /// does not equal `session_id` — the caller must treat `false` as a
+    /// stale/rejected publish, not a silent success.
+    [[nodiscard]] bool set_gateway_route(const std::string& agent_id, const std::string& session_id,
+                                         const std::string& node,
+                                         std::vector<std::string> capabilities,
+                                         std::string stream_home_id = {},
+                                         std::string cluster_id = {});
 
     /// HA WS-4 #4324: the `stream_home_id` most recently published for
     /// `agent_id` via `set_gateway_route`, IFF the presented `session_id`
@@ -824,13 +859,16 @@ public:
         // only re-wraps this into a `SendCommandRequest`, never re-decides
         // classification or authorization.
         pb::CommandRequest cmd;
-        /// WS-4 4.2b Task C: the cluster this entry was routed via the
-        /// GatewayRouteStore directory FALLBACK path (`send_via_directory`),
-        /// as opposed to the pre-existing `gateway_node`-session path (`nullopt`
-        /// here — `forward_gateway_pending` has always had exactly one
-        /// `gw_mgmt_stub_` to forward to regardless of node/cluster, so the
-        /// pre-existing path never needed to carry one). Carried through for
-        /// 4.3 (multi-cluster fan-out); inert until then.
+        /// WS-4 4.2b Task C introduced this field for the GatewayRouteStore
+        /// directory FALLBACK path (`send_via_directory`) alone, "carried
+        /// through for 4.3, inert until then." WS-4 4.3 makes it live and
+        /// extends population to the far more common `send_to`/`send_to_all`
+        /// gateway-session path too (`AgentSession::cluster_id`, stamped by
+        /// `set_gateway_route`) — `nullopt` now means "no cluster identity
+        /// available" (a direct agent, or a gateway build predating 4.1/4.3),
+        /// not "not the fallback path." `forward_gateway_pending`
+        /// (server.cpp) resolves this against the configured per-cluster
+        /// stub map; `nullopt`/empty resolves to the legacy single stub.
         std::optional<std::string> cluster_id;
     };
 

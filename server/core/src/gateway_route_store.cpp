@@ -369,6 +369,58 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     return AnnounceResult{.matched = false};
 }
 
+std::expected<bool, GatewayRouteStoreError>
+GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
+                                              std::string_view session_id,
+                                              int lease_ttl_secs) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::reclaim_tombstoned_session: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // Same ON-CONFLICT-DO-UPDATE-WHERE idiom as register_fresh's guarded
+    // upsert, but the guard is `session_id IS NULL` — a genuinely
+    // TOMBSTONED row (deregister sets session_id=NULL, never a
+    // register_fresh row, whose session_id is set immediately on creation).
+    // The INSERT branch (no existing row at all) supplies the real
+    // session_id directly, so this `session_id IS NULL` guard only ever
+    // matters on the UPDATE/conflict branch — this is a resurrection of the
+    // SAME session under a tombstone, not a new one racing for the row, so
+    // the guard is on session identity, not an epoch comparison.
+    // (HA WS-4 4.4 post-build review, PR #4636 FortitudeEtc minor finding:
+    // this comment was previously truncated mid-sentence — corrected here,
+    // no code change.) connection_epoch is 0 on a brand-new row (INSERT)
+    // and UNTOUCHED on a re-armed existing tombstone (UPDATE never sets
+    // it) — either way a genuine concurrent or later register_fresh still
+    // always wins regardless of commit order (file header "THE FENCE"):
+    // its nextval mint exceeds a fresh row's 0, and a tombstone's retained
+    // epoch is exactly what register_fresh already tolerated overwriting.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO gateway_route_store.agent_routes "
+        "  (agent_id, connection_epoch, session_id, lease_until, updated_at) "
+        "VALUES ($1, 0, $2, now() + ($3 || ' seconds')::interval, now()) "
+        "ON CONFLICT (agent_id) DO UPDATE SET "
+        "  session_id = EXCLUDED.session_id, "
+        "  lease_until = EXCLUDED.lease_until, "
+        "  updated_at = now() "
+        "WHERE agent_routes.session_id IS NULL "
+        "RETURNING agent_id",
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::to_string(lease_ttl_secs)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::reclaim_tombstoned_session: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    // Zero rows: the ON CONFLICT branch's WHERE guard rejected the update
+    // because the row belongs to a DIFFERENT, LIVE (non-NULL) session — a
+    // genuine stale/zombie replay. The caller must refuse it outright.
+    return PQntuples(res.get()) == 1;
+}
+
 std::expected<DeregisterResult, GatewayRouteStoreError>
 GatewayRouteStore::deregister(std::string_view agent_id, std::string_view session_id,
                               std::string_view stream_home_id) {
@@ -507,10 +559,62 @@ GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
     session_views.reserve(session_ids.size());
     for (const std::string& s : session_ids)
         session_views.emplace_back(s);
+    // HA WS-4 4.4 review fix (sec-H1, BLOCKING; round-3 Fable pass extended
+    // it to `updated_at` too — see below): a row that was ADOPTED or
+    // RECLAIMED (session_id set) but never received its own confirming
+    // CONNECTED (cluster_id/gateway_node still NULL — e.g. the
+    // reannounce/2 notification that would have confirmed it was dropped
+    // at ?MAX_NOTIFY_INFLIGHT capacity or during a circuit-open window)
+    // must NOT have its lease extended indefinitely by ordinary
+    // BatchHeartbeat renewals — the agent keeps heartbeating (so nothing
+    // else ever notices), while the row stays PERMANENTLY unroutable
+    // (`routable` requires `cluster_id IS NOT NULL`) with no path back to
+    // `reclaim_tombstoned_session` ever running again. A plain `CASE`
+    // (never `LEAST(...)` — an earlier draft of this comment named the
+    // wrong construct) leaves a cluster_id-IS-NULL row's `lease_until` and
+    // `updated_at` UNCHANGED — heartbeat renewals become a complete no-op
+    // for it instead of pushing it forward forever.
+    //
+    // BOTH columns, not just `lease_until` (round-3 Fable review fix): a
+    // freshly `register_fresh`'d row never had a lease at all
+    // (`lease_until IS NULL` until its own `announce_connected`), so
+    // leaving only `lease_until` alone would do nothing for THIS row shape
+    // — sweep (a) below requires `lease_until IS NOT NULL` and never sees
+    // it, while sweep (b) (the tombstone/never-announced purge) keys on
+    // `updated_at`, which unconditional renewal was still bumping forever.
+    // Freezing `updated_at` too means a `register_fresh` row whose very
+    // FIRST CONNECTED is dropped is no longer immune to BOTH sweeps —
+    // sweep (b) purges it after `kTombstonePurgeAgeSecs` (see
+    // `reap_stale_routes()`), which then surfaces on every subsequent
+    // heartbeat as `renew_leases`'s own `shortfall` desync outcome instead
+    // of silently matching forever. This is bootstrap-safe: `register_fresh`,
+    // `announce_connected`, and `reclaim_tombstoned_session` all stamp their
+    // OWN `updated_at = now()` directly, so a row genuinely still converging
+    // (CONNECTED in flight, not yet 5 minutes stale) is untouched by this
+    // freeze — only a row BatchHeartbeat is the sole thing keeping "fresh"
+    // is affected, which is exactly the stuck state this fix targets.
+    //
+    // Either way, this closes the loop only as far as making a stuck row
+    // TOMBSTONED/PURGED and OBSERVABLE (via the `shortfall` desync outcome
+    // once heartbeats stop matching) — not instantly "healed": convergence
+    // itself still requires the NEXT circuit-recovery replay (which adopts
+    // the reclaimed/re-created row and re-triggers a reannounce) or the
+    // agent's own natural reconnect. If that replay's OWN reannounce is
+    // ALSO dropped, the same cycle repeats rather than compounding into a
+    // permanent state — see `?MAX_NOTIFY_INFLIGHT` follow-up `#4632` for
+    // the actual lever on how often that happens. A CONVERGED row
+    // (cluster_id set) is completely unaffected by any of this —
+    // `announce_connected` is the sole writer of `cluster_id`, and it
+    // always grants a full, unfrozen fresh lease + `updated_at` on every
+    // genuine CONNECTED, independent of whatever this function did
+    // beforehand.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes AS r SET "
-        "  lease_until = now() + ($3 || ' seconds')::interval, updated_at = now() "
+        "  lease_until = CASE WHEN r.cluster_id IS NULL THEN r.lease_until "
+        "                     ELSE now() + ($3 || ' seconds')::interval END, "
+        "  updated_at = CASE WHEN r.cluster_id IS NULL THEN r.updated_at "
+        "                    ELSE now() END "
         "FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
         "WHERE r.agent_id = t.agent_id AND r.session_id = t.session_id "
         "RETURNING r.agent_id",

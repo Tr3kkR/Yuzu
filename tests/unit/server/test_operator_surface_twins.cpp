@@ -433,6 +433,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
     {"get_workflow_execution", "Workflow", "Read", true},
+    // #2146 A2-R1 - pinned against the new GET /api/v1/executions/{id}/children
+    // (rest_api_v1.cpp) and legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) handlers' shared (securable, operation) gate.
+    {"get_execution_children", "Execution", "Read", true},
     // #4029 (api-parity Batch A content/catalog half): instruction-definition
     // read twins, pinned against instruction_definition_model.hpp / the new
     // GET /api/v1/instructions* routes (rest_api_v1.cpp).
@@ -561,6 +565,12 @@ constexpr TwinRow kExpectedTwins[] = {
     // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
     // app-usage), same (securable, operation) the MCP twin enforces.
     {"get_agent_app_usage", "Forensics", "Read", true},
+    // #2146 A2-R4 (review finding, PR #4656) — approval-review read twins.
+    // Pinned against rest_api_v1.cpp's GET /api/v1/approvals and GET
+    // /api/v1/approvals/pending/count, same Approval:Read gate the MCP
+    // twins' tier_allows/perm_fn calls enforce.
+    {"list_pending_approvals", "Approval", "Read", true},
+    {"get_pending_approval_count", "Approval", "Read", true},
 };
 
 } // namespace
@@ -629,6 +639,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_pending_approval_count",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");

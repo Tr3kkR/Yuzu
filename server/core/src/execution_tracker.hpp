@@ -198,6 +198,35 @@ struct EventOutboxReapOutcome {
     bool clock_anomaly{false};
 };
 
+/// #2146 A2-R1 governance re-review (blocking): `get_children_checked`'s
+/// underlying query was unbounded (no LIMIT at all), unlike its sibling
+/// `ScheduleEngine::query_schedules_checked` (`schedule_engine.hpp`'s
+/// `ScheduleListResult`, whose shape this mirrors exactly). `truncated` is
+/// `true` when the row cap (`kExecutionChildrenCap`, execution_tracker.cpp)
+/// dropped rows past the newest `dispatched_at`-ordered window -- REST v1
+/// `GET /api/v1/executions/{id}/children`, the legacy
+/// `GET /api/executions/{id}/children`, and MCP `get_execution_children` all
+/// surface it as `result_truncated_by_cap` so a capped response is never
+/// presented as the parent's complete child list.
+///
+/// #2146 A2-R1 Gate 8 re-review fix: the cap used to apply to the RAW,
+/// unfiltered `parent_id`-matched row set, BEFORE any caller-side
+/// `execution_visible` confinement filter -- a confined caller's own visible
+/// children could be entirely displaced out of the capped window by
+/// invisible siblings dispatched more recently, with no signal that this
+/// happened (`truncated:false` while the caller's OWN visible set was
+/// silently incomplete). `get_children_checked` now takes the caller's
+/// `ExecutionScope` and pushes it into the query (via
+/// `append_execution_scope_clause`) BEFORE `ORDER BY`/`LIMIT` -- the SAME
+/// SQL-pushdown pattern `query_executions_checked` already uses for the
+/// LIST route (ADR-0017 INV-3). `truncated` now answers "did THIS CALLER's
+/// own visible row set exceed the cap" under an engaged scope, or "did the
+/// fleet-wide row set exceed the cap" when `scope` is `nullopt`.
+struct ExecutionChildrenResult {
+    std::vector<Execution> children;
+    bool truncated{false};
+};
+
 class ExecutionTracker {
 public:
     explicit ExecutionTracker(pg::PgPool& pool);
@@ -298,12 +327,41 @@ public:
     std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
     get_agent_statuses_for_executions_checked(
         const std::vector<std::string>& execution_ids) const;
+    /// Best-effort convenience wrapper over `get_children_checked` with
+    /// `scope = nullopt` -- test-only production usage today (no confined
+    /// caller). Discards BOTH the degrade signal (a pool/query failure
+    /// collapses to the same empty vector a genuinely childless parent
+    /// returns) and `ExecutionChildrenResult::truncated` -- silently, since
+    /// no caller today reads past `kExecutionChildrenCap` rows to notice. A
+    /// future caller that needs either signal should call
+    /// `get_children_checked` directly rather than add it here.
     std::vector<Execution> get_children(const std::string& parent_id) const;
     /// #3789: degrade-distinguishable twin of `get_children`, for the
     /// migrated `/api/executions/{id}/children` route — `nullopt` on a
     /// pool/query failure, an empty vector means the parent genuinely has
-    /// no children.
-    std::optional<std::vector<Execution>> get_children_checked(const std::string& parent_id) const;
+    /// no children. #2146 A2-R1 (governance re-review, blocking): the query
+    /// is now hard-capped at `kExecutionChildrenCap` rows (execution_tracker.cpp)
+    /// -- previously unbounded, unlike every other list-shaped read in this
+    /// class -- so `ExecutionChildrenResult::truncated` tells all three
+    /// callers (REST v1, the legacy route, MCP) when the cap dropped rows.
+    ///
+    /// #2146 A2-R1 Gate 8 re-review fix: `scope` is now REQUIRED, not
+    /// defaulted -- deliberately, mirroring `authz::VisibleSet`'s own "require
+    /// it, never default it" rule (authz_model.hpp), so a caller cannot
+    /// forget to thread its real confinement scope and compile clean anyway.
+    /// Pass `std::nullopt` explicitly for an unrestricted read (every
+    /// existing test/tool-internal caller that has no confinement scope to
+    /// thread does exactly this). When `scope` is engaged,
+    /// `append_execution_scope_clause` pushes the SAME owner-or-visible-agent
+    /// admission predicate `execution_visible` (execution_scope_rules.hpp)
+    /// decides in-process into the SQL `WHERE` clause, BEFORE `ORDER BY`/
+    /// `LIMIT` (ADR-0017 INV-3) -- so the cap applies to THIS CALLER's own
+    /// visible row set, not the fleet-wide raw one. `truncated == false`
+    /// now genuinely means every child this caller can see was returned;
+    /// under `nullopt`, it answers "did the fleet-wide row set exceed the
+    /// cap", exactly as before.
+    std::optional<ExecutionChildrenResult>
+    get_children_checked(const std::string& parent_id, const ExecutionScope& scope) const;
 
     // Mutation
     std::expected<std::string, std::string> create_execution(const Execution& exec);

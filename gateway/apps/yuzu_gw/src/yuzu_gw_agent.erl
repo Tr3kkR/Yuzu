@@ -28,7 +28,8 @@
 -export([start_link/1,
          dispatch/3,
          get_info/1,
-         disconnect/1]).
+         disconnect/1,
+         reannounce/2]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3, code_change/4]).
@@ -76,6 +77,28 @@ get_info(Pid) ->
 -spec disconnect(pid()) -> ok.
 disconnect(Pid) ->
     gen_statem:cast(Pid, disconnect).
+
+%% @doc HA WS-4 4.4 (`#4246` #6): tell this agent process its upstream
+%% `ProxyRegister` replay was ADOPTED under `SessionId` (the server
+%% published S, never a fresh mint) — so this process should RE-SEND its
+%% own CONNECTED notification, republishing `gateway_node`/
+%% `wire_capabilities`/`stream_home_id` through the existing, session-
+%% guarded `NotifyStreamStatus` -> `set_gateway_route` path. This is the
+%% mechanism that converges the server's in-memory placement after
+%% `ProxyRegister` (which always installs a brand-new `AgentSession`,
+%% wiping that trio — see gateway_service_impl.cpp's ProxyRegister) —
+%% NOT a new state or a second `CONNECTED` for a DIFFERENT home; the
+%% `streaming` clause below only acts when `SessionId` still matches this
+%% process's OWN session, so a superseded/dead process ignores it (a cast
+%% to a dead pid is silently dropped by the runtime; a cast to a pid that
+%% has since moved on to a DIFFERENT session is dropped by the match
+%% guard below), and it always resends the SAME `stream_home_id` this
+%% process already holds — never a new one — so the standing invariant
+%% against a same-session `CONNECTED(S, home2)` (gateway_route_store.hpp's
+%% FORWARD NOTE) is not violated.
+-spec reannounce(pid(), binary()) -> ok.
+reannounce(Pid, SessionId) ->
+    gen_statem:cast(Pid, {upstream_reannounced, SessionId}).
 
 %%%===================================================================
 %%% gen_statem callbacks
@@ -181,7 +204,31 @@ connecting(info, {'DOWN', MonRef, process, _Pid, _Reason},
     {next_state, disconnected, Data};
 
 connecting(cast, disconnect, Data) ->
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+connecting(cast, {upstream_reannounced, SessionId},
+           #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+                stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 review fix (N1): init/1 sends this process's ONLY
+    %% CONNECTED before the state machine ever reaches `connecting`
+    %% (neither `connecting` nor `stream_ready`'s transition to
+    %% `streaming` sends a second one) — so an ADOPT landing in this
+    %% narrow window, before Subscribe's stream_pid arrives, must still
+    %% re-announce here, or the server's placement (wiped by
+    %% `register_agent`) stays unrecovered until this session eventually
+    %% disconnects and reconnects. Same payload, same mechanism as the
+    %% `streaming` clause below — only the state differs.
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED (still connecting) to converge server-side placement",
+                [AgentId, SessionId]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+connecting(cast, {upstream_reannounced, _OtherSessionId}, _Data) ->
+    %% A superseded session — same rationale as streaming's own mismatch
+    %% clause below.
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: streaming — the hot path
@@ -249,7 +296,32 @@ streaming(cast, disconnect, Data) ->
         undefined -> ok;
         _         -> StreamPid ! close_stream
     end,
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+streaming(cast, {upstream_reannounced, SessionId},
+          #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+               stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 (`#4246` #6, reannounce/2's doc comment): SessionId still
+    %% matches this process's own session (the equality is enforced by the
+    %% pattern match, not a guard) — re-send the SAME CONNECTED payload this
+    %% process already advertised at init/1, republishing gateway_node/
+    %% wire_capabilities/stream_home_id through the ordinary session-guarded
+    %% path. Does not change `Data` (nothing about THIS process's own state
+    %% changed — only the server's independently-installed placement did).
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED to converge server-side placement", [AgentId, SessionId]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+streaming(cast, {upstream_reannounced, _OtherSessionId}, Data) ->
+    %% This process has since moved on to a DIFFERENT session than the one
+    %% the (now-stale) replay drip entry adopted — a benign race between the
+    %% drip and a genuine agent reconnect. Ignore; the reconnect's own
+    %% CONNECTED already carries the correct, current placement.
+    logger:debug("Agent ~s: ignoring stale upstream_reannounced for a superseded session",
+                [Data#data.agent_id]),
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: disconnected — cleanup and terminate
