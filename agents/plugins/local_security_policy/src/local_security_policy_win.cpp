@@ -421,7 +421,7 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     const ScratchSweepResult swept = sweep_stale_scratch_dirs(
-        std::filesystem::path{std::string{data_dir}}.wstring(), static_cast<std::int64_t>(now));
+        yuzu::win::to_wide(std::string{data_dir}), static_cast<std::int64_t>(now));
     spdlog::info("local_security_policy: {}", format_sweep_summary(swept));
     if (swept.enumerate_error)
         spdlog::warn("local_security_policy: sweep could not enumerate data_dir (os error {})",
