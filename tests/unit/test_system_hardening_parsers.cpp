@@ -327,17 +327,41 @@ TEST_CASE("system_hardening: a run of only values and absent keys adds no token 
     CHECK(acc.reason().empty());
 }
 
-TEST_CASE("system_hardening: every key absent is still not a failure",
+// Fails under: dropping the all-ENOENT canary (a hidden /proc/sys reading as 11
+// independently-absent rows and a clean OK/FULL, indistinguishable from a healthy host).
+TEST_CASE("system_hardening: every key individually absent is a row fact; ALL of them absent "
+          "together is a canary",
           "[system_hardening][collect]") {
     ConstraintAccumulator acc;
     const auto rows =
         collect_linux_posture([](std::string_view) { return ReadOutcome{ENOENT, 0, {}}; }, acc);
     REQUIRE(rows.size() == kLinuxAllowlist.size());
     for (const auto& r : rows) {
+        // Each row still reports the true, per-key fact: this key was not there.
         CHECK(r.state == PostureState::absent);
         CHECK(r.raw == "-");
     }
+    // But eleven-for-eleven ENOENT is not a healthy host with nothing configured -- it is
+    // /proc/sys itself not being the tree this plugin expects (ProcSubset=pid, a restricted
+    // container). That downgrades the overall result, without touching any row above.
+    CHECK(acc.any_failure());
+    CHECK(acc.reason() == "proc_sys:not_visible");
+}
+
+// Fails under: the canary firing on a real host where some keys are legitimately absent
+// (e.g. no Yama LSM) but most keys read cleanly -- only ALL ELEVEN absent should trip it.
+TEST_CASE("system_hardening: a mostly-present host with a few legitimately-absent keys "
+          "never trips the all-absent canary",
+          "[system_hardening][collect]") {
+    auto reader = [](std::string_view path) -> ReadOutcome {
+        if (path == "/proc/sys/kernel/yama/ptrace_scope") return {ENOENT, 0, {}};
+        return {0, 0, "1"};
+    };
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(reader, acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
     CHECK_FALSE(acc.any_failure());
+    CHECK(acc.reason().empty());
 }
 
 TEST_CASE("system_hardening: a mixed absent + EACCES run reports exactly the EACCES token",

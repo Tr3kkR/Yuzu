@@ -312,14 +312,24 @@ struct PostureStatus {
 }
 
 /// `read(path)` -> ReadOutcome. One row per kLinuxAllowlist entry, in order.
+///
+/// Canary: any ONE key legitimately not existing is a real, per-key `absent` (some
+/// kernels lack `kernel.yama.ptrace_scope`, for instance, and that alone is not
+/// suspicious). ALL ELEVEN keys reading ENOENT together is a different fact -- it means
+/// `/proc/sys` itself is not the tree this plugin expects (a `ProcSubset=pid` mount, a
+/// restricted container/chroot), not that every hardening knob coincidentally vanished.
+/// That aggregate case adds one `proc_sys:not_visible` token so the result downgrades to
+/// CONSTRAINED; it does not change any individual row, which is still reporting a true fact.
 template <typename Reader>
 [[nodiscard]] std::vector<PostureRow> collect_linux_posture(Reader&& read,
                                                             yuzu::shared::ConstraintAccumulator& acc) {
     std::vector<PostureRow> rows;
     rows.reserve(kLinuxAllowlist.size());
+    std::size_t enoent_count = 0;
     for (const auto& k : kLinuxAllowlist) {
         const ReadOutcome o = read(k.path);
         if (o.err != 0) {
+            if (o.err == ENOENT) ++enoent_count;
             rows.push_back(failed_row("linux", k.key, o.err, acc));
             continue;
         }
@@ -327,6 +337,8 @@ template <typename Reader>
         const auto state = evaluate_linux(k.key, raw);
         rows.push_back({"linux", k.key, std::move(raw), state});
     }
+    if (enoent_count == kLinuxAllowlist.size())
+        acc.add_failure("proc_sys:not_visible");
     return rows;
 }
 
