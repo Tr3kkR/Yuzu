@@ -27,18 +27,21 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 > **Method (reproduce this before trusting the number).** Every figure below is a direct
-> tally of the per-entry status icons in the 39 domains that follow — no entry is counted
+> tally of the per-entry status icons in the 40 domains that follow — no entry is counted
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 25 46 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `194 25 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
 > file presence and meson-build compilation only** (grep/`ls`/`meson.build` census, 2026-09-07);
 > their per-row behavioural claims (exact signal counts, retention windows, etc.) are inherited
 > from the unmerged 2026-07 capability-industry review rather than independently re-derived
-> this session — honest scoping over implied uniform depth. Domains 1-31's regraded rows each
+> this session — honest scoping over implied uniform depth. **Domain 40 (Reflex) is new,
+> added 2026-09-17 (R0 of the Spark/Reflex/DEX macOS programme) — design-only, zero code, every
+> row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.**
+> Domains 1-31's regraded rows each
 > carry their own inline evidence citation and verification date. **Rows regraded or added carry
 > the marker `*(verified <date>)*`; all other rows carry their v3.0 (2026-03-30) grade unchanged
 > and were NOT re-verified.** The marker carries **three possible dates**: `2026-09-07` (the v4.0
@@ -61,10 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/172 done (75%) (21 partial)
-Future       [=========-----------------------]  10/34 done  (29%) (3 partial)
+Advanced     [========================--------]  129/175 done (74%) (21 partial)
+Future       [=========-----------------------]  10/35 done  (29%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/265 done (73%) (25 partial)
+Overall      [=======================---------]  194/269 done (72%) (25 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -108,7 +111,8 @@ Overall      [=======================---------]  194/265 done (73%) (25 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **194** | **25** | **46** |
+| 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
+| **TOTAL** | **269** | **194** | **25** | **50** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -266,7 +270,7 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 ### 3.9 Printer Inventory :white_check_mark: `T3` *(verified 2026-09-15)*
 
-`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. See `agents/plugins/printing/README.md`.
+`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. `clear_queue` cancels exactly one job (Destructive/Irreversible, admin-or-approval) with no purge-all path. See `agents/plugins/printing/README.md`.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2` *(verified 2026-09-10)*
 
@@ -1539,6 +1543,55 @@ Closed-set `principal_class` label (`human` / `agent` / `none` / `engine`) for H
 ### 39.3 On-Behalf-Of Assertion Guard :white_check_mark: `T2` *(verified 2026-09-07)*
 
 The server rejects — not silently ignores — any on-behalf-of assertion on every ingress surface (REST, MCP, agent gRPC) until Phase 5 server-verifiable delegation ships; a rejected assertion is a hard error, so a header-stamping proxy fails loudly rather than silently impersonating. Per CLAUDE.md's routed-concerns table, the four health-probe paths are the sole exception (so a header-stamping proxy doesn't crash-loop the server). *(Evidence: `server/core/src/on_behalf_guard.hpp`.)*
+
+---
+
+## 40. Reflex — Agent-Local Automated Response
+
+*Design-only as of this entry (R0 of the Spark/Reflex/DEX macOS programme, 2026-09-17). Sparks
+(ADR-0021, §31) already give the agent a converged, use-case-agnostic detection layer; Reflex is the
+third sovereign Spark consumer alongside Guardian (§31, real-time compliance enforcement) and DEX
+(§32, curated telemetry) — never a specialization of either. A Reflex is a YAML-authored, agent-local
+binding from a Spark to a small chain (≤ 4) of plugin-action Reactions, executed on the device the
+instant the Spark fires, with or without server connectivity, deployed only as part of a Reflex Set
+(exactly the Baseline grammar — individual Reflexes never deploy alone). Design contract:
+`docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md` (Decisions 2, 4, 5, 6, 7,
+8, 9, 10 and the 2026-09-17 amendment). No code exists yet — no GitHub tracking issue filed for this domain
+as a whole; see `docs/roadmap.md` Phase 20.*
+
+### 40.1 Reflex Set Authoring and Safety/Consent Gates :x: `T2`
+
+Not implemented. YAML-authoritative Reflex Set CRUD; the `dangerous_reactions_in_spec()` safety
+chokepoint (extends the existing `dangerous_*_in_spec` doctrine, §24 of
+`docs/yuzu-guardian-design-v1.1.md`, fed by `CommandCapabilityRegistry::classify`); the
+device-classification consent gate (free-form `device_class` asset tag, `server` | `workstation`,
+unclassified = workstation = fail-closed).
+
+### 40.2 Digest-Bound Two-Person Approval and Deploy :x: `T2`
+
+Not implemented. Deploy gated on a dedicated `Reflex:Execute` RBAC permission (never the
+Guardian-only `Push` cross-seed array); approval by a principal distinct from both the last content
+editor and the deployer, bound to a canonical digest over compiled content + assignment scope,
+recomputed and compared at every compile — fail-closed on mismatch.
+
+### 40.3 Agent-Local Spark→Reaction Execution :x: `T2`
+
+Not implemented. `ReflexEngine`, a queued (never inline) SparkEngine consumer that runs a fired
+Reflex's Reaction chain locally via the agent's `LocalDispatcher` — authorized once, at deploy time,
+by 40.1/40.2, never re-authorized per fire. Wire: reserved plugin name `__reflex__` (`push_sets` /
+`get_status` / `status`), mirroring `__guard__`'s two-halves reserved-name interception.
+
+### 40.4 Reflex Outcomes, Observability, and Dashboard :x: `T3`
+
+Not implemented. Outcomes reuse the existing `__guard__`/`event` channel
+(`GuaranteedStateEvent.family == "reflex"`), land in a Reflex-only `reflex_outcomes` table (a
+deliberate, ADR-amended partial exception to Decision 6's "one event store" — the single ingest
+router chokepoint is unaffected). The push itself is a SEPARATE `ReflexSetPush`/generation counter,
+an accepted-interim, ADR-amended exception to Decision 8's single compiled per-device document —
+not yet folded into it. Reflex outcomes are never surfaced on the executions-history ladder
+(agent-local automation, not operator dispatch). Fleet Prometheus families, heartbeat tags, audit
+verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard round-tripping the YAML
+— never the model.
 
 ---
 

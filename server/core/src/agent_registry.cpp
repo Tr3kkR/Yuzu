@@ -422,7 +422,8 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
 bool AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& session_id,
                                       const std::string& node,
                                       std::vector<std::string> capabilities,
-                                      std::string stream_home_id) {
+                                      std::string stream_home_id,
+                                      std::string cluster_id) {
     std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
@@ -452,6 +453,30 @@ bool AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     session->gateway_wire_capabilities =
         std::unordered_set<std::string>(capabilities.begin(), capabilities.end());
     session->gateway_stream_home_id = std::move(stream_home_id);
+    // HA WS-4 4.3: same atomic publish, same reason — see AgentSession::
+    // cluster_id's comment.
+    session->cluster_id = std::move(cluster_id);
+    return true;
+}
+
+bool AgentRegistry::unpublish_gateway_route(const std::string& agent_id,
+                                            const std::string& session_id) {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return false;
+        session = it->second;
+    }
+    // Same lock domain as set_gateway_route, for the same M1 reason: a
+    // reader (send_to/send_to_all) must never observe a torn intermediate
+    // state between clearing these four fields.
+    std::lock_guard slock(session->stream_mu);
+    session->gateway_node.clear();
+    session->gateway_wire_capabilities.clear();
+    session->gateway_stream_home_id.clear();
+    session->cluster_id.clear();
     return true;
 }
 
@@ -686,8 +711,16 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         // gateway_wire_capabilities (set/cleared under the same lock).
         if (gateway_capability_missing(*session, metrics_, agent_id))
             return false;
+        // HA WS-4 4.3: stamp the session's own cluster_id (published by
+        // set_gateway_route under this same stream_mu) so
+        // forward_gateway_pending dials the owning cluster instead of always
+        // the single legacy stub. Empty -> nullopt, matching how
+        // GatewayRouteStore::RoutableRoute already treats an empty/absent
+        // cluster as non-routable.
+        std::optional<std::string> cluster_id =
+            session->cluster_id.empty() ? std::nullopt : std::make_optional(session->cluster_id);
         std::lock_guard glock(gw_pending_mu_);
-        gw_pending_.push_back({agent_id, cmd.wire()});
+        gw_pending_.push_back({agent_id, cmd.wire(), std::move(cluster_id)});
         return true;
     }
     if (session->stream)
@@ -718,8 +751,11 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
             // stream already excludes a direct agent without aborting the loop.
             if (gateway_capability_missing(*s, metrics_, s->agent_id))
                 continue;
+            // HA WS-4 4.3: see send_to()'s matching comment.
+            std::optional<std::string> cluster_id =
+                s->cluster_id.empty() ? std::nullopt : std::make_optional(s->cluster_id);
             std::lock_guard glock(gw_pending_mu_);
-            gw_pending_.push_back({s->agent_id, cmd.wire()});
+            gw_pending_.push_back({s->agent_id, cmd.wire(), std::move(cluster_id)});
             ++count;
         } else if (s->stream && s->stream->Write(cmd.wire(), grpc::WriteOptions())) {
             ++count;

@@ -35,6 +35,7 @@
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
+#include "approval_model.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
@@ -59,6 +60,7 @@
 #include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
+#include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
 #include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
@@ -748,6 +750,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
+#include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
+#include "workflow_api_local.hpp"       // ADR-0031 WS-A4 (eighth family): wire the real WorkflowApi seam
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -947,6 +951,18 @@ struct McpTestServer {
     /// path unconditionally). Default nullptr preserves that prior
     /// behaviour for tests that don't opt in.
     yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
+
+    /// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: an
+    /// injected test double, INDEPENDENT of workflow_engine_for_test above --
+    /// mirrors verify_api_for_test's pattern. Lets a test prove the three MCP
+    /// tools call the WorkflowApi seam and not the raw engine even while a
+    /// real (differently-answering) engine is ALSO wired via
+    /// workflow_engine_for_test, closing the mutation-testing gap the round
+    /// found: reverting a tool body to call workflow_engine directly used to
+    /// pass every existing test, because workflow_api_ was always DERIVED
+    /// from the same engine both doors shared. Takes precedence over the
+    /// workflow_engine_for_test-derived seam below when set.
+    std::shared_ptr<const yuzu::server::WorkflowApi> workflow_api_for_test;
 
     /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
     /// definition_id/enabled_only filters can be exercised end-to-end.
@@ -1585,6 +1601,41 @@ private:
         if (app_perf_providers_for_test.cohort)
             verify_api_for_test = std::make_shared<yuzu::server::test::FnVerifyApi>(
                 app_perf_providers_for_test.cohort);
+
+        // ADR-0031 WS-A4 (seventh family): wire the REAL ScheduleApi seam
+        // over this test's schedule_engine_for_test — same setter idiom as
+        // set_dex_api/set_dex_perf_api above (`build_handler`'s own
+        // `ScheduleEngine* schedule_engine` param below is now unused inside
+        // list_schedules, kept for signature stability). Gated on
+        // schedule_engine_for_test's presence, mirroring production's
+        // schedule_engine_-gated construction: unwired -> null seam -> the
+        // tool's `!schedule_api_` guard answers "Schedule engine
+        // unavailable", preserving every pre-seam test's default behaviour.
+        if (schedule_engine_for_test)
+            mcp.set_schedule_api(
+                yuzu::server::make_local_schedule_api(*schedule_engine_for_test));
+
+        // ADR-0031 WS-A4 (eighth family): wire the REAL WorkflowApi seam
+        // over this test's workflow_engine_for_test — same setter idiom as
+        // set_schedule_api above (`build_handler`'s own `WorkflowEngine*
+        // workflow_engine` param below is now unused inside
+        // list_workflows/get_workflow/get_workflow_execution, kept for
+        // signature stability). Gated on workflow_engine_for_test's
+        // presence, mirroring production's workflow_engine_-gated
+        // construction: unwired -> null seam -> the tools' `!workflow_api_`
+        // guard answers "Workflow engine unavailable", preserving every
+        // pre-seam test's default behaviour. adversarial-review round finding:
+        // workflow_api_for_test (an injected test double) takes precedence over
+        // the engine-derived seam, so a test can wire a REAL, differently-
+        // answering engine via workflow_engine_for_test AND a distinguishing
+        // seam double at once, proving the three tools call the seam and not
+        // the raw engine (see workflow_api_for_test's own doc comment).
+        if (workflow_api_for_test) {
+            mcp.set_workflow_api(workflow_api_for_test);
+        } else if (workflow_engine_for_test) {
+            mcp.set_workflow_api(
+                yuzu::server::make_local_workflow_api(*workflow_engine_for_test));
+        }
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -7851,6 +7902,396 @@ TEST_CASE("MCP C8: a non-service session still reaches list_agents "
     CHECK_FALSE(body.contains("error"));
 }
 
+// ── list_pending_approvals / get_pending_approval_count (#2146 A2-R4) ────────
+// Previously untested at the MCP dispatch layer beyond the tools/list
+// outputSchema spot-check — every other "approval"-tagged test in this file
+// exercises the ticket mint/consume recall flow (a different mechanism), not
+// these two plain list/count reads.
+
+TEST_CASE("MCP list_pending_approvals: happy path returns the widened field set",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto id =
+        appr.submit("def-mcp-list", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(appr.approve(*id, "reviewer1", "looks good").has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"list_pending_approvals","arguments":{"status":"approved"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured["approvals"].size() == 1);
+    auto row = structured["approvals"][0];
+    CHECK(row["id"] == *id);
+    CHECK(row["definition_id"] == "def-mcp-list");
+    CHECK(row["status"] == "approved");
+    CHECK(row["submitted_by"] == "operator1");
+    // The widened field set (#2146 A2-R4) — previously missing from this
+    // tool relative to the REST twins.
+    CHECK(row["reviewed_by"] == "reviewer1");
+    CHECK(row["review_comment"] == "looks good");
+    CHECK(row.contains("reviewed_at"));
+    CHECK_FALSE(structured.contains("result_truncated_by_cap"));
+    // compliance-officer governance finding (#2146 A2-R4): a future refactor
+    // deleting the mcp_audit("success", ...) call on this handler would
+    // otherwise pass this test silently.
+    bool found_audit = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("surface=list") != std::string::npos) {
+            found_audit = true;
+            CHECK(d.find("count=1") != std::string::npos);
+        }
+    }
+    CHECK(found_audit);
+}
+
+TEST_CASE("MCP list_pending_approvals: row is byte-identical to approval_row_json directly "
+          "(Rule 1 regression test, consistency-auditor governance finding, #2146 A2-R4)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto id =
+        appr.submit("def-rule1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(appr.approve(*id, "reviewer1", "looks good").has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"list_pending_approvals","arguments":{"status":"approved"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured["approvals"].size() == 1);
+
+    // Fetch the same row directly and compare against the SAME shared
+    // builder both surfaces call -- this is the actual regression test for
+    // "cannot drift by construction" (docs/api-twin-recipe.md's Rule 1),
+    // not just an independent assertion on individually-picked fields that
+    // would stay green if a call site swapped onto a near-identical but
+    // not-actually-shared builder.
+    auto direct = appr.get(*id);
+    REQUIRE(direct.has_value());
+    CHECK(structured["approvals"][0] == yuzu::server::approval_row_json(*direct));
+}
+
+TEST_CASE("MCP list_pending_approvals: an out-of-enum status is rejected with kInvalidParams "
+          "(unhappy-path governance finding, #2146 A2-R4)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    SECTION("typo'd value") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"list_pending_approvals","arguments":{"status":"aproved"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+
+    SECTION("explicit empty string -- must not silently mean ALL statuses") {
+        // Pre-fix: query_checked's own filter-building treats "" as "no
+        // filter", so this silently returned every status instead of
+        // rejecting the caller's malformed input or honoring the tool's own
+        // documented pending-on-omission default.
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"list_pending_approvals","arguments":{"status":""}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+}
+
+TEST_CASE("MCP list_pending_approvals: status/submitted_by wrong JSON type is rejected -- "
+          "not silently dropped to the default (#2146 A2-R4 governance finding)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    SECTION("status wrong type") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"list_pending_approvals","arguments":{"status":42}}})");
+        REQUIRE(res);
+        // Pre-fix: param_str silently read this as absent, aq.status fell
+        // back to "pending", and the tool answered 200 with an unfiltered-
+        // by-caller-intent result instead of rejecting the malformed input.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("status must be a JSON string") !=
+              std::string::npos);
+    }
+
+    SECTION("submitted_by wrong type") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"list_pending_approvals","arguments":{"submitted_by":["bob"]}}})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(
+                  "submitted_by must be a JSON string") != std::string::npos);
+    }
+}
+
+TEST_CASE("MCP list_pending_approvals: status:\"expired\" is accepted, matching the REST v1 "
+          "twin's enum (#2146 A2-R4 governance finding)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals","arguments":{"status":"expired"}}})");
+    REQUIRE(res);
+    // Pre-fix: the tool's own declared schema enum omitted "expired" even
+    // though it is a real, store-written status the REST v1 twin's OpenAPI
+    // enum already listed -- a schema-validating client had no way to
+    // discover this value was accepted. The handler itself never validated
+    // against the schema (this call already worked pre-fix); this test
+    // pins the schema/handler agreement, not a behavior change.
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+}
+
+TEST_CASE("MCP list_pending_approvals: RBAC denial (Approval:Read) blocks the call",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Approval" && op == "Read");
+    };
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP list_pending_approvals: no approval_manager wired is an internal error, "
+          "not an empty list",
+          "[mcp][approval]") {
+    McpTestServer ts; // approval_manager_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP list_pending_approvals: a genuine store failure is never a false empty "
+          "list, and a permanent one (DROP TABLE, 42P01) is NOT presented as retryable "
+          "(review finding, PR #4656)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                           std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // DROP TABLE is a 42P01 (class 42) failure -- is_permanent_pg_error
+    // classifies it PERMANENT, so this must NOT be the retryable message
+    // (review finding, PR #4656): retry_after_ms=5000 on a condition that
+    // will not clear without an operator is an unbounded retry loop.
+    CHECK(body["error"]["message"] == "approval store unavailable");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("MCP list_pending_approvals: a TRANSIENT store failure (lock_not_available, "
+          "55P03) IS presented as retryable, the other half of the permanent/transient "
+          "split (cpp-safety finding, PR #4656)",
+          "[pg][mcp][approval]") {
+    // Same lock-timeout technique as "ApprovalManager: a store fault AT the
+    // binding check masks a foreign-submitter ticket's kind" above
+    // (test_approval_manager.cpp precedent, #2786/#2456): a second raw
+    // connection holds an ACCESS EXCLUSIVE table lock, and the manager under
+    // test is built with a short lock_timeout_ms so its blocked read fails
+    // with a real, deterministic transient SQLSTATE (55P03, class 55) rather
+    // than hanging.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    REQUIRE(appr_bundle->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    pg::PgPool short_lock_pool{{.conninfo = appr_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ApprovalManager mgr{short_lock_pool};
+    REQUIRE(mgr.is_open());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &mgr;
+    ts.start("operator");
+
+    pg::PgConn locker{PQconnectdb(appr_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE approval_manager.approvals IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "approval store degraded");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP list_pending_approvals: result_truncated_by_cap appears past the 100-row "
+          "cap (#2146 A2-R4 boundary)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    for (int i = 0; i < 101; ++i)
+        REQUIRE(appr.submit("def-cap", "operator1", "scope-" + std::to_string(i), "",
+                            ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto structured = body["result"]["structuredContent"];
+    CHECK(structured["approvals"].size() == 100);
+    CHECK(structured["result_truncated_by_cap"] == true);
+}
+
+TEST_CASE("MCP get_pending_approval_count: happy path reflects the pending queue",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction).has_value());
+    REQUIRE(
+        appr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto structured = body["result"]["structuredContent"];
+    CHECK(structured["count"] == 2);
+}
+
+TEST_CASE("MCP get_pending_approval_count: RBAC denial (Approval:Read) blocks the call",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Approval" && op == "Read");
+    };
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP get_pending_approval_count: no approval_manager wired is an internal "
+          "error, not a false zero",
+          "[mcp][approval]") {
+    McpTestServer ts; // approval_manager_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP get_pending_approval_count: a genuine store failure is never a false "
+          "zero, and a permanent one (DROP TABLE, 42P01) is NOT presented as retryable "
+          "(review finding, PR #4656)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                           std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":308,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // Same permanent (42P01) classification as list_pending_approvals above.
+    CHECK(body["error"]["message"] == "approval store unavailable");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+}
+
 // guardian-confinement-2298 hardening sweep: ITServiceOwner grants full CRUD
 // on Schedule, and ScheduleEngine::query_schedules has no owner/service
 // filter of any kind, so a bare Schedule:Read tier/perm gate alone let a
@@ -7883,6 +8324,41 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
         CHECK(a != "mcp.list_schedules|success");
     }
     CHECK(saw_denied);
+}
+
+// Governance Gate 3 (quality-engineer SHOULD-1, feat/split-a4-schedule-seam):
+// the fragment (`GET /fragments/schedules`) and REST v1 twin
+// (`GET /api/v1/schedules`) both have an explicit unwired-seam test; MCP did
+// not. The deny test above never reaches the `!schedule_api_` guard at all
+// (the fleet-wide service-scoped deny fires first, per its own comment), so
+// it cannot stand in for this case. An ORDINARY (non-service-scoped, no tier
+// restriction) caller with `schedule_engine_for_test` left at its default
+// nullptr must still hit the same "Schedule engine unavailable" fallback
+// REST v1/the fragment answer with their own equivalent (503 / "Not
+// available") -- proving the seam's null-guard still behaves correctly for
+// the one caller class the deny-focused test above cannot exercise.
+TEST_CASE("MCP: list_schedules answers 'Schedule engine unavailable' for an "
+          "ordinary caller when the seam is unwired",
+          "[mcp][integration][schedule]") {
+    McpTestServer ts;
+    // schedule_engine_for_test stays nullptr (the default) -- schedule_api_
+    // is therefore never constructed, matching production's
+    // `if (schedule_engine_) schedule_api = make_local_schedule_api(...)`
+    // gate in server.cpp when no ScheduleEngine was opened.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":48,"params":{"name":"list_schedules"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "Schedule engine unavailable");
+
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "schedule.list|success");
+        CHECK(a != "mcp.list_schedules|success");
+    }
 }
 
 // #2146 A2-R1: definition_id/enabled_only filters, threaded into the same
@@ -10611,6 +11087,143 @@ TEST_CASE("MCP get_workflow_execution: unconfined caller still sees the full "
     REQUIRE(sc["steps"].size() == 1);
     REQUIRE(sc["steps"][0]["result"].contains("agents_reached"));
     CHECK(sc["steps"][0]["result"]["agents_reached"] == 2);
+}
+
+// ADR-0031 WS-A4 (eighth family), adversarial-review round finding: a
+// mutation run reverting list_workflows/get_workflow/get_workflow_execution
+// to call `workflow_engine` directly (instead of `workflow_api_`) passed
+// every pre-existing MCP test unchanged -- consumer TUs are
+// INSPECTED-NOT-ENFORCED by check-seam-closure.py, so nothing else caught
+// it. These three tests wire a REAL WorkflowEngine (via
+// workflow_engine_for_test, so a revert-to-raw-engine still finds a live,
+// answerable store) AND a DISTINGUISHING FnWorkflowApi double (via the
+// independent workflow_api_for_test override) at the same time, so the two
+// doors answer DIFFERENTLY -- a revert to the raw engine flips these tests
+// from pass to fail, closing the gap the mutation run found.
+
+TEST_CASE("MCP list_workflows: answers via the WorkflowApi seam, not the raw "
+          "engine, when both are wired",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    REQUIRE(workflows
+                .create_workflow("kind: Workflow\nmetadata:\n  displayName: "
+                                 "engine-real-name\nspec:\n  steps:\n    - "
+                                 "instruction: def-x\n")
+                .has_value());
+
+    yuzu::server::Workflow seam_only;
+    seam_only.id = "seam-wf-1";
+    seam_only.name = "seam-double-name";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        [seam_only](const yuzu::server::WorkflowQuery&)
+            -> std::expected<std::vector<yuzu::server::Workflow>, std::string> {
+            return std::vector<yuzu::server::Workflow>{seam_only};
+        },
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":900,"params":{"name":"list_workflows"}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["workflows"];
+    REQUIRE(sc.is_array());
+    REQUIRE(sc.size() == 1);
+    CHECK(sc[0]["name"] == "seam-double-name");
+    for (const auto& w : sc)
+        CHECK(w["name"] != "engine-real-name");
+}
+
+TEST_CASE("MCP get_workflow: answers via the WorkflowApi seam, not the raw "
+          "engine, even for a valid real-engine id",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    auto real_id = workflows.create_workflow(
+        "kind: Workflow\nmetadata:\n  displayName: engine-real-detail\nspec:\n"
+        "  steps:\n    - instruction: def-y\n");
+    REQUIRE(real_id.has_value());
+
+    yuzu::server::Workflow seam_only;
+    seam_only.id = *real_id; // same id the real engine actually has, deliberately
+    seam_only.name = "seam-double-detail";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [seam_only](const std::string&)
+            -> std::expected<std::optional<yuzu::server::Workflow>, std::string> {
+            return seam_only;
+        },
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    ts.start();
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":901,)"
+                    R"("params":{"name":"get_workflow","arguments":{"workflow_id":")") +
+        *real_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["name"] == "seam-double-detail");
+}
+
+TEST_CASE("MCP get_workflow_execution: answers via the WorkflowApi seam, not "
+          "the raw engine, even for a valid real-engine id",
+          "[pg][mcp][integration][workflow]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+    auto wf_id = workflows.create_workflow(
+        "kind: Workflow\nmetadata:\n  displayName: engine-real-exec\nspec:\n"
+        "  steps:\n    - instruction: def-z\n");
+    REQUIRE(wf_id.has_value());
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(R"({"status":"dispatched","command_id":"cmd-mcp-wf3"})");
+    };
+    auto real_exec_id = workflows.execute(*wf_id, {"agent-Z"}, dispatch_fn);
+    REQUIRE(real_exec_id.has_value());
+
+    yuzu::server::WorkflowExecution seam_only;
+    seam_only.id = *real_exec_id; // same id the real engine actually has, deliberately
+    seam_only.workflow_id = *wf_id;
+    seam_only.status = "seam-double-status";
+    seam_only.agent_ids_json = "[]";
+    auto seam_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        yuzu::server::test::FnWorkflowApi::GetFn{},
+        [seam_only](const std::string&)
+            -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+            return seam_only;
+        });
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.workflow_api_for_test = seam_api;
+    // fleet_read_fn_for_test left unwired -- defaults to unconfined admit, same
+    // as the "unconfined caller" test above, so workflow_execution_visible()
+    // passes regardless of seam_only's (empty) agent_ids_json.
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":902,)"
+                    R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+        *real_exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["status"] == "seam-double-status");
 }
 
 // #1634: execution rows carry no single agent_id, so a confined caller is
@@ -26381,6 +26994,601 @@ TEST_CASE("MCP reevaluate_result_set: a smuggled params bound is a permanent cli
     CHECK_FALSE(dispatched);
 }
 
+// #4306 / #2500-class target erasure: reevaluate_result_set synthesises the
+// sibling's dispatch scope from the LIVE, nullable parent_id FK. If the
+// original was narrowed at creation time (scope_input_id persisted into
+// source_payload) but its parent was later deleted (ON DELETE SET NULL), an
+// absent parent_id read downstream as "broadcast to __all__" silently turns
+// "re-ask the same narrow question" into "ask the whole visible fleet".
+// Mirrors test_rest_result_sets_async.cpp's identical coverage of the REST
+// twin on this same route family.
+TEST_CASE("MCP reevaluate_result_set: dispatch scope narrows to the still-live "
+          "parent, never broadcasts (positive control for #4306)",
+          "[pg][mcp][integration][result-sets][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "ground";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1", "a2"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 7";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(captured_scope == "from_result_set:" + parent->id);
+}
+
+TEST_CASE("MCP reevaluate_result_set: a genuinely parentless original still "
+          "broadcasts (no regression, positive control for #4306)",
+          "[pg][mcp][integration][result-sets][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig-no-parent";
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {});
+    REQUIRE(orig.has_value());
+
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-2"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(captured_scope == "__all__");
+}
+
+TEST_CASE("MCP reevaluate_result_set: refused when the original's live parent "
+          "was deleted, never falls back to broadcast (#4306 target erasure)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "narrow-target";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig->id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+
+    // No new pending/materialized row landed -- only the original remains.
+    std::string next;
+    auto rows = rs_bundle.get()->list_by_owner("test-user", "", 50, next);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].id == orig->id);
+
+    // Denied and audited with reason=parent_gone.
+    bool found_log = false;
+    for (auto& l : ts.audit_log)
+        if (l == "result_set.create|denied")
+            found_log = true;
+    CHECK(found_log);
+    bool found_detail = false;
+    for (auto& d : ts.audit_details)
+        if (d.find("reason=parent_gone") != std::string::npos)
+            found_detail = true;
+    CHECK(found_detail);
+}
+
+TEST_CASE("MCP reevaluate_result_set: an alias-referenced parent is refused "
+          "after deletion, never silently re-resolved to a newer set bound to "
+          "the same alias (#4306)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306][alias]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "my-alias";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    // Original narrowed via the ALIAS string, not the canonical rs_ id --
+    // mirrors what create_result_set_from_tar_query persists into
+    // scope_input_id when the caller supplies an alias as parent_id.
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = "my-alias";
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig";
+    orig_cr.parent_id = parent->id; // canonical id, resolved at creation time
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+
+    // Re-bind the alias to a DIFFERENT, newer set. If the fix silently
+    // re-resolved scope_input_id as a fresh alias lookup, THIS is the set it
+    // would wrongly retarget to.
+    CreateRequest newer_cr;
+    newer_cr.owner_principal = "test-user";
+    newer_cr.name = "my-alias";
+    newer_cr.source_kind = std::string(source_kind::kManualCurate);
+    newer_cr.source_payload = "{}";
+    auto newer = rs_bundle.get()->create_materialized(newer_cr, {"b1", "b2"});
+    REQUIRE(newer.has_value());
+
+    bool dispatched = false;
+    std::string captured_scope;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string& scope,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        captured_scope = scope;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK_FALSE(dispatched);
+    CHECK(captured_scope.empty()); // never even reached from_result_set:<newer>
+}
+
+TEST_CASE("MCP reevaluate_result_set: the parent-gone refusal surfaces a "
+          "dropped audit row via audit_persisted:false, not silently",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "narrow-target-2";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    payload["scope_input_id"] = parent->id;
+    CreateRequest orig_cr;
+    orig_cr.owner_principal = "test-user";
+    orig_cr.name = "orig2";
+    orig_cr.parent_id = parent->id;
+    orig_cr.source_kind = std::string(source_kind::kTarQuery);
+    orig_cr.source_payload = payload.dump();
+    auto orig = rs_bundle.get()->create_materialized(orig_cr, {"a1"});
+    REQUIRE(orig.has_value());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+
+    auto dispatch =
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.audit_succeeds_ = false; // models a dropped audit row (#1647 posture)
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP reevaluate_result_set: refused when a GENERIC-create original's "
+          "live parent was deleted, never falls back to broadcast (#4306 "
+          "follow-up: the generic create_result_set tool persists "
+          "scope_input_id too)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that
+    // scope_input_id was ONLY persisted by the two dedicated producer tools
+    // (create_result_set_from_tar_query / create_result_set_from_instruction_
+    // result). create_result_set accepts an UNRESTRICTED source_kind/
+    // source_payload (no allowlist) plus a caller-supplied, owner-checked
+    // parent_id -- a row minted here with a crafted tar_query-shaped payload
+    // was indistinguishable at re-eval time from a genuinely parentless
+    // original once its parent was deleted, and would have silently
+    // broadcast to __all__ (the same #2500 shape #4306 itself closed for the
+    // producer tools).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "narrow-target-generic";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // Empty tier: create_result_set is Infrastructure:Write, which "operator"
+    // tier denies outright (mcp_policy.hpp tier_allows) -- see the happy-path
+    // lifecycle test's own comment above for why this file mints via the
+    // generic tool under an empty (non-MCP-token) tier.
+    ts.start_with_dispatch(dispatch, "");
+
+    // Minted via the GENERIC create_result_set tool (not
+    // create_result_set_from_tar_query), with a crafted source_kind/
+    // source_payload the dedicated producer would have built itself.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},"parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id =
+        created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    // Positive control: the generic tool now records scope_input_id, the same
+    // as the two dedicated producer tools do.
+    auto orig_row = rs_bundle.get()->get(orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE(orig_row->has_value());
+    auto sp = nlohmann::json::parse((*orig_row)->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    REQUIRE(sp.value("scope_input_id", "") == parent->id);
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig_id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched -- before this fix, a
+    // generic-create original with no recorded scope_input_id would have
+    // fallen through to the genuinely-parentless branch and broadcast to
+    // __all__ here.
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP reevaluate_result_set: the parent-gone audit detail neutralises a "
+          "delimiter-bearing scope_input_id instead of forging adjacent k=v tokens "
+          "(Gate 8 governance follow-up, #4306)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // scope_input_id is the raw caller-supplied parent_id/alias at creation
+    // time and can be an arbitrary string (an alias, not just a canonical
+    // rs_ id). Craft one containing a space and '=' -- the exact shape that
+    // could forge an adjacent k=v token or split the audit line if not
+    // neutralised. Reaches the vulnerable branch WITHOUT ever supplying a
+    // real parent_id: the generic tool stores source_payload verbatim when
+    // parent_id is absent, so a caller can hand-craft scope_input_id directly.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // Empty tier: create_result_set is Infrastructure:Write, which "operator"
+    // tier denies outright (mcp_policy.hpp tier_allows) -- see the happy-path
+    // lifecycle test's own comment above for why this file mints via the
+    // generic tool under an empty (non-MCP-token) tier.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":{"sql":"SELECT 1","scope_input_id":"evil target_id=rs_other"}}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id = created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+
+    bool found = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("reason=parent_gone") != std::string::npos) {
+            found = true;
+            // The raw delimiter-bearing value must NOT survive verbatim.
+            CHECK(d.find("evil target_id=rs_other") == std::string::npos);
+            // The neutralised form (log_token: space and '=' -> '_') must be
+            // present exactly.
+            CHECK(d.find("scope_input_id=evil_target_id_rs_other") != std::string::npos);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP reevaluate_result_set: a non-object source_payload on a "
+          "GENERIC-create original with a real parent_id never reaches dispatch "
+          "after the parent is deleted (#4306 governance follow-up -- locks the "
+          "is_object() joint invariant between the create-time scope_input_id "
+          "merge and the re-eval-time sql/instruction_id extraction, currently a "
+          "coincidence rather than a documented contract)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // Both the create-time scope_input_id merge (generic create tools) and the
+    // re-eval-time sql/instruction_id extraction independently gate on
+    // source_payload.is_object() -- a caller supplying a non-object
+    // source_payload (a bare JSON string here) alongside a real, owned
+    // parent_id skips the scope_input_id merge at creation, but the SAME
+    // predicate also blocks the sql/instruction_id extraction at re-eval time,
+    // so the row 400s "no re-runnable source" before ever reaching dispatch.
+    // Currently safe only by this coincidence (Gate 4/5 governance) -- this
+    // test locks it down.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "narrow-target-nonobject";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "");
+
+    // source_payload is a bare JSON STRING, not an object.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"tar_query","source_payload":"not-an-object","parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id =
+        created_body["result"]["structuredContent"]["id"].get<std::string>();
+
+    // Confirm the marker was NOT recorded (is_object() gate skipped the merge).
+    auto orig_row = rs_bundle.get()->get(orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE(orig_row->has_value());
+    auto sp = nlohmann::json::parse((*orig_row)->source_payload, nullptr, false);
+    REQUIRE_FALSE(sp.is_object());
+
+    REQUIRE(rs_bundle.get()->delete_set(parent->id).has_value());
+    auto reloaded = rs_bundle.get()->get(orig_id);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->has_value());
+    REQUIRE_FALSE((*reloaded)->parent_id.has_value());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    // Refused for lack of a re-runnable "sql" field (the coincidental gate),
+    // NOT the parent_gone message -- confirms it fell into the "genuinely
+    // parentless" branch (no scope_input_id found) and was THEN stopped by the
+    // separate sql-presence check, never reaching dispatch.
+    CHECK(body["error"]["message"].get<std::string>().find("no SQL") != std::string::npos);
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP reevaluate_result_set: an unsupported source_kind is refused as "
+          "RESULT_SET_REEVAL_UNSUPPORTED even when a crafted scope_input_id would "
+          "otherwise trip the parent-gone guard (#4306 follow-up misclassification fix)",
+          "[pg][mcp][integration][result-sets][security][reeval][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that a
+    // manual_curate (or any other unsupported-source_kind) row minted via
+    // the generic create_result_set tool with a crafted
+    // source_payload={"scope_input_id":"..."} but NO real parent_id reached
+    // the scope_input_id / parent-gone guard BEFORE the source_kind check,
+    // so it was misclassified as kInvalidParams "parent set no longer
+    // exists" instead of the correct RESULT_SET_REEVAL_UNSUPPORTED. Both
+    // outcomes were already refusals with nothing dispatched either way (not
+    // a dispatch-safety bug) -- this proves the reorder fixed the
+    // classification, not merely that both still refuse. Mirrors the
+    // equivalent REST-side test (test_rest_result_sets_async.cpp).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // Empty tier: create_result_set is Infrastructure:Write, which "operator"
+    // tier denies outright (mcp_policy.hpp tier_allows) -- see the happy-path
+    // lifecycle test's own comment above for why this file mints via the
+    // generic tool under an empty (non-MCP-token) tier.
+    ts.start_with_dispatch(dispatch, "");
+
+    // No parent_id supplied at all -- source_payload's scope_input_id is
+    // entirely caller-crafted and points at an id that never existed, never
+    // exercising the real parent_id owner-check/merge path.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"source_kind":"manual_curate","source_payload":{"scope_input_id":"rs_deadbeefdeadbeef"}}}})");
+    REQUIRE(created);
+    auto created_body = nlohmann::json::parse(created->body);
+    REQUIRE(created_body.contains("result"));
+    auto orig_id = created_body["result"]["structuredContent"]["id"].get<std::string>();
+    auto orig_row = rs_bundle.get()->get(orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE(orig_row->has_value());
+    REQUIRE_FALSE((*orig_row)->parent_id.has_value());
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        orig_id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_REEVAL_UNSUPPORTED") != std::string::npos);
+    CHECK(msg.find("parent set no longer exists") == std::string::npos);
+    CHECK_FALSE(dispatched);
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -
@@ -26430,6 +27638,49 @@ TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is con
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(payload["device_count"] == 1);
+}
+
+TEST_CASE("MCP create_result_set_from_inventory_query: a supplied parent_id is "
+          "persisted as scope_input_id (Gate 8 governance follow-up positive "
+          "control, #4306)",
+          "[pg][mcp][integration][result-sets][inventory][reeval][security][4306]") {
+    // MCP twin of the identical REST test in test_rest_result_sets_async.cpp.
+    // Gate 7's #4306 follow-up added this tool's own scope_input_id merge
+    // (mcp_server.cpp, body["scope_input_id"] = pid) but shipped with no
+    // direct test proving the merge actually happens -- only the fact that
+    // re-eval's source_kind allowlist independently refuses kInventoryQuery
+    // regardless was covered. This does not need a full re-eval assertion --
+    // just confirm the stored row.
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::server::InventoryStore inventory{rs_bundle.pool()};
+    REQUIRE(inventory.is_open());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "mcp-inv-query-parent";
+    parent_cr.source_kind = std::string(source_kind::kManualCurate);
+    parent_cr.source_payload = "{}";
+    auto parent = rs_bundle.get()->create_materialized(parent_cr, {"a1"});
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered (nullopt scope)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"child-of-parent","parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    auto new_id = payload["id"].get<std::string>();
+
+    auto row = rs_bundle.get()->get(new_id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    auto sp = nlohmann::json::parse((*row)->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    CHECK(sp.value("scope_input_id", "") == parent->id);
 }
 
 // #2437-class guard (C11/C12), MCP transport: create_result_set_from_inventory_query
