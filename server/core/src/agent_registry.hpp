@@ -29,6 +29,7 @@
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
 #include "event_bus.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
 #include "scope_engine.hpp"
 
 // Forward declarations
@@ -37,7 +38,6 @@ class TagStore;
 class CustomPropertiesStore;
 class ResultSetStore;
 class DeviceTokenStore;
-class OfflineEndpointStore;
 /// PLAN (p8/PR1.9c): forward-declared so `ClassifiedCommand` below can name
 /// it as the only PRODUCTION friend able to construct one — the full
 /// definition lives entirely in server.cpp (`ServerImpl` has no separate
@@ -932,10 +932,33 @@ public:
     std::vector<std::string> all_ids() const;
 
     // Local-only agent count, under the SAME lock all_ids() uses — never
-    // includes presence. HA WS-5: lets a caller (dispatch_confined_arms's
-    // Broadcast fast path) tell whether all_ids()/known_agent_ids() actually
-    // added anything beyond what this replica knows locally.
+    // includes presence. Exposed for tests/diagnostics; NOT used by
+    // dispatch_confined_arms.hpp's fast-path gate (see has_remote_presence
+    // below and its own doc comment for why a two-call size comparison is
+    // racy and this single-call membership check replaced it, governance
+    // Gate 4 unhappy-path finding, 2026-09-22).
     [[nodiscard]] std::size_t local_agent_count() const;
+
+    // HA WS-5 governance hardening (Gate 4 unhappy-path finding, 2026-09-22):
+    // returns true iff ANY of `ids` is NOT in the local live registry, under
+    // ONE lock acquisition against the registry's CURRENT state — replaces
+    // the two-call `known_agent_ids().size() == local_agent_count()`
+    // comparison `confined_broadcast`'s fast-path gate originally used.
+    // That comparison raced: `local_agent_count()` and `known_agent_ids()`
+    // (→ all_ids()) are two SEPARATE lock acquisitions, so concurrent local
+    // registry churn between them could make the SIZES coincidentally match
+    // while the SETS differ (a local disconnect and a presence addition
+    // canceling out numerically) — silently taking the fast path
+    // (`send_to_all_unfiltered`, which re-walks a FRESH local snapshot and
+    // has no per-id directory-fallback hook) while `ids` genuinely contained
+    // a presence-only id, with no `not_sent` entry and no metric to catch
+    // it. This method instead does a DIRECT membership check against `ids`
+    // (already fetched by the caller) — self-correcting in the safe
+    // direction: if an id in `ids` was presence-only at fetch time but has
+    // since genuinely registered locally, this correctly reports "no longer
+    // remote" and the fast path (which walks the CURRENT registry) reaches
+    // it anyway.
+    [[nodiscard]] bool has_remote_presence(const std::vector<std::string>& ids) const;
 
     // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
     // that all_ids()/evaluate_scope() merge in for ids absent from the local
@@ -1047,6 +1070,36 @@ private:
     /// evaluate_scope().
     OfflineEndpointStore* presence_store_{nullptr};
     std::chrono::seconds presence_ttl_{90};
+
+    /// HA WS-5 governance hardening (Gate 3 performance + sre, 2026-09-22):
+    /// a bare `presence_store_->query_live_ids(...)` on every all_ids()/
+    /// evaluate_scope() call put a synchronous Postgres round trip on paths
+    /// that were previously pure in-memory on EVERY deployment — presence is
+    /// wired unconditionally at boot whenever `OfflineEndpointStore`
+    /// constructs, not gated behind an HA/2nd-replica signal (none exists).
+    /// This collapses arbitrarily many callers within `kPresenceCacheTtl` of
+    /// each other into ONE Postgres query, on the SAME read-cache mutex
+    /// (deliberately separate from `mu_` — the whole point of keeping the
+    /// Postgres read off `mu_` is defeated if a second lock serializes it
+    /// against that one instead). A `kPresenceCacheTtl`-stale read is
+    /// harmless here specifically because presence is already an
+    /// eventually-consistent, over-inclusion-safe signal (bounded by
+    /// `presence_ttl_`, itself ~90s) — a few extra seconds of read staleness
+    /// on top of that is a negligible relative addition, never a new
+    /// correctness class. `live_presence()` is the ONLY caller of
+    /// `presence_store_->query_live_ids`; all_ids()/evaluate_scope() must
+    /// route through it, never call query_live_ids directly.
+    static constexpr std::chrono::seconds kPresenceCacheTtl{3};
+    mutable std::mutex presence_cache_mu_;
+    mutable std::vector<PresenceIdentity> presence_cache_;
+    mutable std::chrono::steady_clock::time_point presence_cache_at_{};
+
+    /// Returns the cached (or freshly-fetched, if stale/first-call) live
+    /// presence set. Empty immediately, no lock taken, when presence is
+    /// unconfigured (`presence_store_ == nullptr`) — the common single-
+    /// replica case pays only the pointer check.
+    std::vector<PresenceIdentity> live_presence() const;
+
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
 

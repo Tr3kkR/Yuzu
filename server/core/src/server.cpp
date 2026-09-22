@@ -4283,6 +4283,12 @@ public:
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
                 startup_failed_ = true;
+            } else {
+                // HA WS-5 governance hardening (Gate 3 sre finding): this
+                // store is now load-bearing for cross-replica scope
+                // evaluation, not just the viz page, so its fail-soft
+                // degrade paths need a counter, not just a debug log.
+                offline_endpoint_store_->set_metrics(&metrics_);
             }
         }
 
@@ -9535,13 +9541,21 @@ public:
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         // HA WS-5: same discipline as the heartbeat_ingestion_ line above —
         // registry_ outlives offline_endpoint_store_ (it is torn down much
-        // later, if ever, as part of this object's own member destruction),
-        // and unlike the gRPC-handler-only heartbeat path, evaluate_scope()/
-        // all_ids() are also reachable from the policy-evaluator background
-        // thread and REST/dashboard/MCP handlers whose own drains are not
-        // all guaranteed to have completed by this exact point — null the
-        // borrowed pointer before the store it points to is destroyed, never
-        // rely on drain ordering alone for a cross-cutting read path.
+        // later, if ever, as part of this object's own member destruction).
+        // Corrected per governance Gate 3 (security-guardian + cpp-safety,
+        // independently, 2026-09-22): this is belt-and-braces, not a claim
+        // of an unresolved reachability gap — every thread class that could
+        // call evaluate_scope()/all_ids() (gRPC handlers via
+        // agent_server_/mgmt_server_->Shutdown(deadline) above; REST/
+        // dashboard/MCP, which share the same httplib worker pool, via
+        // web_thread_.join() a few lines above that; the policy-evaluator
+        // and every other named background thread via their own .join()
+        // calls) is ALREADY drained by this point — cpp-safety traced this
+        // as a genuine happens-before, not a "benign aligned pointer store"
+        // — matching the #2703/#3495 precedent this same stop() sequence
+        // already documents elsewhere. Nulled anyway, matching every sibling
+        // raw-pointer null-out in this block (execution_tracker_,
+        // blast_radius_detector, cert callbacks, session_store).
         registry_.configure_presence(nullptr, cfg_.session_timeout);
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
@@ -11667,7 +11681,9 @@ private:
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
             },
-            [this] { return registry_.local_agent_count(); }};
+            [this](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
+            }};
     }
 
     /// #881: the ONE place a `ContainmentGate` is built. Called once per
@@ -19610,26 +19626,45 @@ private:
         }
 
         agent_service_.record_send_time(command_id);
-        // WS-4 4.2b Task D: this sink is deliberately left WITHOUT a fourth
-        // (`prepare_route_fallback`) field — this legacy forwarder is
-        // Broadcast-only (see this dispatch's own DispatchArm::Broadcast call
-        // just below), so `ArmDispatchResult::route_unreadable` can never be
-        // set here regardless; unlike the /api/command and MCP/dashboard/
-        // workflow sites (which DO wire the gateway routing-directory
-        // fallback and so DO need the `route_unreadable` cascade branch
-        // below), this site has no `route_unreadable` branch to add.
+        // WS-4 4.2b Task D note (now SUPERSEDED — see the HA WS-5 comment
+        // below): this sink was originally left WITHOUT a `prepare_route_
+        // fallback` field on the theory that a Broadcast-only forwarder's
+        // candidates are always locally known, so no directory consult was
+        // ever needed and `ArmDispatchResult::route_unreadable` could never
+        // be set here.
+        //
+        // HA WS-5 (governance Gate 4 happy-path finding, 2026-09-22): that
+        // theory broke the moment `registry_.all_ids()` could return a
+        // presence-only (cross-replica) id — this is a REAL BLOCKING bug
+        // WS-5 exposed, not a hypothetical: with no `prepare_route_fallback`
+        // and a bare `registry_.send_to(aid, ...)` (which returns `false`
+        // silently for any id absent from the LOCAL `agents_` map, no log,
+        // no metric — agent_registry.cpp's `send_to`), a presence-only id
+        // reached via this legacy forwarder was dropped with zero signal —
+        // and if at least one OTHER agent was local, the overall dispatch
+        // still reported plain success. Fixed by wiring the same
+        // `GatewayRouteFallback` the other three production
+        // `ConfinedDispatchSink` sites (`make_confined_dispatch_sink`,
+        // `dispatch_scope_ladder.hpp`) already use, so this route now
+        // reaches a cross-replica agent exactly like every other dispatch
+        // surface — see `route_unreadable`'s handling a few lines below,
+        // which this route previously had no branch for and now needs one.
+        auto legacy_route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
+            registry_, gateway_route_store_.get());
         const yuzu::server::ConfinedDispatchSink sink{
-            [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
+            [&](const std::string& aid) {
+                if (auto cluster = legacy_route_fallback->cluster_for(aid))
+                    return registry_.send_via_directory(aid, *classified, *cluster);
+                return registry_.send_to(aid, *classified);
+            },
             [&] { return registry_.send_to_all(*classified); },
             [&] { return registry_.all_ids(); },
-            /*prepare_route_fallback=*/nullptr,
-            // HA WS-5: wired (unlike prepare_route_fallback above, which this
-            // Broadcast-only forwarder deliberately omits) so the unfiltered
-            // fast path stays available when presence adds nothing — see
-            // ConfinedDispatchSink::local_agent_count's own doc comment for
-            // why an unwired one would otherwise force the slow path on
-            // every call once presence is configured fleet-wide.
-            [&] { return registry_.local_agent_count(); }};
+            [legacy_route_fallback](const std::vector<std::string>& candidates) {
+                return legacy_route_fallback->prepare(candidates);
+            },
+            [&](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
+            }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves

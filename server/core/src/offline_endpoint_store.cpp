@@ -8,6 +8,8 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <yuzu/metrics.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -68,6 +70,24 @@ std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;
     return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+// HA WS-5 governance hardening (Gate 4 consistency-auditor finding,
+// 2026-09-22): matches WS-4's `record_route_store_failure` (gateway_service_
+// impl.cpp) naming/label convention exactly — `{op,reason}`, `reason` ∈
+// {store_unavailable, db_error} — rather than the original narrower
+// `{op}`-only counter, which also mis-named itself "_read_" despite firing
+// from `remove_if_session` (a write). Documented in
+// docs/observability-conventions.md's HA metrics table.
+void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
+                                   bool had_lease) {
+    const char* reason = had_lease ? "db_error" : "store_unavailable";
+    if (metrics) {
+        metrics
+            ->counter("yuzu_server_agent_presence_store_failed_total",
+                      {{"op", std::string(op)}, {"reason", reason}})
+            .increment();
+    }
 }
 
 } // namespace
@@ -152,6 +172,7 @@ std::vector<PresenceIdentity> OfflineEndpointStore::query_live_ids(std::chrono::
     if (!lease) {
         spdlog::debug("OfflineEndpointStore: query_live_ids skipped, no connection in time ({})",
                       pool_.last_error());
+        record_presence_store_failure(metrics_, "query_live_ids", /*had_lease=*/false);
         return out;
     }
     // DATABASE-clock filter (`now()` in-SQL) — never the replica's own
@@ -166,6 +187,7 @@ std::vector<PresenceIdentity> OfflineEndpointStore::query_live_ids(std::chrono::
         std::vector<std::string>{std::to_string(ttl.count()), std::to_string(kQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: query_live_ids failed: {}", PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "query_live_ids", /*had_lease=*/true);
         return out;
     }
     const int rows = PQntuples(res.get());
@@ -190,6 +212,7 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
     if (!lease) {
         spdlog::debug("OfflineEndpointStore: remove_if_session skipped, no connection in time ({})",
                       pool_.last_error());
+        record_presence_store_failure(metrics_, "remove_if_session", /*had_lease=*/false);
         return false;
     }
     // RETURNING, not a bare DELETE: a DELETE with a WHERE clause that matches
@@ -207,8 +230,11 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: remove_if_session failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "remove_if_session", /*had_lease=*/true);
         return false;
     }
+    // A zero-row RETURNING result here is a legitimate SESSION MISMATCH (the
+    // guard this method exists to enforce), never a failure — no counter.
     return PQntuples(res.get()) > 0;
 }
 

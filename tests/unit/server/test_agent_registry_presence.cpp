@@ -11,6 +11,7 @@
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "scope_engine.hpp"
+#include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -20,10 +21,12 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
 using yuzu::server::OfflineEndpointStore;
+using yuzu::server::TagStore;
 using yuzu::server::pg::PgPool;
 
 namespace agent_pb = ::yuzu::agent::v1;
@@ -146,6 +149,78 @@ TEST_CASE("HA WS-5: evaluate_scope resolves a remote-only agent's identity attri
         REQUIRE(matched.has_value());
         CHECK(matched->empty());
     }
+}
+
+// HA WS-5 governance hardening (Gate 3 quality-engineer finding, 2026-09-22):
+// the code comment on the presence-only resolver in agent_registry.cpp
+// claims "tag:/props. already resolve correctly for these ids" since the
+// bulk preloads (tag_values/props_values) are id-keyed, not scoped to local
+// agents_ — that claim was previously unverified by test. This closes the
+// tag: half with a REAL TagStore (the store-first #3295 precedence path);
+// props. would need a CustomPropertiesStore fixture this file doesn't
+// otherwise need, so is left for a follow-up if this pattern proves useful
+// elsewhere.
+TEST_CASE("HA WS-5: evaluate_scope resolves tag:<key> for a remote-only agent via "
+          "the store-first bulk preload",
+          "[pg][ha][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    TagStore tag_store{pool};
+    REQUIRE(tag_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+    (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+    REQUIRE(store.upsert("remote-agent", "remote-host", "windows", 0, 0, "", "", "sess-remote"));
+    REQUIRE(tag_store.set_tag("remote-agent", "department", "finance").has_value());
+
+    auto parsed = yuzu::scope::parse(R"(tag:department == "finance")");
+    REQUIRE(parsed.has_value());
+    // tag_store passed this time (unlike the sibling TEST_CASE above, which
+    // deliberately passes nullptr) — this is exactly the STORE-FIRST path
+    // (agent_registry.cpp's `tag:` resolver branch), not the in-memory
+    // scopable_tags fallback, which a presence-only id has no source for at
+    // all (no AgentSession exists for it).
+    auto matched = registry.evaluate_scope(*parsed, &tag_store);
+    REQUIRE(matched.has_value());
+    CHECK(contains(*matched, "remote-agent"));
+    CHECK_FALSE(contains(*matched, "local-agent"));
+}
+
+// HA WS-5 governance hardening (Gate 3 performance finding, 2026-09-22):
+// live_presence()'s cache must not re-fetch on every call within its TTL
+// window, and must fetch again once stale.
+TEST_CASE("HA WS-5: live_presence() caches within its TTL window", "[pg][ha][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+
+    REQUIRE(store.upsert("cache-agent-1", "h", "linux", 0, 0, "", "", "sess-1"));
+    auto ids_first = registry.all_ids();
+    CHECK(contains(ids_first, "cache-agent-1"));
+
+    // A row added AFTER the first (now-cached) read must NOT appear until
+    // the cache window (3s) elapses — proves the second call is served from
+    // cache, not a fresh Postgres read.
+    REQUIRE(store.upsert("cache-agent-2", "h", "linux", 0, 0, "", "", "sess-2"));
+    auto ids_second = registry.all_ids();
+    CHECK_FALSE(contains(ids_second, "cache-agent-2"));
+
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    auto ids_after_ttl = registry.all_ids();
+    CHECK(contains(ids_after_ttl, "cache-agent-2"));
 }
 
 TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-monolith-outcome drift",

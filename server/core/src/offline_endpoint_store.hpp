@@ -8,6 +8,17 @@
 /// every heartbeat ingest (direct + gateway, via HeartbeatIngestion), read by
 /// the viz topology handler. No secrets — plain columns, no SecretCodec.
 ///
+/// **HA WS-5 (ADR-2002 §7a, governance Gate 3 architect finding, 2026-09-22):
+/// this store's blast radius is WIDER than the paragraph above states.**
+/// `AgentRegistry::all_ids()`/`evaluate_scope()` (via `configure_presence`)
+/// merge this store's live rows into cross-replica scope-evaluation
+/// visibility — a degraded/misbehaving `OfflineEndpointStore` on a
+/// multi-replica deployment now affects live dispatch targeting, not only a
+/// stale-cube viz render. It remains fail-SOFT for that consumer by design
+/// (a read failure degrades to local-only visibility, never a wrong
+/// dispatch — see `AgentRegistry::live_presence()`'s doc comment), so this
+/// widening does not change the store's own posture, only who depends on it.
+///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
 /// and schema-qualifies every runtime statement (`endpoint_state.endpoints`) —
@@ -19,6 +30,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -74,6 +89,17 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// HA WS-5 governance hardening (Gate 3 sre finding, 2026-09-22):
+    /// `query_live_ids`/`remove_if_session` are fail-soft by design (see
+    /// their own doc comments — a read failure degrades to local-only
+    /// visibility, never a wrong dispatch), but fail-soft must not mean
+    /// fail-INVISIBLE now that this store is load-bearing for cross-replica
+    /// scope-evaluation correctness. Set ONCE during single-threaded
+    /// startup, before serving threads read it without synchronisation —
+    /// same idiom as `AppPerfDailyStore::set_metrics` and its siblings. Null
+    /// (the default, e.g. unit tests / pre-WS-5 callers) disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     /// Upsert one agent's last-known identity + last-seen. Best-effort: returns
     /// false (logged at debug) on an empty lease or a query error so a slow or
     /// blipping database never fails the heartbeat path — the live in-memory
@@ -125,6 +151,7 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server

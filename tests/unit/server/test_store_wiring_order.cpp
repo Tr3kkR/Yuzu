@@ -290,3 +290,56 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
                       std::sregex_iterator()));
     CHECK(count == 4);
 }
+
+// HA WS-5 governance hardening (Gate 3 quality-engineer finding, 2026-09-22):
+// `registry_.configure_presence(offline_endpoint_store_.get(), ...)` is the
+// EXACT #3261 shape (a wiring call whose safety depends on running after its
+// member's construction) but doesn't match this file's general setter regex
+// — different receiver (`registry_`, not `agent_service_`/`gateway_service_
+// ->`), a two-argument setter, and a name that isn't `set_X`. Rather than
+// widen the general regex (risking exactly the false-match/false-miss class
+// its own header comment warns block-comment-stripping already caused once),
+// this is a dedicated bespoke-anchor test, following the same
+// ServerImpl-is-not-unit-constructible / source-scan rationale as the
+// #1712 test above.
+TEST_CASE("server.cpp: registry_.configure_presence runs after "
+          "offline_endpoint_store_'s construction (HA WS-5)",
+          "[wiring_order][ha]") {
+    const std::string text = strip_line_comments(read_server_cpp());
+
+    static const std::regex construct_re(
+        R"(offline_endpoint_store_\s*=\s*std::make_unique<)");
+    std::smatch construct_match;
+    REQUIRE(std::regex_search(text, construct_match, construct_re));
+    const int construct_line = line_of(text, static_cast<std::size_t>(construct_match.position(0)));
+
+    static const std::regex wire_re(
+        R"(registry_\.configure_presence\(\s*offline_endpoint_store_\.get\(\))");
+    std::smatch wire_match;
+    REQUIRE(std::regex_search(text, wire_match, wire_re));
+    const int wire_line = line_of(text, static_cast<std::size_t>(wire_match.position(0)));
+
+    INFO("offline_endpoint_store_ constructed at server.cpp:" << construct_line);
+    INFO("registry_.configure_presence(offline_endpoint_store_.get(), ...) at server.cpp:"
+         << wire_line);
+    CHECK(construct_line < wire_line);
+
+    // The teardown null-out (`registry_.configure_presence(nullptr, ...)`)
+    // must run BEFORE offline_endpoint_store_.reset() destroys the object
+    // presence_store_ borrows — the inverse ordering requirement stop()
+    // exists to satisfy (see agent_registry.hpp's presence_store_ doc
+    // comment and the comment on this call site in server.cpp).
+    static const std::regex null_wire_re(R"(registry_\.configure_presence\(\s*nullptr\s*,)");
+    std::smatch null_wire_match;
+    REQUIRE(std::regex_search(text, null_wire_match, null_wire_re));
+    const int null_wire_line = line_of(text, static_cast<std::size_t>(null_wire_match.position(0)));
+
+    static const std::regex reset_re(R"(offline_endpoint_store_\.reset\(\))");
+    std::smatch reset_match;
+    REQUIRE(std::regex_search(text, reset_match, reset_re));
+    const int reset_line = line_of(text, static_cast<std::size_t>(reset_match.position(0)));
+
+    INFO("registry_.configure_presence(nullptr, ...) at server.cpp:" << null_wire_line);
+    INFO("offline_endpoint_store_.reset() at server.cpp:" << reset_line);
+    CHECK(null_wire_line < reset_line);
+}

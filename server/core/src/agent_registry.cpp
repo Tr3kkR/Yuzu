@@ -1413,13 +1413,14 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 }
 
 std::vector<std::string> AgentRegistry::all_ids() const {
-    // HA WS-5: the presence query is a Postgres round trip and must run OFF
-    // mu_ — the same rule the evaluate_scope preloads follow. A null
-    // presence_store_ (unconfigured) makes this call cost nothing beyond the
-    // pointer check, byte-identical to pre-WS-5 behavior.
-    std::vector<PresenceIdentity> presence;
-    if (presence_store_)
-        presence = presence_store_->query_live_ids(presence_ttl_);
+    // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
+    // mu_ — the same rule the evaluate_scope preloads follow, never holding
+    // the registry lock across Postgres I/O. A null presence_store_
+    // (unconfigured) makes this call cost nothing beyond the pointer check;
+    // a configured one (the production default — see live_presence()'s own
+    // doc comment for why this is NOT gated behind an HA-only signal) costs
+    // at most one cached-or-fresh read, never a bare per-call round trip.
+    std::vector<PresenceIdentity> presence = live_presence();
 
     std::lock_guard lock(mu_);
     std::vector<std::string> ids;
@@ -1441,9 +1442,32 @@ std::size_t AgentRegistry::local_agent_count() const {
     return agents_.size();
 }
 
+bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) const {
+    std::lock_guard lock(mu_);
+    for (const auto& id : ids)
+        if (!agents_.contains(id))
+            return true;
+    return false;
+}
+
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
     presence_store_ = store;
     presence_ttl_ = ttl;
+}
+
+std::vector<PresenceIdentity> AgentRegistry::live_presence() const {
+    if (!presence_store_)
+        return {};
+    std::lock_guard lock(presence_cache_mu_);
+    const auto now = std::chrono::steady_clock::now();
+    // `presence_cache_at_{}` (default-constructed epoch) is always stale on
+    // the first call, so this always fetches at least once before serving a
+    // cached copy.
+    if (now - presence_cache_at_ >= kPresenceCacheTtl) {
+        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_at_ = now;
+    }
+    return presence_cache_; // copy out under the cache lock, never mu_
 }
 
 std::string AgentRegistry::find_agent_by_stream(
@@ -1665,10 +1689,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     // HA WS-5 (ADR-2002 §7a): preload cross-replica presence OFF mu_, same
     // rule as the from_result_set:/props./tag: preloads above — merged
     // below (after the local loop) for ids this replica has no local
-    // session for; local always wins.
-    std::vector<PresenceIdentity> presence_rows;
-    if (presence_store_)
-        presence_rows = presence_store_->query_live_ids(presence_ttl_);
+    // session for; local always wins. Cached (live_presence(),
+    // kPresenceCacheTtl) so the policy-evaluator's N-policies-per-tick
+    // sweep issues one Postgres read per cache window, not N.
+    std::vector<PresenceIdentity> presence_rows = live_presence();
 
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
@@ -1677,6 +1701,15 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         // scope_kind_catalog() (declared just after this class in
         // agent_registry.hpp) — that catalog backs GET /api/v1/discover/scope-kinds
         // and its CROSS-CHECK test. Add the branch AND the catalog entry together.
+        // HA WS-5 (governance Gate 3 cpp-expert finding, 2026-09-22): the
+        // presence-only resolver a little further down (search "extend the
+        // iteration domain with presence") duplicates this lambda's
+        // ostype/hostname/arch/agent_version/tag:/props./from_result_set:
+        // branches against a PresenceIdentity instead of an AgentSession.
+        // The catalog cross-check test does NOT exercise that second copy —
+        // a new scope-kind branch added HERE without also updating THAT one
+        // silently under-matches presence-only (cross-replica) agents, with
+        // no test failure to catch it. Update both together.
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
             // from_result_set:<id> — composable-scope membership (capability

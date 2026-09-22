@@ -74,7 +74,7 @@ struct ConfinedDispatchSink {
     /// caller IS filtered. HA WS-5 (ADR-2002 §7a): once `known_agent_ids` is
     /// wired to a presence-merged source (`AgentRegistry::all_ids()`), a
     /// Broadcast/None candidate is no longer by construction always locally
-    /// known — see `prepare_route_fallback` and `local_agent_count` below,
+    /// known — see `prepare_route_fallback` and `presence_widens` below,
     /// both updated for exactly this reason.
     std::function<std::vector<std::string>()> known_agent_ids;
     /// WS-4 4.2b Task C (fallback-only gateway routing-directory consult,
@@ -99,22 +99,30 @@ struct ConfinedDispatchSink {
     /// wired-but-behaviorally-dead reader, the exact class of bug WS-4 hit
     /// twice before shipping. `confined_broadcast`'s UNFILTERED fast path
     /// (`send_to_all_unfiltered`) does NOT call this — see
-    /// `local_agent_count` below for how that path stays safe instead.
+    /// `presence_widens` below for how that path stays safe instead.
     std::function<bool(const std::vector<std::string>& candidates)> prepare_route_fallback;
-    /// HA WS-5: local-registry-only agent count (`AgentRegistry::
-    /// local_agent_count()`), i.e. `known_agent_ids()`'s size MINUS whatever
-    /// presence added. `confined_broadcast()`'s UNFILTERED fast path
+    /// HA WS-5 (governance Gate 4 unhappy-path hardening, 2026-09-22):
+    /// `AgentRegistry::has_remote_presence(candidates)` — a SINGLE-lock
+    /// membership check against the registry's CURRENT local state, given
+    /// the candidate list `confined_broadcast()` already fetched via
+    /// `known_agent_ids()`. `confined_broadcast()`'s UNFILTERED fast path
     /// (`send_to_all_unfiltered`, which walks ONLY local sessions and has no
-    /// per-id hook to consult the directory) is eligible only when
-    /// `known_agent_ids().size() == local_agent_count()` — i.e. presence
-    /// added nothing this call, so the fast path's local-only walk is
-    /// provably complete. UNSET (a test/legacy sink that predates this
-    /// field) is treated as 0 by `confined_broadcast` — so an unmigrated
-    /// sink with a genuinely non-empty `known_agent_ids()` always takes the
-    /// SLOW (filtered, `prepare_route_fallback`-covered) path instead of
-    /// silently skipping this check: fail-closed on missing wiring, never
-    /// fail-open into a stale fast path.
-    std::function<std::size_t()> local_agent_count;
+    /// per-id hook to consult the directory) is eligible only when this
+    /// returns false — i.e. presence added nothing reachable this call, so
+    /// the fast path's local-only walk is provably complete. This
+    /// SUPERSEDES an earlier `local_agent_count()`-vs-`known_agent_ids().
+    /// size()` comparison, which was racy: those were two SEPARATE lock
+    /// acquisitions, so concurrent local churn between them could make the
+    /// SIZES coincidentally match while the SETS differed, silently taking
+    /// the fast path with a presence-only id still in `candidates`. A direct
+    /// membership check against the already-fetched list has no such gap —
+    /// see `has_remote_presence`'s own doc comment. UNSET (a test/legacy
+    /// sink that predates this field) is treated as "presence widens" (an
+    /// unconditional true) by `confined_broadcast` — so an unmigrated sink
+    /// always takes the SLOW (filtered, `prepare_route_fallback`-covered)
+    /// path instead of silently skipping this check: fail-closed on missing
+    /// wiring, never fail-open into a stale fast path.
+    std::function<bool(const std::vector<std::string>& candidates)> presence_widens;
 };
 
 /// Targets the CALLER has already resolved. Each arm reads only its own field;
@@ -772,13 +780,16 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         // presence-only (remote) ids, so the fast path below — which walks
         // ONLY local sessions via `send_to_all_unfiltered` and has no per-id
         // hook to consult the routing directory for one — is eligible only
-        // when presence added nothing this call. `local_agent_count` unset
-        // (a sink predating this field) counts as 0, so a genuinely
+        // when presence added nothing reachable this call. A DIRECT
+        // membership check against the already-fetched `candidates`
+        // (`presence_widens`), not a two-call size comparison — the latter
+        // raced (governance Gate 4 unhappy-path finding, 2026-09-22): see
+        // `presence_widens`'s own doc comment. Unset (a sink predating this
+        // field) is treated as "presence widens" (true), so a genuinely
         // non-empty fleet always falls through to the filtered path below.
-        const std::size_t local_count = sink.local_agent_count ? sink.local_agent_count() : 0;
         auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
-        if (!exec_visible && !gate.enforced && plugin_missing.empty() &&
-            candidates.size() == local_count)
+        const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
+        if (!exec_visible && !gate.enforced && plugin_missing.empty() && !widened)
             return sink.send_to_all_unfiltered();
         // WS-4 4.2b Task C: same batched-before-the-walk shape Group/Scope/Ids
         // already use — Broadcast/None previously skipped this call on the

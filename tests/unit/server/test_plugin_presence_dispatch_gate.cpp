@@ -48,10 +48,12 @@ struct RecordingSink {
             },
             [this] { return fleet; },
             /*prepare_route_fallback=*/nullptr,
-            // HA WS-5: see test_dispatch_confined_arms.cpp's RecordingSink —
-            // this mock has no presence concept, so local_agent_count() must
-            // match fleet.size() for the fast-path eligibility check to hold.
-            [this] { return fleet.size(); }};
+            // HA WS-5 (governance hardening, 2026-09-22): see
+            // test_dispatch_confined_arms.cpp's RecordingSink — this mock
+            // has no presence concept, so every candidate is always locally
+            // known (never widens) for the fast-path eligibility check to
+            // hold.
+            [](const std::vector<std::string>&) { return false; }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
