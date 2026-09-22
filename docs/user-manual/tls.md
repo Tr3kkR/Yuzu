@@ -31,8 +31,8 @@ ECDHE-RSA-CHACHA20-POLY1305
 
 **Agent side is NOT pinned by this change.** `agents/core`'s own gRPC client
 credentials still negotiate whatever gRPC's library default offers
-(AEAD-only suites, TLS 1.2 floor) until the follow-up PR (#4722 Part B) pins
-`agents/core` the same way.
+(AEAD-only suites, TLS 1.2 floor) — the agent side is not yet pinned; tracked
+under [#4722](https://github.com/Tr3kkR/Yuzu/issues/4722).
 
 ## Why a process environment variable
 
@@ -70,6 +70,18 @@ If the allow-list resolves to zero usable TLS 1.2 ciphers against the
 OpenSSL build actually linked (a boot self-check, distinct from the log
 lines above), the server logs a `critical` message and refuses to start
 rather than silently serving with no effective policy.
+
+**If you hit this refusal.** The `critical` line names which of three causes
+fired: the throwaway `SSL_CTX` failed to construct, `SSL_CTX_set_cipher_list`
+rejected the compile-time literal, or the list resolved to zero TLS 1.2
+ciphers actually available in the linked OpenSSL build. The allow-list is a
+compile-time literal with no runtime override — there is no flag or
+environment variable that changes it — and this condition cannot be produced
+by any operator configuration; it means the OpenSSL library the server
+actually linked against no longer provides any of the six pinned suites.
+Restore the shipped OpenSSL library files (reinstall or repair the package),
+or roll back to the previous release, and report it as a build/packaging
+defect.
 
 ## What CI asserts
 
@@ -145,5 +157,6 @@ against `start_web_server()`'s listener. An automated assertion for both is
 tracked as [#4740](https://github.com/Tr3kkR/Yuzu/issues/4740) against the
 `scripts/integration-test.sh` TLS mode (roadmap PR 1).
 
-Part B of this work pins `agents/core`'s own gRPC client the same way and
-reuses `tests/unit/tls_probe.hpp` unchanged.
+The agent side is not yet pinned; tracked under
+[#4722](https://github.com/Tr3kkR/Yuzu/issues/4722). Any future work there can
+reuse `tests/unit/tls_probe.hpp` unchanged.
