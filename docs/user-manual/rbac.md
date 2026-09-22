@@ -161,7 +161,7 @@ enabled = true
 
 ## The authorization topology floor (#2376)
 
-Five reads are treated as **authorization topology** rather than ordinary
+Ten reads are treated as **authorization topology** rather than ordinary
 operational data, and require the `admin` session role no matter how the
 `[rbac] enabled` toggle is set:
 
@@ -172,6 +172,11 @@ operational data, and require the `admin` session role no matter how the
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
+| `TlsConfig:Read` (#4028) | TLS settings read-twin, `GET /api/v1/settings/tls` |
+| `PluginSigning:Read` (#4028) | Plugin-signing enforcement status, `GET /api/v1/settings/plugin-signing` |
+| `ServerConfig:Read` (#4028) | Server runtime-configuration read-twin, `GET /api/v1/settings/server` |
+| `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
+| `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2) |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -250,16 +255,17 @@ decision (including what was deliberately excluded from the floor and why).
 
 ## System Roles
 
-Six roles are created automatically and cannot be deleted:
+Seven roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (118 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 38 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (193 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Decommission:Delete (92 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 24 securable types (24 permissions) — see the Securable Types table below; the read-list is an explicit allow-list, not "everything except" | Helpdesk staff, auditors, read-only dashboards |
+| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
 
 ## Securable Types
 
@@ -288,6 +294,21 @@ Six roles are created automatically and cannot be deleted:
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection). Administrator-only by default (absent from the Viewer read-list); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
+| `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
+| `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
+| `Workflow` | Multi-step workflow definitions and executions |
+| `ProductPack` | Installed product packs |
+| `PluginConfig` | Per-plugin configuration and kill switches |
+| `PluginSecret` | Per-plugin secret material — never Operator-readable |
+| `UploadGrant` | Upload-grant mint/revoke lifecycle |
+| `PowerManagement` | `power_health.set_power_plan`, the plugin surface's only destructive power action |
+| `Directory` | AD/Entra-synced user and group data |
+| `TlsConfig` | TLS settings. Server-administration: denied to every MCP tier, and admin-floored when RBAC is off |
+| `PluginSigning` | Plugin-signature enforcement settings. Server-administration, same posture as `TlsConfig` |
+| `ServerConfig` | Server runtime configuration. Server-administration, same posture as `TlsConfig` |
+| `AnalyticsConfig` | Analytics/offload configuration. Server-administration, same posture as `TlsConfig` |
+| `Enrollment` | Auto-approve enrollment rules and pending-agent visibility |
+| `OidcConfig` | OIDC SSO configuration |
 
 ## Operations
 
@@ -421,9 +442,15 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/roles
       "description": "Read-only access to operational data",
       "is_system": true,
       "created_at": 1710849600
+    },
+    {
+      "name": "Reviewer",
+      "description": "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)",
+      "is_system": true,
+      "created_at": 1710849600
     }
   ],
-  "pagination": { "total": 6, "start": 0, "page_size": 50 },
+  "pagination": { "total": 7, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
