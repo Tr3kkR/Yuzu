@@ -38,6 +38,7 @@ struct FakeFs {
     std::map<std::string, std::string> files;
     std::map<std::string, std::vector<std::string>> dirs;
     std::vector<std::string> denied;
+    bool dirs_truncated = false; // drives DirList::truncated (walk_dir_capped hit kMaxDirEntries)
     FileReader reader() const {
         return [this](const std::string& p) -> FileRead {
             if (std::find(denied.begin(), denied.end(), p) != denied.end()) return {EACCES, {}};
@@ -49,7 +50,8 @@ struct FakeFs {
     DirLister lister() const {
         return [this](const std::string& d) -> DirList {
             const auto it = dirs.find(d);
-            return it == dirs.end() ? DirList{ENOENT, {}, false} : DirList{0, it->second, false};
+            if (it == dirs.end()) return DirList{ENOENT, {}, false};
+            return DirList{0, it->second, dirs_truncated};
         };
     }
 };
@@ -336,6 +338,40 @@ TEST_CASE("Linux hardened host (fedora:40): exact rows", "[local_security_policy
     CHECK(su[16] == "sudoers|/etc/sudoers.d/10-ops|defaults|user:OPS|-|-|!requiretty");
     CHECK(su[17] == "sudoers|/etc/sudoers.d/10-ops|user_spec|OPS@ALL|root|true|WEB");
     CHECK(su[18] == "sudoers|/etc/sudoers.d/10-ops|user_spec|OPS@ALL|root|false|/usr/bin/journalctl");
+}
+
+// Fails under: a failure counted WITHOUT its row. That pairing is what apply_collected's banner
+// relies on to guarantee collect_file_policy never returns a non-OK status with zero rows -- and
+// on THIS action the fallback would be 4 fields against a 7-field contract. Also pins that the
+// two dir-level failure modes (truncated listing, unreadable directory) reach the wire as rows,
+// not only as the status reason.
+TEST_CASE("sudoers.d: a dir-level failure is a row, never only a reason", "[local_security_policy][collector]") {
+    SECTION("truncated listing") {
+        auto fs = hardened_fs();
+        fs.dirs_truncated = true;
+        const auto c = run(fs, LocalPolicyAction::Sudoers);
+        CHECK(c.status == PolicyStatus::Constrained);
+        CHECK(c.reason == "sudoers.d:truncated");
+        REQUIRE_FALSE(c.rows.empty()); // the invariant apply_collected depends on
+        const auto row = std::find(c.rows.begin(), c.rows.end(),
+                                   "sudoers|/etc/sudoers.d|unreadable|-|-|-|truncated");
+        REQUIRE(row != c.rows.end());
+        CHECK(split_escape_aware(*row).size() == 7); // the action's real contract, not the 4-field fallback
+    }
+    SECTION("every collected row still keeps the 7-field shape") {
+        auto fs = hardened_fs();
+        fs.dirs_truncated = true;
+        for (const auto& r : run(fs, LocalPolicyAction::Sudoers).rows)
+            CHECK(split_escape_aware(r).size() == 7);
+    }
+    SECTION("unreadable directory") {
+        auto fs = hardened_fs();
+        fs.dirs.erase("/etc/sudoers.d"); // lister reports ENOENT -> absent, not a failure
+        const auto c = run(fs, LocalPolicyAction::Sudoers);
+        CHECK(c.status == PolicyStatus::Ok); // absent is a state, never a failure
+        REQUIRE_FALSE(c.rows.empty());
+        CHECK(c.rows.back() == "sudoers|/etc/sudoers.d|absent|-|-|-|-");
+    }
 }
 
 TEST_CASE("sudoers.d: names sudo ignores are listed as `ignored`, not read", "[local_security_policy][collector]") {

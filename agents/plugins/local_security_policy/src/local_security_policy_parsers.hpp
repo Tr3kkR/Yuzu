@@ -635,7 +635,17 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
             t.row(format_sudoers_row("/etc/sudoers.d", {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
             break;
         }
-        if (d.truncated) t.acc.add_failure("sudoers.d:truncated"), ++t.failed;
+        // Pair the failure with its row, like every other failure site in this
+        // function. Counting one WITHOUT a row is what would let collect_file_policy
+        // return a non-OK status with zero rows, and apply_collected's fallback would
+        // then write its 4-field `<action>|status|...` shape into this action's
+        // 7-field contract. It also puts the truncation on the wire instead of only
+        // in the status reason. `unreadable` is already a declared sudoers kind.
+        if (d.truncated) {
+            t.acc.add_failure("sudoers.d:truncated");
+            ++t.failed;
+            t.row(format_sudoers_row("/etc/sudoers.d", {"unreadable", "-", "-", "-", "truncated"}));
+        }
         for (const auto& n : d.names) {
             const std::string path = "/etc/sudoers.d/" + n;
             if (sudoers_dir_entry_ignored(n))
