@@ -493,6 +493,11 @@ agent_test_exe = executable(
                                                 # row/parameter parsers (agents/shared, agent-core primitive)
     'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
                                                 # dylib/.so/.dll driven end to end via LocalDispatcher
+    'unit/test_app_control_parsers.cpp',         # Wave 8 PR8.6: pure app_control mappers/row formatters/dump
+                                                # parsers over the-rig REAL CAPTURE fixtures (REQUIRE(exists))
+    'unit/test_app_control_local_dispatcher.cpp', # Wave 8 PR8.6: real app_control dylib/.so/.dll driven end to
+                                                # end via LocalDispatcher (unguarded: non-Windows asserts the
+                                                # exact unsupported row)
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -522,6 +527,10 @@ agent_test_exe = executable(
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
+    'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
+    'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -565,6 +574,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
     include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
+    include_directories('../agents/plugins/asset_tags/src'),     # asset_tags_parsers.hpp / asset_tags_store.hpp (#232)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -682,10 +692,12 @@ agent_test_exe = executable(
                 app_usage_plugin_lib,  # Wave 7b PR7b.3
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
+                app_control_plugin_lib,  # Wave 8 PR8.6
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
                 browser_inventory_plugin_lib,  # Wave 10 P2a
+                asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak

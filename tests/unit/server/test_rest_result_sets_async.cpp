@@ -980,10 +980,282 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     // Re-dispatched the original SQL.
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].params.at("sql") == "SELECT 7");
+    // #4306: the still-live parent narrows the re-dispatch, not a broadcast.
+    REQUIRE(h.calls[0].scope_expr == "from_result_set:" + grandparent);
     // Sibling: new set's parent == original's parent (NOT the original).
     auto row = get_ok(*h.store, new_id);
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == grandparent);
+}
+
+TEST_CASE("re-eval: a genuinely parentless original still broadcasts (no regression)",
+          "[pg][result_set][async][reeval][4306]") {
+    // Positive control for the #4306 fix: an original that was NEVER narrowed
+    // at creation (no parent_id supplied, so no scope_input_id was ever
+    // persisted) must still broadcast on re-eval, unchanged. Omitting a
+    // parent_id is deliberately "the whole fleet" everywhere else on this
+    // route family; the parent-gone refusal must not widen to cover this case.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+    h.calls.clear();
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].scope_expr == "__all__");
+}
+
+TEST_CASE("re-eval: refused when the original's live parent was deleted, "
+          "never falls back to broadcast (#4306 target erasure)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.calls.clear();
+    h.audits.clear();
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched.
+    REQUIRE(h.calls.empty());
+    // No new pending/materialized row landed -- only the original remains.
+    std::string next;
+    auto rows = h.store->list_by_owner("operator-1", "", 50, next);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0].id == orig_id);
+    // Denied and audited with reason=parent_gone.
+    bool found = false;
+    for (auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos)
+            found = true;
+    CHECK(found);
+}
+
+TEST_CASE("re-eval: the parent-gone refusal surfaces a dropped audit row via "
+          "Sec-Audit-Failed, not silently",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-2", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE(h.store->delete_set(parent).has_value());
+
+    h.audit_ok = false; // models a dropped audit row (#1647 posture)
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(h.last_sec_audit_failed == "true");
+}
+
+TEST_CASE("re-eval: an alias-referenced parent is refused after deletion, never "
+          "silently re-resolved to a newer set bound to the same alias (#4306)",
+          "[pg][result_set][async][reeval][security][4306][alias]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("my-alias", {"a1"});
+    int status = 0;
+    // Original parented via the ALIAS, not the canonical rs_ id.
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    // The alias was pre-resolved to the canonical id at creation time.
+    REQUIRE(*get_ok(*h.store, orig_id)->parent_id == parent);
+    h.calls.clear();
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    // Re-bind the alias to a DIFFERENT, newer set. If the fix silently
+    // re-resolved scope_input_id as a fresh alias lookup, THIS is the set it
+    // would wrongly retarget to.
+    h.seed_materialized("my-alias", {"b1", "b2"});
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
+          "deleted, never falls back to broadcast (#4306 follow-up: the "
+          "generic POST /api/v1/result-sets route persists scope_input_id too)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that
+    // scope_input_id was ONLY persisted by the two dedicated producer routes
+    // (from-tar-query / from-instruction-result). This route accepts an
+    // UNRESTRICTED source_kind/source_payload (no allowlist) plus a
+    // caller-supplied, owner-checked parent_id -- a row minted here with a
+    // crafted tar_query-shaped payload was indistinguishable at re-eval time
+    // from a genuinely parentless original once its parent was deleted, and
+    // would have silently broadcast to __all__ (the same #2500 shape #4306
+    // itself closed for the producer routes).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-generic", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Positive control: the generic route now records scope_input_id, the
+    // same as the dedicated producers do.
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    REQUIRE(sp.value("scope_input_id", "") == parent);
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched -- before this fix, a
+    // generic-create original with no recorded scope_input_id would have
+    // fallen through to the genuinely-parentless branch and broadcast to
+    // __all__ here.
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: the parent-gone audit detail neutralises a delimiter-bearing "
+          "scope_input_id instead of forging adjacent k=v tokens (Gate 8 governance "
+          "follow-up, #4306)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // scope_input_id is the raw caller-supplied parent_id/alias at creation time
+    // and can be an arbitrary string (an alias, not just a canonical rs_ id).
+    // Craft one containing a space and '=' -- the exact shape that could forge
+    // an adjacent k=v token or split the audit line if not neutralised. This
+    // reaches the vulnerable branch WITHOUT ever supplying a real parent_id: the
+    // generic create route stores source_payload verbatim when parent_id is
+    // absent, so a caller can hand-craft scope_input_id directly.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query",)"
+                       R"("source_payload":{"sql":"SELECT 1","scope_input_id":)"
+                       R"("evil target_id=rs_other"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.audits.clear();
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
+
+    bool found = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos) {
+            found = true;
+            // The raw delimiter-bearing value must NOT survive verbatim.
+            CHECK(a.detail.find("evil target_id=rs_other") == std::string::npos);
+            // The neutralised form (log_token: space and '=' -> '_') must be
+            // present exactly.
+            CHECK(a.detail.find("scope_input_id=evil_target_id_rs_other") !=
+                  std::string::npos);
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("re-eval: a non-object source_payload on a GENERIC-create original with a "
+          "real parent_id never reaches dispatch after the parent is deleted (#4306 "
+          "governance follow-up -- locks the is_object() joint invariant between the "
+          "create-time scope_input_id merge and the re-eval-time sql/instruction_id "
+          "extraction, currently a coincidence rather than a documented contract)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Both the create-time scope_input_id merge (generic create routes) and the
+    // re-eval-time sql/instruction_id extraction independently gate on
+    // source_payload.is_object() -- a caller supplying a non-object source_payload
+    // (a bare JSON string here) alongside a real, owned parent_id skips the
+    // scope_input_id merge at creation, but the SAME predicate also blocks the
+    // sql/instruction_id extraction at re-eval time, so the row 400s "no
+    // re-runnable source" before ever reaching dispatch. Currently safe only by
+    // this coincidence (Gate 4/5 governance) -- this test locks it down.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-nonobject", {"a1"});
+    int status = 0;
+    // source_payload is a bare JSON STRING, not an object.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":"not-an-object",)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Confirm the marker was NOT recorded (is_object() gate skipped the merge).
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE_FALSE(sp.is_object());
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    // Refused for lack of a re-runnable "sql" field (the coincidental gate),
+    // NOT the parent_gone message -- confirms it fell into the "genuinely
+    // parentless" branch (no scope_input_id found) and was THEN stopped by the
+    // separate sql-presence check, never reaching run_async.
+    CHECK(re["error"]["message"].get<std::string>().find("no SQL") != std::string::npos);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {
@@ -995,6 +1267,45 @@ TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][re
     int status = 0;
     h.post("/api/v1/result-sets/" + manual + "/re-eval", "", status);
     REQUIRE(status == 400);
+}
+
+TEST_CASE("re-eval: an unsupported source_kind is refused as RESULT_SET_REEVAL_UNSUPPORTED "
+          "even when a crafted scope_input_id would otherwise trip the parent-gone guard "
+          "(#4306 follow-up misclassification fix)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that a
+    // manual_curate (or any other unsupported-source_kind) row minted via
+    // the generic create route with a crafted
+    // source_payload={"scope_input_id":"..."} but NO real parent_id reached
+    // the scope_input_id / parent-gone guard BEFORE the source_kind check,
+    // so it was misclassified as RESULT_SET_BAD_REQUEST (reason=parent_gone)
+    // instead of the correct RESULT_SET_REEVAL_UNSUPPORTED. Both outcomes
+    // were already 400 refusals with nothing dispatched either way (not a
+    // dispatch-safety bug) -- this proves the reorder fixed the
+    // classification, not merely that both still 400.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    // No parent_id supplied at all -- source_payload's scope_input_id is
+    // entirely caller-crafted and points at an id that never existed, never
+    // exercising the real parent_id owner-check/merge path.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"manual_curate",)"
+                       R"("source_payload":{"scope_input_id":"rs_deadbeefdeadbeef"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    const auto msg = re["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_REEVAL_UNSUPPORTED") != std::string::npos);
+    CHECK(msg.find("parent set no longer exists") == std::string::npos);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][reeval]") {
@@ -1763,6 +2074,37 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(body["data"]["device_count"] == 1);
+}
+
+TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "
+          "(Gate 8 governance follow-up positive control, #4306)",
+          "[pg][result_set][async][inventory][reeval][security][4306]") {
+    // Gate 7's #4306 follow-up added this route's own scope_input_id merge
+    // (rest_api_v1.cpp, body["scope_input_id"] = pid) but shipped with no
+    // direct test proving the merge actually happens -- only the fact that
+    // re-eval's source_kind allowlist independently refuses kInventoryQuery
+    // was covered. This does not need a full re-eval assertion (re-eval never
+    // accepts inventory_query regardless) -- just confirm the stored row.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    auto parent = h.seed_materialized("inv-query-parent", {"a1"});
+
+    int status = 0;
+    auto body = h.post("/api/v1/result-sets/from-inventory-query",
+                       R"({"name":"child-of-parent","parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto new_id = body["data"]["id"].get<std::string>();
+
+    auto row = get_ok(*h.store, new_id);
+    REQUIRE(row.has_value());
+    auto sp = nlohmann::json::parse(row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    CHECK(sp.value("scope_input_id", "") == parent);
 }
 
 // #2437-class guard (C11/C12): a stored data_json row nesting past

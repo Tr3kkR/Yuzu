@@ -9,7 +9,7 @@
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the fifteen-span composition is the drift a shared seam exists to
+// copy of the sixteen-span composition is the drift a shared seam exists to
 // remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.
@@ -35,6 +35,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 
@@ -62,6 +63,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
