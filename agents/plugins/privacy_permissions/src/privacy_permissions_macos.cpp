@@ -122,17 +122,21 @@ private:
 /// acceptance criterion for this leg is recording the ACTUAL denied/constrained outcome, not
 /// asserting one). `db_path` is a parameter (not baked in) so a unit test can force the exact
 /// open-failure branch deterministically against a path this process genuinely cannot open,
-/// without needing a non-FDA identity or touching the real TCC.db -- sqlite3_open_v2 treats
-/// "file missing" and "permission refused" identically here (see the caller's own comment on
-/// why there is no finer-grained code to branch on), so a missing-path failure exercises
-/// exactly the same code as a real SIP/TCC denial would.
-DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPath) {
+/// without needing a non-FDA identity or touching the real TCC.db. `out_rc`, if non-null,
+/// receives the real sqlite3_open_v2 result code on failure (C4-CODEX-004): the file's
+/// previous banner claimed "sqlite3_open_v2 treats file-missing and permission-refused
+/// identically, no finer-grained code to branch on" -- that was simply wrong. SQLITE_CANTOPEN/
+/// SQLITE_AUTH/SQLITE_PERM ARE distinct from e.g. SQLITE_NOMEM/SQLITE_IOERR; the caller now
+/// uses this to stop reporting every open failure as a refusal.
+DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPath,
+                       int* out_rc = nullptr) {
     sqlite3* raw = nullptr;
     const int rc = sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
     DbHandle db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
                       // carry the error message; RAII from here regardless of `rc`.
     if (rc != SQLITE_OK) {
+        if (out_rc) *out_rc = rc;
         err_msg = db ? sqlite3_errmsg(db.get()) : "sqlite3_open_v2 failed";
         return DbHandle{};
     }
@@ -173,15 +177,21 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
     std::vector<PermissionRow> rows;
 
     std::string err_msg;
-    DbHandle db = open_readonly(err_msg);
+    int open_rc = SQLITE_OK;
+    DbHandle db = open_readonly(err_msg, kTccDbPath, &open_rc);
     if (!db) {
-        // SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM on a SIP-protected file all surface through
-        // sqlite3_open_v2's generic failure path -- there is no finer-grained code to branch
-        // on here, so any open failure is treated as a refusal (the charter's expected
-        // outcome), not as "the file doesn't exist" (never `absent` for a system file that is
-        // always present on a modern macOS host).
-        rows.push_back(whole_read_failed_row("macos", PermissionState::denied,
-                                             "tcc_db:open_failed:" + err_msg, acc, true));
+        // C4-CODEX-004: only SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM on a SIP-protected file
+        // are a genuine refusal (the charter's expected outcome for an unentitled process);
+        // any other open failure (SQLITE_NOMEM, SQLITE_IOERR, ...) is a real resource/storage
+        // fault this process did not cause and cannot fix by gaining FDA -- reporting it as
+        // `denied` would send an operator chasing a TCC entitlement that was never the
+        // problem. Never `absent` either way -- a system file that is always present on a
+        // modern macOS host.
+        const bool this_denied = (open_rc == SQLITE_CANTOPEN || open_rc == SQLITE_AUTH ||
+                                  open_rc == SQLITE_PERM);
+        rows.push_back(whole_read_failed_row(
+            "macos", this_denied ? PermissionState::denied : PermissionState::unreadable,
+            "tcc_db:open_failed:" + err_msg, acc, this_denied));
         return emit_rows(ctx, rows, acc, false);
     }
 

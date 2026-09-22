@@ -87,7 +87,7 @@
           ]
         },
         {
-          "description": "Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path or Package Family Name qualified with the owning profile's name (Windows -- the agent runs as LocalSystem and reads every real profile's ConsentStore, so `<profile>\\<app_id>` keeps the same app on two different profiles from colliding), a portal-reported app id (Linux). \"-\" when the row reports the capability's own global default rather than a specific app, or when the whole read failed before any app-level row could be produced.\n",
+          "description": "Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path or Package Family Name (Windows), a portal-reported app id (Linux). On Windows, non-\"-\" identifiers AND the \"-\" capability-level default are both qualified with the owning profile's name (`<profile>\\<app_id>` / `<profile>\\-`) -- the agent runs as LocalSystem and reads every real profile's ConsentStore, so a bare \"-\" default would be ambiguous between two profiles with different defaults for the same category. Bare \"-\" (no qualifier) means the whole read failed before any app-level row could be produced, or (Windows only, no reachable profile) a machine-wide HKLM default with no profile to attribute it to.\n",
           "example": "com.example.App",
           "name": "app_id",
           "platforms": [
@@ -209,9 +209,9 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`<category>:query_step_failed`, `<category>:shape`, `<category>:entry_shape`, `<app_id>:<category>:value_unreadable`, `<category>:capability:access_denied`, `<category>:packaged_app:access_denied`, `<category>:nonpackaged_container:access_denied`, `<category>:nonpackaged_app:access_denied`, `hklm:win32_<n>`, `<profile>:win32_<n>`, `tcc_db:prepare_failed:<msg>`",
+      "provenance": "`<category>:query_step_failed`, `<category>:shape`, `<category>:entry_shape`, `<app_id>:<category>:value_unreadable`, `<app_id>:<category>:value_oversized`, `<category>:capability:access_denied`, `<category>:packaged_app:access_denied`, `<category>:nonpackaged_container:access_denied`, `<category>:nonpackaged_app:access_denied`, `<category>:packaged_enum_<n>`, `<category>:packaged_enum_truncated`, `<category>:nonpackaged_enum_<n>`, `<category>:nonpackaged_enum_truncated`, `hklm:win32_<n>`, `<profile>:win32_<n>`, `<profile>:privilege_missing`, `<profile>:hive_not_found`, `<profile>:profile_path_unreadable`, `<profile>:hive_mount_failed`, `<profile>:hive_unload_failed`, `profiles:truncated`, `profiles:profile_list_unreadable`, `tcc_db:prepare_failed:<msg>`, `<category>:lookup_failed`, `portal:not_built`",
       "status": "`CONSTRAINED`",
-      "when": "A read failed for a reason other than a refusal, or a below-root Windows denial that left the rest of that root's tree readable; the reason names the mechanism-specific cause."
+      "when": "A read failed for a reason other than a refusal, or a below-root Windows denial that left the rest of that root's tree readable; the reason names the mechanism-specific cause. This list is illustrative, not exhaustive -- every token is `<subject>:<cause>` shaped and self-describing."
     },
     {
       "completeness": "`PARTIAL`",

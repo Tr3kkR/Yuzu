@@ -63,12 +63,14 @@ spec:
         type: string
         description: >
           Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path
-          or Package Family Name qualified with the owning profile's name (Windows -- the
-          agent runs as LocalSystem and reads every real profile's ConsentStore, so
-          `<profile>\<app_id>` keeps the same app on two different profiles from colliding),
-          a portal-reported app id (Linux). "-" when the row reports the capability's own
-          global default rather than a specific app, or when the whole read failed before any
-          app-level row could be produced.
+          or Package Family Name (Windows), a portal-reported app id (Linux). On Windows,
+          non-"-" identifiers AND the "-" capability-level default are both qualified with the
+          owning profile's name (`<profile>\<app_id>` / `<profile>\-`) -- the agent runs as
+          LocalSystem and reads every real profile's ConsentStore, so a bare "-" default would
+          be ambiguous between two profiles with different defaults for the same category.
+          Bare "-" (no qualifier) means the whole read failed before any app-level row could
+          be produced, or (Windows only, no reachable profile) a machine-wide HKLM default
+          with no profile to attribute it to.
         example: com.example.App
         platforms: [windows, linux, darwin]
       - name: category

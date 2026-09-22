@@ -72,9 +72,12 @@ inline constexpr DWORD kMaxEnumeratedSubkeys = 4096;
 /// ERROR_NO_MORE_ITEMS is the only clean stop (CDX-R2-002: a previous version discarded this
 /// entirely, so a mid-enumeration ERROR_ACCESS_DENIED was silently indistinguishable from
 /// having enumerated every child). `truncated`, if non-null, is set when the walk stopped
-/// because it hit kMaxEnumeratedSubkeys -- a THIRD, distinct outcome (visible truncation, not
-/// a Win32 error): `terminal_rc` stays whatever the last successful call returned (ordinarily
-/// ERROR_SUCCESS, since there was almost certainly a next item we simply didn't ask for).
+/// because it hit kMaxEnumeratedSubkeys AND a genuine next entry exists -- "cap reached" alone
+/// is NOT the same fact as "a record was dropped" (C4-CODEX-005/K2: a key with EXACTLY
+/// kMaxEnumeratedSubkeys real children would otherwise report a false truncation, since the
+/// cap-reached check alone can't tell "there were exactly this many" from "there were more").
+/// One extra, uncounted RegEnumKeyExW probe at the current index disambiguates -- same shape as
+/// win_profiles.hpp's own enumerate_profile_records/profile_list_actually_truncated precedent.
 std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc = nullptr,
                                                  bool* truncated = nullptr) {
     std::vector<std::wstring> out;
@@ -88,7 +91,16 @@ std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc 
         out.emplace_back(buf, len);
         len = kNameBufLen;
     }
-    if (truncated) *truncated = (idx >= kMaxEnumeratedSubkeys);
+    if (truncated) {
+        if (idx >= kMaxEnumeratedSubkeys) {
+            wchar_t probe_buf[kNameBufLen]{};
+            DWORD probe_len = kNameBufLen;
+            *truncated = (RegEnumKeyExW(parent, idx, probe_buf, &probe_len, nullptr, nullptr,
+                                        nullptr, nullptr) == ERROR_SUCCESS);
+        } else {
+            *truncated = false;
+        }
+    }
     if (terminal_rc) *terminal_rc = rc;
     return out;
 }
@@ -99,7 +111,15 @@ RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view categ
 
     DWORD type = 0, size = 0;
     const LONG probe_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size);
-    if (probe_rc == ERROR_SUCCESS && size > 0) {
+    if (probe_rc == ERROR_SUCCESS && size > 0 && size > yuzu::win::kMaxRegValueBytes) {
+        // C4-CODEX-002: this subtree is under the OWNING USER's write access (the file
+        // banner's own words), so an unbounded allocation sized from a provider-reported
+        // DWORD lets that user make the privileged agent retain an arbitrarily large buffer
+        // per value -- the same class of problem win_profiles.hpp's own kMaxRegValueBytes
+        // (1 MiB) exists to cap. Reported honestly (unreadable, via the caller's existing
+        // value_unreadable token -- see merge_and_emit), never silently truncated/guessed.
+        g.state = PermissionState::unreadable;
+    } else if (probe_rc == ERROR_SUCCESS && size > 0) {
         std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
         DWORD sz = size;
         const LONG real_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type,
@@ -237,9 +257,14 @@ void merge_and_emit(const std::vector<RawGrant>& base,
     for (const auto& g : base) merged[{g.app_id, g.category}] = g;
     for (const auto& [key, g] : hklm_by_key) merged[key] = g; // overwrite: HKLM precedence
     for (const auto& [key, g] : merged) {
-        const std::string app_id = (g.app_id == "-" || qualify.empty())
-                                       ? g.app_id
-                                       : (qualify + "\\" + g.app_id);
+        // C4-CODEX-003/K1: a capability-level "-" row is the owning profile's OWN global
+        // default for that category, NOT a machine-wide fact -- exempting it from
+        // qualification (as the original round-2 rewrite did) let two different profiles'
+        // opposing defaults for the same category collide into indistinguishable rows. Only
+        // truly qualify-less output (empty `qualify`, the no-reachable-profile HKLM fallback,
+        // where there IS no profile to attribute a default to) keeps the bare "-".
+        const std::string app_id =
+            qualify.empty() ? g.app_id : (qualify + "\\" + g.app_id);
         if (g.state == PermissionState::unreadable)
             acc.add_failure(app_id + ":" + g.category + ":value_unreadable");
         else if (g.read_denied)
@@ -286,6 +311,27 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     // mount_failed) silently dropped HKLM policy data entirely instead of falling back.
     std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
+        // C4-CODEX-001: with_user_hive's live-hive check tests only `== ERROR_SUCCESS` --
+        // ERROR_ACCESS_DENIED on the LIVE HKU\<SID> root and ERROR_FILE_NOT_FOUND (no such
+        // live entry, the ordinary case) are indistinguishable to its caller, and if the
+        // offline fallback then ALSO fails (privilege_missing/mount_failed), the original
+        // live-root denial is lost entirely -- reported as a generic CONSTRAINED token
+        // instead of the contract-required PERMISSION_DENIED a refused root read gets
+        // everywhere else in this file. This is a genuine gap in the SHARED with_user_hive
+        // primitive (also affects license_scan/registry, out of scope to fix here without a
+        // wider, separately-reviewed change), so it is worked around plugin-locally: a cheap
+        // peek at the live root BEFORE calling with_user_hive, used only to enrich a
+        // subsequent non-ok status with the real reason when it was specifically denied.
+        // Benign TOCTOU: ACLs changing between the peek and with_user_hive's own attempt in
+        // the few-microsecond window is exactly as safe/unsafe as every other check-then-act
+        // registry read in this file, and the peek never gates or replaces the real call.
+        LONG peek_rc = ERROR_SUCCESS;
+        {
+            yuzu::win::RegKey peek;
+            peek_rc = RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(profile.sid).c_str(), 0,
+                                    KEY_READ, peek.put());
+        }
+
         std::vector<RawGrant> user_grants;
         LONG user_rc = ERROR_SUCCESS;
         yuzu::win::HiveAccessReport report;
@@ -305,7 +351,13 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             ++reachable_profiles;
             break;
         case yuzu::win::HiveAccessStatus::privilege_missing:
-            acc.add_failure(profile.profile_name + ":privilege_missing");
+            if (peek_rc == ERROR_ACCESS_DENIED) {
+                rows.push_back(whole_read_failed_row("windows", PermissionState::denied,
+                                                      profile.profile_name + ":access_denied",
+                                                      acc, true));
+            } else {
+                acc.add_failure(profile.profile_name + ":privilege_missing");
+            }
             continue;
         case yuzu::win::HiveAccessStatus::not_found:
             // Enumerated but genuinely unreachable (no live HKU entry, no offline NTUSER.DAT
@@ -317,7 +369,13 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
                                                              : ":hive_not_found"));
             continue;
         case yuzu::win::HiveAccessStatus::mount_failed:
-            acc.add_failure(profile.profile_name + ":hive_mount_failed");
+            if (peek_rc == ERROR_ACCESS_DENIED) {
+                rows.push_back(whole_read_failed_row("windows", PermissionState::denied,
+                                                      profile.profile_name + ":access_denied",
+                                                      acc, true));
+            } else {
+                acc.add_failure(profile.profile_name + ":hive_mount_failed");
+            }
             continue;
         }
 
