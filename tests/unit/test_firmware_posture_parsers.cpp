@@ -265,6 +265,16 @@ TEST_CASE("parse_smbios_type0: the-rig REAL CAPTURE rsmb.bin parses and every pr
     require_self_consistent_prefixes(raw);
 }
 
+// Fails under: the Windows shell's no-RSMB-provider path going back to silently adding no row.
+TEST_CASE("smbios_rows: a default (unparsed) Smbios0 -- the shell's absence shape -- is three absent rows",
+          "[firmware_posture][smbios]") {
+    const auto rows = smbios_rows(Smbios0{});
+    REQUIRE(rows.size() == 3); // no rom_size_bytes/bios_release/ec_release row: nothing was specified
+    CHECK(row_str(rows[0]) == "firmware|vendor|absent|smbios");
+    CHECK(row_str(rows[1]) == "firmware|version|absent|smbios");
+    CHECK(row_str(rows[2]) == "firmware|release_date|absent|smbios");
+}
+
 // ── Linux sysfs DMI ──────────────────────────────────────────────────────
 
 // ASSUMED SHAPE, not a capture: one raw sysfs file body per key, trailing newline included.
@@ -315,6 +325,17 @@ TEST_CASE("parse_dmi_sysfs: unreadable vs malformed", "[firmware_posture][dmi]")
 }
 
 // RECONSTRUCTED Win32_BIOS row (ASSUMED SHAPE). BIOSVersion is array-typed and never reaches a row.
+// Fails under: the Windows shell's WMI namespace/class-absent and empty-result paths going back to
+// silently adding no row (the earlier, contract-violating shape: absence must be a row, not silence).
+TEST_CASE("wmi_bios_rows: an empty result -- the shell's absence shape -- is three absent rows, not none",
+          "[firmware_posture][wmi]") {
+    const auto rows = wmi_bios_rows({});
+    REQUIRE(rows.size() == 3);
+    CHECK(row_str(rows[0]) == "firmware|vendor|absent|wmi");
+    CHECK(row_str(rows[1]) == "firmware|version|absent|wmi");
+    CHECK(row_str(rows[2]) == "firmware|release_date|absent|wmi");
+}
+
 TEST_CASE("wmi_bios_rows: maps the three scalar Win32_BIOS columns", "[firmware_posture][wmi]") {
     const auto rows = wmi_bios_rows({{"Manufacturer", "Acme Corp"},
                                      {"SMBIOSBIOSVersion", "A1B2C3 (1.05)"},

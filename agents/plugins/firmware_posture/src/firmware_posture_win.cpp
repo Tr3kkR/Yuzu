@@ -23,11 +23,13 @@
  *           RawSMBIOSData header -- go to parse_smbios_type0 (pure,
  *           bounds-checked). This TU never interprets a byte.
  *
- * Failure vs absence (run-context CONTRACT DECISION): a definitive
- * not-there (WMI class/namespace absent, no RSMB provider) adds NO row and NO
- * failure token; a refused call (ERROR_ACCESS_DENIED / WBEM access denied)
- * and any other failure go through FirmwareReport::fail as an `unreadable`
- * row plus a `<source>:<cause>` token (the refusal also sets the denial flag).
+ * Failure vs absence: a definitive not-there (WMI class/namespace absent, no
+ * RSMB provider) is its own row -- vendor/version/release_date `absent`, via
+ * the same pure formatter (wmi_bios_rows / smbios_rows) an empty result maps
+ * through -- with NO failure token; a refused call (ERROR_ACCESS_DENIED /
+ * WBEM access denied) and any other failure go through FirmwareReport::fail
+ * as an `unreadable` row plus a `<source>:<cause>` token (the refusal also
+ * sets the denial flag).
  * Every classification (classify_win32_error / classify_hresult) and row
  * mapping (wmi_bios_rows / parse_smbios_type0 / smbios_rows) is a pure
  * function in the parsers header; this TU only performs the calls, builds a
@@ -133,8 +135,10 @@ void collect_wmi(FirmwareReport& report) {
     if (query.error.has_value()) {
         const auto hr = hresult_from_token(*query.error);
         const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
-        if (o == ReadOutcome::absent)
-            return; // namespace/class not there: definitive absence, no row, no token
+        if (o == ReadOutcome::absent) {
+            report.add_all(wmi_bios_rows({})); // namespace/class not there: a definitive absent row
+            return;
+        }
         report.fail("vendor", kSrcWmi, "wmi:" + *query.error, o == ReadOutcome::denied);
         return;
     }
@@ -142,8 +146,10 @@ void collect_wmi(FirmwareReport& report) {
         report.note_failure("wmi:row_cap");
     // Win32_BIOS is a singleton on every host seen; if a host reports more
     // than one instance the first is authoritative and the rest ignored.
-    if (query.rows.empty())
-        return; // class present, no instance: definitive absence
+    if (query.rows.empty()) {
+        report.add_all(wmi_bios_rows({})); // class present, no instance: a definitive absent row
+        return;
+    }
     report.add_all(wmi_bios_rows(query.rows.front()));
 }
 
@@ -152,8 +158,10 @@ void collect_wmi(FirmwareReport& report) {
 /// A GetSystemFirmwareTable call that returned 0: classify GetLastError().
 void smbios_call_failed(FirmwareReport& report, DWORD err) {
     const ReadOutcome o = classify_win32_error(static_cast<std::uint32_t>(err));
-    if (o == ReadOutcome::absent)
-        return; // no RSMB provider on this host: definitive absence
+    if (o == ReadOutcome::absent) {
+        report.add_all(smbios_rows(Smbios0{})); // no RSMB provider: a definitive absent row
+        return;
+    }
     report.fail("vendor", kSrcSmbios, "smbios:win32_" + std::to_string(err),
                 o == ReadOutcome::denied);
 }
