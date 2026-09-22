@@ -4,7 +4,7 @@
  * `secedit /export` of the SECURITYPOLICY area, parsed from its UTF-16LE INI.
  *
  * RUNG 2 (an honest argv leaf, not rung 1): no in-tree LSA policy-query
- * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md:244
+ * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md:245
  * names `secedit /export` the authoritative source on a running box. Spawned via
  * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), absolute
  * System32 argv[0], no shell/PowerShell/.bat/.cmd. Sink-manifest site ID:

@@ -4,9 +4,9 @@
  * generic dispatcher coverage. That file's bare `LocalDispatcher` run never configures
  * `agent.data_dir`, so collect_windows_policy's very first check (local_security_policy_win.cpp:
  * "if (data_dir.empty()) return emit_constrained(ctx, "data_dir_unset");") short-circuits before
- * the real `secedit` spawn is ever reached -- the live path has had exactly one manual the-rig
- * verification (the `RIG PROBE` banner in local_security_policy_win.cpp) and no repeatable CI
- * regression. Same shape as execution_artifacts's own win-local split
+ * the real `secedit` spawn is ever reached -- so until this file the live path had exactly one
+ * manual the-rig verification (the `RIG PROBE` banner in local_security_policy_win.cpp) and no
+ * repeatable CI regression. This file IS that regression. Same shape as execution_artifacts's own win-local split
  * (test_execution_artifacts_win_local.cpp), which solved the identical gap for `amcache`.
  *
  * Same loading harness as test_local_security_policy_local_dispatcher.cpp -- LocalDispatcher over

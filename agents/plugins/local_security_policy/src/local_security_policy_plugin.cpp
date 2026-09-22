@@ -16,7 +16,7 @@
 
 namespace {
 
-// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md:244);
+// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md:245);
 // the wording is finalised from the Windows leg's rig-probe banner.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
