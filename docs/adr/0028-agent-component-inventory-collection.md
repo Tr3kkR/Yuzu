@@ -1463,7 +1463,9 @@ to an actual merge-blocking condition the way the RBAC/audit item above was).** 
 PR (or the coordinated set of PRs, if the ADR-0016 amendment and `component_inventory` ship
 separately) must record, as part of its own change summary, that this dependency has landed —
 "strongly worded in the ADR" is not itself a gate; a reviewer must affirmatively check it before
-approving.
+approving. The `installed_apps` `list` action now reports `install_location` and `bundle_id`; the
+hashed `list_inventory` blob addition has not landed, so this condition stays open until it does
+(see the status row above).
 
 **Binding condition: the `vuln_scan` → `component_inventory` fleet rollout follows the three-phase
 sequence in Decision 2 (ship fleet-wide → repoint + retire the other four definitions → remove

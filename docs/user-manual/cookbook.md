@@ -473,18 +473,22 @@ wait_for(exec_id)
 responses = get_responses("crossplatform.software.inventory", exec_id)
 
 # Find machines with outdated Java
-# `output` is the raw pipe row: app|name|version|publisher|install_date|install_location|bundle_id
-# (seven escape-aware tokens; agents on plugin < 1.2.0 emit five)
+# `output` holds many newline-joined rows, each app|name|version|publisher|install_date|
+# install_location|bundle_id (seven escape-aware tokens on plugin >= 1.2.0; an older
+# agent emits five and does not escape `|`, so only 5- or 7-token lines are accepted).
 import re
-def split_row(output):
-    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", output)]
+def split_row(line):
+    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", line)]
 for row in responses:
-    tokens = split_row(row["output"])
-    if len(tokens) < 4 or tokens[0] != "app":
-        continue
-    name, version = tokens[1], tokens[2]
-    if "java" in name.lower() and version < "21.0":
-        print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
+    for line in row["output"].splitlines():
+        if not line:
+            continue
+        tokens = split_row(line)
+        if tokens[0] != "app" or len(tokens) not in (5, 7):
+            continue
+        name, version = tokens[1], tokens[2]
+        if "java" in name.lower() and version < "21.0":
+            print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
 ```
 
 #### CEL Compliance Expression

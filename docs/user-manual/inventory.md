@@ -16,12 +16,17 @@ cadences.
   macOS: `system_profiler`). The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
-  `bundle_id` (ADR-0028). Rows are seven escape-aware tokens: split on `|` not
-  preceded by `\`, decode `\|` to `|`; every field is escaped the same way (`\`
+  `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
+  newlines: split `output` on newlines first, then each row is seven
+  escape-aware tokens: split on `|` not preceded by `\`, decode `\|` to `|`;
+  every field is escaped the same way (`\`
   folds to `/`, CR/LF to a space, a field over 4 KiB is cut), so a literal `|` in
-  a name never shifts a column; automation that assumed exactly five fields needs
-  an update, and agents still on plugin < 1.2.0 emit five (treat a missing sixth
-  or seventh as `-`). The dashboard results table renders `installed_apps` rows
+  a name never shifts a column on an agent running plugin 1.2.0 or later.
+  Agents older than 1.2.0 emit five tokens and do not escape `|`, so a row from
+  one of them can split into any count: accept a row only when it has exactly 5
+  or exactly 7 tokens under the escape-aware split, reject any other count, and
+  read the sixth/seventh columns only for agents known to be on plugin >= 1.2.0.
+  The dashboard results table renders `installed_apps` rows
   as key/value (`app` plus one remainder cell — a pre-existing server-side limit
   shared by the four original columns), so the new columns are not separately
   sortable or filterable there; read them from the raw `output` on
@@ -622,7 +627,7 @@ and Linux, and on macOS for a non-bundle location or beyond the 5000-application
 
 **The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
 the first `|` (`app` plus one merged cell) while the headers come from the definition. Nothing is lost: read the
-seven fields from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
+seven tokens from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
 with the results search box.
 
 ## Device-identity inventory (`device_ci`)
