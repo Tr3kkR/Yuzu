@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
+#include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -64,7 +65,8 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
-#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -1122,9 +1124,26 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{"deleted":{"type":"boolean"}},"required":["deleted"]})j"},
 
-    {"list_pending_approvals", "List pending approval requests.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
-     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
+    {"list_pending_approvals", "List approval requests (REST v1 twin: GET /api/v1/approvals; "
+     "also matches the legacy GET /api/approvals field set — #2146 A2-R4). Rows now also carry "
+     "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
+     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure never "
+     "presents as a false empty list -- retry_after_ms is a concrete hint on a transient "
+     "failure, null on a permanent one that will NOT clear on retry. The underlying query is hard-capped at "
+     "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
+     "exactly 100 matching rows is a complete, non-truncated result.",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string","maxLength":256,"description":"Exact-match filter on the submitting principal"}}})",
+     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
+
+    {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
+     "/api/v1/approvals/pending/count; also matches the legacy GET "
+     "/api/approvals/pending/count — #2146 A2-R4). Gated on pending_count_checked: a "
+     "store/pool failure never presents as a false zero count -- retry_after_ms is a "
+     "concrete hint on a transient failure, null on a permanent one that will NOT clear "
+     "on retry.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]})j"},
 
     // ── #4031: AD/Entra directory-sync read twins — parity with GET
     // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
@@ -3575,6 +3594,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"unpin_result_set", {"Infrastructure", "Write"}},
     {"delete_result_set", {"Infrastructure", "Delete"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    // #2146 A2-R4 — same gate as list_pending_approvals: a fleet-wide
+    // operator-facing review-queue count with no per-agent axis, matching
+    // the legacy GET /api/approvals/pending/count's bare gate.
+    {"get_pending_approval_count", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
@@ -4286,6 +4309,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"unpin_result_set", {ToolEffect::Additive, true, "Unpin result set"}},
     {"delete_result_set", {ToolEffect::Destructive, false, "Delete result set"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"get_pending_approval_count", {ToolEffect::ReadOnly, true, "Get pending approval count"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
@@ -5221,6 +5245,12 @@ McpServer::HandlerFn McpServer::build_handler(
     InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
     ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+    // `schedule_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, seventh family — list_schedules routes through the member
+    // `schedule_api_`/`set_schedule_api` instead, mcp_server.hpp's doc
+    // comment). Kept, unremoved, for constructor-signature stability across
+    // the three forwarding overloads below — a disclosed, deferred
+    // follow-up, not an oversight.
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
@@ -5237,6 +5267,12 @@ McpServer::HandlerFn McpServer::build_handler(
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
+    // `workflow_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, eighth family — list_workflows/get_workflow/get_workflow_
+    // execution route through the member `workflow_api_`/`set_workflow_api`
+    // instead, mcp_server.hpp's doc comment). Kept, unremoved, for
+    // constructor-signature stability across the two forwarding overloads
+    // below — a disclosed, deferred follow-up, not an oversight.
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
     std::shared_ptr<const VerifyApi> verify_api, LockoutClearFn lockout_clear_fn,
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
@@ -10875,7 +10911,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                // ADR-0031 WS-A4 (seventh family): routed through the
+                // ScheduleApi seam (schedule_api_, set_schedule_api) —
+                // supersedes a direct `schedule_engine` reach; the
+                // `build_handler` parameter of that name is now unused in
+                // this handler, kept for constructor-signature stability
+                // across the two forwarding overloads that construct
+                // build_handler's caller (mcp_server.cpp's two
+                // `ScheduleEngine* schedule_engine` overload parameters
+                // that forward into this call -- a bounded, 2-site ripple,
+                // not an open-ended one; see mcp_server.hpp's
+                // set_schedule_api doc comment).
+                if (!schedule_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Schedule engine unavailable"),
                         "application/json");
@@ -10923,7 +10970,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 sq.enabled_only = *enabled_only_opt;
-                auto schedules_result = schedule_engine->query_schedules_checked(sq);
+                auto schedules_result = schedule_api_->list_schedules(sq);
                 if (!schedules_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -10933,10 +10980,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
-                // widens this tool's output with execution_count, the one field
-                // the dashboard fragment showed that this tool didn't. Same
-                // builder as GET /api/v1/schedules, so the two cannot drift.
+                // #4030: shared builder (schedule_row_json, schedule_model.hpp,
+                // split out of workflow_model.hpp by the ADR-0031 WS-A4
+                // seventh-family seam) — widens this tool's output with
+                // execution_count, the one field the dashboard fragment
+                // showed that this tool didn't. Same builder as
+                // GET /api/v1/schedules, so the two cannot drift.
                 JArr arr;
                 for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());
@@ -10962,6 +11011,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_workflows (#4030) ────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam (workflow_api_, set_workflow_api) — the SAME
+            // instance the REST v1 twin uses (server.cpp), so the two can
+            // never disagree.
             if (tool_name == "list_workflows") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -10971,7 +11024,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine || !workflow_engine->is_open()) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
@@ -10979,7 +11032,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 WorkflowQuery wq;
                 wq.name_filter = param_str(args, "name");
                 wq.limit = std::min(param_int32(args, "limit", 100), 500);
-                auto workflows_result = workflow_engine->list_workflows(wq);
+                auto workflows_result = workflow_api_->list_workflows(wq);
                 if (!workflows_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11002,6 +11055,8 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_workflow (#4030) ──────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam — see list_workflows above.
             if (tool_name == "get_workflow") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -11011,13 +11066,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto workflow_id = param_str(args, "workflow_id");
-                auto workflow_result = workflow_engine->get_workflow(workflow_id);
+                auto workflow_result = workflow_api_->get_workflow(workflow_id);
                 if (!workflow_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11046,7 +11101,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // model from get_execution_status's fan-out Execution. Confined:
             // agent_ids_json names agents directly, so this gates on
             // fleet_read_fn_ (not a plain perm_fn) and confines the emitted
-            // agent_ids to the caller's visible scope.
+            // agent_ids to the caller's visible scope. ADR-0031 WS-A4
+            // (eighth family): routed through the WorkflowApi seam — see
+            // list_workflows above.
             if (tool_name == "get_workflow_execution") {
                 if (!fleet_read_fn_) {
                     spdlog::error(
@@ -11058,13 +11115,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                auto exec_result = workflow_engine->get_execution(exec_id);
+                auto exec_result = workflow_api_->get_workflow_execution(exec_id);
                 if (!exec_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -12667,25 +12724,132 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 ApprovalQuery aq;
-                aq.status = param_str(args, "status", "pending");
-                aq.submitted_by = param_str(args, "submitted_by");
-                auto approvals = approval_manager->query(aq);
-                JArr arr;
-                for (const auto& a : approvals) {
-                    arr.add(JObj()
-                                .add("id", a.id)
-                                .add("definition_id", a.definition_id)
-                                .add("status", a.status)
-                                .add("submitted_by", a.submitted_by)
-                                .add("submitted_at", a.submitted_at)
-                                .add("scope_expression", a.scope_expression));
+                // Gate 2 governance finding (#2146 A2-R4, same defect class as
+                // #2970B/#2146 A2-R1/A2-R2's param_int_strict/param_bool_strict/
+                // param_string_strict family): a present-but-wrong-JSON-type
+                // status/submitted_by must not silently read as absent and
+                // default to "pending"/"" -- reject it instead.
+                auto status_opt = param_string_strict(args, "status", "pending");
+                if (!status_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "status must be a JSON string"),
+                        "application/json");
+                    return;
                 }
-                mcp_audit("success");
+                // unhappy-path governance finding (#2146 A2-R4): a well-typed
+                // but out-of-enum status -- a typo, a case mismatch, or an
+                // explicit "" (which query_checked's filter-building treats
+                // as "no filter", silently returning EVERY status instead of
+                // the documented pending-on-omission default) -- must be
+                // rejected, not silently misinterpreted.
+                if (std::find(ApprovalManager::allowed_status().begin(),
+                              ApprovalManager::allowed_status().end(),
+                              *status_opt) == ApprovalManager::allowed_status().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid status"),
+                                    "application/json");
+                    return;
+                }
+                auto submitted_by_opt = param_string_strict(args, "submitted_by");
+                if (!submitted_by_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "submitted_by must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                aq.status = *status_opt;
+                aq.submitted_by = *submitted_by_opt;
+                // #2146 A2-R4 review finding: was the unchecked query(), which
+                // silently returned an empty list on pool exhaustion / a
+                // failed query, indistinguishable from a genuinely empty
+                // queue -- mirrors list_schedules' checked/a4_error shape
+                // immediately above.
+                auto list_result = approval_manager->query_checked(aq);
+                if (!list_result) {
+                    mcp_audit("failure", "store degraded; list_pending_approvals");
+                    // review finding (PR #4656): a permanent store failure
+                    // (schema drift, disk-full, store never opened) was
+                    // answered with the same retry_after_ms as a transient
+                    // one -- an unbounded "retry forever" loop that also
+                    // writes an audit row every attempt. Read-only sibling
+                    // of consume_ticket's approval_store_error_body -- same
+                    // sqlstate classification, wording that doesn't imply a
+                    // ticket was in play.
+                    res.set_content(
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       list_result.error().sqlstate),
+                        "application/json");
+                    return;
+                }
+                // Shared builder (approval_model.hpp, #2146 A2-R4 Rule 1) --
+                // same JSON shape as GET /api/v1/approvals and the single-
+                // fetch GET /api/v1/approvals/{id}, so the three cannot
+                // drift from each other.
+                JArr arr;
+                for (const auto& a : list_result->approvals)
+                    arr.add_raw(approval_row_json(a).dump());
+                // compliance-officer governance finding (#2146 A2-R4):
+                // detail content, matching the REST twin's audit posture
+                // (surface=list count=N) rather than an empty detail string.
+                mcp_audit("success", "surface=list count=" + std::to_string(arr.size()));
+                // result_truncated_by_cap (declared in the output schema
+                // above, precedent: list_schedules): the underlying query is
+                // hard-capped at 100 rows with no limit/cursor parameter on
+                // this tool; tells a caller when this response is a partial
+                // page rather than the complete approval queue.
+                // content[].text stays the bare `approvals` array unchanged
+                // for backward compat -- the flag lives only in
+                // structuredContent, same split as list_schedules.
+                JObj structured;
+                structured.raw("approvals", arr.str());
+                if (list_result->truncated)
+                    structured.add("result_truncated_by_cap", true);
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("approvals", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_pending_approval_count (#2146 A2-R4) ───────────────────
+            if (tool_name == "get_pending_approval_count") {
+                if (!tier_allows(tier, "Approval", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Approval", "Read"))
+                    return;
+                if (!approval_manager) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Approval manager unavailable"),
+                        "application/json");
+                    return;
+                }
+                // #2146 A2-R4: the unchecked pending_count() silently returns
+                // 0 on pool exhaustion / a failed query, indistinguishable
+                // from a genuine "zero pending approvals" state -- the exact
+                // false-negative a maker-checker backlog monitor cannot
+                // tolerate. Same checked/a4_error shape as list_pending_approvals
+                // above.
+                auto count_result = approval_manager->pending_count_checked();
+                if (!count_result) {
+                    mcp_audit("failure", "store degraded; get_pending_approval_count");
+                    // review finding (PR #4656): same permanent-vs-transient
+                    // misclassification as list_pending_approvals above.
+                    res.set_content(
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       count_result.error().sqlstate),
+                        "application/json");
+                    return;
+                }
+                // compliance-officer governance finding (#2146 A2-R4): detail
+                // content, matching the REST twin's audit posture.
+                mcp_audit("success", "surface=count count=" + std::to_string(*count_result));
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().add("count", *count_result).str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
