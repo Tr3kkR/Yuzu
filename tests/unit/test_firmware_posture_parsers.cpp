@@ -354,6 +354,22 @@ TEST_CASE("normalize_release_date: one shape, unknown text left alone", "[firmwa
     CHECK(normalize_release_date("garbage") == "garbage");
 }
 
+// Fails under: reformatting a shape-matching but non-calendar date into a confidently-wrong
+// ISO date instead of passing it through unchanged.
+TEST_CASE("normalize_release_date: a shape match with no real calendar date is left alone",
+          "[firmware_posture]") {
+    CHECK(normalize_release_date("13/40/2024") == "13/40/2024");   // month 13, day 40
+    CHECK(normalize_release_date("00/14/2024") == "00/14/2024");   // month 0
+    CHECK(normalize_release_date("03/00/2024") == "03/00/2024");   // day 0
+    CHECK(normalize_release_date("02/30/2023") == "02/30/2023");   // Feb 30 in a non-leap year
+    CHECK(normalize_release_date("02/29/2023") == "02/29/2023");   // Feb 29, 2023 is not a leap year
+    CHECK(normalize_release_date("02/29/2024") == "2024-02-29");   // 2024 IS a leap year
+    CHECK(normalize_release_date("02/29/2000") == "2000-02-29");   // divisible by 400: leap
+    CHECK(normalize_release_date("02/29/1900") == "02/29/1900");   // divisible by 100, not 400: not leap
+    CHECK(normalize_release_date("20241340000000.000000+000") == "20241340000000.000000+000"); // month 13
+    CHECK(normalize_release_date("20240000000000.000000+000") == "20240000000000.000000+000"); // month 0, day 0
+}
+
 // ── read classification and the shared verdict ───────────────────────────
 
 TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware_posture]") {

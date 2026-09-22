@@ -216,21 +216,49 @@ inline Field text_field(const std::map<std::string, std::string>& m, const char*
     return f;
 }
 
+/// True for a real calendar date: month 1-12, day 1-(28/29/30/31) with the Gregorian leap
+/// rule (divisible by 4, not by 100 unless also by 400). Guards normalize_release_date so a
+/// malformed source (month 13, day 40) is returned unchanged rather than reformatted into a
+/// confidently-wrong ISO date.
+inline bool valid_calendar_date(unsigned year, unsigned month, unsigned day) noexcept {
+    if (month < 1 || month > 12 || day < 1)
+        return false;
+    constexpr unsigned kDaysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    unsigned max_day = kDaysInMonth[month - 1];
+    if (month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
+        max_day = 29;
+    return day <= max_day;
+}
+
 } // namespace detail
 
 /// One release-date shape across sources: SMBIOS/DMI `MM/DD/YYYY` and a WMI CIM datetime
 /// `YYYYMMDDhhmmss.mmmmmm+UUU` both become `YYYY-MM-DD`. Anything else (SMBIOS also permits
-/// a 2-digit year, and hosts emit free text) is returned unchanged rather than guessed at.
+/// a 2-digit year, and hosts emit free text) is returned unchanged rather than guessed at. A
+/// shape that parses but names no real calendar date (month 13, day 40) is also returned
+/// unchanged, never reformatted into a confidently-wrong ISO date.
 [[nodiscard]] inline std::string normalize_release_date(std::string_view raw) {
     const std::string s = detail::rtrim(raw);
     // MM/DD/YYYY
     if (s.size() == 10 && s[2] == '/' && s[5] == '/' && detail::all_digits(s.substr(0, 2)) &&
-        detail::all_digits(s.substr(3, 2)) && detail::all_digits(s.substr(6, 4)))
-        return s.substr(6, 4) + '-' + s.substr(0, 2) + '-' + s.substr(3, 2);
+        detail::all_digits(s.substr(3, 2)) && detail::all_digits(s.substr(6, 4))) {
+        const auto mo = *detail::to_uint(s.substr(0, 2));
+        const auto dy = *detail::to_uint(s.substr(3, 2));
+        const auto yr = *detail::to_uint(s.substr(6, 4));
+        if (detail::valid_calendar_date(yr, mo, dy))
+            return s.substr(6, 4) + '-' + s.substr(0, 2) + '-' + s.substr(3, 2);
+        return s;
+    }
     // CIM datetime: 14 digits, '.', 6 digits, sign, 3 digits
     if (s.size() == 25 && detail::all_digits(std::string_view{s}.substr(0, 14)) && s[14] == '.' &&
-        (s[21] == '+' || s[21] == '-'))
-        return s.substr(0, 4) + '-' + s.substr(4, 2) + '-' + s.substr(6, 2);
+        (s[21] == '+' || s[21] == '-')) {
+        const auto yr = *detail::to_uint(s.substr(0, 4));
+        const auto mo = *detail::to_uint(s.substr(4, 2));
+        const auto dy = *detail::to_uint(s.substr(6, 2));
+        if (detail::valid_calendar_date(yr, mo, dy))
+            return s.substr(0, 4) + '-' + s.substr(4, 2) + '-' + s.substr(6, 2);
+        return s;
+    }
     return s;
 }
 
