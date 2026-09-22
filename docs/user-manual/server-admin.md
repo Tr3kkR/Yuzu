@@ -211,6 +211,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
+
+**What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
+previously synthesised the sibling's dispatch scope from the original's live, nullable
+`parent_id` foreign key. If the original's parent result set was later deleted (`parent_id ...
+ON DELETE SET NULL`), the column read as absent, and an absent `parent_id` reaching dispatch
+synthesis meant "broadcast to `__all__`" — silently turning "re-ask the same narrow question"
+into "ask the whole visible fleet." Both routes now refuse (`400 RESULT_SET_BAD_REQUEST`,
+`reason=parent_gone`) when the live parent is gone but the original's persisted `source_payload`
+shows it was narrowed at creation, instead of broadcasting.
+
+**Who this affects.** Any caller (REST or MCP) whose automation re-evaluates a result set that
+was originally narrowed to a `parent_id`, where that parent set has since been deleted.
+Previously such a call silently succeeded with a `202` (REST) or a materialized/pending result
+(MCP) dispatched to the entire visible fleet; it now refuses instead -- REST returns `400
+RESULT_SET_BAD_REQUEST`, MCP returns a JSON-RPC error (`kInvalidParams`) over HTTP 200, per that
+transport's existing error-shape convention. No legitimate caller should have been relying on the
+fleet-wide broadcast — this was the target-erasure defect being fixed — but any automation
+catching only success responses on this route should add handling for the new `400
+reason=parent_gone` case: create a fresh result set from the intended parent instead of
+re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
+at creation) still broadcasts on re-eval, unchanged.
+
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
 **What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.

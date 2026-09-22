@@ -1937,6 +1937,56 @@ Land after the foundational IPC plugins (19.1) ship and the rendering model prov
 
 ---
 
+## Phase 20: Reflex — Agent-Local Automated Response (Proposed)
+
+*Sparks (ADR-0021) already give the agent a converged, use-case-agnostic detection layer; Reflex is
+the third and last sovereign Spark consumer alongside Guardian (real-time compliance enforcement)
+and DEX (curated telemetry) — a YAML-authored, agent-local binding from a Spark to a small chain of
+plugin-action Reactions, executed on the device the instant the Spark fires, with or without server
+connectivity. Design contract: `docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md`
+(Decisions 2, 4, 5, 6, 7, 8, 9, 10 and the 2026-09-17 Reflex amendment). No GitHub tracking issue filed yet
+for this phase as a whole — file one before implementation slices land, per
+`docs/agents/issue-standard.md`.*
+
+### Issue 20.1: Reflex Set Authoring, Storage, and Safety/Consent Gates
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+YAML-authoritative Reflex Set CRUD (`ReflexSetStore`, born-on-PostgreSQL per ADR-0012), the
+`dangerous_reactions_in_spec()` safety chokepoint (extends the existing `dangerous_*_in_spec`
+doctrine, fed by `CommandCapabilityRegistry::classify`), and the device-classification consent gate
+(the free-form `device_class` asset tag, `server` | `workstation`, unclassified = workstation =
+fail-closed — see `docs/asset-tagging-guide.md` "Recipe: Reflex consent gate").
+
+### Issue 20.2: Digest-Bound Two-Person Approval and Deploy/Push
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+Deploy gated on a dedicated `Reflex:Execute` RBAC permission (never the Guardian-only `Push` cross-seed),
+approved by a different principal than both the last editor and the deployer, bound to a canonical
+digest over compiled content + assignment scope, recomputed and compared at every compile. Compiled
+Reflex Sets fan out over the reserved `__reflex__` plugin name's `push_sets` action.
+
+### Issue 20.3: Agent-Local Spark→Reaction Execution
+**Capability:** new | **Scope:** Agent | **Status:** Proposed
+
+`ReflexEngine`, a queued SparkEngine consumer (never inline) that runs each fired Reflex's Reaction
+chain locally via the agent's `LocalDispatcher` — authorized once, at deploy time, by 20.1/20.2, never
+re-authorized per fire (agent-local dispatch is architecturally distinct from the server's
+operator-dispatch `classify_and_authorize_dispatch`/`DispatchCaller` chokepoint — see
+`docs/reflex-design.md` "Safety chokepoint"). Per-set serialized concurrency, bounded detached reaction
+workers counted into the agent's hard-exit grace sum, crash-safe (an in-flight chain marker is aborted,
+never resumed).
+
+### Issue 20.4: Reflex Outcomes, Observability, and Dashboard
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+Outcomes ride the existing `__guard__`/`event` channel (`GuaranteedStateEvent.family == "reflex"`),
+land in a Reflex-only `reflex_outcomes` table (ADR-0021 Decision 6 partial supersession), and are
+never surfaced on the executions-history ladder (agent-local automation, not operator dispatch).
+Fleet Prometheus families, heartbeat tags, audit verbs, SOC 2 evidence rows, REST + MCP CRUD, and an
+HTMX `/reflex` dashboard round-tripping the YAML — never the model.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
