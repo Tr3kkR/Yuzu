@@ -540,13 +540,32 @@ struct Tally {
     std::vector<std::string> rows;
     bool capped = false;
 
+    /// The LAST slot is reserved for the truncation marker itself. Without that
+    /// reservation the cap silently drops the row announcing the cap, so the
+    /// output ended on an ordinary row indistinguishable from a complete dump --
+    /// the one place a non-OK status was not paired with a row saying why.
+    /// `marker_prefix` is the action's row prefix; `marker_fields` makes the
+    /// marker match the action's own field count (4 for the kv actions, 7 for
+    /// sudoers), so the truncation notice never breaks the wire shape.
     void row(std::string r) {
-        if (rows.size() >= kMaxRows) {
-            if (!capped) acc.add_failure("row_cap");
+        if (rows.size() + 1 >= kMaxRows) {
+            if (!capped) {
+                acc.add_failure("row_cap");
+                rows.push_back(truncation_marker());
+            }
             capped = true;
             return;
         }
         rows.push_back(std::move(r));
+    }
+
+    std::string marker_prefix{"local_security_policy"};
+    std::size_t marker_fields{4};
+    [[nodiscard]] std::string truncation_marker() const {
+        return marker_fields == 7
+                   ? format_sudoers_row("-", {"unreadable", "-", "-", "-", "row_cap"})
+                   : format_kv_row(marker_prefix, "source_state", "unreadable:row_cap",
+                                   marker_prefix);
     }
     /// Records a failed (non-absent) read.
     void failure(const ReadOutcome& o, std::string_view src) {
@@ -634,13 +653,22 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
                                      const FileReader& rd, const DirLister& ls) {
     detail::Tally t;
     const auto prefix = action_row_prefix(action);
-    // The Password/Lockout arms below read Linux paths and never consult `flavor`;
-    // on macOS those two actions come from pwpolicy and the leg returns before it
-    // gets here. Enforced at the seam rather than one file away, so relaxing that
-    // early return cannot silently start reading /etc/login.defs on a Mac.
-    if (flavor == FileFlavor::Macos &&
-        (action == LocalPolicyAction::Password || action == LocalPolicyAction::Lockout))
-        return {};
+    // Shape the row-cap truncation marker like the action's own rows (sudoers is
+    // 7 fields, the rest 4), so the notice can never break the wire contract.
+    t.marker_prefix = std::string{prefix};
+    t.marker_fields = action == LocalPolicyAction::Sudoers ? 7u : 4u;
+    // FAIL CLOSED, not open. Both arms below are unreachable today -- execute()
+    // rejects Unknown before any leg runs, and the macOS leg routes Password and
+    // Lockout to pwpolicy before calling here -- but returning an empty Collected
+    // would be status OK with zero rows, which apply_collected reports as a green
+    // empty result. A named CONSTRAINED says what happened instead. (The
+    // Password/Lockout arms read Linux paths and never consult `flavor`, so this
+    // is also what stops a relaxed macOS early return quietly reading
+    // /etc/login.defs on a Mac.)
+    if (action == LocalPolicyAction::Unknown ||
+        (flavor == FileFlavor::Macos &&
+         (action == LocalPolicyAction::Password || action == LocalPolicyAction::Lockout)))
+        return {{}, PolicyStatus::Constrained, "unsupported_action"};
     switch (action) {
     case LocalPolicyAction::Password: {
         detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsPasswordKeys);
@@ -710,7 +738,7 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
         }
         break;
     }
-    case LocalPolicyAction::Unknown: break;
+    case LocalPolicyAction::Unknown: break; // refused above; the switch stays exhaustive
     }
     return {std::move(t.rows), select_status(t.readable, t.denied, t.failed + (t.capped ? 1 : 0)),
             t.acc.reason()};

@@ -90,6 +90,18 @@ std::vector<std::string> split_escape_aware(const std::string& row) {
     return out;
 }
 
+/// True when every row splits into exactly `n` escape-aware fields. One assertion
+/// for a whole result set: a per-row CHECK over a 4096-row capped run would add
+/// thousands of assertions to the suite for a single shape property.
+bool all_rows_have_fields(const std::vector<std::string>& rows, std::size_t n) {
+    for (const auto& r : rows)
+        if (split_escape_aware(r).size() != n) {
+            UNSCOPED_INFO("row with " << split_escape_aware(r).size() << " fields: " << r);
+            return false;
+        }
+    return true;
+}
+
 std::vector<std::uint8_t> utf16le_bom(const std::u16string& s, bool bom = true) {
     std::vector<std::uint8_t> b;
     if (bom) b = {0xFF, 0xFE};
@@ -424,8 +436,7 @@ TEST_CASE("sudoers.d: a dir-level failure is a row, never only a reason", "[loca
     SECTION("every collected row still keeps the 7-field shape") {
         auto fs = hardened_fs();
         fs.dirs_truncated = true;
-        for (const auto& r : run(fs, LocalPolicyAction::Sudoers).rows)
-            CHECK(split_escape_aware(r).size() == 7);
+        CHECK(all_rows_have_fields(run(fs, LocalPolicyAction::Sudoers).rows, 7));
     }
     SECTION("unreadable directory") {
         auto fs = hardened_fs();
@@ -618,4 +629,56 @@ TEST_CASE("pwpolicy plist bridge: real capture, malformed input and wrong root",
     CHECK_FALSE(pwpolicy_plist_to_items("<?xml version=\"1.0\"?><plist><dict><key>x</key>").has_value());  // truncated
     CHECK_FALSE(pwpolicy_plist_to_items("<?xml version=\"1.0\"?><plist version=\"1.0\"><array/></plist>").has_value()); // root not a dict
     CHECK_FALSE(pwpolicy_plist_to_items("").has_value());
+}
+
+// Fails under: the row cap dropping the row that ANNOUNCES the cap, or the marker
+// breaking the action's field count. Before the reservation, a capped run ended on an
+// ordinary row indistinguishable from a complete dump -- the one place a non-OK status
+// was not paired with a row saying why, against the invariant apply_collected states.
+TEST_CASE("row cap: the truncation marker is emitted and keeps the action's shape",
+          "[local_security_policy][collector]") {
+    SECTION("sudoers keeps 7 fields") {
+        auto fs = hardened_fs();
+        std::string many;
+        for (int i = 0; i < 6000; ++i) many += "u" + std::to_string(i) + " ALL=(ALL) NOPASSWD: ALL\n";
+        fs.files["/etc/sudoers"] = "@" + many;
+        const auto c = run(fs, LocalPolicyAction::Sudoers);
+        CHECK(c.status == PolicyStatus::Constrained);
+        CHECK(c.reason == "row_cap");
+        REQUIRE(c.rows.size() == kMaxRows);
+        CHECK(c.rows.back() == "sudoers|-|unreadable|-|-|-|row_cap"); // the marker, not a data row
+        CHECK(all_rows_have_fields(c.rows, 7)); // one assertion, not one per row
+    }
+    SECTION("a kv action keeps 4 fields") {
+        auto fs = default_fs();
+        std::string many;
+        for (int i = 0; i < 6000; ++i) many += "K" + std::to_string(i) + " v\n";
+        fs.files["/etc/security/pwquality.conf"] = "@" + many;
+        const auto c = run(fs, LocalPolicyAction::Password);
+        CHECK(c.status == PolicyStatus::Constrained);
+        CHECK(c.reason == "row_cap");
+        REQUIRE(c.rows.size() == kMaxRows);
+        CHECK(c.rows.back() == "password_policy|source_state|unreadable:row_cap|password_policy");
+        CHECK(all_rows_have_fields(c.rows, 4));
+    }
+}
+
+// Fails under: an unsupported action returning an empty Collected, which apply_collected
+// reports as OK/FULL with zero rows -- a green empty result. Unreachable in production
+// (execute() rejects Unknown; the macOS leg routes Password/Lockout to pwpolicy), so this
+// pins the FAIL-CLOSED shape of the guard rather than a live path.
+TEST_CASE("collect_file_policy fails closed on an action it cannot serve",
+          "[local_security_policy][collector]") {
+    const auto fs = default_fs();
+    const auto unknown = run(fs, LocalPolicyAction::Unknown);
+    CHECK(unknown.status == PolicyStatus::Constrained);
+    CHECK(unknown.reason == "unsupported_action");
+    CHECK(unknown.rows.empty()); // apply_collected supplies the fallback row for this case
+    for (const auto a : {LocalPolicyAction::Password, LocalPolicyAction::Lockout}) {
+        const auto mac = run(fs, a, FileFlavor::Macos);
+        CHECK(mac.status == PolicyStatus::Constrained);
+        CHECK(mac.reason == "unsupported_action");
+    }
+    // macOS audit and sudoers ARE served by this collector and must be unaffected.
+    CHECK(run(fs, LocalPolicyAction::Sudoers, FileFlavor::Macos).status == PolicyStatus::Ok);
 }
