@@ -480,10 +480,13 @@ FAMILIES = {
     },
     # `guardian` (ADR-0031 WS-A4, the NINTH family) — the Guardian /
     # Guaranteed State READ surface: `GuaranteedStateStore`-backed
-    # `GET /api/v1/guaranteed-state/{rules,rules/{id},schemas,status,
+    # `GET /api/v1/guaranteed-state/{rules,rules/{id},status,
     # status/{agent_id},rules/{id}/status,agents/{id}/rules,events}` +
-    # `BaselineStore`-backed `device-compliance`, all nine with a live MCP
-    # twin. Enforced at the HEADER level only, same posture as
+    # `BaselineStore`-backed `device-compliance` — eight of the family's
+    # nine public resources, each with a live MCP twin. The ninth,
+    # `schemas`/MCP `get_guardian_schemas`, is deliberately outside the
+    # seam (a compiled-in, store-free catalog — see guardian_api.hpp).
+    # Enforced at the HEADER level only, same posture as
     # `dex`/`dex_perf`/`schedule`/`workflow` and for the SAME reason:
     # `rest_api_v1.cpp`/`mcp_server.cpp` are multi-family TUs, and
     # `guardian_routes.cpp` — UNLIKE those four siblings — has no

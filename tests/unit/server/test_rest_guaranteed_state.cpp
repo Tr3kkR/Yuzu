@@ -34,6 +34,7 @@
 #include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
+#include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 #include "test_verify_api_double.hpp"
@@ -335,7 +336,15 @@ struct RestGsHarness {
     // explicit `live_deps=false` case already exercised.
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
                            bool wire_app_perf = true, bool with_exec_visible = true,
-                           pg::PgPool* resp_pool = nullptr, bool wire_list_read_fn = true)
+                           pg::PgPool* resp_pool = nullptr, bool wire_list_read_fn = true,
+                           // ADR-0031 WS-A4 (ninth family), seam-bypass tripwire: when
+                           // set, this DISTINGUISHING GuardianApi double is wired
+                           // INSTEAD of the seam this harness otherwise derives from its
+                           // own live store/baseline_store below — the real stores are
+                           // still constructed and REQUIRE'd open either way, so a
+                           // revert-to-raw-store still finds a live, answerable store at
+                           // the SAME id but a DIFFERENT answer than the double gives.
+                           std::shared_ptr<yuzu::server::GuardianApi> guardian_api_override = nullptr)
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
           wire_list_read_fn_(wire_list_read_fn) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -547,9 +556,13 @@ struct RestGsHarness {
         // server.cpp — this harness's constructor already REQUIREs both
         // stores open before reaching here, so both pointers are always
         // non-null in practice; each method still degrades individually if
-        // either were absent (guardian_api.cpp).
-        auto guardian_api_local =
-            yuzu::server::make_local_guardian_api(store.get(), baseline_store.get());
+        // either were absent (guardian_api.cpp). guardian_api_override (an
+        // injected test double) takes precedence when set — see the
+        // constructor param's own doc comment (seam-bypass tripwire testing).
+        std::shared_ptr<yuzu::server::GuardianApi> guardian_api_local =
+            guardian_api_override ? guardian_api_override
+                                  : yuzu::server::make_local_guardian_api(store.get(),
+                                                                           baseline_store.get());
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
@@ -4560,4 +4573,253 @@ TEST_CASE("REST gs.device-all-guards: an unwired scoped_perm_fn fails closed (50
     auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
     REQUIRE(res);
     CHECK(res->status == 503);
+}
+
+// ── ADR-0031 WS-A4 (ninth family) — seam-bypass tripwires ───────────────────
+//
+// Gate 3 quality-engineer finding on this seam's own governance round: every
+// prior WS-A4 family (network/verify/device/compliance/dex_perf/schedule/
+// workflow) shipped a positive, non-crashing tripwire proving each rewired
+// handler answers via the family's *Api seam and not a silently-reverted raw
+// store call — `rest_api_v1.cpp`/`mcp_server.cpp` are INSPECTED-NOT-ENFORCED
+// by check-seam-closure.py (both already #include guaranteed_state_store.hpp
+// for the mutators this seam doesn't cover), so a revert compiles clean and
+// the static check stays green; only a DYNAMIC test with a real store AND a
+// DISTINGUISHING FnGuardianApi double wired at once can catch it (the two
+// doors must answer DIFFERENTLY, so a revert flips the test from pass to
+// fail). `guardian` shipped with none; these eight close that gap, one per
+// rewired REST resource (`test_mcp_server.cpp` carries the MCP-side twins).
+//
+// Each test seeds REAL, separately-answerable data via the harness's normal
+// (mutator, unaffected by this seam) helpers, then wires a `guardian_api_override`
+// double that answers the SAME query differently — so a revert-to-raw-store
+// would show the REAL data, not the double's.
+
+TEST_CASE("REST gs.rules (seam-bypass tripwire): answers via GuardianApi, not the raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+            GuaranteedStateRuleRow r;
+            r.rule_id = "seam-only-id";
+            r.name = "seam-only-name";
+            return std::vector<GuaranteedStateRuleRow>{r};
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
+                        RestGsHarness::make_rule_body("real-id", "real-name"))
+                ->status == 201);
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["name"] == "seam-only-name");
+    CHECK(j["pagination"]["total"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.rules/{id} (seam-bypass tripwire): answers via GuardianApi, not the raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    // Nothing seeded in the real store at "seam-id" — a revert to the raw
+    // store would 404; the double answers 200 with a distinguishing name.
+    GuaranteedStateRuleRow seam_row;
+    seam_row.rule_id = "seam-id";
+    seam_row.name = "seam-only-detail";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        [seam_row](const std::string& id)
+            -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            if (id != "seam-id")
+                return std::optional<GuaranteedStateRuleRow>{};
+            return std::optional<GuaranteedStateRuleRow>{seam_row};
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/seam-id");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["name"] == "seam-only-detail");
+}
+
+TEST_CASE("REST gs.status (fleet, seam-bypass tripwire): answers via GuardianApi, not the raw "
+          "store",
+          "[pg][rest][guaranteed_state][twins]") {
+    GuardianStatusRollup seam_rollup;
+    seam_rollup.total_rules = 999;
+    seam_rollup.errored_rules = 888;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        [seam_rollup](const std::optional<std::vector<std::string>>&)
+            -> std::optional<GuardianStatusRollup> { return seam_rollup; });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    // Real store has genuinely different (small) data, proving the response
+    // is NOT derived from it.
+    h.seed_rule("r1", "real-rule");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_rules"].get<int>() == 999);
+    CHECK(j["data"]["errored_rules"].get<int>() == 888);
+}
+
+TEST_CASE("REST gs.status/{agent_id} (seam-bypass tripwire): answers via GuardianApi, not the "
+          "raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    GuardianAgentStatusRollup seam_rollup;
+    seam_rollup.total_rules = 777;
+    seam_rollup.errored_rules = 666;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        [seam_rollup](const std::string&) -> std::optional<GuardianAgentStatusRollup> {
+            return seam_rollup;
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    h.seed_rule("r1", "real-rule");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_rules"].get<int>() == 777);
+    CHECK(j["data"]["errored_rules"].get<int>() == 666);
+}
+
+TEST_CASE("REST gs.rules/{id}/status (seam-bypass tripwire): answers via GuardianApi, not the "
+          "raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    // The handler's existence pre-check calls get_rule() through the SAME
+    // seam, so the double must answer both methods it needs.
+    GuaranteedStateRuleRow found;
+    found.rule_id = "r1";
+    found.name = "rule-one";
+    GuardianRuleAgentStatusRow seam_row;
+    seam_row.agent_id = "WS-SEAM";
+    seam_row.state = "drifted";
+    seam_row.updated_at = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        [found](const std::string&)
+            -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            return std::optional<GuaranteedStateRuleRow>{found};
+        },
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        [seam_row](const std::string&) -> std::optional<std::vector<GuardianRuleAgentStatusRow>> {
+            return std::vector<GuardianRuleAgentStatusRow>{seam_row};
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    // Real store's r1 has NO status rows — a revert would answer an empty list.
+    h.seed_rule("r1", "rule-one");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["agent_id"] == "WS-SEAM");
+}
+
+TEST_CASE("REST gs.agents/{id}/rules (seam-bypass tripwire): answers via GuardianApi, not the "
+          "raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    GuardianDeviceGuardRow seam_row;
+    seam_row.rule_id = "r-seam";
+    seam_row.name = "seam-guard";
+    seam_row.state = "compliant";
+    seam_row.updated_at = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [seam_row](const std::string&) -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            return std::vector<GuardianDeviceGuardRow>{seam_row};
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    // Real store has NO guards reported for WS-1 — a revert would answer an
+    // empty list.
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["guards"].is_array());
+    REQUIRE(j["data"]["guards"].size() == 1);
+    CHECK(j["data"]["guards"][0]["name"] == "seam-guard");
+}
+
+TEST_CASE("REST gs.device-compliance (seam-bypass tripwire): answers via GuardianApi, not the "
+          "raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    GuardianDeviceComplianceRollup seam_rollup;
+    seam_rollup.baseline_id = "seam-baseline-id";
+    seam_rollup.baseline_name = "SEAM-BASELINE";
+    seam_rollup.baseline_lifecycle = "deployed";
+    seam_rollup.deployed = true;
+    seam_rollup.total_guards = 1;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
+        [seam_rollup](const std::string&, const std::string&, bool* store_degraded,
+                     bool* pii_access_began) -> std::optional<GuardianDeviceComplianceRollup> {
+            *store_degraded = false;
+            *pii_access_began = true;
+            return seam_rollup;
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    // No real Baseline named "B" exists — a revert to the raw store would
+    // answer 404 (baseline name not found).
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["baseline"]["name"] == "SEAM-BASELINE");
+}
+
+TEST_CASE("REST gs.events (seam-bypass tripwire): answers via GuardianApi, not the raw store",
+          "[pg][rest][guaranteed_state][twins]") {
+    GuaranteedStateEventRow seam_event;
+    seam_event.event_id = "seam-event";
+    seam_event.rule_id = "r-seam";
+    seam_event.agent_id = "WS-SEAM";
+    seam_event.event_type = "drift.detected";
+    seam_event.severity = "high";
+    seam_event.timestamp = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
+        yuzu::server::test::FnGuardianApi::DeviceComplianceFn{},
+        [seam_event](const GuaranteedStateEventQuery&) -> std::vector<GuaranteedStateEventRow> {
+            return {seam_event};
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    // No real events exist — a revert to the raw store would answer an
+    // empty list.
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/events");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["event_id"] == "seam-event");
 }

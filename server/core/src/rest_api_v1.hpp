@@ -516,14 +516,20 @@ public:
         // ADDITIONAL seam, not a replacement, until every consumer migrates.
         std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
         // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read
-        // API seam — backs the 9 GET /api/v1/guaranteed-state/* resources
-        // (the SAME instance the MCP Guardian tools use). REQUIRED: nullptr →
-        // those routes answer 503, equivalent to the old
-        // `!guaranteed_state_store` readiness guard (server.cpp wires this
-        // iff BOTH `guaranteed_state_store_` and `baseline_store_` are
-        // present — `device-compliance` needs both). `guaranteed_state_store`
-        // above stays wired too, for the rule/baseline MUTATORS this seam
-        // does not cover.
+        // API seam — backs 8 of the 9 GET /api/v1/guaranteed-state/*
+        // resources (the SAME instance the MCP Guardian tools use;
+        // `schemas` stays outside the seam, store-free — see
+        // guardian_api.hpp). server.cpp constructs this UNCONDITIONALLY
+        // (never null) — each of the two backing store pointers is checked
+        // INDIVIDUALLY inside the impl (guardian_api.cpp), mirroring
+        // dex_perf_api's own multi-dependency posture: a null
+        // `guaranteed_state_store_` degrades every method, a null
+        // `baseline_store_` degrades ONLY device_compliance. The
+        // `!guardian_api` guard the 8 routes still carry is therefore
+        // defense-in-depth only, matching the pre-seam
+        // `!guaranteed_state_store` guard's practical behaviour.
+        // `guaranteed_state_store` above stays wired too, for the
+        // rule/baseline MUTATORS this seam does not cover.
         std::shared_ptr<const GuardianApi> guardian_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an

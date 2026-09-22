@@ -48,9 +48,13 @@ class BaselineStore;
 ///
 /// LIFETIME CONTRACT (load-bearing, mirrors `dex_perf_api_local.hpp`): each
 /// pointer is BORROWED, NOT owned — it MUST outlive every call to the
-/// returned API. `ServerImpl` guarantees this by joining the web thread
-/// (`web_server_->stop()`) before destroying `guaranteed_state_store_`/
-/// `baseline_store_`.
+/// returned API. `ServerImpl::stop()` joins the web thread
+/// (`web_server_->stop()` + `web_thread_.join()`) before either store is
+/// destroyed — explicitly for `guaranteed_state_store_` (`stop()`'s own
+/// `.reset()` call), implicitly via member-declaration order for
+/// `baseline_store_` (torn down after `stop()` returns, in `~ServerImpl`).
+/// Either way, no in-flight REST/MCP handler can be mid-call into a store
+/// by the time it is destroyed.
 [[nodiscard]] std::shared_ptr<GuardianApi>
 make_local_guardian_api(GuaranteedStateStore* store, BaselineStore* baseline_store);
 

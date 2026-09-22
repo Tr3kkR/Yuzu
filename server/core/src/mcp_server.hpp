@@ -737,18 +737,21 @@ public:
 
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
-    /// server.cpp wires the IDENTICAL instance so the nine Guardian read
-    /// tools can never disagree with REST v1. `build_handler`'s own
-    /// `GuaranteedStateStore* guaranteed_state_store` parameter stays wired
-    /// too — the nine Guardian tool bodies below now call `guardian_api_`
-    /// exclusively for their reads, but the rule/baseline MUTATOR tools
-    /// (`create_guardian_rule` etc., no public seam of their own) still need
-    /// the raw store. Unset (default-constructed null) ⇒ the nine tools' own
-    /// `!guardian_api_` readiness guard answers "Guaranteed State store
-    /// unavailable", matching the pre-seam `!guaranteed_state_store` guard's
-    /// behaviour exactly — server.cpp wires this iff BOTH
-    /// `guaranteed_state_store_` and `baseline_store_` are present
-    /// (`device_compliance` needs both).
+    /// server.cpp wires the IDENTICAL instance so the eight Guardian read
+    /// tools can never disagree with REST v1 (`get_guardian_schemas` stays
+    /// outside the seam, store-free — see guardian_api.hpp). `build_handler`'s
+    /// own `GuaranteedStateStore* guaranteed_state_store` parameter stays
+    /// wired too — the eight Guardian tool bodies below now call
+    /// `guardian_api_` exclusively for their reads, but the rule/baseline
+    /// MUTATOR tools (`create_guardian_rule` etc., no public seam of their
+    /// own) still need the raw store. server.cpp constructs this
+    /// UNCONDITIONALLY (never null) — each of the two backing store
+    /// pointers is checked INDIVIDUALLY inside the impl (guardian_api.cpp),
+    /// mirroring dex_perf_api's own multi-dependency posture: a null
+    /// `guaranteed_state_store_` degrades every method, a null
+    /// `baseline_store_` degrades ONLY device_compliance. The tools' own
+    /// `!guardian_api_` guard is therefore defense-in-depth only, matching
+    /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
     void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)

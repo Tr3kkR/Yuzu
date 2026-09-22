@@ -73,6 +73,20 @@ GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     return r;
 }
 
+GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
+                                   std::string agent_id) {
+    GuaranteedStateEventRow e;
+    e.event_id = std::move(event_id);
+    e.rule_id = std::move(rule_id);
+    e.agent_id = std::move(agent_id);
+    e.event_type = "drift.detected";
+    e.severity = "high";
+    e.guard_type = "registry";
+    e.guard_category = "event";
+    e.timestamp = "2026-04-19T12:00:00Z";
+    return e;
+}
+
 } // namespace
 
 TEST_CASE("GuardianApi::list_rules: forwards an empty catalogue and returns an honest-empty result",
@@ -209,6 +223,26 @@ TEST_CASE("GuardianApi::list_events: forwards an empty, plain-vector, non-option
 
     std::vector<GuaranteedStateEventRow> rows = api->list_events(GuaranteedStateEventQuery{});
     CHECK(rows.empty());
+}
+
+TEST_CASE("GuardianApi::list_events: a real event round-trips unmodified through the seam",
+          "[pg][guardian_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, baselinestore_tpl);
+    PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 2}};
+    BaselineStore baseline_store{bl_pool};
+
+    REQUIRE(store.insert_event(make_event("evt-1", "rule-1", "agent-1")).has_value());
+
+    auto api = make_local_guardian_api(&store, &baseline_store);
+
+    auto rows = api->list_events(GuaranteedStateEventQuery{});
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].event_id == "evt-1");
+    CHECK(rows[0].rule_id == "rule-1");
+    CHECK(rows[0].agent_id == "agent-1");
 }
 
 TEST_CASE("GuardianApi: a null baseline_store degrades ONLY device_compliance — the other seven "

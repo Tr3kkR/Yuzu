@@ -15676,8 +15676,7 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
             if (!guardian_api) {
-                spdlog::error("guardian.device.baseline: store null "
-                              "(guaranteed_state_store/baseline_store) — "
+                spdlog::error("guardian.device.baseline: guardian_api seam null — "
                               "registration-order defect; cid={}",
                               cid);
                 res.status = 503;

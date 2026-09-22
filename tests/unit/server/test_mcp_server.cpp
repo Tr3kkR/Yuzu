@@ -60,6 +60,7 @@
 #include "test_dex_perf_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
+#include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi, seam-bypass tripwire tests
 #include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
@@ -1095,6 +1096,18 @@ struct McpTestServer {
     /// unavailable" path (mirrors production's own null-check).
     yuzu::server::BaselineStore* baseline_store_for_test{nullptr};
 
+    /// ADR-0031 WS-A4 (ninth family), seam-bypass tripwire (mirrors
+    /// workflow_api_for_test's own doc comment above): optionally inject a
+    /// DISTINGUISHING GuardianApi double instead of the seam this harness
+    /// derives from guaranteed_state_store_for_test/baseline_store_for_test.
+    /// A real (differently-answering) store is ALSO wired via those two
+    /// fields, so reverting a Guardian tool body to call the raw store
+    /// directly finds a live, answerable store at the SAME id/key but a
+    /// DIFFERENT answer than the double gives — the two doors disagree, and
+    /// a revert flips the test from pass to fail. Takes precedence over the
+    /// store-derived seam below when set.
+    std::shared_ptr<const yuzu::server::GuardianApi> guardian_api_for_test;
+
     /// #2146 Batch B1: optionally wire a fan-out stub so push_guardian_rules
     /// can be exercised end-to-end (records the (scope, full_sync) args and
     /// returns a caller-controlled agent count / sentinel). Default empty
@@ -1649,9 +1662,16 @@ private:
         // BOTH would 503 those tools' tests purely because they don't happen
         // to need a baseline fixture — each method degrades individually
         // instead (guardian_api.cpp), preserving every pre-seam test's
-        // default behaviour exactly.
-        mcp.set_guardian_api(yuzu::server::make_local_guardian_api(
-            guaranteed_state_store_for_test, baseline_store_for_test));
+        // default behaviour exactly. guardian_api_for_test (an injected test
+        // double) takes precedence over the store-derived seam, mirroring
+        // workflow_api_for_test's own precedence rule above — see that
+        // field's doc comment for why (seam-bypass tripwire testing).
+        if (guardian_api_for_test) {
+            mcp.set_guardian_api(guardian_api_for_test);
+        } else {
+            mcp.set_guardian_api(yuzu::server::make_local_guardian_api(
+                guaranteed_state_store_for_test, baseline_store_for_test));
+        }
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -5317,6 +5337,324 @@ TEST_CASE("MCP Guardian: get_guardian_device_compliance rejects control characte
     REQUIRE(nul_body.contains("error"));
     CHECK(nul_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(ts.audit_log.empty());
+}
+
+// ── ADR-0031 WS-A4 (ninth family) — seam-bypass tripwires (MCP side) ────────
+// Mirrors the REST tripwires in test_rest_guaranteed_state.cpp — see that
+// file's own banner comment for the full rationale (Gate 3 quality-engineer
+// finding on this seam's governance round). Each test wires a REAL store
+// (via guaranteed_state_store_for_test/baseline_store_for_test) AND a
+// DISTINGUISHING guardian_api_for_test double at once, so a revert of a tool
+// body to call the raw store directly answers DIFFERENTLY than the double.
+
+TEST_CASE("MCP list_guardian_rules (seam-bypass tripwire): answers via the GuardianApi "
+          "seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "real-id", "real-name");
+
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+            GuaranteedStateRuleRow r;
+            r.rule_id = "seam-only-id";
+            r.name = "seam-only-name";
+            return std::vector<GuaranteedStateRuleRow>{r};
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"list_guardian_rules"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["rules"].is_array());
+    REQUIRE(data["rules"].size() == 1);
+    CHECK(data["rules"][0]["name"] == "seam-only-name");
+}
+
+TEST_CASE("MCP get_guardian_rule (seam-bypass tripwire): answers via the GuardianApi seam, "
+          "not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    // Nothing seeded at "seam-id" in the real store — a revert would 404.
+
+    GuaranteedStateRuleRow seam_row;
+    seam_row.rule_id = "seam-id";
+    seam_row.name = "seam-only-detail";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        [seam_row](const std::string& id)
+            -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            if (id != "seam-id")
+                return std::optional<GuaranteedStateRuleRow>{};
+            return std::optional<GuaranteedStateRuleRow>{seam_row};
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"get_guardian_rule",)"
+        R"("arguments":{"rule_id":"seam-id"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["name"] == "seam-only-detail");
+}
+
+TEST_CASE("MCP get_guardian_status (seam-bypass tripwire): answers via the GuardianApi "
+          "seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "real-rule"); // real, small, different data
+
+    GuardianStatusRollup seam_rollup;
+    seam_rollup.total_rules = 999;
+    seam_rollup.errored_rules = 888;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        [seam_rollup](const std::optional<std::vector<std::string>>&)
+            -> std::optional<GuardianStatusRollup> { return seam_rollup; });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["total_rules"].get<int>() == 999);
+    CHECK(data["errored_rules"].get<int>() == 888);
+}
+
+TEST_CASE("MCP get_guardian_agent_status (seam-bypass tripwire): answers via the "
+          "GuardianApi seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "real-rule");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    GuardianAgentStatusRollup seam_rollup;
+    seam_rollup.total_rules = 777;
+    seam_rollup.errored_rules = 666;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        [seam_rollup](const std::string&) -> std::optional<GuardianAgentStatusRollup> {
+            return seam_rollup;
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"get_guardian_agent_status",)"
+        R"("arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["total_rules"].get<int>() == 777);
+    CHECK(data["errored_rules"].get<int>() == 666);
+}
+
+TEST_CASE("MCP get_guardian_rule_status (seam-bypass tripwire): answers via the "
+          "GuardianApi seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one"); // real rule, NO real status rows
+
+    GuaranteedStateRuleRow found;
+    found.rule_id = "r1";
+    found.name = "rule-one";
+    GuardianRuleAgentStatusRow seam_row;
+    seam_row.agent_id = "WS-SEAM";
+    seam_row.state = "drifted";
+    seam_row.updated_at = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        [found](const std::string&)
+            -> std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError> {
+            return std::optional<GuaranteedStateRuleRow>{found};
+        },
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        [seam_row](const std::string&) -> std::optional<std::vector<GuardianRuleAgentStatusRow>> {
+            return std::vector<GuardianRuleAgentStatusRow>{seam_row};
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"get_guardian_rule_status",)"
+        R"("arguments":{"rule_id":"r1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["agents"].is_array());
+    REQUIRE(data["agents"].size() == 1);
+    CHECK(data["agents"][0]["agent_id"] == "WS-SEAM");
+}
+
+TEST_CASE("MCP get_guardian_device_guards (seam-bypass tripwire): answers via the "
+          "GuardianApi seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    // Nothing reported for WS-1 in the real store — a revert would answer [].
+
+    GuardianDeviceGuardRow seam_row;
+    seam_row.rule_id = "r-seam";
+    seam_row.name = "seam-guard";
+    seam_row.state = "compliant";
+    seam_row.updated_at = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [seam_row](const std::string&) -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            return std::vector<GuardianDeviceGuardRow>{seam_row};
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"get_guardian_device_guards",)"
+        R"("arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["guards"].is_array());
+    REQUIRE(data["guards"].size() == 1);
+    CHECK(data["guards"][0]["name"] == "seam-guard");
+}
+
+TEST_CASE("MCP get_guardian_device_compliance (seam-bypass tripwire): answers via the "
+          "GuardianApi seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    // No real Baseline named "B" exists — a revert would 404 "baseline not found".
+
+    GuardianDeviceComplianceRollup seam_rollup;
+    seam_rollup.baseline_id = "seam-baseline-id";
+    seam_rollup.baseline_name = "SEAM-BASELINE";
+    seam_rollup.baseline_lifecycle = "deployed";
+    seam_rollup.deployed = true;
+    seam_rollup.total_guards = 1;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
+        [seam_rollup](const std::string&, const std::string&, bool* store_degraded,
+                     bool* pii_access_began) -> std::optional<GuardianDeviceComplianceRollup> {
+            *store_degraded = false;
+            *pii_access_began = true;
+            return seam_rollup;
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.guardian_api_for_test = seam_api;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"get_guardian_device_compliance",)"
+        R"("arguments":{"baseline":"B","agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["baseline"]["name"] == "SEAM-BASELINE");
+}
+
+TEST_CASE("MCP list_guardian_events (seam-bypass tripwire): answers via the GuardianApi "
+          "seam, not the raw store",
+          "[pg][mcp][integration][guardian][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    // No real events exist — a revert would answer [].
+
+    GuaranteedStateEventRow seam_event;
+    seam_event.event_id = "seam-event";
+    seam_event.rule_id = "r-seam";
+    seam_event.agent_id = "WS-SEAM";
+    seam_event.event_type = "drift.detected";
+    seam_event.severity = "high";
+    seam_event.timestamp = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
+        yuzu::server::test::FnGuardianApi::DeviceComplianceFn{},
+        [seam_event](const GuaranteedStateEventQuery&) -> std::vector<GuaranteedStateEventRow> {
+            return {seam_event};
+        });
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"list_guardian_events"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["events"].is_array());
+    REQUIRE(data["events"].size() == 1);
+    CHECK(data["events"][0]["event_id"] == "seam-event");
 }
 
 // #2146 Batch A audit (2026-09-10): get_guardian_status's degraded-query
