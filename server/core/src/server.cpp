@@ -194,6 +194,7 @@
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
+#include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): make_local_guardian_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -16693,6 +16694,25 @@ private:
         std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
         if (workflow_engine_)
             workflow_api = make_local_workflow_api(*workflow_engine_);
+        // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
+        // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
+        // (all but the store-free `schemas`) and their MCP twins, so the two
+        // can never disagree.
+        // Constructed UNCONDITIONALLY (never null) — mirrors dex_perf_api's
+        // own multi-dependency posture, NOT dex_api's/workflow_api's
+        // store-gated one: seven of the eight methods need ONLY
+        // guaranteed_state_store_, and only device_compliance needs both, so
+        // each backing store pointer is checked INDIVIDUALLY inside the impl
+        // (guardian_api.cpp) — a null `guaranteed_state_store_` degrades
+        // every method, a null `baseline_store_` degrades ONLY
+        // device_compliance, exactly matching the pre-seam per-route
+        // `if (!guaranteed_state_store)` guards (never a combined
+        // both-required gate, which would make baseline_store_'s mere
+        // absence 503 the other seven routes too).
+        // `guaranteed_state_store_`/`baseline_store_` stay wired below too,
+        // for the rule/baseline MUTATORS this seam does not cover.
+        auto guardian_api = make_local_guardian_api(guaranteed_state_store_.get(),
+                                                     baseline_store_.get());
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -18940,7 +18960,13 @@ private:
             // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
             // guards produced (app_perf_providers stays wired above too — this
             // is additive until every consumer migrates).
-            dex_perf_api);
+            dex_perf_api,
+            // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam,
+            // constructed unconditionally above — each method individually
+            // degrades when its own backing store is absent, the exact same
+            // per-route degrade the old `!guaranteed_state_store`/
+            // `!baseline_store` guards produced.
+            guardian_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -19176,6 +19202,14 @@ private:
             // unavailable", matching the pre-seam !workflow_engine guard
             // exactly.
             mcp_server_->set_workflow_api(workflow_api);
+            // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
+            // instance the REST GET /api/v1/guaranteed-state/* handlers use
+            // (constructed unconditionally above), so the 8 seamed MCP Guardian
+            // read tools can never disagree with REST v1 — each method
+            // individually degrades when its own backing store is absent,
+            // matching the pre-seam per-route !guaranteed_state_store/
+            // !baseline_store guards exactly.
+            mcp_server_->set_guardian_api(guardian_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see
