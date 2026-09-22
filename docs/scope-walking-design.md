@@ -395,7 +395,7 @@ Step 11. Watch: heightened TAR retention + IOC subscription scoped to rs_04 for 
 
 Every step's audit row carries `parent_result_set_id` and `result_result_set_id` so a forensic timeline reconstructs the full reasoning chain — *exactly the limited-context-window problem this primitive exists to solve*.
 
-This walkthrough is the reference test for end-to-end correctness. A regression test fixture in `tests/integration/test_chrome_ir_chain.cpp` should drive the chain against a live UAT stack with synthetic agents and assert lineage / audit completeness.
+This walkthrough is the reference test for end-to-end correctness. That fixture now exists as `tests/unit/server/test_chrome_ir_chain.cpp`: it drives the chain through the real `/api/v1/result-sets` REST surface (in-process, via `TestRouteSink`) and asserts lineage and audit completeness, pin-survives-GC, and clean chain teardown. It stops short of what this section originally envisaged in one respect, stated in the test's own header: command dispatch is faked rather than driven against a live UAT stack with synthetic agents.
 
 ## 11. Roll-out — what ships when
 

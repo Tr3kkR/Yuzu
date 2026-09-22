@@ -251,8 +251,8 @@ For every feature in Section 3:
    throughout.
 
 4. **Test.** Run `/test --quick` before commit. The
-   `tests/unit/test_auth_db.cpp` and `test_auth_routes.cpp` patterns are the
-   reference.
+   `tests/unit/server/test_auth_db_pg.cpp` and
+   `tests/unit/server/test_auth_routes.cpp` patterns are the reference.
 
 5. **Governance.** Run `/governance dev..HEAD` before pushing — Gate 2
    (security-guardian + docs-writer mandatory deep-dive) plus the AuthDB

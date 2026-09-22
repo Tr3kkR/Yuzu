@@ -39,7 +39,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 - `agents/plugins/*/src/*.cpp` — Plugin source (often platform-specific)
 - `vcpkg.json` — Package manifest with platform filters
 - `.github/workflows/ci.yml` — CI matrix definition
-- `server/core/src/cert_store.cpp` — Windows cert store integration
+- `agents/core/src/cert_store.cpp` — Windows cert store integration
 
 ## Standing Platform Pitfalls
 

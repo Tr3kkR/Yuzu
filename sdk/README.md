@@ -9,7 +9,11 @@ plugins that load into the Yuzu agent at runtime.
 |------|---------|
 | `include/yuzu/plugin.h` | Stable C ABI — the only supported boundary for third-party plugin authors |
 | `include/yuzu/plugin.hpp` | C++23 convenience wrapper (inline, header-only) |
-| `include/yuzu/sdk.hpp` | Common helpers (JSON, logging, metrics, secure-zero, string utilities) |
+| `include/yuzu/sdk_utilities.hpp` | Pipe-delimited-table ↔ JSON conversion helpers (header-only) |
+| `include/yuzu/json_log_formatter.hpp` | Structured JSON log formatting |
+| `include/yuzu/metrics.hpp` | `MetricsRegistry` — counters, gauges, histograms |
+| `include/yuzu/secure_zero.hpp` | Guaranteed-not-elided memory scrubbing |
+| `include/yuzu/string_utils.hpp` | Common string helpers |
 
 ## ABI compatibility
 

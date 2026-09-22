@@ -29,7 +29,7 @@ You implement new plugins for roadmap phases 4-7, maintain the SDK ABI boundary,
   - Subdirectories by category: hardware, network, security, filesystem, system, etc.
 - `sdk/include/yuzu/plugin.h` — Stable C ABI (DO NOT BREAK)
 - `sdk/include/yuzu/plugin.hpp` — C++ CRTP wrapper
-- `sdk/src/sdk_utilities.cpp` — SDK utility functions
+- `sdk/include/yuzu/sdk_utilities.hpp` — SDK utility functions (header-only)
 - `agents/core/src/plugin_loader.cpp` — Plugin discovery and loading
 - `content/definitions/` — YAML InstructionDefinition files
 - `agents/plugins/example/` — Canonical example plugin

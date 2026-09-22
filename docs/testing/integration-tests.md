@@ -210,10 +210,10 @@ integration-test:
 
 ## Gateway Python Test Suite
 
-The `test_gateway.py` script (`scripts/test_gateway.py` or `gateway/test_gateway.py`) provides a Python-based gateway test harness that cleans stale beam files and runs a minimized performance suite suitable for CI:
+The `test_gateway.py` script (`scripts/test_gateway.py`) provides a Python-based gateway test harness that cleans stale beam files and runs a minimized performance suite suitable for CI:
 
 ```bash
-python3 test_gateway.py
+python3 scripts/test_gateway.py
 ```
 
 This was added to complement the shell-based integration test with more granular gateway-specific validation.
