@@ -258,6 +258,37 @@ TEST_CASE("parse_sudoers: NOPASSWD: is decoded whatever its position in the Tag_
     CHECK(e[3].commands == "SETENV: /usr/bin/baz");
 }
 
+// Fails under: keying the Tag_Spec scan on whitespace instead of the colon. sudo's lexer
+// matches NOPASSWD[[:blank:]]*: with no requirement of a blank AFTER the colon, so all
+// four spellings below are valid sudoers -- confirmed with `visudo -c` (sudo 1.9.17p2) --
+// and all four mean passwordless. Splitting on whitespace saw `NOPASSWD:/bin/ls` as one
+// opaque word and reported nopasswd|false for a genuinely passwordless root grant, with
+// status OK and no failure token.
+TEST_CASE("parse_sudoers: NOPASSWD: is decoded whatever the blanks around its colon",
+          "[local_security_policy][parsers]") {
+    const auto e = parse_sudoers("web1 web = (root) NOPASSWD: /bin/ls\n"   // the spelling that worked
+                                 "web2 web = (root) NOPASSWD:/bin/ls\n"    // no blank after the colon
+                                 "web3 web = (root) NOPASSWD :/bin/ls\n"   // blank before it
+                                 "web4 web = (root) NOPASSWD : /bin/ls\n"  // both
+                                 "web5 web = (root) SETENV:NOPASSWD:/bin/ls\n"); // tight, two tags
+    REQUIRE(e.size() == 5);
+    for (std::size_t i = 0; i < 5; ++i) {
+        INFO("entry " << i << " commands=[" << e[i].commands << "]");
+        CHECK(e[i].kind == "user_spec");
+        CHECK(e[i].nopasswd == "true");
+    }
+    CHECK(e[0].commands == "/bin/ls");
+    CHECK(e[1].commands == "/bin/ls");
+    CHECK(e[2].commands == "/bin/ls");
+    CHECK(e[3].commands == "/bin/ls");
+    CHECK(e[4].commands == "SETENV: /bin/ls"); // the undecoded tag still survives verbatim
+    // A colon inside a COMMAND is not a tag: the text before it is not [A-Z_]-only.
+    const auto cmd = parse_sudoers("web6 web = (root) /bin/foo -o a:b\n");
+    REQUIRE(cmd.size() == 1);
+    CHECK(cmd[0].nopasswd == "false");
+    CHECK(cmd[0].commands == "/bin/foo -o a:b");
+}
+
 // Fails under: split_unescaped_commas gaining paren-nesting awareness (which would change this
 // row's shape) without a matching test update. Not a data-loss bug -- documents the existing,
 // safe fallback: a comma inside a Runas_List paren group is not comma-aware, so the whole line
@@ -321,8 +352,11 @@ TEST_CASE("Linux default host (debian:12): exact rows", "[local_security_policy]
     const auto au = run(fs, LocalPolicyAction::Audit).rows;
     // REQUIRE, not CHECK: a regression that drops a row makes front()/back() read past
     // the end, aborting the whole agent test binary instead of failing here by name.
-    REQUIRE(au.size() == 5); // rules / watch_rules / syscall_rules / unmodelled_lines / enabled
-    CHECK(au.front() == "audit_policy|rules|4|/etc/audit/audit.rules");
+    REQUIRE(au.size() == 6); // rules / watch / syscall / unmodelled / control / enabled
+    // debian:12's stock audit.rules is FOUR control directives (-D, -b, -f,
+    // --backlog_wait_time) and ZERO rules. `rules` must say 0, not 4.
+    CHECK(au.front() == "audit_policy|rules|0|/etc/audit/audit.rules");
+    CHECK(au[4] == "audit_policy|control_lines|4|/etc/audit/audit.rules");
     CHECK(au.back() == "audit_policy|enabled|unset|/etc/audit/audit.rules");
     const auto su = run(fs, LocalPolicyAction::Sudoers);
     REQUIRE(su.rows.size() == 7);
@@ -351,11 +385,15 @@ TEST_CASE("Linux hardened host (fedora:40): exact rows", "[local_security_policy
         "lockout_policy|pam.auth.pam_faillock.so|required authfail|/etc/pam.d/password-auth",
         "lockout_policy|pam.account.pam_faillock.so|required|/etc/pam.d/password-auth"});
     const auto au = run(fs, LocalPolicyAction::Audit).rows;
-    REQUIRE(au.size() == 5); // au[4] below reads past the end otherwise
-    CHECK(au[0] == "audit_policy|rules|7|/etc/audit/audit.rules");
+    REQUIRE(au.size() == 6); // au[5] below reads past the end otherwise
+    // The row set closes: rules == watch_rules + syscall_rules + unmodelled_lines,
+    // and control_lines (-D, -e) accounts for every remaining non-comment line.
+    CHECK(au[0] == "audit_policy|rules|5|/etc/audit/audit.rules");
     CHECK(au[1] == "audit_policy|watch_rules|2|/etc/audit/audit.rules");
     CHECK(au[2] == "audit_policy|syscall_rules|3|/etc/audit/audit.rules");
-    CHECK(au[4] == "audit_policy|enabled|immutable|/etc/audit/audit.rules");
+    CHECK(au[3] == "audit_policy|unmodelled_lines|0|/etc/audit/audit.rules");
+    CHECK(au[4] == "audit_policy|control_lines|2|/etc/audit/audit.rules");
+    CHECK(au[5] == "audit_policy|enabled|immutable|/etc/audit/audit.rules");
     const auto su = run(fs, LocalPolicyAction::Sudoers).rows;
     REQUIRE(su.size() == 20);
     CHECK(su[13] == "sudoers|/etc/sudoers|includedir|-|-|-|/etc/sudoers.d");

@@ -220,8 +220,16 @@ struct AuditRuleCounts {
     std::size_t total = 0;    // every non-comment, non-blank line
     std::size_t watches = 0;  // -w
     std::size_t syscalls = 0; // -a / -A
+    std::size_t control = 0;  // -D/-b/-f/-r/-i/-c/-e/--backlog_wait_time/--loginuid-immutable
     std::size_t unmodelled = 0;
     std::optional<std::string> enabled; // -e value, last one wins
+
+    /// The RULE count. A control directive (-D, -b, -f, -e, ...) configures the
+    /// auditd subsystem; it is not a rule, and counting it as one reports
+    /// "4 rules" for a stock file that contains no rule at all. An unrecognised
+    /// line counts as a rule: this is a rules file, and over-reporting an
+    /// unknown line is safer than dropping a real rule.
+    [[nodiscard]] std::size_t rules() const { return watches + syscalls + unmodelled; }
 };
 
 inline AuditRuleCounts parse_auditd_rules_count(std::string_view text) {
@@ -234,10 +242,13 @@ inline AuditRuleCounts parse_auditd_rules_count(std::string_view text) {
         const auto opt = line.substr(0, sp);
         if (opt == "-w") ++c.watches;
         else if (opt == "-a" || opt == "-A") ++c.syscalls;
-        else if (opt == "-e") c.enabled = std::string{sp == std::string_view::npos ? "" : trim_ws(line.substr(sp))};
+        else if (opt == "-e") {
+            c.enabled = std::string{sp == std::string_view::npos ? "" : trim_ws(line.substr(sp))};
+            ++c.control;
+        }
         else if (opt == "-D" || opt == "-b" || opt == "-f" || opt == "-r" || opt == "-i" ||
                  opt == "-c" || opt == "--backlog_wait_time" || opt == "--loginuid-immutable")
-            continue; // control lines: counted in total, not a rule class
+            ++c.control; // configures auditd; not a rule
         else ++c.unmodelled;
     }
     return c;
@@ -286,9 +297,30 @@ inline std::string_view cut_sudoers_comment(std::string_view s) {
     return s;
 }
 
-inline bool is_tag_word(std::string_view w) {
-    if (w.size() < 2 || w.back() != ':') return false;
-    return std::all_of(w.begin(), w.end() - 1, [](char c) { return (c >= 'A' && c <= 'Z') || c == '_'; });
+/// True for a bare Tag_Spec NAME (no colon): non-empty, `[A-Z_]` only.
+inline bool is_tag_name(std::string_view w) {
+    return !w.empty() &&
+           std::all_of(w.begin(), w.end(), [](char c) { return (c >= 'A' && c <= 'Z') || c == '_'; });
+}
+
+/// Length of the leading `TAG:` in `s`, INCLUDING the colon and any blanks
+/// around it, or 0 when `s` does not start with one.
+///
+/// Keyed on the COLON, not on whitespace: sudo's lexer matches
+/// `NOPASSWD[[:blank:]]*:` with no requirement of a blank AFTER the colon, so
+/// `NOPASSWD:/bin/ls`, `NOPASSWD :/bin/ls` and `NOPASSWD : /bin/ls` are all
+/// valid sudoers (verified with visudo) and all mean passwordless. Splitting
+/// on whitespace saw the first two as one opaque word and reported
+/// `nopasswd|false` for a genuinely passwordless root grant. A command can
+/// still carry a colon (`/bin/foo -o a:b`): the text before it is not
+/// `[A-Z_]`-only, so this returns 0 and the caller stops scanning.
+inline std::size_t tag_prefix_len(std::string_view s) {
+    const auto colon = s.find(':');
+    if (colon == std::string_view::npos) return 0;
+    if (!is_tag_name(trim_ws(s.substr(0, colon)))) return 0;
+    std::size_t end = colon + 1;
+    while (end < s.size() && (s[end] == ' ' || s[end] == '\t')) ++end;
+    return end;
 }
 
 /// `user host = (runas) TAG: cmd, cmd ...` -> one entry per contiguous (runas, NOPASSWD) run.
@@ -330,15 +362,16 @@ inline bool parse_user_spec(std::string_view line, std::vector<SudoersEntry>& ou
         // property is ever traded for the other.
         std::string kept_tags;
         for (;;) {
-            const auto w = it.substr(0, it.find_first_of(" \t"));
-            if (!is_tag_word(w)) break;
-            if (w == "NOPASSWD:") next_nopw = "true";
-            else if (w == "PASSWD:") next_nopw = "false";
+            const std::size_t len = tag_prefix_len(it);
+            if (len == 0) break;
+            const auto name = trim_ws(it.substr(0, it.find(':')));
+            if (name == "NOPASSWD") next_nopw = "true";
+            else if (name == "PASSWD") next_nopw = "false";
             else {
-                kept_tags.append(w);
-                kept_tags.push_back(' ');
+                kept_tags.append(name); // normalised to `TAG: `, whatever spacing it had
+                kept_tags.append(": ");
             }
-            it = trim_ws(it.substr(w.size()));
+            it = trim_ws(it.substr(len));
         }
         if (it.empty()) return false;
         if (next_runas != runas || next_nopw != nopasswd) flush();
@@ -638,10 +671,14 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
             break;
         }
         const auto c = parse_auditd_rules_count(*text);
-        t.row(format_kv_row(prefix, "rules", std::to_string(c.total), path));
+        // rules == watch_rules + syscall_rules + unmodelled_lines, and
+        // control_lines accounts for every remaining non-comment line, so the
+        // row set closes arithmetically and `rules` means what it says.
+        t.row(format_kv_row(prefix, "rules", std::to_string(c.rules()), path));
         t.row(format_kv_row(prefix, "watch_rules", std::to_string(c.watches), path));
         t.row(format_kv_row(prefix, "syscall_rules", std::to_string(c.syscalls), path));
         t.row(format_kv_row(prefix, "unmodelled_lines", std::to_string(c.unmodelled), path));
+        t.row(format_kv_row(prefix, "control_lines", std::to_string(c.control), path));
         t.row(format_kv_row(prefix, "enabled", c.enabled ? audit_enabled_token(*c.enabled) : "unset", path));
         break;
     }
