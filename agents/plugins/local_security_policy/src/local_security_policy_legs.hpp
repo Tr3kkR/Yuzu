@@ -50,6 +50,14 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 /// concern's "a refused read is permission_denied, never an empty result"
 /// applies to the wire output, not just the status field, and every sibling
 /// plugin in this diff pairs a non-OK status with an explicit row.
+///
+/// Today the fallback is reachable ONLY from the macOS pwpolicy path: every
+/// file-backed source pairs each denial/failure with its own row as it records
+/// it, so `collect_file_policy` cannot return empty rows with a non-OK status.
+/// That matters for the `sudoers` action, whose normal row is 7 fields, not 4 --
+/// if a future file-source failure is ever counted WITHOUT emitting its row,
+/// this fallback would write a 4-field row into a 7-field contract. Keep the
+/// pairing, or give this function the action-shaped fallback before you break it.
 inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
                            std::string_view action_prefix) {
     for (const auto& r : c.rows) ctx.write_output(r);

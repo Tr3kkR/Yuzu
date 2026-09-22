@@ -287,7 +287,7 @@
           ]
         },
         {
-          "description": "Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.",
+          "description": "Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable, or status when a non-OK outcome produced no rows at all (on macOS, a failed pwpolicy run).",
           "example": "LOGIN_RETRIES",
           "name": "key",
           "platforms": [
@@ -299,7 +299,7 @@
           "values": null
         },
         {
-          "description": "The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.",
+          "description": "The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>. For status, constrained or permission_denied.",
           "example": "5",
           "name": "value",
           "platforms": [
@@ -311,7 +311,7 @@
           "values": null
         },
         {
-          "description": "Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows).",
+          "description": "Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows). On a status row this field carries the failure reason token instead, not a source.",
           "example": "/etc/login.defs",
           "name": "source",
           "platforms": [
@@ -343,7 +343,7 @@
           ]
         },
         {
-          "description": "Setting name: a login.defs / pwquality key, a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.",
+          "description": "Setting name: a login.defs / pwquality key, a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable, or status when a non-OK outcome produced no rows at all (on macOS, a failed pwpolicy run).",
           "example": "PASS_MAX_DAYS",
           "name": "key",
           "platforms": [
@@ -355,7 +355,7 @@
           "values": null
         },
         {
-          "description": "The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.",
+          "description": "The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>. For status, constrained or permission_denied.",
           "example": "99999",
           "name": "value",
           "platforms": [
@@ -367,7 +367,7 @@
           "values": null
         },
         {
-          "description": "Where the row was read: a file path (Linux), pwpolicy:<policy identifier> (macOS) or secedit (Windows).",
+          "description": "Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows). On a status row this field carries the failure reason token instead, not a source.",
           "example": "/etc/login.defs",
           "name": "source",
           "platforms": [
@@ -409,7 +409,7 @@
           "values": null
         },
         {
-          "description": "Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands). ignored: a sudoers.d file sudo skips by name. absent: the file does not exist. unreadable: the read failed (reason in commands).",
+          "description": "Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands). ignored: a sudoers.d file sudo skips by name. absent: the file does not exist. unreadable: the read failed (reason in commands). The plugin also emits kind unsupported on Windows (reason windows_has_no_sudoers in commands), which this definition cannot surface because it does not run there.",
           "example": "user_spec",
           "name": "kind",
           "platforms": [
@@ -430,8 +430,8 @@
           ]
         },
         {
-          "description": "User, group or alias the entry applies to; the Defaults scope (user:, host:, cmnd:, runas:) for a scoped Defaults line; a dash when not applicable.",
-          "example": "%sudo",
+          "description": "Who the entry applies to. A user spec carries <user>@<host> -- the user, group or alias joined to the host list the spec applies on. An alias row carries <Alias_Type>:<name>. A scoped Defaults line carries its scope (user:, host:, cmnd:, runas:). A dash when not applicable.",
+          "example": "%sudo@ALL",
           "name": "subject",
           "platforms": [
             "linux",
@@ -480,7 +480,7 @@
       "definition_id": "crossplatform.local_security_policy.sudoers"
     }
   ],
-  "outputs_note": "Pipe-delimited rows via `write_output()`. The first field is the fixed literal action name (`password_policy`, `lockout_policy`, `audit_policy` or `sudoers`), then `<key>`, `<value>` and `<source>` (for `sudoers`: `<file>`, `<kind>`, `<subject>`, `<runas>`, `<nopasswd>`, `<commands>`). Every field passes through the shared untrusted-output escaper. A key present with no value reads `present`. A source that is missing or unreadable is one `source_state` row (`absent`, or `unreadable:<token>`). Windows keys the export does not carry read `absent`. macOS reports `policies|none` when no matching policy is set, which is the default. Row output is capped at 4096 rows (`row_cap`). File-backed and `pwpolicy` failures are data-level outcomes and the action returns 0; a Windows failure and an internal exception return 1 with the single row `constrained|<token>`; `sudoers` on Windows returns 1 with the row `sudoers|-|unsupported|-|-|-|windows_has_no_sudoers` and status `UNAVAILABLE`.",
+  "outputs_note": "Pipe-delimited rows via `write_output()`. The first field is the fixed literal action name (`password_policy`, `lockout_policy`, `audit_policy` or `sudoers`), then `<key>`, `<value>` and `<source>` (for `sudoers`: `<file>`, `<kind>`, `<subject>`, `<runas>`, `<nopasswd>`, `<commands>`). Every field passes through the shared untrusted-output escaper. A key present with no value reads `present`. A source that is missing or unreadable is one `source_state` row (`absent`, or `unreadable:<token>`). Windows keys the export does not carry read `absent`. macOS reports `policies|none` when no matching policy is set, which is the default. Row output is capped at 4096 rows (`row_cap`). When a non-OK outcome produced no rows at all — today only a failed `pwpolicy` run (spawn error, deadline, truncated output, non-zero exit, no plist or an unparseable one) — the action writes one `<action>|status|<state>|<reason>` row rather than an empty result: the third field is `constrained` or `permission_denied` and the fourth carries the reason token, not a source. File-backed and `pwpolicy` failures are data-level outcomes and the action returns 0; a Windows failure and an internal exception return 1 with the single row `constrained|<token>` — that two-field row is the Windows leg's generic failure tag and reads `constrained` even when the typed status is `PERMISSION_DENIED` (the status field and the token, e.g. `secedit:access_denied`, carry the distinction); `sudoers` on Windows returns 1 with the row `sudoers|-|unsupported|-|-|-|windows_has_no_sudoers` and status `UNAVAILABLE`.",
   "platforms": {
     "linux": "constrained",
     "macos": "constrained",

@@ -53,17 +53,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: 'Setting name: a login.defs / pwquality key, a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.'
+        description: 'Setting name: a login.defs / pwquality key, a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable, or status when a non-OK outcome produced no rows at all (on macOS, a failed pwpolicy run).'
         example: PASS_MAX_DAYS
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.'
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>. For status, constrained or permission_denied.'
         example: "99999"
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> (macOS) or secedit (Windows).'
+        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows). On a status row this field carries the failure reason token instead, not a source.'
         example: /etc/login.defs
         platforms: [windows, linux, darwin]
     aggregation:
@@ -129,17 +129,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: 'Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), or source_state when a whole source is absent or unreadable.'
+        description: 'Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable, or status when a non-OK outcome produced no rows at all (on macOS, a failed pwpolicy run).'
         example: LOGIN_RETRIES
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>.'
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry. For source_state, absent or unreadable:<reason>. For status, constrained or permission_denied.'
         example: "5"
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows).'
+        description: 'Where the row was read: a file path (Linux), pwpolicy:<policy identifier> or pwpolicy (macOS) or secedit (Windows). On a status row this field carries the failure reason token instead, not a source.'
         example: /etc/login.defs
         platforms: [windows, linux, darwin]
     aggregation:
@@ -283,14 +283,14 @@ spec:
         platforms: [linux, darwin]
       - name: kind
         type: string
-        description: 'Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands). ignored: a sudoers.d file sudo skips by name. absent: the file does not exist. unreadable: the read failed (reason in commands).'
+        description: 'Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands). ignored: a sudoers.d file sudo skips by name. absent: the file does not exist. unreadable: the read failed (reason in commands). The plugin also emits kind unsupported on Windows (reason windows_has_no_sudoers in commands), which this definition cannot surface because it does not run there.'
         values: [defaults, alias, include, includedir, user_spec, unmodelled, ignored, absent, unreadable]
         example: user_spec
         platforms: [linux, darwin]
       - name: subject
         type: string
-        description: 'User, group or alias the entry applies to; the Defaults scope (user:, host:, cmnd:, runas:) for a scoped Defaults line; a dash when not applicable.'
-        example: '%sudo'
+        description: 'Who the entry applies to. A user spec carries <user>@<host> -- the user, group or alias joined to the host list the spec applies on. An alias row carries <Alias_Type>:<name>. A scoped Defaults line carries its scope (user:, host:, cmnd:, runas:). A dash when not applicable.'
+        example: '%sudo@ALL'
         platforms: [linux, darwin]
       - name: runas
         type: string
