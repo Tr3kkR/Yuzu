@@ -380,11 +380,26 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     // have gone through when it should have been refused, or vice versa.
     bool cluster_affinity_violation = false;
     if (cluster_arg.has_value()) {
+        // #4669 pr-rev round 2 (FortitudeEtc, CRITICAL, empirically reproduced
+        // by Codex + Kimi independently): also match `session_id IS NULL` —
+        // NOT just `session_id=$2` — so a row the (b') soft-tombstone sweep
+        // orphaned (durable session_id cleared, home_cluster_id preserved)
+        // is still recognised as an affinity violation when the SAME rogue
+        // resends CONNECTED under its still-live in-memory session. Before
+        // this fix, an orphaned row's real (differing) home_cluster_id was
+        // invisible to this probe — session_id=$2 could never match a durable
+        // NULL — so the rogue's resend was classified as an ordinary benign
+        // `session_mismatch`, never unpublished, and the in-memory dispatch
+        // route silently carried the rogue's cluster while the durable row
+        // (never fooled) still said otherwise. Safe for a genuine first-ever
+        // TOFU contact: that case has `home_cluster_id IS NULL`, which this
+        // predicate's own `IS NOT NULL` clause already excludes regardless of
+        // session_id, so an ordinary slow-first-CONNECTED is unaffected.
         pg::PgResult probe = pg::exec_params(
             lease.get(),
             "SELECT 1 FROM gateway_route_store.agent_routes "
-            "WHERE agent_id=$1 AND session_id=$2 AND home_cluster_id IS NOT NULL "
-            "  AND home_cluster_id <> $3",
+            "WHERE agent_id=$1 AND (session_id=$2 OR session_id IS NULL) "
+            "  AND home_cluster_id IS NOT NULL AND home_cluster_id <> $3",
             std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                      cluster_arg});
         if (probe.status() == PGRES_TUPLES_OK && PQntuples(probe.get()) > 0)
@@ -610,11 +625,20 @@ GatewayRouteStore::has_cluster_affinity_conflict(std::string_view agent_id,
         spdlog::warn("GatewayRouteStore::has_cluster_affinity_conflict: lease timeout — degraded");
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
+    // #4669 pr-rev round 2 (FortitudeEtc, CRITICAL): `(session_id=$2 OR
+    // session_id IS NULL)` — see announce_connected's diagnostic probe for
+    // the full rationale (same predicate, same reason, shared attack shape).
+    // This is the PRIMARY closure: catching the orphaned-row hijack HERE,
+    // before NotifyStreamStatus's CONNECTED handler ever calls
+    // set_gateway_route, means the in-memory dispatch route is never
+    // published in the first place for the common case — announce_connected's
+    // probe (and unpublish_gateway_route) remain defense-in-depth for the
+    // residual race the pre-check can miss under degradation.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT 1 FROM gateway_route_store.agent_routes "
-        "WHERE agent_id=$1 AND session_id=$2 AND home_cluster_id IS NOT NULL "
-        "  AND home_cluster_id <> $3",
+        "WHERE agent_id=$1 AND (session_id=$2 OR session_id IS NULL) "
+        "  AND home_cluster_id IS NOT NULL AND home_cluster_id <> $3",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                  std::string(cluster_id)});
     if (res.status() != PGRES_TUPLES_OK) {

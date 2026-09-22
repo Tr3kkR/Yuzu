@@ -1221,12 +1221,39 @@ adversarial review surfaced, not a routing change.
   epoch race (pre-existing,
   accepted DoS-shaped churn, unchanged), but its own subsequent `announce_connected`/CONNECTED can no
   longer make `cluster_id` — and therefore `GatewayMgmtStubPool::resolve()`'s dispatch target — move to
-  the rogue's cluster. The real agent's own later reconnect (its own fresh `register_fresh`, always
-  eventually wins the epoch race) self-heals by announcing the matching cluster. Two legitimate re-home
-  triggers, matching the issue's own design: (1) genuine staleness — `reap_stale_routes`' expired-lease
-  sweep now ALSO NULLs `home_cluster_id` (>= the existing grace window past the lease TTL, i.e. requires
-  the real cluster to have been genuinely unreachable that long, not something a rogue can force
-  instantly), and its tombstone-purge sweep already removes the affinity with the row; (2)
+  the rogue's cluster. **Correction (pr-rev round 1, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the sweep this paragraph originally described as removing affinity ("its
+  tombstone-purge sweep already removes the affinity with the row") in fact let a SINGLE rogue
+  `register_fresh` (which never confirms via `announce_connected`) manufacture that same purge predicate
+  and force a re-home window on the real cluster — the sweep hard-deleted ANY `lease_until IS NULL` row
+  past the purge age regardless of a bound `home_cluster_id`. Fixed: the tombstone-purge sweep now NEVER
+  purges a row carrying a bound `home_cluster_id`, full stop; a session-bearing, never-reconfirmed row is
+  instead soft-tombstoned (session/cluster/gateway_node/stream_home_id cleared, `home_cluster_id`
+  PRESERVED) and an already-tombstoned affinity-bound row is left untouched indefinitely — either way it
+  is PARKED, not purged, and the sentence above is corrected accordingly at item (1) below. **Correction
+  (pr-rev round 2, FortitudeEtc/Codex+Kimi, CRITICAL, 2026-09-22, empirically confirmed twice
+  independently):** that same round-1 soft-tombstone, by clearing the durable `session_id` while
+  preserving `home_cluster_id`, reopened the ORIGINAL hijack through a different door — the rogue's
+  original `ProxyRegister` already installed its session in the gateway's own in-memory state, and
+  nothing invalidates that entry when its first CONNECTED is refused, so once the soft-tombstone fires
+  (~300s later) the rogue simply resends CONNECTED under that same still-live session. Both affinity
+  probes (`has_cluster_affinity_conflict` and `announce_connected`'s own diagnostic probe) matched only
+  `session_id=$2` exactly, which a durable NULL can never satisfy, so the resend was invisible to both
+  and classified as an ordinary, unaudited `session_mismatch` — the durable row was never fooled
+  (`home_cluster_id` stays correct throughout), but the IN-MEMORY dispatch route (`AgentSession::cluster_id`,
+  what `send_to`/`send_to_all` actually read) silently took the rogue's cluster. Fixed: both probes'
+  predicates extended to `(session_id=$2 OR session_id IS NULL) AND home_cluster_id IS NOT NULL AND
+  home_cluster_id <> $3` — a session-orphaned row with a bound, differing affinity is now caught by the
+  pre-check itself, before anything is published, exactly like a session-matched violation always was.
+  Safe for a genuine first-ever TOFU contact, which always has `home_cluster_id IS NULL` and so is
+  excluded by the predicate's own `IS NOT NULL` clause regardless of session_id. The real agent's own
+  later reconnect (its own fresh `register_fresh`, always eventually wins the epoch race) self-heals by
+  announcing the matching cluster. Two legitimate re-home triggers, matching the issue's own design:
+  (1) genuine staleness — `reap_stale_routes`' expired-lease sweep now ALSO NULLs `home_cluster_id` (>=
+  the existing grace window past the lease TTL, i.e. requires the real cluster to have been genuinely
+  unreachable that long, not something a rogue can force instantly); the tombstone-purge sweep, per the
+  round-1 correction above, does NOT remove the affinity — it parks the row with the affinity preserved,
+  so re-home via that path still requires the SAME genuine lease-expiry precondition to occur first; (2)
   `GatewayRouteStore::clear_cluster_affinity` — an explicit, unconditional, operator-invoked clear (the
   CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — tracked as
   `#4696`, which also requires the audit wiring land in the SAME diff as the route). Deliberately NOT

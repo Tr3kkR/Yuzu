@@ -639,10 +639,24 @@ public:
     clear_cluster_affinity(std::string_view agent_id);
 
     /// #4669: a lightweight, READ-ONLY pre-check — true iff `agent_id`'s row
-    /// is CURRENTLY owned by `session_id` (a match) but its durable
-    /// `home_cluster_id` is bound to a DIFFERENT, non-null cluster than
-    /// `cluster_id` (an empty `cluster_id` never conflicts — same "unknown"
-    /// convention as `announce_connected`). Lets a caller refuse EARLY,
+    /// is CURRENTLY owned by `session_id` (a match), OR its durable
+    /// `session_id` is NULL (session-orphaned — pr-rev round 2 fix below),
+    /// AND its durable `home_cluster_id` is bound to a DIFFERENT, non-null
+    /// cluster than `cluster_id` (an empty `cluster_id` never conflicts —
+    /// same "unknown" convention as `announce_connected`). The `session_id
+    /// IS NULL` disjunct (FortitudeEtc/Codex+Kimi, CRITICAL, pr-rev round 2,
+    /// 2026-09-22, empirically reproduced twice independently) closes a
+    /// second hijack the round-1 fix's soft-tombstone sweep (b') itself
+    /// opened: once (b') clears a session-bearing affinity-bound row's
+    /// durable `session_id` while preserving `home_cluster_id`, the ORIGINAL
+    /// rogue's still-live in-memory gateway session can resend CONNECTED
+    /// under that same session id — `session_id=$2` alone can never match a
+    /// durable NULL, so without this disjunct the resend was invisible to
+    /// this pre-check and fell through to the ordinary, unaudited
+    /// `session_mismatch` bucket. Safe for a genuine first-ever TOFU contact
+    /// — that row has `home_cluster_id IS NULL`, already excluded by this
+    /// predicate's own `IS NOT NULL` clause regardless of session_id, so an
+    /// ordinary slow first CONNECTED is unaffected. Lets a caller refuse EARLY,
     /// before publishing anything to its OWN non-durable state (e.g. an
     /// in-memory registry), without paying for a write. NOT the security
     /// boundary by itself — `announce_connected`'s own guarded UPDATE
