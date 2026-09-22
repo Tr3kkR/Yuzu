@@ -1173,6 +1173,45 @@ TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][re
     REQUIRE(status == 400);
 }
 
+TEST_CASE("re-eval: an unsupported source_kind is refused as RESULT_SET_REEVAL_UNSUPPORTED "
+          "even when a crafted scope_input_id would otherwise trip the parent-gone guard "
+          "(#4306 follow-up misclassification fix)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that a
+    // manual_curate (or any other unsupported-source_kind) row minted via
+    // the generic create route with a crafted
+    // source_payload={"scope_input_id":"..."} but NO real parent_id reached
+    // the scope_input_id / parent-gone guard BEFORE the source_kind check,
+    // so it was misclassified as RESULT_SET_BAD_REQUEST (reason=parent_gone)
+    // instead of the correct RESULT_SET_REEVAL_UNSUPPORTED. Both outcomes
+    // were already 400 refusals with nothing dispatched either way (not a
+    // dispatch-safety bug) -- this proves the reorder fixed the
+    // classification, not merely that both still 400.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    // No parent_id supplied at all -- source_payload's scope_input_id is
+    // entirely caller-crafted and points at an id that never existed, never
+    // exercising the real parent_id owner-check/merge path.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"manual_curate",)"
+                       R"("source_payload":{"scope_input_id":"rs_deadbeefdeadbeef"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    const auto msg = re["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_REEVAL_UNSUPPORTED") != std::string::npos);
+    CHECK(msg.find("parent set no longer exists") == std::string::npos);
+    REQUIRE(h.calls.empty());
+}
+
 TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

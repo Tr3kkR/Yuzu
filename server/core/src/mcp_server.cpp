@@ -12323,6 +12323,30 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                // #4306 follow-up (adversarial review, Kimi+Codex): the
+                // source_kind support check must run BEFORE the parent-gone /
+                // scope_input_id guard below, or a manual_curate (or any
+                // other unsupported-source_kind) row minted via the generic
+                // create_result_set tool with a crafted
+                // source_payload={"scope_input_id":"..."} but no real parent
+                // gets misclassified as RESULT_SET_BAD_REQUEST
+                // (reason=parent_gone) instead of RESULT_SET_REEVAL_UNSUPPORTED.
+                // Both outcomes are refusals with nothing dispatched either
+                // way (not a dispatch-safety bug -- an error/audit-reason
+                // correctness bug), but the unsupported-kind rejection takes
+                // priority: it depends on nothing computed below (no synth,
+                // no reeval_name), so hoist it to an early return right after
+                // sp is parsed. Mirrors REST's identical reorder on this
+                // route (rest_api_v1.cpp).
+                if (orig->source_kind != source_kind::kTarQuery &&
+                    orig->source_kind != source_kind::kInstructionResult) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                       "is not yet supported"),
+                        "application/json");
+                    return;
+                }
                 // Synthesise the parent so the sibling shares the original's
                 // parent (re-eval re-asks the same question against today's
                 // estate).
@@ -12518,13 +12542,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                     rs_run_async(def->plugin, def->action, params, source_kind::kInstructionResult,
                                 orig->source_payload, orig->matcher, synth, reeval_name);
-                } else {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
-                                       "is not yet supported"),
-                        "application/json");
                 }
+                // else: unreachable -- the early return above already refused
+                // every source_kind other than kTarQuery/kInstructionResult
+                // before we got here.
                 return;
             }
 

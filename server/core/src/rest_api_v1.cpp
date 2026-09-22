@@ -1508,7 +1508,7 @@ const std::string& openapi_spec() {
         // #3992 F2 split just below.
         R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's source_kind is unsupported for re-eval (RESULT_SET_REEVAL_UNSUPPORTED) - checked ahead of the parent-gone guard below (#4306 follow-up) so a crafted scope_input_id on an unsupported source_kind can never be misreported as parent_gone; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), or a re-run field exceeds its bound (#4373)"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -10831,6 +10831,28 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                      // #4306 follow-up (adversarial review, Kimi+Codex): the
+                      // source_kind support check must run BEFORE the
+                      // parent-gone / scope_input_id guard below, or a
+                      // manual_curate (or any other unsupported-source_kind)
+                      // row minted via the generic create route with a
+                      // crafted source_payload={"scope_input_id":"..."} but
+                      // no real parent gets misclassified as
+                      // RESULT_SET_BAD_REQUEST (reason=parent_gone) instead of
+                      // RESULT_SET_REEVAL_UNSUPPORTED. Both outcomes are 400
+                      // refusals with nothing dispatched either way (not a
+                      // dispatch-safety bug -- an error/audit-reason
+                      // correctness bug), but the unsupported-kind rejection
+                      // takes priority: it depends on nothing computed below
+                      // (no synth, no reeval_name), so hoist it to an early
+                      // return right after sp is parsed.
+                      if (orig->source_kind != source_kind::kTarQuery &&
+                          orig->source_kind != source_kind::kInstructionResult) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                 "lands in PR-G");
+                          return;
+                      }
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
                       // against the same candidate scope, today's estate).
@@ -11017,11 +11039,10 @@ void RestApiV1::register_routes(
                           run_async(req, res, *session, def->plugin, def->action, params,
                                     source_kind::kInstructionResult, orig->source_payload,
                                     orig->matcher, synth, reeval_name);
-                      } else {
-                          rs_err(res, 400,
-                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
-                                 "lands in PR-G");
                       }
+                      // else: unreachable -- the early return above already
+                      // refused every source_kind other than kTarQuery/
+                      // kInstructionResult before we got here.
                   });
 
         // GET /api/v1/result-sets/{id}
