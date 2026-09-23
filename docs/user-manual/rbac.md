@@ -4,7 +4,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 ## Enabling RBAC
 
-RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that require admin regardless of the toggle; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
+RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that the fallback still refuses to a non-admin; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
 
 Toggle RBAC via the Settings page or the server configuration file:
 
@@ -162,8 +162,11 @@ enabled = true
 ## The authorization topology floor (#2376)
 
 Ten reads are treated as **authorization topology** rather than ordinary
-operational data, and require the `admin` session role no matter how the
-`[rbac] enabled` toggle is set:
+operational data. Wherever the legacy RBAC-off fallback is the branch in
+effect, they require the `admin` session role — the generic “any Read is
+allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
+permission checks, so a seeded `Reviewer` holding `AccessReview:Read` is
+admitted; the floor never overrides a live RBAC grant.)
 
 | Securable:Operation | Surface |
 |---|---|
