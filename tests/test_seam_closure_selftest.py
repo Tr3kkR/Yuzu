@@ -108,6 +108,31 @@ EXPECTED_FAMILIES = {
             "server/core/src/dex_perf_api_local.hpp",
         ],
     },
+    "schedule": {
+        "tus": [
+            "server/core/src/schedule_types.hpp",
+            "server/core/src/schedule_model.hpp",
+            "server/core/src/schedule_model.cpp",
+            "server/core/src/schedule_api.hpp",
+            "server/core/src/schedule_api_local.hpp",
+        ],
+    },
+    "workflow": {
+        "tus": [
+            "server/core/src/workflow_types.hpp",
+            "server/core/src/workflow_model.hpp",
+            "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_api.hpp",
+            "server/core/src/workflow_api_local.hpp",
+        ],
+    },
+    "guardian": {
+        "tus": [
+            "server/core/src/guardian_types.hpp",
+            "server/core/src/guardian_api.hpp",
+            "server/core/src/guardian_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
@@ -120,6 +145,12 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     # the other three patterns read as perfectly clean - a silent, invisible
     # widening. Probe 7 below proves it actually fires.
     "*_api_local.hpp",
+    # `schedule` (seventh family) / a future `workflow` seam, Fable review:
+    # ScheduleEngine/WorkflowEngine are Postgres-backed stores named
+    # `*_engine.hpp`, not `*_store.hpp` - see check-seam-closure.py's own
+    # comment on this pair for the full rationale.
+    "schedule_engine.hpp",
+    "workflow_engine.hpp",
 ]
 # --- Impl-purity rule constants (ADR-0031 WS-A4, Fable review). Pinned so a
 # --- narrowing (dropping an impl TU, weakening the presentation-header set, or
@@ -136,8 +167,12 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
     "server/core/src/dex_perf_api.cpp",
+    "server/core/src/schedule_api.cpp",
+    "server/core/src/workflow_api.cpp",
     "server/core/src/dex_read_model.cpp",
     "server/core/src/dex_app_perf_model.cpp",
+    "server/core/src/guardian_api.cpp",
+    "server/core/src/guardian_model.cpp",
 ]
 EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
 # Abstract-header store-type probe (PR #4582 FIX 3).
@@ -148,9 +183,13 @@ EXPECTED_ABSTRACT_API_HEADERS = [
     "server/core/src/device_api.hpp",
     "server/core/src/dex_api.hpp",
     "server/core/src/dex_perf_api.hpp",
+    "server/core/src/schedule_api.hpp",
+    "server/core/src/workflow_api.hpp",
+    "server/core/src/guardian_api.hpp",
 ]
 EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
-                                    "AgentRegistry", "ExecutionTracker", "PgPool"]
+                                    "AgentRegistry", "ExecutionTracker", "PgPool",
+                                    "ScheduleEngine", "WorkflowEngine"]
 
 
 def _fail(msg: str, failures: list) -> None:

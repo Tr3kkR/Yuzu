@@ -14,6 +14,7 @@
 
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
+#include <yuzu/log_token.hpp>
 
 #include "fake_journal_store.hpp" // FakeJournalStore (#4153)
 #include "test_helpers.hpp"
@@ -752,6 +753,60 @@ TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spar
     REQUIRE(got[0].drift.detected_value == "<absent>");
 }
 
+TEST_CASE("#4606 criterion-10: on_event(Fired) stages a timing record with trigger present "
+          "(mechanism/handler/seq); a Convergence pass with no event stages trigger absent",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_known(FileSnapshot{.exists = true}); // compliant
+    auto steady_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    const auto mono_before_ns = steady_ns();
+    const auto before = std::chrono::system_clock::now();
+    const SparkEvent ev{.key = key, .seq = 42, .at = std::chrono::system_clock::now(),
+                        .kind = SparkEventKind::Fired};
+    rt->on_event(ev);
+    const auto after = std::chrono::system_clock::now();
+    const auto mono_after_ns = steady_ns();
+    drain_all(*rt); // clears the buffered edge; not what this test asserts on
+
+    auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1);
+    REQUIRE(timings[0].trigger.has_value());
+    CHECK(timings[0].trigger->seq == 42);
+    // The three *_mono_ns stamps must be REAL steady_clock reads: the runtime's injected clock
+    // (make_rt) is a small synthetic time_point, so a stamp taken from it would fall outside this
+    // bracket and fail, and the chain must be non-decreasing in program order.
+    REQUIRE(timings[0].accepted);
+    CHECK(timings[0].trigger->handler_mono_ns >= mono_before_ns);
+    CHECK(timings[0].trigger->handler_mono_ns <= timings[0].detect_mono_ns);
+    CHECK(timings[0].detect_mono_ns <= timings[0].fire_mono_ns);
+    CHECK(timings[0].fire_mono_ns <= mono_after_ns);
+    CHECK(timings[0].trigger->mechanism_wall_ns ==
+          std::chrono::duration_cast<std::chrono::nanoseconds>(ev.at.time_since_epoch()).count());
+    const auto before_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(before.time_since_epoch()).count();
+    const auto after_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(after.time_since_epoch()).count();
+    CHECK(timings[0].trigger->handler_wall_ns >= before_ns);
+    CHECK(timings[0].trigger->handler_wall_ns <= after_ns);
+
+    // Convergence-reason pass, no event context. Flip the read so it actually produces a
+    // record (a no-op Convergence over unchanged compliant state stages nothing).
+    r->file = read_known(FileSnapshot{.exists = false}); // now drifted
+    rt->evaluate_key(key, EvalReason::Convergence);
+    timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1);
+    CHECK_FALSE(timings[0].trigger.has_value());
+}
+
 TEST_CASE("pending-initial holds until a Known verdict, kept on Unknown", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -943,6 +998,37 @@ TEST_CASE("at outbox cap the eval stays pending and is delivered after a drain",
     REQUIRE(got.size() == 1);
     REQUIRE(got[0].rule_id == "r3");
     REQUIRE(rt->pending_initial(k3).empty());
+}
+
+TEST_CASE("#4606 criterion-10: a rejected enqueue at outbox cap stages accepted=false with "
+          "fire_wall_ns/fire_mono_ns at the -1 sentinel while detect_wall_ns is still captured",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor; three drifting keys exceed it
+    auto rt = make_rt(r, b, cfg);
+    const auto k3 = spark_key(file_spec("/c"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true);
+    rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3", /*present=*/false), true);
+    r->file = read_known(FileSnapshot{.exists = true}); // present -> all rules drift (expect absent)
+
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // slot 1
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial); // slot 2 (full)
+    REQUIRE(rt->outbox_size() == 2);
+
+    rt->evaluate_key(k3, EvalReason::Initial); // rejected at cap
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 1); // r3's one drift entry, rejected
+    CHECK_FALSE(timings[0].accepted);
+    // -1 "never fired" sentinel, never a fabricated 0 a parser could read as "fired at the epoch".
+    CHECK(timings[0].fire_wall_ns == -1);
+    CHECK(timings[0].fire_mono_ns == -1);
+    CHECK(timings[0].detect_wall_ns != 0); // still captured even though the enqueue was rejected
+    CHECK(timings[0].detect_mono_ns != 0);
 }
 
 TEST_CASE("a configured capacity below two is floored so a recovery pair can never be lost",
@@ -2081,6 +2167,387 @@ TEST_CASE("recovery to a drifted state emits BOTH guard.healthy and the drift ve
     REQUIRE_FALSE(g[1].drift.compliant);
 }
 
+TEST_CASE("#4606 criterion-10: a two-entry build_entries pass stages two timing records "
+          "sharing one detect timestamp with distinct event_ids",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io"); // errored
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1); // health(false)
+
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    const auto mono_before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto mono_after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+    REQUIRE(drain_all(*rt).size() == 2); // health(true) + the drift, landed atomically
+
+    const auto timings = rt->last_eval_timings_for_test();
+    REQUIRE(timings.size() == 2);
+    // Both stamps are REAL steady_clock reads (the injected make_rt clock is a small synthetic
+    // time_point that would fall outside this bracket), taken inside the evaluate_key call.
+    for (const auto& t : timings) {
+        CHECK(t.detect_mono_ns >= mono_before_ns);
+        CHECK(t.detect_mono_ns <= t.fire_mono_ns);
+        CHECK(t.fire_mono_ns <= mono_after_ns);
+    }
+    CHECK(timings[0].detect_wall_ns == timings[1].detect_wall_ns);
+    CHECK(timings[0].detect_mono_ns == timings[1].detect_mono_ns);
+    CHECK(timings[0].detect_wall_ns != 0);
+    CHECK(timings[0].event_id != timings[1].event_id);
+    CHECK(timings[0].accepted);
+    CHECK(timings[1].accepted);
+    CHECK(timings[0].fire_wall_ns == timings[1].fire_wall_ns); // one backfill pass, same instant
+    // T_fire is the measurement itself: an ACCEPTED record's fire_* must actually be populated
+    // (not left at the -1 "never fired" sentinel) and must not precede its own detect stamp.
+    // The mono pair uses steady_clock so the ordering check is immune to a wall-clock step.
+    CHECK(timings[0].fire_wall_ns != -1);
+    CHECK(timings[0].fire_mono_ns != -1);
+    CHECK(timings[1].fire_mono_ns != -1);
+    CHECK(timings[0].fire_mono_ns >= timings[0].detect_mono_ns);
+    CHECK(timings[1].fire_mono_ns >= timings[1].detect_mono_ns);
+    CHECK_FALSE(timings[0].trigger.has_value()); // evaluate_key called directly, no trigger arg
+    CHECK_FALSE(timings[1].trigger.has_value());
+}
+
+TEST_CASE("#4606 criterion-10: a failure while staging timing records never drops the event",
+          "[spark][runtime]") {
+    // The timing bookkeeping runs BEFORE the real enqueue inside evaluate_key. It must be
+    // best-effort: if it cannot allocate, the pass loses its timing lines, never its outbox entry
+    // (and never throws out of evaluate_key, which would also skip the drain-worker wake).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    rt->fail_timing_stage_at_for_test(0); // fail on the very first record
+    r->file = read_unknown<FileSnapshot>("io"); // errored -> one health entry
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 1);                // the event was still enqueued
+    CHECK(rt->last_eval_timings_for_test().empty());  // only the timing was dropped
+
+    // With the seam off the same pass shape stages its timing again, so the empty result above
+    // was the seam, not a broken accessor.
+    rt->fail_timing_stage_at_for_test(-1);
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(drain_all(*rt).size() == 2);
+    CHECK(rt->last_eval_timings_for_test().size() == 2);
+}
+
+TEST_CASE("#4606 criterion-10: a failure part-way through a rule's batch drops that whole batch's "
+          "timing but never an event",
+          "[spark][runtime]") {
+    // One rule, two entries in one pass (recovery + drift). Failing on the SECOND record means the
+    // first was already staged when the handler runs, so this is the case where the handler's
+    // tail erase has something to erase: leaving the half-staged record would report a batch whose
+    // second entry has no timing.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io"); // errored
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    rt->fail_timing_stage_at_for_test(1);
+    r->file = read_known(FileSnapshot{.exists = false}); // recovery, but now drifted -> 2 entries
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Event));
+    CHECK(drain_all(*rt).size() == 2);                // both events enqueued
+    CHECK(rt->last_eval_timings_for_test().empty());  // the half-staged record was erased too
+}
+
+TEST_CASE("#4606 criterion-10: a staging failure for one rule keeps the timing of the rules before "
+          "AND after it in the same pass",
+          "[spark][runtime]") {
+    // Three rules on one key each emit one entry in one pass. The seam is one-shot and fails the
+    // second record: that rule's timing is dropped, the earlier rule's already-staged record
+    // survives, and the LATER rule stages normally (a seam that re-fired after the erase would leave
+    // only one record). All three events are still enqueued.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+    rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3", /*present=*/true), true);
+
+    rt->fail_timing_stage_at_for_test(1);
+    r->file = read_unknown<FileSnapshot>("io"); // all rules edge -> three health entries
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 3);                   // every event enqueued
+    CHECK(rt->last_eval_timings_for_test().size() == 2); // exactly the failing rule's timing dropped
+}
+
+TEST_CASE("#4606 criterion-10: a failure in the timing reserve() never drops the event",
+          "[spark][runtime]") {
+    // The reserve() runs before the registry commit. Its guard is a swallowed catch, so a failure
+    // there must leave the pass enqueuing and still staging timing (the loop re-allocates on its
+    // own); without the guard the exception would escape evaluate_key before any of that.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("f1", file_spec("/a"), file_exists_rule("f1", /*present=*/true), true);
+
+    rt->fail_next_timing_reserve_for_test();
+    r->file = read_unknown<FileSnapshot>("io"); // errored -> one health entry
+    REQUIRE_NOTHROW(rt->evaluate_key(key, EvalReason::Initial));
+    CHECK(drain_all(*rt).size() == 1);                   // the event was enqueued
+    CHECK(rt->last_eval_timings_for_test().size() == 1); // and timing still staged (reserve is a hint)
+}
+
+TEST_CASE("#4606 criterion-10: format_eval_timing_line field order + absent-trigger sentinel "
+          "contract (pure formatter, no runtime)",
+          "[spark][runtime]") {
+    EvalTimingRecord r;
+    r.event_id = "evt-1";
+    r.domain = OutboxDomain::Compliance;
+    r.detect_wall_ns = 100;
+    r.detect_mono_ns = 200;
+    r.accepted = true;
+    r.fire_wall_ns = 300;
+    r.fire_mono_ns = 400;
+    // trigger left absent (std::nullopt by default)
+
+    const auto line_absent = format_eval_timing_line(r);
+    // The exact line pins FIELD ORDER, which the substring checks below cannot: the header calls
+    // it the parseable-log-line contract the benchmark tooling regexes against.
+    CHECK(line_absent ==
+          "Guardian T_detect event_id=evt-1 domain=compliance detect_wall_ns=100 "
+          "detect_mono_ns=200 accepted=1 fire_wall_ns=300 fire_mono_ns=400 trigger_present=0 "
+          "mechanism_wall_ns=-1 handler_wall_ns=-1 handler_mono_ns=-1 seq=-1");
+    CHECK(line_absent.find("event_id=evt-1") != std::string::npos);
+    CHECK(line_absent.find("domain=compliance") != std::string::npos);
+    CHECK(line_absent.find("detect_wall_ns=100") != std::string::npos);
+    CHECK(line_absent.find("detect_mono_ns=200") != std::string::npos);
+    CHECK(line_absent.find("accepted=1") != std::string::npos);
+    CHECK(line_absent.find("fire_wall_ns=300") != std::string::npos);
+    CHECK(line_absent.find("fire_mono_ns=400") != std::string::npos);
+    CHECK(line_absent.find("trigger_present=0") != std::string::npos);
+    CHECK(line_absent.find("mechanism_wall_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("handler_wall_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("handler_mono_ns=-1") != std::string::npos);
+    CHECK(line_absent.find("seq=-1") != std::string::npos);
+    // "absent" must never render as a fabricated zero a benchmark parser could mistake
+    // for "observed, zero-latency".
+    CHECK(line_absent.find("mechanism_wall_ns=0") == std::string::npos);
+    CHECK(line_absent.find("handler_wall_ns=0") == std::string::npos);
+    CHECK(line_absent.find("handler_mono_ns=0") == std::string::npos);
+    CHECK(line_absent.find("seq=0") == std::string::npos);
+
+    EvalTrigger trig;
+    trig.mechanism_wall_ns = 10;
+    trig.handler_wall_ns = 20;
+    trig.handler_mono_ns = 30;
+    trig.seq = 7;
+    r.trigger = trig;
+    r.accepted = false;
+    r.fire_wall_ns = -1;
+    r.fire_mono_ns = -1;
+
+    const auto line_present = format_eval_timing_line(r);
+    CHECK(line_present ==
+          "Guardian T_detect event_id=evt-1 domain=compliance detect_wall_ns=100 "
+          "detect_mono_ns=200 accepted=0 fire_wall_ns=-1 fire_mono_ns=-1 trigger_present=1 "
+          "mechanism_wall_ns=10 handler_wall_ns=20 handler_mono_ns=30 seq=7");
+    CHECK(line_present.find("accepted=0") != std::string::npos);
+    CHECK(line_present.find("fire_wall_ns=-1") != std::string::npos);
+    CHECK(line_present.find("fire_mono_ns=-1") != std::string::npos);
+    // A record never touched by the backfill (rejected enqueue) must default to the
+    // sentinel, not to a fabricated 0.
+    CHECK(EvalTimingRecord{}.fire_wall_ns == -1);
+    CHECK(EvalTimingRecord{}.fire_mono_ns == -1);
+    CHECK(line_present.find("trigger_present=1") != std::string::npos);
+    CHECK(line_present.find("mechanism_wall_ns=10") != std::string::npos);
+    CHECK(line_present.find("handler_wall_ns=20") != std::string::npos);
+    CHECK(line_present.find("handler_mono_ns=30") != std::string::npos);
+    CHECK(line_present.find("seq=7") != std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: format_send_timing_line field order (pure formatter)",
+          "[spark][runtime]") {
+    SendTimingRecord r;
+    r.event_id = "evt-9";
+    r.sent = true;
+    r.wire_wall_ns = 555;
+    // domain left absent: the legacy drift-sink path has no outbox and so no OutboxDomain.
+    const auto line = format_send_timing_line(r);
+    CHECK(line.find("event_id=evt-9") != std::string::npos);
+    CHECK(line.find("domain=legacy") != std::string::npos);
+    CHECK(line.find("sent=1") != std::string::npos);
+    CHECK(line.find("wire_wall_ns=555") != std::string::npos);
+    // event_id stays the first field after the line-name token (correlator parse invariant),
+    // and the exact line pins the full field order.
+    CHECK(line.find("Guardian T_wire event_id=evt-9") == 0);
+    CHECK(line == "Guardian T_wire event_id=evt-9 domain=legacy sent=1 wire_wall_ns=555");
+
+    r.sent = false;
+    const auto line2 = format_send_timing_line(r);
+    CHECK(line2.find("sent=0") != std::string::npos);
+
+    // Every Spark-outbox domain renders by name, so a Lifecycle journal replay (server answers
+    // Redelivered, legitimately no T_server) is distinguishable from a lost Compliance/Health
+    // event in the log alone.
+    r.domain = OutboxDomain::Lifecycle;
+    CHECK(format_send_timing_line(r).find("domain=lifecycle") != std::string::npos);
+    r.domain = OutboxDomain::Compliance;
+    CHECK(format_send_timing_line(r).find("domain=compliance") != std::string::npos);
+    r.domain = OutboxDomain::Health;
+    CHECK(format_send_timing_line(r).find("domain=health") != std::string::npos);
+    CHECK(format_send_timing_line(r).find("domain=legacy") == std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: make_outbox_send_timing carries the entry's event_id and domain",
+          "[spark][runtime]") {
+    // send_guardian_outbox_entry (agent.cpp) builds its T_wire record through this function.
+    // AgentImpl is unreachable from a unit test, so this proves the HELPER carries event_id and
+    // domain (a hard-coded or dropped domain fails here); that agent.cpp calls it, with the right
+    // entry and outcome, is a single call site checked by reading it, not by a test.
+    OutboxEntry lifecycle;
+    lifecycle.domain = OutboxDomain::Lifecycle;
+    lifecycle.event_id = "evt-life";
+    const auto rec = make_outbox_send_timing(lifecycle, /*sent=*/true, 777);
+    CHECK(rec.event_id == "evt-life");
+    REQUIRE(rec.domain.has_value());
+    CHECK(*rec.domain == OutboxDomain::Lifecycle);
+    CHECK(rec.sent);
+    CHECK(rec.wire_wall_ns == 777);
+    CHECK(format_send_timing_line(rec) ==
+          "Guardian T_wire event_id=evt-life domain=lifecycle sent=1 wire_wall_ns=777");
+
+    OutboxEntry health;
+    health.domain = OutboxDomain::Health;
+    health.event_id = "evt-health";
+    const auto rec2 = make_outbox_send_timing(health, /*sent=*/false, 5);
+    REQUIRE(rec2.domain.has_value());
+    CHECK(*rec2.domain == OutboxDomain::Health);
+    CHECK_FALSE(rec2.sent);
+    // A Spark-path record never renders as the legacy marker.
+    CHECK(format_send_timing_line(rec2).find("domain=legacy") == std::string::npos);
+}
+
+TEST_CASE("#4606 criterion-10: an untrusted event id cannot forge a token or a line in the "
+          "agent T_detect/T_wire output",
+          "[spark][runtime]") {
+    // The event id embeds the operator-authored rule id (any non-empty string is accepted at rule
+    // creation), so it reaches these lines unvalidated. A newline would forge a whole physical
+    // line and a space or '=' would forge extra key=value tokens that a first-match parser reads.
+    const std::string hostile =
+        "agent-1-r x=9\nGuardian T_wire event_id=victim domain=health sent=1 wire_wall_ns=1";
+    const std::string neutral =
+        "agent-1-r_x_9_Guardian_T_wire_event_id_victim_domain_health_sent_1_wire_wall_ns_1";
+    auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    EvalTimingRecord e;
+    e.event_id = hostile;
+    e.domain = OutboxDomain::Compliance;
+    const auto detect = format_eval_timing_line(e);
+    CHECK(detect.find('\n') == std::string::npos);
+    CHECK(detect.rfind("Guardian T_detect event_id=" + neutral + " domain=compliance ", 0) == 0);
+    CHECK(count(detect, "event_id=") == 1);
+    CHECK(count(detect, " domain=") == 1);
+    CHECK(count(detect, "Guardian T_") == 1);
+
+    SendTimingRecord w;
+    w.event_id = hostile;
+    w.domain = OutboxDomain::Health;
+    w.sent = true;
+    w.wire_wall_ns = 9;
+    const auto wire = format_send_timing_line(w);
+    CHECK(wire == "Guardian T_wire event_id=" + neutral + " domain=health sent=1 wire_wall_ns=9");
+    CHECK(wire.find('\n') == std::string::npos);
+    CHECK(count(wire, "event_id=") == 1);
+    CHECK(count(wire, "Guardian T_") == 1);
+
+    // Both lines shorten an over-long id with the SAME function the server's T_server line uses
+    // (head, '~', last 24 bytes), so it still joins.
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'a');
+    e.event_id = longid;
+    w.event_id = longid;
+    const std::string shortened =
+        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'a') + "~" +
+        std::string(yuzu::kGuardianLogIdTailBytes, 'a');
+    CHECK(shortened.size() == yuzu::kGuardianLogIdMaxBytes);
+    CHECK(format_eval_timing_line(e).rfind("Guardian T_detect event_id=" + shortened + " ", 0) == 0);
+    CHECK(format_send_timing_line(w).rfind("Guardian T_wire event_id=" + shortened + " ", 0) == 0);
+
+    // The tail (`<wall_ms>-<seq>`) survives, so two events of one very long rule id stay distinct.
+    const std::string rule(300, 'r');
+    e.event_id = rule + "-1789930557755-101";
+    const auto first = format_eval_timing_line(e);
+    e.event_id = rule + "-1789930557755-102";
+    CHECK(format_eval_timing_line(e) != first);
+
+    // A multi-byte character (here U+2028 LINE SEPARATOR, and a run of lone lead bytes) never
+    // reaches the line: every byte outside printable ASCII becomes '_', so the output is ASCII
+    // and cannot be split by a Unicode-aware consumer or made invalid UTF-8 by a cut (the exact
+    // straddle of the head boundary is pinned in test_log_token.cpp).
+    e.event_id = "a\xE2\x80\xA8" "b" + std::string(300, '\xC3');
+    for (const char c : format_eval_timing_line(e))
+        CHECK(static_cast<unsigned char>(c) < 0x80);
+    w.event_id = "a\xE2\x80\xA8" "b";
+    CHECK(format_send_timing_line(w) == "Guardian T_wire event_id=a___b domain=health sent=1 wire_wall_ns=9");
+}
+
+TEST_CASE("#4606 criterion-10: format_arm_committed_line keeps the #3990 driver's pinned shape and "
+          "cannot be forged through the rule id",
+          "[spark][runtime]") {
+    // Formatter-only: the runtime's own spdlog output is not reliably capturable from a test (it
+    // lives in libyuzu_agent_core, see test_log_capture.hpp), so nothing here pins that the call
+    // sites in guardian_spark_runtime.cpp actually go through log_id_token. Those are checked by
+    // reading.
+    // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
+    // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
+    CHECK(format_arm_committed_line("blackout-reg-01", 3, 101, "file", "inline-shared", 7) ==
+          "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=101, "
+          "type=file, via=inline-shared, attach_to_commit_ms=7)");
+
+    // The rule id is operator-authored and unvalidated. A newline would forge a whole physical
+    // line (here a fake benchmark T_detect line) and a space, '=' or ',' would forge tokens.
+    const auto hostile = format_arm_committed_line(
+        "x a=b,c\nGuardian T_detect event_id=victim domain=health detect_wall_ns=1", 1, 2, "file",
+        "callback-arm", 0);
+    CHECK(hostile.find('\n') == std::string::npos);
+    CHECK(hostile ==
+          "Guardian spark: arm committed for rule "
+          "'x_a_b_c_Guardian_T_detect_event_id_victim_domain_health_detect_wall_ns_1' (epoch=1, "
+          "incarnation=2, type=file, via=callback-arm, attach_to_commit_ms=0)");
+
+    // Non-ASCII bytes (U+2028, a lone lead byte) never reach the line, and an over-long id is
+    // shortened with the same head + '~' + last-24-bytes rule as the T_* lines.
+    for (const char c : format_arm_committed_line("a\xE2\x80\xA8" "b\xC3", 1, 2, "file", "x", 0))
+        CHECK(static_cast<unsigned char>(c) < 0x80);
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes + 40, 'a');
+    const std::string shortened =
+        std::string(yuzu::kGuardianLogIdMaxBytes - yuzu::kGuardianLogIdTailBytes - 1, 'a') + "~" +
+        std::string(yuzu::kGuardianLogIdTailBytes, 'a');
+    CHECK(format_arm_committed_line(longid, 1, 2, "file", "x", 0)
+              .rfind("Guardian spark: arm committed for rule '" + shortened + "' (epoch=1,",
+                     0) == 0);
+
+    // std::format on a null const char* is undefined; a null type or via prints as "unknown",
+    // which still fits the driver's T2_RE token class ([\w-]+).
+    CHECK(format_arm_committed_line("r1", 1, 2, nullptr, nullptr, 3) ==
+          "Guardian spark: arm committed for rule 'r1' (epoch=1, incarnation=2, type=unknown, "
+          "via=unknown, attach_to_commit_ms=3)");
+}
+
 TEST_CASE("event ids fold in the agent id + are distinct per observation", "[spark][runtime]") {
     // Within one runtime, two observations of the same rule get distinct ids (seq);
     // two agents get distinct id prefixes - so the server's event_id PK never drops a
@@ -2210,9 +2677,22 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
         while (!go.load()) {}
         for (int i = 0; i < kIters; ++i) drain_all(*rt);
     });
+    // Reader: the #4606 test accessor copies the last staged batch under its leaf mutex while the
+    // evaluators move-assign into it. It keeps reading until every writer has finished, so it
+    // overlaps the writers (a fixed iteration count can finish before the first writer takes the
+    // lock); writer-vs-writer is exercised by the evaluators themselves.
+    std::atomic<bool> writers_done{false};
+    std::thread reader([&] {
+        while (!go.load()) {}
+        std::size_t seen = 0;
+        while (!writers_done.load()) seen += rt->last_eval_timings_for_test().size();
+        (void)seen;
+    });
 
     go.store(true);
     for (auto& th : threads) th.join();
+    writers_done.store(true);
+    reader.join();
     rt->begin_stop();
     SUCCEED(); // no crash / no TSan report is the assertion
 }

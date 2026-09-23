@@ -113,6 +113,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--grpc-max-threads` | `8192` | **gRPC server bound (#913).** Thread ceiling for the gRPC sync server, applied via `ResourceQuota::SetMaxThreads`. Without it the per-connection stream cap below bounds nothing globally — connections are uncapped, so N connections yield N x cap concurrent handlers. This is also what bounds the OTA admission map's overshoot. **THIS IS A FLEET-SIZE CEILING, not a tuning dial.** `AgentService` is synchronous and `Subscribe` holds one thread for the entire life of each connected agent's command stream, so this value MUST exceed your concurrently-connected agent count with headroom. Set below it, gRPC answers `RESOURCE_EXHAUSTED` to every RPC on every service sharing the quota — a fleet-wide outage, not back-pressure. Size it as `expected_agents x 1.5`, and raise it before a fleet grows into it. Env: `YUZU_GRPC_MAX_THREADS`. |
 | `--grpc-max-concurrent-streams` | `128` | **gRPC server bound (#913).** Maximum concurrent HTTP/2 streams per gRPC connection. Before this setting the server's one `ServerBuilder` carried keepalive/ping arguments and nothing else — no stream cap and no `ResourceQuota` existed anywhere — which is what made an unbounded per-peer OTA path a capacity-monopolisation issue rather than a theoretical one. Env: `YUZU_GRPC_MAX_CONCURRENT_STREAMS`. |
 | `--grpc-max-resource-memory-mb` | `512` | **gRPC server bound (#913).** `ResourceQuota` memory ceiling in MiB for the gRPC server. At capacity gRPC rejects rather than queueing. Sized for a typical fleet server; raise it on large deployments if you observe rejections that do not correlate with an actual attack. Env: `YUZU_GRPC_MAX_RESOURCE_MEMORY_MB`. |
+| `--log-level` | `info` | Logging verbosity: `trace`, `debug`, `info`, `warn`, `error`. Applies to every log sink (the console and the `--log-file` file). Read once at startup: a `log_level` stored through runtime configuration is re-applied at boot and overrides it, and the same key changes the level without a restart; level names are lowercase and case sensitive, and an unrecognised value given to this flag (including `WARN`) is treated as `off`. The Upgrade note "new `Guardian T_*` diagnostic log lines" lists the restart-free levers and what `warn` also silences (including authentication and session lines). Env: `YUZU_LOG_LEVEL`. |
+| `--log-max-size` | `52428800` | Size in bytes at which the `--log-file` file rotates (50 MB). Ignored without `--log-file`. Env: `YUZU_LOG_MAX_SIZE`. |
+| `--log-max-files` | `5` | Number of rotated `--log-file` files kept. Ignored without `--log-file`. Env: `YUZU_LOG_MAX_FILES`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 | `--kek-min-rotate-interval` | `3600` | **KEK rotation runaway/abuse guard (#2530) — NOT a rotation-schedule setting.** A floor on how *frequently* `/api/v1/secrets/kek/rotate` may be attempted at all (seconds), read from `secrets.kek_meta.created_at` on the database server's own clock — cluster-wide and restart-persistent (the only authoritative control; a cheap process-local pre-check that used to sit alongside it was removed as a correctness bug, #2530 G7-S9 — see "Key management (secrets KEK)"). A rotate inside the window gets `429` with an honest `retry_after_ms`. The default is sized to stop looping automation, not to express how often you intend to rotate; **most operators should never change it.** Raising it delays *emergency* re-rotation after a suspected KEK compromise with no bypass (`/rewrap` only resumes an in-progress rotation, it never mints a new version) — do not set it to your rotation *cadence* (e.g. a 90-day quarterly policy), that is a routine rotation followed by a compromise the next day leaving you refused for the next three months. The upper bound (365 days) is a fat-finger sanity ceiling, not an endorsement of setting it that high. **A fresh install's first rotate attempt is refused for up to this interval** — KEK v1 is minted at boot with `created_at = now()`, so the durable clock starts counting down from install time, not from your first rotate call. See "Key management (secrets KEK)" for the full contract. Env: `YUZU_KEK_MIN_ROTATE_INTERVAL`. |
 | `--kek-max-live-versions` | `32` | **KEK rotation runaway control (#2530).** Backstop ceiling on the number of non-retired KEK versions; a rotate at or above it gets `409` with no retry hint. There is no retire route (#2525), so raising this above the default is the **supported escape hatch** that keeps rotation usable once an install hits it — a deliberate, logged (`spdlog::warn` at boot) and audited (`server.kek_ceiling_raised`) temporary risk acceptance, not a routine tuning knob; every server sharing the database needs the raised value for the ceiling to lift fleet-wide. See "Key management (secrets KEK)". Env: `YUZU_KEK_MAX_LIVE_VERSIONS`. |
@@ -208,6 +211,100 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — `installed_apps list` rows carry two more fields (breaking)
+
+**What changed.** The `installed_apps` agent plugin's operator `list` action (definition
+`crossplatform.software.inventory`) now emits seven `|`-separated fields per row instead of five:
+`app|name|version|publisher|install_date|install_location|bundle_id`. `install_location` is the Windows
+Uninstall-key `InstallLocation` (unexpanded) or the location macOS reports; `bundle_id` is the macOS
+`CFBundleIdentifier`. Either is `-` where the OS has none: every Linux row ends `-|-`, and many Windows rows
+have no `InstallLocation` (182 of 241 on the reference developer workstation). The first five fields keep their
+position; every field is now escape-aware (`\` folds to `/`, `|` to `\|`, CR/LF to a space, a field over 4 KiB
+is cut), a no-op for every value in the three reference captures. Row shape for `query`, `list_per_user` and the
+daily-sync inventory (ADR-0016) is unchanged, though on macOS the collector `list`/`query`/`list_per_user` share
+now sorts same-named apps by (name, install_location) instead of leaving their order arbitrary.
+
+**Who this affects.** Automation reading `installed_apps list` output from `GET /api/v1/responses/{id}`, its
+`/export`, or MCP `query_responses` that (a) unpacks or anchors exactly five fields, or (b) treats the last
+field as `install_date`. The dashboard is unaffected: it has always split these rows into `app` plus one
+remainder cell, so the new fields appear inside that cell (and the search box matches them) but are not
+separate, sortable or filterable columns. A policy or script that substring-matches the raw `output` now also
+matches install paths and bundle identifiers.
+
+**Mixed fleets.** Upgrade order is server first, so agents keep answering with five fields until they take the
+release carrying `installed_apps` 1.2.0 (the definition's `minAgentVersion` stays `1.0.0`). Agents older than
+1.2.0 do not escape `|` in name, version, publisher or install date, so a row from one of them can split into
+any count under the escape-aware split: accept a row only when it has exactly 5 or exactly 7 tokens, reject any
+other count, and read the sixth/seventh columns only for agents known to be on plugin 1.2.0 or later.
+
+**Existing deployments keep the old definition.** The bundled definition is seeded once and never refreshed
+on an existing server (see the InstructionStore note in [`upgrading.md`](upgrading.md); #2555), so
+`get_definition` and `discover_instructions` keep listing four columns at version 1.0.0. Row content is
+unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
+new columns is optional and cosmetic.
+
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
+pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
+
+### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
+
+**What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
+previously synthesised the sibling's dispatch scope from the original's live, nullable
+`parent_id` foreign key. If the original's parent result set was later deleted (`parent_id ...
+ON DELETE SET NULL`), the column read as absent, and an absent `parent_id` reaching dispatch
+synthesis meant "broadcast to `__all__`" — silently turning "re-ask the same narrow question"
+into "ask the whole visible fleet." Both routes now refuse (`400 RESULT_SET_BAD_REQUEST`,
+`reason=parent_gone`) when the live parent is gone but the original's persisted `source_payload`
+shows it was narrowed at creation, instead of broadcasting.
+
+**Who this affects.** Any caller (REST or MCP) whose automation re-evaluates a result set that
+was originally narrowed to a `parent_id`, where that parent set has since been deleted.
+Previously such a call silently succeeded with a `202` (REST) or a materialized/pending result
+(MCP) dispatched to the entire visible fleet; it now refuses instead -- REST returns `400
+RESULT_SET_BAD_REQUEST`, MCP returns a JSON-RPC error (`kInvalidParams`) over HTTP 200, per that
+transport's existing error-shape convention. No legitimate caller should have been relying on the
+fleet-wide broadcast — this was the target-erasure defect being fixed — but any automation
+catching only success responses on this route should add handling for the new `400
+reason=parent_gone` case: create a fresh result set from the intended parent instead of
+re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
+at creation) still broadcasts on re-eval, unchanged.
+
+### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
+
+**What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.
+
+**Who this affects.** Any deployment that previously set `GRPC_SSL_CIPHER_SUITES` in the server's environment to select or restrict its own cipher suites — that variable is now silently ignored, and the server's fixed allow-list applies instead.
+
+**What to do.** There is no override flag and no config option to restore the previous behavior — this is a deliberate policy floor, not an oversight. If your environment relied on a non-default `GRPC_SSL_CIPHER_SUITES` value, remove it (it no longer does anything) and confirm your TLS clients support at least one suite in the pinned list (`tls.md`); operator-issued RSA certificates remain supported via the pinned ECDHE-RSA suites.
+
+### vNEXT — new `Guardian T_*` diagnostic log lines at `info` level (#4606; NOT breaking)
+
+**What changed.** The server now writes one `info`-level line for every Guardian event it stores for an ordinary rule (ruleless DEX observations are excluded):
+
+```
+Guardian T_server event_id=… agent=… rule=… recv_ns=… committed_ns=… agent_ns=… store_ms=…
+```
+
+The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=…` for every Guardian event it attempts to send over the Subscribe stream on the legacy detection path (`domain=legacy`; `sent=0` means the link was down or the local write failed, and that event was dropped and is not retried). Ruleless DEX observations are not logged. Only once the Spark path is the live backend (`prefer_spark`, off by default) does it also write `Guardian T_detect …` for each outbox entry an evaluation pass stages (a pass evaluates every rule on the watched key and stages up to two entries for each, so a key shared by several rules can produce several lines, and a pass that stages nothing produces none), plus the same `T_wire` line for the Spark outbox path (there `sent=0` means the local write failed and the entry is retried; a down stream logs nothing). They exist to measure detect-to-deliver latency for the Spark cutover benchmark (#4606); they are plain log lines, not metrics or audit events, and no shipped component consumes them. If you do consume them, join on the agent and `event_id` (the agent-side lines carry no agent field, so take the agent from which log the line came from and from the server line's `agent=`), and never on log-file line order: a `T_wire` line can appear before its own `T_detect` line.
+
+**What the lines contain.** Only identifiers, times and a few flags and counters: the event id, the agent id, the rule id, instants or elapsed times, and fields such as `sent`, `accepted` and `seq`. They contain no event detail, no detected or expected value, no user name, process name or path. Ids are neutralised before they are written: every byte outside printable ASCII, and any space, `=` or `,` (a line break included), becomes `_`, and an id longer than 256 bytes is shortened to 256 by keeping its head and its last 24 bytes (the part that tells two events apart), identically on the agent and the server and on the server's Guardian ingest replay, conflict, error, oversized-detail and parse-failure lines, so an operator-chosen rule id such as `Disk Full` appears as `Disk_Full` and a non-ASCII rule name appears as underscores. The event id printed on the server's replay, conflict and oversized-detail lines is this neutralised form, so to find that event in the store, match on the agent, the rule and the time rather than pasting the id. This covers only the lines named here and the agent Spark runtime's lines that print a rule id (dormant unless `prefer_spark` is on; a watched key on the same line is not neutralised). Other log lines print a rule id or a watched key as authored, and either can contain a space, `=` or a line break. They include, and are not limited to, the legacy file, registry and service guards (the live detection path today), SparkEngine, the Guardian engine's arm, baseline and rule-parsing messages, the Spark runtime's own lines that name only a watched key, the server's Guardian push enforce-downgrade warning, and the event store's own error lines (not the ingest error line above). A search for `Disk_Full` will not find them, and a log pipeline must not treat an id on those lines as validated or forge-resistant. They are ordinary log output, so how long they are kept is decided by your log pipeline, not by the Guardian event retention period, and they are not an audit record.
+
+**Impact.** Log volume only. There is no API, schema, metric, alert or wire change, and no change to any detection, dispatch or ingest decision. Nothing to do on upgrade.
+
+- **Today, on the legacy path:** up to one server line and one agent line per Guardian event, so it tracks your Guardian event volume. The agent debounces drift events per rule (default 1000 ms, the rule parameter `event_debounce_ms`), which collapses rapid drifts; a rule configured with `event_debounce_ms` of `0` emits every drift, and a return to compliant is never debounced, so a rule that flaps can still log at its flap rate.
+- **Once the Spark path is live:** up to two agent lines per event (`T_detect` and `T_wire`) plus the server line. Lifecycle events, replayed events and health events raised by a subscription fault or its recovery log `T_wire` with no `T_detect` (health entries raised by an evaluation pass do get one), a retried send logs `T_wire` again, lifecycle journal replays re-send on every reconnect (with no info-level server line), a rule stuck in an unknown or error state re-emits on the errored-refresh cadence (default 5 minutes, and in practice no faster than the rule type's convergence sweep), and each evaluation pass rejected by a full outbox logs another `accepted=0` `T_detect` line with no rate limit of its own.
+- **Where the lines go:** wherever a log file is in use (`--log-file` on the server or the agent; a Windows service agent defaults to `yuzu-agent.log` under its data directory) the file sink rotates at 50 MB and keeps the active file plus up to 5 rotated files by default (up to about 300 MB per sink; `--log-max-size` in bytes, `--log-max-files`), so an event storm shortens how far back your logs reach. Without a log file the lines go to the console and Yuzu applies no rotation: retention and any rate limiting belong to your service manager or container runtime (a journald rate limit can drop lines, including unrelated warnings).
+- **They are written synchronously** by the threads that handle the event: on the agent, a guard worker (legacy path) or the Spark consumer, convergence and send threads; on the server, the thread that reads the agent's stream, or the `ForwardGuardianMessage` handler when the agent is behind a gateway. A log sink that blocks, such as an undrained pipe or a stalled network mount, blocks those threads too. The agent's guard workers already write `info` lines on drift, so the legacy agent side adds volume rather than a new coupling; on the server, `T_server` is the first per-event `info` line on that ingest path, and for the Spark path the coupling is a precondition of the `prefer_spark` flip recorded in `docs/spark-flip-gate.md` section 7.
+
+**If log volume matters.** There is no dedicated switch for these lines. The only lever is the log level, and it is blunt: `warn` also suppresses every other `info` line, including on the server the authentication and session lines (for example `User '…' authenticated`, `Local session created`) and the API-token created/revoked lines, which a SIEM ingesting the server log would then lose, and the Guardian arm/commit messages on an agent. The audit log is a separate store and is not affected by the log level. Prefer applying it to agents only, and weigh it before applying it fleet-wide.
+
+- **At startup:** `--log-level warn` (env `YUZU_LOG_LEVEL`) on the server and/or the agent; this needs a restart. Level names are lowercase and matching is case sensitive, so `WARN` is not `warn`: an unrecognised value given this way is treated as `off`, not rejected, so a typo silences everything. On an agent, `--verbose` forces `trace` whatever `--log-level` says.
+- **Without a restart:** on the server, the `log_level` runtime-configuration key (`PUT /api/config/log_level`, needs `Infrastructure:Write`, applied immediately and persisted, so it survives a restart; an invalid value is rejected; see [REST API: Runtime Configuration](rest-api.md#when-a-change-takes-effect)); on an agent, the `agent_actions` plugin's `set_log_level` action, which is in-process only and lasts until that agent restarts (see the agent `--log-level` flag in [device-management.md](device-management.md)).
+- **Precedence:** a `log_level` stored through runtime configuration is re-applied when the server boots, after the command line and environment, so it overrides `--log-level`. If `--log-level warn` appears to have no effect, check the stored value first; and if you stored `warn` to quieten these lines, remember to store `info` again afterwards.
+
+Retiring or gating these lines once the benchmark concludes is recorded in `docs/spark-flip-gate.md` §7.
+
 ### vNEXT — gateway-fronted agents stay dispatchable across circuit-recovery replays (HA WS-4 4.4, `#4246` #6; NOT breaking)
 
 New, non-breaking, purely additive. No operator action required.
@@ -243,6 +340,49 @@ reclaim activity rather than instant convergence, and (2) a replay refused
 because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
+
+### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
+
+New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
+
+Before this change, a rogue or compromised gateway process could re-register an agent identity that was already approved and live on a DIFFERENT cluster (`ProxyRegister` needs no per-agent secret for an already-approved agent), then legitimately answer for it — intercepting command payloads and forging terminal results for that agent, despite each `--gateway-cluster-addr` entry conceptually representing a separate trust zone.
+
+**What changes:** each agent now durably binds to the first cluster that legitimately confirms its connection (trust-on-first-use). A later claim from a DIFFERENT cluster for an already-bound agent is refused — for the ordinary case, before anything is published to the routing directory or the in-memory dispatch path; on a definitive conflict caught only at the durable write (a rare defense-in-depth case — the fast pre-check missed it, e.g. under a transient store hiccup), an in-memory placement already published moments earlier is reverted rather than left live — and the refusal is audited (`gateway.cluster_affinity_violation`, see [audit-log.md](audit-log.md)) and counted (`yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="cluster_affinity_violation"}`, alerted via `YuzuGatewayClusterAffinityViolation`). An agent's affinity re-binds when the previously-bound cluster has been genuinely unreachable for the full stale-route grace window **and no session is currently claiming the row** — a single rogue registration alone (with no completed connection) parks the row instead, preserving its affinity, precisely so a rogue cannot force a re-home just by registering (an operator-forced re-home route is tracked as a follow-up, `#4696` — not available in this release).
+
+**Rollout window — read this if you run multi-cluster gateway mode today.** Every agent that was already connected before you upgrade to this version has NO bound affinity until its NEXT `CONNECTED` notification — until then, that agent is still open to a same-shape claim from any cluster, exactly as before this fix. Long-lived gateway↔agent connections may not reconnect on their own for a long time. **To close this window immediately across your whole fleet, restart your gateway processes (or otherwise force your agents to reconnect) after upgrading** — each forced reconnect binds that agent's affinity right away rather than waiting on an organic reconnect.
+
+This does not provide full trust-zone isolation between clusters — a gateway's claimed `cluster_id` is still not cryptographically bound to its actual identity (mitigation 2, tracked separately, not implemented). Do not present multi-cluster gateway mode as providing that guarantee. Multi-cluster gateway mode has no production deployments as of this release.
+
+### vNEXT — a command forwarded to a gateway-connected agent always resolves instead of getting stuck at RUNNING (#4672; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, a command dispatched to a gateway-fronted agent (multi-cluster gateway
+mode — see [ha-postgres.md](ha-postgres.md) and ADR-2002 §7) could get stuck at `RUNNING`
+forever with no terminal signal if the forward itself failed: the gateway's mgmt-plane peer
+pin rejecting this server's certificate, the gateway staying unreachable after retries, a
+target cluster with no configured `--gateway-cluster-addr`, or a response that could not be
+attributed to the intended agent. The executions drawer and any API caller polling that
+command's status saw it idle indefinitely.
+
+**What changes:** every one of those cases now resolves the command to a terminal `FAILURE`,
+at most once, with `error_detail` (the field the REST/MCP response surfaces — there is no
+separate structured `error.code`) prefixed with a specific reason code you can use to
+diagnose the cause, e.g. `[gateway_unavailable] Gateway unreachable after 3 attempts —
+command not delivered`:
+
+| Reason code prefix | Meaning | What to check |
+|---|---|---|
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
+| `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
+| `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
+| `gateway_forward_failed` | Any other gateway `SendCommand` RPC failure | The gateway's own logs for the specific gRPC error |
+
+**Recovery:** there is no automatic re-drive for a gateway-forward failure — re-dispatch the
+command once the underlying cause is fixed. Automatic durable retry is tracked as a follow-up
+in #4690. One case is not yet covered by this fix: a gateway response stream that closes
+cleanly with zero frames still leaves the command stuck at RUNNING (tracked separately, #4691).
 
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 
@@ -2325,6 +2465,8 @@ The Yuzu server has **two independent TLS surfaces**:
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
+
+Both surfaces pin the same TLS 1.2 cipher allow-list and version floor; see [TLS policy](tls.md) for the exact list, what's proven by CI, and what isn't pinned yet.
 
 ### HTTPS via CLI Flags
 

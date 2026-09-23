@@ -549,6 +549,16 @@ yuzu_server_guardian_events_ingest_errors_total # should stay at 0 in a healthy 
 
 No config or data migration is required.
 
+## Behaviour change: a degraded file-change rule now reports itself unhealthy instead of staying silently green (#4748)
+
+A `file-change` Guardian rule watches its target's parent directory to detect the target being renamed or moved. If that watch's own teardown repeatedly fails to confirm (normally only a wedged filesystem driver, or sustained packet loss on a network share), rename detection for that rule permanently disables until the rule is re-armed. Previously the only signal was a single agent log line — the rule kept reporting `guard.compliant` (the device page's compliance census showed it green) for as long as the agent ran, even though it could no longer detect a rename of its watched directory.
+
+After this upgrade, a rule that reaches this state reports itself `errored` on the device page (the same red state as an unresolved drift) instead, with an operator-facing detail explaining the cause and how to recover, and re-asserts every 5 minutes for as long as it stays disabled. The rule's own file presence/content detection is unaffected either way — only rename detection is lost, and only its *reporting* changes here.
+
+**This is not a retroactive flip.** The disabled state is in-memory only (never persisted), so it resets on the very restart that ships this fix — no rule that was showing compliant before upgrading suddenly shows errored at upgrade time. What changes is *future* behavior: if a rule reaches this degraded state after upgrading (e.g. from another bout of network-share packet loss), it now shows red where a pre-upgrade agent would have stayed silently green. If you see a previously-quiet `file-change` rule turn red after upgrading, that is very likely this fix correctly surfacing a pre-existing condition on your network share, not a new regression — see [the degraded-mode section](guaranteed-state.md#file-guards--detect-a-file-changed-or-deleted-in-realtime) for the recovery steps (re-push the rule's policy, re-deploy its Baseline, or restart the agent).
+
+No config or data migration is required.
+
 ## Behaviour change: dashboard YAML Save is schema-aware and stricter (#1993)
 
 `POST /api/instructions/yaml` (the New Definition panel's Save endpoint) and
@@ -2836,6 +2846,12 @@ Before upgrading any component:
   agent's next daily sync, so any query automation that matched the corrupted `?`
   strings will return nothing afterward — see the non-ASCII troubleshooting note in
   [Installed-Software Inventory](inventory.md) for the force-resync path.
+- [ ] **`installed_apps list` rows carry two more fields (breaking for fixed-width parsers):** the operator `list`
+  action now emits seven fields instead of five (`…|install_date|install_location|bundle_id`). Check any script,
+  SIEM parser or export that reads `crossplatform.software.inventory` output; agents not yet upgraded keep
+  emitting five and do not escape `|`, so accept a row only when it has exactly 5 or exactly 7 escape-aware
+  tokens, reading the sixth/seventh only from agents known to be on plugin 1.2.0+. See
+  [Server Administration](server-admin.md#upgrade-notes).
 - [ ] **New SparkEngine health telemetry (auto-on, engine-health only):** on agent
   upgrade, agents begin shipping SparkEngine posture tags on the existing
   heartbeat (2 keys when quiescent), and the server exposes 11 new

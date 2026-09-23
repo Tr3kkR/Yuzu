@@ -6,6 +6,8 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
+#include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -27,6 +29,7 @@
 #ifndef _WIN32
 #include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (#3007, mirrors the agent)
 #endif
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
 #include <atomic>
 #include <chrono>
@@ -283,6 +286,18 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // #4722: gRPC's ConfigVars snapshots GRPC_SSL_CIPHER_SUITES on first use;
+    // pin it before any gRPC symbol can run (unconditional overwrite — see
+    // tls_policy.hpp). ORDERING IS THE CONTRACT: no automated test observes
+    // this line (the test executable pins from its own static initialiser);
+    // moving it below the first gRPC call silently restores gRPC's default
+    // TLS 1.2 cipher list.
+    if (!yuzu::tls::pin_grpc_cipher_env()) {
+        std::cerr << "Failed to pin " << yuzu::tls::kGrpcCipherSuitesEnvVar
+                  << " in the process environment; refusing to start\n";
+        return EXIT_FAILURE;
+    }
+
     CLI::App app{"Yuzu Server", "yuzu-server"};
     app.set_version_flag("--version",
                          std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
@@ -397,6 +412,21 @@ int main(int argc, char* argv[]) {
     app.add_option("--gateway-command-addr", cfg.gateway_command_address,
                    "Gateway ManagementService address for command forwarding (host:port)")
         ->envname("YUZU_GATEWAY_COMMAND_ADDR");
+    // HA WS-4 4.3: raw entries, parsed+validated into cfg.gateway_cluster_addresses
+    // after CLI11_PARSE below (parse_gateway_cluster_addrs needs to reject a
+    // malformed entry with a CLI exit, not a lenient warning — see that
+    // function's doc comment, gateway_mgmt_stub_pool.hpp).
+    std::vector<std::string> gateway_cluster_addr_entries;
+    app.add_option("--gateway-cluster-addr", gateway_cluster_addr_entries,
+                   "Per-cluster gateway ManagementService address(es) for cross-cluster command "
+                   "fan-out, cluster_id=host:port (e.g. us-east=10.0.1.5:50063). Repeatable or "
+                   "comma-separated. Unset (default) = single-cluster mode: "
+                   "--gateway-command-addr alone is used for every cluster_id. Per-cluster "
+                   "routing only -- trust-zone isolation between clusters is not yet provided "
+                   "(#4669); do not rely on this to keep one cluster's gateway from being able "
+                   "to answer for an agent on another cluster.")
+        ->delimiter(',')
+        ->envname("YUZU_GATEWAY_CLUSTER_ADDR");
     app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
                    "Multi-egress NAT/proxy CIDR(s) (e.g. 203.0.113.0/24,2001:db8::/32). A direct "
                    "agent whose Register and Subscribe source IPs both fall in one range is "
@@ -1090,6 +1120,20 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // ── Validate --gateway-cluster-addr (HA WS-4 4.3) ──
+    // A malformed/duplicate entry here is a routing-correctness defect, not
+    // an advisory allowlist like --trusted-nat-cidr's own lenient parse —
+    // fail the CLI outright rather than silently dropping or half-applying
+    // an entry (Fable pre-implementation review, 4.3 plan).
+    if (auto parsed = yuzu::server::parse_gateway_cluster_addrs(
+            gateway_cluster_addr_entries, yuzu::server::detail::kMaxClusterIdLen);
+        parsed.has_value()) {
+        cfg.gateway_cluster_addresses = std::move(*parsed);
+    } else {
+        std::cerr << "Invalid --gateway-cluster-addr: " << parsed.error() << "\n";
+        return EXIT_FAILURE;
+    }
+
 #ifdef _WIN32
     if (install_service || remove_service) {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
@@ -1176,6 +1220,19 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
+    // Refuse to start rather than silently serve on an OpenSSL build where our
+    // allow-list resolves to zero usable TLS 1.2 ciphers.
+    {
+        const auto tls_policy = yuzu::tls::resolve_cipher_policy();
+        if (!tls_policy) {
+            spdlog::critical("{}", yuzu::tls::describe_cipher_policy_error(tls_policy.error()));
+            return EXIT_FAILURE;
+        }
+        for (const auto& line : yuzu::tls::tls_policy_report_lines(*tls_policy))
+            spdlog::info("{}", line);
+    }
 
     // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
     // Disabling client certificate verification requires BOTH a CLI flag AND

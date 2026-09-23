@@ -146,24 +146,20 @@ enum class ClassificationError : uint8_t {
 /// `std::string` materialization.
 class CommandCapabilityRegistry {
 public:
-    /// Fragments compose here (the per-group headers, the per-plugin headers,
-    /// plus this package's own `core_dispatch_capabilities()`). Exceeding
-    /// `kMaxSources` is a construction-time programmer error — fail loud via an
-    /// exception, never silently drop a fragment (a dropped fragment would make
-    /// every one of its rows `Unclassified`, indistinguishable from an honest
-    /// miss).
-    ///
-    /// **This is no longer the generous ceiling it was written as.** The live
-    /// composition in `ServerImpl` is at 16 of 16, so the NEXT fragment added
-    /// here must also carry the 16 -> 32 raise, together with the two
-    /// hand-maintained mirrors that move with it: the `std::array<..., 16>`
-    /// AND the "sixteen spans" prose in `test_dispatch_destructive_gate.cpp`,
-    /// and the prose in `test_capability_catalogue.cpp` and
-    /// `test_real_capability_registry.hpp` (five sites, three files -- grep
-    /// `sixteen\|, 16>` under tests/unit/server/). The array is ill-formed with a
-    /// 17th initialiser, so CI reddens before a server that cannot construct
-    /// could ship — but it reddens in a file whose name does not suggest why.
-    static constexpr std::size_t kMaxSources = 16;
+    /// A handful of fragments compose here (five per-group headers plus this
+    /// package's own `core_dispatch_capabilities()`); `kMaxSources` is a
+    /// generous ceiling, not a tight fit, so an additional fragment group
+    /// does not silently overflow it. Exceeding it is a construction-time
+    /// programmer error — fail loud via an exception, never silently drop a
+    /// fragment (a dropped fragment would make every one of its rows
+    /// `Unclassified`, indistinguishable from an honest miss).
+    /// Raised 16 to 24 (#4729 merge, two sibling plugins — browser_inventory
+    /// and app_control — each shipping its own fragment file landed the live
+    /// source count at 17, past the old ceiling): the prior value was already
+    /// at capacity with zero headroom, contrary to its own "generous, not a
+    /// tight fit" contract. 24 gives room for several more
+    /// individually-fragmented plugins before this needs raising again.
+    static constexpr std::size_t kMaxSources = 24;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {

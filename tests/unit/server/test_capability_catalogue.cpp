@@ -32,6 +32,8 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "command_capability.hpp"
 
@@ -141,6 +143,8 @@ struct LabeledSpan {
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
+        {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
+        {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"local_security_policy", capdecls::plugin_action_catalogue_local_security_policy(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
@@ -150,7 +154,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, sixteen sources exactly as a live composition site would use.
+    // literally, eighteen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -166,6 +170,8 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::core_dispatch_capabilities(),
     };
@@ -216,6 +222,13 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversib
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
 }};
+// `printing.clear_queue` is deliberately NOT allowlisted here: it is
+// Destructive+Irreversible. Cancelling a job has no compensating Yuzu
+// dispatch (`command_capability.hpp`:42-46's "undone by a subsequent
+// dispatch of the same or a compensating action" contract) — a human
+// re-printing the document from their own application is real-world
+// recoverability, not a `printing.*` action, unlike `set_power_plan`'s
+// genuine second-dispatch undo above.
 
 TEST_CASE("capability catalogue: every Destructive row is Irreversible unless explicitly "
           "allowlisted",
@@ -259,6 +272,26 @@ TEST_CASE("capability catalogue: autoruns.list and autoruns.catalog pin their ex
         CHECK(it->mutability == Mutability::None);
         CHECK(it->securable == "Security");
         CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
+/// Exact-row pin for `app_control` (Wave 8): both read-only posture actions, so a silent
+/// reclassification (e.g. ReadOnly -> Mutating) fails here rather than passing the generic gates.
+TEST_CASE("capability catalogue: app_control.wdac_policy and app_control.applocker_policy pin "
+          "their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_app_control();
+    for (const auto action : {"wdac_policy", "applocker_policy"}) {
+        const auto it = std::find_if(rows.begin(), rows.end(),
+                                     [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Security");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(it->system_reserved);
         CHECK(it->execute_gate == ExecuteGate::None);
     }
 }
@@ -331,6 +364,30 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
     auto other = registry.classify("content_dist", "list_staged");
     REQUIRE(other.has_value());
     CHECK(other->dispatch_class == DispatchClass::ReadOnly);
+}
+
+/// Exact-row pin for `browser_inventory` (Wave 10 Forensics-class plugin,
+/// P2a-3), the same way `kReversibleDestructive` protects
+/// `power_health.set_power_plan`'s fields and the autoruns pin above
+/// protects autoruns' — a field-for-field copy of execution_artifacts'
+/// Forensics/AdminOrApproval boundary (see the catalogue fragment's file
+/// header) must not silently drift.
+TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_browser_inventory();
+    for (const auto action : {"browsers", "profiles"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Forensics");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::High);
+        CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(it->system_reserved);
+    }
 }
 
 /// Exact-row pin for the four `local_security_policy` rows (Wave 8): read-only posture
