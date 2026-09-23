@@ -3680,7 +3680,7 @@ Enable a previously disabled policy.
 
 ```json
 {
-  "status": "enabled"
+  "status": "ok"
 }
 ```
 
@@ -3700,7 +3700,7 @@ Disable a policy, pausing compliance checks.
 
 ```json
 {
-  "status": "disabled"
+  "status": "ok"
 }
 ```
 
