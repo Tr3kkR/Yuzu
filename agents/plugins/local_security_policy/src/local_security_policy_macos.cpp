@@ -44,7 +44,7 @@ Collected collect_pwpolicy(LocalPolicyAction action) {
     if (!xml) return constrained("pwpolicy:no_plist");
     const auto items = pwpolicy_plist_to_items(*xml);
     if (!items) return constrained("pwpolicy:plist_unparseable");
-    return {pwpolicy_rows(action, *items), PolicyStatus::Ok, ""};
+    return pwpolicy_rows(action, *items); // CONSTRAINED when an item was not in the documented shape
 }
 
 } // namespace

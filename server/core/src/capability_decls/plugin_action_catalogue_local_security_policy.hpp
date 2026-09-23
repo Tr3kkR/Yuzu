@@ -17,8 +17,9 @@
 /// (`login.defs`, pwquality/faillock, `/etc/pam.d`, audit rules, sudoers),
 /// macOS runs `pwpolicy -getaccountpolicies` (a read-only argv leaf) and reads
 /// `audit_control` / sudoers, and Windows runs `secedit.exe /export` (a
-/// read-only argv leaf) into an agent-owned scratch directory that is swept on
-/// the next dispatch. No leg changes host policy or account state. Grouped
+/// read-only argv leaf) into an agent-owned scratch directory under
+/// `agent.data_dir`, removed on return and swept by a later dispatch if a crash
+/// orphans it. No leg changes host policy or account state. Grouped
 /// under the existing `Security` securable, the antivirus/bitlocker/firewall/
 /// autoruns class of read-only security-posture plugins.
 namespace yuzu::server::capdecls {

@@ -5,7 +5,8 @@
  * Windows leg's secedit export: which leftover directories under
  * agent.data_dir the pre-dispatch sweep may reclaim, how the secedit run and
  * the read of its output are classified. No OS calls -- only the standard
- * library -- so every decision is unit-tested on every OS. The shell in
+ * library -- so every decision compiles on every OS (the plugin has no dedicated
+ * unit suite; the decisions were kept pure so one can be added). The shell in
  * local_security_policy_win.cpp only performs what these functions return. The
  * exported-INI -> rows mapping is NOT here: it is the parsers header's.
  *
@@ -236,8 +237,8 @@ struct ExportReadFailure {
 }
 
 /// The exported object's shape, decided before any byte is read; nullopt = usable.
-/// Lives here rather than in the leg TU so all six `secedit:` wire tokens are
-/// decided by one pure layer and tested on every OS, not just the three that were.
+/// Lives here rather than in the leg TU so every `secedit:` read-side wire token
+/// is decided by one pure layer.
 [[nodiscard]] inline std::optional<ExportReadFailure>
 classify_export_object(bool reparse_or_directory, std::uint64_t size_bytes) {
     if (reparse_or_directory)

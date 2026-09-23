@@ -56,16 +56,18 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 /// applies to the wire output, not just the status field, and every sibling
 /// plugin in this diff pairs a non-OK status with an explicit row.
 ///
-/// Today the fallback is reachable ONLY from the macOS pwpolicy path: every
-/// file-backed source pairs each denial/failure with its own row as it records
-/// it, so `collect_file_policy` cannot return empty rows with a non-OK status.
-/// That matters for the `sudoers` action, whose normal row is 7 fields, not 4 --
-/// if a future file-source failure is ever counted WITHOUT emitting its row,
-/// this fallback would write a 4-field row into a 7-field contract. Keep the
+/// Today the fallback is reachable ONLY from the macOS pwpolicy path, and only with
+/// state `constrained`: every file-backed source pairs each denial/failure with its
+/// own row as it records it, so `collect_file_policy` cannot return empty rows with a
+/// non-OK status, and the pwpolicy path never reports PERMISSION_DENIED (a refused
+/// run is not distinguishable from any other non-zero exit). The `permission_denied`
+/// arm below is therefore defensive; the docs describe the status row as
+/// `constrained` only. That matters for the `sudoers` action, whose normal row is 7
+/// fields, not 4 -- if a future file-source failure is ever counted WITHOUT emitting
+/// its row, this fallback would write a 4-field row into a 7-field contract. Keep the
 /// pairing, or give this function the action-shaped fallback before you break it.
-/// The pairing is pinned by "sudoers.d: a dir-level failure is a row, never only
-/// a reason" in test_local_security_policy_parsers.cpp; the `sudoers.d` truncation
-/// arm was the one site that counted without emitting, and it no longer does.
+/// No test pins the pairing (the plugin has no dedicated suite); the `sudoers.d`
+/// truncation arm was the one site that counted without emitting, and it no longer does.
 inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
                            std::string_view action_prefix) {
     for (const auto& r : c.rows) ctx.write_output(r);
@@ -190,24 +192,41 @@ inline std::optional<std::string> cf_scalar_text(CFTypeRef v) {
     return std::nullopt;
 }
 
-inline std::vector<std::pair<std::string, CFTypeRef>> cf_dict_entries(CFDictionaryRef d) {
-    std::vector<std::pair<std::string, CFTypeRef>> out;
+struct CfDictEntries {
+    std::vector<std::pair<std::string, CFTypeRef>> entries; // key-sorted
+    bool non_string_key = false; // a key that is not a CFString was skipped -- reported, not dropped
+};
+
+inline CfDictEntries cf_dict_entries(CFDictionaryRef d) {
+    CfDictEntries out;
     const CFIndex n = CFDictionaryGetCount(d);
     std::vector<const void*> keys(static_cast<std::size_t>(n)), vals(static_cast<std::size_t>(n));
     CFDictionaryGetKeysAndValues(d, keys.data(), vals.data());
-    for (CFIndex i = 0; i < n; ++i)
-        if (CFGetTypeID(static_cast<CFTypeRef>(keys[i])) == CFStringGetTypeID())
-            out.emplace_back(cf_to_utf8(static_cast<CFStringRef>(keys[i])).value_or("unmodelled"),
-                             static_cast<CFTypeRef>(vals[i]));
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (CFIndex i = 0; i < n; ++i) {
+        if (CFGetTypeID(static_cast<CFTypeRef>(keys[i])) != CFStringGetTypeID()) {
+            out.non_string_key = true;
+            continue;
+        }
+        out.entries.emplace_back(cf_to_utf8(static_cast<CFStringRef>(keys[i])).value_or("unmodelled"),
+                                 static_cast<CFTypeRef>(vals[i]));
+    }
+    std::sort(out.entries.begin(), out.entries.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     return out;
+}
+
+inline void add_defect(PwPolicyItem& it, std::string_view d) {
+    if (std::find(it.defects.begin(), it.defects.end(), d) == it.defects.end())
+        it.defects.emplace_back(d);
 }
 
 } // namespace detail
 
 /// pwpolicy plist half: XML -> PwPolicyItems via CFPropertyListCreateWithData (no hand-rolled
-/// scan); nullopt when CF rejects the bytes or the root is not a dictionary. Inline so the
-/// unit suite can call it (a symbol inside the dlopen'd plugin is not reachable).
+/// scan); nullopt when CF rejects the bytes or the root is not a dictionary. Anything below the
+/// root that is not in the documented shape is recorded on an item (PwPolicyItem::defects),
+/// never skipped. Element keys other than policyIdentifier / policyContent / policyParameters
+/// (e.g. the localised policyContentDescription dictionary) are ignored by design.
 inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::string_view xml) {
     yuzu::agent::ScopedCFRef<CFDataRef> data(CFDataCreate(
         kCFAllocatorDefault, reinterpret_cast<const UInt8*>(xml.data()), static_cast<CFIndex>(xml.size())));
@@ -219,27 +238,48 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
     if (!plist || CFGetTypeID(plist.get()) != CFDictionaryGetTypeID()) return std::nullopt;
 
     std::vector<PwPolicyItem> items;
-    for (const auto& [category, value] : detail::cf_dict_entries(static_cast<CFDictionaryRef>(plist.get()))) {
+    const auto root = detail::cf_dict_entries(static_cast<CFDictionaryRef>(plist.get()));
+    if (root.non_string_key) {
+        PwPolicyItem it; // no category text to name: routed to both actions
+        detail::add_defect(it, "non_string_key");
+        items.push_back(std::move(it));
+    }
+    for (const auto& [category, value] : root.entries) {
         if (CFGetTypeID(value) != CFArrayGetTypeID()) {
-            items.push_back({category, "", "", {}}); // not the documented shape -> unmodelled_category
+            PwPolicyItem it{category, "", "", {}, {}};
+            detail::add_defect(it, "malformed_category");
+            items.push_back(std::move(it));
             continue;
         }
         const auto arr = static_cast<CFArrayRef>(value);
         for (CFIndex i = 0; i < CFArrayGetCount(arr); ++i) {
             const auto el = static_cast<CFTypeRef>(CFArrayGetValueAtIndex(arr, i));
-            if (CFGetTypeID(el) != CFDictionaryGetTypeID()) continue;
-            PwPolicyItem it{category, "", "", {}};
-            for (const auto& [k, v] : detail::cf_dict_entries(static_cast<CFDictionaryRef>(el))) {
+            PwPolicyItem it{category, "", "", {}, {}};
+            if (CFGetTypeID(el) != CFDictionaryGetTypeID()) {
+                detail::add_defect(it, "malformed_policy");
+                items.push_back(std::move(it));
+                continue;
+            }
+            const auto fields = detail::cf_dict_entries(static_cast<CFDictionaryRef>(el));
+            if (fields.non_string_key) detail::add_defect(it, "non_string_key");
+            for (const auto& [k, v] : fields.entries) {
                 // "unmodelled" only on a genuine conversion failure (nullopt) -- a real
                 // empty string from CF still comes back as an empty std::string, not
                 // nullopt, so this never mislabels a genuinely-empty value.
-                if (k == "policyIdentifier")
+                if (k == "policyIdentifier") {
                     it.identifier = detail::cf_scalar_text(v).value_or("unmodelled");
-                else if (k == "policyContent")
+                } else if (k == "policyContent") {
                     it.content = detail::cf_scalar_text(v).value_or("unmodelled");
-                else if (k == "policyParameters" && CFGetTypeID(v) == CFDictionaryGetTypeID())
-                    for (const auto& [pk, pv] : detail::cf_dict_entries(static_cast<CFDictionaryRef>(v)))
+                } else if (k == "policyParameters") {
+                    if (CFGetTypeID(v) != CFDictionaryGetTypeID()) {
+                        detail::add_defect(it, "malformed_parameters");
+                        continue;
+                    }
+                    const auto params = detail::cf_dict_entries(static_cast<CFDictionaryRef>(v));
+                    if (params.non_string_key) detail::add_defect(it, "non_string_key");
+                    for (const auto& [pk, pv] : params.entries)
                         it.params.emplace_back(pk, detail::cf_scalar_text(pv).value_or("unmodelled"));
+                }
             }
             items.push_back(std::move(it));
         }
@@ -249,10 +289,9 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
 
 #else
 
-/// Off macOS there is no CFPropertyList. The stub exists so the unguarded parsers
-/// test TU compiles and links on every OS (the platform-guarded-TU-hides-a-dead-leg
-/// rule); it reports failure rather than guessing a shape, and its only caller maps
-/// that to `pwpolicy:plist_unparseable`.
+/// Off macOS there is no CFPropertyList. The stub keeps this header's surface identical
+/// on every OS; it reports failure rather than guessing a shape, and its only caller
+/// (the macOS leg) would map that to `pwpolicy:plist_unparseable`.
 inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::string_view) {
     return std::nullopt;
 }

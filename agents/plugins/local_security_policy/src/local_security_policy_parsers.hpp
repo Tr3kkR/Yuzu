@@ -9,9 +9,12 @@
  *   sudoers|<file>|<kind>|<subject>|<runas>|<nopasswd>|<commands>
  *     kind: defaults | alias | include | includedir | user_spec | unmodelled | ignored | absent | unreadable
  *   <action>|status|<state>|<reason>         the zero-row fallback (local_security_policy_legs.hpp)
- *   constrained|<token>                      the Windows leg's 2-field diagnostic row
+ *   constrained|<token>                      the 2-field diagnostic row: every Windows-leg failure,
+ *                                            and a contained exception (`internal_error`) on any leg
  * A definitively missing source is the row state `absent` (key `source_state`) and no
  * failure token; an unreadable one is `unreadable:<token>` -- failure never reads as absent.
+ * A pwpolicy item that is not in the documented plist shape is the same
+ * `source_state|unreadable:<defect>` row plus a `pwpolicy:<defect>` token (pwpolicy_rows).
  */
 #pragma once
 
@@ -612,6 +615,9 @@ inline void kv_source(const FileReader& rd, Tally& t, std::string_view action, c
             t.row(format_kv_row(action, k, v, path));
 }
 
+/// `files` are distro ALTERNATIVES (Debian common-*, RHEL system-auth/password-auth), so one
+/// ABSENT file is deliberately silent while any sibling exists; a refused or failed one is
+/// always its own row, and all-absent is one `/etc/pam.d` absent row.
 inline void pam_sources(const FileReader& rd, Tally& t, std::string_view action,
                         std::span<const std::string_view> files,
                         std::span<const std::string_view> types,
@@ -810,6 +816,14 @@ struct PwPolicyItem {
     std::string identifier; // policyIdentifier
     std::string content;    // policyContent (Apple policy expression)
     std::vector<std::pair<std::string, std::string>> params; // policyParameters scalars, key-sorted
+    /// What the plist bridge could NOT read in the documented shape, each named once:
+    /// `malformed_category` (the category's value is not an array), `malformed_policy`
+    /// (an array element is not a dictionary), `malformed_parameters` (policyParameters
+    /// is not a dictionary), `non_string_key` (a dictionary key that is not a string was
+    /// skipped; at the plist root the item's category is empty). A known category that
+    /// is malformed would otherwise yield no rows and read as `policies|none`, a clean
+    /// "nothing configured" -- so every defect becomes a row and a token, never silence.
+    std::vector<std::string> defects;
 };
 
 /// `pwpolicy -getaccountpolicies` prints a non-plist banner line before the XML
@@ -843,21 +857,34 @@ inline std::optional<unsigned> pwpolicy_min_length(std::string_view content) {
     return n;
 }
 
-/// Rows for one action from the parsed policy items. Categories: *Authentication ->
-/// lockout, policyCategoryPassword* -> password, anything else is `unmodelled_category`
-/// in BOTH actions. Only `policyAttribute*` parameter keys carry a value; other
-/// parameter keys are named (`unmodelled_parameter`), never valued. No matching
-/// policy is the modal row `policies|none`, not an error.
-inline std::vector<std::string> pwpolicy_rows(LocalPolicyAction action,
-                                              const std::vector<PwPolicyItem>& items) {
+/// Rows + status for one action from the parsed policy items. Categories:
+/// *Authentication -> lockout, policyCategoryPassword* -> password, anything else is
+/// `unmodelled_category` in BOTH actions. Only `policyAttribute*` parameter keys carry
+/// a value; other parameter keys are named (`unmodelled_parameter`), never valued. Each
+/// item defect (PwPolicyItem::defects) is a `source_state|unreadable:<defect>` row and a
+/// `pwpolicy:<defect>` token (CONSTRAINED) in the action(s) its category routes to. No
+/// matching policy and no defect is the modal row `policies|none`, not an error.
+inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPolicyItem>& items) {
     const auto prefix = action_row_prefix(action);
     std::vector<std::string> rows;
+    yuzu::shared::ConstraintAccumulator acc;
     for (const auto& it : items) {
         const bool lock = it.category.find("Authentication") != std::string::npos;
         const bool pw = it.category.rfind("policyCategoryPassword", 0) == 0;
-        const std::string src = "pwpolicy:" + (it.identifier.empty() ? it.category : it.identifier);
+        const std::string& named = it.identifier.empty() ? it.category : it.identifier;
+        const std::string src = named.empty() ? std::string{"pwpolicy"} : "pwpolicy:" + named;
+        const auto defect_rows = [&] {
+            for (const auto& d : it.defects) {
+                rows.push_back(format_kv_row(prefix, "source_state", "unreadable:" + d, src));
+                acc.add_failure("pwpolicy:" + d);
+            }
+        };
         if (!lock && !pw) {
-            rows.push_back(format_kv_row(prefix, "unmodelled_category", it.category, "pwpolicy"));
+            // The root non_string_key placeholder has no category to name; a real
+            // category -- even an empty-named one -- always keeps its row.
+            if (!(it.category.empty() && !it.defects.empty()))
+                rows.push_back(format_kv_row(prefix, "unmodelled_category", it.category, "pwpolicy"));
+            defect_rows();
             continue;
         }
         if (lock != (action == LocalPolicyAction::Lockout)) continue;
@@ -868,9 +895,11 @@ inline std::vector<std::string> pwpolicy_rows(LocalPolicyAction action,
             if (k.rfind("policyAttribute", 0) == 0) rows.push_back(format_kv_row(prefix, k, v, src));
             else rows.push_back(format_kv_row(prefix, "unmodelled_parameter", k, src));
         }
+        defect_rows();
     }
     if (rows.empty()) rows.push_back(format_kv_row(prefix, "policies", "none", "pwpolicy"));
-    return rows;
+    return {std::move(rows), acc.any_failure() ? PolicyStatus::Constrained : PolicyStatus::Ok,
+            acc.reason()};
 }
 
 } // namespace yuzu::local_security_policy

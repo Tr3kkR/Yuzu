@@ -3,9 +3,15 @@
  * sudoers content (read-only). Portable TU; the only target-OS #ifs are the Windows
  * sudoers short-circuit and the dispatch to a leg (local_security_policy_{linux,macos,
  * win}.cpp behind local_security_policy_legs.hpp).
- * Row shapes and failure semantics: local_security_policy_parsers.hpp. Reads are
- * unprivileged except /etc/sudoers (0440) and /etc/audit/audit.rules (0640): a refused
- * read reports permission_denied, never an empty result.
+ * Row shapes and failure semantics: local_security_policy_parsers.hpp. File reads are
+ * unprivileged except /etc/sudoers + the /etc/sudoers.d files (0440), Linux /etc/audit/audit.rules
+ * (0640) and a present macOS /etc/security/audit_control (root-only): a refused read is an
+ * `unreadable` row with a `<source>:permission_denied` token -- PERMISSION_DENIED when
+ * nothing else was readable, CONSTRAINED otherwise -- never an empty result. Windows
+ * secedit needs an elevated token (measured only as LocalSystem; see the leg banner).
+ * CONTAINERS: the Linux leg reads the /etc it can see, which in the shipped
+ * deploy/docker/Dockerfile.agent image (unprivileged `yuzu-agent`, no host /etc mounted)
+ * is the IMAGE's -- its rows describe the container, not the host.
  */
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
@@ -18,68 +24,103 @@
 namespace {
 
 // Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md:245);
-// the wording is finalised from the Windows leg's rig-probe banner.
+// the wording is finalised from the Windows leg's rig-probe banner. Every leg names each
+// file it reads and, on Windows, the scratch file it stages and the sweep that removes it.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "password_policy",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "/etc/login.defs + /etc/security/pwquality.conf + /etc/pam.d password stacks (bounded file reads)",
+         "/etc/login.defs + /etc/security/pwquality.conf + /etc/pam.d/{common-password,"
+         "system-auth,password-auth} (bounded file reads)",
          "reports what the config files state, not the live PAM decision; pwquality.conf.d fragments "
-         "are not read; a missing file is reported as absent, an unreadable one as permission_denied/constrained"},
+         "and PAM include/substack targets are not read; a missing file is reported as absent, an "
+         "unreadable one as unreadable (permission_denied/constrained)"
+         "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
+         "the host's"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "pwpolicy -getaccountpolicies (CFPropertyList)",
          "global account policies only; rung 2 because no public OpenDirectory global-policy "
-         "API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value. "
+         "API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value; "
+         "a plist item not in the documented shape is an unreadable row and constrained. "
          "Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload "
          "surfaces here is unverified"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
+         "into an agent.data_dir scratch file",
          "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
          "LOCAL security database after GPO application; domain-account policy is not reported. "
-         "Measured on a standalone host; see the Windows leg banner"},
+         "The export (the whole SECURITYPOLICY area) is staged as "
+         "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
+         "directory removed on return; every dispatch first sweeps such directories older than "
+         "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
+         "elevated, on a standalone host; see the Windows leg banner"},
     },
     {
         /* .action      = */ "lockout_policy",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "/etc/security/faillock.conf + /etc/login.defs + /etc/pam.d auth/account stacks (bounded file reads)",
-         "reports configuration, not live lockout counters"},
+         "/etc/login.defs + /etc/security/faillock.conf + /etc/pam.d/{common-auth,common-account,"
+         "system-auth,password-auth} (bounded file reads)",
+         "reports configuration, not live lockout counters; faillock.conf drop-ins and PAM "
+         "include/substack targets are not read"
+         "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
+         "the host's"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "pwpolicy -getaccountpolicies (CFPropertyList)",
-         "global account policies only; no authentication policy reports policies|none (the default). "
+         "global account policies only; no authentication policy reports policies|none (the default); "
+         "a plist item not in the documented shape is an unreadable row and constrained. "
          "Measured on an UNMANAGED Mac, so on a managed device policies|none must not be read as "
          "'no lockout enforced' -- profile-delivered policy is unverified here"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
+         "into an agent.data_dir scratch file",
          "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
          "LOCAL security database after GPO application; domain-account policy is not reported. "
-         "Measured on a standalone host; see the Windows leg banner"},
+         "The export (the whole SECURITYPOLICY area) is staged as "
+         "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
+         "directory removed on return; every dispatch first sweeps such directories older than "
+         "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
+         "elevated, on a standalone host; see the Windows leg banner"},
     },
     {
         /* .action      = */ "audit_policy",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "/etc/audit/audit.rules (bounded file read)",
-         "rule counts and -e state of the rule file only, not the live kernel rules (auditctl -l); "
-         "the file is 0640 root, so an unprivileged agent reports permission_denied"},
+         "rule counts and -e state of the rule file only, not the live kernel rules (auditctl -l) "
+         "and not /etc/audit/rules.d; the file is 0640 root, so an unprivileged agent reports "
+         "permission_denied"
+         "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
+         "the host's"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "/etc/security/audit_control (bounded file read)",
          "absent by default on current macOS (only audit_control.example ships), reported as absent; "
          "a present file is root-readable only"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2, "secedit.exe /export /areas SECURITYPOLICY",
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
+         "into an agent.data_dir scratch file",
          "the LEGACY [Event Audit] categories only. Where Advanced Audit Policy "
          "subcategories are in force -- the Windows 10/11 default and the norm under GPO -- "
          "these are NOT the effective audit state: a category reading none means the legacy "
          "category is unset, not that the host is not auditing. auditpol subcategories are "
-         "not read; see the Windows leg banner"},
+         "not read. "
+         "The export (the whole SECURITYPOLICY area) is staged as "
+         "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
+         "directory removed on return; every dispatch first sweeps such directories older than "
+         "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
+         "elevated, on a standalone host; see the Windows leg banner"},
     },
     {
         /* .action      = */ "sudoers",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "/etc/sudoers + /etc/sudoers.d (bounded file reads)",
          "parsed content, not sudo's evaluation: include directives are listed, not followed; "
-         "unrecognised lines are kind unmodelled; needs read access to the 0440 root files"},
+         "unrecognised lines are kind unmodelled; needs read access to the 0440 root files"
+         "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
+         "the host's"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "/etc/sudoers + /etc/sudoers.d (bounded file reads)",
          "/etc/sudoers is root:wheel 0440: reading it needs root or group wheel, otherwise "

@@ -6,48 +6,63 @@
  * RUNG 2 (an honest argv leaf, not rung 1): no in-tree LSA policy-query
  * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md:245
  * names `secedit /export` the authoritative source on a running box. Spawned via
- * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), absolute
- * System32 argv[0], no shell/PowerShell/.bat/.cmd. Sink-manifest site ID:
+ * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), argv[0] the
+ * absolute `<system directory>\secedit.exe` resolved through
+ * yuzu::agent::windows_system_directory() (GetSystemDirectoryW, never a guessed
+ * `C:\Windows\System32` literal; unresolved -> `secedit:system_directory_unresolved`),
+ * no shell/PowerShell/.bat/.cmd. Sink-manifest site ID:
  * local_security_policy/do_export#1 (one spawn per dispatch, all three actions).
- * Read-only: no /configure, /import, other area or auditpol.
+ * Read-only as far as host policy goes: no /configure, /import, other area or auditpol.
  *
- * ---- Scratch directory + stale sweep ---------------------------------------
- * The CHILD writes the export, so the agent creates a per-dispatch directory
- * with yuzu_create_temp_dir("local_security_policy-", data_dir) (128-bit
+ * ---- What this leg writes to disk --------------------------------------------
+ * The CHILD writes the export: `<agent.data_dir>\local_security_policy-<32 hex>\policy.inf`,
+ * the WHOLE SECURITYPOLICY area (privilege-right assignments with SIDs, registry
+ * values, ...), not only the keys reported. The agent creates that directory per
+ * dispatch with yuzu_create_temp_dir("local_security_policy-", data_dir) (128-bit
  * random name, CREATE_NEW, owner-only DACL; `constrained|data_dir_unset` when
  * data_dir is empty -- no fallback location), holds it open without
  * FILE_SHARE_DELETE, verifies with scratch_dir_is_ours, and removes it (RAII)
  * on every survivable path. A crash or service stop between export and delete
- * would orphan a copy of the machine's policy, so EVERY dispatch first sweeps
- * stale `local_security_policy-<32hex>` directories older than one hour under
- * data_dir through agents/core confined_fs (open_root / enumerate_at /
- * unlink_at), ownership-verified: a same-named directory owned by another SID
- * is skipped, a non-flat one is left intact. The outcome is logged as
- * `scratch_sweep:<removed>/<skipped>` only -- never a row or a token.
+ * orphans that copy, so EVERY dispatch first sweeps stale
+ * `local_security_policy-<32hex>` directories older than one hour under data_dir
+ * through agents/core confined_fs (open_root / enumerate_at / unlink_at),
+ * ownership-verified: a same-named directory owned by another SID is skipped, a
+ * non-flat one is left intact. RESIDUAL: an orphan younger than one hour, or one
+ * left with no later Windows dispatch, stays on disk until a sweep reaches it. Per
+ * Microsoft's secedit documentation, with no /log argument secedit also appends to
+ * its default log (%windir%\security\logs\scesrv.log); not measured on the rig. The
+ * sweep outcome is logged at warn, only when the pass did something, as
+ * `scratch_sweep: removed <n> failed <n> fresh <n> not_ours <n> deferred <n>`
+ * (format_sweep_summary) -- never a row or a token.
  *
  * ---- Pure/thin split -------------------------------------------------------
  * Every decision (sweep selection, run/read classification) is a pure function
- * in local_security_policy_scratch_sweep.hpp with tests on every OS. The
- * exported INI -> rows mapping is NOT in this TU: it is the parsers header's
- * (secedit_policy_rows), the one mapper the real-capture fixture test covers.
+ * in local_security_policy_scratch_sweep.hpp, OS-free so it compiles everywhere.
+ * The exported INI -> rows mapping is NOT in this TU: it is the parsers header's
+ * (secedit_policy_rows), the one mapper. This plugin has no dedicated unit suite.
  * This TU performs the Win32 calls and writes what those return. The exception
  * boundary is the shared execute(); it is not repeated here.
  *
  * ---- RIG PROBE (rig session, 2026-09-21; the transcript is in the PR body) ---------
- * The exact argv was run as LocalSystem (scheduled task, RunLevel Highest) on the-rig
- * (Windows 11 Pro 10.0.26200 x64) with the service's default privilege set:
+ * The exact argv (then with the literal C:\Windows\System32 argv[0], which is the
+ * system directory on that host) was run as LocalSystem (scheduled task, RunLevel
+ * Highest) on the-rig (Windows 11 Pro 10.0.26200 x64, standalone, not domain-joined):
  *   identity                    : nt authority\system
  *   whoami /priv (relevant)     : SeSecurityPrivilege present, state Disabled
  *   secedit exit code           : 0
  *   policy.inf size (bytes)     : 12828 (UTF-16LE with a BOM, CRLF)
- *   SeSecurityPrivilege suffices: yes -- the export succeeded with the privilege NOT enabled,
- *                                 nothing else was granted or needed
+ *   what this shows             : the export succeeds as LocalSystem, elevated, with
+ *                                 SeSecurityPrivilege present but NOT enabled. It does not
+ *                                 show which privilege is required, nor that the dedicated
+ *                                 NT SERVICE\YuzuAgent account (#1442) succeeds -- neither
+ *                                 was measured. A refusal would surface as a non-zero exit,
+ *                                 `secedit:exit_<n>` (CONSTRAINED); also unmeasured.
  *   stale-sweep pre-seed removed: yes. Three directories were pre-seeded under data_dir: a
  *                                 SYSTEM-owned one aged 3 h (REMOVED), a same-named one owned by
  *                                 BUILTIN\Administrators aged 3 h (SKIPPED, foreign SID) and a
- *                                 fresh SYSTEM-owned one (kept); the log read
- *                                 scratch_sweep:1/2, then 0/2 on the next dispatches.
- * Fixture: tests/unit/fixtures/wave8/local_security_policy/windows/secedit_export.inf.
+ *                                 fresh SYSTEM-owned one (kept); the log (the earlier
+ *                                 removed/skipped format) read 1/2, then 0/2 on the next dispatches.
+ * No fixture of the export is committed.
  */
 
 #ifdef _WIN32
@@ -97,8 +112,6 @@ namespace cfs = yuzu::agent::confined_fs;
 static_assert(kWin32FileNotFound == ERROR_FILE_NOT_FOUND);
 static_assert(kWin32PathNotFound == ERROR_PATH_NOT_FOUND);
 static_assert(kWin32AccessDenied == ERROR_ACCESS_DENIED);
-
-constexpr std::string_view kSecedit = "C:\\Windows\\System32\\secedit.exe";
 
 /// The leading `constrained` is this leg's GENERIC failure-row tag, not a mirror
 /// of `status` -- a PERMISSION_DENIED result also writes `constrained|<token>`,
@@ -420,6 +433,10 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
     // The shared dispatcher has already validated `action` before calling a leg.
     if (data_dir.empty())
         return emit_constrained(ctx, "data_dir_unset");
+    // Fail closed on an unresolved system directory: never a guessed literal.
+    const std::string& sys_dir = yuzu::agent::windows_system_directory();
+    if (sys_dir.empty())
+        return emit_constrained(ctx, "secedit:system_directory_unresolved");
 
     // Sweep BEFORE spawning: a prior crash may have orphaned an export.
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -461,7 +478,7 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 
     // sink: local_security_policy/do_export#1
     const yuzu::agent::SubprocessResult run = yuzu::agent::run_bounded_subprocess(
-        {std::string{kSecedit}, "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY", "/quiet"},
+        {sys_dir + "\\secedit.exe", "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY", "/quiet"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::milliseconds{kExportDeadlineMs}});
     const std::string run_token = classify_export_run(to_run_end(run.termination_reason),
                                                       run.exit_code);
@@ -481,8 +498,8 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
     if (const auto bad = classify_decoded_export(text); !bad.empty())
         return emit_constrained(ctx, bad);
 
-    // The INI -> rows mapping is the parsers header's (the one mapper the real-capture
-    // fixture test covers); never re-add a second mapper in this TU.
+    // The INI -> rows mapping is the parsers header's (the one mapper); never re-add a
+    // second mapper in this TU.
     const SeceditRows built = secedit_policy_rows(action, parse_inf_sections(*text));
     if (!built.failure_token.empty())
         return emit_constrained(ctx, built.failure_token);
