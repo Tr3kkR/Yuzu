@@ -60,29 +60,6 @@ inline std::vector<std::string_view> split_lines(std::string_view text) {
     return out;
 }
 
-/// Lines with trailing-backslash continuations joined (single space), each trimmed.
-/// `cut_comment` runs on each PHYSICAL line BEFORE the continuation test, as sudo's
-/// lexer and libpam's _pam_assemble_line both do: a comment ending in `\` must not
-/// swallow the next line (a `# note \` above a NOPASSWD grant hid the grant).
-template <class CutComment>
-std::vector<std::string> logical_lines(std::string_view text, CutComment cut_comment) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (auto raw : split_lines(text)) {
-        raw = trim_ws(cut_comment(trim_ws(raw)));
-        const bool cont = !raw.empty() && raw.back() == '\\';
-        if (cont) raw = trim_ws(raw.substr(0, raw.size() - 1));
-        if (!cur.empty()) cur += ' ';
-        cur.append(raw);
-        if (!cont) {
-            out.push_back(std::move(cur));
-            cur.clear();
-        }
-    }
-    if (!cur.empty()) out.push_back(std::move(cur));
-    return out;
-}
-
 // ---- secedit export (UTF-16LE INI) -------------------------------------------
 
 /// UTF-16LE with a mandatory FF FE BOM -> UTF-8. nullopt (never an empty
@@ -186,13 +163,42 @@ struct PamLine {
     std::string args;    // remaining text, verbatim
 };
 
+/// PAM logical lines exactly as libpam 1.7.0 assembles them (libpam_internal/pam_line.c,
+/// `_pam_str_prepare`): a `#` ANYWHERE cuts the rest of the physical line and ENDS the
+/// logical line, so no `\` before or inside a comment continues it; otherwise a `\`
+/// ending the line (only spaces/tabs after it) joins the next physical line with one
+/// blank. A blank or comment-only line ends a pending continuation.
+inline std::vector<std::string> pam_logical_lines(std::string_view text) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (auto raw : split_lines(text)) {
+        bool cont = false;
+        if (const auto hash = raw.find('#'); hash != std::string_view::npos) {
+            raw = raw.substr(0, hash);
+        } else {
+            while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t')) raw.remove_suffix(1);
+            cont = !raw.empty() && raw.back() == '\\';
+            if (cont) raw.remove_suffix(1);
+        }
+        raw = trim_ws(raw);
+        if (!raw.empty()) {
+            if (!cur.empty()) cur += ' ';
+            cur.append(raw);
+        }
+        if (!cont && !cur.empty()) {
+            out.push_back(std::move(cur));
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) out.push_back(std::move(cur));
+    return out;
+}
+
 /// Skips comments, blanks and `@include`. A line that is not `type control module`
-/// is dropped (PAM itself would reject it) -- pam.d holds no other policy. A `#`
-/// anywhere starts a comment, as in libpam.
+/// is dropped (PAM itself would reject it) -- pam.d holds no other policy.
 inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
     std::vector<PamLine> out;
-    const auto cut = [](std::string_view l) { return l.substr(0, l.find('#')); };
-    for (const auto& line : logical_lines(text, cut)) {
+    for (const auto& line : pam_logical_lines(text)) {
         std::string_view s = line;
         if (s.empty() || s.front() == '@') continue;
         const auto word = [&s]() {
@@ -284,83 +290,347 @@ struct SudoersEntry {
 
 namespace detail {
 
-/// Splits a sudoers list at unescaped commas. A comma inside a Runas_Spec -- a `(`
-/// that OPENS an item, up to its `)` -- is part of the spec, not a separator:
-/// `(root, %wheel) NOPASSWD: /bin/ls` is one item (sudoers(5) Runas_List). Only an
-/// item-leading `(` opens a spec, so parentheses inside a command's arguments never
-/// suppress splitting.
-inline std::vector<std::string> split_unescaped_commas(std::string_view s) {
-    std::vector<std::string> out;
-    std::string cur;
-    bool in_runas = false;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 1 < s.size()) {
-            cur += s[i];
-            cur += s[++i];
-        } else if (s[i] == '(' && !in_runas && trim_ws(cur).empty()) {
-            in_runas = true;
-            cur += s[i];
-        } else if (s[i] == ')' && in_runas) {
-            in_runas = false;
-            cur += s[i];
-        } else if (s[i] == ',' && !in_runas) {
-            out.push_back(std::string{trim_ws(cur)});
-            cur.clear();
-        } else {
-            cur += s[i];
-        }
+/// One sudoers token over SudoersStatement::text[b, e). `kind` is the character itself
+/// for `( ) , = : ! >`, else 'w' a word (name, alias, keyword, %group, +netgroup, #uid,
+/// IP address), 's' a double-quoted string, 'c' a command (a path, regex or sudoedit with
+/// its arguments), 't' a tag with its colon, 'd' a digest spec, 'x' text sudo rejects.
+struct SudoersToken {
+    char kind;
+    std::size_t b, e;
+};
+
+/// One statement: comments cut, each line continuation replaced by one blank (by nothing
+/// inside a quoted string, as sudo joins it) and every other blank run by one blank.
+struct SudoersStatement {
+    std::string text;
+    std::vector<SudoersToken> toks;
+};
+
+inline constexpr std::string_view kSudoersTags[] = {
+    "NOPASSWD", "PASSWD", "NOEXEC", "EXEC", "INTERCEPT", "NOINTERCEPT", "SETENV", "NOSETENV",
+    "LOG_OUTPUT", "NOLOG_OUTPUT", "LOG_INPUT", "NOLOG_INPUT", "MAIL", "NOMAIL", "FOLLOW",
+    "NOFOLLOW"};
+inline constexpr std::string_view kSudoersOptions[] = {
+    "CWD", "CHROOT", "TIMEOUT", "NOTBEFORE", "NOTAFTER", "ROLE", "TYPE", "APPARMOR_PROFILE",
+    "PRIVS", "LIMITPRIVS"};
+
+/// sudoers(5) lexing in ONE linear pass, following sudo 1.9.16's toke.l rather than
+/// approximating it -- each ad-hoc scan it replaces reported a passwordless grant as
+/// `nopasswd=false` for some legal line. The rules that decide a statement's shape:
+///  - `#` starts a comment unless followed by a digit (`#1000`, a uid) or inside double
+///    quotes, glued to a token or not (`/bin/ls#note` is `/bin/ls` then a comment). A
+///    comment runs to the end of the physical line and ENDS the statement: a `\` before
+///    or inside it never continues onto the next line. `#include` is a directive only in
+///    column 0.
+///  - `\`, optional blanks, newline continues the statement, except glued to a word as
+///    `\ ` (an escaped blank, as sudo's WORD) -- and `\ # x` is an escaped blank, then a
+///    comment, so it does not continue either.
+///  - A command (`/path`, `^regex$`, `sudoedit`) takes arguments up to an unescaped
+///    `#`, `:`, `,` or `=`; a double quote there is literal. Elsewhere `"..."` is one
+///    token (`CWD="/x y:z"`) with `\"` inside it, and `\` escapes the next character.
+///  - `NAME:` with a tag name (blanks allowed before the colon) is one tag token, a
+///    `sha224`..`sha512` digest with its colon and digest is one token, and an IPv6
+///    literal (`2001:db8::1`, `::1`) is one word -- so no colon inside any of them is
+///    ever a separator.
+class SudoersLexer {
+public:
+    explicit SudoersLexer(std::string_view src) : s_{src} {}
+
+    std::vector<SudoersStatement> run() {
+        while (i_ < s_.size()) step();
+        end_statement();
+        return std::move(out_);
     }
-    out.push_back(std::string{trim_ws(cur)});
-    return out;
-}
 
-/// Cuts a `# comment` from one physical line: a whole-line comment (not `#<digits>`,
-/// a uid, nor `#include`/`#includedir`) or a trailing one preceded by whitespace.
-inline std::string_view cut_sudoers_comment(std::string_view s) {
-    if (!s.empty() && s.front() == '#' && !(s.size() > 1 && s[1] >= '0' && s[1] <= '9') &&
-        !s.starts_with("#include"))
-        return {};
-    for (std::size_t i = 1; i < s.size(); ++i)
-        if (s[i] == '#' && (s[i - 1] == ' ' || s[i - 1] == '\t') &&
-            !(i + 1 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '9'))
-            return trim_ws(s.substr(0, i));
-    return s;
-}
+private:
+    std::string_view s_;
+    std::size_t i_ = 0, bol_ = 0;
+    SudoersStatement st_;
+    std::vector<SudoersStatement> out_;
+    bool blank_ = false, defaults_ = false, want_value_ = false, bad_ = false;
+    static constexpr std::size_t npos = std::string_view::npos;
 
-/// True for a bare Tag_Spec NAME (no colon): non-empty, `[A-Z_]` only.
-inline bool is_tag_name(std::string_view w) {
-    return !w.empty() &&
-           std::all_of(w.begin(), w.end(), [](char c) { return (c >= 'A' && c <= 'Z') || c == '_'; });
-}
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+    static bool xdigit(char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }
+    [[nodiscard]] char at(std::size_t k) const { return k < s_.size() ? s_[k] : '\0'; }
+    [[nodiscard]] std::size_t newline_len(std::size_t k) const {
+        return at(k) == '\n' ? 1 : (at(k) == '\r' && at(k + 1) == '\n' ? 2 : 0);
+    }
+    /// Index just past a line continuation (`\`, blanks, newline) starting at k, or 0.
+    [[nodiscard]] std::size_t continuation(std::size_t k) const {
+        if (at(k) != '\\') return 0;
+        for (++k; at(k) == ' ' || at(k) == '\t'; ++k) {}
+        const std::size_t nl = newline_len(k);
+        return nl != 0 ? k + nl : 0;
+    }
+    std::size_t mark() {
+        if (blank_ && !st_.text.empty()) st_.text += ' ';
+        blank_ = false;
+        return st_.text.size();
+    }
+    void put(char c) {
+        mark();
+        st_.text += c;
+    }
+    void emit(char kind, std::size_t b) { st_.toks.push_back({kind, b, st_.text.size()}); }
+    void end_statement() {
+        if (!st_.text.empty()) out_.push_back(std::move(st_));
+        st_ = {};
+        blank_ = defaults_ = want_value_ = false;
+    }
 
-/// Length of the leading `TAG:` in `s`, INCLUDING the colon and any blanks
-/// around it, or 0 when `s` does not start with one.
-///
-/// Keyed on the COLON, not on whitespace: sudo's lexer matches
-/// `NOPASSWD[[:blank:]]*:` with no requirement of a blank AFTER the colon, so
-/// `NOPASSWD:/bin/ls`, `NOPASSWD :/bin/ls` and `NOPASSWD : /bin/ls` are all
-/// valid sudoers (verified with visudo) and all mean passwordless. Splitting
-/// on whitespace saw the first two as one opaque word and reported
-/// `nopasswd|false` for a genuinely passwordless root grant. A command can
-/// still carry a colon (`/bin/foo -o a:b`): the text before it is not
-/// `[A-Z_]`-only, so this returns 0 and the caller stops scanning.
-inline std::size_t tag_prefix_len(std::string_view s) {
-    const auto colon = s.find(':');
-    if (colon == std::string_view::npos) return 0;
-    if (!is_tag_name(trim_ws(s.substr(0, colon)))) return 0;
-    std::size_t end = colon + 1;
-    while (end < s.size() && (s[end] == ' ' || s[end] == '\t')) ++end;
-    return end;
-}
+    void step() {
+        const char c = s_[i_];
+        if (const std::size_t nl = newline_len(i_)) {
+            i_ = bol_ = i_ + nl;
+            return end_statement();
+        }
+        if (c == ' ' || c == '\t' || c == '\r') {
+            blank_ = true;
+            ++i_;
+            return;
+        }
+        if (const std::size_t next = continuation(i_)) {
+            blank_ = true;
+            i_ = bol_ = next;
+            return;
+        }
+        const bool uid = digit(at(i_ + 1)) || (at(i_ + 1) == '-' && digit(at(i_ + 2)));
+        if (c == '#' && !uid) {
+            if (i_ == bol_ && st_.toks.empty() && include_directive()) return;
+            while (i_ < s_.size() && newline_len(i_) == 0) ++i_; // a comment
+            return;
+        }
+        const std::size_t b = mark();
+        if (c == '"') return quoted(b);
+        if (!defaults_ && !want_value_ && (c == '/' || c == '^')) return command(b);
+        if (const std::size_t n = ipv6_len()) {
+            copy(n);
+            want_value_ = false;
+            return emit('w', b);
+        }
+        if (c == '!') {
+            std::size_t n = 0;
+            for (; at(i_) == '!'; ++n) copy(1);
+            if (n % 2 == 1) emit('!', b); // an even run cancels out, as in sudo
+            return;
+        }
+        if (std::string_view{"(),=:>"}.find(c) != npos) {
+            copy(1);
+            return emit(c, b);
+        }
+        for (const auto name : kSudoersTags) {
+            if (!s_.substr(i_).starts_with(name)) continue;
+            std::size_t k = i_ + name.size();
+            while (at(k) == ' ' || at(k) == '\t') ++k;
+            if (at(k) != ':') continue;
+            st_.text.append(name);
+            st_.text += ':';
+            i_ = k + 1;
+            return emit('t', b);
+        }
+        word(b);
+    }
 
-/// Length of a leading sudoers(5) Option_Spec word (`CWD=/tmp`, `TIMEOUT=5m`,
-/// `ROLE=sysadm_r`, `NOTBEFORE=...`, `APPARMOR_PROFILE=...`): `[A-Z_]+=` plus the
-/// non-blank value; 0 when `s` does not start with one.
-inline std::size_t option_prefix_len(std::string_view s) {
-    const auto eq = s.find('=');
-    if (eq == std::string_view::npos || !is_tag_name(s.substr(0, eq))) return 0;
-    const auto end = s.find_first_of(" \t", eq);
-    return end == std::string_view::npos ? s.size() : end;
+    void copy(std::size_t n) {
+        for (std::size_t k = 0; k < n; ++k) put(s_[i_ + k]);
+        i_ += n;
+    }
+
+    bool include_directive() {
+        for (const std::string_view d : {"#includedir", "#include"}) {
+            const char after = at(i_ + d.size());
+            if (!s_.substr(i_).starts_with(d) || (after != ' ' && after != '\t')) continue;
+            const std::size_t b = mark();
+            copy(d.size());
+            emit('w', b);
+            include_path();
+            return true;
+        }
+        return false;
+    }
+
+    /// The path after an include directive (toke.l GOTINC): quoted, or non-space text.
+    void include_path() {
+        while (at(i_) == ' ' || at(i_) == '\t') {
+            blank_ = true;
+            ++i_;
+        }
+        const std::size_t b = mark();
+        if (at(i_) == '"') return quoted(b);
+        while (i_ < s_.size() && std::isspace(static_cast<unsigned char>(s_[i_])) == 0)
+            copy(s_[i_] == '\\' && (at(i_ + 1) == ' ' || at(i_ + 1) == '\t') ? 2 : 1);
+        if (st_.text.size() > b) emit('w', b);
+    }
+
+    void quoted(std::size_t b) {
+        copy(1);
+        for (;;) {
+            if (i_ >= s_.size() || newline_len(i_) != 0) return emit('x', b); // unterminated
+            if (const std::size_t next = continuation(i_)) {
+                for (i_ = bol_ = next; at(i_) == ' ' || at(i_) == '\t';) ++i_;
+                continue;
+            }
+            const char ch = s_[i_];
+            copy(ch == '\\' && at(i_ + 1) == '"' ? 2 : 1);
+            if (ch == '"') break;
+        }
+        want_value_ = false;
+        emit('s', b);
+    }
+
+    /// Length of an IPv6 literal at i_ (toke.l IPV6ADDR, with an optional /prefix), or 0.
+    [[nodiscard]] std::size_t ipv6_len() const {
+        const auto hex = [this](std::size_t k) {
+            std::size_t n = 0;
+            while (n < 4 && xdigit(at(k + n))) ++n;
+            return n;
+        };
+        std::size_t k = i_, groups = 0;
+        for (; groups < 7 && at(k + hex(k)) == ':'; ++groups) k += hex(k) + 1;
+        if (groups < 2) return 0;
+        k += hex(k);
+        while (digit(at(k)) || at(k) == '.') ++k; // an embedded IPv4 tail
+        if (at(k) == '/')
+            for (++k; xdigit(at(k)) || at(k) == ':' || at(k) == '.';) ++k;
+        return k - i_;
+    }
+
+    void word(std::size_t b) {
+        if (at(i_) == '%') copy(at(i_ + 1) == ':' ? 2 : 1);
+        if (at(i_) == '#') { // #uid, %#gid
+            copy(at(i_ + 1) == '-' ? 2 : 1);
+            while (digit(at(i_))) copy(1);
+        } else {
+            while (i_ < s_.size()) {
+                const char ch = s_[i_];
+                if (ch == '\\') {
+                    const char n = at(i_ + 1);
+                    if (i_ + 1 >= s_.size() || n == '\n' || n == '\r' || (n == '\t' && !defaults_))
+                        break;
+                    copy(2);
+                } else if (std::string_view{"#>!=:,() \t\r\n\""}.find(ch) == npos) {
+                    copy(1);
+                } else {
+                    break;
+                }
+            }
+        }
+        if (st_.text.size() == b) { // nothing sudo lexes starts here
+            copy(1);
+            return emit('x', b);
+        }
+        const std::string w = st_.text.substr(b);
+        if (w == "sudoedit" && !defaults_ && !want_value_) return command_args(b);
+        if (w == "sha224" || w == "sha256" || w == "sha384" || w == "sha512") {
+            std::size_t k = i_;
+            while (at(k) == ' ' || at(k) == '\t') ++k;
+            std::size_t d = k + 1;
+            while (at(d) == ' ' || at(d) == '\t') ++d;
+            const std::size_t d0 = d;
+            const auto digest_char = [](char ch) {
+                return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '+' || ch == '/' ||
+                       ch == '=';
+            };
+            while (digest_char(at(d))) ++d;
+            if (at(k) == ':' && d > d0) {
+                st_.text += ':';
+                i_ = d0;
+                copy(d - d0);
+                return emit('d', b);
+            }
+        }
+        if (st_.toks.empty() && w.starts_with("Defaults") && (w.size() == 8 || w[8] == '@'))
+            defaults_ = true;
+        emit('w', b);
+        if (w == "@include" || w == "@includedir") include_path();
+        want_value_ = w == "CWD" || w == "CHROOT"; // toke.l EXPECTPATH: the value is no command
+    }
+
+    void command(std::size_t b) {
+        if (s_[i_] == '/') {
+            while (i_ < s_.size()) {
+                const char ch = s_[i_];
+                if (ch == '\\' && i_ + 1 < s_.size() &&
+                    std::string_view{",:= \t#"}.find(s_[i_ + 1]) != npos)
+                    copy(2);
+                else if (std::string_view{",:=\\ \t\r\n#"}.find(ch) == npos)
+                    copy(1);
+                else
+                    break;
+            }
+            if (st_.text.back() == '/') return emit('c', b); // a directory takes no arguments
+            return command_args(b);
+        }
+        // toke.l REGEX is the LONGEST match: it ends at the last `$` before an unescaped
+        // `#`, an unescaped `$` or the line end.
+        std::size_t end = 0, k = i_ + 1;
+        for (; k < s_.size() && newline_len(k) == 0; ++k) {
+            const bool escaped = s_[k - 1] == '\\';
+            if (s_[k] == '#' && !escaped) break;
+            if (s_[k] == '$') {
+                end = k + 1;
+                if (!escaped) break;
+            }
+        }
+        if (end == 0) { // unterminated: consumed whole, so no later `^` rescans it
+            copy(k - i_);
+            return emit('x', b);
+        }
+        copy(end - i_);
+        command_args(b);
+    }
+
+    /// toke.l GOTCMND: arguments run to an unescaped `#`, `:`, `,`, `=` or the line end.
+    void command_args(std::size_t b) {
+        bad_ = false;
+        bool have_arg = false;
+        while (i_ < s_.size() && newline_len(i_) == 0) {
+            const char ch = s_[i_];
+            if (std::string_view{"#:,="}.find(ch) != npos) break;
+            if (ch == ' ' || ch == '\t' || ch == '\r') {
+                blank_ = true;
+                ++i_;
+            } else if (const std::size_t next = continuation(i_)) {
+                blank_ = true;
+                i_ = bol_ = next;
+            } else if (ch == '^' && !have_arg) {
+                arg_regex();
+                break;
+            } else if (ch == '\\') {
+                const bool known = i_ + 1 < s_.size() &&
+                    std::string_view{":\\,= \t#*?[]!^"}.find(s_[i_ + 1]) != npos;
+                bad_ = bad_ || !known;
+                copy(known ? 2 : 1);
+                have_arg = true;
+            } else {
+                copy(1);
+                have_arg = true;
+            }
+        }
+        emit(bad_ ? 'x' : 'c', b);
+    }
+
+    /// toke.l GOTREGEX: a first argument `^...$` may hold blanks, commas and colons; it
+    /// ends the command. `#` or a line end inside it is an error.
+    void arg_regex() {
+        copy(1);
+        while (i_ < s_.size() && newline_len(i_) == 0 && s_[i_] != '#') {
+            if (const std::size_t next = continuation(i_)) {
+                i_ = bol_ = next;
+                continue;
+            }
+            const char ch = s_[i_];
+            copy(ch == '\\' && i_ + 1 < s_.size() && newline_len(i_ + 1) == 0 ? 2 : 1);
+            if (ch == '$') return;
+        }
+        bad_ = true;
+    }
+};
+
+inline bool is_option_name(std::string_view w) {
+    return std::find(std::begin(kSudoersOptions), std::end(kSudoersOptions), w) !=
+           std::end(kSudoersOptions);
 }
 
 /// True when `s` still carries an unescaped `NOPASSWD:` / `PASSWD:` tag (blanks
@@ -378,71 +648,49 @@ inline bool has_passwd_tag(std::string_view s) {
     return false;
 }
 
-/// sudoers(5) Tag_Spec names and Digest_Spec types: a `:` after one of these is
-/// part of the Cmnd_Spec, never a Host_List clause separator.
-inline constexpr std::string_view kColonWords[] = {
-    "EXEC", "NOEXEC", "FOLLOW", "NOFOLLOW", "LOG_INPUT", "NOLOG_INPUT", "LOG_OUTPUT",
-    "NOLOG_OUTPUT", "MAIL", "NOMAIL", "INTERCEPT", "NOINTERCEPT", "PASSWD", "NOPASSWD",
-    "SETENV", "NOSETENV", "sha224", "sha256", "sha384", "sha512"};
-
-/// Splits a user spec's right-hand side into its `Host_List = Cmnd_Spec_List`
-/// clauses (sudoers(5): `User_List Host_List = Cmnd_Spec_List (: Host_List =
-/// Cmnd_Spec_List)*`). A `:` separates clauses only when it is unescaped, outside a
-/// Runas_Spec, not after a tag name or digest type, and followed by a non-empty
-/// host list and `=`. Returns {host, cmnd_spec_list} pairs; the first host is `host`.
-inline std::vector<std::pair<std::string, std::string>> split_host_clauses(std::string_view host,
-                                                                           std::string_view rhs) {
-    std::vector<std::pair<std::string, std::string>> out{{std::string{host}, {}}};
-    int depth = 0;
-    for (std::size_t i = 0; i < rhs.size(); ++i) {
-        if (rhs[i] == '\\' && i + 1 < rhs.size()) {
-            out.back().second.append(rhs.substr(i++, 2));
-            continue;
-        }
-        if (rhs[i] == '(') ++depth;
-        if (rhs[i] == ')' && depth > 0) --depth;
-        if (rhs[i] == ':' && depth == 0) {
-            std::size_t w_end = i;
-            while (w_end > 0 && (rhs[w_end - 1] == ' ' || rhs[w_end - 1] == '\t')) --w_end;
-            std::size_t w = w_end;
-            while (w > 0 && std::string_view{" \t,()"}.find(rhs[w - 1]) == std::string_view::npos) --w;
-            const auto word = rhs.substr(w, w_end - w);
-            std::size_t eq = i + 1;
-            while (eq < rhs.size() && rhs[eq] != '=' && rhs[eq] != '\\') ++eq;
-            const auto next_host = eq < rhs.size() && rhs[eq] == '='
-                                       ? trim_ws(rhs.substr(i + 1, eq - i - 1)) : std::string_view{};
-            if (std::find(std::begin(kColonWords), std::end(kColonWords), word) == std::end(kColonWords) &&
-                !next_host.empty() && next_host.find_first_of(":()") == std::string_view::npos) {
-                out.emplace_back(std::string{next_host}, std::string{});
-                i = eq;
-                continue;
-            }
-        }
-        out.back().second += rhs[i];
-    }
-    return out;
-}
-
-/// `user host = (runas) OPTION=v TAG: cmd, cmd ... [: host2 = ...]` -> one entry per
-/// contiguous (runas, NOPASSWD) run of each Host_List clause; nullopt when the line is
-/// not decodable as a user spec.
+/// One lexed user spec, parsed by the sudoers(5) grammar:
+/// `User_List Host_List = Cmnd_Spec_List (: Host_List = Cmnd_Spec_List)*`, each
+/// Cmnd_Spec `[(Runas)] Option_Spec* Tag_Spec* Digest_Spec* !* Cmnd`. One entry per
+/// contiguous (runas, NOPASSWD) run of each Host_List clause; runas and tags carry
+/// across one clause's Cmnd_Specs, never into the next clause. Every tag other than
+/// NOPASSWD:/PASSWD: is kept in the command text as `TAG: `, every Option_Spec verbatim.
+/// nullopt when the tokens do not follow the grammar.
 ///
-/// FAIL SAFE: nopasswd is the one field a reader filters on, so a NOPASSWD:/PASSWD:
-/// tag this function did not decode must never leave a `false` row under OK. If one
-/// survives into any field (a shape the scan does not model), the whole line is
-/// nullopt -- parse_sudoers then reports it `unmodelled`, and the collector adds the
-/// `<file>:undecoded_passwd_tag` token (CONSTRAINED).
-inline std::optional<std::vector<SudoersEntry>> parse_user_spec(std::string_view line) {
-    const auto eq = line.find('=');
-    if (eq == std::string_view::npos) return std::nullopt;
-    const auto left = trim_ws(line.substr(0, eq));
-    const auto ws = left.find_last_of(" \t");
-    if (ws == std::string_view::npos) return std::nullopt;
-    const std::string users{trim_ws(left.substr(0, ws))};
+/// WHAT `nopasswd` GUARANTEES: the clause colon is a token, so a `:` inside a quoted
+/// Option_Spec value, an IPv6 host, a digest, a runas group or an escape never splits a
+/// clause. Defence in depth: a NOPASSWD:/PASSWD: tag that still survives into any field
+/// makes the whole line nullopt -- parse_sudoers reports it `unmodelled` and the collector
+/// adds `<file>:undecoded_passwd_tag` (CONSTRAINED). Known limits: this is sudo 1.9.16's
+/// lexing (checked against it differentially); the column is the tag alone (a Defaults
+/// `!authenticate` also removes the password prompt); aliases and includes are not
+/// resolved; and a line sudo itself rejects is reported best-effort.
+inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersStatement& st) {
+    const auto& t = st.toks;
+    const std::string_view text = st.text;
+    std::size_t k = 0;
+    const auto is = [&](char kind) { return k < t.size() && t[k].kind == kind; };
+    const auto span = [&](std::size_t b, std::size_t e) {
+        return std::string{text.substr(b, e - b)};
+    };
+    // User_List / Host_List: item (',' item)*, item = '!'* word-or-string; verbatim text.
+    const auto member_list = [&]() -> std::optional<std::string> {
+        const std::size_t first = k;
+        for (;;) {
+            while (is('!')) ++k;
+            if (!is('w') && !is('s')) return std::nullopt;
+            ++k;
+            if (!is(',')) return span(t[first].b, t[k - 1].e);
+            ++k;
+        }
+    };
+    const auto users = member_list();
+    if (!users) return std::nullopt;
     std::vector<SudoersEntry> out;
-    for (const auto& [host, list] : split_host_clauses(trim_ws(left.substr(ws)), line.substr(eq + 1))) {
-        // Runas and tags carry across one Cmnd_Spec_List, never into the next clause.
-        const std::string subject = users + "@" + host;
+    for (;;) {
+        const auto host = member_list();
+        if (!host || !is('=')) return std::nullopt;
+        ++k;
+        const std::string subject = *users + "@" + *host;
         std::string runas = "-", nopasswd = "false";
         std::vector<std::string> run;
         const auto flush = [&] {
@@ -452,50 +700,50 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(std::string_view
             out.push_back({"user_spec", subject, runas, nopasswd, std::move(cmds)});
             run.clear();
         };
-        for (auto item : split_unescaped_commas(list)) {
-            std::string_view it = item;
-            std::string next_runas = runas, next_nopw = nopasswd;
-            if (!it.empty() && it.front() == '(') {
-                const auto close = it.find(')');
-                if (close == std::string_view::npos) return std::nullopt;
-                next_runas = std::string{trim_ws(it.substr(1, close - 1))};
-                it = trim_ws(it.substr(close + 1));
+        for (;;) {
+            std::string next_runas = runas, next_nopw = nopasswd, kept;
+            if (is('(')) {
+                const std::size_t open = k++;
+                while (is('w') || is('s') || is(',') || is(':') || is('!')) ++k;
+                if (!is(')')) return std::nullopt;
+                next_runas = std::string{trim_ws(text.substr(t[open].e, t[k].b - t[open].e))};
+                ++k;
             }
-            // sudoers(5) lets a Tag_Spec carry its tags in ANY order, so the scan must not
-            // stop at the first tag it does not decode: `SETENV: NOPASSWD: /usr/bin/bar`
-            // grants passwordless root exactly as `NOPASSWD: SETENV: ...` does. Option_Spec
-            // words (`CWD=/tmp`, `TIMEOUT=5m`, ...) precede the tags and are consumed the
-            // same way. Only NOPASSWD:/PASSWD: are decoded into the typed column; every
-            // OTHER tag (SETENV: and NOEXEC: among them, both sudo privilege-escalation
-            // vectors) and every option is carried into the stored command text verbatim
-            // -- the same "never dropped" treatment unmodelled_parameter gets elsewhere
-            // in this file -- so neither property is ever traded for the other.
-            std::string kept_tags;
-            for (;;) {
-                if (const std::size_t len = tag_prefix_len(it)) {
-                    const auto name = trim_ws(it.substr(0, it.find(':')));
+            for (;;) { // Option_Spec and Tag_Spec, accepted in any order
+                if (is('t')) {
+                    const auto name = text.substr(t[k].b, t[k].e - t[k].b - 1);
                     if (name == "NOPASSWD") next_nopw = "true";
                     else if (name == "PASSWD") next_nopw = "false";
-                    else {
-                        kept_tags.append(name); // normalised to `TAG: `, whatever spacing it had
-                        kept_tags.append(": ");
-                    }
-                    it = trim_ws(it.substr(len));
-                } else if (const std::size_t opt = option_prefix_len(it)) {
-                    kept_tags.append(it.substr(0, opt));
-                    kept_tags += ' ';
-                    it = trim_ws(it.substr(opt));
+                    else kept.append(name).append(": ");
+                    ++k;
+                } else if (is('w') && k + 2 < t.size() && t[k + 1].kind == '=' &&
+                           (t[k + 2].kind == 'w' || t[k + 2].kind == 's') &&
+                           is_option_name(text.substr(t[k].b, t[k].e - t[k].b))) {
+                    kept.append(span(t[k].b, t[k + 2].e)).append(" ");
+                    k += 3;
                 } else {
                     break;
                 }
             }
-            if (it.empty()) return std::nullopt;
+            const std::size_t cmd_b = k < t.size() ? t[k].b : text.size();
+            while (is('d')) {
+                ++k;
+                if (is(',') && k + 1 < t.size() && t[k + 1].kind == 'd') ++k;
+            }
+            while (is('!')) ++k;
+            if (!is('c') && !is('w')) return std::nullopt;
+            const std::size_t cmd_e = t[k++].e;
             if (next_runas != runas || next_nopw != nopasswd) flush();
             runas = std::move(next_runas);
             nopasswd = std::move(next_nopw);
-            run.emplace_back(kept_tags + std::string{it});
+            run.push_back(kept + span(cmd_b, cmd_e));
+            if (!is(',')) break;
+            ++k;
         }
         flush();
+        if (k == t.size()) break;
+        if (!is(':')) return std::nullopt;
+        ++k;
     }
     for (const auto& e : out)
         if (has_passwd_tag(e.subject) || has_passwd_tag(e.runas) || has_passwd_tag(e.commands))
@@ -506,15 +754,14 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(std::string_view
 } // namespace detail
 
 /// Parses one sudoers file. `#include`/`#includedir`/`@include*` are listed
-/// (kind include/includedir), never followed; any other line that is not a
-/// Defaults / *_Alias / user spec is kind `unmodelled` with the raw line in
+/// (kind include/includedir), never followed; any other statement that is not a
+/// Defaults / *_Alias / user spec is kind `unmodelled` with the statement text in
 /// `commands` -- never dropped. An `unmodelled` line that still carries a
 /// NOPASSWD:/PASSWD: tag is the collector's `undecoded_passwd_tag` failure.
 inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
     std::vector<SudoersEntry> out;
-    for (const auto& line_str : logical_lines(text, detail::cut_sudoers_comment)) {
-        const std::string_view line = line_str;
-        if (line.empty()) continue;
+    for (const auto& st : detail::SudoersLexer{text}.run()) {
+        const std::string_view line = st.text;
         const auto word = line.substr(0, line.find_first_of(" \t"));
         const auto rest = trim_ws(line.substr(word.size()));
         if (word == "#include" || word == "@include")
@@ -534,7 +781,7 @@ inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
             const auto eq = rest.find('=');
             out.push_back({"alias", std::string{word} + ":" + std::string{trim_ws(rest.substr(0, eq))},
                            "-", "-", eq == std::string_view::npos ? "" : std::string{trim_ws(rest.substr(eq + 1))}});
-        } else if (auto spec = detail::parse_user_spec(line)) {
+        } else if (auto spec = detail::parse_user_spec(st)) {
             for (auto& e : *spec) out.push_back(std::move(e));
         } else {
             out.push_back({"unmodelled", "-", "-", "-", std::string{line}});
@@ -953,8 +1200,9 @@ inline bool secedit_export_complete(std::string_view text) {
 /// `<action>|<key>|<value>|secedit` rows (audit: every [Event Audit] category). A key the
 /// export does not carry is the row value `absent` (a modal state, no token); a missing
 /// required section means the export is not the shape we read -- a failure token, never an
-/// empty success. A reported key or value holding U+0000 is `secedit:embedded_nul` (the
-/// Windows leg is all-or-nothing): the value past it is unknowable, never truncated.
+/// empty success. The leg refuses a NUL anywhere in the export first
+/// (classify_decoded_export); a reported key or value holding one is still
+/// `secedit:embedded_nul` here, so this mapper is safe on its own.
 inline SeceditRows secedit_policy_rows(std::string_view action, const InfSections& sections) {
     SeceditRows out;
     const auto which = parse_local_policy_action(action);

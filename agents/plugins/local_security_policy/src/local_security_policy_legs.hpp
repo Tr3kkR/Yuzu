@@ -80,8 +80,9 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 /// Today the fallback is reachable ONLY from the macOS pwpolicy path, and only with
 /// state `constrained`: every file-backed source pairs each denial/failure with its
 /// own row as it records it, so `collect_file_policy` returns empty rows with a non-OK
-/// status only from its unreachable `unsupported_action` guard, and the pwpolicy path never reports PERMISSION_DENIED (a refused
-/// run is not distinguishable from any other non-zero exit). The `permission_denied`
+/// status only from its unreachable `unsupported_action` guard, and the pwpolicy path
+/// never reports PERMISSION_DENIED (a refused run is not distinguishable from any other
+/// non-zero exit). The `permission_denied`
 /// arm below is therefore defensive; the docs describe the status row as
 /// `constrained` only. That matters for the `sudoers` action, whose normal row is 7
 /// fields, not 4 -- if a future file-source failure is ever counted WITHOUT emitting

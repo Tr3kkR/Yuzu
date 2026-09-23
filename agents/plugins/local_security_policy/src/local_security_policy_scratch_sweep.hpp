@@ -258,10 +258,13 @@ classify_export_object(bool reparse_or_directory, std::uint64_t size_bytes) {
 }
 
 /// A real export is never empty, so an empty decode is a failed decode, exactly
-/// like a decode that did not happen. Empty string = usable.
+/// like a decode that did not happen. A U+0000 ANYWHERE is `secedit:embedded_nul`,
+/// as checked_read does for files: a NUL in a key that is then never found would
+/// otherwise report that key `absent` under OK. Empty string = usable.
 [[nodiscard]] inline std::string
 classify_decoded_export(const std::optional<std::string>& text) {
-    return (!text || text->empty()) ? "secedit:decode_failed" : std::string{};
+    if (!text || text->empty()) return "secedit:decode_failed";
+    return text->find('\0') == std::string::npos ? std::string{} : "secedit:embedded_nul";
 }
 
 } // namespace yuzu::local_security_policy
