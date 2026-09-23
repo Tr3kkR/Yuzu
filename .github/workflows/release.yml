@@ -371,7 +371,7 @@ jobs:
           # Something must have EXECUTED: a set-up crash in every module
           # prints "Failed: 0.  Skipped: 0.  Passed: 0." -- an all-cancelled
           # run that would otherwise read as a pass (#4800 false-green class).
-          if ! grep -qE "All [1-9][0-9]* tests? passed\.|Test passed\.|Passed: [1-9]|Failed: [1-9]" eunit.log; then
+          if ! grep -qE "All [1-9][0-9]* tests? passed\.|^ *2 tests passed\.|^ *Test passed\.|Passed: [1-9]|Failed: [1-9]" eunit.log; then
             echo "::error::EUnit executed zero tests"
             exit 1
           fi

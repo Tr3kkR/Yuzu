@@ -49,6 +49,7 @@ class ExecutedCount(unittest.TestCase):
             '  All 324 tests passed.': 324,
             '  Failed: 2.  Skipped: 0.  Passed: 309.': 311,
             '  Test passed.': 1,
+            '  2 tests passed.': 2,
             'There were no tests to run.': 0,
             # the #4800 false green itself
             '\x1b[0mAll 0 tests passed.\r\n': 0,
@@ -62,6 +63,25 @@ class ExecutedCount(unittest.TestCase):
     def test_no_summary_is_none(self):
         self.assertIsNone(gts.executed_count('===> Compiling yuzu_gw\n'))
         self.assertIsNone(gts.executed_count(''))
+
+    def test_truncated_capture_fails_closed(self):
+        # #4800 Gate 5 CH-1: output cut before rebar3's summary must never
+        # read as a pass, including when a test's own log text CONTAINS a
+        # summary-shaped phrase (anchoring), a line is cut mid-way, or an
+        # ANSI escape is split by the cut.
+        real = ('%%% yuzu_gw_e2e_SUITE: ....\n'
+                '*** log: All 5 tests passed. (fixture noise)\n'
+                'agent said "Passed 3 tests." earlier\n'
+                '\x1b[0mAll 52 tests passed.\n')
+        cut = real.index('\x1b[0mAll 52')
+        for n in range(0, cut + 1):
+            with self.subTest(cut=n):
+                self.assertEqual(gts.require_tests_executed(real[:n], 'ct', 0), 1)
+        for partial in ('All 5', '\x1b[0mAll 52 tests pass', '\x1b[', '\x1b[0'):
+            with self.subTest(partial=partial):
+                self.assertEqual(
+                    gts.require_tests_executed(real[:cut] + partial, 'ct', 0), 1)
+        self.assertEqual(gts.require_tests_executed(real, 'ct', 0), 0)
 
     def test_last_summary_wins(self):
         self.assertEqual(

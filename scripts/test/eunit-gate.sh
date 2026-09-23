@@ -79,7 +79,7 @@ rebar3_rc=${PIPESTATUS[0]}
 
 # Parse the EUnit summary. It is one of:
 #   `  All N tests passed.`                      (rc 0)
-#   `  Test passed.`                             (rc 0, exactly one test)
+#   `  2 tests passed.` / `  Test passed.`       (rc 0, exactly two / one)
 #   `  Failed: N.  Skipped: N.  Passed: N.`      (failures and/or cancellations)
 #   `  There were no tests to run.`
 # Neither rc 0 nor Failed: 0 proves anything ran, so both paths also require
@@ -88,7 +88,9 @@ out=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$capture")
 executed=""
 if line=$(grep -E "All [0-9]+ tests? passed\." <<<"$out" | tail -1) && [[ -n "$line" ]]; then
     executed=$(sed -E 's/.*All ([0-9]+) tests? passed\..*/\1/' <<<"$line")
-elif grep -qE "(^|[^A-Za-z])Test passed\." <<<"$out"; then
+elif grep -qE "^[[:space:]]*2 tests passed\.[[:space:]]*$" <<<"$out"; then
+    executed=2   # eunit's wording for exactly two tests
+elif grep -qE "^[[:space:]]*Test passed\.[[:space:]]*$" <<<"$out"; then
     executed=1
 fi
 summary=$(grep -E "^[[:space:]]*Failed:[[:space:]]+[0-9]+" <<<"$out" | tail -1)
