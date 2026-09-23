@@ -102,13 +102,18 @@ namespace {
 constexpr DWORD kArmFailRetryMs = 30000;
 
 // Health-report detail text for the parent-watch permanent-disable transition (see
-// ParentIoRelease/kParentIoAbandonLimit). No path in the string — the accompanying
-// spdlog::error line already carries it, and this text is pinned by tests, so keeping
-// it path-free keeps the pin stable across different watched paths.
+// ParentIoRelease/kParentIoAbandonLimit). Rendered VERBATIM on the device page's
+// event detail column (device_ui.cpp), so it is written for an operator, not an
+// engineer — plain language, no internal terms ("cancel drain", "abandon limit").
+// The engineering detail (drain-failure count, mechanism) stays in the accompanying
+// spdlog::error line instead, which is not customer-facing. No path in the string —
+// keeps the text identical across different watched paths (a future test pinning it
+// can rely on that).
 constexpr std::string_view kParentDisabledDetail =
-    "parent-directory watch permanently disabled after 3 unconfirmed cancel drains; "
-    "a rename or move of the watched directory is not detected in real time until "
-    "this rule is re-armed (policy re-push or agent restart)";
+    "Rename/move detection for this rule is disabled after repeated failures to "
+    "reset its file-system watch (often caused by a slow or unreliable network "
+    "share). This rule's file presence/content checks are unaffected. To restore "
+    "rename detection: re-push this rule's policy, or restart the agent.";
 
 // (A dead, uncalled local to_wide copy was removed here in the #1681 win_str
 // de-dup — guard_file does no wide<->UTF-8 conversion of its own.)
