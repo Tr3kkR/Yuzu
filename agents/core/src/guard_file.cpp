@@ -42,8 +42,12 @@
  * guard's lifetime (logged once, at error level) — no further retry of any kind,
  * until the rule is next re-armed (a policy re-push or an agent restart). On that
  * transition this guard reports itself "guard.unhealthy" (once at the edge, then
- * re-sent every parent_unhealthy_refresh_ms while still disabled — a lost-edge
- * backstop, since the legacy sink drops events on disconnect with no retry) and
+ * re-sent every parent_unhealthy_refresh_ms for as long as this guard's OWN worker
+ * thread keeps running — a lost-edge backstop against the legacy sink dropping an
+ * event on disconnect with no retry, not a guarantee against the thread itself
+ * dying: a WAIT_FAILED/WAIT_ABANDONED break or an unhandled exception silently ends
+ * run(), and this guard then sends nothing further until the next reconcile
+ * replaces it) and
  * withholds every further compliant publication until the rule is re-armed, so the
  * operator-facing census cannot show 100% compliant while rename detection is dead
  * (see report_compliant() below). Either way, X's own detection (presence/content,
@@ -982,8 +986,13 @@ void FileGuard::run() try {
         } else if (idx_p != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_p) {
             handle_p_wake();
         } else if (idx_refresh != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_refresh) {
-            // Lost-edge backstop tick: re-send, no re-arm, no filesystem access.
-            report_parent_unhealthy();
+            // Lost-edge backstop tick: re-send, no re-arm, no filesystem access. idx_stop is
+            // always the highest index (see handles[] population above), so a stop() racing a
+            // coincident timer tick can have WaitForMultipleObjects report THIS (lower) index
+            // even though a stop was also signalled — check stop_ explicitly rather than issue
+            // one more (potentially blocking) send on the way out.
+            if (!stop_.load(std::memory_order_acquire))
+                report_parent_unhealthy();
         } else {
             spdlog::error("Guardian FileGuard[{}]: WaitForMultipleObjects failed (r={}, err={}) — "
                           "watch stopping",
