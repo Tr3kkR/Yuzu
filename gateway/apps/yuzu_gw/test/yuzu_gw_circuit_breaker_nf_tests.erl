@@ -93,8 +93,13 @@ trip_circuit() ->
 %% `timer:sleep(N)` then `half_open` check is an UPPER-bound race: it failed on
 %% the first macOS CI run (#4841; BigMags shares its CPU between two agents, and
 %% macOS coalesces background timers). Poll with a generous deadline instead.
-%% The LOWER-bound checks ("still open at N ms") keep their fixed sleeps. Delay
-%% can only make those safer, and they are what prove the backoff doubles.
+%% The LOWER-bound checks ("still open at N ms") keep their fixed sleeps: they
+%% are what prove the backoff grew. They are NOT immune to delay. A test process
+%% that wakes after the gateway's timer has fired sees half_open and fails. Each
+%% sits deliberately at the midpoint between the previous timeout and the new
+%% one (e.g. 150ms between 100 and 200), so its margin is symmetric (50ms each
+%% way at the base timeout) and cannot widen without weakening the check that
+%% the backoff actually doubled, short of raising the base timeout for every test.
 %% Where a wait pins the backoff AMOUNT, the caller passes an upper bound
 %% (`WithinMs`) that is ~3x the old margin but still shorter than the wrong
 %% amount it must reject (e.g. the 500ms cap vs an uncapped 800ms). Elsewhere
