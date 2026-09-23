@@ -1691,6 +1691,165 @@ TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
     CHECK(saw_success);
 }
 
+// ADR-0031 WS-A4 DexPerfApi seam (#4626) characterization: /fragments/dex/perf
+// and /fragments/dex/perf/cohort-diff had NO route-level coverage before this
+// seam's dashboard rewire. Pinned here BEFORE the rewire (perf_fn_ still the
+// live provider) so the rewire onto DexPerfApi::fleet_snapshot cannot silently
+// change the rendered HTML for these two fragments.
+TEST_CASE("DEX perf fragment (F2a fleet-now): unwired placeholder vs wired snapshot",
+          "[pg][dex][perf][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("perf_fn unwired -> honest unavailable placeholder") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/perf");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no perf snapshot provider wired") != std::string::npos);
+    }
+
+    SECTION("perf_fn wired -> fleet-now cards render the reporting device") {
+        yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+            yuzu::server::DexPerfSnapshot snap;
+            yuzu::server::DexPerfDevice d;
+            d.agent_id = "WS-1";
+            d.os = "windows";
+            d.cpu_pct = 50.0;
+            snap.devices.push_back(d);
+            return snap;
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                               /*responses_fn=*/{}, perf_fn);
+        auto r = sink.Get("/fragments/dex/perf");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Fleet now (last rollup cycle)") != std::string::npos);
+        CHECK(r->body.find("CPU utilization") != std::string::npos);
+        CHECK(r->body.find("50.0%") != std::string::npos);
+    }
+}
+
+TEST_CASE("DEX perf cohort-diff fragment: unwired placeholder vs wired empty-cohort note",
+          "[pg][dex][perf][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("perf_fn unwired -> honest unavailable placeholder") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?a=x&b=y");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no perf snapshot provider wired") != std::string::npos);
+    }
+
+    SECTION("perf_fn wired, no devices tagged -> both cohorts render absent") {
+        yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+            return yuzu::server::DexPerfSnapshot{}; // no devices, no keys
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                               /*responses_fn=*/{}, perf_fn);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?a=imageA&b=imageB");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no reporting devices") != std::string::npos);
+        CHECK(r->body.find("absent") != std::string::npos);
+        CHECK(r->body.find(">imageA</b>") != std::string::npos);
+        CHECK(r->body.find(">imageB</b>") != std::string::npos);
+    }
+}
+
+// kDexCohortFloor suppression at the route level (fleet + group paths) —
+// pinned before the DexPerfApi rewire so the floor can never silently drop
+// out when the handler switches from AppPerfProviders.fleet/.group to
+// DexPerfApi::app_fleet_trend/group_trend (both apply the SAME
+// app_perf_fleet_trend/app_perf_group_trend pure reduction + kDexCohortFloor).
+TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
+          "(fleet and group paths)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    auto sub_floor_row = []() {
+        AppPerfFleetRow row;
+        row.app_name = "chrome.exe";
+        row.version = "125.0.0.0";
+        row.day = 1'700'000'000;
+        row.device_count = 3; // < kDexCohortFloor (10)
+        row.cpu_sum = 30.0;
+        row.cpu_max = 40.0;
+        row.hist_version = kAppPerfHistVersion;
+        return row;
+    };
+
+    SECTION("fleet path (no group/model) floors too") {
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{sub_floor_row()};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
+        // The exact CPU mean (30.0/3=10.0%) must be withheld once suppressed.
+        CHECK(r->body.find("10.0%") == std::string::npos);
+    }
+
+    SECTION("group path floors identically") {
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{sub_floor_row()};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe&group=G1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
+        CHECK(r->body.find("10.0%") == std::string::npos);
+    }
+}
+
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
 
 TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",
