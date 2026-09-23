@@ -66,8 +66,15 @@ if [[ $# -eq 0 ]]; then
     set -- --dir apps/yuzu_gw/test
 fi
 
+# Per-run capture file: the verdict below is parsed from it, so a fixed path
+# would let two overlapping runs on one host (#1871) interleave and one read
+# the other's summary.
+capture=$(mktemp "${TMPDIR:-/tmp}/yuzu_test_eunit_gate.XXXXXX") \
+    || { echo "eunit-gate: mktemp failed" >&2; exit 2; }
+trap 'rm -f "$capture"' EXIT
+
 REBAR_BASE_DIR="${REBAR_BASE_DIR:-$PWD/_build_eunit}" \
-    rebar3 eunit "$@" 2>&1 | tee /tmp/eunit-gate-output.txt
+    rebar3 eunit "$@" 2>&1 | tee "$capture"
 rebar3_rc=${PIPESTATUS[0]}
 
 # Parse the EUnit summary. It is one of:
@@ -77,7 +84,7 @@ rebar3_rc=${PIPESTATUS[0]}
 #   `  There were no tests to run.`
 # Neither rc 0 nor Failed: 0 proves anything ran, so both paths also require
 # a nonzero executed (failed + passed) count (#4800).
-out=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/eunit-gate-output.txt)
+out=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$capture")
 executed=""
 if line=$(grep -E "All [0-9]+ tests? passed\." <<<"$out" | tail -1) && [[ -n "$line" ]]; then
     executed=$(sed -E 's/.*All ([0-9]+) tests? passed\..*/\1/' <<<"$line")

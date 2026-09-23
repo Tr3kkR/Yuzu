@@ -64,12 +64,14 @@ def require_tests_executed(text, label, returncode):
     if executed is None:
         print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but printed no "
               "recognisable test summary -- cannot confirm any test ran. "
-              "Failing (#4800).", file=sys.stderr)
+              "Failing (#4800). If rebar3 changed its summary wording, "
+              "update scripts/gateway_test_summary.py.", file=sys.stderr)
         return 1
     if executed == 0:
         print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but executed ZERO "
-              "tests -- the suite directory or --dir is wrong. Failing so this "
-              "cannot pass as a false green (#4800).", file=sys.stderr)
+              "tests -- nothing was discovered (wrong suite directory / --dir) "
+              "or every test was skipped (check the CT/eunit logs). Failing so "
+              "this cannot pass as a false green (#4800).", file=sys.stderr)
         return 1
     print(f"\n[test_gateway.py] {label}: {executed} tests executed.")
     return 0

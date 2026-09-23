@@ -15,7 +15,9 @@ Three responsibilities beyond the bare rebar3 invocation:
      so subsequent runs find them locally without a network
      round-trip — on the persistent self-hosted Windows runner this
      means hex.pm is only touched on the very first run.
-  2. OTP 25 CT I/O race detection — see comment block below.
+  2. Zero-executed guard (#4800): a rebar3 exit 0 that executed no
+     tests, or printed no recognisable summary, fails the run
+     (scripts/gateway_test_summary.py).
   3. Live-streamed output under a hard wall-clock deadline
      (`_run_streamed`, `_RUN_DEADLINE_SECS`) BELOW meson's own
      suite-level test timeout. A prior version of this wrapper called
@@ -328,7 +330,7 @@ def run_with_retry(args, label, max_attempts=4):
     return result
 
 
-# Capture output to detect OTP 25 CT I/O race, but also tee to console.
+# Output is captured for the zero-executed guard and also teed to console.
 # run_with_retry handles hex.pm fetch flakes by detecting the
 # "Failed to fetch and copy dep:" sentinel and backing off between
 # attempts. 4 attempts × ~35s of waits at most before giving up.
@@ -341,20 +343,11 @@ output = result.stdout or ""
 # tests/test_gateway_test_summary.py).
 from gateway_test_summary import require_tests_executed as _require_tests_executed  # noqa: E402
 
-# OTP 25 has a known race where the CT I/O handler (test_server_io)
-# terminates before all suite completion messages are written, causing
-# rebar3 to exit with code 1 even though all tests passed.  Detect this
-# by checking if the output contains "0 failed" and the crash signature.
-if result.returncode != 0 and suite == "ct":
-    has_io_crash = "ct_util_server got EXIT" in output or "test_server_io" in output
-    # Count failed tests from CT output lines like "N ok, M failed"
-    fail_counts = re.findall(r"(\d+)\s+failed", output)
-    all_zero_fails = fail_counts and all(int(n) == 0 for n in fail_counts)
-    if has_io_crash and all_zero_fails:
-        print("\n[test_gateway.py] OTP 25 CT I/O race detected — "
-              "no failures reported but CT runner crashed on teardown. "
-              "Ignoring rebar3's exit code; the zero-executed guard still "
-              "requires a summary showing tests ran.")
-        sys.exit(_require_tests_executed(output, suite, 0))
-
+# (An OTP-25-only override used to live here: when CT's I/O handler crashed
+# at teardown it replaced rebar3's non-zero exit with 0 if every "N failed"
+# count in the output was 0. Governance for #4800 found that it could also
+# pass a run in which a whole suite was auto-skipped ("0 failed, 6 skipped"),
+# so it was removed. OTP 28 is the only supported toolchain
+# (scripts/erlang_toolchain.py, CI), and on any other OTP the wrapper now
+# fails closed on rebar3's own exit code.)
 sys.exit(_require_tests_executed(output, suite, result.returncode))
