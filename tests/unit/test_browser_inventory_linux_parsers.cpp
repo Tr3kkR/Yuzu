@@ -334,6 +334,94 @@ TEST_CASE("browser_inventory linux: linux_browser_rows_at reports the fixture's 
 #endif // !defined(_WIN32)
 }
 
+TEST_CASE("browser_inventory linux: a symlink planted at a browser binary path is refused, not "
+          "reported as a clean absence",
+          "[browser_inventory][linux][walk]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Adversarial-review finding (2026-09-22): AT_SYMLINK_NOFOLLOW confines
+    // the read (nothing is followed), but the OLD code collapsed a refused
+    // symlink into `present=false, constrained=false` -- indistinguishable
+    // from the binary genuinely not existing. MUTATION: reverting the
+    // S_ISLNK branch back to a bare S_ISREG check passes `present == 0`
+    // here but loses the CONSTRAINED token this test also checks.
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_symlink_"};
+    std::filesystem::create_directories(dir.path / "opt" / "google" / "chrome");
+    std::filesystem::create_symlink("/etc/passwd", dir.path / "opt" / "google" / "chrome" / "chrome");
+
+    std::optional<std::string> token;
+    const auto rows = linux_browser_rows_at(dir.path, token);
+    REQUIRE(token.has_value());
+    CHECK(token->find("linux:browser_inventory:symlink_refused") != std::string::npos);
+    CHECK(std::find(rows.begin(), rows.end(), "browser|chrome|0|-") != rows.end());
+#endif // !defined(_WIN32)
+}
+
+TEST_CASE("browser_inventory linux: a FIFO planted at 'Local State' is refused promptly, not "
+          "blocked on open()",
+          "[browser_inventory][linux][walk]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Adversarial-review finding (2026-09-22): open(2) of a FIFO with no
+    // writer blocks forever unless O_NONBLOCK is set. This test's own
+    // completion (Catch2/CI's normal per-test wall clock, no explicit
+    // alarm needed) IS the regression signal -- reverting the O_NONBLOCK
+    // fix in read_file_bounded_at hangs this test rather than failing an
+    // assertion.
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_fifo_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "microsoft-edge";
+    std::filesystem::create_directories(browser_dir);
+    REQUIRE(::mkfifo((browser_dir / "Local State").string().c_str(), 0644) == 0);
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    REQUIRE(token.has_value());
+    CHECK(token->find("linux:browser_inventory:not_regular") != std::string::npos);
+    CHECK(rows.empty());
+#endif // !defined(_WIN32)
+}
+
+TEST_CASE("browser_inventory linux: a Local State file over the 1 MiB cap reports a distinct "
+          "too-large token, not local_state_malformed",
+          "[browser_inventory][linux][walk]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Adversarial-review finding (2026-09-22): the old code silently
+    // truncated an over-cap read to `cap` bytes and let the subsequent
+    // JSON parse fail on the cut point, reporting the same
+    // local_state_malformed token as genuinely-invalid JSON -- conflating
+    // a size-policy refusal with invalid content.
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_oversize_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "google-chrome";
+    std::filesystem::create_directories(browser_dir);
+    {
+        // Valid JSON, deliberately padded past the 1 MiB cap with a long
+        // string value -- proves this is a SIZE refusal, not a parse
+        // refusal (the content, if read in full, would parse cleanly).
+        std::ofstream f(browser_dir / "Local State", std::ios::binary);
+        f << R"({"profile":{"info_cache":{"Default":{"name":")";
+        f << std::string(1024 * 1024 + 1, 'x');
+        f << R"("}}}})";
+    }
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    REQUIRE(token.has_value());
+    CHECK(token->find("linux:browser_inventory:local_state_too_large") != std::string::npos);
+    CHECK(token->find("local_state_malformed") == std::string::npos);
+    CHECK(rows.empty());
+#endif // !defined(_WIN32)
+}
+
 TEST_CASE("browser_inventory linux: profile rows deliberately carry the local OS username, never "
           "a browsing-account identifier",
           "[browser_inventory][linux][privacy]") {
@@ -389,6 +477,39 @@ TEST_CASE("browser_inventory linux: no row carries the fixtures' redaction/fabri
     CHECK_FALSE(any_row_contains(rows, "999999999999999999999"));
     CHECK_FALSE(any_row_contains(rows, "Not A Real Person"));
     CHECK_FALSE(any_row_contains(rows, "not-a-real-person@example.invalid"));
+#endif // !defined(_WIN32)
+}
+
+TEST_CASE("browser_inventory linux: an e-mail-shaped display_name is redacted in the FULL wire "
+          "row, through safe_output_field escaping, not just at the pure-parser level",
+          "[browser_inventory][linux][privacy]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // security-guardian advisory (2026-09-22, PR #4729 remediation): the
+    // sibling fixture-driven privacy test above never puts an e-mail-shaped
+    // value in profile_dir/display_name specifically (its fixtures carry
+    // that shape only in the structurally-absent user_name/gaia_id/
+    // gaia_name fields) -- this test closes that gap by hand-authoring a
+    // Local State whose info_cache KEY and NAME are both e-mail-shaped, run
+    // through the real Linux leg end to end (walk + read + parse +
+    // safe_output_field), not just profiles_from_local_state() directly.
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_wire_email_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "google-chrome";
+    std::filesystem::create_directories(browser_dir);
+    {
+        std::ofstream f(browser_dir / "Local State", std::ios::binary);
+        f << R"({"profile":{"info_cache":{"account@example.com":{"name":"account@example.com"}}}})";
+    }
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front() == "profile|alice|chrome|[redacted-email]|[redacted-email]");
+    CHECK(rows.front().find('@') == std::string::npos);
 #endif // !defined(_WIN32)
 }
 

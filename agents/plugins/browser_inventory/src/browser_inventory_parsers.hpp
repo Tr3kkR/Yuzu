@@ -11,22 +11,29 @@
  * PRIVACY CONTRACT (binding for this whole plugin): a row built from this
  * header's parsers NEVER carries a browsing-account identifier -- no
  * gaia_id, no e-mail address, no Chromium info_cache user_name/gaia_name,
- * no browsing history, no cookies, no bookmarks. This is enforced
- * structurally: BrowserProfileRow simply has no such field, so no code
- * path in this header could put one on the wire. See
- * test_browser_inventory_parsers.cpp for a fixture that carries those keys
- * in its input and asserts they never reach a row.
+ * no browsing history, no cookies, no bookmarks. The dedicated-identifier
+ * half of this (gaia_id/user_name/gaia_name) is enforced structurally --
+ * BrowserProfileRow simply has no such field. The e-mail-address half is
+ * enforced by VALUE, not by absence: `profile_dir` and `display_name` ARE
+ * free-text fields Chromium populates from the account (a signed-in Edge
+ * profile in particular is often keyed by its account e-mail), so
+ * `looks_like_email_address` below redacts either field to
+ * `kRedactedEmailPlaceholder` before it ever reaches BrowserProfileRow
+ * (adversarial-review finding, 2026-09-22 -- the original structural-only
+ * claim was incomplete). See test_browser_inventory_parsers.cpp for a
+ * fixture that carries those keys, and an e-mail-shaped profile_dir/
+ * display_name, and asserts none of them reach a row unredacted.
  * TWO EXCEPTIONS (decided 2026-09-22, not part of this contract): (1) the
  * Linux leg's wire-row builder (browser_inventory_linux_parsers.hpp)
  * prepends the LOCAL OS/home-directory username to disambiguate profiles
  * across users sharing a machine -- that value never passes through this
  * header or BrowserProfileRow, and is not a browsing-account identifier.
- * (2) BrowserProfileRow.display_name IS a field of this header's row
- * model, sourced verbatim from info_cache[dir].name -- Chromium-family
- * browsers commonly auto-populate it from the signed-in account's real
- * name, so it CAN legitimately carry a personal name; this is an accepted
- * residual risk (see BrowserProfileRow's own doc comment and the plugin
- * README's PRIVACY CONTRACT), not something this header filters.
+ * (2) BrowserProfileRow.display_name may still carry a personal (non-
+ * e-mail) name -- Chromium-family browsers commonly auto-populate it from
+ * the signed-in account's real name, and only the e-mail SHAPE is
+ * filtered above; a bare name is an accepted residual risk (see
+ * BrowserProfileRow's own doc comment and the plugin README's PRIVACY
+ * CONTRACT), not something this header filters.
  * No file inside a profile directory ("Preferences", "Secure Preferences",
  * "History", "Cookies", ...) is read by any caller of this header in this
  * release; the per-profile `extensions` action follows as its own PR.
@@ -56,6 +63,10 @@ namespace yuzu::browser_inventory {
 /// added by browser_inventory_linux_parsers.hpp, never a field here.)
 struct BrowserProfileRow {
     std::string profile_dir;  // the info_cache key, e.g. "Default", "Profile 1"
+                               // -- Edge in particular sometimes uses the
+                               // signed-in account's e-mail address as this
+                               // key itself; see kRedactedEmailPlaceholder
+                               // below.
     std::string display_name; // info_cache[dir].name -- a user-editable
                                // label. Often a generic default ("Profile 1",
                                // "Work"), but Chromium-family browsers
@@ -63,10 +74,42 @@ struct BrowserProfileRow {
                                // signed-in account's real name -- this CAN
                                // legitimately be a personal name (accepted
                                // exception, see the file banner's PRIVACY
-                               // CONTRACT; not filtered). "-" if absent.
+                               // CONTRACT; a personal name is not filtered).
+                               // "-" if absent.
     bool active{false};       // dir == profile.last_used
     bool ephemeral{false};    // info_cache[dir].is_ephemeral, default false
 };
+
+/// Substituted for `profile_dir`/`display_name` when the raw value has the
+/// shape of an e-mail address (see `looks_like_email_address` below).
+/// Irreversible by construction -- unlike the accepted personal-name
+/// residual risk on `display_name`, an e-mail address is a
+/// browsing-account identifier and the PRIVACY CONTRACT above forbids it
+/// unconditionally, so this is a filter, not a documented exception.
+inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]";
+
+/// True when `value` has the shape of an e-mail address. Deliberately a
+/// coarse heuristic, never full RFC 5322 validation: exactly one '@', at
+/// least one character on each side of it, and the domain side contains a
+/// '.' with a non-empty label on each side of THAT, with no whitespace
+/// anywhere. A privacy filter's safe failure direction is over-matching
+/// (redacting a value that merely looks like an address), never
+/// under-matching -- this checks the shape adversarial review actually
+/// reproduced ("account@example.com"), not a value merely containing '@'.
+[[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
+    if (value.find(' ') != std::string_view::npos || value.find('\t') != std::string_view::npos)
+        return false;
+    const auto at = value.find('@');
+    if (at == std::string_view::npos || at == 0 || at == value.size() - 1)
+        return false;
+    if (value.find('@', at + 1) != std::string_view::npos)
+        return false; // a second '@' isn't a bare local@domain shape
+    const auto domain = value.substr(at + 1);
+    const auto dot = domain.find('.');
+    if (dot == std::string_view::npos || dot == 0 || dot == domain.size() - 1)
+        return false;
+    return true;
+}
 
 namespace detail {
 
@@ -133,10 +176,13 @@ profiles_from_local_state(std::string_view local_state_text) {
             if (!info.is_object())
                 continue;
             BrowserProfileRow row;
-            row.profile_dir = dir;
+            row.profile_dir = looks_like_email_address(dir) ? std::string{kRedactedEmailPlaceholder}
+                                                              : dir;
             row.display_name = info.value("name", std::string{});
             if (row.display_name.empty())
                 row.display_name = "-";
+            else if (looks_like_email_address(row.display_name))
+                row.display_name = std::string{kRedactedEmailPlaceholder};
             row.active = (dir == last_used);
             row.ephemeral = info.value("is_ephemeral", false);
             rows.push_back(std::move(row));

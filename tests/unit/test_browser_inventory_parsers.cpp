@@ -132,6 +132,53 @@ TEST_CASE("profiles_from_local_state: display_name deliberately passes through a
     CHECK(rows->front().display_name == "Jordan Smith");
 }
 
+TEST_CASE("profiles_from_local_state: an e-mail-shaped display_name is redacted, never passed "
+          "through -- the blocker this contract exists to close",
+          "[browser_inventory][profiles][privacy]") {
+    // Adversarial-review finding (2026-09-22): the accepted personal-name
+    // exception (see the sibling "real-name-shaped" test above) does NOT
+    // extend to an e-mail address -- the PRIVACY CONTRACT forbids that
+    // unconditionally. Both external reviewers independently compiled a
+    // harness reproducing exactly this shape and got the raw address on
+    // the wire; this pins the fix.
+    const auto text = std::string{R"({"profile":{"info_cache":{"Default":{)"} +
+                       R"("name":"account@example.com"}}}})";
+    const auto rows = profiles_from_local_state(text);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().display_name == "[redacted-email]");
+    CHECK(rows->front().display_name.find('@') == std::string::npos);
+}
+
+TEST_CASE("profiles_from_local_state: an e-mail-shaped profile_dir (the info_cache key itself) "
+          "is redacted the same way as display_name",
+          "[browser_inventory][profiles][privacy]") {
+    // Edge in particular sometimes keys a signed-in profile's info_cache
+    // entry by the account e-mail rather than a generic "Profile N" name
+    // -- this is the profile_dir half of the same blocker.
+    const auto text = std::string{R"({"profile":{"info_cache":{"account@example.com":{)"} +
+                       R"("name":"account@example.com"}}}})";
+    const auto rows = profiles_from_local_state(text);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().profile_dir == "[redacted-email]");
+    CHECK(rows->front().display_name == "[redacted-email]");
+}
+
+TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profiles][privacy]") {
+    CHECK(looks_like_email_address("account@example.com"));
+    CHECK(looks_like_email_address("a@b.co"));
+    CHECK_FALSE(looks_like_email_address("Default"));
+    CHECK_FALSE(looks_like_email_address("Profile 1"));
+    CHECK_FALSE(looks_like_email_address("Jordan Smith"));
+    CHECK_FALSE(looks_like_email_address(""));
+    CHECK_FALSE(looks_like_email_address("@example.com"));  // nothing before '@'
+    CHECK_FALSE(looks_like_email_address("account@"));      // nothing after '@'
+    CHECK_FALSE(looks_like_email_address("account@example")); // no '.' in domain
+    CHECK_FALSE(looks_like_email_address("a@b@c.com"));     // second '@'
+    CHECK_FALSE(looks_like_email_address("contact @ x.com")); // whitespace
+}
+
 TEST_CASE("profiles_from_local_state: SYNTHETIC (Chrome) — two profiles, second is ephemeral "
           "and not active; fabricated user_name/gaia_id in the source JSON still never "
           "reach a row",

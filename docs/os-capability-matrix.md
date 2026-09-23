@@ -253,10 +253,10 @@ implementation is.
 | bitlocker | state | linux | supported | 1 | libblkid+sysfs | - |
 | bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
-| browser_inventory | browsers | linux | constrained | 1 | ~/.config/{google-chrome,microsoft-edge} directory presence | presence-only; no version/channel detection in this package |
+| browser_inventory | browsers | linux | constrained | 1 | fixed system binary path presence (/opt/google/chrome/chrome, /opt/microsoft/msedge/msedge, /usr/lib/chromium/chromium) | presence-only; no version/channel detection in this package |
 | browser_inventory | browsers | macos | planned | 1 | /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | follows as its own PR |
 | browser_inventory | browsers | windows | planned | 1 | ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | follows as its own PR |
-| browser_inventory | profiles | linux | supported | 1 | ~/.config/{google-chrome,microsoft-edge}/Local State JSON read | - |
+| browser_inventory | profiles | linux | supported | 1 | ~/.config/{google-chrome,chromium,microsoft-edge}/Local State JSON read | - |
 | browser_inventory | profiles | macos | planned | 1 | /Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application Support/{Google/Chrome,Microsoft Edge} walk; Safari bundle + .appex containers | follows as its own PR |
 | browser_inventory | profiles | windows | planned | 1 | ProfileList walk + %LOCALAPPDATA% User Data; Program Files Application\\<semver> dirs | follows as its own PR |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |

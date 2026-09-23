@@ -80,7 +80,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "browsers",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "~/.config/{google-chrome,microsoft-edge} directory presence",
+         "fixed system binary path presence "
+         "(/opt/google/chrome/chrome, /opt/microsoft/msedge/msedge, "
+         "/usr/lib/chromium/chromium)",
          "presence-only; no version/channel detection in this package"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
@@ -96,7 +98,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "profiles",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
-         "~/.config/{google-chrome,microsoft-edge}/Local State JSON read", nullptr},
+         "~/.config/{google-chrome,chromium,microsoft-edge}/Local State JSON read", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
          "/Applications/{Google Chrome,Microsoft Edge}.app Info.plist + ~/Library/Application "

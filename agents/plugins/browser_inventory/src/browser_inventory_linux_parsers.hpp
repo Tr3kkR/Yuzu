@@ -256,7 +256,21 @@ regular_file_present_no_follow_at(const std::filesystem::path& root, std::string
         if (is_benign_absent_errno(err)) return RegularFilePresence{false, false, {}};
         return RegularFilePresence{false, true, dir_open_constraint_token(err)};
     }
-    return RegularFilePresence{S_ISREG(st.st_mode), false, {}};
+    // AT_SYMLINK_NOFOLLOW means a successful stat here always describes the
+    // leaf itself, never a followed target -- so a non-regular leaf is a
+    // real, distinguishable outcome, not benign absence. A deliberately-
+    // refused symlink previously collapsed into `present=false,
+    // constrained=false`, indistinguishable from the binary genuinely not
+    // existing (adversarial-review finding, 2026-09-22). Token names match
+    // the existing `linux:browser_inventory:symlink_refused`/`not_regular`
+    // constants this file already emits elsewhere (see
+    // dir_open_constraint_token / read_file_bounded_at), and the
+    // symlink-vs-other split mirrors autoruns_linux.cpp's precedent.
+    if (S_ISREG(st.st_mode))
+        return RegularFilePresence{true, false, {}};
+    if (S_ISLNK(st.st_mode))
+        return RegularFilePresence{false, true, "linux:browser_inventory:symlink_refused"};
+    return RegularFilePresence{false, true, "linux:browser_inventory:not_regular"};
 }
 
 /// Outcome of a bounded per-file read: whether a REAL failure (as opposed
@@ -271,11 +285,17 @@ struct FileReadOutcome {
 /// failure, including benign absence (ENOENT) — `outcome.constrained`
 /// distinguishes the two for the caller. A non-regular leaf (e.g. a FIFO
 /// planted where a profile expects a plain file) is a real constraint, not
-/// an absence.
+/// an absence. O_NONBLOCK is LOAD-BEARING (adversarial-review finding,
+/// 2026-09-22, same class as certificates_linux_store.hpp's read_cert_entry
+/// banner): open(2) of a FIFO with no writer blocks forever, and the
+/// S_ISREG check below cannot run until open returns, so a blocking open
+/// lets a planted FIFO wedge this worker before the type filter gets a
+/// chance to reject it. Inert once S_ISREG is confirmed — reads of a
+/// regular file never block — so no fcntl clear is needed afterward.
 inline bool read_file_bounded_at(int dir_fd, const char* name, std::size_t cap, std::string& text,
                                  FileReadOutcome& outcome) {
     text.clear();
-    yuzu::agent::ScopedFd fd(::openat(dir_fd, name, O_RDONLY | O_NOFOLLOW));
+    yuzu::agent::ScopedFd fd(::openat(dir_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
     if (!fd.valid()) {
         const int err = errno;
         if (!is_benign_absent_errno(err)) outcome = {true, dir_open_constraint_token(err)};
@@ -291,8 +311,21 @@ inline bool read_file_bounded_at(int dir_fd, const char* name, std::size_t cap, 
         outcome = {true, "linux:browser_inventory:not_regular"};
         return false;
     }
-    const std::size_t want =
-        static_cast<std::size_t>(st.st_size) > cap ? cap : static_cast<std::size_t>(st.st_size);
+    // A genuinely oversized file is a size-POLICY refusal, not invalid
+    // content -- silently truncating it and letting the caller's JSON
+    // parse fail on the cut point reported the same
+    // `linux:browser_inventory:local_state_malformed` token as actually-
+    // invalid JSON, conflating two different causes (adversarial-review
+    // finding, 2026-09-22; precedent: execution_artifacts_win.cpp's
+    // `hive_oversized`). This function currently has exactly one caller
+    // (the "Local State" read below), hence the caller-specific token name
+    // — a second bounded-read consumer should parameterise this instead of
+    // reusing it verbatim.
+    if (static_cast<std::size_t>(st.st_size) > cap) {
+        outcome = {true, "linux:browser_inventory:local_state_too_large"};
+        return false;
+    }
+    const std::size_t want = static_cast<std::size_t>(st.st_size);
     text.resize(want);
     std::size_t total = 0;
     while (total < want) {
