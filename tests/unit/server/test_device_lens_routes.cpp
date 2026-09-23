@@ -8,8 +8,10 @@
 /// reads store data.
 
 #include "device_lens_routes.hpp"
+#include "dex_api_local.hpp"          // make_local_dex_api
 #include "dex_routes.hpp"             // dex_iso_since / dex_window_to_days / dex_device_score (oracle)
 #include "guaranteed_state_store.hpp"
+#include "guardian_api_local.hpp"     // make_local_guardian_api
 #include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 
@@ -117,9 +119,11 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[pg][device][routes]")
             throw std::runtime_error("audit DB write blew up");
         return audit_ok;
     };
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, scoped_perm, &store, audit);
+    routes.register_routes(sink, scoped_perm, dex_api.get(), guardian_api.get(), audit);
 
     SECTION("Read denied -> 403, nothing rendered, no audit") {
         allow_read = false;
@@ -197,9 +201,11 @@ TEST_CASE("device lenses: out-of-scope DEX lens is 403, no PII read (not audited
         audited.push_back(a + "|" + tid);
         return true;
     };
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, scoped_perm, &store, audit);
+    routes.register_routes(sink, scoped_perm, dex_api.get(), guardian_api.get(), audit);
 
     auto r = sink.Get("/fragments/device/dex?id=other-team");
     REQUIRE(r);
@@ -219,7 +225,7 @@ TEST_CASE("device lenses: bare=1 hides the lens tab bar", "[device][routes]") {
     SECTION("dex fragment: bare=1 omits the tab bar; without it, the bar renders") {
         yuzu::server::test::TestRouteSink sink;
         DeviceLensRoutes routes;
-        routes.register_routes(sink, okScoped, /*store=*/nullptr);
+        routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, /*guardian_api=*/nullptr);
         auto bare = sink.Get("/fragments/device/dex?id=a-1&bare=1");
         REQUIRE(bare);
         CHECK(bare->body.find("Device info") == std::string::npos);
@@ -230,7 +236,7 @@ TEST_CASE("device lenses: bare=1 hides the lens tab bar", "[device][routes]") {
     SECTION("guardian fragment: bare=1 omits the tab bar; without it, the bar renders") {
         yuzu::server::test::TestRouteSink sink;
         DeviceLensRoutes routes;
-        routes.register_routes(sink, okScoped, /*store=*/nullptr);
+        routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, /*guardian_api=*/nullptr);
         auto bare = sink.Get("/fragments/device/guardian?id=a-1&bare=1");
         REQUIRE(bare);
         CHECK(bare->body.find("Device info") == std::string::npos);
@@ -258,7 +264,7 @@ TEST_CASE("device lenses: store-unavailable placeholders are byte-exact (bare=1)
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, /*store=*/nullptr);
+    routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, /*guardian_api=*/nullptr);
 
     auto dex = sink.Get("/fragments/device/dex?id=a-1&bare=1");
     REQUIRE(dex);
@@ -287,11 +293,13 @@ TEST_CASE("device lenses: DEX lens renders the per-device score + known signal c
     const std::string since = yuzu::server::dex_iso_since(7);
     const int expected_score = yuzu::server::dex_device_score(&store, agent, since);
 
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, &store);
+    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
 
     auto r = sink.Get("/fragments/device/dex?id=" + agent + "&bare=1");
     REQUIRE(r);
@@ -316,11 +324,13 @@ TEST_CASE("device lenses: DEX lens — no signals in-window renders the honest-e
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
 
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, &store);
+    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
 
     auto r = sink.Get("/fragments/device/dex?id=dex-empty-1&bare=1");
     REQUIRE(r);
@@ -350,11 +360,13 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
     REQUIRE(store.insert_event(make_drift_event("evt-orphan", "r-orphan", agent, "drift.detected",
                                                 "2026-04-19T14:00:00Z")));
 
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, &store);
+    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
 
     auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
     REQUIRE(r);
@@ -387,11 +399,13 @@ TEST_CASE("device lenses: Guardian lens — zero statuses renders the honest-emp
     // proves the empty-guards message, not a degraded-store message.
     REQUIRE(store.create_rule(make_lens_rule("r-unreported", "Unreported Guard")));
 
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, &store);
+    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
 
     auto r = sink.Get("/fragments/device/guardian?id=guardian-empty-1&bare=1");
     REQUIRE(r);
