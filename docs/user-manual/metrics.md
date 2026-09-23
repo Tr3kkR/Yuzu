@@ -111,6 +111,24 @@ manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
 
+### Agent presence metrics (HA WS-5 slice 1)
+
+`OfflineEndpointStore` (schema `endpoint_state`) is the cross-replica agent
+presence source `AgentRegistry::all_ids()`/`evaluate_scope()` merge into
+scope-evaluation visibility (ADR-2002 §7a). See
+`docs/postgres-migration-ladder.md`'s `OfflineEndpointStore` row for the v3
+migration and `docs/observability-conventions.md` for the fail-soft posture
+this counter covers.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_agent_presence_store_failed_total` | counter | A presence-store operation that degraded instead of succeeding, labeled `op` (`upsert`\|`query_live_ids`\|`remove_if_session`) and `reason` (`store_unavailable`\|`db_error`). All three operations are fail-soft by design (a degraded `upsert` just means this heartbeat's identity/liveness refresh didn't land, self-healing on the next heartbeat; a degraded read leaves `evaluate_scope`/`all_ids()` local-only for the cache window; a degraded delete leaves a departed agent's row to expire via the ordinary TTL filter instead of an immediate delete) — this counter exists so fail-soft does not also mean fail-invisible. A legitimate session-mismatch result from `remove_if_session` (zero rows matched `RETURNING`) is NOT counted here, only a genuine store-unavailable/query-error path. |
+
+There is deliberately no success/rate counter and no dedicated alert rule yet
+— same posture as `yuzu_server_gateway_route_desync_total` below: a
+background rate worth paging on needs real fleet data once a multi-replica
+deployment exists to generate any.
+
 ### Gateway routing directory metrics (HA WS-4 4.1)
 
 `GatewayRouteStore` (schema `gateway_route_store`) is the fenced agent→cluster

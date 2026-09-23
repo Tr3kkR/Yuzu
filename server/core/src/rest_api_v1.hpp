@@ -21,6 +21,7 @@
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -513,7 +514,23 @@ public:
         // route guard is defense-in-depth, never expected to fire.
         // `app_perf_providers`/`dex_perf_fn` above stay wired too — this is an
         // ADDITIONAL seam, not a replacement, until every consumer migrates.
-        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read
+        // API seam — backs 8 of the 9 GET /api/v1/guaranteed-state/*
+        // resources (the SAME instance the MCP Guardian tools use;
+        // `schemas` stays outside the seam, store-free — see
+        // guardian_api.hpp). server.cpp constructs this UNCONDITIONALLY
+        // (never null) — each of the two backing store pointers is checked
+        // INDIVIDUALLY inside the impl (guardian_api.cpp), mirroring
+        // dex_perf_api's own multi-dependency posture: a null
+        // `guaranteed_state_store_` degrades every method, a null
+        // `baseline_store_` degrades ONLY device_compliance. The
+        // `!guardian_api` guard the 8 routes still carry is therefore
+        // defense-in-depth only, matching the pre-seam
+        // `!guaranteed_state_store` guard's practical behaviour.
+        // `guaranteed_state_store` above stays wired too, for the
+        // rule/baseline MUTATORS this seam does not cover.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -608,7 +625,10 @@ public:
         std::shared_ptr<const DexApi> dex_api = nullptr,
         // ADR-0031 WS-A4 (sixth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
