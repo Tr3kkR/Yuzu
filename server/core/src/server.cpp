@@ -16740,10 +16740,19 @@ private:
 
         // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
         // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
-        // banner). Same store/scope/audit wiring the lenses had inside DeviceRoutes.
+        // banner) and rewired onto the DexApi/GuardianApi seams (issue #4576 +
+        // the deferred guardian-lens rewire). `dex_api` is already gated on
+        // `guaranteed_state_store_` presence above (null -> null, matching the
+        // fragment's own pre-rewire `!store_` 503-placeholder posture
+        // byte-for-byte); `guardian_api` itself is constructed unconditionally
+        // (its OWN degrade posture is per-method, not per-instance), so the
+        // SAME `guaranteed_state_store_` presence gate is applied explicitly
+        // here to preserve that byte-identical posture for this lens too.
+        // Same scope/audit wiring the lenses had inside DeviceRoutes.
         device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
-        device_lens_routes_->register_routes(*web_server_, scoped_perm_fn,
-                                             guaranteed_state_store_.get(), audit_fn);
+        device_lens_routes_->register_routes(
+            *web_server_, scoped_perm_fn, dex_api.get(),
+            guaranteed_state_store_ ? guardian_api.get() : nullptr, audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
