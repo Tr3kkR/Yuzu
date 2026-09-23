@@ -5,11 +5,28 @@
 // Inner classes extracted: agent_registry, agent_service_impl, gateway_service_impl, event_bus
 // Pre-existing extractions: rest_api_v1, mcp_server
 
+// #4722: this TU's own pre-existing includes pull in <windows.h> transitively somewhere ahead
+// of grpc_tls_credentials.hpp's new grpcpp/security/*.h includes (grpc's own port_platform.h
+// self-guards, but that's no help if windows.h was already fully processed earlier in THIS TU --
+// once min/max are defined by an unguarded windows.h, they stay defined for the rest of the file
+// regardless of what any later header does). Must be first, before any other include: matches
+// key_provider.cpp's established guard, just applied at file scope instead of one include site.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 #include "bundled_content.hpp"
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
+#include "grpc_tls_credentials.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -7792,22 +7809,23 @@ public:
         start_web_server();
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
-        // startup_failed_ (SCIM boot failure) and return before launching
-        // the web listener, but by this point the agent/management gRPC
-        // listeners are already live (BuildAndStart above). Re-check here,
-        // before spinning up any more threads or reaching
-        // agent_server_->Wait() below, so a SCIM boot failure genuinely
-        // halts the process instead of serving on the gRPC ports with a
-        // broken web/SCIM surface. stop() is safe to call this early — every
-        // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by the
-        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
-        // it here and letting the destructor run again afterward is a deliberate
-        // no-op the second time (same thread, sequential — not a wait).
+        // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
+        // failure) and return before launching the web listener, but by this
+        // point the agent/management gRPC listeners are already live
+        // (BuildAndStart above). Re-check here, before spinning up any more
+        // threads or reaching agent_server_->Wait() below, so a startup
+        // failure genuinely halts the process instead of serving on the gRPC
+        // ports with a broken web/SCIM surface. stop() is safe to call this
+        // early — every thread/store it joins or resets is
+        // joinable()/nullptr-guarded, and it also runs from ~ServerImpl
+        // (guarded against double-entry by the lifecycle_mu_/teardown_complete_
+        // completion barrier — #3007), so calling it here and letting the
+        // destructor run again afterward is a deliberate no-op the second
+        // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure); stopping the already-started agent/management "
-                         "gRPC listeners.");
+                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
+                         "error); stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }
@@ -10252,60 +10270,11 @@ private:
                           const std::filesystem::path& key_path,
                           const std::filesystem::path& ca_path, bool insecure_skip_client_verify,
                           bool require_client_cert, std::string_view listener_name) const {
-        if (cert_path.empty() || key_path.empty()) {
-            spdlog::error("{} TLS requires certificate and key", listener_name);
-            return nullptr;
-        }
-
-        if (!detail::validate_key_file_permissions(key_path, listener_name)) {
-            return nullptr;
-        }
-
-        auto cert = detail::read_file_contents(cert_path);
-        auto key = detail::read_file_contents(key_path);
-        if (cert.empty() || key.empty()) {
-            spdlog::error("Failed to read {} TLS cert/key files", listener_name);
-            return nullptr;
-        }
-
-        grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
-        key_cert.private_key = std::move(key);
-        key_cert.cert_chain = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
-
-        if (!ca_path.empty()) {
-            auto ca = detail::read_file_contents(ca_path);
-            if (ca.empty()) {
-                spdlog::error("Failed to read {} CA cert from {}", listener_name, ca_path.string());
-                return nullptr;
-            }
-
-            ssl_opts.pem_root_certs = std::move(ca);
-            // Under built-in default certs the agent has no client cert yet
-            // (per-agent issuance is PR3): REQUEST + VERIFY if presented, but do
-            // NOT REQUIRE — otherwise no agent could connect. Operator-provided
-            // certs keep the strict REQUIRE posture.
-            ssl_opts.client_certificate_request =
-                require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
-                                    : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
-        } else {
-            if (!insecure_skip_client_verify) {
-                spdlog::error("{} TLS requires --ca-cert (or enable "
-                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
-                              listener_name);
-                return nullptr;
-            }
-            spdlog::warn("{} TLS running without client certificate verification "
-                         "(--insecure-skip-client-verify)",
-                         listener_name);
-        }
-
-        auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(kc.private_key);
-        }
-        return creds;
+        // #4722: moved to grpc_tls_credentials.cpp (yuzu::server::detail) so the
+        // real-handshake test suite can drive the production builder directly.
+        return detail::build_server_tls_credentials(cert_path, key_path, ca_path,
+                                                     insecure_skip_client_verify,
+                                                     require_client_cert, listener_name);
     }
 
     // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
@@ -10339,42 +10308,13 @@ private:
     // Residual (tracked on #1422): no CRL/OCSP check on this path yet, so a
     // revoked-but-stolen SERVER leaf still passes until rotation; and
     // through-gateway operator identity stays app-layer.
+    // #4722: body moved to grpc_tls_credentials.cpp (yuzu::server::detail);
+    // see that header for the full #1314/#1422 narrative.
     [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
     build_gateway_command_credentials() const {
-        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
-                          "client cert/key to present for mutual TLS — command forwarding "
-                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
-            return nullptr;
-        }
-        if (cfg_.tls_ca_cert.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
-                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
-            return nullptr;
-        }
-        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
-            return nullptr;
-        }
-        grpc::SslCredentialsOptions ssl_opts;
-        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
-        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
-        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
-        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
-            ssl_opts.pem_private_key.empty()) {
-            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
-                          "command forwarding DISABLED (fail-closed).");
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-            return nullptr;
-        }
-        auto creds = grpc::SslCredentials(ssl_opts);
-        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
-        // key is the sensitive one, the CA/cert are public, but zeroing all three
-        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
-        // metadata resident longer than needed.
-        yuzu::secure_zero(ssl_opts.pem_private_key);
-        yuzu::secure_zero(ssl_opts.pem_cert_chain);
-        yuzu::secure_zero(ssl_opts.pem_root_certs);
-        return creds;
+        return detail::build_mtls_client_credentials(cfg_.tls_ca_cert, cfg_.tls_server_cert,
+                                                      cfg_.tls_server_key,
+                                                      "Gateway command plane");
     }
 
     // -- PKI PR3: per-agent client-cert issuance + revocation ------------------
@@ -13260,6 +13200,25 @@ private:
             }
             web_server_ = std::make_unique<httplib::SSLServer>(
                 cfg_.https_cert_path.string().c_str(), cfg_.https_key_path.string().c_str());
+
+            // #4722: same TLS 1.2 cipher allow-list as the gRPC listeners.
+            // httplib's create_server_context() already floors at
+            // TLS1_2_VERSION (httplib.h:16411); this pins the suites.
+            // tls_context() is the current accessor (ssl_context() is
+            // [[deprecated]]). Fail closed: an unpinned HTTPS listener must
+            // not serve. (Note: the cert-missing `return`s above deliberately
+            // do NOT set startup_failed_ — this branch is fail-closed on
+            // purpose, do not "harmonise" it away.)
+            auto* ssl_server = static_cast<httplib::SSLServer*>(web_server_.get());
+            if (!yuzu::tls::apply_tls12_cipher_list(
+                    static_cast<SSL_CTX*>(ssl_server->tls_context()))) {
+                spdlog::error("HTTPS: failed to pin the TLS 1.2 cipher list on the dashboard "
+                              "listener — refusing to serve");
+                web_server_.reset();
+                startup_failed_ = true;
+                return;
+            }
+
             spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})", cfg_.https_port,
                          cfg_.https_cert_path.string(), cfg_.https_key_path.string());
         } else {

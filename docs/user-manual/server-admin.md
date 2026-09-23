@@ -270,6 +270,14 @@ reason=parent_gone` case: create a fresh result set from the intended parent ins
 re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
 at creation) still broadcasts on re-eval, unchanged.
 
+### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
+
+**What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.
+
+**Who this affects.** Any deployment that previously set `GRPC_SSL_CIPHER_SUITES` in the server's environment to select or restrict its own cipher suites — that variable is now silently ignored, and the server's fixed allow-list applies instead.
+
+**What to do.** There is no override flag and no config option to restore the previous behavior — this is a deliberate policy floor, not an oversight. If your environment relied on a non-default `GRPC_SSL_CIPHER_SUITES` value, remove it (it no longer does anything) and confirm your TLS clients support at least one suite in the pinned list (`tls.md`); operator-issued RSA certificates remain supported via the pinned ECDHE-RSA suites.
+
 ### vNEXT — new `Guardian T_*` diagnostic log lines at `info` level (#4606; NOT breaking)
 
 **What changed.** The server now writes one `info`-level line for every Guardian event it stores for an ordinary rule (ruleless DEX observations are excluded):
@@ -2457,6 +2465,8 @@ The Yuzu server has **two independent TLS surfaces**:
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
+
+Both surfaces pin the same TLS 1.2 cipher allow-list and version floor; see [TLS policy](tls.md) for the exact list, what's proven by CI, and what isn't pinned yet.
 
 ### HTTPS via CLI Flags
 
