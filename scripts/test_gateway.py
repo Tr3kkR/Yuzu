@@ -335,72 +335,11 @@ def run_with_retry(args, label, max_attempts=4):
 result = run_with_retry(cmd, suite, max_attempts=4)
 output = result.stdout or ""
 
-# ──────────────────────────────────────────────────────────────────────
-# Zero-executed guard (#4800)
-# ──────────────────────────────────────────────────────────────────────
-# rebar3 exits 0 when it discovers nothing to run, so a green exit code
-# alone proves nothing. A run is only a pass if its final summary line
-# reports at least one EXECUTED (passed + failed) test. Summary shapes:
-#   ct:    "All 52 tests passed."
-#          "Failed 6 tests. Skipped 2 (0, 2) tests. Passed 44 tests."
-#   eunit: "All 311 tests passed."
-#          "Failed: 2.  Skipped: 0.  Passed: 309."
-#          "There were no tests to run."
-# The LAST summary wins (rebar3 prints one per run; anything earlier is
-# test-emitted noise). No recognisable summary on an otherwise-green run
-# is ALSO a failure: we cannot confirm anything ran.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_SUMMARY_RE = re.compile(
-    # ct and eunit, all green
-    r"All (?P<all>\d+) tests? passed\."
-    # eunit, exactly one test
-    r"|(?P<one>\bTest passed\.)"
-    # ct: each clause is printed only when its count is non-zero, except
-    # "Passed", which is always printed
-    r"|(?:Failed (?P<cf>\d+) tests?\. )?(?:Skipped \d+ \(\d+, \d+\) tests?\. )?"
-    r"Passed (?P<cp>\d+) tests?\."
-    # eunit, any failure/skip
-    r"|Failed: (?P<ef>\d+)\.\s+Skipped: \d+\.\s+Passed: (?P<ep>\d+)\."
-    r"|(?P<none>There were no tests to run)"
-)
-
-
-def _executed_count(text):
-    """Executed (passed + failed) count from the last summary, or None."""
-    last = None
-    for m in _SUMMARY_RE.finditer(_ANSI_RE.sub("", text)):
-        last = m
-    if last is None:
-        return None
-    g = last.group
-    if g("all") is not None:
-        return int(g("all"))
-    if g("one") is not None:
-        return 1
-    if g("none") is not None:
-        return 0
-    if g("cp") is not None:
-        return int(g("cf") or 0) + int(g("cp"))
-    return int(g("ef")) + int(g("ep"))
-
-
-def _require_tests_executed(text, label, returncode):
-    """Turn a green exit with zero executed tests into a failure."""
-    if returncode != 0:
-        return returncode
-    executed = _executed_count(text)
-    if executed is None:
-        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but printed no "
-              "recognisable test summary -- cannot confirm any test ran. "
-              "Failing (#4800).", file=sys.stderr)
-        return 1
-    if executed == 0:
-        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but executed ZERO "
-              "tests -- the suite directory or --dir is wrong. Failing so this "
-              "cannot pass as a false green (#4800).", file=sys.stderr)
-        return 1
-    print(f"\n[test_gateway.py] {label}: {executed} tests executed.")
-    return 0
+# Zero-executed guard (#4800): a rebar3 exit 0 with ZERO executed tests, or
+# with no recognisable summary, is a failure. Logic and the summary shapes
+# it accepts live in scripts/gateway_test_summary.py (pinned by
+# tests/test_gateway_test_summary.py).
+from gateway_test_summary import require_tests_executed as _require_tests_executed  # noqa: E402
 
 # OTP 25 has a known race where the CT I/O handler (test_server_io)
 # terminates before all suite completion messages are written, causing
@@ -413,8 +352,9 @@ if result.returncode != 0 and suite == "ct":
     all_zero_fails = fail_counts and all(int(n) == 0 for n in fail_counts)
     if has_io_crash and all_zero_fails:
         print("\n[test_gateway.py] OTP 25 CT I/O race detected — "
-              "all tests passed but CT runner crashed on teardown. "
-              "Treating as success.")
+              "no failures reported but CT runner crashed on teardown. "
+              "Ignoring rebar3's exit code; the zero-executed guard still "
+              "requires a summary showing tests ran.")
         sys.exit(_require_tests_executed(output, suite, 0))
 
 sys.exit(_require_tests_executed(output, suite, result.returncode))

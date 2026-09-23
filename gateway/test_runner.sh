@@ -70,11 +70,13 @@ rebar3 compile
 
 FAILURES=0
 
-# Run EUnit tests
+# Run EUnit tests. In `do`, the comma that ends a task's args must be followed
+# by the next task as its OWN word (`--dir X, cover`); `--dir X,cover` is read
+# as a single --dir value and the cover task never runs.
 if $RUN_EUNIT; then
     log "Running EUnit tests..."
     if $RUN_COVER; then
-        rebar3 as test do eunit --dir apps/yuzu_gw/test,cover || FAILURES=$((FAILURES + 1))
+        rebar3 as test do eunit --dir apps/yuzu_gw/test, cover || FAILURES=$((FAILURES + 1))
     else
         rebar3 as test eunit --dir apps/yuzu_gw/test || FAILURES=$((FAILURES + 1))
     fi
@@ -87,7 +89,7 @@ fi
 if $RUN_CT; then
     log "Running Common Test suites..."
     if $RUN_COVER; then
-        rebar3 as test do ct --dir apps/yuzu_gw/test/ct,cover || FAILURES=$((FAILURES + 1))
+        rebar3 as test do ct --dir apps/yuzu_gw/test/ct, cover || FAILURES=$((FAILURES + 1))
     else
         rebar3 as test ct --dir apps/yuzu_gw/test/ct || FAILURES=$((FAILURES + 1))
     fi

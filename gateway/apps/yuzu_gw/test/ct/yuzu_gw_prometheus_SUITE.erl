@@ -31,8 +31,8 @@
 %% Bind an EPHEMERAL port (0) and read back what the OS assigned. A fixed
 %% port (this suite used 19568) is a cross-job shared resource on the
 %% self-hosted CI pools: 4 runner agents share ONE OS identity on ONE box,
-%% and the WSL2 and native-Windows runners share localhost, so two
-%% concurrent `gateway ct` runs would collide with eaddrinuse (#1871). This
+%% so two concurrent `gateway ct` runs would collide with eaddrinuse
+%% (#1871). This
 %% suite only started running in CI with #4800, which is what made the
 %% collision reachable.
 -define(PROM_PORT, 0).

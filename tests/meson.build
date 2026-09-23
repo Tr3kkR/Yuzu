@@ -2261,6 +2261,17 @@ test('proto gen_proto version check',
   timeout: 30,
 )
 
+# #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
+# points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
+# sitting below its meson timeout. Hermetic (parses sources, runs no
+# rebar3), so it runs on every leg, including ones without Erlang.
+test('gateway wrapper guard selftest',
+  _python3_test,
+  args: [files('test_gateway_test_summary.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
