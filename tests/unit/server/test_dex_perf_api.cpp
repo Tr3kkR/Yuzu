@@ -233,6 +233,41 @@ TEST_CASE("DexPerfApi device_app_perf_json() parity + null-store degrade", "[pg]
     CHECK_FALSE(degraded->device_app_perf_json("agent-1", "").has_value());
 }
 
+// GAP-2 (#4626): device_app_summaries() is the summary-shaped twin of
+// device_app_perf_json above, added for the /fragments/dex/device/app-perf
+// dashboard drill. Parity-tested against the SAME direct app_perf_device_summaries
+// pure transform device_app_perf_json's own parity test uses for
+// dex_device_app_perf_json — proving both seam methods agree with the pure
+// reductions over the identical raw B1 read, never with each other directly.
+TEST_CASE("DexPerfApi device_app_summaries() parity + null-store degrade", "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    REQUIRE(b1.is_open());
+
+    const std::int64_t day = today_utc() - 86400;
+    seed_b1(b1, "agent-1", "chrome.exe", "124.0.0.0", day, 9.0, 100000000);
+    seed_b1(b1, "agent-1", "explorer.exe", "10.0.19045", day, 1.5, 20000000);
+
+    auto api = make_local_dex_perf_api({}, nullptr, &b1, nullptr, nullptr, nullptr);
+
+    auto rows = b1.get_agent_app_perf("agent-1");
+    REQUIRE(rows.has_value());
+    const auto direct = yuzu::server::app_perf_device_summaries(*rows);
+    auto seam = api->device_app_summaries("agent-1");
+    REQUIRE(seam.has_value());
+    REQUIRE(seam->size() == direct.size());
+    REQUIRE(seam->size() == 2);
+    CHECK((*seam)[0].app_name == direct[0].app_name);
+    CHECK((*seam)[0].peak_cpu_avg == direct[0].peak_cpu_avg);
+    REQUIRE(!(*seam)[0].versions.empty());
+    CHECK((*seam)[0].versions[0].cpu_avg == direct[0].versions[0].cpu_avg);
+
+    auto degraded = make_local_dex_perf_api({}, nullptr, nullptr, nullptr, nullptr, nullptr);
+    CHECK_FALSE(degraded->device_app_summaries("agent-1").has_value());
+}
+
 TEST_CASE("DexPerfApi fleet_snapshot() empty-DexPerfFn degrade", "[dex_perf_api]") {
     // No PG needed: fleet_snapshot's only behaviour is the null-DexPerfFn
     // degrade contract (an empty fn -> default DexPerfSnapshot{}), matching

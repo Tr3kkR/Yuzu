@@ -2643,24 +2643,24 @@ void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn) {
+                                DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
                     std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(app_perf_providers), std::move(group_list_fn),
-                    std::move(fleet_read_fn));
+                    std::move(dex_perf_api), std::move(group_list_fn), std::move(fleet_read_fn),
+                    std::move(tag_values_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn) {
+                                DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2670,10 +2670,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     audit_fn_ = std::move(audit_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
-    perf_fn_ = std::move(perf_fn);
-    app_perf_providers_ = std::move(app_perf_providers);
+    perf_fn_ = std::move(perf_fn); // dead — see PerfFn's own doc comment (#4626)
+    dex_perf_api_ = std::move(dex_perf_api);
     fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
+    tag_values_fn_ = std::move(tag_values_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
     // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
@@ -2900,9 +2901,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                             "Agent", id, "DEX per-device signal history");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
+        // #4626: dex_perf_api_->fleet_snapshot() replaces perf_fn_(key) — a null
+        // dex_perf_api_ (unwired) omits the strips, exactly like the old
+        // !perf_fn_ check; a wired-but-empty dex_perf_fn inside collapses to an
+        // all-empty DexPerfSnapshot{} instead of omitting the section (an
+        // accepted delta, #4626 Concern A — the strips section already renders
+        // an honest "no comparison data" over an empty snapshot).
         std::optional<DexPerfSnapshot> snap;
-        if (perf_fn_)
-            snap = perf_fn_(kDexDefaultCohortKey);
+        if (dex_perf_api_)
+            snap = dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey);
         res.set_content(render_dex_device_fragment(store_, id, w, snap ? &*snap : nullptr),
                         "text/html; charset=utf-8");
     });
@@ -2974,7 +2981,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        // #4626: dex_perf_api_ replaces perf_fn_ — unwired is the same
+        // misconfiguration case the old !perf_fn_ check answered (server.cpp
+        // constructs dex_perf_api_ UNCONDITIONALLY in production; a null value
+        // here is a test-only/misconfigured-deployment case, never "no data").
+        if (!dex_perf_api_) {
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -2987,7 +2998,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             req.has_param("key") ? req.get_param_value("key") : kDexDefaultCohortKey;
         if (!valid_tag_key(key))
             key = kDexDefaultCohortKey;
-        res.set_content(render_dex_perf_fragment(perf_fn_(key), window_days),
+        res.set_content(render_dex_perf_fragment(dex_perf_api_->fleet_snapshot(key), window_days),
                         "text/html; charset=utf-8");
     });
 
@@ -2997,7 +3008,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        if (!dex_perf_api_) { // #4626: see /fragments/dex/perf's own comment above
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -3010,7 +3021,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // residual, and the pure model reports found=false for an unknown one.
         const std::string a = req.has_param("a") ? req.get_param_value("a") : "";
         const std::string b = req.has_param("b") ? req.get_param_value("b") : "";
-        res.set_content(render_dex_perf_cohort_diff_fragment(perf_fn_(key), a, b, window_days),
+        res.set_content(render_dex_perf_cohort_diff_fragment(dex_perf_api_->fleet_snapshot(key), a,
+                                                             b, window_days),
                         "text/html; charset=utf-8");
     });
 
@@ -3030,7 +3042,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        if (!perf_fn_) {
+        if (!dex_perf_api_) { // #4626: see /fragments/dex/perf's own comment above
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
                             "text/html; charset=utf-8");
@@ -3067,9 +3079,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         (void)detail::try_persist_audit(audit_fn_, req, "dex.perf.device.view", "success",
                                         "GuaranteedState", "",
                                         "fleet-wide DEX perf device list via dashboard fragment");
-        res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
-                                                         not_reporting, cohort_filter, limit,
-                                                         window_days, vis ? &*vis : nullptr),
+        res.set_content(render_dex_perf_devices_fragment(
+                            dex_perf_api_->fleet_snapshot(cohort_key), metric, not_reporting,
+                            cohort_filter, limit, window_days, vis ? &*vis : nullptr),
                         "text/html; charset=utf-8");
     });
 
@@ -3088,21 +3100,23 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  const int window_days = window_to_days(
                      req.has_param("window") ? req.get_param_value("window") : "7d");
-                 if (!app_perf_providers_.apps) {
-                     res.set_content(placeholder("Application performance unavailable",
-                                                 "This server has no app-perf store wired."),
-                                     "text/html; charset=utf-8");
-                     return;
-                 }
+                 // #4626: dex_perf_api_ replaces app_perf_providers_ — server.cpp
+                 // constructs it UNCONDITIONALLY, collapsing "no store wired" and
+                 // "the store degraded" to the SAME nullopt from apps() (Concern
+                 // A), so both cases now render ONE honest wording instead of the
+                 // old two-message split (a null dex_perf_api_ itself is the
+                 // test-only/misconfigured-deployment case, same as the fragments
+                 // above).
                  bool truncated = false;
-                 const auto apps = app_perf_providers_.apps(truncated);
-                 if (!apps) { // nullopt = a real read error → honest degrade, not empty
+                 const auto apps = dex_perf_api_ ? dex_perf_api_->apps(truncated) : std::nullopt;
+                 if (!apps) { // nullopt = unwired OR a real read error → honest degrade, not empty
                      // Render the note at 200, not 503: the dashboard htmx drops
                      // 4xx/5xx bodies (responseHandling swap:false), so a 503 would
                      // swap nothing. The store already counted the degrade
                      // (yuzu_app_perf_read_degrade_total) before returning nullopt.
                      res.set_content(placeholder("Application performance unavailable",
-                                                 "The app-perf store could not be read right now."),
+                                                 "App performance data unavailable (not "
+                                                 "configured or degraded) — retry shortly."),
                                      "text/html; charset=utf-8");
                      return;
                  }
@@ -3166,78 +3180,68 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::vector<DexGroupOption> groups =
             group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
 
-        // group set → the named-group on-the-fly B1 aggregate
-        // (app_perf_group_trend, sub-floor suppression at the SAME
-        // kDexCohortFloor the REST group endpoint uses); else model set → the
-        // SAME B1-aggregate shape via the device-model tag cohort (identical
-        // floor treatment — it is the same "named set of specific devices"
-        // case the floor exists for, see AppPerfTagCohortFn's own doc comment);
-        // else fleet B2 (app_perf_fleet_trend). group and model are mutually
+        // group set → the named-group on-the-fly B1 aggregate (DexPerfApi::
+        // group_trend, sub-floor suppression at the SAME kDexCohortFloor the
+        // REST group endpoint uses, applied INSIDE the seam); else model set →
+        // the SAME B1-aggregate shape via the device-model tag cohort
+        // (DexPerfApi::tag_trend, identical floor treatment — it is the same
+        // "named set of specific devices" case the floor exists for); else
+        // fleet B2 (DexPerfApi::app_fleet_trend). group and model are mutually
         // exclusive — group wins if a caller supplies both (matches
-        // render_dex_app_perf_trend's own precedence comment).
-        std::optional<std::vector<AppPerfFleetRow>> rows;
+        // render_dex_app_perf_trend's own precedence comment). #4626: each
+        // branch now calls DexPerfApi directly (already floor-applied
+        // AppPerfTrendPoint output) instead of app_perf_providers_'s raw-row
+        // provider + the app_perf_group_trend/app_perf_fleet_trend transform —
+        // the seam applies the SAME transform+floor internally, so this route
+        // and the REST/MCP twins can never disagree. A null dex_perf_api_ AND
+        // a read degrade now collapse to the SAME nullopt (Concern A) — ONE
+        // honest wording per scope, not the old two-message "not wired" vs
+        // "degraded" split.
+        std::optional<std::vector<AppPerfTrendPoint>> trend;
         std::vector<AppPerfVersionSummary> versions;
         if (!group.empty()) {
-            if (!app_perf_providers_.group) {
+            trend = dex_perf_api_ ? dex_perf_api_->group_trend(group, app, version) : std::nullopt;
+            if (!trend) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the seam
+                // already counted the degrade.  (REST twin stays fail-closed.)
                 res.set_content(placeholder("Group performance unavailable",
-                                            "This server has no group app-perf reader wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.group(group, app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
-                // reader already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Group performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+            versions = app_perf_version_summaries(*trend);
         } else if (!model.empty()) {
-            if (!app_perf_providers_.tag_cohort) {
+            trend = dex_perf_api_ ? dex_perf_api_->tag_trend(kDexDefaultCohortKey, model, app,
+                                                             version)
+                                  : std::nullopt;
+            if (!trend) {
                 res.set_content(placeholder("Model performance unavailable",
-                                            "This server has no device-model cohort reader wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.tag_cohort(kDexDefaultCohortKey, model, app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the tag
-                // cohort provider already counted the degrade (a failed
-                // TagStore read fails the whole lookup closed).
-                res.set_content(placeholder("Model performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+            versions = app_perf_version_summaries(*trend);
         } else {
-            if (!app_perf_providers_.fleet) {
+            trend = dex_perf_api_ ? dex_perf_api_->app_fleet_trend(app, version) : std::nullopt;
+            if (!trend) {
                 res.set_content(placeholder("Application performance unavailable",
-                                            "This server has no fleet app-perf store wired."),
+                                            "App performance data unavailable (not configured "
+                                            "or degraded) — retry shortly."),
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.fleet(app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
-                // already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Application performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
+            versions = app_perf_version_summaries(*trend);
         }
-        // Model-selector values — best-effort: an unwired/degraded tag_values
-        // provider just hides the selector (empty vector), same convention as
-        // an empty `groups` list above; it never blocks the page render.
+        // GAP-1 (#4626): model-selector values — a narrow, disclosed
+        // presentation-side data dependency OUTSIDE the DexPerfApi seam (see
+        // TagValuesFn's own doc comment). Best-effort: an unwired/degraded
+        // tag_values_fn_ just hides the selector (empty vector), same
+        // convention as an empty `groups` list above; it never blocks render.
         const std::vector<std::string> model_values =
-            app_perf_providers_.tag_values
-                ? app_perf_providers_.tag_values(kDexDefaultCohortKey).value_or(
-                      std::vector<std::string>{})
-                : std::vector<std::string>{};
+            tag_values_fn_ ? tag_values_fn_(kDexDefaultCohortKey).value_or(std::vector<std::string>{})
+                          : std::vector<std::string>{};
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version, model_values, model),
                         "text/html; charset=utf-8");
@@ -3315,21 +3319,21 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!gate.admitted)
             return; // the gate already wrote 401/403/503 (not a <tr> — the accepted
                     // denial shape for this gate everywhere else it's used)
-        if (!app_perf_providers_.version_devices) {
+        if (!dex_perf_api_) { // #4626: replaces app_perf_providers_.version_devices
             res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
                                 "(no app-perf device provider wired).</div>"),
                             "text/html; charset=utf-8");
             return;
         }
         // gate.scope: nullopt = unfiltered; engaged (incl. empty) = restrict to
-        // exactly these agent_ids. Converted to the provider's vector shape —
-        // still pushed into the STORE query by the provider, never post-filtered
+        // exactly these agent_ids. Converted to the seam's vector shape —
+        // still pushed into the STORE query by DexPerfApi, never post-filtered
         // here.
         std::optional<std::vector<std::string>> visible_ids;
         if (gate.scope)
             visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
         bool truncated = false;
-        auto rows = app_perf_providers_.version_devices(app, version, visible_ids, truncated);
+        auto rows = dex_perf_api_->app_version_devices(app, version, visible_ids, truncated);
         if (!rows) {
             // Store degrade — audit the attempted access (CC7.2), set-and-proceed
             // (this fragment is not the fail-closed surface; the REST twin is).
@@ -3641,9 +3645,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
 
     // B1 per-device app-perf-over-time drill — the retained-daily companion to the
-    // live procperf query above. Reads the CENTRAL Postgres B1 store
-    // (app_perf_providers_.device → AppPerfDailyStore::get_agent_app_perf): NO
-    // dispatch, NO Execute probe (it does not touch the device). Per-device
+    // live procperf query above. Reads the CENTRAL Postgres B1 store via
+    // DexPerfApi::device_app_summaries (→ AppPerfDailyStore::get_agent_app_perf,
+    // #4626): NO dispatch, NO Execute probe (it does not touch the device). Per-device
     // behavioural PII, so it is scoped-Read gated AND audited per access; the HTML
     // fragment posture is set-and-proceed (flag via Sec-Audit-Failed, still render)
     // — the REST twin GET /dex/devices/{id}/app-perf is the fail-closed 503 surface.
@@ -3666,27 +3670,30 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                      "text/html; charset=utf-8");
                      return;
                  }
-                 if (!app_perf_providers_.device) {
-                     res.set_content(
-                         "<div class=\"gp-note\">Application performance history is unavailable on "
-                         "this server (no app-perf store wired).</div>",
-                         "text/html; charset=utf-8");
-                     return;
-                 }
-                 // Audit the behavioural-PII access before serving (provider-null
-                 // checked first, so a no-store server does not log a read that
-                 // returns nothing — matches the REST twin's ordering). result=success
-                 // records that access was GRANTED + attempted (the established
-                 // pre-read convention, same as the REST twin); a subsequent store
-                 // degrade still carries this row — it over-audits, never under-audits.
+                 // #4626 Concern A: audit the behavioural-PII access BEFORE checking
+                 // dex_perf_api_ — server.cpp constructs it UNCONDITIONALLY in
+                 // production, so there is no longer a separate "provider never
+                 // wired" signal distinct from "the read degraded" to check first;
+                 // this handler now emits the audit even on the rare
+                 // null-dex_perf_api_ (test-only/misconfigured-deployment) path —
+                 // it OVER-audits, never UNDER-audits. result=success records that
+                 // access was GRANTED + attempted (the established pre-read
+                 // convention, same as the REST twin); a subsequent degrade still
+                 // carries this row.
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
                      "device app-perf-over-time drill (B1 retained)");
-                 const auto rows = app_perf_providers_.device(id);
-                 if (!rows) {
-                     // nullopt = a real read degrade. Render the honest note at status
-                     // 200, NOT 503: the dashboard htmx config drops 4xx/5xx bodies
-                     // (responseHandling swap:false), so a 503 here would render
+                 // GAP-2: DexPerfApi::device_app_summaries replaces
+                 // app_perf_providers_.device(id) + the local app_perf_device_summaries
+                 // call — the seam derives the summary from the SAME raw B1 read
+                 // device_app_perf_json (the REST/MCP drill) uses, never a second
+                 // independent reduction.
+                 const auto summaries =
+                     dex_perf_api_ ? dex_perf_api_->device_app_summaries(id) : std::nullopt;
+                 if (!summaries) {
+                     // nullopt = unwired OR a real read degrade. Render the honest note
+                     // at status 200, NOT 503: the dashboard htmx config drops 4xx/5xx
+                     // bodies (responseHandling swap:false), so a 503 here would render
                      // nothing — the exact "fake empty" we mean to avoid. The store
                      // already counted the degrade (yuzu_app_perf_read_degrade_total)
                      // before returning nullopt, so monitoring is unaffected. The REST
@@ -3697,7 +3704,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                          "text/html; charset=utf-8");
                      return;
                  }
-                 res.set_content(render_dex_device_app_perf(app_perf_device_summaries(*rows)),
+                 res.set_content(render_dex_device_app_perf(*summaries),
                                  "text/html; charset=utf-8");
              });
 }

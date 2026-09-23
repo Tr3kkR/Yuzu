@@ -2,20 +2,30 @@
 
 /// @file test_dex_perf_api_double.hpp
 /// FnDexPerfApi — a test-only `DexPerfApi` adapter wrapping the pre-seam
-/// `DexPerfFn` (heartbeat-now) + `AppPerfProviders` (app-perf-over-time)
-/// shapes every existing DEX-perf REST/MCP test harness already builds.
-/// Performs the SAME assembly `LocalDexPerfApi` does (dex_perf_api.cpp) —
-/// apply `app_perf_fleet_trend`/`app_perf_group_trend` + `kDexCohortFloor`,
-/// serialize the device drill via `dex_device_app_perf_json` — so a test
-/// fixture only needs to supply the SAME raw-row lambdas it did before this
-/// seam existed. Mirrors `FnVerifyApi` (test_verify_api_double.hpp), the
-/// established pattern for this exact "wire the real seam over a
-/// function-shaped test double" problem.
+/// `DexPerfFn` (heartbeat-now) + a bundle of per-method raw-provider
+/// `std::function`s (app-perf-over-time) every existing DEX-perf REST/MCP
+/// test harness already builds. Performs the SAME assembly `LocalDexPerfApi`
+/// does (dex_perf_api.cpp) — apply `app_perf_fleet_trend`/
+/// `app_perf_group_trend` + `kDexCohortFloor`, serialize the device drill via
+/// `dex_device_app_perf_json` — so a test fixture only needs to supply the
+/// SAME raw-row lambdas it did before this seam existed. Mirrors `FnVerifyApi`
+/// (test_verify_api_double.hpp), the established pattern for this exact
+/// "wire the real seam over a function-shaped test double" problem.
+///
+/// `Providers` is DELIBERATELY decoupled from the (now-retired) production
+/// `AppPerfProviders` aggregate — it is this test double's OWN type, defined
+/// here, so `AppPerfProviders` could be deleted from production (#4626 Concern
+/// C) without breaking every harness that builds one of these. It keeps the
+/// SAME field names/types `AppPerfProviders` had (including `.cohort`/
+/// `.tag_values`, which `DexPerfApi` itself never reads) purely so existing
+/// callers building a `Providers` and separately reusing `.cohort` for
+/// VerifyApi's own test wiring, or `.tag_values` for a caller's own picker,
+/// need NO field-level changes — only the type name at the declaration site.
 ///
 /// NOT for production use — the production factory is `make_local_dex_perf_api`
 /// (dex_perf_api_local.hpp), which wires real store pointers instead.
 
-#include "dex_app_perf_builders.hpp" // app_perf_fleet_trend/group_trend, dex_device_app_perf_json, AppPerfProviders
+#include "dex_app_perf_builders.hpp" // app_perf_fleet_trend/group_trend, dex_device_app_perf_json, the AppPerfXxxFn provider typedefs
 #include "dex_perf_api.hpp"
 #include "dex_perf_model.hpp" // DexPerfFn
 
@@ -28,7 +38,22 @@ namespace yuzu::server::test {
 
 class FnDexPerfApi final : public yuzu::server::DexPerfApi {
 public:
-    FnDexPerfApi(yuzu::server::DexPerfFn dex_perf_fn, yuzu::server::AppPerfProviders providers)
+    /// Per-method raw-provider bundle — SAME shape as the retired
+    /// `AppPerfProviders` (see the file banner above for why `.cohort`/
+    /// `.tag_values` are kept even though `DexPerfApi` itself never reads
+    /// them).
+    struct Providers {
+        yuzu::server::AppPerfFleetFn fleet;
+        yuzu::server::AppPerfAppListFn apps;
+        yuzu::server::AppPerfDeviceFn device;
+        yuzu::server::AppPerfGroupFn group;
+        yuzu::server::AppPerfCohortFn cohort; ///< VERIFY before/after compare; unused by DexPerfApi
+        yuzu::server::AppPerfVersionDevicesFn version_devices;
+        yuzu::server::AppPerfTagCohortFn tag_cohort;
+        yuzu::server::AppPerfTagValuesFn tag_values; ///< unused by DexPerfApi (see GAP-1/TagValuesFn)
+    };
+
+    FnDexPerfApi(yuzu::server::DexPerfFn dex_perf_fn, Providers providers)
         : dex_perf_fn_(std::move(dex_perf_fn)), providers_(std::move(providers)) {}
 
     [[nodiscard]] yuzu::server::DexPerfSnapshot
@@ -96,9 +121,23 @@ public:
                                                        audit_persisted);
     }
 
+    // GAP-2 (#4626): the summary-shaped twin of device_app_perf_json above —
+    // both derive from the SAME providers_.device(agent_id) raw-row read
+    // (mirrors LocalDexPerfApi's own shared-helper contract; neither is
+    // derived from the other).
+    [[nodiscard]] std::optional<std::vector<yuzu::server::AppPerfDeviceApp>>
+    device_app_summaries(const std::string& agent_id) const override {
+        if (!providers_.device)
+            return std::nullopt;
+        auto rows = providers_.device(agent_id);
+        if (!rows)
+            return std::nullopt;
+        return yuzu::server::app_perf_device_summaries(*rows);
+    }
+
 private:
     yuzu::server::DexPerfFn dex_perf_fn_;
-    yuzu::server::AppPerfProviders providers_;
+    Providers providers_;
 };
 
 } // namespace yuzu::server::test

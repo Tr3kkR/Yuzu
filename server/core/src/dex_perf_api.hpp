@@ -86,23 +86,27 @@
 /// `dex_perf_api_->method(...)` exclusively (zero remaining direct
 /// `app_perf_providers.<member>()`/`dex_perf_fn()` calls in either file —
 /// grep-verified). This mirrors DexApi's own first-commit shape (PR #4582,
-/// 241e835f5): the REST+MCP rewire lands together with the seam build; only
-/// the dashboard (`dex_perf_ui.cpp` / `dex_app_perf_ui.{hpp,cpp}`) is
-/// DEFERRED (tracked as a follow-up, mirroring DexApi's own dashboard
-/// deferral to #4576) — it still calls `dex_perf_fn`/`app_perf_providers`
-/// directly, unchanged.
-/// `AppPerfProviders` (the pre-seam provider bundle) is KEPT, UNCHANGED, and
-/// STILL WIRED in `server.cpp` — additively alongside this seam, not
-/// replaced by it — because the deferred dashboard fragments are its last
-/// live consumers; deleting it is out of scope until the dashboard also
-/// migrates. See `dex_app_perf_builders.hpp`'s banner for why its `.cohort`
-/// field specifically is not folded into this seam (a Fable review of the
-/// plan found it dead in production and would drag VerifyApi's types into
-/// this closure). `check-seam-closure.py` enforces this seam at the HEADER
-/// level only (this file + its pure dependencies + the impl TU), same
-/// honestly-weaker posture as `DexApi`'s own current state (5
-/// consumer-enforced families + this one header-only, until the dashboard
-/// migrates and `AppPerfProviders` can be retired).
+/// 241e835f5): the REST+MCP rewire lands together with the seam build.
+///
+/// #4626 completed the dashboard rewire (`dex_routes.cpp`'s F2a/F2b
+/// fragments, `dex_perf_ui.cpp`, `dex_app_perf_ui.{hpp,cpp}`) — mirroring how
+/// #4576 completed `DexApi`'s own dashboard deferral. `AppPerfProviders` (the
+/// pre-seam provider bundle) is RETIRED — this seam's `dex_perf_api` instance
+/// is now the SOLE consumer for every surface (REST, MCP, dashboard).
+/// GAP-1: the model-picker's device-tag distinct-values read has NO home in
+/// `DexPerfApi` (no public fleet-wide "distinct tag values" resource exists
+/// yet) — `DexRoutes` carries it as its own standalone, disclosed
+/// `TagValuesFn` outside this seam (see that type's own doc comment).
+/// See `dex_app_perf_builders.hpp`'s banner for why VerifyApi's `.cohort`
+/// input shape specifically is not folded into this seam (a Fable review of
+/// the plan found it dead in production and would drag VerifyApi's types
+/// into this closure). `check-seam-closure.py`'s `dex_perf` family now
+/// enforces the dashboard consumer TUs too (`dex_perf_ui.cpp`,
+/// `dex_app_perf_ui.{hpp,cpp}`), narrowing the gap to `network`'s
+/// five-consumer-enforced posture — `dex_routes.cpp`/`.hpp` itself stays
+/// OUTSIDE the enforced set (it also registers the still-store-coupled
+/// DEX-SIGNALS fragments, out of this seam's scope; see the script's own
+/// comment on that family entry).
 
 #include "app_perf_types.hpp"    // AppPerfAppSummary, AppPerfVersionDeviceRow — floor-free, cross verbatim
 #include "dex_app_perf_pure.hpp" // AppPerfTrendPoint et al. (F2b percentile-series output shapes)
@@ -200,6 +204,20 @@ public:
     [[nodiscard]] virtual std::optional<std::string>
     device_app_perf_json(const std::string& agent_id, const std::string& app_filter,
                          bool audit_persisted = true) const = 0;
+
+    /// The SUMMARY-shaped twin of `device_app_perf_json` above — a core-side
+    /// PROJECTION of the SAME public resource (`GET /api/v1/dex/devices/{id}/
+    /// app-perf`, INV-31-4-compliant: identical underlying B1 data, a pure
+    /// summariser over it), added for the `/fragments/dex/device/app-perf`
+    /// dashboard drill (#4626), which renders `AppPerfDeviceApp` rows directly
+    /// rather than consuming the already-serialized JSON body. The impl MUST
+    /// derive this from the SAME raw-row read `device_app_perf_json` uses —
+    /// neither method derives from the other (see `LocalDexPerfApi`'s shared
+    /// private helper) — so the two can never disagree on what a device's
+    /// retained B1 rows say. `nullopt` = read degrade (same authoritative
+    /// contract as every other over-time method above).
+    [[nodiscard]] virtual std::optional<std::vector<AppPerfDeviceApp>>
+    device_app_summaries(const std::string& agent_id) const = 0;
 };
 
 } // namespace yuzu::server

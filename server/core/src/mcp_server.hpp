@@ -681,8 +681,8 @@ public:
     /// (never null) — each backing store pointer is checked individually
     /// inside the impl, matching the old per-lambda null-checks; the tools'
     /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
-    /// fire. Additive alongside `app_perf_providers` (still wired, still used
-    /// by the dashboard fragments) until every consumer migrates.
+    /// fire. `AppPerfProviders` (the pre-seam bundle) is retired (#4626) — the
+    /// dashboard fragments now route through this same seam too.
     void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
@@ -806,7 +806,6 @@ public:
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             yuzu::MetricsRegistry* metrics = nullptr,
-                            AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
                             TagPushFn tag_push_fn = {},
                             // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
@@ -1012,7 +1011,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1104,7 +1102,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,

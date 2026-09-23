@@ -30,6 +30,7 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam (#4626)
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
 #include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
@@ -199,18 +200,11 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 
 // ── F2a PR2: device drill perf extensions ────────────────────────────────────
 
-/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
-/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
-struct DexProcPerfRow {
-    std::string name; ///< image name — agent bytes, HTML-escape at render
-    std::int64_t samples{0};
-    std::int64_t instances_max{0};
-    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
-    double cpu_max{0.0};
-    double ws_avg_bytes{0.0};
-    double ws_max_bytes{0.0};
-    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
-};
+// `DexProcPerfRow` — relocated to the pure `dex_perf_model.hpp` (#4626 Concern
+// B) so `dex_perf_ui.cpp` can include that header alone instead of this
+// httplib-coupled one. Re-exported here transitively (dex_perf_model.hpp is
+// already included above), so every existing caller of THIS header is
+// unaffected.
 
 /// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
 /// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
@@ -320,14 +314,46 @@ public:
     using ResponsesFn = DexResponsesFn;
 
     /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
-    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
-    /// empty → the Performance tab renders an honest "unavailable" placeholder.
+    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). NO LONGER
+    /// READ by the route handlers (#4626 — they call `DexPerfApi::fleet_snapshot`
+    /// instead, the SAME `dex_perf_fn` closure wired one level down inside
+    /// `dex_perf_api`); kept as a parameter/member purely for source stability
+    /// of existing `register_routes` call sites (mirrors the equally-dead
+    /// `DexPerfFn dex_perf_fn` parameter `RestApiV1`/`McpServer` kept for the
+    /// same reason).
     using PerfFn = DexPerfFn;
+
+    /// ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-
+    /// time API seam (`dex_perf_api.hpp`) — backs BOTH the F2a heartbeat-now
+    /// fragments (`fleet_snapshot`) and the F2b over-time fragments (`apps`/
+    /// `app_fleet_trend`/`app_version_devices`/`group_trend`/`tag_trend`/
+    /// `device_app_perf_json`/`device_app_summaries`), replacing `PerfFn`/
+    /// `AppPerfProviders` (#4626). `nullptr` (the default) degrades every
+    /// consuming fragment to an honest "unavailable" placeholder — matching
+    /// server.cpp's own posture of constructing `dex_perf_api` UNCONDITIONALLY
+    /// and letting each method collapse a null/degraded backing store to
+    /// `nullopt` individually (see `dex_perf_api.hpp`'s own doc comment).
+    using DexPerfApiPtr = std::shared_ptr<const DexPerfApi>;
 
     /// F2b: the management groups offered in the app-perf scope selector (id +
     /// name + member count), sourced from ManagementGroupStore::list_groups. May
     /// be empty → the scope selector is omitted (whole-fleet only).
     using GroupListFn = std::function<std::vector<DexGroupOption>()>;
+
+    /// GAP-1 (#4626): the app-perf trend page's device-MODEL scope selector
+    /// values (`GET /fragments/dex/perf/app`'s `model_values`) — resolves the
+    /// distinct values of the conventional cohort tag key (`kDexDefaultCohortKey`,
+    /// "model"), server.cpp wiring the SAME `TagStore::get_distinct_values`
+    /// lambda the pre-seam `AppPerfProviders::tag_values` field used. This is a
+    /// NARROW, DISCLOSED presentation-side data dependency OUTSIDE the
+    /// `DexPerfApi` seam: no public fleet-wide "distinct tag values" resource
+    /// exists yet (`DexPerfApi` only exposes device-scoped/floor-applied reads);
+    /// widening the seam to add one is a follow-up, not this change's scope.
+    /// `nullopt` = a read degrade (the picker best-effort hides itself, same
+    /// convention as an unwired `group_list_fn` above); empty (default) = the
+    /// selector is omitted.
+    using TagValuesFn =
+        std::function<std::optional<std::vector<std::string>>(const std::string& tag_key)>;
 
     /// The version-drill "which devices" fragment's SOLE authorization gate —
     /// the injected-callback twin of `AuthRoutes::require_fleet_read`
@@ -360,8 +386,9 @@ public:
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
+                         TagValuesFn tag_values_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -370,8 +397,9 @@ public:
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
+                         TagValuesFn tag_values_fn = {});
 
 private:
     /// Deny a service-scoped API token on a fleet-wide fragment that names more
@@ -401,10 +429,11 @@ private:
     AuditFn audit_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
-    PerfFn perf_fn_;
-    AppPerfProviders app_perf_providers_;
+    PerfFn perf_fn_; ///< dead — see PerfFn's own doc comment (#4626)
+    DexPerfApiPtr dex_perf_api_;
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
+    TagValuesFn tag_values_fn_;
 };
 
 } // namespace yuzu::server

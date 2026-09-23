@@ -250,7 +250,7 @@ struct RestGsHarness {
     // Slice-2 DEX app-perf read seams. Wired with present-but-empty doubles by
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
-    yuzu::server::AppPerfProviders app_perf_providers_;
+    yuzu::server::test::FnDexPerfApi::Providers app_perf_providers_;
     // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing GET
     // /api/v1/dex/perf/compare (replaces the retired AppPerfCohortFn-in-
     // AppPerfProviders ad-hoc cohort provider). Left null when wire_app_perf is
@@ -597,7 +597,7 @@ struct RestGsHarness {
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, app_perf_providers_,
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,

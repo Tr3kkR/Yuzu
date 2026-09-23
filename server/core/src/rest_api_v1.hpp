@@ -433,7 +433,6 @@ public:
         ResponseScopeFn response_scope_fn = {},
         // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
         // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
         // optional dep; nullptr leaves the assign/unassign routes answering
@@ -505,15 +504,14 @@ public:
         // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-
         // over-time API seam — backs the 9 GET /api/v1/dex/perf/* resources
         // (minus /compare, VerifyApi's) + GET /api/v1/dex/devices/{id}/app-perf
-        // (the SAME instance the MCP DEX perf tools use). REQUIRED: nullptr →
-        // those routes answer 503, equivalent to the old
-        // `!dex_perf_fn`/`!app_perf_providers.<member>` readiness guards.
-        // Unlike dex_api above, server.cpp constructs this UNCONDITIONALLY
-        // (never null) — each backing store pointer is checked individually
-        // inside the impl, matching the old per-lambda null-checks, so the
-        // route guard is defense-in-depth, never expected to fire.
-        // `app_perf_providers`/`dex_perf_fn` above stay wired too — this is an
-        // ADDITIONAL seam, not a replacement, until every consumer migrates.
+        // (the SAME instance the MCP DEX perf tools and the dashboard
+        // fragments use, #4626). REQUIRED: nullptr → those routes answer 503,
+        // equivalent to the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+        // readiness guards. Unlike dex_api above, server.cpp constructs this
+        // UNCONDITIONALLY (never null) — each backing store pointer is
+        // checked individually inside the impl, matching the old per-lambda
+        // null-checks, so the route guard is defense-in-depth, never expected
+        // to fire. `AppPerfProviders` (the pre-seam bundle) is retired.
         std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
         // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read
         // API seam — backs 8 of the 9 GET /api/v1/guaranteed-state/*
@@ -581,7 +579,6 @@ public:
         ResponseScopeFn response_scope_fn = {},
         // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
         // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // routes (/api/v1/engine-principals/{id}/roles), which capture this
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
