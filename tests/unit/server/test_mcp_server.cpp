@@ -760,7 +760,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "pg/pg_raii.hpp"               // PgResult
-#include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
+#include "dex_app_perf_model.hpp"      // the app-perf read types
 #include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
 #include "software_licensing_store.hpp"  // SLE discovery store (query_software_licenses, ADR-0024)
 #include "app_usage_store.hpp"           // app-usage projection (get_agent_app_usage, wave 7 PR7.2)

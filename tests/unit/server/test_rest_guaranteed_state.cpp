@@ -21,7 +21,7 @@
 
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
-#include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
+#include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"

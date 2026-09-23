@@ -246,6 +246,36 @@ TEST_CASE("device lenses: bare=1 hides the lens tab bar", "[device][routes]") {
     }
 }
 
+// A WIRED GuardianApi whose read degrades (device_guards -> nullopt) is a
+// production-reachable path distinct from the unwired (nullptr) placeholder
+// above: it must render the byte-exact "degraded" placeholder AFTER the
+// access audit, never an empty/partial guard list. make_local_guardian_api
+// with a null store is the same degrade double test_dex_routes.cpp uses.
+TEST_CASE("device lenses: Guardian lens on a degraded read renders the degraded placeholder",
+          "[device][routes]") {
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
+                            const std::string&, const std::string& tid, const std::string&) {
+        audited.push_back(a + "|" + tid);
+        return true;
+    };
+    auto degraded = make_local_guardian_api(/*store=*/nullptr, /*baseline_store=*/nullptr);
+    REQUIRE_FALSE(degraded->device_guards("a-1").has_value());
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, degraded, audit);
+
+    auto gd = sink.Get("/fragments/device/guardian?id=a-1&bare=1");
+    REQUIRE(gd);
+    CHECK(gd->status == 200);
+    CHECK(gd->body == "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>Guardian store "
+                      "degraded.</div>");
+    REQUIRE(audited.size() == 1);
+    CHECK(audited[0] == "guardian.device.view|a-1");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // CHARACTERIZATION — pins the exact rendered HTML BEFORE the WS-A4 seam
 // rewire (issue #4576 + the guardian-lens deferral) so the rewire in a

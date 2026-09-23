@@ -13,11 +13,13 @@
 /// an explicit residual row.
 ///
 /// #4626 Concern B: includes the PURE `dex_perf_model.hpp` directly rather
-/// than the httplib-coupled `dex_routes.hpp` (which transitively pulls store
-/// headers via `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` — see
-/// `dex_view_types.hpp`'s own doc comment, which flagged this exact chain).
-/// Store-freedom is enforced by `scripts/ci/check-seam-closure.py`'s
-/// `dex_perf` family.
+/// than the httplib-coupled `dex_routes.hpp` (which still transitively pulls
+/// store headers via its own `#include "dex_read_builders.hpp"`; the former
+/// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` chain was severed in
+/// #4626). This TU's include-closure store-freedom is enforced by
+/// `scripts/ci/check-seam-closure.py`'s `dex_perf` family — a header-closure
+/// check over include basenames; it does not scan this file's text for store
+/// type names.
 
 #include "dex_perf_model.hpp"
 

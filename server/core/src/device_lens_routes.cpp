@@ -82,9 +82,10 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
                                             "Agent", id,
                                             "device Guardian lens (per-guard compliance)");
         // device_guards() is a single per-agent-scoped SQL read (ADR-0038
-        // catastrophic-read set): a degraded read (std::nullopt) must render the
-        // same "store unavailable" placeholder as the `!guardian_api_` guard
-        // above, never a silent empty/partial guard list (which would misreport
+        // catastrophic-read set): a degraded read (std::nullopt) must render an
+        // honest "Guardian store degraded." placeholder (distinct from the
+        // unwired `!guardian_api_` "unavailable" one above), never a silent
+        // empty/partial guard list (which would misreport
         // a device as having no guards, or drop live drift verdicts, for the
         // operator viewing this lens).
         auto guards_result = guardian_api_->device_guards(id);
