@@ -282,16 +282,20 @@ Separately, on REST, the three async result-set producers (`POST /api/v1/result-
 the pending result-set row failing to persist *after* a real command had already dispatched to
 agents — to `400`. That was a client-error status for a server-side fault; it is now
 `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`, matching MCP's `rs_run_async`, which already used its
-`kInternalError` branch for the identical case and did not change. The same three REST routes
-also gained a new PRE-dispatch `503 RESULT_SET_STORE_UNAVAILABLE` when the per-owner quota cannot
-be verified before dispatch — nothing is sent in that case, and the request is safe to retry.
+`kInternalError` branch for the identical case (the JSON-RPC error type is unchanged). The same
+three REST routes also gained a new PRE-dispatch `503 RESULT_SET_STORE_UNAVAILABLE` when the
+per-owner quota cannot be verified before dispatch — nothing is sent in that case, and the request
+is safe to retry.
 
 **Who this affects.** Any REST caller that treats `GET /api/v1/result-sets` as never-erroring, or
 that pattern-matches the old `400` on the three async producers' post-dispatch failure path. A
 `503` should be retried (`Retry-After` header present); a `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`
 means a command already dispatched — do not re-send, poll `GET /api/v1/executions/{id}` for its
-outcome instead. MCP callers are unaffected — `rs_run_async`'s post-dispatch fault mapping is
-unchanged.
+outcome instead. MCP's error *type* (`kInternalError`) is unchanged, but the embedded fault-message
+token was also renamed to `RESULT_SET_STORE_FAULT_AFTER_DISPATCH` for the same reason as REST — any
+MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string on this specific
+post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
+document both tokens explicitly).
 
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
