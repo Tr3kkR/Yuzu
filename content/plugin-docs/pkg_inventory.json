@@ -105,7 +105,7 @@
     }
   ],
   "description": "Machine-scope package-manager inventory (managers and packages); per-user package stores are out of scope, deferred to the user-context bridge",
-  "how_it_works": "`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW`): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned. Every action writes a `status` row first, then data rows. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. On Linux, `managers` reads nothing and reports `status|managers|unsupported|linux:planned` (caveat 3), and `packages` is unsupported by design (`installed_apps` owns the Linux package roster). On Windows both actions read nothing and report `status|<action>|unsupported|windows:planned` (caveat 5). Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree and through the real emission seam.",
+  "how_it_works": "`managers` reports which package managers are present on the host and their manager-level configuration facts; `packages` lists the macOS Homebrew formulae and casks. Both are pure filesystem reads (`open`/`openat`/`readdir` with `O_NOFOLLOW` on every hop, so a symlinked prefix or marker is refused, never followed): no `brew`, `dpkg`, `rpm`, `pacman`, `apk` or `winget` is ever spawned. Every action writes a `status` row first, then data rows. On macOS, both actions probe both Homebrew prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel) and read directory names under `Library/Taps`, `Cellar` and `Caskroom`. Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge. On Linux, `managers` reads nothing and reports `status|managers|unsupported|linux:planned` (caveat 3), and `packages` is unsupported by design (`installed_apps` owns the Linux package roster). On Windows both actions read nothing and report `status|<action>|unsupported|windows:planned` (caveat 5). Every walk takes an injected root (production passes `/`) so the unit suite drives it over a committed fixture tree and through the real emission seam.",
   "inputs": [],
   "kind": {
     "collector": true,
@@ -146,7 +146,7 @@
           "values": null
         },
         {
-          "description": "Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap was hit), unsupported (Linux by design, Windows planned).",
+          "description": "Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap or walk budget was hit), unsupported (Linux by design, Windows planned).",
           "example": "openssl@3",
           "name": "id",
           "platforms": [
@@ -158,7 +158,7 @@
           "values": null
         },
         {
-          "description": "Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap), linux:owned_by_installed_apps or windows:planned.",
+          "description": "Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap or macos:homebrew_caskroom:walk_budget), linux:owned_by_installed_apps or windows:planned.",
           "example": "3.4.1",
           "name": "version",
           "platforms": [
@@ -233,7 +233,7 @@
           ]
         },
         {
-          "description": "Manager rows: the manager version, or \"-\" (versions are not read in this release, so always \"-\"). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied), linux:planned or windows:planned.",
+          "description": "Manager rows: the manager version, or \"-\" (versions are not read in this release, so always \"-\"). Status rows: the comma-joined failure tokens, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied or macos:homebrew_taps:walk_budget), linux:planned or windows:planned.",
           "example": "-",
           "name": "version",
           "platforms": [
@@ -322,7 +322,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`<os>:<source>:<detail>`",
       "status": "`CONSTRAINED`",
-      "when": "At least one location could not be read completely. `<os>` is `macos`; `<source>` names the location (`homebrew_taps`, `homebrew_cellar`, `homebrew_caskroom`); `<detail>` is `permission_denied`, `symlink_refused`, `not_a_directory`, `io_error`, `entry_cap` or `enumeration_error` (directory listing truncated or errored), or `row_cap` (Homebrew package-row cap reached). Several tokens are comma-joined."
+      "when": "At least one location could not be read completely. `<os>` is `macos`; `<source>` names the location (`homebrew_taps`, `homebrew_cellar`, `homebrew_caskroom`); `<detail>` is `permission_denied`, `symlink_refused`, `not_a_directory`, `io_error`, `entry_cap` or `enumeration_error` (directory listing truncated or errored), `row_cap` (Homebrew package-row cap reached) or `walk_budget` (the whole-action entry or wall-clock budget ran out; the locations not yet read are skipped and the rows already found are kept). A symlinked Homebrew prefix or marker directory is refused, never followed (`symlink_refused` or `not_a_directory`, by platform). Several tokens are comma-joined."
     },
     {
       "completeness": "`PARTIAL`",

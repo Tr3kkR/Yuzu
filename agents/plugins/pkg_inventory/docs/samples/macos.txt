@@ -2,7 +2,7 @@ captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-22 · euid 501 · le
 == action=managers
 status|managers|supported|-
 manager|homebrew|present|-|/opt/homebrew|taps=0;formulae=66;casks=0|-
-[result_status] OK / FULL / 
+[result_status] OK / FULL /
 
 == action=packages
 status|packages|supported|-
@@ -72,5 +72,4 @@ package|homebrew|wxwidgets@3.2|3.2.11|formula
 package|homebrew|xxhash|0.8.3|formula
 package|homebrew|xz|5.8.3|formula
 package|homebrew|zstd|1.5.7_1|formula
-[result_status] OK / FULL / 
-
+[result_status] OK / FULL /

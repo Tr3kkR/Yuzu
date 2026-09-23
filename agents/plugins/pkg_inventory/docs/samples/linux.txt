@@ -6,4 +6,3 @@ status|managers|unsupported|linux:planned
 == action=packages
 status|packages|unsupported|linux:owned_by_installed_apps
 [result_status] UNAVAILABLE / PARTIAL / linux:owned_by_installed_apps
-

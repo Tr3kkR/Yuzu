@@ -25,7 +25,10 @@
  * backslash or a pipe in an OS-supplied value can never shift a column).
  * `status` tokens follow the repo convention ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$
  * and are composed by make_token from compile-time literals; the grammar is
- * pinned by the test oracle in test_pkg_inventory_parsers.cpp.
+ * pinned by the test oracle in test_pkg_inventory_parsers.cpp. The one
+ * deliberate exception is the fixed exception-firewall token
+ * `pkg_inventory:exception` (pkg_inventory_plugin.cpp), which names no OS
+ * because it reports a thrown exception, like autoruns' `autoruns:exception`.
  *
  * "FAILURE NEVER READS AS ABSENT". A genuinely absent manager/prefix yields
  * `supported` + zero data rows. A failed or unreadable read yields

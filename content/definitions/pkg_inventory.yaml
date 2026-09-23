@@ -90,7 +90,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied), linux:planned or windows:planned.'
+        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied or macos:homebrew_taps:walk_budget), linux:planned or windows:planned.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: root_path
@@ -191,12 +191,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: id
         type: string
-        description: 'Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap was hit), unsupported (Linux by design, Windows planned).'
+        description: 'Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap or walk budget was hit), unsupported (Linux by design, Windows planned).'
         example: openssl@3
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap), linux:owned_by_installed_apps or windows:planned.'
+        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap or macos:homebrew_caskroom:walk_budget), linux:owned_by_installed_apps or windows:planned.'
         example: "3.4.1"
         platforms: [windows, linux, darwin]
       - name: kind
