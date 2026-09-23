@@ -4,7 +4,8 @@
  *
  * Holds the `Action` enum and its string conversions, the per-OS entry-point
  * declarations, and the ONE result-emission helper every leg calls (status row
- * first, then data rows, then the CC-07 typed status). Modelled on
+ * first, then data rows, then the CC-07 typed status), and the exception
+ * firewall (run_guarded) that wraps the whole of execute(). Modelled on
  * peripherals_legs.hpp.
  *
  * Also holds the guarded POSIX directory primitives (`posix::`, bottom of the
@@ -269,6 +270,12 @@ inline void note_listing(yuzu::shared::ConstraintAccumulator& acc, std::string_v
         acc.add_failure(make_token(os, source, "entry_cap"));
         acc.mark_incomplete();
     }
+}
+
+/// True when the listing read every real entry: not cut at the cap and no readdir
+/// error. An incomplete listing's count is only a lower bound, never a fact.
+[[nodiscard]] inline bool listing_complete(const DirListing& l) noexcept {
+    return !(l.walk.truncated || l.walk.enumeration_error);
 }
 
 } // namespace posix

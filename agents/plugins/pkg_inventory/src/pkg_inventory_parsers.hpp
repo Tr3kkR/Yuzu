@@ -9,7 +9,7 @@
  *
  * SCOPE. MACHINE-SCOPE package-manager state only: per-user package stores
  * (npm/pip/cargo/per-user Homebrew) are out of scope and deferred to the
- * user-context-bridge session helper. This release ships the macOS Homebrew
+ * user-session helper (ADR-3003). This release ships the macOS Homebrew
  * legs; the Linux `managers` leg (manager identity/presence and manager-level
  * config facts) follows as its own PR and reports the PLANNED token until then.
  * Linux never reports a package roster (installed_apps.get_inventory_linux owns
@@ -27,7 +27,8 @@
  * and are composed by make_token from compile-time literals; the grammar is
  * pinned by the test oracle in test_pkg_inventory_parsers.cpp. The one
  * deliberate exception is the fixed exception-firewall token
- * `pkg_inventory:exception` (pkg_inventory_plugin.cpp), which names no OS
+ * `pkg_inventory:exception` (kTokenException, emitted by run_guarded's firewall in
+ * pkg_inventory_legs.hpp), which names no OS
  * because it reports a thrown exception, like autoruns' `autoruns:exception`.
  *
  * "FAILURE NEVER READS AS ABSENT". A genuinely absent manager/prefix yields

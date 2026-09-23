@@ -90,7 +90,7 @@ public:
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Machine-scope package-manager inventory (managers and packages); per-user "
-               "package stores are out of scope, deferred to the user-context bridge";
+               "package stores are out of scope, deferred to the user-session helper";
     }
 
     const char* const* actions() const noexcept override {

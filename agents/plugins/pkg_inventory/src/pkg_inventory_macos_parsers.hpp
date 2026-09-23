@@ -162,10 +162,14 @@ struct WalkBudget {
     }
     [[nodiscard]] bool exhausted() const noexcept { return remaining_entries == 0 || timed_out(); }
     void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
-    /// Charges one emitted row; false (and nothing charged) when it would exceed
-    /// the output-byte allowance.
+    /// Charges one emitted row; false when it would exceed the output-byte
+    /// allowance, which is then spent for good (like row_cap, once the cap trips no
+    /// later, shorter row slips in).
     [[nodiscard]] bool charge_row(std::size_t n) noexcept {
-        if (n > remaining_bytes) return false;
+        if (n > remaining_bytes) {
+            remaining_bytes = 0;
+            return false;
+        }
         remaining_bytes -= n;
         return true;
     }
@@ -243,7 +247,7 @@ struct SubdirCount {
     SubdirCount out;
     const auto listing = posix::list_names(dir, lim.max_entries_per_dir);
     posix::note_listing(acc, kOs, source, listing);
-    if (listing.walk.truncated || listing.walk.enumeration_error) out.ok = false;
+    if (!posix::listing_complete(listing)) out.ok = false;
     budget.charge(listing.names.size());
     for (const auto& name : listing.names) {
         if (budget.timed_out()) {
@@ -316,7 +320,7 @@ count_taps(const std::filesystem::path& root, const Prefix& prefix, MarkerState&
     posix::note_listing(acc, kOs, source, orgs);
     budget.charge(orgs.names.size());
     std::size_t taps = 0;
-    bool ok = !(orgs.walk.truncated || orgs.walk.enumeration_error);
+    bool ok = posix::listing_complete(orgs);
     for (const auto& org : orgs.names) {
         if (!version_dir_name_ok(org)) continue;
         const auto cls = posix::classify_entry(opened.r.dir, org.c_str());
@@ -414,7 +418,7 @@ append_package_rows(const std::filesystem::path& root, const Prefix& prefix, std
                 return false;
             }
             auto row = format_package_row(id, version, kind);
-            if (!budget.charge_row(row.size() + 1)) {
+            if (!budget.charge_row(row.size() + 1)) { // + the row separator
                 acc.add_failure(make_token(kOs, source, "byte_cap"));
                 acc.mark_incomplete();
                 return false;
@@ -570,7 +574,7 @@ private:
     explicit WalkSlot(std::atomic<bool>* flag) noexcept : flag_(flag) {}
     [[nodiscard]] static std::atomic<bool>& flag_for(Action a) noexcept {
         static std::atomic<bool> flags[2]{};
-        return flags[a == Action::managers ? 0 : 1];
+        return flags[static_cast<std::size_t>(a)];
     }
     std::atomic<bool>* flag_;
 };

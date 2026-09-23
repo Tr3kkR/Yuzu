@@ -32,6 +32,9 @@
  *  - dropping the constraint at the emit seam (run_macos_at -> emit_result)
  *                                                          -> the forced-constraint seam case
  *  - dropping the single-flight slot from run_macos_guarded -> the busy-slot cases
+ *  - pointing the plugin's run_macos at run_macos_at         -> the entry-point busy case (Apple only)
+ *  - dropping the per-entry wall-clock check in count_subdirs -> the managers zero-clock case
+ *  - leaking a Dir/fd on an early return                     -> the fd-balance case
  *  - opening a marker as one joined path instead of open_under_prefix's per-hop
  *    O_NOFOLLOW                                            -> the symlinked Library and prefix cases
  *  - dropping the caller-side `walk_budget` record, or the count_taps budget check
@@ -326,27 +329,38 @@ std::vector<std::string> captured_rows(const std::string& captured) {
 // not just the walk's return values.
 const fs::path* g_leg_root = nullptr;
 yuzu::pkg_inventory::Action g_leg_action = yuzu::pkg_inventory::Action::managers;
-bool g_leg_guarded = false; ///< run the production shape (behind the single-flight slot)
+/// Which seam the harness drives: the bare walk, the walk behind the single-flight
+/// slot, or (Apple only) the plugin's own `run_macos` entry point that execute() calls.
+enum class Via { at, guarded, entry };
+Via g_leg_via = Via::at;
 
 int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
                 std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
-    return g_leg_guarded
-               ? yuzu::pkg_inventory::mac::run_macos_guarded(ctx, g_leg_action, *g_leg_root)
-               : yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
+    switch (g_leg_via) {
+    case Via::guarded:
+        return yuzu::pkg_inventory::mac::run_macos_guarded(ctx, g_leg_action, *g_leg_root);
+#if defined(__APPLE__)
+    case Via::entry: return yuzu::pkg_inventory::run_macos(ctx, g_leg_action);
+#else
+    case Via::entry: break;
+#endif
+    case Via::at: break;
+    }
+    return yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
 }
 
 yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inventory::Action a,
-                                             bool guarded = false) {
+                                             Via via = Via::at) {
     g_leg_root = &root;
     g_leg_action = a;
-    g_leg_guarded = guarded;
+    g_leg_via = via;
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &leg_execute;
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(&descriptor, "probe");
     g_leg_root = nullptr;
-    g_leg_guarded = false;
+    g_leg_via = Via::at;
     return result;
 }
 
@@ -766,7 +780,7 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
         REQUIRE(held.has_value());
         CHECK_FALSE(mac::WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
 
-        const auto busy = run_leg(dir.path, Action::managers, /*guarded=*/true);
+        const auto busy = run_leg(dir.path, Action::managers, Via::guarded);
         CHECK(busy.rc == 0); // a busy answer is a degraded read, not a failed command
         const auto rows = captured_rows(busy.captured);
         REQUIRE(rows.size() == 1); // the status row only: nothing was walked
@@ -776,7 +790,7 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
         CHECK(busy.result_provenance == "macos:managers:busy");
 
         // The slots are per action: `packages` is not blocked by a held `managers`.
-        const auto other = run_leg(dir.path, Action::packages, /*guarded=*/true);
+        const auto other = run_leg(dir.path, Action::packages, Via::guarded);
         const auto orows = captured_rows(other.captured);
         REQUIRE(orows.size() == 11);
         CHECK(orows[0] == "status|packages|supported|-");
@@ -785,7 +799,7 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
 
     // Released with the guard: the same action walks again, and releases its own slot.
     for (int i = 0; i < 2; ++i) {
-        const auto again = run_leg(dir.path, Action::managers, /*guarded=*/true);
+        const auto again = run_leg(dir.path, Action::managers, Via::guarded);
         const auto rows = captured_rows(again.captured);
         REQUIRE(rows.size() == 2);
         CHECK(rows[0] == "status|managers|supported|-");
@@ -794,6 +808,24 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
     CHECK(mac::WalkSlot::try_acquire(Action::managers).has_value());
     CHECK(mac::WalkSlot::try_acquire(Action::packages).has_value());
 }
+
+#if defined(__APPLE__)
+TEST_CASE("pkg_inventory macos seam: the plugin's own run_macos entry point walks behind the slot",
+          "[pkg_inventory][macos][seam][busy]") {
+    using namespace yuzu::pkg_inventory;
+    // run_macos is what execute() calls in production (pkg_inventory_macos.cpp). Holding
+    // the slot proves THAT call site is the guarded one, without walking this host's
+    // real "/" tree. MUTATION: calling run_macos_at from run_macos walks instead.
+    const auto held = mac::WalkSlot::try_acquire(Action::packages);
+    REQUIRE(held.has_value());
+    const auto busy = run_leg(fs::path{"/"}, Action::packages, Via::entry);
+    CHECK(busy.rc == 0);
+    const auto rows = captured_rows(busy.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|packages|constrained|macos:packages:busy");
+    CHECK(busy.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+}
+#endif // defined(__APPLE__)
 
 TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exactly as they found them",
           "[pkg_inventory][macos][walk]") {

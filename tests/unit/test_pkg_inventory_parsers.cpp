@@ -580,6 +580,17 @@ TEST_CASE("pkg_inventory walk: note_listing names a truncated and an errored lis
     CHECK(acc.reason() ==
           "macos:homebrew_cellar:enumeration_error,macos:homebrew_cellar:entry_cap");
     CHECK(acc.incomplete());
+
+    // The count-is-a-fact predicate both walks use: EITHER flag alone makes it a
+    // lower bound. MUTATION: dropping either half of listing_complete survives every
+    // walk case (no real readdir I/O error can be provoked) but fails here.
+    pi::posix::DirListing cut;
+    cut.walk.truncated = true;
+    pi::posix::DirListing errored;
+    errored.walk.enumeration_error = true;
+    CHECK(pi::posix::listing_complete(clean));
+    CHECK_FALSE(pi::posix::listing_complete(cut));
+    CHECK_FALSE(pi::posix::listing_complete(errored));
 }
 
 // ── presence evidence ────────────────────────────────────────────────────
@@ -634,6 +645,9 @@ public:
             if (::fcntl(fd, F_GETFD) != -1) highest = fd;
         rlimit tight = saved_;
         tight.rlim_cur = static_cast<rlim_t>(highest + 2 + keep_free);
+        // Reserve before lowering the limit: a throwing push_back below would skip
+        // the destructor and leave the limit lowered and the fds open.
+        burned_.reserve(static_cast<std::size_t>(tight.rlim_cur));
         if (tight.rlim_cur > saved_.rlim_max || ::setrlimit(RLIMIT_NOFILE, &tight) != 0) {
             ok_ = false;
             return;
@@ -683,33 +697,68 @@ TEST_CASE("pkg_inventory walk: fd exhaustion is a constraint, never a fabricated
         CHECK(managers[0] == "manager|homebrew|present|-|/usr/local|taps=1;formulae=0;casks=0|-");
     }
 
-    std::vector<std::string> managers;
-    std::optional<std::string> token;
-    bool squeezed = false;
-    {
-        FdSqueeze squeeze{1};
-        squeezed = squeeze.ok();
-        if (squeezed) managers = pi::mac::macos_manager_rows_at(dir.path, token);
-    } // limits restored and fds closed BEFORE any assertion can need one
-    if (!squeezed) SKIP("could not constrain RLIMIT_NOFILE on this host");
+    // Zero free fds fails the prefix ROOT hop itself, which for /opt/homebrew would
+    // otherwise read as "the prefix exists, so Homebrew does".
+    for (const int free_fds : {0, 1}) {
+        INFO("free fds: " << free_fds);
+        std::vector<std::string> managers;
+        std::optional<std::string> token;
+        bool squeezed = false;
+        {
+            FdSqueeze squeeze{free_fds};
+            squeezed = squeeze.ok();
+            if (squeezed) managers = pi::mac::macos_manager_rows_at(dir.path, token);
+        } // limits restored and fds closed BEFORE any assertion can need one
+        if (!squeezed) SKIP("could not constrain RLIMIT_NOFILE on this host");
 
-    CHECK(managers.empty());
-    REQUIRE(token.has_value());
-    // The kernel answers EMFILE before it resolves the path, so every hop that needs
-    // a descriptor reports it (Taps for sure; Cellar and Caskroom too): the point is
-    // that all of them are named `io_error` and none of them became a manager row.
-    CHECK(token->find("macos:homebrew_taps:io_error") == 0);
-    std::size_t tokens = 0;
-    for (std::size_t pos = 0; pos < token->size();) {
-        const auto comma = token->find(',', pos);
-        const auto end = comma == std::string::npos ? token->size() : comma;
-        const std::string one = token->substr(pos, end - pos);
-        CHECK(one.size() > 9);
-        CHECK(one.compare(one.size() - 9, 9, ":io_error") == 0);
-        ++tokens;
-        pos = end + 1;
+        CHECK(managers.empty());
+        REQUIRE(token.has_value());
+        // The kernel answers EMFILE before it resolves the path, so every hop that
+        // needs a descriptor reports it: all of them are named `io_error` and none of
+        // them became a manager row.
+        CHECK(token->find("macos:homebrew_taps:io_error") == 0);
+        for (std::size_t pos = 0; pos < token->size();) {
+            const auto comma = token->find(',', pos);
+            const auto end = comma == std::string::npos ? token->size() : comma;
+            const std::string one = token->substr(pos, end - pos);
+            REQUIRE(one.size() > 9);
+            CHECK(one.compare(one.size() - 9, 9, ":io_error") == 0);
+            pos = end + 1;
+        }
     }
-    CHECK(tokens >= 1);
+}
+
+TEST_CASE("pkg_inventory walk: a refused marker under /usr/local proves Homebrew, and a broken "
+          "repository directory is refused, not skipped past",
+          "[pkg_inventory][walk][macos]") {
+    // Below the prefix root a refused marker IS evidence (only the /usr/local ROOT
+    // proves nothing), and the Intel repository probe must not fall through to the
+    // prefix-level Library/Taps when Homebrew/ exists but cannot be entered.
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_usrlocal_cellar_link_"};
+        make_dir(dir.path, "elsewhere");
+        make_dir(dir.path, "usr/local");
+        std::error_code ec;
+        std::filesystem::create_directory_symlink(dir.path / "elsewhere", dir.path / "usr/local/Cellar", ec);
+        REQUIRE_FALSE(ec);
+        std::optional<std::string> token;
+        const auto managers = pi::mac::macos_manager_rows_at(dir.path, token);
+        REQUIRE(managers.size() == 1);
+        CHECK(managers[0] == "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_cellar:not_a_directory");
+    }
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_repo_link_"};
+        make_dir(dir.path, "elsewhere");
+        make_dir(dir.path, "usr/local/Library/Taps/org/repo");
+        std::error_code ec;
+        std::filesystem::create_directory_symlink(dir.path / "elsewhere", dir.path / "usr/local/Homebrew", ec);
+        REQUIRE_FALSE(ec);
+        std::optional<std::string> token;
+        const auto managers = pi::mac::macos_manager_rows_at(dir.path, token);
+        REQUIRE(managers.size() == 1);
+        // taps is NOT read from the flat Library/Taps behind the refused repository.
+        CHECK(managers[0] == "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_taps:not_a_directory");
+    }
 }
 
 // ── hostile entries INSIDE the tree ──────────────────────────────────────
@@ -817,6 +866,15 @@ TEST_CASE("pkg_inventory walk: the output byte cap stops the rows and says so, c
     const auto full = pi::mac::macos_package_rows_at(dir.path, token, lim);
     CHECK_FALSE(token.has_value());
     CHECK(full.size() == 3);
+
+    // Once the cap trips it stays tripped (like row_cap): a SHORTER row in a later
+    // container must not slip in. 30 spare bytes fit the 26-byte cask row.
+    make_dir(dir.path, "opt/homebrew/Caskroom/z/1");
+    lim.max_output_bytes = 2 * row_bytes + 30;
+    const auto sticky = pi::mac::macos_package_rows_at(dir.path, token, lim);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_cellar:byte_cap,macos:homebrew_caskroom:byte_cap");
+    CHECK(sticky.size() == 2); // pkg-a, pkg-b; neither pkg-c nor the cask
 }
 
 #endif // !defined(_WIN32)

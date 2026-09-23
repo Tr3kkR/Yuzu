@@ -4,9 +4,9 @@
 ## Plugin: pkg_inventory | Actions: managers, packages
 ##
 ## Sources by platform:
-##   Linux:   managers -- PLANNED this release: the status row reports
+##   Linux:   managers -- PLANNED (not implemented in this release): the status row reports
 ##            `status|managers|unsupported|linux:planned` and there are no
-##            manager rows. The leg follows as its own PR and will report
+##            manager rows. The leg follows in a later release and will report
 ##            package-manager identity and manager-level config facts only (tool
 ##            presence for dpkg/apt/rpm/dnf/pacman/apk, the dpkg architecture
 ##            list, apt/dnf source-file counts, pacman.conf and mirrorlist line
@@ -18,11 +18,11 @@
 ##   macOS:   managers/packages -- Homebrew Library/Taps, Cellar and Caskroom
 ##            directory names under BOTH /opt/homebrew (Apple silicon) and
 ##            /usr/local (Intel).
-##   Windows: PLANNED this release -- both actions report
+##   Windows: PLANNED (not implemented in this release) -- both actions report
 ##            `status|<action>|unsupported|windows:planned`. The Chocolatey and
 ##            winget legs follow as their own PR.
 ##
-## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-context bridge.
+## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-session helper (ADR-3003).
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
 ## bundles that installed_apps' macOS `list` also reports via system_profiler, and
 ## installed_apps' `list_per_user` lists Homebrew formulae per user (user_app|brew|...);
@@ -84,13 +84,13 @@ spec:
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason). Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).'
+        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason); a prefix root that cannot be opened counts as Homebrew only for /opt/homebrew, since /usr/local exists on every Mac and there the status tokens appear with no manager row. Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).'
         values: [present, unavailable, supported, constrained, unsupported]
         example: present
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget or macos:managers:busy), linux:planned or windows:planned.'
+        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget or macos:managers:busy), linux:planned, windows:planned or pkg_inventory:exception (a leg threw).'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: root_path
@@ -196,7 +196,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps or windows:planned.'
+        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps, windows:planned or pkg_inventory:exception (a leg threw).'
         example: "3.4.1"
         platforms: [windows, linux, darwin]
       - name: kind
