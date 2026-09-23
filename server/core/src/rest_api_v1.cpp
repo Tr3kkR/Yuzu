@@ -9690,14 +9690,20 @@ void RestApiV1::register_routes(
         // tools' shape cannot drift (api-twin-recipe.md Rule 1).
         auto rs_to_json = [](const ResultSet& r) { return result_set_json(r).dump(); };
 
-        // Emit an A4 error with a fresh correlation id.
-        auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
+        // Emit an A4 error with a fresh correlation id. `opts` defaults to {}
+        // (no retry hint) - a call site that fails BEFORE anything was
+        // dispatched passes {.retry_after_ms = 5000} to match the MCP
+        // twins' kMcpStoreFaultRetryMs (#4306/#4307 adversarial review: REST's
+        // fail-closed 503 branches were dropping the retry hint MCP carries
+        // for the identical fault).
+        auto rs_err = [](httplib::Response& res, int status, std::string_view msg,
+                          const detail::A4ErrorOpts& opts = {}) {
             res.status = status;
             // Route through a4_error so the X-Correlation-Id RESPONSE HEADER is set
             // (via ensure_correlation_id) — error_json_a4 alone builds only the body,
             // leaving the header absent on all 26 result-set error paths (S1,
             // adversarial review). a4_error derives the body `code` from res.status.
-            res.set_content(detail::a4_error(res, msg), "application/json");
+            res.set_content(detail::a4_error(res, msg, opts), "application/json");
         };
 
         // Load a row and enforce the owner check. Returns nullopt and writes a
@@ -9927,7 +9933,8 @@ void RestApiV1::register_routes(
                     res.set_header("Sec-Audit-Failed", "true");
                 rs_err(res, 503,
                        "RESULT_SET_STORE_UNAVAILABLE: could not verify the per-owner "
-                       "result-set quota; nothing was dispatched execution_id=" + exec_id);
+                       "result-set quota; nothing was dispatched execution_id=" + exec_id,
+                       {.retry_after_ms = 5000});
                 return;
             }
             if (*quota >= ResultSetStore::kMaxPerOwner) {
@@ -10090,7 +10097,8 @@ void RestApiV1::register_routes(
             auto page = result_set_store->list_by_owner_checked(session->username, cursor, limit);
             if (!page) {
                 rs_err(res, 503,
-                       "RESULT_SET_STORE_UNAVAILABLE: could not list result sets");
+                       "RESULT_SET_STORE_UNAVAILABLE: could not list result sets",
+                       {.retry_after_ms = 5000});
                 return;
             }
             JArr arr;
@@ -10439,7 +10447,8 @@ void RestApiV1::register_routes(
                                   rs_err(res, 503,
                                          "RESULT_SET_STORE_UNAVAILABLE: could not read the "
                                          "parent set's members; refusing to materialise a "
-                                         "partial result set");
+                                         "partial result set",
+                                         {.retry_after_ms = 5000});
                                   return;
                               }
                               ms.insert(page_result->device_ids.begin(),
@@ -11183,7 +11192,8 @@ void RestApiV1::register_routes(
                      if (!page) {
                          rs_err(res, 503,
                                 "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
-                                "members");
+                                "members",
+                                {.retry_after_ms = 5000});
                          return;
                      }
                      JArr arr;
@@ -11222,7 +11232,8 @@ void RestApiV1::register_routes(
                      if (!chain_result) {
                          rs_err(res, 503,
                                 "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
-                                "lineage");
+                                "lineage",
+                                {.retry_after_ms = 5000});
                          return;
                      }
                      JArr arr;

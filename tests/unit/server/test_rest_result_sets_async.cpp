@@ -19,6 +19,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "mcp_retry.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -3004,6 +3005,12 @@ TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any di
     const std::string msg = j["error"]["message"].get<std::string>();
     CHECK(msg.find("could not verify the per-owner result-set quota") != std::string::npos);
     CHECK(msg.find("nothing was dispatched") != std::string::npos);
+    // #4306/#4307 adversarial review (Kimi + Codex): REST's fail-closed 503
+    // dropped the retry hint the MCP twin carries for the identical fault
+    // (kMcpStoreFaultRetryMs) - REST was the outlier. Nothing was dispatched
+    // here, so this IS safe to retry.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
 
     // The load-bearing assertion: dispatch never fired.
     CHECK(h.calls.empty());
@@ -3072,6 +3079,13 @@ TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful disp
     CHECK(j["error"]["message"].get<std::string>().find(
               "result-set store unavailable after dispatch already succeeded") !=
           std::string::npos);
+    // #4306/#4307 adversarial review: this branch is DELIBERATELY left
+    // non-retryable (unlike the five 503 pre-dispatch branches above/below) -
+    // a real dispatch already succeeded here, so a positive retry hint would
+    // tell a caller to re-send a command that already reached the fleet.
+    // Regression-lock the null.
+    REQUIRE(j["error"].contains("retry_after_ms"));
+    CHECK(j["error"]["retry_after_ms"].is_null());
 
     // Dispatch DID fire -- the whole point of this branch: create_pending
     // failed AFTER a real command already reached agents.
@@ -3118,6 +3132,9 @@ TEST_CASE("from-inventory-query: a degraded members-table read on the parent-nar
     REQUIRE(j.contains("error"));
     CHECK(j["error"]["message"].get<std::string>().find(
               "could not read the parent set's members") != std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
 
     bool saw_failure_audit = false;
     for (const auto& a : h.audits)
@@ -3163,6 +3180,9 @@ TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 w
     REQUIRE(j.contains("error"));
     CHECK(j["error"]["message"].get<std::string>().find("could not list result sets") !=
           std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
@@ -3200,6 +3220,9 @@ TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read r
     REQUIRE(j.contains("error"));
     CHECK(j["error"]["message"].get<std::string>().find("could not read result-set members") !=
           std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
