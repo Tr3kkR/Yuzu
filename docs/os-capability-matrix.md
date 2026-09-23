@@ -697,6 +697,9 @@ implementation is.
 | storage | clear | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
 | storage | clear | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
 | storage | clear | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
+| system_hardening | posture | linux | supported | 1 | allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable; a missing key is absent only when statfs confirms /proc/sys is procfs) | - |
+| system_hardening | posture | macos | supported | 1 | allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs) | - |
+| system_hardening | posture | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel mitigation registry + GetProcessMitigationPolicy (agent process) | Rig-verified 2026-09-21: MitigationOptions/MitigationAuditOptions are ABSENT on a default Windows 11 install (rows read `absent`, not a failure); a present value decodes as 16 two-bit nibbles (dep, sehop, aslr_bottom_up, aslr_high_entropy and cfg confirmed on hardware); GetProcessMitigationPolicy succeeds for DEP/ASLR/CFG on x64. |
 | tags | set | linux | supported | 1 | local_json_store | - |
 | tags | set | macos | supported | 1 | local_json_store | - |
 | tags | set | windows | supported | 1 | local_json_store | - |
