@@ -1,4 +1,5 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 3ae8f69c8f94
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 · leg-hash 3e5b5b08ee49
 == action=permissions
 permissions|linux|-|-|unsupported|-|-|-
-[result_status] UNAVAILABLE / FULL /
+[result_status] UNAVAILABLE / FULL / 
+
