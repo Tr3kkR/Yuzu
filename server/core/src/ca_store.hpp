@@ -49,7 +49,6 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -312,25 +311,18 @@ public:
 
     // ── CRL versions ────────────────────────────────────────────────────────────
 
-    /// Next CRL sequence number = MAX(version)+1. NOT durable across the allocate→record gap on
-    /// its own: callers MUST serialise allocate+record externally (the server holds its own
-    /// `crl_publish_mu_` for exactly this) so two publishers can't compute the same number and
-    /// have `record_crl` collide. `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read
-    /// failure — **the caller MUST abort the publish attempt, never substitute a default number**
-    /// (the pre-migration SQLite version silently returned 1 on any error; that default is UNSAFE
-    /// once the CRL table can hold real history, per ADR-0053 "CRL version continuity" — a
-    /// resumed-from-1 sequence after real versions already exist would either collide loudly
-    /// against `record_crl`'s duplicate-refusal, in the best case, or, before any real CRL has
-    /// ever been published, would silently proceed on stale information). In an HA / multi-
-    /// instance / DB-restore scenario this single-DB counter can still collide across instances —
-    /// durable cross-instance CRL numbering remains a tracked follow-up (#1240 UP-4), unchanged
-    /// (not newly introduced) by this migration; `record_crl()`'s duplicate-refusal keeps a
-    /// collision LOUD, never a silent clobber, both before and after this migration.
+    /// Next CRL sequence number = MAX(version)+1, as a plain read. NOT an allocator: the number
+    /// can be taken by another publisher (on this or any other replica) before a caller inserts
+    /// it. Production publishing goes through `publish_next_crl`, which allocates under a table
+    /// lock inside its own transaction. `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a
+    /// genuine read failure — never substitute a default number (ADR-0053 "CRL version
+    /// continuity").
     [[nodiscard]] std::expected<std::uint64_t, std::string> next_crl_number();
 
-    /// Persist an allocated CRL version. Plain INSERT (never "ON CONFLICT ... DO UPDATE"): a
-    /// duplicate version is a real conflict (two publishers raced a number) — refused so the
-    /// caller re-allocates, rather than silently clobbering an existing generation.
+    /// Persist a CRL version with a caller-chosen number (test seeding / import). Plain INSERT
+    /// (never "ON CONFLICT ... DO UPDATE"): a duplicate version is refused, never a silent
+    /// clobber of an existing generation. Takes the ROW EXCLUSIVE lock, so it also queues behind
+    /// an in-flight `publish_next_crl`.
     [[nodiscard]] bool record_crl(const CrlVersionRecord& rec);
 
     /// The most recently published CRL, if any. Both "genuinely none published yet" and "a
@@ -340,36 +332,37 @@ public:
     /// `std::optional` rather than `std::expected` (ADR-0053).
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();
 
-    /// Builds the signed CRL DER for an allocated `crl_number` over the supplied `revoked`
-    /// inventory. Returns empty to abort (e.g. a bad serial — fail closed). Runs under
-    /// `crl_publish_mu_` only (NOT a DB lease), so it may load the CA key + sign without blocking
-    /// issuance. It MUST NOT call `publish_next_crl` itself (`crl_publish_mu_` is a plain,
-    /// non-recursive mutex).
-    using CrlBuilder =
-        std::function<std::vector<uint8_t>(uint64_t crl_number,
-                                           const std::vector<IssuedCertRecord>& revoked)>;
+    /// What a `CrlBuilder` returns: the signed DER plus the validity window it signed.
+    struct BuiltCrl {
+        std::vector<uint8_t> der;
+        int64_t this_update{0};
+        int64_t next_update{0};
+    };
 
-    /// Allocate the next CRL number, build the DER for THAT number, and persist it — serialised by
-    /// `crl_publish_mu_` so two concurrent same-process publishers can never claim the same number
-    /// or clobber a generation. **Zero production callers as of this migration** (verified:
-    /// `server.cpp`'s `publish_crl()` calls `next_crl_number()`/`record_crl()` directly under its
-    /// OWN `crl_publish_mu_` member instead, so it can load the CA key + sign in between with no
-    /// store-held lock at all) — kept for API/test parity; internally now aborts (returns
-    /// `nullopt`, consumes nothing) on a `next_crl_number()`/`list_revoked()` read failure rather
-    /// than silently building over a wrong number or an empty revoked set.
+    /// Builds and signs the CRL for an allocated `crl_number` over the supplied `revoked`
+    /// inventory. Runs INSIDE `publish_next_crl`'s transaction while the CRL table lock is held,
+    /// so it must be pure CPU work — load the CA key BEFORE calling `publish_next_crl`, never in
+    /// here. Returning `nullopt` or empty DER aborts the publish (e.g. a bad serial — fail closed)
+    /// and consumes no number. It must not call back into this store.
+    using CrlBuilder = std::function<std::optional<BuiltCrl>(
+        uint64_t crl_number, const std::vector<IssuedCertRecord>& revoked)>;
+
+    /// The one production CRL publish path (HA WS-6 slice 6.1, closes #4126). One transaction:
+    /// take `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`, read MAX+1, read
+    /// the revoked set, build, INSERT, COMMIT. The table lock serialises every publisher on every
+    /// replica sharing the database, so crlNumbers are strictly increasing with no duplicates
+    /// and no gaps, and each new CRL contains every revocation the previous one did. Not
+    /// epoch-fenced: operator revocation publishes through here synchronously (two-dispatch-
+    /// planes rule), and the lock alone is what makes concurrent publishers safe. `nullopt` on
+    /// any failure (lock timeout, read failure, build abort, insert failure, lost COMMIT ack) —
+    /// nothing is reported as published unless the transaction committed.
     [[nodiscard]] std::optional<CrlVersionRecord>
-    publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                     const std::string& issuer_fingerprint = {},
+    publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint = {},
                      const std::string& issuer_key_id = {});
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
-    /// Serialises `publish_next_crl` callers against each other (see that method's doc — it has no
-    /// production caller today, but keeps its pre-migration atomicity contract for whoever calls
-    /// it directly / tests). Acquire only at the top of `publish_next_crl`, never while holding a
-    /// DB lease, to keep lock order consistent.
-    std::mutex crl_publish_mu_;
 };
 
 } // namespace yuzu::server

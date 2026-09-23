@@ -11,7 +11,9 @@
  *    (fail-closed bool), list_revoked, a real-leaf revocation round-trip through pki::.
  *  - serial normalisation (pure function).
  *  - CRL numbering + record/latest roundtrip, publish_next_crl atomic allocation,
- *    record_crl's duplicate-version refusal.
+ *    record_crl's duplicate-version refusal, and the HA WS-6 6.1 cross-replica publish
+ *    contract (two stores on separate pools: distinct gap-free numbers, superset-on-wait,
+ *    clean lock timeout).
  *
  * No legacy-SQLite backfill test coverage: `CaStore::migrate_from_sqlite()` itself was retired
  * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0053 Update, 2026-09-03) -- no production
@@ -39,8 +41,14 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <set>
 #include <string>
 #include <string_view>
@@ -71,6 +79,13 @@ int64_t now_s() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// Deterministic stand-in for a signed CRL: DER encodes the number, validity is derived from it.
+std::optional<CaStore::BuiltCrl> fake_crl(uint64_t n, const std::vector<IssuedCertRecord>&) {
+    const std::string s = "CRL#" + std::to_string(n);
+    return CaStore::BuiltCrl{std::vector<uint8_t>(s.begin(), s.end()),
+                             1000 + static_cast<int64_t>(n), 2000 + static_cast<int64_t>(n)};
 }
 
 IssuedCertRecord sample_issued(const std::string& serial, const std::string& purpose = "agent") {
@@ -753,21 +768,24 @@ TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically", "[
 
     uint64_t seen_number = 0;
     std::size_t seen_revoked = 0;
-    auto build = [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked) {
+    auto build = [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked)
+        -> std::optional<CaStore::BuiltCrl> {
         seen_number = n;
         seen_revoked = revoked.size();
-        const std::string s = "CRL#" + std::to_string(n);
-        return std::vector<uint8_t>(s.begin(), s.end());
+        return fake_crl(n, revoked);
     };
 
-    auto v1 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    auto v1 = store.publish_next_crl(build, "FP1", "KID1");
     REQUIRE(v1);
     CHECK(v1->version == 1);
     CHECK(seen_number == 1);
     CHECK(seen_revoked == 1); // build saw the revoked DEAD cert
     CHECK(v1->issuer_fingerprint == "FP1");
+    CHECK(v1->issuer_key_id == "KID1");
+    CHECK(v1->this_update == 1000 + 1);
+    CHECK(v1->next_update == 2000 + 1);
 
-    auto v2 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    auto v2 = store.publish_next_crl(build, "FP1");
     REQUIRE(v2);
     CHECK(v2->version == 2);
     CHECK(seen_number == 2);
@@ -776,13 +794,150 @@ TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically", "[
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->version == 2);
+    CHECK(latest->der == v2->der);
+    CHECK(latest->this_update == v2->this_update);
 
-    // A build that aborts (empty DER) inserts nothing and does NOT consume a number.
-    auto none = store.publish_next_crl(
-        [](uint64_t, const std::vector<IssuedCertRecord>&) { return std::vector<uint8_t>{}; },
-        now_s(), now_s() + 7 * 86400);
-    REQUIRE_FALSE(none);
+    // A build that aborts (nullopt or empty DER) rolls back and does NOT consume a number.
+    CHECK_FALSE(store.publish_next_crl(
+        [](uint64_t, const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
+            return std::nullopt;
+        }));
+    CHECK_FALSE(store.publish_next_crl(
+        [](uint64_t, const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
+            return CaStore::BuiltCrl{};
+        }));
     CHECK(store.next_crl_number().value() == 3);
+}
+
+// HA WS-6 6.1 (#4126): two CaStore instances on separate pools stand in for two server replicas
+// sharing one database. Every concurrent publish must succeed with a distinct number, and the
+// numbers must be exactly 1..N — no duplicate-key failure, no gap.
+TEST_CASE("CaStore: concurrent publishers across replicas get distinct, gap-free CRL numbers",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 4}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.is_open());
+    REQUIRE(replica_b.is_open());
+
+    constexpr int kThreadsPerReplica = 3;
+    constexpr int kPublishesPerThread = 8;
+    std::atomic<int> failures{0};
+    std::mutex seen_mu;
+    std::vector<int64_t> seen;
+    auto worker = [&](CaStore& store) {
+        for (int i = 0; i < kPublishesPerThread; ++i) {
+            auto rec = store.publish_next_crl(fake_crl);
+            if (!rec) {
+                failures.fetch_add(1);
+                continue;
+            }
+            std::lock_guard lk(seen_mu);
+            seen.push_back(rec->version);
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        for (int t = 0; t < kThreadsPerReplica; ++t) {
+            threads.emplace_back(worker, std::ref(replica_a));
+            threads.emplace_back(worker, std::ref(replica_b));
+        }
+    }
+    constexpr int kTotal = 2 * kThreadsPerReplica * kPublishesPerThread;
+    CHECK(failures.load() == 0);
+    REQUIRE(seen.size() == static_cast<std::size_t>(kTotal));
+    std::sort(seen.begin(), seen.end());
+    for (int i = 0; i < kTotal; ++i)
+        CHECK(seen[static_cast<std::size_t>(i)] == i + 1);
+    CHECK(replica_a.next_crl_number().value() == static_cast<uint64_t>(kTotal + 1));
+}
+
+// The superset property: a publish that is waiting on the CRL table lock must see a revocation
+// committed by another replica while it waited, because it reads the revoked set only after it
+// acquires the lock.
+TEST_CASE("CaStore: a publish queued on the lock includes revocations committed while it waited",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 2}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 2}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.record_issued(sample_issued("AAAA")).has_value());
+    REQUIRE(replica_a.record_issued(sample_issued("BBBB")).has_value());
+    REQUIRE(replica_a.revoke("AAAA", "x").value_or(false));
+
+    // A third connection plays "another replica mid-publish": it holds the CRL table lock.
+    PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(holder.get(), "BEGIN")}.status() == PGRES_COMMAND_OK);
+    REQUIRE(PgResult{PQexec(holder.get(),
+                            "LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE")}
+                .status() == PGRES_COMMAND_OK);
+
+    std::vector<std::string> serials_in_crl;
+    std::optional<CrlVersionRecord> result;
+    std::jthread publisher([&] {
+        result = replica_b.publish_next_crl(
+            [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked) {
+                for (const auto& r : revoked)
+                    serials_in_crl.push_back(r.serial_hex);
+                return fake_crl(n, revoked);
+            });
+    });
+
+    // Wait until the publisher is actually blocked on the lock before revoking.
+    PgConn probe{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
+    bool waiting = false;
+    for (int i = 0; i < 200 && !waiting; ++i) {
+        PgResult w{PQexec(probe.get(),
+                          "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                          "WHERE c.relname = 'ca_crl_versions' AND NOT l.granted")};
+        REQUIRE(w.status() == PGRES_TUPLES_OK);
+        waiting = std::string(PQgetvalue(w.get(), 0, 0)) != "0";
+        if (!waiting)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(waiting);
+
+    REQUIRE(replica_a.revoke("BBBB", "x").value_or(false)); // commits while the publisher waits
+    REQUIRE(PgResult{PQexec(holder.get(), "COMMIT")}.status() == PGRES_COMMAND_OK);
+    publisher.join();
+
+    REQUIRE(result);
+    CHECK(result->version == 1);
+    std::sort(serials_in_crl.begin(), serials_in_crl.end());
+    CHECK(serials_in_crl == std::vector<std::string>{"AAAA", "BBBB"});
+}
+
+TEST_CASE("CaStore: a publish that cannot get the CRL lock fails cleanly and consumes no number",
+          "[ca_store][pg][crl][ha][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 300}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(holder.get(), "BEGIN")}.status() == PGRES_COMMAND_OK);
+    REQUIRE(PgResult{PQexec(holder.get(),
+                            "LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE")}
+                .status() == PGRES_COMMAND_OK);
+
+    bool build_called = false;
+    auto rec = store.publish_next_crl([&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+        build_called = true;
+        return fake_crl(n, r);
+    });
+    CHECK_FALSE(rec);
+    CHECK_FALSE(build_called); // never signed anything without holding the lock
+
+    REQUIRE(PgResult{PQexec(holder.get(), "ROLLBACK")}.status() == PGRES_COMMAND_OK);
+    auto after = store.publish_next_crl(fake_crl);
+    REQUIRE(after);
+    CHECK(after->version == 1);
 }
 
 TEST_CASE("CaStore: record_crl rejects version < 1 and silent-clobber duplicates",

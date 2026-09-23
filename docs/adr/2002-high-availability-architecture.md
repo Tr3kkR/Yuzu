@@ -1421,6 +1421,28 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
   current version must not silently produce unverifiable material). KMS/HSM via the existing seam is
   optional (SaaS / high-security).
 
+**Update (2026-09-23, WS-6 planning + slice 6.1).** Three points above are resolved as follows:
+- **The CA root key does NOT become a `SecretCodec` blob in Postgres.** The first bullet conflicted
+  with ADR-0010 Decision 6 (the CA root key stays behind `KeyProvider`; "no future store migration
+  may" move it) and ADR-0053 §Secrets. ADR-0010 governs. Putting the key under the secrets KEK would
+  make database + KEK sufficient to hold the CA, while saving little operationally, because the KEK
+  files must be distributed to every replica anyway. WS-6 instead uses **shared key custody**: the
+  CA key and KEK files are provisioned to every replica, and a replica must prove it can resolve
+  every required key before it is admitted (slice 6.3, with `/readyz`).
+- **`CaStore` → Postgres** was already done by ADR-0053 before WS-6 began.
+- **CRL publication (slice 6.1, closes #4126)** is one Postgres transaction:
+  `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE` → read `MAX(version)+1` → read
+  the revoked set → sign → `INSERT` → `COMMIT` (`CaStore::publish_next_crl`). Allocate, store and
+  make-current happen together at the commit ("current" is the highest committed version), a
+  rollback consumes no number, so there are no gaps and no sequence is needed. The table lock is
+  the fencing rule: it serialises every publisher on every replica and is released by the commit.
+  It is deliberately not a leader epoch, because the operator revoke path publishes synchronously
+  (the two-dispatch-planes rule). Reading the revoked set after acquiring the lock makes each CRL a
+  superset of the one before it. The CA key is loaded before the lock is taken; only signing runs
+  under it.
+- **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
+  `pending-agents.cfg` once at first boot rather than starting fresh.
+
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
 mandatory and reprioritized. Rule: runtime-mutable state → Postgres; only idempotent external caches

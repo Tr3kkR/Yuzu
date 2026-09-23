@@ -157,6 +157,18 @@ cannot be persisted, so the response reports `crl_republished:false`, the
 `ca.crl.published` `result=failure` audit fires, and the failure counter
 increments — the revocation itself is NOT undone (already enforced server-side).
 
+**CRL numbering across replicas (HA WS-6 slice 6.1).** Every CRL publish — the
+boot-time pre-publish, an operator revoke, and the leader-gated freshness
+re-publish — goes through `CaStore::publish_next_crl`, which runs as one Postgres
+transaction under `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`.
+Server replicas sharing one database therefore publish strictly increasing
+crlNumbers with no duplicates or gaps, and each CRL includes every revocation the
+previous one did. The lock does not block `GET /api/v1/ca/crl`. A publish that
+cannot get the lock within the pool's `lock_timeout` fails honestly
+(`crl_republished:false`, failure audit, `yuzu_server_ca_crl_publish_failures_total`)
+and consumes no number. Replicas booting together each publish once, so a
+simultaneous boot of N replicas leaves N consecutive CRL versions — harmless.
+
 **curl examples:**
 
 ```bash
@@ -698,10 +710,8 @@ self-contained modules, so a field added to the agent-listener `agent_pb` but no
 the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the
 PR5 `csr_pem` catch; `agent.proto:96`); a per-module roundtrip test covers it but a
 CI regen+diff job (elevated **before PR5d**) is the structural fix; **durable
-cross-instance CRL numbering** (`next_crl_number()` = `MAX(version)+1` is serialised
-within one instance via `crl_publish_mu_`, but an HA/multi-instance/DB-restore
-scenario can still collide — `record_crl` rejects a duplicate rather than
-clobbering, #1240 UP-4); revoke-superseded-cert-on-renewal; the `is_revoked`
+cross-instance CRL numbering** — **done** in HA WS-6 slice 6.1 (#4126, #1240 UP-4):
+see "CRL numbering across replicas" above; revoke-superseded-cert-on-renewal; the `is_revoked`
 heartbeat hot-path in-memory revoked-set memoization (pairs with the open-stream
 sweep); a distinct gateway **upstream TLS-handshake-failure metric**
 (`yuzu_gw_upstream_tls_handshake_failures_total`, R-3) so cert-expiry / CA-rotation

@@ -195,6 +195,23 @@ IssuedCertRecord read_issued_row(PGresult* res, int row) {
     return r;
 }
 
+// The full revoked set, read on the SUPPLIED connection so `publish_next_crl` can read it inside
+// its own transaction (after taking the CRL table lock) rather than on a separate lease.
+std::expected<std::vector<IssuedCertRecord>, std::string> query_revoked_on(PGconn* conn) {
+    std::string sql = std::string("SELECT ") + kIssuedCols +
+                      " FROM ca_store.ca_issued WHERE status = 'revoked' ORDER BY revoked_at";
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "list_revoked failed: " + PQerrorMessage(conn));
+    const int rows = PQntuples(res.get());
+    std::vector<IssuedCertRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_issued_row(res.get(), i));
+    return out;
+}
+
 constexpr const char* kRootCols =
     "cert_pem, key_ref, algo, not_before, not_after, fingerprint_sha256, mode, created_at, "
     "chain_pem";
@@ -593,18 +610,7 @@ std::expected<std::vector<IssuedCertRecord>, std::string> CaStore::list_revoked(
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
-    std::string sql = std::string("SELECT ") + kIssuedCols +
-                      " FROM ca_store.ca_issued WHERE status = 'revoked' ORDER BY revoked_at";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string(kCaDbErrorPrefix) +
-                               "list_revoked failed: " + PQerrorMessage(lease.get()));
-    const int rows = PQntuples(res.get());
-    std::vector<IssuedCertRecord> out;
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        out.push_back(read_issued_row(res.get(), i));
-    return out;
+    return query_revoked_on(lease.get());
 }
 
 std::expected<std::vector<std::string>, std::string> CaStore::list_revoked_serials() {
@@ -731,46 +737,80 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
 }
 
 std::optional<CrlVersionRecord>
-CaStore::publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                          const std::string& issuer_fingerprint,
+CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
                           const std::string& issuer_key_id) {
-    if (!build)
+    if (!build || !open_)
         return std::nullopt;
-    // Serialise same-process publishers against each other so the number allocated by
-    // next_crl_number() is still free when record_crl() inserts it — WITHOUT holding a DB lease
-    // across the signing callback. See the .hpp: zero production callers today.
-    std::lock_guard pub(crl_publish_mu_);
-    if (!is_open())
+    std::optional<CrlVersionRecord> published;
+    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // SHARE ROW EXCLUSIVE self-conflicts, so every publisher on every replica sharing this
+        // database queues here until the holder commits or rolls back. It does NOT conflict with
+        // the ACCESS SHARE a plain SELECT takes, so `latest_crl()` / `GET /api/v1/ca/crl` keep
+        // serving throughout. The wait is bounded by the pool's per-connection lock_timeout.
+        pg::PgResult lock = pg::exec_params(
+            conn, "LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE",
+            std::vector<std::string>{});
+        if (lock.status() != PGRES_COMMAND_OK) {
+            spdlog::error("CaStore::publish_next_crl: CRL table lock failed: {} — aborting",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        pg::PgResult num = pg::exec_params(
+            conn, "SELECT COALESCE(MAX(version), 0) + 1 FROM ca_store.ca_crl_versions",
+            std::vector<std::string>{});
+        if (num.status() != PGRES_TUPLES_OK) {
+            spdlog::error("CaStore::publish_next_crl: number read failed: {} — aborting",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        const auto number = static_cast<std::uint64_t>(to_i64(PQgetvalue(num.get(), 0, 0)));
+        // Read AFTER the lock: every revocation committed before the previous CRL's commit is
+        // visible to this statement, so CRL N+1 is always a superset of CRL N. A revocation
+        // committing after this read is picked up by that revoke's own publish, which queues
+        // behind this one on the lock above.
+        auto revoked = query_revoked_on(conn);
+        if (!revoked) {
+            spdlog::error("CaStore::publish_next_crl: {} — aborting (never build a CRL over a "
+                          "possibly-incomplete revoked set)",
+                          revoked.error());
+            return false;
+        }
+        auto built = build(number, *revoked);
+        if (!built || built->der.empty()) {
+            spdlog::error("CaStore::publish_next_crl: build produced no DER (version {})", number);
+            return false; // rolled back → the number is not consumed
+        }
+        CrlVersionRecord rec;
+        rec.version = static_cast<int64_t>(number);
+        rec.der = std::move(built->der);
+        rec.this_update = built->this_update;
+        rec.next_update = built->next_update;
+        rec.published_at = now_epoch();
+        rec.issuer_fingerprint = issuer_fingerprint;
+        rec.issuer_key_id = issuer_key_id;
+        pg::PgResult ins = pg::exec_params(
+            conn,
+            "INSERT INTO ca_store.ca_crl_versions (version, der, this_update, next_update, "
+            "published_at, issuer_fingerprint, issuer_key_id) "
+            "VALUES ($1::bigint, decode($2,'hex'), $3::bigint, $4::bigint, $5::bigint, $6, $7)",
+            std::vector<std::string>{std::to_string(rec.version), bytes_to_hex(rec.der),
+                                     std::to_string(rec.this_update),
+                                     std::to_string(rec.next_update),
+                                     std::to_string(rec.published_at), rec.issuer_fingerprint,
+                                     rec.issuer_key_id});
+        if (ins.status() != PGRES_COMMAND_OK) {
+            spdlog::error("CaStore::publish_next_crl: insert of v{} failed: {}", number,
+                          PQerrorMessage(conn));
+            return false;
+        }
+        published = std::move(rec);
+        return true;
+    });
+    // A lost COMMIT acknowledgement reports failure even if Postgres committed. That is the safe
+    // direction: the caller reports "not republished", and the next publish takes the next number.
+    if (!committed)
         return std::nullopt;
-    auto number = next_crl_number();
-    if (!number) {
-        spdlog::error("CaStore::publish_next_crl: next_crl_number failed: {} — aborting",
-                      number.error());
-        return std::nullopt;
-    }
-    auto revoked = list_revoked();
-    if (!revoked) {
-        spdlog::error("CaStore::publish_next_crl: list_revoked failed: {} — aborting (never "
-                      "build a CRL over a possibly-incomplete revoked set)",
-                      revoked.error());
-        return std::nullopt;
-    }
-    std::vector<uint8_t> der = build(*number, *revoked);
-    if (der.empty()) {
-        spdlog::error("CaStore::publish_next_crl: build produced no DER (version {})", *number);
-        return std::nullopt; // nothing inserted → the number is not consumed
-    }
-    CrlVersionRecord rec;
-    rec.version = static_cast<int64_t>(*number);
-    rec.der = std::move(der);
-    rec.this_update = this_update;
-    rec.next_update = next_update;
-    rec.published_at = now_epoch();
-    rec.issuer_fingerprint = issuer_fingerprint;
-    rec.issuer_key_id = issuer_key_id;
-    if (!record_crl(rec))
-        return std::nullopt;
-    return rec;
+    return published;
 }
 
 } // namespace yuzu::server

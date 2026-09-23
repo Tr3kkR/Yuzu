@@ -306,6 +306,22 @@ than silently building a CRL over a wrong number or a possibly-incomplete revoke
 fix class as the production path's own hardening above, applied so the untested-in-production
 method does not carry a latent version of the identical bug.
 
+### Update (2026-09-23): cross-instance CRL numbering delivered by HA WS-6 slice 6.1
+
+Point 3 above and the "zero production callers" section are superseded. `publish_next_crl` is now
+the ONLY production CRL publish path: `server.cpp`'s `publish_crl()` loads the CA key, then calls
+it with a pure signing callback, and `ServerImpl::crl_publish_mu_` and `CaStore::crl_publish_mu_`
+are both removed. The method runs one transaction that takes
+`LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`, reads `MAX(version)+1` and the
+revoked set on the same connection, signs, inserts and commits. The lock serialises publishers
+across every replica sharing the database, so numbering is strictly increasing with no duplicates
+and no gaps, and a CRL never omits a revocation its predecessor carried. The ADR-0012 §2 rule
+("never hold a lease across disk/signing work") is kept for the disk half: the key load happens
+before the lease is taken. Signing does run while the lease and lock are held — that is
+milliseconds of CPU, and it is what makes the number and the signed content atomic. Points 1 and 2
+(no default number on a read failure; `record_crl` never clobbers) still hold. See ADR-2002 §8
+"Update (2026-09-23)".
+
 ### Backfill (ADR-0009)
 
 **Mandatory, three-table, fingerprint-verified** — extends `LicenseStore`'s (ADR-0048) two-table
@@ -387,7 +403,8 @@ here.
   call sites (see "Adversarial review" below) — a warning comment narrows the class of mistake, it
   does not substitute for checking every call site against it.
 - **Solving cross-instance CRL numbering (auto-retry-on-conflict) as part of this migration.**
-  Rejected as scope creep beyond "migrate the persistence layer" — it is a pre-existing, already-
+  (Since delivered by HA WS-6 slice 6.1 with a table lock rather than a retry loop — see "Update
+  (2026-09-23)" above.) Rejected as scope creep beyond "migrate the persistence layer" — it is a pre-existing, already-
   tracked (#1240 UP-4) limitation this migration does not worsen (a collision was always refused
   loudly, never silently), and building the retry loop correctly requires re-running the CA-key-
   load-and-sign step, which crosses into `server.cpp`'s signing orchestration, not this store.
