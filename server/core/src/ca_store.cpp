@@ -23,6 +23,8 @@ constexpr const char* kStoreName = "ca_store";
 // ApiTokenStore::validate_token's hot-path timeout (another security-gate read).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2500};
+static_assert(CaStore::kCrlLeaseTimeout == kWriteTimeout,
+              "publish_next_crl's default local wait assumes the store's write-lease bound");
 
 // gov UP-5 precedent (every migrated store on this ladder): bounded materialization regardless
 // of table growth — an operator convenience list, not a paged feed.
@@ -328,7 +330,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // can tell — without comparing timestamps written by different replicas' clocks —
         // whether a revocation is missing from the latest CRL. NULL on rows published before v3,
         // which reads as "not covered" and triggers one republish after upgrade.
-        {3, "ALTER TABLE ca_crl_versions ADD COLUMN revoked_count BIGINT;"},
+        // The ALTER needs ACCESS EXCLUSIVE on a table publishers lock; bound the wait so boot
+        // fails loudly (and retries on restart) rather than hanging behind a stalled holder.
+        {3, "SET LOCAL lock_timeout = '30s'; "
+            "ALTER TABLE ca_crl_versions ADD COLUMN revoked_count BIGINT;"},
     };
     return kMigrations;
 }
@@ -683,7 +688,12 @@ bool CaStore::delete_issued_by(const std::string& issued_by) {
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return false;
-    pg::PgResult res = pg::exec_params(lease.get(), "DELETE FROM ca_store.ca_issued WHERE issued_by = $1",
+    // Never delete a revoked row: it is the record that keeps the cert rejected by is_revoked()
+    // and listed in every later CRL, and it keeps the revoked set append-only, which
+    // has_unpublished_revocations() relies on.
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "DELETE FROM ca_store.ca_issued WHERE issued_by = $1 "
+                                       "AND status <> 'revoked'",
                                        std::vector<std::string>{sanitize_pg_text(issued_by)});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("CaStore::delete_issued_by: failed: {}", PQerrorMessage(lease.get()));
@@ -729,9 +739,11 @@ std::expected<bool, std::string> CaStore::has_unpublished_revocations() {
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
-    // One statement, one snapshot. Revocations are never undone, so a count that differs from
-    // the one the latest CRL was built from means that CRL does not cover the current set. No
-    // CRL at all, or a pre-v3 row (NULL count), also reads as "not covered".
+    // One statement, one snapshot. The revoked set is append-only (revoke() never un-revokes and
+    // delete_issued_by() keeps revoked rows), so a count that differs from the one the latest
+    // CRL was built from means that CRL does not cover the current set. No CRL at all, or a
+    // pre-v3 row (NULL count), also reads as "not covered". An operator deleting revoked rows by
+    // hand (the default_certs runbook) breaks that assumption — see pki-architecture.md.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT (SELECT revoked_count FROM ca_store.ca_crl_versions ORDER BY version DESC "
@@ -754,7 +766,7 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT version, encode(der,'hex'), this_update, next_update, published_at, "
-        "issuer_fingerprint, issuer_key_id FROM ca_store.ca_crl_versions "
+        "issuer_fingerprint, issuer_key_id, revoked_count FROM ca_store.ca_crl_versions "
         "ORDER BY version DESC LIMIT 1",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
@@ -768,20 +780,24 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     r.published_at = to_i64(PQgetvalue(res.get(), 0, c++));
     r.issuer_fingerprint = text_col(res.get(), 0, c++);
     r.issuer_key_id = text_col(res.get(), 0, c++);
+    if (!PQgetisnull(res.get(), 0, c))
+        r.revoked_count = to_i64(PQgetvalue(res.get(), 0, c));
     return r;
 }
 
 std::expected<CrlVersionRecord, CaStore::PublishError>
 CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
-                          const std::string& issuer_key_id) {
+                          const std::string& issuer_key_id,
+                          std::chrono::milliseconds local_wait) {
     if (!build || !open_)
         return std::unexpected(PublishError::Failed);
-    // Bound = the longest a holder can legitimately keep it: its own lease wait + lock wait.
+    // Bounded, not "until the holder finishes": a holder can legitimately run longer (up to
+    // kCrlStatementTimeout per statement), and giving up here is healed by the freshness pass.
     std::unique_lock local(publish_mu_, std::defer_lock);
-    if (!local.try_lock_for(kWriteTimeout + kCrlLockTimeout)) {
-        spdlog::error("CaStore::publish_next_crl: another CRL publish in this process did not "
-                      "finish within {} ms — giving up",
-                      (kWriteTimeout + kCrlLockTimeout).count());
+    if (!local.try_lock_for(local_wait)) {
+        spdlog::warn("CaStore::publish_next_crl: another CRL publish in this process is still "
+                     "running after {} ms — not publishing",
+                     local_wait.count());
         return std::unexpected(PublishError::Busy);
     }
     std::optional<CrlVersionRecord> published;
@@ -790,12 +806,15 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
     const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         txn_body_ran = true;
         // Transaction-scoped bounds: they hold even when the pool could not set its own at
-        // connect time (a DSN carrying `options=`, or PGOPTIONS). Without them a stalled lock
-        // holder on another replica would make every waiter here block indefinitely.
+        // connect time (a DSN carrying `options=`, or PGOPTIONS). lock_timeout bounds OUR wait;
+        // idle_in_transaction_session_timeout bounds how long WE can hold the lock if this
+        // process is frozen mid-transaction (SIGSTOP, a paused container), so a stalled holder
+        // cannot block every other replica's publish indefinitely.
         pg::PgResult bounds = pg::exec_params(
             conn,
             "SELECT set_config('lock_timeout', $1, true), "
-            "set_config('statement_timeout', $2, true)",
+            "set_config('statement_timeout', $2, true), "
+            "set_config('idle_in_transaction_session_timeout', $2, true)",
             std::vector<std::string>{std::to_string(kCrlLockTimeout.count()) + "ms",
                                      std::to_string(kCrlStatementTimeout.count()) + "ms"});
         if (bounds.status() != PGRES_TUPLES_OK) {

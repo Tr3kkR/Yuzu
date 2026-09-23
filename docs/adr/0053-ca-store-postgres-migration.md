@@ -326,7 +326,11 @@ increasing with no duplicates, and a CRL never omits a revocation its predecesso
 was built from — with no backfill (NULL reads as "not covered"). `has_unpublished_revocations()`
 compares it with the current revoked count in one statement, and the leader's freshness pass
 republishes when they differ, so a revoke whose own publish failed reaches the CRL without a
-second revoke.
+second revoke. That comparison relies on the revoked set being append-only, so
+`delete_issued_by()` now keeps revoked rows — before this change, regenerating the default certs
+deleted a revoked default leaf's row, which also made `is_revoked()` accept it again. The v3 DDL
+runs under `SET LOCAL lock_timeout = '30s'`, and each publish also sets
+`idle_in_transaction_session_timeout` so a frozen holder cannot keep the lock.
 
 ADR-0012 §2(b) forbids holding a lease across "network, disk, or other external work". Loading
 the key is disk work and happens before the lease is taken; signing a key already in memory is

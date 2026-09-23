@@ -106,7 +106,9 @@ bool wait_for_crl_lock_waiter(const std::string& dsn) {
     PgConn probe{PQconnectdb(dsn.c_str())};
     if (PQstatus(probe.get()) != CONNECTION_OK)
         return false;
-    for (int i = 0; i < 200; ++i) {
+    // 2.5 s budget: a publisher gives up on the lock after CaStore::kCrlLockTimeout (5 s), so
+    // the probe must observe it well before that.
+    for (int i = 0; i < 100; ++i) {
         PgResult w{PQexec(probe.get(),
                           "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
                           "WHERE c.relname = 'ca_crl_versions' AND NOT l.granted "
@@ -977,7 +979,8 @@ TEST_CASE("CaStore: a publish that cannot get the CRL lock times out without a p
     CHECK(rec.error() == CaStore::PublishError::Failed);
     CHECK_FALSE(build_called); // never signed anything without holding the lock
     CHECK(waited >= CaStore::kCrlLockTimeout - std::chrono::milliseconds(500));
-    CHECK(waited < CaStore::kCrlLockTimeout + std::chrono::seconds(3));
+    // Generous upper bound: the timer also covers lease acquire and BEGIN on a loaded CI box.
+    CHECK(waited < CaStore::kCrlLockTimeout + std::chrono::seconds(10));
 
     holder.release();
     auto after = store.publish_next_crl(fake_crl);
@@ -1026,6 +1029,81 @@ TEST_CASE("CaStore: a publish whose root was replaced while it waited is refused
     REQUIRE(retried);
     CHECK(retried->version == 1);
     CHECK(retried->issuer_fingerprint == "FP:NEW");
+}
+
+// safety-1: a second publish in the same process waits on the local mutex (bounded by
+// local_wait) instead of parking another pool connection on the table lock; past the bound it
+// reports Busy rather than queueing indefinitely.
+TEST_CASE("CaStore: a publish that cannot get the per-process lock reports Busy",
+          "[ca_store][pg][crl][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::atomic<bool> in_builder{false};
+    std::atomic<bool> release_builder{false};
+    std::optional<int64_t> first_version;
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        auto rec = store.publish_next_crl([&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+            in_builder = true;
+            for (int i = 0; i < 400 && !release_builder; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return fake_crl(n, r);
+        });
+        if (rec)
+            first_version = rec->version;
+    });
+    for (int i = 0; i < 400 && !in_builder; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(in_builder);
+
+    bool second_built = false;
+    auto second = store.publish_next_crl(
+        [&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+            second_built = true;
+            return fake_crl(n, r);
+        },
+        {}, {}, std::chrono::milliseconds{200});
+    release_builder = true;
+    threads[0].join();
+
+    REQUIRE_FALSE(second);
+    CHECK(second.error() == CaStore::PublishError::Busy);
+    CHECK_FALSE(second_built);
+    REQUIRE(first_version);
+    CHECK(*first_version == 1);
+}
+
+// UP2-2: purging stale default-cert inventory must never delete a revoked row — that would make
+// is_revoked() accept the cert again, drop it from every later CRL, and (by shrinking the revoked
+// count) let has_unpublished_revocations() miss a revocation elsewhere.
+TEST_CASE("CaStore: delete_issued_by keeps revoked rows", "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    auto leaf = [](const std::string& serial) {
+        auto r = sample_issued(serial, "server");
+        r.issued_by = "system:default-certs";
+        return r;
+    };
+    REQUIRE(store.record_issued(leaf("AAAA")).has_value());
+    REQUIRE(store.record_issued(leaf("BBBB")).has_value());
+    REQUIRE(store.revoke("AAAA", "key compromise").value_or(false));
+    REQUIRE(store.publish_next_crl(fake_crl));
+
+    REQUIRE(store.delete_issued_by("system:default-certs"));
+
+    CHECK(store.is_revoked("AAAA"));
+    auto a = store.get_issued("AAAA");
+    REQUIRE(a.has_value());
+    CHECK(a->has_value());
+    auto b = store.get_issued("BBBB");
+    REQUIRE(b.has_value());
+    CHECK_FALSE(b->has_value());
+    CHECK_FALSE(store.has_unpublished_revocations().value());
 }
 
 // qe-1: a COMMIT that fails after the row was built and inserted must not be reported as

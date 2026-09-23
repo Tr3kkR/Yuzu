@@ -435,15 +435,24 @@ What changes on **every** deployment, including single-server:
   its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
   revoked" and does not publish. The freshness pass now also republishes, on its
   next 15 s tick, whenever the latest CRL was not built from the current revoked
-  set (after a failed attempt it waits 5 minutes before trying again). Expect
-  one extra CRL version after the upgrade (rows from before v3 read as "not
-  covered") and, occasionally, a redundant version shortly after a revoke.
+  set (after a failed attempt it waits 5 minutes before trying again). You may
+  occasionally see a redundant CRL version shortly after a revoke.
+- **A revoked default server certificate now stays revoked.** Previously,
+  regenerating the built-in default certificates (for example after changing
+  `--cert-san`) deleted their old inventory rows, including revoked ones, so a
+  revoked default leaf was accepted again and dropped from the CRL. Revoked rows
+  are now kept.
 
 Single-server remains the only supported topology. If you nevertheless run two
 server versions against one database during an upgrade, a publish from the
 **older** binary does not take the lock and can still publish a CRL that omits a
 revocation the newer binary just recorded; the newer binary's freshness pass
-republishes it within a tick once it is running. Multi-replica PKI also still
+republishes to cover it (and can do so on every tick for as long as the older
+binary keeps publishing).
+
+**Rollback** to the previous release is safe: v3 only adds a nullable column, and
+an older binary boots against it and ignores it. It will not self-heal a missed
+CRL; rolling forward again republishes once. Multi-replica PKI also still
 needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
 freshness pass runs only on the elected leader, and a leader whose CA directory
 lacks the CA key can never publish.
@@ -2414,8 +2423,9 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
    *Revoked* and the public CRL is republished automatically. If that publish
-   fails (the panel says so), the server republishes it on its own within about
-   15 seconds of the failure clearing — you do not need to revoke again.
+   fails (the panel says so), the server republishes it on its own: on the next
+   15-second freshness tick once the cause clears, or up to about 5 minutes later
+   if that attempt fails too. You do not need to revoke again.
 
 Revocation takes effect **immediately server-side**: the agent is refused on its
 next connection, and any already-open command stream is torn down by the

@@ -165,28 +165,35 @@ transaction under `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MO
 re-checks that `ca_root` is still the root the caller loaded (a subordinate import
 in between makes it retry once with the new root), and reads the revoked set only
 after the lock is held. Server replicas sharing one database therefore publish
-strictly increasing crlNumbers with no duplicates, and each CRL includes every
-revocation the previous one did. The lock does not block `GET /api/v1/ca/crl`.
+strictly increasing crlNumbers with no duplicates or gaps, and each CRL includes
+every revocation the previous one did. The lock does not block `GET /api/v1/ca/crl`.
 
 - **Failure.** A publish that waits more than 5 s for the lock (a transaction-scoped
   `lock_timeout`, so it holds even when the DSN's `options=` suppresses the pool's
-  own) fails and consumes no number; within one server process, concurrent
-  publishes queue on a local lock first, so at most one pool connection waits on
-  the table lock. Every trigger increments `yuzu_server_ca_crl_publish_failures_total`;
+  own) fails and consumes no number. A publisher frozen mid-transaction loses its
+  session after 30 s idle (`idle_in_transaction_session_timeout`), releasing the
+  lock for everyone else. Within one server process, concurrent publishes take a
+  local lock first, so at most one pool connection waits on the table lock; an
+  operator publish that cannot get the local lock within 7.5 s fails, and the
+  background freshness pass skips instead of waiting. Every trigger increments `yuzu_server_ca_crl_publish_failures_total`;
   the operator-revoke paths additionally return `crl_republished:false` and write a
   `ca.crl.published` failure audit. The import-chain, boot and freshness paths
   write no `ca.crl.published` audit row, success or failure.
 - **Self-heal.** Each CRL row records how many revoked certs it was built from
   (`revoked_count`, migration v3). The leader's freshness pass republishes, on its
-  next 15 s tick, whenever that count differs from the current revoked count — so
-  a revocation whose own publish failed reaches the served CRL without a second
-  revoke (which would return "already revoked"). The check compares counts, never
-  timestamps written by different replicas' clocks.
+  next 15 s tick (or up to 5 minutes later after a failed attempt), whenever that
+  count differs from the current revoked count — so a revocation whose own publish
+  failed reaches the served CRL without a second revoke (which would return
+  "already revoked"). The check compares counts, never timestamps written by
+  different replicas' clocks. It relies on the revoked set being append-only:
+  `revoke()` never un-revokes, and `delete_issued_by()` (the default-cert
+  inventory purge) never deletes a revoked row.
 - **Boot.** Replicas booting together each publish once, leaving up to N
   consecutive CRL versions for N replicas — harmless.
 - **What the lock does not cover.** Restoring the database to an earlier point in
   time, losing an asynchronously replicated commit in a failover, or the
-  `default_certs` runbook clearing `ca_crl_versions`, all restart numbering from
+  `default_certs` runbook clearing `ca_crl_versions` (or deleting revoked
+  `ca_issued` rows by hand, which also defeats the self-heal count), all restart numbering from
   the surviving `MAX(version)+1`, which can reuse a crlNumber that was already
   served. During a rolling upgrade, a publish from an older binary does not take
   the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so

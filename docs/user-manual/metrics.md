@@ -67,6 +67,7 @@ All Yuzu metrics follow a consistent naming scheme.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_ca_crl_publish_failures_total` | counter | CRL (re)publish attempts that failed: CA root read error, CA key load failure, CRL build/sign failure, a degraded revoked-set or number read, an insert or COMMIT failure, a wait of more than 5 s for the `ca_store.ca_crl_versions` table lock, or another publish in the same process still running (operator paths only — the background freshness pass skips instead). Server-side revocation enforcement is unaffected; the public CRL is stale until the next successful publish, which the leader's freshness pass retries automatically. Fires `YuzuCaCrlPublishFailing` (`docs/prometheus/yuzu-alerts.yml`). |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
 ## Executions event-outbox metrics (HA WS-2a)

@@ -307,10 +307,11 @@ public:
     /// is revoked".
     [[nodiscard]] std::expected<std::vector<std::string>, std::string> list_revoked_serials();
 
-    /// Delete all issued-cert rows with the given issued_by — used to purge stale default-cert
-    /// inventory on regeneration so the store reflects only the live set. Best-effort / non-fatal
-    /// by design (the caller already logs+continues on failure — a purge miss leaves stale rows,
-    /// not a security or correctness defect); stays a plain `bool`.
+    /// Delete the NON-revoked issued-cert rows with the given issued_by — used to purge stale
+    /// default-cert inventory on regeneration. Revoked rows are always kept: deleting one would
+    /// make `is_revoked()` accept that cert again and drop it from every later CRL, and the
+    /// revoked set must stay append-only for `has_unpublished_revocations()`. Best-effort /
+    /// non-fatal by design (the caller logs and continues on failure); stays a plain `bool`.
     [[nodiscard]] bool delete_issued_by(const std::string& issued_by);
 
     // ── CRL versions ────────────────────────────────────────────────────────────
@@ -366,6 +367,7 @@ public:
     /// `set_config('lock_timeout', …, true)` so it holds even when the DSN's `options=` /
     /// PGOPTIONS stops the pool from setting its own. `statement_timeout` is set the same way.
     static constexpr std::chrono::milliseconds kCrlLockTimeout{5000};
+    static constexpr std::chrono::milliseconds kCrlLeaseTimeout{2500}; // == the store's write-lease bound
     static constexpr std::chrono::milliseconds kCrlStatementTimeout{30000};
 
     /// The ONE production CRL publish path (HA WS-6 slice 6.1, closes #4126). Extend it; never
@@ -381,12 +383,17 @@ public:
     /// lock. Not epoch-fenced: operator revocation publishes through here synchronously
     /// (two-dispatch-planes rule).
     ///
-    /// Errors: `Busy` (another publish in this process held the local mutex past its bound),
+    /// Errors: `Busy` (another publish in this process still held the local mutex after
+    /// `local_wait` — a holder can legitimately take longer, so this is an honest failure the
+    /// freshness pass heals, not a stuck publisher),
     /// `RootChanged` (see above), `Failed` (lock timeout, read failure, build abort, insert
     /// failure, lost COMMIT ack). Nothing is reported as published unless the txn committed.
+    /// `local_wait` bounds the wait for another publish in this process; pass zero from a
+    /// background pass, which should skip rather than queue behind an operator publish.
     [[nodiscard]] std::expected<CrlVersionRecord, PublishError>
     publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint = {},
-                     const std::string& issuer_key_id = {});
+                     const std::string& issuer_key_id = {},
+                     std::chrono::milliseconds local_wait = kCrlLeaseTimeout + kCrlLockTimeout);
 
 private:
     pg::PgPool& pool_;

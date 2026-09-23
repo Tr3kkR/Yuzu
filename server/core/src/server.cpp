@@ -8249,19 +8249,24 @@ public:
                         bool unpublished_revocation = false;
                         if (!stale) {
                             auto missing = ca_store_->has_unpublished_revocations();
-                            if (!missing)
+                            if (!missing) {
+                                // Throttle: a persistent read failure logs once a minute, not
+                                // every 15 s tick.
                                 spdlog::warn("PKI: unpublished-revocation check skipped: {}",
                                              missing.error());
-                            else
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(1);
+                            } else {
                                 unpublished_revocation = *missing;
+                            }
                         }
                         if (stale || unpublished_revocation) {
-                            if (publish_crl())
+                            bool skipped = false;
+                            if (publish_crl(/*background=*/true, &skipped))
                                 spdlog::info(
                                     "PKI: CRL re-published ({})",
                                     stale ? "nextUpdate window"
                                           : "the latest CRL did not cover every revocation");
-                            else
+                            else if (!skipped) // another publish is running; recheck next tick
                                 crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
                         }
                     }
@@ -11022,7 +11027,12 @@ private:
     /// across every replica by a table lock (HA WS-6 6.1); the key is loaded BEFORE
     /// that lock is taken. If a subordinate import swaps the root in between, the
     /// store refuses (RootChanged) and this retries once with the new root.
-    std::optional<std::vector<std::uint8_t>> publish_crl() {
+    /// `background` = the freshness pass: it skips rather than queue behind another publish in
+    /// this process, so it never delays the revocation sweep that runs after it on the same
+    /// thread. A skip is not a failure (no counter; `*skipped` is set so the caller retries on
+    /// the next tick instead of backing off).
+    std::optional<std::vector<std::uint8_t>> publish_crl(bool background = false,
+                                                         bool* skipped = nullptr) {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
         auto fail = [this]() -> std::optional<std::vector<std::uint8_t>> {
@@ -11084,10 +11094,19 @@ private:
                             .count()};
                 };
 
-                auto rec =
-                    ca_store_->publish_next_crl(build, root->fingerprint_sha256, issuer_key_id);
+                auto rec = background
+                               ? ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id,
+                                                             std::chrono::milliseconds{0})
+                               : ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id);
                 if (rec)
                     return std::move(rec->der);
+                if (background && rec.error() == CaStore::PublishError::Busy) {
+                    if (skipped)
+                        *skipped = true;
+                    return std::nullopt;
+                }
                 if (rec.error() == CaStore::PublishError::RootChanged && attempt == 1) {
                     spdlog::info("PKI: CA root changed during CRL publish — retrying with the "
                                  "new root");
@@ -11105,6 +11124,9 @@ private:
         } catch (const std::exception& e) {
             // The store rolled back; never let a builder exception escape a background thread.
             spdlog::error("PKI: CRL publish threw: {} — CRL not published", e.what());
+            return fail();
+        } catch (...) {
+            spdlog::error("PKI: CRL publish threw a non-standard exception — CRL not published");
             return fail();
         }
         return fail();
