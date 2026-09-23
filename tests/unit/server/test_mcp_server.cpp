@@ -1219,9 +1219,11 @@ struct McpTestServer {
     /// query_software_licenses.
     yuzu::server::AppUsageStore* app_usage_store_for_test{nullptr};
 
-    /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
-    /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
-    /// can be exercised. Default empty keeps existing tests on the unavailable path.
+    /// DEX app-perf-over-time (slice 2): optionally wire this FnDexPerfApi::Providers
+    /// test double (NOT the retired production `AppPerfProviders`, #4626 Concern C —
+    /// see this field's own type) so the app-perf tools (list_dex_perf_apps /
+    /// get_dex_app_perf / get_dex_group_app_perf) can be exercised. Default empty
+    /// keeps existing tests on the unavailable path.
     /// `.cohort` (ADR-0031 WS-A4 #4250) is no longer read by production
     /// compare_app_perf_versions directly — the harness below wraps it in a
     /// FnVerifyApi at build time so every EXISTING test setting `.cohort`

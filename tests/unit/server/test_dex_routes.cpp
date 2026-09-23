@@ -2632,7 +2632,7 @@ TEST_CASE("DEX version-devices drill fragment: gate, param validation, audit, "
         test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
-                               {}, {}, admit_unfiltered); // app_perf_providers = {}
+                               {}, {}, admit_unfiltered); // dex_perf_api = {} (unwired)
         auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
         REQUIRE(r);
         CHECK(r->status == 200);

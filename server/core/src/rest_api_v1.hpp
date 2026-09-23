@@ -430,8 +430,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
         // optional dep; nullptr leaves the assign/unassign routes answering
@@ -576,8 +574,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // routes (/api/v1/engine-principals/{id}/roles), which capture this
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
