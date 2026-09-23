@@ -39,12 +39,16 @@
 /// — never treat it as empty-container."
 ///
 /// `list_by_owner`, `members`, `lineage`, and `count_for_owner` are thin
-/// `.value_or(...)` wrappers over their `_checked` twins above, kept for
-/// callers that deliberately stay on the deny-or-benign plain shape — today
-/// only the render-only dashboard fragments in `result_set_routes.cpp`
+/// `.value_or(...)` wrappers over their `_checked` twins above, kept for API
+/// continuity. `list_by_owner` and `lineage` still have real production
+/// callers — the render-only dashboard fragments in `result_set_routes.cpp`
 /// (`docs/postgres-store-playbook.md` rule 4's render-only carve-out: no
 /// decision downstream of a dashboard render, so a degraded read just
-/// re-renders an empty fragment rather than needing a 503). **`lineage`'s
+/// re-renders an empty fragment rather than needing a 503). `members` and
+/// `count_for_owner` have NO production caller left after this widening —
+/// every call site that could grant/target/dispatch on their result now goes
+/// through the `_checked` twin; the plain forms exist only for
+/// `test_result_set_store.cpp`'s own healthy-path assertions. **`lineage`'s
 /// wrapper is NOT behaviourally identical to the pre-#4306 plain
 /// implementation**: the old `lineage()` returned a PARTIAL chain on a
 /// mid-walk query failure (whatever had been accumulated before the failing

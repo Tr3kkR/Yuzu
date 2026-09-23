@@ -268,8 +268,9 @@ blocks boot.
 
 ## Update (2026-09-23) — `count_for_owner`/`members`/`list_by_owner`/`lineage` widened (#4306)
 
-The "Follow-ups and accepted risks" section above (and the Posture bullet at line 81)
-claimed these four reads "still return plain `std::optional`/containers with no error
+The "Follow-ups and accepted risks" section above (and the Posture bullet on the
+type-distinguishable-reads paragraph) claimed these four reads "still return plain
+`std::optional`/containers with no error
 channel" and that their failure modes were "deny-or-benign... none
 grants/targets/enforces/skips/inverts." That was true when written but is now FALSIFIED
 for two of the four: `count_for_owner` backs the PRE-DISPATCH per-owner quota check on the
@@ -285,11 +286,16 @@ empty/zero/truncated) and adopted at every call site where a degraded read could
 grant/target/dispatch/materialise: the REST/MCP async-producer quota pre-checks, the
 from-inventory-query parent-narrowing loop and its MCP twin, and the REST/MCP
 list/members/lineage read routes. The plain `list_by_owner`/`members`/`lineage`/
-`count_for_owner` wrappers remain for the one deliberately-still-plain consumer class — the
-render-only dashboard fragments in `result_set_routes.cpp` (no decision downstream of a
-dashboard render; `docs/postgres-store-playbook.md` rule 4's render-only carve-out).
+`count_for_owner` wrappers remain for API continuity, but only two of the four still have a
+real production caller: `list_by_owner` and `lineage` back the render-only dashboard
+fragments in `result_set_routes.cpp` (no decision downstream of a dashboard render;
+`docs/postgres-store-playbook.md` rule 4's render-only carve-out). `members` and
+`count_for_owner` have no production caller left — every site that could
+grant/target/dispatch on their result now goes through the `_checked` twin; the plain forms
+exist only for `test_result_set_store.cpp`'s own healthy-path assertions.
 
-**Correction to the "short lineage breadcrumb" characterisation (line 83):** the pre-#4306
+**Correction to the "short lineage breadcrumb" characterisation on the Follow-ups list
+above:** the pre-#4306
 plain `lineage()` did not just return an empty breadcrumb on a DB fault — it returned
 whatever PARTIAL chain had been accumulated before a mid-walk query failure, which reads
 indistinguishably from a genuinely short (but complete) lineage. The new `lineage_checked`
