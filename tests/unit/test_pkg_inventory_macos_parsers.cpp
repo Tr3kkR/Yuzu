@@ -1,14 +1,16 @@
 /**
  * test_pkg_inventory_macos_parsers.cpp — injected-root tests for the pkg_inventory
- * macOS Homebrew walks (macos_manager_rows_at, macos_package_rows_at) over a
- * committed REAL CAPTURE tree manifest
+ * macOS Homebrew walks (macos_manager_rows_at, macos_package_rows_at). The
+ * happy-path cases run over a committed REAL CAPTURE tree manifest
  * (tests/unit/fixtures/wave10/pkg_inventory/macos/tree.manifest; provenance.txt
- * beside it). The seams are NOVEL design (peripherals' injected-root precedent is
- * Linux-only). This TU is UNGUARDED: the manifest parser cases run on every OS;
- * the cases that materialize a tree and run the walk wrap their BODIES in
- * `#if !defined(_WIN32)` because the O_NOFOLLOW/dirent walk shell
- * (posix_dir_walk.hpp) does not exist on Windows. They run on Linux CI too: the
- * walk reads an injected root, not this host's /opt/homebrew.
+ * beside it); the failure, hostile-tree, budget and seam cases build small
+ * SYNTHETIC trees in code. The seams are NOVEL design (peripherals' injected-root
+ * precedent is Linux-only). This TU is UNGUARDED: the manifest parser cases run
+ * on every OS; the TEST_CASEs that materialize a tree and run the walk are
+ * wrapped in `#if !defined(_WIN32)` (absent, not empty, on Windows) because the
+ * O_NOFOLLOW/dirent walk shell (posix_dir_walk.hpp) does not exist on Windows.
+ * They run on Linux CI too: the walk reads an injected root, not this host's
+ * /opt/homebrew.
  *
  * The capture is FORMULAE-ONLY (ten real Cellar entries, an empty real Caskroom,
  * no Taps directory): the capture host has no casks
@@ -29,6 +31,7 @@
  *  - swallowing an open failure as zero rows / a false 0    -> the unreadable-Cellar case
  *  - dropping the constraint at the emit seam (run_macos_at -> emit_result)
  *                                                          -> the forced-constraint seam case
+ *  - dropping the single-flight slot from run_macos_guarded -> the busy-slot cases
  *  - opening a marker as one joined path instead of open_under_prefix's per-hop
  *    O_NOFOLLOW                                            -> the symlinked Library and prefix cases
  *  - dropping the caller-side `walk_budget` record, or the count_taps budget check
@@ -57,6 +60,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -322,22 +326,37 @@ std::vector<std::string> captured_rows(const std::string& captured) {
 // not just the walk's return values.
 const fs::path* g_leg_root = nullptr;
 yuzu::pkg_inventory::Action g_leg_action = yuzu::pkg_inventory::Action::managers;
+bool g_leg_guarded = false; ///< run the production shape (behind the single-flight slot)
 
 int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
                 std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
-    return yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
+    return g_leg_guarded
+               ? yuzu::pkg_inventory::mac::run_macos_guarded(ctx, g_leg_action, *g_leg_root)
+               : yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
 }
 
-yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inventory::Action a) {
+yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inventory::Action a,
+                                             bool guarded = false) {
     g_leg_root = &root;
     g_leg_action = a;
+    g_leg_guarded = guarded;
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &leg_execute;
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(&descriptor, "probe");
     g_leg_root = nullptr;
+    g_leg_guarded = false;
     return result;
+}
+
+/// Number of open file descriptors of this process (fd numbers, machine
+/// independent: only a before/after difference is ever asserted).
+std::size_t open_fd_count() {
+    std::size_t n = 0;
+    for (int fd = 0; fd < 1024; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1) ++n;
+    return n;
 }
 
 } // namespace
@@ -462,7 +481,7 @@ TEST_CASE("pkg_inventory macos: a symlinked Library component is refused, never 
     const auto rows = mac::macos_manager_rows_at(dir.path, token);
 
     REQUIRE(token.has_value());
-    CHECK(token->rfind("macos:homebrew_taps:", 0) == 0); // symlink_refused (ELOOP) by construction
+    CHECK(token->rfind("macos:homebrew_taps:", 0) == 0); // a symlink is ENOTDIR (not_a_directory) under O_DIRECTORY|O_NOFOLLOW
     // Homebrew is still reported present (Caskroom reads fine); the refused
     // Taps marker's fact is OMITTED (never a fabricated non-zero count), and
     // the attacker's tap name never reaches the row.
@@ -484,7 +503,7 @@ TEST_CASE("pkg_inventory macos: a whole-action walk budget stops a breadth-distr
     // pre-existing per-directory cap) reads all four id-directories and
     // returns 8 rows instead of 2.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_walk_budget_"};
-    for (const std::string& id : {"pkg-a", "pkg-b", "pkg-c", "pkg-d"}) {
+    for (const char* id : {"pkg-a", "pkg-b", "pkg-c", "pkg-d"}) {
         fs::create_directories(dir.path / "opt/homebrew/Cellar" / id / "1.0.0");
         fs::create_directories(dir.path / "opt/homebrew/Cellar" / id / "1.0.1");
     }
@@ -621,7 +640,7 @@ TEST_CASE("pkg_inventory macos: a symlinked Homebrew prefix is refused by both a
     const auto packages = mac::macos_package_rows_at(dir.path, token);
     CHECK(packages.empty());
     REQUIRE(token.has_value());
-    CHECK(token->rfind("macos:homebrew_cellar:", 0) == 0); // ELOOP or ENOTDIR by platform
+    CHECK(token->rfind("macos:homebrew_cellar:", 0) == 0); // a symlink is ENOTDIR (not_a_directory) under O_DIRECTORY|O_NOFOLLOW
     CHECK(token->find("evil") == std::string::npos);
 
     token.reset();
@@ -688,7 +707,7 @@ TEST_CASE("pkg_inventory macos seam: a forced constraint reaches BOTH the status
     CHECK(pstatus[0] == "status");
     CHECK(pstatus[1] == "packages");
     CHECK(pstatus[2] == "constrained");
-    CHECK(pstatus[3].rfind("macos:homebrew_cellar:", 0) == 0); // ELOOP or ENOTDIR by platform
+    CHECK(pstatus[3].rfind("macos:homebrew_cellar:", 0) == 0); // a symlink is ENOTDIR (not_a_directory) under O_DIRECTORY|O_NOFOLLOW
     CHECK(packages.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(packages.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(packages.result_provenance == pstatus[3]); // one seam, two views
@@ -707,6 +726,111 @@ TEST_CASE("pkg_inventory macos seam: a forced constraint reaches BOTH the status
     CHECK(managers.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(managers.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(managers.result_provenance == mstatus[3]);
+}
+
+
+TEST_CASE("pkg_inventory macos: managers under an already-expired wall-clock budget omits the fact "
+          "it could not finish counting",
+          "[pkg_inventory][macos][walk]") {
+    using namespace yuzu::pkg_inventory;
+    // count_subdirs checks the clock per entry, so even ONE big listing cannot outlast
+    // the budget on a slow filesystem. Zero seconds is expired deterministically (the
+    // steady clock never runs backwards).
+    // MUTATION: dropping the per-entry check in count_subdirs reads the Cellar in
+    // full and reports formulae=2 with no token.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_managers_clock_"};
+    fs::create_directories(dir.path / "opt/homebrew/Cellar/a/1.0");
+    fs::create_directories(dir.path / "opt/homebrew/Cellar/b/1.0");
+
+    Limits lim;
+    lim.max_walk_seconds = 0;
+    std::optional<std::string> token;
+    const auto rows = mac::macos_manager_rows_at(dir.path, token, lim);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_cellar:walk_budget");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "manager|homebrew|present|-|/opt/homebrew|taps=0;casks=0|-");
+}
+
+TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in flight is answered "
+          "busy at once and walks nothing",
+          "[pkg_inventory][macos][seam][busy]") {
+    using namespace yuzu::pkg_inventory;
+    // The walk's wall clock cannot interrupt a syscall stalled on a hung mount inside
+    // the tree, so one stalled walk must not let every later dispatch pin another pool
+    // worker. MUTATION: dropping the WalkSlot from run_macos_guarded walks (and would
+    // pin a worker) instead of answering busy, so the tree's rows appear below.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_busy_"};
+    std::string err;
+    REQUIRE(build_macos_tree(dir.path, err));
+
+    {
+        const auto held = mac::WalkSlot::try_acquire(Action::managers);
+        REQUIRE(held.has_value());
+        CHECK_FALSE(mac::WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
+
+        const auto busy = run_leg(dir.path, Action::managers, /*guarded=*/true);
+        CHECK(busy.rc == 0); // a busy answer is a degraded read, not a failed command
+        const auto rows = captured_rows(busy.captured);
+        REQUIRE(rows.size() == 1); // the status row only: nothing was walked
+        CHECK(rows[0] == "status|managers|constrained|macos:managers:busy");
+        CHECK(busy.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(busy.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(busy.result_provenance == "macos:managers:busy");
+
+        // The slots are per action: `packages` is not blocked by a held `managers`.
+        const auto other = run_leg(dir.path, Action::packages, /*guarded=*/true);
+        const auto orows = captured_rows(other.captured);
+        REQUIRE(orows.size() == 11);
+        CHECK(orows[0] == "status|packages|supported|-");
+        CHECK(other.result_status == YUZU_RESULT_STATUS_OK);
+    }
+
+    // Released with the guard: the same action walks again, and releases its own slot.
+    for (int i = 0; i < 2; ++i) {
+        const auto again = run_leg(dir.path, Action::managers, /*guarded=*/true);
+        const auto rows = captured_rows(again.captured);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0] == "status|managers|supported|-");
+        CHECK(again.result_status == YUZU_RESULT_STATUS_OK);
+    }
+    CHECK(mac::WalkSlot::try_acquire(Action::managers).has_value());
+    CHECK(mac::WalkSlot::try_acquire(Action::packages).has_value());
+}
+
+TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exactly as they found them",
+          "[pkg_inventory][macos][walk]") {
+    using namespace yuzu::pkg_inventory;
+    // Peak use is two fds; every early return between acquire and release (a refused
+    // symlink hop, a failed openat, a truncated listing, a budget stop) must give
+    // them back. MUTATION: leaking the parent Dir on a failed hop grows the count.
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_fdbalance_"};
+    fs::create_directories(dir.path / "elsewhere/Cellar/evil/1.0");
+    fs::create_directories(dir.path / "opt");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "opt/homebrew", ec); // refused prefix
+    REQUIRE_FALSE(ec);
+    fs::create_directories(dir.path / "usr/local/Homebrew/Library/Taps/org/repo");
+    fs::create_directories(dir.path / "usr/local/Cellar/a/1.0");
+    fs::create_directories(dir.path / "usr/local/Cellar/b/1.0");
+    fs::create_directories(dir.path / "usr/local/Caskroom/c/1.0");
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "usr/local/Cellar/link", ec);
+    REQUIRE_FALSE(ec);
+
+    Limits tight;
+    tight.max_entries_per_dir = 1; // truncated listings
+    Limits expired;
+    expired.max_walk_seconds = 0; // budget stops
+
+    const Limits defaults;
+    const Limits* const all_limits[] = {&defaults, &tight, &expired};
+    const auto before = open_fd_count();
+    std::optional<std::string> token;
+    for (const Limits* lim : all_limits) {
+        (void)mac::macos_manager_rows_at(dir.path, token, *lim);
+        (void)mac::macos_package_rows_at(dir.path, token, *lim);
+    }
+    CHECK(open_fd_count() == before);
 }
 
 #endif // !defined(_WIN32)

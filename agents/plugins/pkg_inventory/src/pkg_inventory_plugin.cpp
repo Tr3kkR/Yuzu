@@ -43,7 +43,6 @@
 
 #include <yuzu/string_utils.hpp>
 
-#include <exception>
 #include <string>
 #include <string_view>
 
@@ -83,18 +82,6 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
-/// The exception-firewall constrained row + typed status pkg_inventory
-/// reports when execute() catches an exception it cannot otherwise recover
-/// from. The provenance token is fixed, never the exception's own text (which
-/// could embed a path or other untrusted-walk-observed content).
-int report_execute_exception(yuzu::CommandContext& ctx, std::string_view action) {
-    ctx.write_output(yuzu::pkg_inventory::format_status_row(
-        action, yuzu::pkg_inventory::StatusLevel::constrained, "pkg_inventory:exception"));
-    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                          "pkg_inventory:exception");
-    return 1;
-}
-
 } // namespace
 
 class PkgInventoryPlugin final : public yuzu::Plugin {
@@ -124,11 +111,11 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        // The WHOLE body -- the unknown-action diagnostic row included -- is
-        // inside this try: a walk exception thrown anywhere below must still
+        // The WHOLE body -- the unknown-action diagnostic row included -- runs
+        // under run_guarded: a walk exception thrown anywhere below must still
         // report pkg_inventory's own typed status/provenance row rather than
         // propagate past this frozen ABI seam unannotated.
-        try {
+        return yuzu::pkg_inventory::run_guarded(ctx, action, [&]() -> int {
             const auto parsed = yuzu::pkg_inventory::parse_action(action);
             if (!parsed) {
                 // `action` is request-supplied and lands in a pipe-delimited stream, so
@@ -149,11 +136,7 @@ public:
             return yuzu::pkg_inventory::run_macos(ctx, *parsed);
 #endif
             return 1; // unreachable on a supported build
-        } catch (const std::exception&) {
-            return report_execute_exception(ctx, action);
-        } catch (...) {
-            return report_execute_exception(ctx, action);
-        }
+        });
     }
 };
 

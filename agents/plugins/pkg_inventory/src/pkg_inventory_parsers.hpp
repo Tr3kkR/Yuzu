@@ -57,9 +57,15 @@ namespace yuzu::pkg_inventory {
 
 /// Per-directory entry cap handed to walk_dir_capped.
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
-/// Whole-action package row cap (Homebrew): beyond it the walk stops and the
-/// status carries `row_cap`.
+/// Whole-action package row cap (Homebrew): once reached, no further row is
+/// added and the status carries `row_cap` (a later container is still opened, but
+/// stops at its first version directory).
 inline constexpr std::size_t kMaxPackageRows = 20000;
+/// Whole-action cap on the bytes of package rows emitted (the row cap alone
+/// allows ~10 MB of maximum-length names, and the command path applies no output
+/// cap of its own). A real install is a few KB; beyond it no further row is
+/// added and the status carries `byte_cap`.
+inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 /// Whole-ACTION entries budget across each action's entire walk (`packages`:
 /// both prefixes x Cellar/Caskroom; `managers`: both prefixes x Taps, Cellar,
 /// Caskroom): each directory's own listing is bounded by kMaxEntriesPerDir and
@@ -78,6 +84,7 @@ inline constexpr std::size_t kMaxPackageWalkSeconds = 10;
 struct Limits {
     std::size_t max_entries_per_dir = kMaxEntriesPerDir;
     std::size_t max_package_rows = kMaxPackageRows;
+    std::size_t max_output_bytes = kMaxOutputBytes;
     std::size_t max_walk_entries = kMaxPackageWalkEntries;
     std::size_t max_walk_seconds = kMaxPackageWalkSeconds;
 };
@@ -143,6 +150,12 @@ enum class StatusLevel { supported, constrained, unsupported };
 inline constexpr std::string_view kTokenLinuxPackagesOwned = "linux:owned_by_installed_apps";
 inline constexpr std::string_view kTokenLinuxPlanned = "linux:planned";
 inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
+/// The exception firewall's fixed provenance (never the exception's own text).
+inline constexpr std::string_view kTokenException = "pkg_inventory:exception";
+/// The named unmodelled failure bucket of open_failure_token (EMFILE, EIO, ...).
+/// It proves nothing about what is on disk, so it is never evidence a directory
+/// exists.
+inline constexpr std::string_view kDetailIoError = "io_error";
 
 /// `<os>:<source>:<detail>` -- the per-location failure token. `source` names
 /// the location (e.g. "apt_sources_d", "homebrew_cellar"), `detail` the
@@ -165,13 +178,16 @@ inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
 
 /// errno from a failed open/openat -> a stable detail token. `io_error` is the
 /// named unmodelled bucket (distinct from "absent" and from every named class).
+/// The walks open with O_DIRECTORY|O_NOFOLLOW, for which a symlink (to anything)
+/// answers ENOTDIR, so a refused link reads `not_a_directory`; `symlink_refused`
+/// (ELOOP) is a link LOOP in the path.
 [[nodiscard]] inline std::string_view open_failure_token(int err) noexcept {
     switch (err) {
     case EACCES:
     case EPERM:   return "permission_denied";
     case ELOOP:   return "symlink_refused";
     case ENOTDIR: return "not_a_directory";
-    default:      return "io_error";
+    default:      return kDetailIoError;
     }
 }
 

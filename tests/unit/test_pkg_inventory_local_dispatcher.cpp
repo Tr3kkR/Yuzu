@@ -28,7 +28,14 @@
  *    holds a well-named version directory `packages` yields >=1
  *    `package|homebrew|` row (so removing the macOS wiring fails it). No
  *    host-specific count or name is asserted (CI's macOS runner has unknown
- *    contents).
+ *    contents);
+ *  - the six declared legs (2 actions x 3 OSes) are never UNDECLARED, match the
+ *    values the code implements, and the host's own leg agrees with what the
+ *    action actually emits;
+ *  - the exception firewall (run_guarded, through a synthetic descriptor: the
+ *    real plugin cannot be made to throw) turns any throw into exactly one
+ *    `constrained` status row carrying the fixed token, UNAVAILABLE/PARTIAL and
+ *    rc 1, never leaking the exception's text.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -38,12 +45,15 @@
 
 #include "local_dispatcher.hpp"
 
+#include "pkg_inventory_legs.hpp"
 #include "pkg_inventory_parsers.hpp"
 
 #include <cstdlib>
 #include <filesystem>
+#include <new>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -384,4 +394,133 @@ TEST_CASE("pkg_inventory plugin: an unknown action is refused, not silently igno
     REQUIRE(hrows.size() == 1);
     CHECK(hrows[0] == "unknown action: no\\|such/");
     CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
+}
+
+TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the host leg agrees with "
+          "what the action emits",
+          "[pkg_inventory][descriptors]") {
+    auto plugin = load_pkg_inventory_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->action_descriptor_count == 2);
+    REQUIRE(plugin->descriptor->action_descriptors != nullptr);
+
+    // The declared support per leg is what the code implements TODAY: macOS
+    // Homebrew is wired, Linux managers and both Windows legs are planned
+    // placeholders, Linux packages is unsupported by design. MUTATION: landing
+    // the Linux managers leg without flipping its descriptor (or the reverse)
+    // fails here, which the capability-matrix gate cannot see (it compares the
+    // doc to the descriptor, not the descriptor to behaviour).
+    struct Expected {
+        const char* action;
+        YuzuSupportLevel linux_leg, macos_leg, windows_leg;
+    };
+    const Expected expected[] = {
+        {"managers", YUZU_SUPPORT_PLANNED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
+        {"packages", YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
+    };
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (std::size_t i = 0; i < plugin->descriptor->action_descriptor_count; ++i) {
+        const auto& d = plugin->descriptor->action_descriptors[i];
+        INFO("action: " << (d.action ? d.action : "<null>"));
+        REQUIRE(d.action != nullptr);
+        CHECK(std::string_view{d.action} == expected[i].action);
+        CHECK(d.linux_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(d.macos_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(d.windows_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(d.linux_leg.support == expected[i].linux_leg);
+        CHECK(d.macos_leg.support == expected[i].macos_leg);
+        CHECK(d.windows_leg.support == expected[i].windows_leg);
+
+#if defined(_WIN32)
+        const auto host_support = d.windows_leg.support;
+#elif defined(__linux__)
+        const auto host_support = d.linux_leg.support;
+#else
+        const auto host_support = d.macos_leg.support;
+#endif
+        const auto result = dispatcher.run(plugin->descriptor, d.action);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE_FALSE(rows.empty());
+        const auto status = split_fields_escape_aware(rows[0]);
+        REQUIRE(status.size() == 4);
+        if (host_support == YUZU_SUPPORT_PLANNED || host_support == YUZU_SUPPORT_UNSUPPORTED)
+            CHECK(status[2] == "unsupported");
+        else
+            CHECK((status[2] == "supported" || status[2] == "constrained"));
+    }
+}
+
+namespace {
+
+enum class Thrown { runtime_error, bad_alloc, non_std };
+Thrown g_thrown = Thrown::runtime_error;
+bool g_body_returns = false;
+int g_body_rc = 0;
+
+int guarded_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
+                    std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return yuzu::pkg_inventory::run_guarded(ctx, "packages", [&]() -> int {
+        if (g_body_returns) {
+            ctx.write_output("status|packages|supported|-");
+            return g_body_rc;
+        }
+        switch (g_thrown) {
+        case Thrown::runtime_error:
+            throw std::runtime_error("secret /Users/someone/path leaked by an exception");
+        case Thrown::bad_alloc: throw std::bad_alloc{};
+        case Thrown::non_std: throw 42;
+        }
+        return 0;
+    });
+}
+
+yuzu::agent::LocalDispatcher::Result run_guarded_execute() {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &guarded_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    return dispatcher.run(&descriptor, "packages");
+}
+
+} // namespace
+
+TEST_CASE("pkg_inventory firewall: any throw becomes one constrained status row, UNAVAILABLE/PARTIAL and "
+          "rc 1, never the exception text",
+          "[pkg_inventory][firewall]") {
+    // MUTATION: removing the try/catch in run_guarded lets the throw escape
+    // run_guarded (the dispatcher would then see an exception, not a result);
+    // emitting e.what() instead of the fixed token fails the leak assertion.
+    g_body_returns = false;
+    for (const auto kind : {Thrown::runtime_error, Thrown::bad_alloc, Thrown::non_std}) {
+        g_thrown = kind;
+        INFO("thrown kind: " << static_cast<int>(kind));
+        const auto result = run_guarded_execute();
+        CHECK(result.rc == 1);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "status|packages|constrained|pkg_inventory:exception");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "pkg_inventory:exception");
+        CHECK(result.captured.find("secret") == std::string::npos);
+        CHECK(result.captured.find("/Users/") == std::string::npos);
+    }
+}
+
+TEST_CASE("pkg_inventory firewall: a body that returns normally is passed through untouched",
+          "[pkg_inventory][firewall]") {
+    g_body_returns = true;
+    for (const int rc : {0, 1}) {
+        g_body_rc = rc;
+        INFO("body rc: " << rc);
+        const auto result = run_guarded_execute();
+        CHECK(result.rc == rc);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "status|packages|supported|-"); // no firewall row appended
+    }
+    g_body_returns = false;
 }

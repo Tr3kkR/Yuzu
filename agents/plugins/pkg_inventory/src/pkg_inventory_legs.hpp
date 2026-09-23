@@ -99,14 +99,43 @@ inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_vi
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
 }
 
+// ── exception firewall ───────────────────────────────────────────────────
+
+/// What `execute()` reports when something below it throws: a `constrained`
+/// status row carrying the fixed provenance token (never the exception's own
+/// text, which could embed a path or other untrusted-walk-observed content), the
+/// typed UNAVAILABLE/PARTIAL status (the autoruns firewall's pairing) and rc 1.
+/// It runs because something already threw, so it must not throw itself: a
+/// failure to report is swallowed and the command still fails with rc 1.
+inline int report_execute_exception(yuzu::CommandContext& ctx, std::string_view action) noexcept {
+    try {
+        ctx.write_output(format_status_row(action, StatusLevel::constrained, kTokenException));
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              kTokenException);
+    } catch (...) {
+    }
+    return 1;
+}
+
+/// Runs `body` (the WHOLE of execute(), the unknown-action diagnostic included)
+/// so that nothing it throws can cross the frozen plugin ABI seam unannotated.
+template <typename Body>
+int run_guarded(yuzu::CommandContext& ctx, std::string_view action, Body&& body) noexcept {
+    try {
+        return body();
+    } catch (...) {
+        return report_execute_exception(ctx, action);
+    }
+}
+
 // ── POSIX directory primitives (thin shell; not compiled on Windows) ─────
 //
 // Used by the macOS walk shell (pkg_inventory_macos_parsers.hpp). Nothing
 // here spawns a process: every read is open/openat/fstatat/readdir with
 // O_NOFOLLOW on the leaf, so a swapped-in symlink is refused rather than
 // followed (a private copy of the autoruns_macos.cpp dir_open_outcome_from_fd
-// / open_dir_no_follow shape; posix_dir_walk.hpp deliberately leaves opening
-// to each caller). Guarded because posix_dir_walk.hpp does not exist on
+// / open_dir_no_follow_checked shape; posix_dir_walk.hpp deliberately leaves
+// opening to each caller). Guarded because posix_dir_walk.hpp does not exist on
 // Windows; the portable row/text layer is pkg_inventory_parsers.hpp.
 #if !defined(_WIN32)
 
