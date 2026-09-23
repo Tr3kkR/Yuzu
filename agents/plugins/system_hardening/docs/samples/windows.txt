@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 26c1ee54c2ae
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated) · leg-hash e678758a486f
 == action=posture
 posture|windows|mitigation_options|-|absent
 posture|windows|mitigation_audit_options|-|absent

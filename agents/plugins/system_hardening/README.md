@@ -46,7 +46,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `posture` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel mitigation registry + GetProcessMitigationPolicy (agent process) | ✅ supported · rung 1 · allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs) | ✅ supported · rung 1 · allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable) |
+| `posture` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel mitigation registry + GetProcessMitigationPolicy (agent process) | ✅ supported · rung 1 · allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs) | ✅ supported · rung 1 · allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable; a missing key is absent only when statfs confirms its nearest existing directory is procfs) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -82,9 +82,9 @@ Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `w
 |---|---|---|---|---|---|
 | `row_kind` | string | `posture` `constrained` | Windows, Linux, macOS | `posture` | Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row: `os` is the host leg, `key` is `internal_error`, `state` is `unreadable`). |
 | `os` | string | `linux` `macos` `windows` | Windows, Linux, macOS | `linux` | The leg that produced the row. |
-| `key` | string | - | Windows, Linux, macOS | `kernel.randomize_va_space` | Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process, or the value name itself for a failed read; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows). |
+| `key` | string | - | Windows, Linux, macOS | `kernel.randomize_va_space` | Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process; a registry value that was not decoded (absent or unreadable) reports under mitigation_options or mitigation_audit_options, and a failed self policy under self.dep, self.aslr or self.cfg; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows). |
 | `raw` | string | - | Windows, Linux, macOS | `2` | The raw value read (integer, string, or 0x-prefixed hex on Windows); "-" when nothing was read (absent or unreadable). An empty macOS kern.bootargs is a successful read and an empty column. |
-| `state` | string | `enabled` `disabled` `partial` `on` `off` `default` `unmodelled` `absent` `unreadable` | Windows, Linux, macOS | `enabled` | Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here. unreadable = the read failed. |
+| `state` | string | `enabled` `disabled` `partial` `on` `off` `default` `unmodelled` `absent` `unreadable` | Windows, Linux, macOS | `enabled` | Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here (only where the surface being read is confirmed present). unreadable = the read failed, or the surface itself (a hidden /proc/sys, a missing Session Manager\kernel key) was not there. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -106,7 +106,7 @@ Pipe-delimited rows, one per allowlisted key, in allowlist order, written via `w
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 26c1ee54c2ae
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated) · leg-hash e678758a486f
 
 ```
 == action=posture
@@ -122,7 +122,7 @@ posture|windows|self.cfg_strict_mode|0|off
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 26c1ee54c2ae
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-23 · euid 501 · leg-hash e678758a486f
 
 ```
 == action=posture
@@ -133,7 +133,7 @@ posture|macos|kern.bootargs||enabled
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 26c1ee54c2ae
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 · leg-hash e678758a486f
 
 ```
 == action=posture
