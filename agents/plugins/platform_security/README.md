@@ -111,7 +111,7 @@ Pipe-delimited rows written via `write_output()`, in read order. The first field
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 98358aa6dbaf
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash fb2bb3055717
 
 ```
 == action=secure_boot
@@ -131,7 +131,7 @@ code_integrity|windows|lsa.LsaCfgFlags|-|absent
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 98358aa6dbaf
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash fb2bb3055717
 
 ```
 == action=secure_boot
@@ -144,7 +144,7 @@ code_integrity|macos|sip|System Integrity Protection status: enabled.|enabled
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 98358aa6dbaf
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash fb2bb3055717
 
 ```
 == action=secure_boot
