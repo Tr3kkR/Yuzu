@@ -158,16 +158,39 @@ cannot be persisted, so the response reports `crl_republished:false`, the
 increments — the revocation itself is NOT undone (already enforced server-side).
 
 **CRL numbering across replicas (HA WS-6 slice 6.1).** Every CRL publish — the
-boot-time pre-publish, an operator revoke, and the leader-gated freshness
-re-publish — goes through `CaStore::publish_next_crl`, which runs as one Postgres
-transaction under `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`.
-Server replicas sharing one database therefore publish strictly increasing
-crlNumbers with no duplicates or gaps, and each CRL includes every revocation the
-previous one did. The lock does not block `GET /api/v1/ca/crl`. A publish that
-cannot get the lock within the pool's `lock_timeout` fails honestly
-(`crl_republished:false`, failure audit, `yuzu_server_ca_crl_publish_failures_total`)
-and consumes no number. Replicas booting together each publish once, so a
-simultaneous boot of N replicas leaves N consecutive CRL versions — harmless.
+boot-time pre-publish, an operator revoke (REST or MCP), a subordinate-CA import
+(REST, MCP or dashboard), and the leader-gated freshness re-publish — goes through
+`CaStore::publish_next_crl`, the single CRL publisher. It runs as one Postgres
+transaction under `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`,
+re-checks that `ca_root` is still the root the caller loaded (a subordinate import
+in between makes it retry once with the new root), and reads the revoked set only
+after the lock is held. Server replicas sharing one database therefore publish
+strictly increasing crlNumbers with no duplicates, and each CRL includes every
+revocation the previous one did. The lock does not block `GET /api/v1/ca/crl`.
+
+- **Failure.** A publish that waits more than 5 s for the lock (a transaction-scoped
+  `lock_timeout`, so it holds even when the DSN's `options=` suppresses the pool's
+  own) fails and consumes no number; within one server process, concurrent
+  publishes queue on a local lock first, so at most one pool connection waits on
+  the table lock. Every trigger increments `yuzu_server_ca_crl_publish_failures_total`;
+  the operator-revoke paths additionally return `crl_republished:false` and write a
+  `ca.crl.published` failure audit. The import-chain, boot and freshness paths
+  write no `ca.crl.published` audit row, success or failure.
+- **Self-heal.** Each CRL row records how many revoked certs it was built from
+  (`revoked_count`, migration v3). The leader's freshness pass republishes, on its
+  next 15 s tick, whenever that count differs from the current revoked count — so
+  a revocation whose own publish failed reaches the served CRL without a second
+  revoke (which would return "already revoked"). The check compares counts, never
+  timestamps written by different replicas' clocks.
+- **Boot.** Replicas booting together each publish once, leaving up to N
+  consecutive CRL versions for N replicas — harmless.
+- **What the lock does not cover.** Restoring the database to an earlier point in
+  time, losing an asynchronously replicated commit in a failover, or the
+  `default_certs` runbook clearing `ca_crl_versions`, all restart numbering from
+  the surviving `MAX(version)+1`, which can reuse a crlNumber that was already
+  served. During a rolling upgrade, a publish from an older binary does not take
+  the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
+  a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
 
 **curl examples:**
 
@@ -621,11 +644,13 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   past `nextUpdate`) until leadership is re-acquired. On a single-replica deployment
   a *transient* coordination loss is momentary, but a *persistent* one keeps it
   paused until leadership returns — investigate the coordination connection, don't
-  wait it out. The *operator revoke* publish path is unfenced and always
-  republishes promptly. A failed republish
-  increments `yuzu_server_ca_crl_publish_failures_total` and audits
-  `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
-  server-side enforcement is already live.
+  wait it out. The *operator revoke* publish path is unfenced and republishes
+  immediately. If that republish fails, it increments
+  `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
+  `result=failure` — alert on it: the public CRL is stale while server-side
+  enforcement is already live. The leader's freshness pass then republishes on its
+  next tick once the failure clears (it detects a revocation the latest CRL does
+  not cover); a second revoke is not a retry path — it returns "already revoked".
 - **Back up** `<ca-dir>/default-ca.key` (0600) to offline storage — losing the root key forces a
   full fleet re-enrollment. The issued-cert inventory + CRL history live in the server's Postgres
   substrate (`ca_store` schema) — back it up with the rest of the database (`docs/postgres-store-
@@ -710,8 +735,9 @@ self-contained modules, so a field added to the agent-listener `agent_pb` but no
 the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the
 PR5 `csr_pem` catch; `agent.proto:96`); a per-module roundtrip test covers it but a
 CI regen+diff job (elevated **before PR5d**) is the structural fix; **durable
-cross-instance CRL numbering** — **done** in HA WS-6 slice 6.1 (#4126, #1240 UP-4):
-see "CRL numbering across replicas" above; revoke-superseded-cert-on-renewal; the `is_revoked`
+cross-instance CRL numbering** — **done** in HA WS-6 slice 6.1 (#4126, #1240 UP-4),
+except after a point-in-time restore, an async-failover commit loss or a runbook
+clear of `ca_crl_versions`: see "CRL numbering across replicas" above; revoke-superseded-cert-on-renewal; the `is_revoked`
 heartbeat hot-path in-memory revoked-set memoization (pairs with the open-stream
 sweep); a distinct gateway **upstream TLS-handshake-failure metric**
 (`yuzu_gw_upstream_tls_handshake_failures_total`, R-3) so cert-expiry / CA-rotation

@@ -7540,13 +7540,12 @@ public:
                 // skip the boot CRL on a single replica (leadership is acquired
                 // asynchronously). It is safe ungated because publish_crl() allocates
                 // the crlNumber under CaStore::publish_next_crl's cross-replica table
-                // lock: N replicas booting together publish N consecutive CRLs, never a
-                // duplicate number. The cost is up to N-1 redundant CRL versions per
-                // simultaneous boot, which is harmless. Distinct from WS-10's
+                // lock: N replicas booting together publish up to N consecutive CRLs,
+                // never a duplicate number — at most N-1 redundant versions, harmless. Distinct from WS-10's
                 // `ca.publish_crl` freshness pass in the health loop, which stays gated.
                 if (!publish_crl())
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                                 "the next revocation republishes");
+                                 "the leader's freshness pass or the next revocation republishes");
             }
             // else: nullopt — genuinely no root (operator brought their own certs) —
             // no signer/recognizer/revocation-checker wiring, same as before.
@@ -8216,40 +8215,54 @@ public:
                 // eventually serves a CRL past its nextUpdate (external validators
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
-                // CRL is missing or within 24h of nextUpdate. publish_crl()
-                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
-                // 7 days out so this fires at most ~once/6 days in steady state.
+                // CRL is missing or within 24h of nextUpdate; once it runs,
+                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                //
+                // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
+                // built from the current revoked set — a revoke whose own publish
+                // failed (lock timeout, pool exhaustion) would otherwise stay out of
+                // the served CRL until the nextUpdate window, and retrying the revoke
+                // returns "already revoked" without publishing. The check compares
+                // counts in the database, never timestamps from different replicas'
+                // clocks, so clock skew cannot make it fire repeatedly.
                 if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
                     // Backoff (steady_clock — immune to NTP jumps): after a failed
-                    // freshness publish, don't retry every tick — wait 5 min so a
-                    // persistent failure (bad CA key) doesn't spam logs + the
-                    // failure counter (gov L1/L5).
+                    // publish, don't retry every tick — wait 5 min so a persistent
+                    // failure (bad CA key) doesn't spam logs + the failure counter
+                    // (gov L1/L5).
                     const auto now_steady = std::chrono::steady_clock::now();
-                    if (now_steady >= crl_freshness_retry_after_) {
+                    YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
+                    // WS-3 3.2: only the fenced leader runs this pass, so N replicas
+                    // don't each publish a redundant CRL. Numbering correctness does
+                    // NOT depend on this gate — publish_next_crl's table lock provides
+                    // it (WS-6 6.1). The OPERATOR revoke path (ca_routes.cpp) publishes
+                    // on its own plane and is deliberately NOT gated (two-dispatch-
+                    // planes rule; it carries no background-job assert).
+                    if (now_steady >= crl_freshness_retry_after_ &&
+                        leader_gate_permits<background_job_class("ca.publish_crl")>(
+                            leader_elector_.get())) {
                         // nextUpdate is a wall-clock epoch → compare with wall time.
                         const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
                         auto latest = ca_store_->latest_crl();
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
-                        if (stale) {
-                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            // WS-3 3.2: gate the background freshness re-publish to
-                            // the fenced leader so N replicas don't each publish a
-                            // redundant CRL every stale tick. Numbering correctness
-                            // does NOT depend on this gate — publish_next_crl's table
-                            // lock provides it (WS-6 6.1). The OPERATOR revoke path
-                            // (ca_routes.cpp) publishes on its own plane and is
-                            // deliberately NOT gated (two-dispatch-planes rule; it
-                            // carries no background-job assert).
-                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
-                                    leader_elector_.get())) {
-                                if (publish_crl())
-                                    spdlog::info(
-                                        "PKI: CRL re-published for freshness (nextUpdate window)");
-                                else
-                                    crl_freshness_retry_after_ =
-                                        now_steady + std::chrono::minutes(5);
-                            }
+                        bool unpublished_revocation = false;
+                        if (!stale) {
+                            auto missing = ca_store_->has_unpublished_revocations();
+                            if (!missing)
+                                spdlog::warn("PKI: unpublished-revocation check skipped: {}",
+                                             missing.error());
+                            else
+                                unpublished_revocation = *missing;
+                        }
+                        if (stale || unpublished_revocation) {
+                            if (publish_crl())
+                                spdlog::info(
+                                    "PKI: CRL re-published ({})",
+                                    stale ? "nextUpdate window"
+                                          : "the latest CRL did not cover every revocation");
+                            else
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
                         }
                     }
                 }
@@ -11006,78 +11019,95 @@ private:
     /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
     /// CA / load / sign / persist failure. Number allocation, the revoked-set read
     /// and the insert are one transaction in CaStore::publish_next_crl, serialised
-    /// across every replica by a table lock (HA WS-6 6.1) — so this needs no
-    /// process-local lock, and the key is loaded BEFORE that lock is taken.
+    /// across every replica by a table lock (HA WS-6 6.1); the key is loaded BEFORE
+    /// that lock is taken. If a subordinate import swaps the root in between, the
+    /// store refuses (RootChanged) and this retries once with the new root.
     std::optional<std::vector<std::uint8_t>> publish_crl() {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root_or_err = ca_store_->get_root();
-        if (!root_or_err) {
-            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
-                          root_or_err.error());
-            return std::nullopt;
-        }
-        auto& root = *root_or_err;
-        if (!root)
-            return std::nullopt;
-        const std::filesystem::path dir =
-            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
-        FileKeyProvider kp(dir);
-        auto ca_key = kp.load_key(root->key_ref);
-        if (!ca_key) {
-            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+        auto fail = [this]() -> std::optional<std::vector<std::uint8_t>> {
             metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
             return std::nullopt;
-        }
-        detail::ScopedKeyZero ca_key_zero{*ca_key};
-
-        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
-        // cert fingerprint plus the STABLE key id (invariant across a subordinate
-        // re-key) so the CRL history is attributable to the key, not just a cert.
-        std::string issuer_key_id;
-        if (auto kid = pki::issuer_key_id(root->cert_pem))
-            issuer_key_id = *kid;
-
-        auto build = [&](std::uint64_t number, const std::vector<IssuedCertRecord>& rows)
-            -> std::optional<CaStore::BuiltCrl> {
-            std::vector<pki::CrlRevocation> revoked;
-            revoked.reserve(rows.size());
-            for (const auto& r : rows) {
-                revoked.push_back(
-                    {r.serial_hex,
-                     std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
-            }
-            // thisUpdate is taken under the table lock, so it never runs backwards
-            // relative to the crlNumber order across replicas.
-            const auto now = std::chrono::system_clock::now();
-            const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-            auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
-            if (!der) {
-                spdlog::error("PKI: build_crl failed for CRL v{}", number);
-                return std::nullopt;
-            }
-            return CaStore::BuiltCrl{
-                std::move(*der),
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    validity.not_before.time_since_epoch())
-                    .count(),
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    validity.not_after.time_since_epoch())
-                    .count()};
         };
+        try {
+            for (int attempt = 1; attempt <= 2; ++attempt) {
+                auto root_or_err = ca_store_->get_root();
+                if (!root_or_err) {
+                    spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                                  root_or_err.error());
+                    return fail();
+                }
+                auto& root = *root_or_err;
+                if (!root)
+                    return std::nullopt;
+                const std::filesystem::path dir =
+                    cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+                FileKeyProvider kp(dir);
+                auto ca_key = kp.load_key(root->key_ref);
+                if (!ca_key) {
+                    spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+                    return fail();
+                }
+                detail::ScopedKeyZero ca_key_zero{*ca_key};
 
-        auto rec = ca_store_->publish_next_crl(build, root->fingerprint_sha256, issuer_key_id);
-        if (!rec) {
-            // B-1 (#1240): never report success unless the new CRL is durably recorded.
-            // Otherwise the revoke handler would audit ca.crl.published/success while
-            // /ca/crl keeps serving the PREVIOUS CRL (missing the just-revoked serial).
-            // ADR-0036/ADR-0053: an abort on a degraded revoked-set read or number read
-            // lands here too — never publish over a possibly-incomplete set.
-            spdlog::error("PKI: CRL publish failed — see CaStore::publish_next_crl log");
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
+                // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+                // cert fingerprint plus the STABLE key id (invariant across a subordinate
+                // re-key) so the CRL history is attributable to the key, not just a cert.
+                std::string issuer_key_id;
+                if (auto kid = pki::issuer_key_id(root->cert_pem))
+                    issuer_key_id = *kid;
+
+                auto build = [&](std::uint64_t number, const std::vector<IssuedCertRecord>& rows)
+                    -> std::optional<CaStore::BuiltCrl> {
+                    std::vector<pki::CrlRevocation> revoked;
+                    revoked.reserve(rows.size());
+                    for (const auto& r : rows) {
+                        revoked.push_back({r.serial_hex, std::chrono::system_clock::time_point{
+                                                             std::chrono::seconds{r.revoked_at}}});
+                    }
+                    // This replica's clock, read under the lock. Across replicas with skewed
+                    // clocks thisUpdate can still run backwards relative to crlNumber.
+                    const auto now = std::chrono::system_clock::now();
+                    const pki::Validity validity{now, now + std::chrono::hours(24 * 7)};
+                    auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
+                    if (!der) {
+                        spdlog::error("PKI: build_crl failed for CRL v{}", number);
+                        return std::nullopt;
+                    }
+                    return CaStore::BuiltCrl{
+                        std::move(*der),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_before.time_since_epoch())
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_after.time_since_epoch())
+                            .count()};
+                };
+
+                auto rec =
+                    ca_store_->publish_next_crl(build, root->fingerprint_sha256, issuer_key_id);
+                if (rec)
+                    return std::move(rec->der);
+                if (rec.error() == CaStore::PublishError::RootChanged && attempt == 1) {
+                    spdlog::info("PKI: CA root changed during CRL publish — retrying with the "
+                                 "new root");
+                    continue;
+                }
+                // B-1 (#1240): never report success unless the new CRL is durably recorded.
+                // Otherwise the revoke handler would audit ca.crl.published/success while
+                // /ca/crl keeps serving the PREVIOUS CRL (missing the just-revoked serial).
+                // ADR-0036/ADR-0053: an abort on a degraded revoked-set read or number read
+                // lands here too — never publish over a possibly-incomplete set.
+                spdlog::error("PKI: CRL publish failed — see the CaStore::publish_next_crl "
+                              "log line above for the cause");
+                return fail();
+            }
+        } catch (const std::exception& e) {
+            // The store rolled back; never let a builder exception escape a background thread.
+            spdlog::error("PKI: CRL publish threw: {} — CRL not published", e.what());
+            return fail();
         }
-        return std::move(rec->der);
+        return fail();
     }
 
     // -- Web server -----------------------------------------------------------

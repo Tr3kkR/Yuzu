@@ -21,7 +21,8 @@
 ///                            event-outbox poll, ADR-2002 §5) are ReplicaSafe and
 ///                            must NEVER be leader-gated.
 ///   - FencedLeaderOnly     — side-effecting singleton work that double-fires
-///                            across replicas (agent dispatch, CRL numbering).
+///                            across replicas (agent dispatch, redundant CRL
+///                            re-publishes).
 ///                            Runs only on the WS-3 fenced leader; ENFORCEMENT is
 ///                            slice 10.3 (rides WS-3 3.2), not this file. ADDING a
 ///                            FencedLeaderOnly pass REQUIRES wrapping its dispatch

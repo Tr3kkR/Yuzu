@@ -310,17 +310,33 @@ method does not carry a latent version of the identical bug.
 
 Point 3 above and the "zero production callers" section are superseded. `publish_next_crl` is now
 the ONLY production CRL publish path: `server.cpp`'s `publish_crl()` loads the CA key, then calls
-it with a pure signing callback, and `ServerImpl::crl_publish_mu_` and `CaStore::crl_publish_mu_`
-are both removed. The method runs one transaction that takes
-`LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`, reads `MAX(version)+1` and the
-revoked set on the same connection, signs, inserts and commits. The lock serialises publishers
-across every replica sharing the database, so numbering is strictly increasing with no duplicates
-and no gaps, and a CRL never omits a revocation its predecessor carried. The ADR-0012 §2 rule
-("never hold a lease across disk/signing work") is kept for the disk half: the key load happens
-before the lease is taken. Signing does run while the lease and lock are held — that is
-milliseconds of CPU, and it is what makes the number and the signed content atomic. Points 1 and 2
-(no default number on a read failure; `record_crl` never clobbers) still hold. See ADR-2002 §8
-"Update (2026-09-23)".
+it with a pure signing callback. `ServerImpl::crl_publish_mu_` is removed; `CaStore`'s old mutex
+is replaced by a bounded `std::timed_mutex` taken before the lease, so one process parks at most
+one pool connection on the lock. `record_crl()` became `record_crl_for_test()` (test seeding
+only), and `next_crl_number()` is a read-only peek. The method runs one transaction that sets a
+transaction-scoped `lock_timeout`/`statement_timeout` (so the bound survives a DSN whose
+`options=` suppresses the pool's), takes `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW
+EXCLUSIVE MODE`, re-checks `ca_root`'s fingerprint against the one the caller loaded (a
+subordinate import in between returns `RootChanged`; the caller retries once), reads
+`MAX(version)+1` and the revoked set on the same connection, signs, inserts and commits. The lock
+serialises publishers across every replica sharing the database, so numbering is strictly
+increasing with no duplicates, and a CRL never omits a revocation its predecessor carried.
+
+**Migration v3** adds a nullable `ca_crl_versions.revoked_count` — how many revoked certs the CRL
+was built from — with no backfill (NULL reads as "not covered"). `has_unpublished_revocations()`
+compares it with the current revoked count in one statement, and the leader's freshness pass
+republishes when they differ, so a revoke whose own publish failed reaches the CRL without a
+second revoke.
+
+ADR-0012 §2(b) forbids holding a lease across "network, disk, or other external work". Loading
+the key is disk work and happens before the lease is taken; signing a key already in memory is
+in-process CPU work, so running it under the lease is not a departure from §2(b). A future
+`KeyProvider` backed by a KMS, HSM or PKCS#11 would turn signing into network work under the lease
+and needs a redesign (or an ADR-0012 exception) before it lands — the `CrlBuilder` "pure CPU work"
+contract in `ca_store.hpp` is where that shows. Points 1 and 2 (no default number on a read
+failure; no clobbering) still hold. Residual limits — point-in-time restore, async-failover commit
+loss and the runbook clear of `ca_crl_versions` restart numbering at the surviving MAX+1 — are
+listed in `docs/pki-architecture.md`. See ADR-2002 §8 "Update (2026-09-23)".
 
 ### Backfill (ADR-0009)
 

@@ -212,6 +212,39 @@ std::expected<std::vector<IssuedCertRecord>, std::string> query_revoked_on(PGcon
     return out;
 }
 
+// The single INSERT into ca_crl_versions, shared by publish_next_crl and record_crl_for_test so
+// the column list and the version/DER guards cannot drift apart.
+bool insert_crl_on(PGconn* conn, const CrlVersionRecord& rec) {
+    if (rec.der.empty()) {
+        spdlog::error("CaStore: refusing to record empty CRL");
+        return false;
+    }
+    if (rec.version < 1) {
+        // crlNumber is a positive monotonic sequence (RFC 5280 §5.2.3); version 0 would collide
+        // with COALESCE(MAX,0) sentinels and is never legitimate.
+        spdlog::error("CaStore: refusing to record CRL with version {} (< 1)", rec.version);
+        return false;
+    }
+    // Plain INSERT (never "ON CONFLICT ... DO UPDATE"): a duplicate version is refused, never a
+    // silent clobber of an existing generation.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "INSERT INTO ca_store.ca_crl_versions (version, der, this_update, next_update, "
+        "published_at, issuer_fingerprint, issuer_key_id, revoked_count) "
+        "VALUES ($1::bigint, decode($2,'hex'), $3::bigint, $4::bigint, $5::bigint, $6, $7, "
+        "NULLIF($8, '')::bigint)",
+        std::vector<std::string>{
+            std::to_string(rec.version), bytes_to_hex(rec.der), std::to_string(rec.this_update),
+            std::to_string(rec.next_update), std::to_string(rec.published_at),
+            rec.issuer_fingerprint, rec.issuer_key_id,
+            rec.revoked_count ? std::to_string(*rec.revoked_count) : std::string{}});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("CaStore: insert of CRL v{} failed: {}", rec.version, PQerrorMessage(conn));
+        return false;
+    }
+    return true;
+}
+
 constexpr const char* kRootCols =
     "cert_pem, key_ref, algo, not_before, not_after, fingerprint_sha256, mode, created_at, "
     "chain_pem";
@@ -291,6 +324,11 @@ const std::vector<pg::PgMigration>& migrations() {
         // (PgMigrationRunner applies only version > current — renumbering an already-shipped
         // version re-applies it against a database that already ran it).
         {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
+        // HA WS-6 6.1: how many revoked certs each CRL was built from, so the freshness pass
+        // can tell — without comparing timestamps written by different replicas' clocks —
+        // whether a revocation is missing from the latest CRL. NULL on rows published before v3,
+        // which reads as "not covered" and triggers one republish after upgrade.
+        {3, "ALTER TABLE ca_crl_versions ADD COLUMN revoked_count BIGINT;"},
     };
     return kMigrations;
 }
@@ -671,43 +709,40 @@ std::expected<std::uint64_t, std::string> CaStore::next_crl_number() {
     return static_cast<std::uint64_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
-bool CaStore::record_crl(const CrlVersionRecord& rec) {
+bool CaStore::record_crl_for_test(const CrlVersionRecord& rec) {
     if (!open_)
         return false;
-    if (rec.der.empty()) {
-        spdlog::error("CaStore::record_crl: refusing to record empty CRL");
-        return false;
-    }
-    if (rec.version < 1) {
-        // crlNumber is a positive monotonic sequence (RFC 5280 §5.2.3); version 0 would collide
-        // with COALESCE(MAX,0) sentinels and is never legitimate.
-        spdlog::error("CaStore::record_crl: refusing to record CRL with version {} (< 1)",
-                      rec.version);
-        return false;
-    }
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
-        spdlog::error("CaStore::record_crl: database unavailable");
+        spdlog::error("CaStore::record_crl_for_test: database unavailable");
         return false;
     }
-    // Plain INSERT (never "ON CONFLICT ... DO UPDATE"): a duplicate version is a real conflict
-    // (two publishers raced a number) — fail it so the caller re-allocates, rather than silently
-    // clobbering an existing generation.
+    CrlVersionRecord stamped = rec;
+    if (!stamped.published_at)
+        stamped.published_at = now_epoch();
+    return insert_crl_on(lease.get(), stamped);
+}
+
+std::expected<bool, std::string> CaStore::has_unpublished_revocations() {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    // One statement, one snapshot. Revocations are never undone, so a count that differs from
+    // the one the latest CRL was built from means that CRL does not cover the current set. No
+    // CRL at all, or a pre-v3 row (NULL count), also reads as "not covered".
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "INSERT INTO ca_store.ca_crl_versions (version, der, this_update, next_update, "
-        "published_at, issuer_fingerprint, issuer_key_id) "
-        "VALUES ($1::bigint, decode($2,'hex'), $3::bigint, $4::bigint, $5::bigint, $6, $7)",
-        std::vector<std::string>{
-            std::to_string(rec.version), bytes_to_hex(rec.der), std::to_string(rec.this_update),
-            std::to_string(rec.next_update),
-            std::to_string(rec.published_at ? rec.published_at : now_epoch()),
-            rec.issuer_fingerprint, rec.issuer_key_id});
-    if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("CaStore::record_crl: insert failed: {}", PQerrorMessage(lease.get()));
-        return false;
-    }
-    return true;
+        "SELECT (SELECT revoked_count FROM ca_store.ca_crl_versions ORDER BY version DESC "
+        "LIMIT 1) IS DISTINCT FROM (SELECT COUNT(*) FROM ca_store.ca_issued "
+        "WHERE status = 'revoked')",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "has_unpublished_revocations failed: " +
+                               PQerrorMessage(lease.get()));
+    return std::string_view(PQgetvalue(res.get(), 0, 0)) == "t";
 }
 
 std::optional<CrlVersionRecord> CaStore::latest_crl() {
@@ -736,17 +771,43 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     return r;
 }
 
-std::optional<CrlVersionRecord>
+std::expected<CrlVersionRecord, CaStore::PublishError>
 CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
                           const std::string& issuer_key_id) {
     if (!build || !open_)
-        return std::nullopt;
+        return std::unexpected(PublishError::Failed);
+    // Bound = the longest a holder can legitimately keep it: its own lease wait + lock wait.
+    std::unique_lock local(publish_mu_, std::defer_lock);
+    if (!local.try_lock_for(kWriteTimeout + kCrlLockTimeout)) {
+        spdlog::error("CaStore::publish_next_crl: another CRL publish in this process did not "
+                      "finish within {} ms — giving up",
+                      (kWriteTimeout + kCrlLockTimeout).count());
+        return std::unexpected(PublishError::Busy);
+    }
     std::optional<CrlVersionRecord> published;
+    bool txn_body_ran = false;
+    bool root_changed = false;
     const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // SHARE ROW EXCLUSIVE self-conflicts, so every publisher on every replica sharing this
-        // database queues here until the holder commits or rolls back. It does NOT conflict with
-        // the ACCESS SHARE a plain SELECT takes, so `latest_crl()` / `GET /api/v1/ca/crl` keep
-        // serving throughout. The wait is bounded by the pool's per-connection lock_timeout.
+        txn_body_ran = true;
+        // Transaction-scoped bounds: they hold even when the pool could not set its own at
+        // connect time (a DSN carrying `options=`, or PGOPTIONS). Without them a stalled lock
+        // holder on another replica would make every waiter here block indefinitely.
+        pg::PgResult bounds = pg::exec_params(
+            conn,
+            "SELECT set_config('lock_timeout', $1, true), "
+            "set_config('statement_timeout', $2, true)",
+            std::vector<std::string>{std::to_string(kCrlLockTimeout.count()) + "ms",
+                                     std::to_string(kCrlStatementTimeout.count()) + "ms"});
+        if (bounds.status() != PGRES_TUPLES_OK) {
+            spdlog::error("CaStore::publish_next_crl: setting txn timeouts failed: {} — aborting",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        // SHARE ROW EXCLUSIVE conflicts with itself and with the ROW EXCLUSIVE any INSERT takes,
+        // so every publisher on every replica — and any writer that doesn't opt in, which an
+        // advisory lock would not stop — queues here until the holder commits or rolls back. It
+        // does NOT conflict with the ACCESS SHARE a plain SELECT takes, so `latest_crl()` /
+        // `GET /api/v1/ca/crl` keep serving throughout.
         pg::PgResult lock = pg::exec_params(
             conn, "LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE",
             std::vector<std::string>{});
@@ -754,6 +815,26 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
             spdlog::error("CaStore::publish_next_crl: CRL table lock failed: {} — aborting",
                           PQerrorMessage(conn));
             return false;
+        }
+        // The caller read the root and loaded its key before the lock. A subordinate import that
+        // committed in between would otherwise let this publish record a CRL signed under the
+        // superseded issuer AFTER the import's own CRL, so the latest CRL would carry the wrong
+        // issuer until the next publish.
+        if (!issuer_fingerprint.empty()) {
+            pg::PgResult root = pg::exec_params(
+                conn, "SELECT fingerprint_sha256 FROM ca_store.ca_root WHERE id = 1",
+                std::vector<std::string>{});
+            if (root.status() != PGRES_TUPLES_OK) {
+                spdlog::error("CaStore::publish_next_crl: root re-read failed: {} — aborting",
+                              PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(root.get()) != 1 || text_col(root.get(), 0, 0) != issuer_fingerprint) {
+                spdlog::warn("CaStore::publish_next_crl: CA root changed since the caller loaded "
+                             "it — aborting so the caller re-reads the root");
+                root_changed = true;
+                return false;
+            }
         }
         pg::PgResult num = pg::exec_params(
             conn, "SELECT COALESCE(MAX(version), 0) + 1 FROM ca_store.ca_crl_versions",
@@ -766,8 +847,8 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         const auto number = static_cast<std::uint64_t>(to_i64(PQgetvalue(num.get(), 0, 0)));
         // Read AFTER the lock: every revocation committed before the previous CRL's commit is
         // visible to this statement, so CRL N+1 is always a superset of CRL N. A revocation
-        // committing after this read is picked up by that revoke's own publish, which queues
-        // behind this one on the lock above.
+        // committing after this read is covered by that revoke's own publish (queued behind this
+        // one) or, if that publish fails, by the freshness pass's unpublished-revocation check.
         auto revoked = query_revoked_on(conn);
         if (!revoked) {
             spdlog::error("CaStore::publish_next_crl: {} — aborting (never build a CRL over a "
@@ -788,29 +869,23 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         rec.published_at = now_epoch();
         rec.issuer_fingerprint = issuer_fingerprint;
         rec.issuer_key_id = issuer_key_id;
-        pg::PgResult ins = pg::exec_params(
-            conn,
-            "INSERT INTO ca_store.ca_crl_versions (version, der, this_update, next_update, "
-            "published_at, issuer_fingerprint, issuer_key_id) "
-            "VALUES ($1::bigint, decode($2,'hex'), $3::bigint, $4::bigint, $5::bigint, $6, $7)",
-            std::vector<std::string>{std::to_string(rec.version), bytes_to_hex(rec.der),
-                                     std::to_string(rec.this_update),
-                                     std::to_string(rec.next_update),
-                                     std::to_string(rec.published_at), rec.issuer_fingerprint,
-                                     rec.issuer_key_id});
-        if (ins.status() != PGRES_COMMAND_OK) {
-            spdlog::error("CaStore::publish_next_crl: insert of v{} failed: {}", number,
-                          PQerrorMessage(conn));
+        rec.revoked_count = static_cast<int64_t>(revoked->size());
+        if (!insert_crl_on(conn, rec))
             return false;
-        }
         published = std::move(rec);
         return true;
     });
+    if (!txn_body_ran)
+        spdlog::error("CaStore::publish_next_crl: no database connection within {} ms ({}) — "
+                      "CRL not published",
+                      kWriteTimeout.count(), pool_.last_error());
+    if (root_changed)
+        return std::unexpected(PublishError::RootChanged);
     // A lost COMMIT acknowledgement reports failure even if Postgres committed. That is the safe
     // direction: the caller reports "not republished", and the next publish takes the next number.
-    if (!committed)
-        return std::nullopt;
-    return published;
+    if (!committed || !published)
+        return std::unexpected(PublishError::Failed);
+    return std::move(*published);
 }
 
 } // namespace yuzu::server

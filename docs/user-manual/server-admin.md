@@ -413,6 +413,41 @@ operator-facing detail, and
 `docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
 for the decision record.
 
+### vNEXT — CRL publishing is serialised in Postgres, and a missed CRL now republishes itself (HA WS-6 6.1, #4126; NOT breaking)
+
+Every CRL publish (startup, an operator revoke, a subordinate-CA import, and the
+freshness re-publish) now runs as one Postgres transaction under a lock on the
+`ca_store.ca_crl_versions` table, instead of behind a lock inside one server
+process. The `ca_store` schema migrates to v3 (a nullable `revoked_count`
+column on `ca_crl_versions`); nothing is backfilled.
+
+What changes on **every** deployment, including single-server:
+
+- **A CRL publish can now fail on lock contention.** A publish that waits more
+  than 5 s for the table lock gives up. On `POST /api/v1/ca/revoke` and MCP
+  `revoke_certificate` that shows as `crl_republished:false` plus a
+  `ca.crl.published` failure audit; every trigger increments
+  `yuzu_server_ca_crl_publish_failures_total`. The revocation itself still
+  takes effect immediately server-side.
+- **A revocation missing from the served CRL is now republished automatically.**
+  Previously, if a revoke's own CRL publish failed, the revocation stayed out of
+  `GET /api/v1/ca/crl` until the next revoke or until the CRL was within 24 h of
+  its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
+  revoked" and does not publish. The freshness pass now also republishes, on its
+  next 15 s tick, whenever the latest CRL was not built from the current revoked
+  set (after a failed attempt it waits 5 minutes before trying again). Expect
+  one extra CRL version after the upgrade (rows from before v3 read as "not
+  covered") and, occasionally, a redundant version shortly after a revoke.
+
+Single-server remains the only supported topology. If you nevertheless run two
+server versions against one database during an upgrade, a publish from the
+**older** binary does not take the lock and can still publish a CRL that omits a
+revocation the newer binary just recorded; the newer binary's freshness pass
+republishes it within a tick once it is running. Multi-replica PKI also still
+needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
+freshness pass runs only on the elected leader, and a leader whose CA directory
+lacks the CA key can never publish.
+
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
 New, non-breaking, and inert on a single-server deployment. As one step toward
@@ -2378,7 +2413,9 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
 2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
-   *Revoked* and the public CRL is republished automatically.
+   *Revoked* and the public CRL is republished automatically. If that publish
+   fails (the panel says so), the server republishes it on its own within about
+   15 seconds of the failure clearing — you do not need to revoke again.
 
 Revocation takes effect **immediately server-side**: the agent is refused on its
 next connection, and any already-open command stream is torn down by the

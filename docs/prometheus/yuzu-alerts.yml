@@ -1409,13 +1409,18 @@ groups:
           summary: "Internal-CA CRL (re)publish is failing"
           description: >-
             yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
-            attempt failed (CA key load / build / record). Consumers keep
-            serving the last still-valid CRL, so this is not yet an outage, but
-            a revocation made since the last successful publish is NOT
-            reflected in the public CRL — server-side enforcement (is_revoked())
-            is unaffected and still blocks the revoked cert directly. Check
-            Postgres availability (ca_store schema) and CA key
-            loadability. See docs/pki-architecture.md "CRL distribution".
+            attempt failed (CA key load / build / record, or a wait of more than
+            5s for the ca_store.ca_crl_versions lock held by another publisher).
+            Consumers keep serving the last still-valid CRL, so this is not yet
+            an outage, but a revocation made since the last successful publish
+            is NOT yet in the public CRL — server-side enforcement (is_revoked())
+            is unaffected and still blocks the revoked cert directly. The
+            leader's freshness pass retries on its own (every 15s, 5 min backoff
+            after a failure) until the CRL covers every revocation, so a
+            transient cause clears without action. If it keeps firing, check
+            Postgres availability (ca_store schema), pg_locks on
+            ca_store.ca_crl_versions, and CA key loadability on the leader. See
+            docs/pki-architecture.md "CRL distribution".
           runbook_url: "https://docs.yuzu.io/runbooks/ca-crl-publish-failing"
 
       - alert: YuzuCaRevocationSweepReadFailing
