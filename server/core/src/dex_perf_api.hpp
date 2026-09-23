@@ -60,8 +60,9 @@
 ///     a stored read at all (`DexApi`'s own scope note; still unowned).
 ///
 /// ── Why ONE seam for heartbeat-now (F2a) AND app-perf-over-time (F2b) ──
-/// A single consumer class already holds both halves (`dex_routes.hpp`'s
-/// `PerfFn` + `app_perf_providers_` members); ONE securable
+/// A single consumer class already held both halves, before this seam existed
+/// (`dex_routes.hpp`'s now-removed `PerfFn` + `app_perf_providers_` members);
+/// ONE securable
 /// (`GuaranteedState:Read`) and ONE floor constant (`kDexCohortFloor`,
 /// `dex_perf_model.hpp`) is consumed by BOTH — splitting them would put the
 /// floor's owner and a consumer in different seams; and the heartbeat-now half
@@ -174,8 +175,9 @@ public:
     /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (a named group is a
     /// set of specific devices, so a small-N aggregate is de-facto individual
     /// behaviour — works-council). `nullopt` = the aggregate read failed OR the
-    /// group/tag store is unwired. A DEGRADED member-resolution read is a known
-    /// pre-existing gap, NOT covered by `nullopt` today:
+    /// B1 `group_reader_` is unwired OR the group/tag store is unwired. A
+    /// DEGRADED member-resolution read is a known pre-existing gap, NOT
+    /// covered by `nullopt` today:
     /// `ManagementGroupStore::get_members` returns an empty vector rather than
     /// a distinguishable error on a store degrade, so `LocalDexPerfApi` cannot
     /// tell "genuinely zero members" from "the read failed" and renders the

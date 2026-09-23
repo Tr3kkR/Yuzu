@@ -22,13 +22,14 @@
 /// VerifyApi's own test wiring, or `.tag_values` for a caller's own picker,
 /// need NO field-level changes — only the type name at the declaration site.
 ///
-/// The individual `AppPerfXxxFn` provider typedefs `Providers` is built from
-/// used to live in the production `dex_app_perf_builders.hpp` alongside the
-/// (now-retired) `AppPerfProviders` bundle; they were production-orphaned the
-/// moment that bundle retired (no production caller ever built one directly)
-/// and are defined below instead. `.cohort`'s `AppPerfCohortFn`/`CohortRead`
-/// are `FnVerifyApi`'s own types (`test_verify_api_double.hpp`) — included
-/// here rather than re-defined, so the two test doubles can never drift.
+/// The individual `AppPerfXxxFn` provider typedefs (that `Providers` below is
+/// built from) used to live in the production `dex_app_perf_builders.hpp`
+/// alongside the (now-retired) `AppPerfProviders` bundle; they were
+/// production-orphaned the moment that bundle retired (no production caller
+/// ever built one directly) and are defined below instead. `.cohort`'s
+/// `AppPerfCohortFn`/`CohortRead` are `FnVerifyApi`'s own types
+/// (`test_verify_api_double.hpp`) — included here rather than re-defined, so
+/// the two test doubles can never drift.
 ///
 /// NOT for production use — the production factory is `make_local_dex_perf_api`
 /// (dex_perf_api_local.hpp), which wires real store pointers instead.

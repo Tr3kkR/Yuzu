@@ -2368,6 +2368,31 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
+    SECTION("empty rows -> \"No application performance history\" placeholder, not the "
+            "unavailable note") {
+        // A wired, healthy provider that simply has nothing retained yet for this
+        // device (present-empty, distinct from the nullopt degrade below) must
+        // render the honest-empty state, never the "unavailable" wording reserved
+        // for an unwired/degraded read.
+        providers.device =
+            [](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+            CHECK(agent_id == "WS-1");
+            return std::vector<AppPerfDailyRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("No application performance history") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable") == std::string::npos);
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
+    }
+
     SECTION("store degrade (nullopt) -> 200 honest note (htmx drops 4xx/5xx), audit still fired") {
         degrade = true;
         test::TestRouteSink sink;
@@ -2382,7 +2407,8 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         // 503 body, rendering nothing — the exact "fake empty" the note avoids.
         CHECK(r->status == 200);
         // SAME unified F2b wording as the trend/app-list fragments (C-1).
-        CHECK(r->body.find("App performance data unavailable") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
         // The access audit fires BEFORE the read, so a degrade still carries the row.
         CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
@@ -2393,7 +2419,8 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit); // dex_perf_api={}
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
-        CHECK(r->body.find("App performance data unavailable") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
         // #4626: dex_perf_api_ is constructed UNCONDITIONALLY in production, so
         // there is no longer a distinct "provider unwired" signal to check
         // BEFORE the audit — the audit now fires even on this null-dex_perf_api_
@@ -2842,7 +2869,8 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         // #4626 Concern A: DexPerfApi::tag_trend collapses "unwired" and
         // "degraded" to the SAME nullopt — ONE honest wording, not the old
         // "no device-model cohort reader wired" placeholder.
-        CHECK(r->body.find("App performance data unavailable") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
     }
 
     SECTION("model path: store degrade (tag_cohort returns nullopt) -> honest placeholder") {
@@ -2861,7 +2889,8 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         REQUIRE(r);
         CHECK(r->status == 200);
         // #4626 Concern A: ONE honest wording (see the sibling "unwired" test above).
-        CHECK(r->body.find("App performance data unavailable") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
     }
 
     SECTION("tag_values_fn populates the Model selector regardless of active scope branch") {
