@@ -19,6 +19,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -121,10 +122,29 @@ struct PortalDecision {
 
 // ── one Lookup call ─────────────────────────────────────────────────────
 
-enum class LookupError { service_unknown, not_found, access_denied, failed };
+enum class LookupError { service_unknown, not_found, access_denied, timeout, failed };
 
-/// A failed Lookup, by its D-Bus error name.
-[[nodiscard]] constexpr LookupError classify_lookup_error(std::string_view dbus_error_name) noexcept {
+// ── one total deadline across every Lookup ─────────────────────────────
+
+/// The whole collection's D-Bus budget: each Lookup gets only what is left of it as its own
+/// method-call timeout, so a portal that accepts the call but never answers holds the dispatch
+/// thread for at most this long in total, never once per lookup. Same 5 s as firewall's budget.
+inline constexpr std::uint64_t kPortalTotalBudgetUs = 5'000'000;
+
+/// Microseconds left of `total_us` after `elapsed_us`; 0 = exhausted. The leg never issues a
+/// Lookup with 0 (sd-bus reads a 0 timeout as "the default") -- that category gets a
+/// `<category>:timeout` row instead.
+[[nodiscard]] constexpr std::uint64_t remaining_budget_us(std::uint64_t total_us,
+                                                          std::uint64_t elapsed_us) noexcept {
+    return elapsed_us >= total_us ? 0 : total_us - elapsed_us;
+}
+
+/// A failed Lookup, by its D-Bus error name, or by its positive errno: ETIMEDOUT (the call ran out
+/// of the remaining budget) is `timeout` whatever name sd-bus attached.
+[[nodiscard]] constexpr LookupError classify_lookup_error(std::string_view dbus_error_name,
+                                                          int err = 0) noexcept {
+    if (err == ETIMEDOUT || dbus_error_name == "org.freedesktop.DBus.Error.Timeout")
+        return LookupError::timeout;
     if (dbus_error_name == "org.freedesktop.DBus.Error.ServiceUnknown")
         return LookupError::service_unknown;
     if (dbus_error_name == "org.freedesktop.portal.Error.NotFound") return LookupError::not_found;
@@ -148,6 +168,9 @@ inline bool append_lookup_error_rows(const PortalTable& t, LookupError e,
         return false;
     case LookupError::access_denied:
         rows.push_back(failure_row("linux", "-", t.category, true, cat + ":access_denied", acc));
+        return false;
+    case LookupError::timeout:
+        rows.push_back(failure_row("linux", "-", t.category, false, cat + ":timeout", acc));
         return false;
     case LookupError::failed:
         break;

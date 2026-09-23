@@ -121,6 +121,45 @@ inline constexpr std::uint32_t kRegQword = 11;
     return rc == kErrorAccessDenied ? std::string{"access_denied"} : "win32_" + std::to_string(rc);
 }
 
+// ── retention bounds (the ConsentStore is under its owning user's write access) ──
+
+/// Cap on one ConsentStore `Value`, in bytes as the registry reports them (UTF-16 + NUL). The
+/// literals measured on the-rig are `Allow`/`Deny`/`Prompt` (at most 14 bytes); 64 bytes (31
+/// characters) leaves room for a longer literal Windows may add without letting a profile owner
+/// make the agent retain the generic 1 MiB registry cap per value. Over it is `value_oversized`.
+inline constexpr std::uint32_t kMaxConsentValueBytes = 64;
+
+/// One run-wide bound on what the Windows walk retains before emitting, across every profile,
+/// HKLM, capability and level (the per-list 4096-child caps alone multiply to tens of GiB).
+/// 65536 grants = kMaxProfiles (512) x 4 categories x 32 entries; 16 MiB = 65536 x 256 bytes of
+/// app_id/value/cause text -- the variable, owner-controlled part of a grant (a NonPackaged path
+/// is well under 256 bytes; a hostile 512-character name makes the byte bound bind first).
+inline constexpr std::size_t kMaxRetainedGrants = 65536;
+inline constexpr std::size_t kMaxRetainedBytes = 16u * 1024u * 1024u;
+
+/// The run-wide budget. charge() is called BEFORE a grant is retained; once either limit would be
+/// crossed it refuses, stays refused (sticky), and the collector stops walking, keeps every row
+/// already charged and reports `collection:budget_exceeded` (unreadable, CONSTRAINED).
+struct RetentionBudget {
+    std::size_t max_grants = kMaxRetainedGrants;
+    std::size_t max_bytes = kMaxRetainedBytes;
+    std::size_t grants = 0;
+    std::size_t bytes = 0;
+    bool exhausted = false;
+
+    [[nodiscard]] bool charge(std::size_t n_bytes) noexcept {
+        if (exhausted || grants + 1 > max_grants || n_bytes > max_bytes - bytes) {
+            exhausted = true;
+            return false;
+        }
+        ++grants;
+        bytes += n_bytes;
+        return true;
+    }
+};
+
+inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
+
 // ── subkey enumeration outcome ─────────────────────────────────────────
 
 enum class EnumOutcome { complete, truncated, failed };
@@ -165,6 +204,29 @@ struct EnumFailure {
     }
     return EnumFailure{std::string{kind} + "_enum_" + std::to_string(v.rc),
                        v.rc == kErrorAccessDenied};
+}
+
+/// How ProfileList discovery ended, as the one whole-source failure it contributes (nullopt: every
+/// profile subkey was enumerated). `root_rc` opened ProfileList; `last_rc`/`probe_rc` are the walk's
+/// terminating RegEnumKeyExW code and cap probe (classify_subkey_enum). A refused root or a refused
+/// mid-walk enumeration is `denied` (PERMISSION_DENIED); any other root failure, terminating error
+/// or a cap with more profiles is `unreadable` -- never a prefix read as the complete list.
+[[nodiscard]] inline std::optional<EnumFailure> profile_discovery_failure(long root_rc, long last_rc,
+                                                                          long probe_rc) {
+    if (root_rc == kErrorAccessDenied) return EnumFailure{"profiles:profile_list_access_denied", true};
+    if (root_rc != kErrorSuccess) return EnumFailure{"profiles:profile_list_unreadable", false};
+    const auto v = classify_subkey_enum(last_rc, probe_rc);
+    if (v.outcome == EnumOutcome::complete) return std::nullopt;
+    if (v.outcome == EnumOutcome::truncated) return EnumFailure{"profiles:truncated", false};
+    return EnumFailure{"profiles:enum_" + std::to_string(v.rc), v.rc == kErrorAccessDenied};
+}
+
+/// One ProfileList record whose SID key (`key_open`) or ProfileImagePath value failed to read.
+/// A refusal is `denied` even when that profile's hive is still reached through HKU.
+[[nodiscard]] inline EnumFailure profile_record_failure(bool key_open, long rc) {
+    return {std::string{key_open ? "profiles:profile_key_" : "profiles:profile_image_path_"} +
+                win32_cause(rc),
+            rc == kErrorAccessDenied};
 }
 
 // ── profile SID validation ──────────────────────────────────────────────
@@ -234,6 +296,35 @@ struct RawGrant {
     return g.read_denied || g.state == PermissionState::unreadable;
 }
 
+/// A LastUsedTime* field that was never set (RawGrant's default for both).
+inline const LastUsedField kLastUsedNotSet{"-", {}, false};
+
+/// Every retained grant's owner-controlled text, charged against RetentionBudget.
+[[nodiscard]] inline std::size_t retained_bytes(const RawGrant& g) noexcept {
+    return g.app_id.size() + g.raw_value.size() + g.cause.size();
+}
+
+/// A category-level failure that is not one Value read (a key that refused/failed to open, an
+/// enumeration that failed or hit its cap). Kept apart from the (app_id, category)-keyed grants
+/// so the precedence merge can never overwrite or drop it.
+[[nodiscard]] inline RawGrant structural_failure(std::string app_id, std::string_view category,
+                                                 std::string cause, bool denied) {
+    return {std::move(app_id), category,
+            denied ? PermissionState::denied : PermissionState::unreadable, "-",
+            kLastUsedNotSet, kLastUsedNotSet, std::move(cause), denied};
+}
+
+/// A `<capability>\NonPackaged` key that did not open. Genuinely missing is the desktop-apps
+/// toggle row reading `absent` -- the toggle is its own row at every level, never omitted; any
+/// other code is a `nonpackaged_container:<cause>` structural failure.
+[[nodiscard]] inline RawGrant nonpackaged_open_failure(std::string_view category, long rc) {
+    if (rc == kErrorFileNotFound)
+        return {std::string{kNonPackagedToggleAppId}, category, PermissionState::absent, "-",
+                kLastUsedNotSet, kLastUsedNotSet, {}, false};
+    return structural_failure("-", category, "nonpackaged_container:" + win32_cause(rc),
+                              rc == kErrorAccessDenied);
+}
+
 /// PRECEDENCE -- Microsoft's documented Settings model for the ConsentStore, confirmed on the-rig
 /// (a non-MDM host carries HKLM `<capability>` `Value Allow` on every capability): the
 /// machine-wide HKLM `Value` is the DEVICE toggle ("allow access on this device"). An HKLM `Deny`
@@ -251,12 +342,12 @@ struct RawGrant {
 
 /// Whether an HKLM entry is emitted ONCE as HKLM's own unqualified row. An overriding `Deny` is
 /// applied into each reachable profile's merge instead, so it is its own row only when no
-/// profile was reachable to carry it. Everything else HKLM holds is its own row -- except a
-/// capability-level `absent` coverage entry, which says nothing and is left to
-/// fill_uncovered_categories.
+/// profile was reachable to carry it. Everything else HKLM holds is its own row -- a
+/// capability-level `absent` included: HKLM was read and definitively holds nothing there, and
+/// that row must survive a profile-side whole-source failure (which suppresses
+/// fill_uncovered_categories' backstop for every source).
 [[nodiscard]] inline bool hklm_emitted_once(const RawGrant& g, bool any_profile_reachable) noexcept {
-    if (hklm_overrides_profile(g)) return !any_profile_reachable;
-    return grant_failed(g) || g.app_id != "-" || g.state != PermissionState::absent;
+    return !hklm_overrides_profile(g) || !any_profile_reachable;
 }
 
 /// The profile's own grants with every overriding HKLM `Deny` applied (hklm_overrides_profile):
@@ -264,12 +355,19 @@ struct RawGrant {
 /// the profile lacks. A FAILED profile entry is never overwritten -- its failure row is kept and
 /// the HKLM value is added beside it, so a read failure is never hidden behind a policy value.
 /// Every other HKLM entry is skipped here (the caller reports those once, hklm_emitted_once).
+/// Two profile entries with the same (app_id, category) -- distinct registry keys that decode to
+/// one id, e.g. NonPackaged `C::a.exe` and `C:#3Aa.exe` -- are both kept as stored, plus one
+/// `duplicate_app_id` unreadable row naming the collision; neither silently replaces the other.
 /// Output sorted by (app_id, category).
 [[nodiscard]] inline std::vector<RawGrant> merge_with_hklm(std::span<const RawGrant> profile,
                                                            std::span<const RawGrant> hklm) {
     std::map<std::pair<std::string, std::string_view>, RawGrant> merged;
-    std::vector<RawGrant> extra; // HKLM values applied beside a failed profile entry
-    for (const auto& g : profile) merged[{g.app_id, g.category}] = g;
+    std::vector<RawGrant> extra; // duplicates, their collision rows, HKLM beside a failed entry
+    for (const auto& g : profile) {
+        if (merged.try_emplace({g.app_id, g.category}, g).second) continue;
+        extra.push_back(g);
+        extra.push_back(structural_failure(g.app_id, g.category, "duplicate_app_id", false));
+    }
     for (const auto& h : hklm) {
         if (!hklm_overrides_profile(h)) continue;
         const auto it = merged.find({h.app_id, h.category});

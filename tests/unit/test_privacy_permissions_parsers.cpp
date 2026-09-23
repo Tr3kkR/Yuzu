@@ -460,7 +460,7 @@ TEST_CASE("win: the three ConsentStore levels on the-rig's real shapes -- the No
 }
 
 TEST_CASE("win::hklm_emitted_once: an overriding Deny is HKLM's own row only with no reachable "
-          "profile; Allow, failures and app-level entries always; a capability-level absent never",
+          "profile; Allow, failures, app-level entries and a capability-level absent always",
           "[privacy_permissions][win_parsers]") {
     win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
     win::RawGrant allow{"-", "camera", PermissionState::allowed, "Allow"};
@@ -476,8 +476,125 @@ TEST_CASE("win::hklm_emitted_once: an overriding Deny is HKLM's own row only wit
     CHECK(win::hklm_emitted_once(allow, true));
     CHECK(win::hklm_emitted_once(refused, true));
     CHECK(win::hklm_emitted_once(absent_app, true));
-    CHECK_FALSE(win::hklm_emitted_once(absent_cap, true));
-    CHECK_FALSE(win::hklm_emitted_once(absent_cap, false));
+    CHECK(win::hklm_emitted_once(absent_cap, true));
+    CHECK(win::hklm_emitted_once(absent_cap, false));
+}
+
+TEST_CASE("win: failed profile discovery never suppresses HKLM's definitive capability-level "
+          "absences -- they are HKLM's own rows, not left to the backstop",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows{
+        failure_row("windows", "-", "-", false, "profiles:profile_list_unreadable", acc)};
+    for (const auto& cap : win::kCapabilities) { // HKLM ConsentStore root: ERROR_FILE_NOT_FOUND
+        const win::RawGrant g{"-", cap.category, PermissionState::absent, "-"};
+        if (win::hklm_emitted_once(g, false))
+            rows.push_back({"windows", g.app_id, g.category, g.state, g.raw_value, "-", "-", false});
+    }
+    fill_uncovered_categories("windows", rows); // suppressed by the whole-source row
+    REQUIRE(rows.size() == 1 + kCategories.size());
+    for (std::size_t i = 0; i < kCategories.size(); ++i) {
+        CHECK(rows[i + 1].category == kCategories[i]);
+        CHECK(rows[i + 1].state == PermissionState::absent);
+    }
+}
+
+TEST_CASE("win::profile_discovery_failure: a refused root or mid-walk enumeration is denied; any "
+          "other root failure, terminating error or cap overflow is unreadable; only a clean end "
+          "(or exactly the cap) is complete",
+          "[privacy_permissions][win_parsers]") {
+    const long ok = win::kErrorSuccess, done = win::kErrorNoMoreItems, refused = win::kErrorAccessDenied;
+    const auto check = [](std::optional<win::EnumFailure> f, std::string cause, bool denied) {
+        REQUIRE(f);
+        CHECK(f->cause == cause);
+        CHECK(f->denied == denied);
+    };
+    check(win::profile_discovery_failure(refused, ok, done), "profiles:profile_list_access_denied", true);
+    check(win::profile_discovery_failure(2, ok, done), "profiles:profile_list_unreadable", false);
+    CHECK_FALSE(win::profile_discovery_failure(ok, done, done));       // walk ended cleanly
+    CHECK_FALSE(win::profile_discovery_failure(ok, ok, done));         // exactly the cap
+    check(win::profile_discovery_failure(ok, ok, ok), "profiles:truncated", false);
+    check(win::profile_discovery_failure(ok, refused, done), "profiles:enum_5", true);
+    check(win::profile_discovery_failure(ok, 1018, done), "profiles:enum_1018", false);
+    check(win::profile_discovery_failure(ok, ok, refused), "profiles:enum_5", true); // cap probe
+    const auto key = win::profile_record_failure(true, refused);
+    CHECK(key.cause == "profiles:profile_key_access_denied");
+    CHECK(key.denied);
+    const auto path = win::profile_record_failure(false, 1018);
+    CHECK(path.cause == "profiles:profile_image_path_win32_1018");
+    CHECK_FALSE(path.denied);
+}
+
+TEST_CASE("win::RetentionBudget: refuses the grant that would cross either run-wide bound, stays "
+          "refused; the ConsentStore Value cap fits every measured literal",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::kMaxConsentValueBytes == 64);
+    CHECK(win::kMaxConsentValueBytes >= (std::string_view{"Prompt"}.size() + 1) * 2);
+    win::RetentionBudget defaults;
+    CHECK(defaults.max_grants == win::kMaxRetainedGrants);
+    CHECK(defaults.max_bytes == win::kMaxRetainedBytes);
+    SECTION("grant count: the cap-th grant fits, one more is refused") {
+        win::RetentionBudget b{3, 1000};
+        CHECK(b.charge(1));
+        CHECK(b.charge(1));
+        CHECK(b.charge(1));
+        CHECK_FALSE(b.charge(0));
+        CHECK(b.exhausted);
+        CHECK(b.grants == 3);
+    }
+    SECTION("bytes: exactly the cap fits, one byte over is refused, and refusal is sticky") {
+        win::RetentionBudget b{100, 10};
+        CHECK(b.charge(6));
+        CHECK(b.charge(4));
+        CHECK(b.bytes == 10);
+        CHECK_FALSE(b.charge(1));
+        CHECK_FALSE(b.charge(0)); // sticky: nothing more is retained once exhausted
+        CHECK(b.grants == 2);
+    }
+    SECTION("one oversized grant is refused without wrapping the arithmetic") {
+        win::RetentionBudget b{100, 10};
+        CHECK_FALSE(b.charge(static_cast<std::size_t>(-1)));
+        CHECK(b.exhausted);
+    }
+    const win::RawGrant g{"C:\\a.exe", "camera", PermissionState::allowed, "Allow"};
+    CHECK(win::retained_bytes(g) == std::string_view{"C:\\a.exe"}.size() + 5);
+    CHECK(win::kBudgetExceededToken == "collection:budget_exceeded");
+}
+
+TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggle row reading "
+          "absent; a refusal is denied, any other code unreadable",
+          "[privacy_permissions][win_parsers]") {
+    const auto missing = win::nonpackaged_open_failure("camera", win::kErrorFileNotFound);
+    CHECK(missing.app_id == win::kNonPackagedToggleAppId);
+    CHECK(missing.state == PermissionState::absent);
+    CHECK(missing.cause.empty());
+    CHECK_FALSE(win::grant_failed(missing));
+    const auto refused = win::nonpackaged_open_failure("camera", win::kErrorAccessDenied);
+    CHECK(refused.app_id == "-");
+    CHECK(refused.read_denied);
+    CHECK(refused.cause == "nonpackaged_container:access_denied");
+    const auto other = win::nonpackaged_open_failure("camera", 1);
+    CHECK(other.state == PermissionState::unreadable);
+    CHECK(other.cause == "nonpackaged_container:win32_1");
+}
+
+TEST_CASE("win::merge_with_hklm: two registry keys decoding to one app id keep both rows plus a "
+          "duplicate_app_id row -- neither silently replaces the other",
+          "[privacy_permissions][win_parsers]") {
+    const std::string id = win::unescape_nonpackaged_app_id("C:#3Aa.exe");
+    REQUIRE(id == win::unescape_nonpackaged_app_id("C::a.exe"));
+    const std::vector<win::RawGrant> profile{{id, "camera", PermissionState::allowed, "Allow"},
+                                             {id, "camera", PermissionState::denied, "Deny"}};
+    const auto m = win::merge_with_hklm(profile, {});
+    REQUIRE(m.size() == 3);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Allow"; }) == 1);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Deny"; }) == 1);
+    const auto collision = std::find_if(m.begin(), m.end(), [](const win::RawGrant& g) {
+        return g.cause == "duplicate_app_id";
+    });
+    REQUIRE(collision != m.end());
+    CHECK(collision->app_id == id);
+    CHECK(collision->state == PermissionState::unreadable);
 }
 
 TEST_CASE("win::classify_subkey_enum + enum_failure: exactly the cap is complete (no token), more "
@@ -812,6 +929,8 @@ TEST_CASE("portal::classify_lookup_error + append_lookup_error_rows: NotFound ab
           LookupError::access_denied);
     CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.NoReply") == LookupError::failed);
     CHECK(portal::classify_lookup_error("") == LookupError::failed);
+    CHECK(portal::classify_lookup_error("", ETIMEDOUT) == LookupError::timeout);
+    CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.Timeout") == LookupError::timeout);
 
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
@@ -827,6 +946,20 @@ TEST_CASE("portal::classify_lookup_error + append_lookup_error_rows: NotFound ab
     CHECK(rows[1].raw == "camera:access_denied");
     CHECK(rows[2].state == PermissionState::unreadable);
     CHECK(rows[2].raw == "camera:lookup_failed");
+    CHECK_FALSE(portal::append_lookup_error_rows(cam, LookupError::timeout, rows, acc));
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[3].state == PermissionState::unreadable);
+    CHECK(rows[3].raw == "camera:timeout");
+}
+
+TEST_CASE("portal::remaining_budget_us: one total deadline -- the time left, 0 once spent",
+          "[privacy_permissions][linux_parsers]") {
+    CHECK(portal::kPortalTotalBudgetUs == 5'000'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 0) == 5'000'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 1'250'000) == 3'750'000);
+    CHECK(portal::remaining_budget_us(5'000'000, 4'999'999) == 1);
+    CHECK(portal::remaining_budget_us(5'000'000, 5'000'000) == 0);
+    CHECK(portal::remaining_budget_us(5'000'000, 9'000'000) == 0);
 }
 
 TEST_CASE("portal::finish_portal_rows: ServiceUnknown on EVERY lookup is whole-mechanism "

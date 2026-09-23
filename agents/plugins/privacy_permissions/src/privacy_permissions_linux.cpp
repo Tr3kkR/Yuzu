@@ -30,12 +30,16 @@
  * (classify_session_bus_open), never folded into "no session". Once the bus is up, every
  * mapped category gets a row: its decoded app rows, `absent` (the portal answered NotFound or
  * an empty table), or a `denied`/`unreadable` row carrying its own `<category>:<cause>` token.
+ * The three Lookups share ONE total deadline (portal::kPortalTotalBudgetUs, re-armed per call
+ * with the time left -- the firewall_plugin.cpp precedent); a lookup that runs out of it, or is
+ * reached after it is spent, is `<category>:timeout`.
  */
 #include "privacy_permissions_legs.hpp"
 #include "privacy_permissions_linux_parsers.hpp"
 
 #if defined(__linux__)
 
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -93,7 +97,7 @@ bool do_lookup(sd_bus* bus, const portal::PortalTable& t, std::vector<Permission
                                       std::string{t.id}.c_str());
     if (rc < 0)
         return portal::append_lookup_error_rows(
-            t, portal::classify_lookup_error(err.err.name ? err.err.name : ""), rows, acc);
+            t, portal::classify_lookup_error(err.err.name ? err.err.name : "", -rc), rows, acc);
 
     portal::PortalReply walked;
     // CDX-R2-004: sd_bus_message_enter_container returns >0 entered, 0 a genuine type MISMATCH
@@ -151,9 +155,22 @@ int collect_linux_permissions(yuzu::CommandContext& ctx) {
                                          "session_bus:open_errno_" + std::to_string(err), acc));
         return emit_rows(ctx, rows, acc, false);
     }
+    // One total deadline across the lookups (portal::kPortalTotalBudgetUs): each call is armed
+    // with only the time left, and a category reached after it ran out is `<category>:timeout`.
+    const auto t_start = std::chrono::steady_clock::now();
     std::vector<std::string_view> service_unknown;
-    for (const auto& t : portal::kPortalLookups)
+    for (const auto& t : portal::kPortalLookups) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_start);
+        const std::uint64_t left = portal::remaining_budget_us(
+            portal::kPortalTotalBudgetUs, static_cast<std::uint64_t>(elapsed.count()));
+        if (left == 0) {
+            portal::append_lookup_error_rows(t, portal::LookupError::timeout, rows, acc);
+            continue;
+        }
+        sd_bus_set_method_call_timeout(bus.bus, left);
         if (do_lookup(bus.bus, t, rows, acc)) service_unknown.push_back(t.category);
+    }
     if (portal::finish_portal_rows(service_unknown, rows, acc))
         return emit_rows(ctx, rows, acc, true);
 #else

@@ -95,8 +95,9 @@ spec:
         description: >
           The fixed cross-OS permission category. "-" only on a whole-source row -- one row
           standing for every category of a source that could not be read at all (a TCC.db, a
-          Windows profile hive or ConsentStore root, the session bus/portal), or that holds no
-          file (a macOS user with no per-user TCC.db).
+          Windows profile hive, ConsentStore root or ProfileList discovery, the session
+          bus/portal, or what a Windows run left unwalked once its retention budget was spent),
+          or that holds no file (a macOS user with no per-user TCC.db).
         values: [camera, microphone, location, full_disk_access, "-"]
         example: camera
         platforms: [windows, linux, darwin]
