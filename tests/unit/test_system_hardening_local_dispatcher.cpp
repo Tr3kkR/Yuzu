@@ -340,9 +340,19 @@ TEST_CASE("system_hardening plugin: the typed status agrees with the rows; only 
     }
     // OK exactly when no key was unreadable -- no silent OK, no phantom failure. An absent key
     // (no Yama on a Docker kernel, no MitigationOptions on a default Windows install) does NOT
-    // lower the status.
-    CHECK(is_ok == unreadable.empty());
-    // An unreadable key is named by a `<key>:<cause>` token; an absent key has none.
+    // lower the status. The one exception is the Linux backstop: every key `absent` on a
+    // confirmed procfs is CONSTRAINED with provenance exactly `proc_sys:not_visible` and no
+    // unreadable row.
+    const bool canary = is_constrained && result.result_provenance == "proc_sys:not_visible";
+    if (canary) {
+        CHECK(kExpectedOs == "linux");
+        CHECK(unreadable.empty());
+        CHECK(absent.size() == rows.size());
+    } else {
+        CHECK(is_ok == unreadable.empty());
+    }
+    // An unreadable key is named by a `<key>:<cause>` token; an absent key has none (the backstop
+    // token names `proc_sys`, not a key).
     for (const auto& f : unreadable) {
         INFO("unreadable key: " << f[2]);
         CHECK(has_token_for(tokens, f[2]));

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -27,6 +28,7 @@
 using namespace yuzu::system_hardening;
 namespace fs = std::filesystem;
 using yuzu::shared::ConstraintAccumulator;
+using namespace std::string_view_literals;
 
 namespace {
 
@@ -327,8 +329,11 @@ TEST_CASE("system_hardening: a run of only values and absent keys adds no token 
     CHECK(acc.reason().empty());
 }
 
-// Fails under: dropping the all-ENOENT canary (a hidden /proc/sys reading as 11
-// independently-absent rows and a clean OK/FULL, indistinguishable from a healthy host).
+// Fails under: dropping the all-ENOENT canary (a confirmed procfs that still hides every key
+// reading as 11 independently-absent rows and a clean OK/FULL, indistinguishable from a healthy
+// host). A hidden /proc/sys (ProcSubset=pid, a masked or tmpfs /proc/sys) never reaches this
+// layer as ENOENT -- the Linux leg remaps it to ENODEV -- so it is covered by the hidden-surface
+// case further down, not by this canary.
 TEST_CASE("system_hardening: every key individually absent is a row fact; ALL of them absent "
           "together is a canary",
           "[system_hardening][collect]") {
@@ -341,11 +346,12 @@ TEST_CASE("system_hardening: every key individually absent is a row fact; ALL of
         CHECK(r.state == PostureState::absent);
         CHECK(r.raw == "-");
     }
-    // But eleven-for-eleven ENOENT is not a healthy host with nothing configured -- it is
-    // /proc/sys itself not being the tree this plugin expects (ProcSubset=pid, a restricted
-    // container). That downgrades the overall result, without touching any row above.
+    // But eleven-for-eleven ENOENT on a confirmed procfs is not a healthy host with nothing
+    // configured -- it is /proc/sys not being the tree this plugin expects. That downgrades the
+    // overall result (CONSTRAINED with zero unreadable rows), without touching any row above.
     CHECK(acc.any_failure());
     CHECK(acc.reason() == "proc_sys:not_visible");
+    CHECK(select_status(acc, any_denied(rows)).status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
 // Fails under: the canary firing on a real host where some keys are legitimately absent
@@ -380,9 +386,10 @@ TEST_CASE("system_hardening: a leaf ENOENT is absence only when /proc/sys is con
     CHECK(classify_read_errno(remap_enoent_for_surface(ENOENT, true)) == PostureState::absent);
 }
 
-// Fails under: the Linux leg only ever statfs()ing /proc/sys (a tmpfs over /proc/sys/kernel then
-// reads as a clean `absent`), probing a directory outside /proc/sys, or dropping the /proc/sys
-// fallback that a legitimately missing directory (kernel/yama without Yama) defers to.
+// Fails under: the probe list starting anywhere but the leaf's own directory, leaving /proc/sys,
+// or dropping the /proc/sys entry that a legitimately missing directory (kernel/yama without
+// Yama) defers to. This pins the LIST; how the walk consumes it is the surface_is_procfs case
+// below.
 TEST_CASE("system_hardening: the surface probe walks from the leaf's directory up to /proc/sys",
           "[system_hardening][classify]") {
     CHECK(surface_probe_dirs("/proc/sys/kernel/yama/ptrace_scope") ==
@@ -400,6 +407,194 @@ TEST_CASE("system_hardening: the surface probe walks from the leaf's directory u
         CHECK(std::string_view{k.path}.starts_with(dirs.front() + "/"));
         CHECK(dirs.back() == "/proc/sys");
     }
+}
+
+namespace {
+
+constexpr std::uint64_t kTmpfsMagic = 0x01021994;
+
+/// A fake statfs over a fixed table: a directory in `table` answers its outcome, any other
+/// directory ENOENT. Every probed directory is recorded, in order.
+struct FakeStatfs {
+    std::map<std::string, StatfsOutcome> table;
+    std::vector<std::string> calls;
+    StatfsOutcome operator()(const std::string& dir) {
+        calls.push_back(dir);
+        const auto it = table.find(dir);
+        return it == table.end() ? StatfsOutcome{-1, ENOENT, 0} : it->second;
+    }
+};
+
+StatfsOutcome fs_of(std::uint64_t magic) { return {0, 0, magic}; }
+
+} // namespace
+
+// Fails under: the walk statfs()ing only /proc/sys (the subtree overmount then reads procfs),
+// walking from the root down, trusting anything after the first existing directory, treating a
+// non-ENOENT statfs failure as "keep looking" or as confirmed, returning true when nothing
+// exists, or probing past /proc/sys.
+TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing directory only",
+          "[system_hardening][classify]") {
+    const std::string leaf = "/proc/sys/kernel/yama/ptrace_scope";
+
+    SECTION("a tmpfs over /proc/sys/kernel under a procfs /proc/sys is not procfs") {
+        FakeStatfs f{{{"/proc/sys/kernel", fs_of(kTmpfsMagic)}, {"/proc/sys", fs_of(kProcSuperMagic)}},
+                     {}};
+        CHECK_FALSE(surface_is_procfs(leaf, f));
+        CHECK(f.calls == std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel"});
+    }
+    SECTION("a missing kernel/yama defers to its procfs parent") {
+        FakeStatfs f{{{"/proc/sys/kernel", fs_of(kProcSuperMagic)}, {"/proc/sys", fs_of(kProcSuperMagic)}},
+                     {}};
+        CHECK(surface_is_procfs(leaf, f));
+        CHECK(f.calls == std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel"});
+    }
+    SECTION("the leaf's own directory, when present and procfs, decides at once") {
+        FakeStatfs f{{{"/proc/sys/fs", fs_of(kProcSuperMagic)}}, {}};
+        CHECK(surface_is_procfs("/proc/sys/fs/suid_dumpable", f));
+        CHECK(f.calls.size() == 1);
+    }
+    SECTION("a statfs failure other than ENOENT is never confirmation, and stops the walk") {
+        for (const int err : {EACCES, EPERM, EINTR, EIO}) {
+            INFO("errno " << err);
+            FakeStatfs f{{{"/proc/sys/kernel/yama", StatfsOutcome{-1, err, 0}},
+                          {"/proc/sys", fs_of(kProcSuperMagic)}},
+                         {}};
+            CHECK_FALSE(surface_is_procfs(leaf, f));
+            CHECK(f.calls.size() == 1);
+        }
+    }
+    SECTION("nothing existing up to /proc/sys is not procfs, and the walk stops at /proc/sys") {
+        FakeStatfs f{{{"/proc", fs_of(kProcSuperMagic)}, {"/", fs_of(kProcSuperMagic)}}, {}};
+        CHECK_FALSE(surface_is_procfs(leaf, f));
+        CHECK(f.calls ==
+              std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel", "/proc/sys"});
+    }
+    SECTION("the walk is bounded by the probe list for every allowlisted key") {
+        for (const auto& k : kLinuxAllowlist) {
+            INFO(k.path);
+            FakeStatfs f; // every directory ENOENT: the longest possible walk
+            CHECK_FALSE(surface_is_procfs(k.path, f));
+            CHECK(f.calls == surface_probe_dirs(k.path));
+            for (const auto& d : f.calls)
+                CHECK(d.starts_with("/proc/sys"));
+        }
+    }
+    SECTION("the chosen answer drives the ENOENT remap end to end") {
+        FakeStatfs hidden{{{"/proc/sys/kernel", fs_of(kTmpfsMagic)}}, {}};
+        CHECK(remap_enoent_for_surface(ENOENT, surface_is_procfs(leaf, hidden)) == ENODEV);
+        FakeStatfs present{{{"/proc/sys/kernel", fs_of(kProcSuperMagic)}}, {}};
+        CHECK(remap_enoent_for_surface(ENOENT, surface_is_procfs(leaf, present)) == ENOENT);
+    }
+}
+
+// Fails under: reading a leaf fstat() does not report as a regular file (a FIFO with no writer
+// pins the worker forever; a device puts NULs and non-UTF-8 in the row), or mistaking the
+// not-regular outcome for an absence, a denial or an errno.
+TEST_CASE("system_hardening: only a regular file is read; anything else is unreadable not_regular",
+          "[system_hardening][classify]") {
+    CHECK(opened_leaf_error(0100644) == 0);           // S_IFREG | 0644: a /proc/sys leaf
+    CHECK(opened_leaf_error(0100000) == 0);           // regular, mode 000
+    CHECK(opened_leaf_error(0010644) == kErrNotRegular); // S_IFIFO
+    CHECK(opened_leaf_error(0020666) == kErrNotRegular); // S_IFCHR (/dev/zero, /dev/urandom)
+    CHECK(opened_leaf_error(0060660) == kErrNotRegular); // S_IFBLK
+    CHECK(opened_leaf_error(0040555) == kErrNotRegular); // S_IFDIR
+    CHECK(opened_leaf_error(0120777) == kErrNotRegular); // S_IFLNK
+    CHECK(opened_leaf_error(0140755) == kErrNotRegular); // S_IFSOCK
+
+    CHECK(kErrNotRegular < 0); // never a real errno
+    CHECK(classify_read_errno(kErrNotRegular) == PostureState::unreadable);
+    CHECK_FALSE(is_denied_errno(kErrNotRegular));
+    REQUIRE(failure_token("kernel.sysrq", kErrNotRegular).has_value());
+    CHECK(*failure_token("kernel.sysrq", kErrNotRegular) == "kernel.sysrq:not_regular");
+
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(
+        [](std::string_view path) -> ReadOutcome {
+            if (path == "/proc/sys/kernel/sysrq") return {kErrNotRegular, 0, {}};
+            return {0, 0, "1\n"};
+        },
+        acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    CHECK(state_of(rows, "kernel.sysrq") == PostureState::unreadable);
+    CHECK(raw_of(rows, "kernel.sysrq") == "-");
+    CHECK(acc.reason() == "kernel.sysrq:not_regular");
+    const auto s = select_status(acc, any_denied(rows));
+    CHECK(s.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(s.provenance == "kernel.sysrq:not_regular");
+}
+
+// Fails under: cutting a Linux value at its first line again (a forged "2\n0" would read as a
+// clean `enabled` on its first line), or trimming a kernel-emitted "N\n" differently.
+TEST_CASE("system_hardening: a Linux value is judged whole, never on its first line",
+          "[system_hardening][mapper]") {
+    CHECK(trimmed_value("2\n") == "2");
+    CHECK(trimmed_value(" \t2\r\n\0"sv) == "2");
+    CHECK(trimmed_value("2\n0") == "2\n0");
+    CHECK(evaluate_linux("kernel.randomize_va_space", "2\n") == PostureState::enabled);
+    CHECK(evaluate_linux("kernel.randomize_va_space", "2\n0\n") == PostureState::unmodelled);
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(
+        [](std::string_view path) -> ReadOutcome {
+            if (path == "/proc/sys/kernel/randomize_va_space") return {0, 0, "2\n0\n"};
+            return {0, 0, "1\n"};
+        },
+        acc);
+    CHECK(state_of(rows, "kernel.randomize_va_space") == PostureState::unmodelled);
+    CHECK(raw_of(rows, "kernel.randomize_va_space") == "2\n0");
+    CHECK(raw_of(rows, "kernel.kptr_restrict") == "1"); // a kernel-emitted value trims as before
+}
+
+// Fails under: judging kern.bootargs emptiness on its first line (a leading newline or NUL hides
+// every override behind a clean `enabled`), or dropping the value after that first line from the
+// raw column.
+TEST_CASE("system_hardening: kern.bootargs is judged and emitted whole",
+          "[system_hardening][mapper]") {
+    using P = PostureState;
+    const std::string long_ws_then_v = std::string(1024, ' ') + "\n\t" + "-v";
+    struct C {
+        std::string raw;
+        P want;
+    };
+    const C cases[] = {
+        {"", P::enabled},
+        {" \n\t  \r\n", P::enabled},          // whitespace only: still no overrides
+        {std::string{"\0\0", 2}, P::enabled}, // NULs only
+        {"\n-v", P::unmodelled},
+        {"\namfi_get_out_of_my_way=1", P::unmodelled},
+        {std::string{"\0-v", 3}, P::unmodelled},
+        {long_ws_then_v, P::unmodelled},
+        {"-v\n", P::unmodelled},
+    };
+    for (const auto& c : cases) {
+        INFO("raw size " << c.raw.size());
+        CHECK(evaluate_macos_string("kern.bootargs", c.raw) == c.want);
+
+        ConstraintAccumulator acc;
+        const auto rows = collect_macos_posture(
+            [&](std::string_view, SysctlKind kind) -> ReadOutcome {
+                if (kind == SysctlKind::string) return {0, 0, c.raw};
+                return {0, 0, {}};
+            },
+            acc);
+        CHECK(state_of(rows, "kern.bootargs") == c.want);
+        CHECK(raw_of(rows, "kern.bootargs") == c.raw); // the whole value, untrimmed
+        CHECK_FALSE(acc.any_failure());
+
+        // The emitted row keeps all five fields: newlines and NULs never split or cut it.
+        std::string row;
+        for (const auto& r : rows)
+            if (r.key == "kern.bootargs") row = format_posture_row(r);
+        CHECK(row.find('\0') == std::string::npos);
+        CHECK(row.find('\n') == std::string::npos);
+        CHECK(std::count(row.begin(), row.end(), '|') == 4);
+        CHECK(row.ends_with(std::string{"|"} + std::string{state_token(c.want)}));
+    }
+    // The override after the leading newline reaches the raw column.
+    CHECK(format_posture_row({"macos", "kern.bootargs", "\n-v", P::unmodelled}) ==
+          "posture|macos|kern.bootargs| -v|unmodelled");
+    CHECK(format_posture_row({"macos", "kern.bootargs", std::string{"\0-v", 3}, P::unmodelled}) ==
+          "posture|macos|kern.bootargs| -v|unmodelled");
 }
 
 // Fails under: a hidden /proc/sys (what the Linux leg hands the pure layer after the surface

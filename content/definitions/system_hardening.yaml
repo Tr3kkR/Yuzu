@@ -29,8 +29,12 @@ metadata:
     rather than failing the command. A not-found only reads `absent` where
     the surface itself is confirmed present: on Linux a hidden or unmounted
     /proc/sys makes every key `unreadable`, and on Windows a missing Session
-    Manager\kernel key (present on every install) reads `unreadable`. In a
-    container the Linux keys are the host kernel's values.
+    Manager\kernel key (present on every install) reads `unreadable`. One
+    Linux backstop is not a key's own row: all eleven keys `absent` on a
+    confirmed procfs adds the reason `proc_sys:not_visible` and reports
+    CONSTRAINED/PARTIAL with every row still `absent`. In a container the
+    Linux keys are those of the kernel the agent runs on (the host's under a
+    shared-kernel runtime).
   tags: [system_hardening, security, posture]
 
 spec:
@@ -63,7 +67,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: 'Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process, or the value name itself for a failed read; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows).'
+        description: 'Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process; a registry value that was not decoded (absent or unreadable) reports under mitigation_options or mitigation_audit_options, and a failed self policy under self.dep, self.aslr or self.cfg; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows).'
         example: kernel.randomize_va_space
         platforms: [windows, linux, darwin]
       - name: raw

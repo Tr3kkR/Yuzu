@@ -21,9 +21,11 @@
 #include <sys/sysctl.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::system_hardening {
 

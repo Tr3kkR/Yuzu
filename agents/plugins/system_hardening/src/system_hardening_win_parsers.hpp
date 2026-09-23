@@ -7,7 +7,9 @@
  *
  * 1. HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel values
  *    `MitigationOptions` / `MitigationAuditOptions` (REG_BINARY, documented
- *    16/24 bytes = 2/3 little-endian QWORDs). The FIRST QWORD is the kernel's
+ *    16/24 bytes = 2/3 little-endian QWORDs; an 8-byte REG_QWORD, which
+ *    Microsoft's documented steps for untrusted-font blocking write, decodes
+ *    as the same single QWORD -- decode_registry_value). The FIRST QWORD is the kernel's
  *    system-wide mitigation option map: one nibble per policy (nibble n holds
  *    bits [4n, 4n+3]), in the order of the kernel's PS_MITIGATION_OPTION
  *    enumeration. That order is undocumented by Microsoft. It is NOT the
@@ -46,8 +48,10 @@
  * `unreadable` = the read failed. Never one state for both, and only
  * `unreadable` adds a reason token (absence never lowers the result status).
  * <raw> is "-" when nothing was read (absent/unreadable), matching
- * system_hardening_parsers.hpp. Never throws (bad_alloc aside); fallible
- * functions return std::expected.
+ * system_hardening_parsers.hpp. A value that was not decoded reports ONE row
+ * under its registry row name (`mitigation_options` / `mitigation_audit_options`),
+ * and a failed self policy ONE row under `self.dep` / `self.aslr` / `self.cfg`.
+ * Never throws (bad_alloc aside); fallible functions return std::expected.
  */
 
 #include <array>
@@ -57,6 +61,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::system_hardening::mitigation {
@@ -84,7 +89,8 @@ struct MitigationRow {
 };
 
 struct DecodeError {
-    std::string token; // empty_blob | odd_length | not_qword_aligned | oversized |
+    std::string token; // registry decode: empty_blob | odd_length | not_qword_aligned | oversized |
+                       // type_<n>; parse_hex_blob only (test fixtures, never the agent):
                        // no_hex_digits | odd_hex_digits | bad_hex
 };
 
@@ -114,7 +120,7 @@ namespace detail {
 
 struct PolicyDef {
     std::string_view name;
-    uint8_t nibble; // nibble index within the first QWORD (0..15); every nibble is two-bit
+    std::uint8_t nibble; // nibble index within the first QWORD (0..15); every nibble is two-bit
 };
 
 // Kernel option map, one nibble per policy in PS_MITIGATION_OPTION order (see the
@@ -139,7 +145,7 @@ inline constexpr std::array<PolicyDef, 16> kPolicyTable{{
     {"image_load_prefer_system32", 15},   // ImageLoadPreferSystem32
 }};
 
-inline std::string hex_of(uint64_t v, int min_digits = 1) {
+inline std::string hex_of(std::uint64_t v, int min_digits = 1) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string digits;
     do {
@@ -151,10 +157,10 @@ inline std::string hex_of(uint64_t v, int min_digits = 1) {
     return "0x" + digits;
 }
 
-inline uint64_t le_qword(std::span<const uint8_t> in, std::size_t qword_index) {
-    uint64_t v = 0;
+inline std::uint64_t le_qword(std::span<const std::uint8_t> in, std::size_t qword_index) {
+    std::uint64_t v = 0;
     for (std::size_t i = 0; i < 8; ++i)
-        v |= static_cast<uint64_t>(in[qword_index * 8 + i]) << (8 * i);
+        v |= static_cast<std::uint64_t>(in[qword_index * 8 + i]) << (8 * i);
     return v;
 }
 
@@ -163,8 +169,8 @@ inline uint64_t le_qword(std::span<const uint8_t> in, std::size_t qword_index) {
 /// Decodes one MitigationOptions/MitigationAuditOptions blob; `prefix` starts
 /// every policy name. A 0-byte, oversized, odd-length or non-QWORD-multiple blob is a
 /// DecodeError, never a partial decode.
-inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<const uint8_t> blob,
-                                                                    std::string_view prefix) {
+inline Result<std::vector<MitigationRow>>
+decode_mitigation_options(std::span<const std::uint8_t> blob, std::string_view prefix) {
     if (blob.empty())
         return std::unexpected(DecodeError{"empty_blob"});
     if (blob.size() > kMaxBlobBytes)
@@ -174,11 +180,11 @@ inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<co
     if (blob.size() % 8 != 0)
         return std::unexpected(DecodeError{"not_qword_aligned"});
 
-    const uint64_t q0 = detail::le_qword(blob, 0);
+    const std::uint64_t q0 = detail::le_qword(blob, 0);
     std::vector<MitigationRow> rows;
 
     for (const auto& def : detail::kPolicyTable) {
-        const auto nib = static_cast<uint8_t>((q0 >> (4 * def.nibble)) & 0xF);
+        const auto nib = static_cast<std::uint8_t>((q0 >> (4 * def.nibble)) & 0xF);
         MitigationRow row;
         row.policy = std::string{prefix} + std::string{def.name};
         row.raw = detail::hex_of(nib);
@@ -201,7 +207,7 @@ inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<co
 
     // QWORDs beyond the table.
     for (std::size_t q = 1; q < blob.size() / 8; ++q) {
-        const uint64_t v = detail::le_qword(blob, q);
+        const std::uint64_t v = detail::le_qword(blob, q);
         rows.push_back({std::string{prefix} + "ext_q" + std::to_string(q),
                         detail::hex_of(v, 16),
                         v == 0 ? PolicyState::default_state : PolicyState::unmodelled});
@@ -209,15 +215,36 @@ inline Result<std::vector<MitigationRow>> decode_mitigation_options(std::span<co
     return rows;
 }
 
+/// Registry value types the leg distinguishes, as plain numbers (winnt.h REG_BINARY / REG_QWORD;
+/// system_hardening_win.cpp static_asserts each against the SDK).
+inline constexpr std::uint32_t kRegBinary = 3;
+inline constexpr std::uint32_t kRegQword = 11;
+
+/// Decodes one Session Manager\kernel value as RegQueryValueExW returned it. REG_BINARY is the
+/// form the documentation describes and decode_mitigation_options takes it whole. REG_QWORD is
+/// what Microsoft's documented registry steps for untrusted-font blocking write (for example
+/// 0x1000000000000, nibble 12); an 8-byte REG_QWORD is stored little-endian, byte-identical to an
+/// 8-byte REG_BINARY, so it decodes the same way. Any other type, and a REG_QWORD that is not 8
+/// bytes (not a QWORD at all), is DecodeError `type_<n>` -- never a guessed decode.
+inline Result<std::vector<MitigationRow>> decode_registry_value(std::uint32_t type,
+                                                                std::span<const std::uint8_t> data,
+                                                                std::string_view prefix) {
+    const bool binary = type == kRegBinary;
+    const bool qword = type == kRegQword && data.size() == 8;
+    if (!binary && !qword)
+        return std::unexpected(DecodeError{"type_" + std::to_string(type)});
+    return decode_mitigation_options(data, prefix);
+}
+
 /// Which GetProcessMitigationPolicy structure the `Flags` DWORD came from.
 enum class SelfPolicy { dep, aslr, cfg };
 
 /// Decodes a PROCESS_MITIGATION_{DEP,ASLR,CONTROL_FLOW_GUARD}_POLICY `Flags`
 /// DWORD (<winnt.h> layouts) into `self.*` rows; `raw` = Flags in decimal.
-inline std::vector<MitigationRow> decode_self_policy(SelfPolicy which, uint32_t flags) {
+inline std::vector<MitigationRow> decode_self_policy(SelfPolicy which, std::uint32_t flags) {
     struct Bit {
         std::string_view name;
-        uint8_t bit;
+        std::uint8_t bit;
     };
     std::vector<Bit> bits;
     switch (which) {
@@ -248,8 +275,12 @@ inline constexpr std::uint32_t kErrorAccessDenied = 5;
 inline constexpr std::uint32_t kErrorNotSupported = 50;
 inline constexpr std::uint32_t kErrorInvalidParameter = 87;
 
-/// Which Win32 call failed: ERROR_INVALID_PARAMETER / ERROR_NOT_SUPPORTED mean "this policy
-/// does not exist here" from GetProcessMitigationPolicy, but are real failures of a registry read.
+/// Which Win32 call failed. From GetProcessMitigationPolicy, ERROR_NOT_SUPPORTED is the OS
+/// saying "this policy does not exist here" (`absent`); ERROR_INVALID_PARAMETER is NOT: every
+/// supported target (Windows 10+ x64) implements the DEP, ASLR and CFG classes (the rig capture
+/// shows all three succeed), so there it can only mean a malformed call -- a wrong structure
+/// size or policy value -- and reads `unreadable` + `<name>:win32_87`. Both are real failures
+/// of a registry read.
 ///
 /// `structural_key` is the OPEN of a registry key that exists on every Windows install --
 /// `Session Manager\kernel` (rig session A compared that key's full contents before and after
@@ -258,7 +289,7 @@ inline constexpr std::uint32_t kErrorInvalidParameter = 87;
 /// A not-found there is never a legitimate absence (a corrupt hive, a stripped image), so it
 /// reads `unreadable` + `<name>:key_missing`, unlike a missing VALUE inside the opened key,
 /// which stays `absent`. Same possibility-gate rule as the sibling platform_security plugin's
-/// Control\Lsa key.
+/// (separate PR) Control\Lsa key.
 enum class ReadSource { registry, process_policy, structural_key };
 
 /// How one failed Win32 read is reported. `state` is "absent" when the OS definitively says the
@@ -273,8 +304,7 @@ struct ReadFailure {
 inline ReadFailure classify_win32_failure(std::string_view name, std::uint32_t err,
                                           ReadSource source) {
     const bool not_found = err == kErrorFileNotFound || err == kErrorPathNotFound;
-    const bool unsupported = source == ReadSource::process_policy &&
-                             (err == kErrorInvalidParameter || err == kErrorNotSupported);
+    const bool unsupported = source == ReadSource::process_policy && err == kErrorNotSupported;
     if (not_found && source == ReadSource::structural_key)
         return {"unreadable", std::string{name} + ":key_missing", false};
     if (not_found || unsupported)
@@ -314,20 +344,20 @@ inline std::array<NamedFailure, kRegistryRows.size()> kernel_key_open_failures(s
 }
 
 /// A read that failed for a cause the shell detected itself (ERROR_MORE_DATA -> "oversized",
-/// a non-REG_BINARY type -> "type_<n>", a decoder token): unreadable, one token, never a denial.
+/// a decode_registry_value token such as "type_<n>"): unreadable, one token, never a denial.
 inline ReadFailure unreadable_failure(std::string_view name, std::string_view cause) {
     return {"unreadable", std::string{name} + ":" + std::string{cause}, false};
 }
 
 /// Hex text -> bytes. Accepts bare hex (whitespace, optional "0x") or a
 /// `reg query` line ("    MitigationOptions    REG_BINARY    0022...").
-inline Result<std::vector<uint8_t>> parse_hex_blob(std::string_view text) {
+inline Result<std::vector<std::uint8_t>> parse_hex_blob(std::string_view text) {
     if (const auto pos = text.find("REG_BINARY"); pos != std::string_view::npos) {
         text.remove_prefix(pos + std::string_view{"REG_BINARY"}.size());
         if (const auto nl = text.find('\n'); nl != std::string_view::npos)
             text = text.substr(0, nl);
     }
-    std::vector<uint8_t> out;
+    std::vector<std::uint8_t> out;
     int pending = -1;
     bool any = false;
     auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
@@ -353,7 +383,7 @@ inline Result<std::vector<uint8_t>> parse_hex_blob(std::string_view text) {
         if (pending < 0) {
             pending = v;
         } else {
-            out.push_back(static_cast<uint8_t>((pending << 4) | v));
+            out.push_back(static_cast<std::uint8_t>((pending << 4) | v));
             pending = -1;
         }
     }

@@ -48,7 +48,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable; a missing "
-         "key is absent only when statfs confirms its directory is procfs)",
+         "key is absent only when statfs confirms its nearest existing directory is procfs)",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
@@ -105,7 +105,9 @@ public:
                 yuzu::Params /*params*/) override {
         // Frozen seam: nothing may escape the plugin ABI (the SDK trampoline does not catch), so
         // the whole body, the unknown-action row included, sits inside the one try; every leg
-        // returns 0 for a data-level outcome, so 1 means exactly this.
+        // returns 0 for a data-level outcome, so 1 means exactly this. The handler allocates (the
+        // row, the status reason), so its own body sits in a nested try: an allocation failure
+        // there drops the internal-error row and still returns 1, and nothing escapes.
         try {
             if (action != "posture") {
                 // `action` is request-supplied and lands in a pipe-delimited stream.
@@ -123,9 +125,12 @@ public:
 #endif
             return 1;
         } catch (...) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "internal_error");
-            ctx.write_output(yuzu::system_hardening::format_internal_error_row(kHostOs));
+            try {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, "internal_error");
+                ctx.write_output(yuzu::system_hardening::format_internal_error_row(kHostOs));
+            } catch (...) {
+            }
             return 1;
         }
     }

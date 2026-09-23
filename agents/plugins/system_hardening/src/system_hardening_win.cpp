@@ -16,13 +16,16 @@
  *                        -> `absent` (a not-found on the Session Manager\kernel KEY
  *                           itself is NOT absence: that key exists on every install,
  *                           so it reads `unreadable`, <row>:key_missing)
- *   GetProcessMitigationPolicy ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED
+ *   GetProcessMitigationPolicy ERROR_NOT_SUPPORTED
  *                        -> `absent`
  *   UNREADABLE -- the read failed; the row reads `unreadable` with one token per cause:
  *   ERROR_ACCESS_DENIED  -> `unreadable`, <name>:access_denied, status
  *                           PERMISSION_DENIED
- *   other Win32 / wrong REG type / oversized / undecodable blob
- *                        -> `unreadable`, <name>:win32_<n> | type_<n> |
+ *   GetProcessMitigationPolicy ERROR_INVALID_PARAMETER
+ *                        -> `unreadable`, <name>:win32_87 (every supported target implements
+ *                           DEP/ASLR/CFG, so it is a malformed call, not an answer)
+ *   other Win32 / a type other than REG_BINARY or an 8-byte REG_QWORD / oversized /
+ *   undecodable blob     -> `unreadable`, <name>:win32_<n> | type_<n> |
  *                           oversized | <decoder token>
  * Only unreadable rows accumulate tokens (ConstraintAccumulator); the status is
  * select_status (system_hardening_parsers.hpp): PERMISSION_DENIED when any read
@@ -44,9 +47,13 @@
  *     UNVERIFIED on hardware: the other eleven nibble positions, nibble values other than 1, and
  *     any non-zero MitigationAuditOptions value.
  *   - GetProcessMitigationPolicy from a 64-bit SYSTEM process: DEP (Flags 0x3), ASLR (0x5) and
- *     CFG (0x0) all succeed, so `self.dep` is a real row on x64; the ERROR_INVALID_PARAMETER /
- *     ERROR_NOT_SUPPORTED -> `absent` (no token) branch below serves 32-bit hosts and older
- *     builds and was not exercised on this rig.
+ *     CFG (0x0) all succeed, so `self.dep` is a real row on x64. The installer admits only
+ *     Windows 10+ x64, where all three classes exist, so neither failure branch below was
+ *     exercised on this rig: ERROR_NOT_SUPPORTED -> `absent` (no token) and
+ *     ERROR_INVALID_PARAMETER -> `unreadable` (`win32_87`). Windows on ARM64 running the x64
+ *     build under emulation is not verified.
+ *   - UNVERIFIED on hardware: a REG_QWORD MitigationOptions (the documented font-blocking
+ *     steps); it is decoded as the 8-byte QWORD it is (decode_registry_value).
  */
 
 #if defined(_WIN32)
@@ -95,6 +102,8 @@ static_assert(mit::kErrorPathNotFound == static_cast<std::uint32_t>(ERROR_PATH_N
 static_assert(mit::kErrorAccessDenied == static_cast<std::uint32_t>(ERROR_ACCESS_DENIED));
 static_assert(mit::kErrorNotSupported == static_cast<std::uint32_t>(ERROR_NOT_SUPPORTED));
 static_assert(mit::kErrorInvalidParameter == static_cast<std::uint32_t>(ERROR_INVALID_PARAMETER));
+static_assert(mit::kRegBinary == static_cast<std::uint32_t>(REG_BINARY));
+static_assert(mit::kRegQword == static_cast<std::uint32_t>(REG_QWORD));
 
 /// Writes the row for one failed read, as the pure layer classified it. `absent` (the OS
 /// definitively says it is not there) adds no token and leaves the status alone; `unreadable`
@@ -108,7 +117,7 @@ void report_failure(yuzu::CommandContext& ctx, Probe& p, std::string_view row_na
     ctx.write_output(mit::format_posture_row(row_name, "-", f.state));
 }
 
-/// Reads + decodes one REG_BINARY value, emitting its rows or one absent/unreadable row.
+/// Reads + decodes one mitigation value, emitting its rows or one absent/unreadable row.
 void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const mit::RegistryRow& row) {
     const std::wstring value_w{row.value_name};
     const std::string_view row_name = row.row_name;
@@ -122,12 +131,10 @@ void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const mi
         return report_failure(ctx, p, row_name,
                               mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(rc),
                                                           mit::ReadSource::registry));
-    if (type != REG_BINARY)
-        return report_failure(ctx, p, row_name,
-                              mit::unreadable_failure(row_name, "type_" + std::to_string(type)));
-
-    auto rows = mit::decode_mitigation_options(std::span<const uint8_t>{buf.data(), size},
-                                               row.row_prefix);
+    // The type decision (REG_BINARY, or an 8-byte REG_QWORD) is the pure decode_registry_value's.
+    auto rows = mit::decode_registry_value(static_cast<std::uint32_t>(type),
+                                           std::span<const std::uint8_t>{buf.data(), size},
+                                           row.row_prefix);
     if (!rows)
         return report_failure(ctx, p, row_name,
                               mit::unreadable_failure(row_name, rows.error().token));
@@ -161,7 +168,7 @@ void collect_self(yuzu::CommandContext& ctx, Probe& p, PROCESS_MITIGATION_POLICY
                               mit::classify_win32_failure(row_name, static_cast<std::uint32_t>(err),
                                                           mit::ReadSource::process_policy));
     }
-    for (const auto& r : mit::decode_self_policy(kind, static_cast<uint32_t>(policy.Flags)))
+    for (const auto& r : mit::decode_self_policy(kind, static_cast<std::uint32_t>(policy.Flags)))
         ctx.write_output(mit::format_posture_row(r));
 }
 

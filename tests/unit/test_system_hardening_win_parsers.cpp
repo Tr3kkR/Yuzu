@@ -73,7 +73,8 @@ std::vector<MitigationRow> decode_ok(const std::vector<uint8_t>& blob,
 
 } // namespace
 
-TEST_CASE("decode: every nibble value maps 0/1/2/3+ to default/on/off/unmodelled",
+TEST_CASE("system_hardening win: decode: every nibble value maps 0/1/2/3+ to "
+          "default/on/off/unmodelled",
           "[system_hardening][win_parsers]") {
     // RECONSTRUCTION; drives kPolicyTable itself. EVERY nibble (dep at 0 and
     // sehop at 1 included) is two-bit; 3..15 are all per-policy meanings.
@@ -99,7 +100,8 @@ TEST_CASE("decode: every nibble value maps 0/1/2/3+ to default/on/off/unmodelled
     }
 }
 
-TEST_CASE("decode: prefix is applied to every row", "[system_hardening][win_parsers]") {
+TEST_CASE("system_hardening win: decode: prefix is applied to every row",
+          "[system_hardening][win_parsers]") {
     // RECONSTRUCTION: nibble 1 is sehop (a defined policy, not reserved).
     const auto rows = decode_ok(make_blob(16, {{1, 0x2}}), "mitigation_audit.");
     const auto by = by_policy(rows);
@@ -111,7 +113,8 @@ TEST_CASE("decode: prefix is applied to every row", "[system_hardening][win_pars
         CHECK(r.policy.rfind("mitigation_audit.", 0) == 0);
 }
 
-TEST_CASE("REAL CAPTURE: the captured blob decodes exactly the five enabled policies on",
+TEST_CASE("system_hardening win: REAL CAPTURE: the captured blob decodes exactly the five "
+          "enabled policies on",
           "[system_hardening][win_parsers][fixture]") {
     // Derived from the REAL CAPTURE (mitigation_options.hex, the-rig). Its
     // .provenance.txt records that only `Set-ProcessMitigation -System -Enable
@@ -153,7 +156,8 @@ TEST_CASE("REAL CAPTURE: the captured blob decodes exactly the five enabled poli
     CHECK(decoded.at("mitigation.ext_q2").state == PolicyState::default_state);
 }
 
-TEST_CASE("decode: QWORDs beyond the documented table are unmodelled when non-zero",
+TEST_CASE("system_hardening win: decode: QWORDs beyond the documented table are unmodelled "
+          "when non-zero",
           "[system_hardening][win_parsers]") {
     // RECONSTRUCTION: 24-byte blob, third QWORD non-zero.
     auto blob = make_blob(24, {});
@@ -165,7 +169,8 @@ TEST_CASE("decode: QWORDs beyond the documented table are unmodelled when non-ze
     CHECK(by_policy(decode_ok(make_blob(16, {}))).count("mitigation.ext_q2") == 0);
 }
 
-TEST_CASE("decode: malformed blobs return a typed error, never a partial decode",
+TEST_CASE("system_hardening win: decode: malformed blobs return a typed error, never a partial "
+          "decode",
           "[system_hardening][win_parsers]") {
     // RECONSTRUCTION negatives.
     const auto err = [](std::size_t n) {
@@ -183,7 +188,7 @@ TEST_CASE("decode: malformed blobs return a typed error, never a partial decode"
     CHECK(decode_mitigation_options(std::vector<uint8_t>(24, 0), "").has_value());
 }
 
-TEST_CASE("self policy: Flags bits map to on/off rows, never default",
+TEST_CASE("system_hardening win: self policy: Flags bits map to on/off rows, never default",
           "[system_hardening][win_parsers]") {
     // RECONSTRUCTION: layouts from <winnt.h> PROCESS_MITIGATION_*_POLICY.
     auto dep = decode_self_policy(SelfPolicy::dep, 0x1);
@@ -205,7 +210,8 @@ TEST_CASE("self policy: Flags bits map to on/off rows, never default",
     CHECK(cfg.at("self.cfg").raw == "3");
 }
 
-TEST_CASE("hex parsing: bare hex, 0x prefix, reg query line, and malformed input",
+TEST_CASE("system_hardening win: hex parsing: bare hex, 0x prefix, reg query line, and "
+          "malformed input",
           "[system_hardening][win_parsers]") {
     // RECONSTRUCTION of the two accepted spellings + negatives.
     const std::vector<uint8_t> want{0x00, 0x22, 0xAB, 0xff};
@@ -219,14 +225,16 @@ TEST_CASE("hex parsing: bare hex, 0x prefix, reg query line, and malformed input
     CHECK(parse_hex_blob("00zz").error().token == "bad_hex");
 }
 
-TEST_CASE("row format: posture|windows|<policy>|<raw>|<state>", "[system_hardening][win_parsers]") {
+TEST_CASE("system_hardening win: row format: posture|windows|<policy>|<raw>|<state>",
+          "[system_hardening][win_parsers]") {
     CHECK(format_posture_row(MitigationRow{"mitigation.cfg", "0x1", PolicyState::on}) ==
           "posture|windows|mitigation.cfg|0x1|on");
     CHECK(format_posture_row("mitigation_options", "-", "absent") ==
           "posture|windows|mitigation_options|-|absent");
 }
 
-TEST_CASE("win32 failures: not found is absent with NO token, on the registry and the policy call",
+TEST_CASE("system_hardening win: win32 failures: not found is absent with NO token, on the "
+          "registry and the policy call",
           "[system_hardening][win_parsers]") {
     // The default Windows 11 state (the rig capture): MitigationOptions / MitigationAuditOptions
     // do not exist. That is a modal state, not a failure: no token, so the run stays OK/FULL.
@@ -246,7 +254,8 @@ TEST_CASE("win32 failures: not found is absent with NO token, on the registry an
 // Fails under: a not-found Session Manager\kernel KEY reading as a clean absent (the key exists
 // on every install -- rig-verified), the gate leaking onto a missing VALUE (which must stay a
 // token-free absent), or the structural source changing access-denied / other-error handling.
-TEST_CASE("win32 failures: a not-found structural KEY is unreadable key_missing, never absent",
+TEST_CASE("system_hardening win: win32 failures: a not-found structural KEY is unreadable "
+          "key_missing, never absent",
           "[system_hardening][win_parsers]") {
     for (const auto err : {kErrorFileNotFound, kErrorPathNotFound}) {
         INFO("err=" << err);
@@ -274,7 +283,8 @@ TEST_CASE("win32 failures: a not-found structural KEY is unreadable key_missing,
 // Fails under: the Win32 shell's key-open path classifying through anything but the
 // structural-key rule, a registry row missing from (or reordered in) the open-failure set, or a
 // row name drifting from the value it reads.
-TEST_CASE("win32 failures: a failed kernel-key open fails every registry row as the key",
+TEST_CASE("system_hardening win: win32 failures: a failed kernel-key open fails every registry "
+          "row as the key",
           "[system_hardening][win_parsers]") {
     REQUIRE(kRegistryRows.size() == 2);
     CHECK(kRegistryRows[0].row_name == "mitigation_options");
@@ -295,23 +305,81 @@ TEST_CASE("win32 failures: a failed kernel-key open fails every registry row as 
     CHECK(denied[1].failure.access_denied);
 }
 
-TEST_CASE("win32 failures: GetProcessMitigationPolicy INVALID_PARAMETER / NOT_SUPPORTED are absent, "
-          "no token; a registry read of the same errors is a real failure",
+// Fails under: GetProcessMitigationPolicy ERROR_INVALID_PARAMETER reading as a clean `absent`
+// (on every supported target DEP/ASLR/CFG exist, so it is a malformed call and would otherwise
+// hide as OK/FULL), or ERROR_NOT_SUPPORTED -- the OS saying the policy does not exist -- gaining
+// a token.
+TEST_CASE("system_hardening win: win32 failures: GetProcessMitigationPolicy NOT_SUPPORTED is "
+          "absent, INVALID_PARAMETER is unreadable win32_87; both fail a registry read",
           "[system_hardening][win_parsers]") {
-    for (const auto err : {kErrorInvalidParameter, kErrorNotSupported}) {
-        const auto policy = classify_win32_failure("self.dep", err, ReadSource::process_policy);
-        INFO("err=" << err);
-        CHECK(policy.state == "absent");
-        CHECK(policy.token.empty()); // the retired `:unsupported` token must not come back
-        CHECK_FALSE(policy.access_denied);
+    const auto unsupported =
+        classify_win32_failure("self.dep", kErrorNotSupported, ReadSource::process_policy);
+    CHECK(unsupported.state == "absent");
+    CHECK(unsupported.token.empty()); // the retired `:unsupported` token must not come back
+    CHECK_FALSE(unsupported.access_denied);
 
+    const auto invalid =
+        classify_win32_failure("self.aslr", kErrorInvalidParameter, ReadSource::process_policy);
+    CHECK(invalid.state == "unreadable");
+    CHECK(invalid.token == "self.aslr:win32_87");
+    CHECK_FALSE(invalid.access_denied);
+
+    for (const auto err : {kErrorInvalidParameter, kErrorNotSupported}) {
+        INFO("err=" << err);
         const auto reg = classify_win32_failure("mitigation_options", err, ReadSource::registry);
         CHECK(reg.state == "unreadable");
         CHECK(reg.token == "mitigation_options:win32_" + std::to_string(err));
     }
 }
 
-TEST_CASE("win32 failures: access denied and any other error are unreadable with exactly one token",
+// Fails under: rejecting the REG_QWORD Microsoft's documented font-blocking steps write (all
+// sixteen rows lost to `type_11`), decoding it differently from the same 8 bytes as REG_BINARY,
+// or guessing a decode for a REG_DWORD / a REG_QWORD that is not 8 bytes.
+TEST_CASE("system_hardening win: registry value: REG_BINARY and an 8-byte REG_QWORD decode alike; "
+          "any other type is type_<n>",
+          "[system_hardening][win_parsers]") {
+    // 0x1000000000000 as a little-endian QWORD: nibble 12 (font_disable) = 1.
+    const std::vector<std::uint8_t> qword{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
+    const auto as_qword = decode_registry_value(kRegQword, qword, "mitigation.");
+    REQUIRE(as_qword.has_value());
+    const auto rows = by_policy(*as_qword);
+    CHECK(as_qword->size() == detail::kPolicyTable.size()); // one QWORD: no ext_q rows
+    CHECK(rows.at("mitigation.font_disable").state == PolicyState::on);
+    CHECK(rows.at("mitigation.font_disable").raw == "0x1");
+    for (const auto& [name, row] : rows)
+        if (name != "mitigation.font_disable")
+            CHECK(row.state == PolicyState::default_state);
+
+    const auto as_binary = decode_registry_value(kRegBinary, qword, "mitigation.");
+    REQUIRE(as_binary.has_value());
+    REQUIRE(as_binary->size() == as_qword->size());
+    for (std::size_t i = 0; i < as_qword->size(); ++i) {
+        CHECK((*as_binary)[i].policy == (*as_qword)[i].policy);
+        CHECK((*as_binary)[i].raw == (*as_qword)[i].raw);
+        CHECK((*as_binary)[i].state == (*as_qword)[i].state);
+    }
+
+    // REG_BINARY keeps the documented 16/24-byte form and the decoder's own errors.
+    CHECK(decode_registry_value(kRegBinary, make_blob(24, {}), "mitigation.").has_value());
+    CHECK(decode_registry_value(kRegBinary, std::vector<std::uint8_t>{}, "mitigation.")
+              .error()
+              .token == "empty_blob");
+
+    // Anything that is not REG_BINARY or an 8-byte REG_QWORD is its type, never a guessed decode.
+    CHECK(decode_registry_value(4, std::vector<std::uint8_t>(4, 0), "mitigation.").error().token ==
+          "type_4"); // REG_DWORD
+    CHECK(decode_registry_value(kRegQword, std::vector<std::uint8_t>(4, 0), "mitigation.")
+              .error()
+              .token == "type_11");
+    CHECK(decode_registry_value(kRegQword, make_blob(16, {}), "mitigation.").error().token ==
+          "type_11");
+    CHECK(decode_registry_value(1, qword, "mitigation.").error().token == "type_1"); // REG_SZ
+    CHECK(kRegBinary == 3u);  // REG_BINARY
+    CHECK(kRegQword == 11u);  // REG_QWORD
+}
+
+TEST_CASE("system_hardening win: win32 failures: access denied and any other error are unreadable "
+          "with exactly one token",
           "[system_hardening][win_parsers]") {
     for (const auto src : {ReadSource::registry, ReadSource::process_policy}) {
         const auto denied = classify_win32_failure("mitigation_options", kErrorAccessDenied, src);
@@ -336,7 +404,8 @@ TEST_CASE("win32 failures: access denied and any other error are unreadable with
     CHECK_FALSE(failed.token.empty());
 }
 
-TEST_CASE("win32 failures: a cause the shell detects itself is unreadable with exactly one token, "
+TEST_CASE("system_hardening win: win32 failures: a cause the shell detects itself is unreadable "
+          "with exactly one token, "
           "never a denial",
           "[system_hardening][win_parsers]") {
     // ERROR_MORE_DATA, a non-REG_BINARY type and a decoder token are found by the Windows shell,
@@ -351,7 +420,8 @@ TEST_CASE("win32 failures: a cause the shell detects itself is unreadable with e
           "mitigation_options:odd_length");
 }
 
-TEST_CASE("win32 failures: the classified error numbers are the winerror.h constants",
+TEST_CASE("system_hardening win: win32 failures: the classified error numbers are the winerror.h "
+          "constants",
           "[system_hardening][win_parsers]") {
     // system_hardening_win.cpp static_asserts these against the SDK on Windows; pinned here on
     // every OS so a typo in the pure header fails loudly on the fast suites too.
@@ -362,7 +432,8 @@ TEST_CASE("win32 failures: the classified error numbers are the winerror.h const
     CHECK(kErrorInvalidParameter == 87u); // ERROR_INVALID_PARAMETER
 }
 
-TEST_CASE("REAL CAPTURE: decoded DEP/ASLR/CFG match Get-ProcessMitigation -System",
+TEST_CASE("system_hardening win: REAL CAPTURE: decoded DEP/ASLR/CFG match "
+          "Get-ProcessMitigation -System",
           "[system_hardening][win_parsers][fixture]") {
     // REAL CAPTURE from the-rig. The provenance file records the ground truth
     // as `expect.<short policy>=<on|off|default>` lines (Get-ProcessMitigation

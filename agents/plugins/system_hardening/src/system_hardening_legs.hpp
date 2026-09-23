@@ -26,10 +26,12 @@ int collect_posture_macos(yuzu::CommandContext& ctx);
 int collect_posture_win(yuzu::CommandContext& ctx);
 
 /// Writes every row, then the CC-07 status via select_status: OK/FULL when acc
-/// holds no failure token (every key was a value or `absent`); PERMISSION_DENIED/
-/// PARTIAL when a read was refused (EACCES/EPERM); else CONSTRAINED/PARTIAL, with
-/// the accumulated `<key>:<cause>` tokens as the reason. Only an `unreadable` key
-/// adds a token; an absent optional key never downgrades the run.
+/// holds no failure token; PERMISSION_DENIED/PARTIAL when a read was refused
+/// (EACCES/EPERM); else CONSTRAINED/PARTIAL, with the accumulated tokens as the
+/// reason. Each `unreadable` key adds one `<key>:<cause>` token; an absent optional
+/// key adds none and never downgrades the run on its own. The one token that is
+/// not a key's is the Linux backstop `proc_sys:not_visible` (all eleven keys ENOENT
+/// on a confirmed procfs), which makes the run CONSTRAINED with every row `absent`.
 inline void emit_posture(yuzu::CommandContext& ctx, const std::vector<PostureRow>& rows,
                          const yuzu::shared::ConstraintAccumulator& acc) {
     for (const auto& r : rows)

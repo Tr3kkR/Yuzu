@@ -24,23 +24,32 @@
  * <raw> is "-" when no value was read (absent/unreadable); an empty value that
  * WAS read (macOS kern.bootargs) is an empty column.
  *
- * REASON TOKENS (yuzu::shared::ConstraintAccumulator, one per UNREADABLE key;
- * an absent key adds none):
+ * REASON TOKENS (yuzu::shared::ConstraintAccumulator): one per UNREADABLE key,
+ * plus one Linux backstop; an absent key adds none.
  *   <key>:eacces          -> unreadable (EACCES or EPERM) AND the run reports
  *                            PERMISSION_DENIED/PARTIAL
+ *   <key>:not_regular     -> unreadable (Linux: the leaf opened but is not a
+ *                            regular file -- a FIFO, device or directory)
  *   <key>:errno_<n>       -> unreadable (any other errno)
+ *   proc_sys:not_visible  -> Linux only: ALL eleven keys read ENOENT on a
+ *                            confirmed procfs (collect_linux_posture); every row
+ *                            still reads `absent`, but the run is CONSTRAINED
  * ENOENT is the only errno that reads as `absent`, and it carries no token. The
  * Linux leg only ever hands this layer an ENOENT it has confirmed: a leaf ENOENT
- * whose /proc/sys is not a procfs mount arrives as ENODEV (remap_enoent_for_surface
- * below) and reads `unreadable` + `<key>:errno_19`, never a clean `absent`. A
- * run whose every key is a value or `absent` therefore reports OK/FULL; a run
- * with an `unreadable` key reports PERMISSION_DENIED/PARTIAL when any read was
+ * whose nearest existing directory is not procfs arrives as ENODEV
+ * (remap_enoent_for_surface below) and reads `unreadable` + `<key>:errno_19`, never
+ * a clean `absent`. A run whose every key is a value or `absent` therefore reports
+ * OK/FULL, except that the all-absent Linux backstop reports CONSTRAINED/PARTIAL; a
+ * run with an `unreadable` key reports PERMISSION_DENIED/PARTIAL when any read was
  * refused (a denial outranks every other cause), else CONSTRAINED/PARTIAL --
  * select_status below decides, for every leg.
  *
  * EMPTY IS NOT FAILED: an empty macOS kern.bootargs is a successful read of
  * an empty string (sysctlbyname size probe rc=0, len=1 -- a lone NUL); the
  * mapper defines it `enabled` (no boot-arg overrides) and it adds no token.
+ * Emptiness is judged on the WHOLE value with whitespace and NULs trimmed from
+ * both ends, never on its first line, so "\n-v" is not empty; the raw column
+ * carries the whole value.
  */
 #pragma once
 
@@ -52,11 +61,13 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::system_hardening {
@@ -165,18 +176,24 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
 
 // ── pure mappers ────────────────────────────────────────────────────────
 
-/// First line of `data`, ASCII-whitespace trimmed.
-[[nodiscard]] inline std::string_view first_line_trimmed(std::string_view data) noexcept {
-    if (const auto nl = data.find('\n'); nl != std::string_view::npos) data = data.substr(0, nl);
-    const auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\0'; };
+/// The WHOLE value with ASCII whitespace (newlines included) and NULs trimmed from both ends.
+/// Never cut at the first line: content after a newline is part of the value, so it can neither
+/// be hidden from the mapper nor dropped from the raw column. Every allowlisted Linux key is one
+/// integer plus one trailing '\n', so a kernel-emitted value trims exactly as before; a
+/// multi-line value (only possible from a forged leaf) now fails the strict integer parse
+/// (`unmodelled`) instead of being judged on its first line.
+[[nodiscard]] inline std::string_view trimmed_value(std::string_view data) noexcept {
+    const auto ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f' || c == '\0';
+    };
     while (!data.empty() && ws(data.front())) data.remove_prefix(1);
     while (!data.empty() && ws(data.back())) data.remove_suffix(1);
     return data;
 }
 
-/// Strict base-10 integer: the whole (trimmed) token or nullopt.
+/// Strict base-10 integer: the whole (trimmed) value or nullopt.
 [[nodiscard]] inline std::optional<std::int64_t> parse_int(std::string_view raw) noexcept {
-    raw = first_line_trimmed(raw);
+    raw = trimmed_value(raw);
     std::int64_t v = 0;
     const auto* end = raw.data() + raw.size();
     const auto [p, ec] = std::from_chars(raw.data(), end, v);
@@ -199,13 +216,14 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
     return PostureState::unmodelled;
 }
 
-/// Only kern.bootargs is a string sysctl. Empty = a successful read of "no
-/// boot-arg overrides" = enabled. A non-empty value is not interpreted (boot
-/// args are an open vocabulary): unmodelled, raw column carries it.
+/// Only kern.bootargs is a string sysctl. Empty (the whole value, whitespace and NULs trimmed)
+/// = a successful read of "no boot-arg overrides" = enabled. A non-empty value is not interpreted
+/// (boot args are an open vocabulary): unmodelled, raw column carries it -- including a value
+/// whose overrides follow a leading newline or NUL.
 [[nodiscard]] inline PostureState evaluate_macos_string(std::string_view name,
                                                         std::string_view raw) noexcept {
     if (name == "kern.bootargs")
-        return first_line_trimmed(raw).empty() ? PostureState::enabled : PostureState::unmodelled;
+        return trimmed_value(raw).empty() ? PostureState::enabled : PostureState::unmodelled;
     return PostureState::unmodelled;
 }
 
@@ -217,15 +235,35 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
     return err == ENOENT ? PostureState::absent : PostureState::unreadable;
 }
 
+/// The read outcome of a leaf that OPENED but is not a regular file (a FIFO, character or block
+/// device, directory, socket). Negative, so it can never collide with a real errno (all
+/// positive): it classifies `unreadable`, is never a denial, and failure_token spells it
+/// `<key>:not_regular`.
+inline constexpr int kErrNotRegular = -1;
+
+/// POSIX file-type bits (S_IFMT / S_IFREG) as plain numbers so this header stays free of
+/// <sys/stat.h>; system_hardening_linux.cpp static_asserts both against the system header.
+inline constexpr std::uint32_t kModeTypeMask = 0170000;
+inline constexpr std::uint32_t kModeRegular = 0100000;
+
+/// Decides whether an opened Linux leaf may be read, from its fstat() `st_mode`: 0 for a
+/// regular file (every /proc/sys leaf is one), kErrNotRegular for anything else. The Linux leg
+/// opens with O_NONBLOCK so a FIFO or device mounted at an allowlisted path returns from open()
+/// at once, and never read()s a non-regular file -- a FIFO with no writer or a blocking device
+/// would otherwise pin an agent worker indefinitely, and a device's bytes (NULs, non-UTF-8)
+/// would reach the row.
+[[nodiscard]] constexpr int opened_leaf_error(std::uint32_t st_mode) noexcept {
+    return (st_mode & kModeTypeMask) == kModeRegular ? 0 : kErrNotRegular;
+}
+
 /// A leaf ENOENT is only evidence that a key is absent when the pseudo-filesystem it lives
 /// on is actually there. `/proc/sys` hidden or replaced by the runtime (a `ProcSubset=pid`
 /// mount, a container or chroot that does not expose it, a tmpfs overmount) turns EVERY read
 /// into ENOENT without saying anything about the host's hardening, so an unconfirmed surface
 /// remaps ENOENT to ENODEV: `unreadable` + `<key>:errno_19`, never a clean `absent`. Every
-/// other errno passes through untouched. `surface_mounted` is decided by the Linux leg
-/// (statfs magic of the leaf's nearest existing directory, surface_probe_dirs); this function
-/// is the pure half of that decision. The
-/// sibling platform_security plugin applies the same rule to efivarfs/securityfs.
+/// other errno passes through untouched. `surface_mounted` is surface_is_procfs() below, run by
+/// the Linux leg with the real statfs(); this function is the errno half of that decision. The
+/// sibling platform_security plugin (separate PR) applies the same rule to efivarfs/securityfs.
 [[nodiscard]] constexpr int remap_enoent_for_surface(int err, bool surface_mounted) noexcept {
     return (err == ENOENT && !surface_mounted) ? ENODEV : err;
 }
@@ -233,7 +271,7 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
 inline constexpr std::string_view kProcSysRoot = "/proc/sys";
 
 /// The directories whose filesystem decides whether a leaf ENOENT is trustworthy, nearest
-/// first: the leaf's parent, then each ancestor up to and including /proc/sys. The Linux leg
+/// first: the leaf's parent, then each ancestor up to and including /proc/sys. surface_is_procfs
 /// statfs()es them in order and trusts the FIRST that exists, so an overmount of a subtree (a
 /// tmpfs over /proc/sys/kernel) is caught, while a directory that is legitimately missing
 /// (kernel/yama without Yama built in) defers to its procfs parent. A path outside /proc/sys
@@ -254,19 +292,49 @@ inline constexpr std::string_view kProcSysRoot = "/proc/sys";
     return dirs;
 }
 
+/// linux/magic.h's ABI-stable PROC_SUPER_MAGIC, as a plain number (no kernel header here).
+inline constexpr std::uint64_t kProcSuperMagic = 0x9fa0;
+
+/// One statfs() answer, as the injected callable reports it: rc 0 = success with `f_type`;
+/// otherwise `err` is the errno.
+struct StatfsOutcome {
+    int rc = 0;
+    int err = 0;
+    std::uint64_t f_type = 0;
+};
+
+/// True iff the nearest EXISTING directory above `leaf` (surface_probe_dirs order, stopping at
+/// /proc/sys) is a procfs mount. `statfs_dir(const std::string& dir) -> StatfsOutcome` is the
+/// real statfs() in the Linux leg and a fake in the unit suite. The walk trusts the FIRST
+/// directory that exists (so a tmpfs over /proc/sys/kernel is caught even with /proc/sys itself
+/// procfs), skips only a missing directory (ENOENT: kernel/yama without Yama defers to its
+/// procfs parent), and answers false on any other statfs failure and when nothing up to
+/// /proc/sys exists -- never guessed true. At most surface_probe_dirs(leaf).size() calls, never a
+/// directory outside /proc/sys.
+template <typename StatfsFn>
+[[nodiscard]] bool surface_is_procfs(std::string_view leaf, StatfsFn&& statfs_dir) {
+    for (const auto& dir : surface_probe_dirs(leaf)) {
+        const StatfsOutcome s = statfs_dir(dir);
+        if (s.rc == 0) return s.f_type == kProcSuperMagic;
+        if (s.err != ENOENT) return false;
+    }
+    return false;
+}
+
 /// EACCES/EPERM: the read was refused. The one pair failure_token spells `:eacces`
 /// and select_status turns into PERMISSION_DENIED.
 [[nodiscard]] constexpr bool is_denied_errno(int err) noexcept {
     return err == EACCES || err == EPERM;
 }
 
-/// The reason token of a FAILED read: `<key>:eacces` | `<key>:errno_<n>`.
-/// Absence is not a failure: for ENOENT (classified `absent`) there is no
-/// token, so the result is nullopt and nothing reaches the accumulator.
+/// The reason token of a FAILED read: `<key>:eacces` | `<key>:not_regular` |
+/// `<key>:errno_<n>`. Absence is not a failure: for ENOENT (classified `absent`)
+/// there is no token, so the result is nullopt and nothing reaches the accumulator.
 [[nodiscard]] inline std::optional<std::string> failure_token(std::string_view key, int err) {
     if (classify_read_errno(err) == PostureState::absent) return std::nullopt;
     std::string t{key};
     if (is_denied_errno(err)) t += ":eacces";
+    else if (err == kErrNotRegular) t += ":not_regular";
     else t += ":errno_" + std::to_string(err);
     return t;
 }
@@ -282,13 +350,23 @@ struct PostureRow {
     int err = 0; // errno of a FAILED read (0 for a value)
 };
 
+/// `raw` with every NUL folded to a space. write_output() hands the row across the plugin ABI
+/// as a C string, so an embedded NUL would cut the row short (losing the state column);
+/// safe_output_field folds newlines the same way but passes NUL through.
+[[nodiscard]] inline std::string fold_nuls(std::string_view raw) {
+    std::string out{raw};
+    for (auto& c : out)
+        if (c == '\0') c = ' ';
+    return out;
+}
+
 [[nodiscard]] inline std::string format_posture_row(const PostureRow& r) {
     std::string out = "posture|";
     out += r.os;   // fixed vocabulary: "linux" / "macos" / "windows"
     out += '|';
     out += r.key;  // allowlist literal
     out += '|';
-    out += yuzu::util::safe_output_field(r.raw); // OS-supplied text
+    out += yuzu::util::safe_output_field(fold_nuls(r.raw)); // OS-supplied text
     out += '|';
     out += state_token(r.state);
     return out;
@@ -357,11 +435,13 @@ struct PostureStatus {
 /// (some kernels lack `kernel.yama.ptrace_scope`, for instance, and that alone is not
 /// suspicious). ALL ELEVEN keys reading ENOENT together is a different fact -- it means
 /// `/proc/sys` itself is not the tree this plugin expects, not that every hardening knob
-/// coincidentally vanished. The Linux leg already remaps ENOENT from an unconfirmed
-/// /proc/sys (remap_enoent_for_surface), so the ordinary hidden-surface case never reaches
-/// here as ENOENT; the canary stays for a confirmed procfs mount that still hides every key.
-/// That aggregate case adds one `proc_sys:not_visible` token so the result downgrades to
-/// CONSTRAINED; it does not change any individual row, which is still reporting a true fact.
+/// coincidentally vanished. The Linux leg already remaps ENOENT from an unconfirmed surface
+/// (remap_enoent_for_surface), so a hidden /proc/sys -- `ProcSubset=pid`, a masked or tmpfs
+/// /proc/sys -- arrives here as ENODEV (`errno_19`) and never as ENOENT; the canary fires only
+/// when every leaf is ENOENT on a CONFIRMED procfs. That aggregate case adds one
+/// `proc_sys:not_visible` token so the result downgrades to CONSTRAINED; it does not change any
+/// individual row, which is still reporting a true fact (so the run is CONSTRAINED with zero
+/// `unreadable` rows).
 template <typename Reader>
 [[nodiscard]] std::vector<PostureRow> collect_linux_posture(Reader&& read,
                                                             yuzu::shared::ConstraintAccumulator& acc) {
@@ -375,7 +455,7 @@ template <typename Reader>
             rows.push_back(failed_row("linux", k.key, o.err, acc));
             continue;
         }
-        std::string raw{first_line_trimmed(o.text)};
+        std::string raw{trimmed_value(o.text)};
         const auto state = evaluate_linux(k.key, raw);
         rows.push_back({"linux", k.key, std::move(raw), state});
     }
@@ -399,10 +479,12 @@ template <typename Reader>
         if (k.kind == SysctlKind::integer) {
             rows.push_back({"macos", k.name, std::to_string(o.ival), evaluate_macos_int(k.name, o.ival)});
         } else {
-            std::string raw{first_line_trimmed(o.text)};
-            const auto state = evaluate_macos_string(k.name, raw);
-            // An empty value is a real read: the raw column stays empty ("-" means "nothing read").
-            rows.push_back({"macos", k.name, std::move(raw), state});
+            // The whole value, untrimmed: emptiness is judged on all of it (evaluate_macos_string),
+            // and the raw column carries all of it -- format_posture_row folds newlines and NULs,
+            // so nothing after a leading "\n" is dropped. An empty value is a real read: the raw
+            // column stays empty ("-" means "nothing read").
+            const auto state = evaluate_macos_string(k.name, o.text);
+            rows.push_back({"macos", k.name, o.text, state});
         }
     }
     return rows;
