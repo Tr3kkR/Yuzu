@@ -445,9 +445,12 @@ What changes on **every** deployment, including single-server:
   purged serial is no longer in the inventory, so revoking it again returns
   `404`. This only affects you if you revoked a default server certificate (for
   example because its key may have leaked) **and** the default certificates were
-  regenerated **before you upgraded to this release**. Check first: if that
-  certificate's serial is still listed as revoked in `GET /api/v1/ca/issued` (or
-  appears in `GET /api/v1/ca/crl`), nothing was lost. If it is missing, re-root
+  regenerated **before you upgraded to this release**. Check first: find the
+  serial in the audit log (the `ca.cert.revoked` event for that revocation), then
+  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
+  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  -noout -text`). If the serial is still listed as revoked, nothing was lost. If
+  it is missing, re-root
   the internal CA with the clean re-root in `docs/pki-architecture.md`
   ("Deliberate clean re-root") — `POST /api/v1/ca/import-chain` is not enough,
   because it keeps the issuing key the leaked certificate chains to. A re-root
