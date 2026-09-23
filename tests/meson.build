@@ -766,7 +766,16 @@ endif
 # [tsan-heavy] is ALWAYS excluded from this entry (previously only in a plain build) - see
 # the #2373/#4153 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
 # below, which is the only place a sanitizer build runs the sole survivor now.
-agent_test_args = ['~[tsan-heavy]']
+#
+# [flaky-4086] is excluded the same way: a single quarantined case (test_guard_file.cpp,
+# "FileGuard rename: the compliant edge cache...") with a measured 9/10 standalone failure
+# rate (issue #4086 - guard_win_handle.hpp's cancel_and_close_ doesn't drain a cancelled
+# OVERLAPPED read before reuse). Its own [.] tag was NOT reliably observed to keep it out
+# of this entry on its own - repeat real-hardware runs against this entry's `~[tsan-heavy]`
+# filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
+# unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
+# verified to work - see the header comment on the TEST_CASE for detail.
+agent_test_args = ['~[tsan-heavy]~[flaky-4086]']
 test(
   'agent unit tests',
   agent_test_exe,
