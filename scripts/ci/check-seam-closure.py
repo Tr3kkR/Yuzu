@@ -334,6 +334,16 @@ FAMILIES = {
             "server/core/src/device_ui.cpp",
             "server/core/src/device_api.hpp",
             "server/core/src/device_api_local.hpp",
+            # device_lens_routes.{cpp,hpp} — the DEX/Guardian device-page lens
+            # fragments, split out of device_routes.cpp in the SAME wave but
+            # left outside this enforced set until their own rewire (issue
+            # #4576 + the guardian-lens deferral). Now onto the DexApi/
+            # GuardianApi abstract seams (see device_lens_routes.hpp's own
+            # banner) — enrolled here alongside device_routes.cpp/device_ui.cpp
+            # rather than as a standalone family, since it is this family's
+            # own presentation surface, just a second TU.
+            "server/core/src/device_lens_routes.cpp",
+            "server/core/src/device_lens_routes.hpp",
         ],
     },
     "network": {
@@ -385,11 +395,14 @@ FAMILIES = {
     # `dex_read_builders.hpp`'s other includers are OUTSIDE this set: they
     # legitimately reach the store (core side of the seam), like every other
     # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
-    # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
-    # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
-    # other families' twin-registration files. REST and MCP both route through
-    # `DexApi`; the dashboard fragments and the /fragments/device/dex lens are
-    # deferred (follow-up).
+    # `dex_routes.cpp` are multi-family / mixed TUs and stay
+    # INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the other
+    # families' twin-registration files. REST and MCP both route through
+    # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
+    # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
+    # `device` family's TU set above (it is that family's own second
+    # presentation TU), not this one, since `dex`'s enforced set here is
+    # header-only.
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",
@@ -501,10 +514,11 @@ FAMILIES = {
     # structs relocated out of `guardian_model.hpp` (that header itself
     # forward-declares `GuaranteedStateStore`/`BaselineStore` and so cannot
     # sit in this family's enforced set — see its own file banner).
-    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment is
-    # NOT rewired onto this seam — mirrors the `dex` family's OWN
-    # device-lens deferral (ISSUE #4576) verbatim, tracked as its own
-    # follow-up.
+    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment IS now
+    # rewired onto this seam (`GuardianApi::device_guards`, mirroring the
+    # `dex` family's own ISSUE #4576 rewire) and enforced — but via the
+    # `device` family's TU set, not this one, since `guardian`'s own enforced
+    # set here is header-only (see the `device` family entry above).
     "guardian": {
         "tus": [
             "server/core/src/guardian_types.hpp",
