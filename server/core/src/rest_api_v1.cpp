@@ -9905,7 +9905,32 @@ void RestApiV1::register_routes(
             // command we can't record. create_pending re-checks atomically
             // below, but rejecting here means the common at-quota case fails
             // BEFORE any agent executes (review finding B5).
-            if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
+            //
+            // #4306 finding 1: the plain count_for_owner() returned 0 on a
+            // degraded read, indistinguishable from a genuinely-empty owner —
+            // an over-quota owner's dispatch would fire for real before
+            // create_pending's atomic in-txn recheck (which runs AFTER
+            // dispatch, below) ever got a chance to refuse it. Fail CLOSED
+            // instead: nothing has been dispatched yet at this point, so
+            // refusing here is free.
+            auto quota = result_set_store->count_for_owner_checked(owner);
+            if (!quota.has_value()) {
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                }
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                        "reason=quota_check_degraded source_kind=" +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 503,
+                       "RESULT_SET_STORE_UNAVAILABLE: could not verify the per-owner "
+                       "result-set quota; nothing was dispatched execution_id=" + exec_id);
+                return;
+            }
+            if (*quota >= ResultSetStore::kMaxPerOwner) {
                 if (metrics_registry)
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
@@ -10016,7 +10041,7 @@ void RestApiV1::register_routes(
         };
 
         // GET /api/v1/result-sets — owner-scoped list.
-        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json,
+        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json, rs_err,
                                          deny_fleet_wide_service_scoped](
                                             const httplib::Request& req, httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding: owner-scoped via
@@ -10047,13 +10072,21 @@ void RestApiV1::register_routes(
                 if (v > 0 && v <= 500)
                     limit = v;
             }
-            std::string next;
-            auto sets = result_set_store->list_by_owner(session->username, cursor, limit, next);
+            // #4306/#4307 finding 2: a degraded page must never silently
+            // read as "empty fleet" — refuse rather than answer 200 with an
+            // empty array indistinguishable from a genuine no-result-sets
+            // owner.
+            auto page = result_set_store->list_by_owner_checked(session->username, cursor, limit);
+            if (!page) {
+                rs_err(res, 503,
+                       "RESULT_SET_STORE_UNAVAILABLE: could not list result sets");
+                return;
+            }
             JArr arr;
-            for (const auto& s : sets)
+            for (const auto& s : page->sets)
                 arr.add_raw(rs_to_json(s));
             auto data =
-                JObj().raw("result_sets", arr.str()).add("next_cursor", next).str();
+                JObj().raw("result_sets", arr.str()).add("next_cursor", page->next_cursor).str();
             res.set_content(ok_json(data), "application/json");
         });
 
@@ -10380,12 +10413,29 @@ void RestApiV1::register_routes(
                               // out-cursor first, so aliasing one variable as
                               // both rereads page 1 forever once the parent
                               // exceeds the page size (review finding B3).
-                              std::string next;
-                              auto page = result_set_store->members(pid, cur, 5000, next);
-                              ms.insert(page.begin(), page.end());
-                              if (next.empty())
+                              auto page_result = result_set_store->members_checked(pid, cur, 5000);
+                              // #4306 finding 3: the plain members() silently
+                              // truncated the loop on a degraded page,
+                              // indistinguishable from a genuine last page —
+                              // this route MATERIALISES the narrowed match set
+                              // into a durable result set, so a truncated read
+                              // here silently narrows who future dispatches
+                              // against it reach. Fail CLOSED: refuse the
+                              // whole operation rather than materialise a
+                              // partial parent_members set.
+                              if (!page_result) {
+                                  audit_failure("store_degraded");
+                                  rs_err(res, 503,
+                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                         "parent set's members; refusing to materialise a "
+                                         "partial result set");
+                                  return;
+                              }
+                              ms.insert(page_result->device_ids.begin(),
+                                       page_result->device_ids.end());
+                              if (page_result->next_cursor.empty())
                                   break;
-                              cur = std::move(next);
+                              cur = std::move(page_result->next_cursor);
                           }
                           parent_members = std::move(ms);
                       }
@@ -11087,7 +11137,7 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, result_set_store, load_owned,
+                 [auth_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11115,19 +11165,29 @@ void RestApiV1::register_routes(
                          if (v > 0 && v <= 10000)
                              limit = v;
                      }
-                     std::string next;
-                     auto devs = result_set_store->members(id, cursor, limit, next);
+                     // #4306 finding 3 / #4307 finding 2: never a 200 with an
+                     // empty array on a degraded read — indistinguishable
+                     // from a genuine last/empty page.
+                     auto page = result_set_store->members_checked(id, cursor, limit);
+                     if (!page) {
+                         rs_err(res, 503,
+                                "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
+                                "members");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& d : devs)
+                     for (const auto& d : page->device_ids)
                          arr.add(d);
-                     auto data =
-                         JObj().raw("device_ids", arr.str()).add("next_cursor", next).str();
+                     auto data = JObj()
+                                     .raw("device_ids", arr.str())
+                                     .add("next_cursor", page->next_cursor)
+                                     .str();
                      res.set_content(ok_json(data), "application/json");
                  });
 
         // GET /api/v1/result-sets/{id}/lineage
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
-                 [auth_fn, result_set_store, load_owned,
+                 [auth_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11145,9 +11205,17 @@ void RestApiV1::register_routes(
                      auto row = load_owned(req, id, session->username, res);
                      if (!row)
                          return;
-                     auto chain = result_set_store->lineage(id, session->username);
+                     // #4306 finding 3 / #4307 finding 2: never a 200 with an
+                     // empty/truncated chain on a degraded read.
+                     auto chain_result = result_set_store->lineage_checked(id, session->username);
+                     if (!chain_result) {
+                         rs_err(res, 503,
+                                "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
+                                "lineage");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& n : chain)
+                     for (const auto& n : *chain_result)
                          arr.add(JObj()
                                      .add("id", n.id)
                                      .add("name", n.name)

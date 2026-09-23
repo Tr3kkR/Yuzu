@@ -2960,3 +2960,222 @@ TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
         });
     CHECK_FALSE(heal_success_audited);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4306 PR-B: findings 1 + 3 (+ #4307 finding 2) — a degraded ResultSetStore
+// read must fail closed (503/500), never silently read as "empty"/"under
+// quota" on a store the async producers dispatch real commands through.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any dispatch — "
+          "nothing reaches an agent, the execution is cancelled, audit shows the failure "
+          "(#4306 finding 1)",
+          "[pg][result_set][async][tar][security][4306]") {
+    // No parent_id: a supplied parent_id would hit resolve_owned_parent's own
+    // DB read first and 503 there instead, before ever reaching the quota
+    // pre-check under test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    AsyncHarness h(short_lock_pool);
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 503);
+    REQUIRE(j.contains("error"));
+    const std::string msg = j["error"]["message"].get<std::string>();
+    CHECK(msg.find("could not verify the per-owner result-set quota") != std::string::npos);
+    CHECK(msg.find("nothing was dispatched") != std::string::npos);
+
+    // The load-bearing assertion: dispatch never fired.
+    CHECK(h.calls.empty());
+
+    // yuzu_result_set_quota_rejected is untouched -- this is a store-fault
+    // refusal, not a quota rejection.
+    CHECK(h.metrics.counter("yuzu_result_set_quota_rejected").value() == 0.0);
+
+    bool saw_failure_audit = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("quota_check_degraded") != std::string::npos)
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
+
+    // The execution row was cancelled, not left running forever. Extract the
+    // execution_id the handler minted from the error message.
+    auto pos = msg.find("execution_id=");
+    REQUIRE(pos != std::string::npos);
+    const std::string exec_id = msg.substr(pos + std::string("execution_id=").size());
+    auto exec = h.tracker->get_execution(exec_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // No pending row was ever created.
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("from-inventory-query: a degraded members-table read on the parent-narrowing loop "
+          "refuses rather than materialising an unnarrowed result set (#4306 finding 3)",
+          "[pg][result_set][async][inventory][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    auto parent = h.seed_materialized("members-parent", {"a1", "a2"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-inventory-query",
+                    R"({"name":"x","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 503);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "could not read the parent set's members") != std::string::npos);
+
+    bool saw_failure_audit = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("store_degraded") != std::string::npos)
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // No new result set was created -- only the seeded parent exists.
+    std::string next;
+    auto sets = h.store->list_by_owner("operator-1", "", 50, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].id == parent);
+}
+
+TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 with an "
+          "empty array indistinguishable from a genuinely empty owner (#4306/#4307 "
+          "finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    h.seed_materialized("has-one", {"a"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = h.sink.Get("/api/v1/result-sets");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find("could not list result sets") !=
+          std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read refuses "
+          "(503), never a 200 with an empty array (#4306 finding 3 / #4307 finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto id = h.seed_materialized("has-members", {"a", "b"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // load_owned's own get() reads `result_sets`, NOT `result_set_members`, so
+    // it passes under this lock -- the members read itself is what's under
+    // test here (distinct from the list/lineage tests, which lock
+    // result_sets and so exercise load_owned's PRE-EXISTING gate instead;
+    // see the lineage test below for the discrimination caveat).
+    auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find("could not read result-set members") !=
+          std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read refuses (503) "
+          "-- NOTE: this exercises load_owned's PRE-EXISTING ownership-check gate (get() also "
+          "reads result_sets), not lineage_checked specifically, since both hit the same "
+          "table under a table-wide lock and load_owned runs first. lineage_checked's own "
+          "DbError branch is covered directly in test_result_set_store.cpp; this test proves "
+          "the ROUTE as a whole stays fail-closed end to end (#4306 finding 3 / #4307 "
+          "finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto id = h.seed_materialized("has-lineage", {"a"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = h.sink.Get("/api/v1/result-sets/" + id + "/lineage");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    // load_owned's own message, not lineage_checked's -- see the TEST_CASE
+    // name for why.
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "could not verify result-set ownership") != std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}

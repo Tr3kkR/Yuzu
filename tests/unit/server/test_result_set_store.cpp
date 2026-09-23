@@ -16,6 +16,7 @@
 
 #include "result_set_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -143,6 +144,67 @@ TEST_CASE("ResultSetStore: synchronous create, get, members", "[pg][result_set][
     CHECK_FALSE(contains_ok(store, rs->id, "dev-z"));
 }
 
+TEST_CASE("ResultSetStore: members_checked matches the plain wrapper on the healthy path, "
+          "and fails closed (DbError) rather than silently truncating on a degraded read "
+          "(#4306 finding 3)",
+          "[pg][result_set][crud][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto rs = store.create_materialized(req("alice", "win-fleet"), {"dev-a", "dev-b", "dev-c"});
+    REQUIRE(rs.has_value());
+
+    // Healthy path: members_checked() reports the exact same page as the
+    // plain wrapper.
+    auto checked = store.members_checked(rs->id, "", 100);
+    REQUIRE(checked.has_value());
+    CHECK(checked->device_ids.size() == 3);
+    CHECK(checked->next_cursor.empty());
+
+    // Same lock-timeout technique as test_approval_manager.cpp's
+    // lock_timeout_ms precedent (#2786/#2456): a second raw connection holds
+    // an ACCESS EXCLUSIVE table lock, and the store under test is built
+    // against a short-lock_timeout_ms pool so its blocked read fails with a
+    // real, deterministic SQLSTATE 55P03 rather than hanging or being
+    // retried away.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.members_checked(rs->id, "", 100);
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged: empty vector, cleared
+    // cursor — never a partial/truncated-but-nonempty page.
+    std::string next = "sentinel";
+    auto plain = degraded_store.members(rs->id, "", 100, next);
+    CHECK(plain.empty());
+    CHECK(next.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // And the fault clears: the same store reads correctly once the lock
+    // releases.
+    auto recovered = degraded_store.members_checked(rs->id, "", 100);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->device_ids.size() == 3);
+}
+
 TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_set][lineage]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -161,6 +223,69 @@ TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_
     CHECK(chain.front().name == "all");     // root first
     CHECK(chain.back().name == "suspects"); // leaf last
     CHECK(chain.front().device_count == 4);
+}
+
+TEST_CASE("ResultSetStore: lineage_checked matches the plain wrapper on the healthy path, "
+          "and fails closed (DbError) on a mid-walk query failure rather than returning the "
+          "partial chain the pre-#4306 plain lineage() used to (#4306 finding 3)",
+          "[pg][result_set][lineage][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto g = store.create_materialized(req("alice", "all"), {"a", "b", "c", "d"});
+    REQUIRE(g.has_value());
+    auto mid = store.create_materialized(req("alice", "windows", g->id), {"a", "b"});
+    REQUIRE(mid.has_value());
+    auto leaf = store.create_materialized(req("alice", "suspects", mid->id), {"a"});
+    REQUIRE(leaf.has_value());
+
+    // Healthy path: lineage_checked() reports the exact same chain as the
+    // plain wrapper.
+    auto checked = store.lineage_checked(leaf->id, "alice");
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 3);
+    CHECK(checked->front().name == "all");
+    CHECK(checked->back().name == "suspects");
+
+    // Same lock-timeout technique as above: lock result_sets (lineage_checked
+    // walks that table on every hop, including the FIRST — the leaf row
+    // itself) so the very first hop of the walk fails deterministically with
+    // 55P03.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.lineage_checked(leaf->id, "alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged in KIND (empty), but
+    // this is the documented semantic shift (#4306): the pre-existing plain
+    // lineage() returned whatever partial chain it had accumulated before a
+    // mid-walk failure, whereas the wrapper built on lineage_checked returns
+    // EMPTY instead — more honest (no silent partial breadcrumb), a real
+    // behavior change for any caller still on the plain wrapper.
+    auto plain = degraded_store.lineage(leaf->id, "alice");
+    CHECK(plain.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.lineage_checked(leaf->id, "alice");
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->size() == 3);
 }
 
 TEST_CASE("ResultSetStore: alias resolution is owner-scoped", "[pg][result_set][alias]") {
@@ -316,6 +441,102 @@ TEST_CASE("ResultSetStore: per-owner quota enforced", "[pg][result_set][quota]")
         REQUIRE(store.create_materialized(req("alice"), {"a"}).has_value());
     CHECK(store.count_for_owner("alice") == 5);
     CHECK(store.count_for_owner("bob") == 0);
+}
+
+TEST_CASE("ResultSetStore: count_for_owner_checked fails closed (DbError) rather than "
+          "reading a degraded backend as a genuinely-empty owner (#4306 finding 1)",
+          "[pg][result_set][quota][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(store.create_materialized(req("alice"), {"a"}).has_value());
+
+    auto checked = store.count_for_owner_checked("alice");
+    REQUIRE(checked.has_value());
+    CHECK(*checked == 5);
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.count_for_owner_checked("alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged: 0, indistinguishable
+    // in KIND from a genuinely-empty owner by design (deny-or-benign wrapper)
+    // — this is exactly why the two async-producer pre-dispatch call sites
+    // moved to the checked method instead of relying on this fallback.
+    CHECK(degraded_store.count_for_owner("alice") == 0);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.count_for_owner_checked("alice");
+    REQUIRE(recovered.has_value());
+    CHECK(*recovered == 5);
+}
+
+TEST_CASE("ResultSetStore: list_by_owner_checked matches the plain wrapper on the healthy "
+          "path, and fails closed (DbError) rather than reading a degraded backend as an "
+          "empty list (#4306 finding 3 / #4307 finding 2)",
+          "[pg][result_set][crud][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    REQUIRE(store.create_materialized(req("alice", "a1"), {"a"}).has_value());
+    REQUIRE(store.create_materialized(req("alice", "a2"), {"b"}).has_value());
+
+    std::string next;
+    auto checked = store.list_by_owner_checked("alice", "", 50);
+    REQUIRE(checked.has_value());
+    CHECK(checked->sets.size() == 2);
+    CHECK(checked->next_cursor.empty());
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.list_by_owner_checked("alice", "", 50);
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    std::string plain_next = "sentinel";
+    auto plain = degraded_store.list_by_owner("alice", "", 50, plain_next);
+    CHECK(plain.empty());
+    CHECK(plain_next.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.list_by_owner_checked("alice", "", 50);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->sets.size() == 2);
 }
 
 TEST_CASE("ResultSetStore: GC sweep deletes expired unpinned rows and returns the count",

@@ -28469,32 +28469,45 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
           "carries a retry hint - poll executions instead of blindly re-sending",
           "[mcp][integration][result-sets]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
-    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle; // migrates the schema, gives us dsn()
 
-    // Break the store's own schema AFTER construction (is_open() already
-    // latched true) so create_pending() fails with DbError specifically -
-    // the dispatch itself must still succeed first, matching the real
-    // "bookkeeping row failed to persist after the fleet was already
-    // reached" scenario this branch exists for.
-    {
-        auto lease = rs_bundle.pool().try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        auto dropped = yuzu::server::pg::exec_params(
-            lease.get(), "DROP SCHEMA result_set_store CASCADE", std::vector<std::string>{});
-        REQUIRE(dropped.status() == PGRES_COMMAND_OK);
-    }
-
+    // #4306 finding 1 changed how this test must force the DbError: the
+    // pre-existing version dropped the WHOLE result_set_store schema, which
+    // now also breaks the NEW pre-dispatch quota pre-check
+    // (count_for_owner_checked reads the same now-missing schema) - the
+    // request would refuse before ever reaching dispatch, invalidating this
+    // test's "dispatch itself must still succeed first" premise. Take a
+    // table lock INSIDE the dispatch closure instead (mirrors the lock-
+    // inside-dispatch technique used elsewhere in this PR to force a fault
+    // strictly after a real dispatch) so the quota pre-check succeeds
+    // against the live schema, dispatch genuinely fires, and ONLY THEN does
+    // create_pending's own INSERT hit a deterministic 55P03 lock-timeout
+    // fault - isolating the branch this test actually exists to cover.
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
     auto succeeding_dispatch =
-        [](const std::string&, const std::string&, const std::vector<std::string>&,
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
            const std::string&, const std::unordered_map<std::string, std::string>&,
            const std::string&,
            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    locker.get(),
+                    "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
         return {.sent = 1, .command_id = "cmd-dberror"};
     };
 
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
     McpTestServer ts;
     ts.execution_tracker_for_test = tracker_bundle.get();
-    ts.result_set_store_for_test = rs_bundle.get();
+    ts.result_set_store_for_test = &short_lock_store;
     ts.start_with_dispatch(succeeding_dispatch, "operator");
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
@@ -28506,6 +28519,9 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
           std::string::npos);
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 }
 
 // Adversarial review (PR #4330, Codex + Kimi): rs_run_async silently

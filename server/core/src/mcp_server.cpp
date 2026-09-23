@@ -11429,8 +11429,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                if (result_set_store_->count_for_owner(session->username) >=
-                    ResultSetStore::kMaxPerOwner) {
+                // #4306 finding 1: the plain count_for_owner() returned 0 on
+                // a degraded read, indistinguishable from a genuinely-empty
+                // owner — an over-quota owner's dispatch would fire for real
+                // before create_pending's atomic in-txn recheck (which runs
+                // AFTER dispatch, below) ever got a chance to refuse it. Fail
+                // CLOSED instead: nothing has been dispatched yet here, so
+                // refusing is free. Mirrors REST's run_async fix exactly.
+                auto quota = result_set_store_->count_for_owner_checked(session->username);
+                if (!quota.has_value()) {
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "failure", "ResultSet", "",
+                        "reason=quota_check_degraded source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: could not verify the "
+                                 "per-owner result-set quota; nothing was dispatched "
+                                 "execution_id=" + exec_id,
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (*quota >= ResultSetStore::kMaxPerOwner) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
@@ -11577,13 +11600,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 500)
                     limit = 500;
-                std::string next;
-                auto sets = result_set_store_->list_by_owner(session->username, cursor,
-                                                              static_cast<int>(limit), next);
+                // #4306/#4307 finding 2: never a success response with an
+                // empty array on a degraded read — indistinguishable from a
+                // genuine no-result-sets owner.
+                auto page = result_set_store_->list_by_owner_checked(
+                    session->username, cursor, static_cast<int>(limit));
+                if (!page) {
+                    mcp_audit("failure");
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not list "
+                                                  "result sets",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : sets)
+                for (const auto& s : page->sets)
                     arr.push_back(result_set_json(s));
-                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -11899,12 +11934,33 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::unordered_set<std::string> ms;
                     std::string cur;
                     while (true) {
-                        std::string next;
-                        auto page = result_set_store_->members(pid, cur, 5000, next);
-                        ms.insert(page.begin(), page.end());
-                        if (next.empty())
+                        // #4306 finding 3: the plain members() silently
+                        // truncated the loop on a degraded page,
+                        // indistinguishable from a genuine last page — this
+                        // tool MATERIALISES the narrowed match set into a
+                        // durable result set, so a truncated read here
+                        // silently narrows who future dispatches against it
+                        // reach. Fail CLOSED: refuse the whole operation
+                        // rather than materialise a partial parent_members
+                        // set. Mirrors REST's identical fix.
+                        auto page_result = result_set_store_->members_checked(pid, cur, 5000);
+                        if (!page_result) {
+                            (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                           "reason=store_degraded source_kind=inventory_query");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                         "parent set's members; refusing to materialise a "
+                                         "partial result set",
+                                         "retry once the server reports ready",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                            return;
+                        }
+                        ms.insert(page_result->device_ids.begin(), page_result->device_ids.end());
+                        if (page_result->next_cursor.empty())
                             break;
-                        cur = std::move(next);
+                        cur = std::move(page_result->next_cursor);
                     }
                     parent_members = std::move(ms);
                 }
@@ -12609,13 +12665,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 10000)
                     limit = 10000;
-                std::string next;
-                auto devs =
-                    result_set_store_->members(rs_id, cursor, static_cast<int>(limit), next);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty result on a degraded read.
+                auto page =
+                    result_set_store_->members_checked(rs_id, cursor, static_cast<int>(limit));
+                if (!page) {
+                    mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set members",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : devs)
+                for (const auto& d : page->device_ids)
                     arr.push_back(d);
-                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success", rs_id);
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -12640,9 +12707,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                auto chain = result_set_store_->lineage(rs_id, session->username);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty/truncated chain on a degraded read.
+                auto chain_result = result_set_store_->lineage_checked(rs_id, session->username);
+                if (!chain_result) {
+                    mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set lineage",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& n : chain)
+                for (const auto& n : *chain_result)
                     arr.push_back({{"id", n.id},
                                    {"name", n.name},
                                    {"source_kind", n.source_kind},
