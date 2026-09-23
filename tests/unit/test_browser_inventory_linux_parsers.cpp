@@ -618,6 +618,44 @@ TEST_CASE("browser_inventory linux: comment-syntax / domain-literal / raw-IDN e-
 #endif // !defined(_WIN32)
 }
 
+TEST_CASE("browser_inventory linux: domain-side CFWS (comment/folding-whitespace before or around "
+          "a domain dot) is redacted in the FULL wire row -- round-2 adversarial finding, domain-"
+          "side mirror of G-3",
+          "[browser_inventory][linux][privacy]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Round-2 adversarial finding (2026-09-23): the domain scan started
+    // matching immediately at '@', so CFWS before the domain or around a
+    // dot produced an empty or truncated domain and returned false --
+    // this is the finding's own stated falsifier (linux_profile_rows_at),
+    // closing it end to end (walk + read + parse + safe_output_field).
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_wire_email_cfws_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "google-chrome";
+    std::filesystem::create_directories(browser_dir);
+    {
+        std::ofstream f(browser_dir / "Local State", std::ios::binary);
+        f << R"json({"profile":{"info_cache":{)json"
+             R"json("profile-a":{"name":"alice@(comment)example.com"},)json"
+             R"json("profile-b":{"name":"alice@ example.com"},)json"
+             R"json("profile-c":{"name":"alice@example (c).com"}}}})json";
+    }
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0] == "profile|alice|chrome|profile-a|[redacted-email]");
+    CHECK(rows[1] == "profile|alice|chrome|profile-b|[redacted-email]");
+    CHECK(rows[2] == "profile|alice|chrome|profile-c|[redacted-email]");
+    for (const auto& row : rows) {
+        CHECK(row.find('@') == std::string::npos);
+    }
+#endif // !defined(_WIN32)
+}
+
 TEST_CASE("browser_inventory linux: an absent root is supported with zero rows, not a failure",
           "[browser_inventory][linux][walk]") {
 #if defined(_WIN32)

@@ -199,11 +199,11 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     CHECK_FALSE(looks_like_email_address("account@"));      // nothing after '@'
     CHECK_FALSE(looks_like_email_address("account@example")); // no '.' in domain
     CHECK(looks_like_email_address("a@b@c.com"));     // contains b@c.com -- over-match is safe
-    // Domain-side failure, not local-side: local-side is position-only
-    // (at > 0) since the G-1 fix, so this stays false because the space
-    // right after '@' leaves an empty domain, not because of the space
-    // before it.
-    CHECK_FALSE(looks_like_email_address("contact @ x.com"));
+    // Round-2 adversarial finding 2026-09-23 (domain-side mirror of G-3):
+    // the space right after '@' is now CFWS, skipped before the domain
+    // scan runs, so this over-matches on "x.com" -- the safe direction,
+    // same as every other CFWS case below.
+    CHECK(looks_like_email_address("contact @ x.com"));
 
     // Round-2 adversarial finding (2026-09-23): the whole-value test under-
     // matched every decorated form -- these are the reviewer's four
@@ -257,6 +257,23 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     // predecessor, so a literal "@@" now over-matches rather than
     // under-matching.
     CHECK(looks_like_email_address("a@@b.com"));
+
+    // Round-2 adversarial finding 2026-09-23 (domain-side mirror of G-3):
+    // CFWS (folding whitespace and/or a parenthesized comment, possibly
+    // nested) is now skipped after '@' and around each domain dot.
+    CHECK(looks_like_email_address("alice@(comment)example.com"));
+    CHECK(looks_like_email_address("alice@ example.com"));
+    CHECK(looks_like_email_address("alice@\texample.com"));
+    CHECK(looks_like_email_address("alice@\r\n example.com"));
+    CHECK(looks_like_email_address("alice@(a(nested))example.com"));
+    CHECK(looks_like_email_address("alice@ (c) [203.0.113.5]"));
+    CHECK(looks_like_email_address("alice@example (c).com"));
+    CHECK(looks_like_email_address("alice@example . com"));
+    // An unterminated comment consumes the rest of the value -- empty
+    // domain, no match (same contract as any other empty domain above).
+    CHECK_FALSE(looks_like_email_address("alice@(unterminated example.com"));
+    CHECK_FALSE(looks_like_email_address("alice@ "));
+    CHECK_FALSE(looks_like_email_address("alice@()"));
 }
 
 TEST_CASE("profiles_from_local_state: SYNTHETIC (Chrome) — two profiles, second is ephemeral "
