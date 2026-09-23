@@ -117,8 +117,9 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 /// domain scan started matching immediately at '@', so CFWS before the
 /// domain or around a dot (`alice@ (comment)example.com`,
 /// `alice@example . com`) produced an empty or truncated domain and
-/// returned false -- an unterminated comment still consumes the rest of
-/// `value`, yielding an empty domain and no match, same as before. Round-2
+/// returned false. (An unterminated comment consumes the rest of `value`
+/// and yields no match by the same pre-existing contract `skip_cfws`
+/// documents below -- not something this finding changed.) Round-3
 /// code-review finding F1 (2026-09-23): a backslash-escaped byte inside a
 /// comment is consumed as one RFC 5322 quoted-pair and never changes depth,
 /// so an escaped `(`/`)` (`alice@(a\(b)example.com`,
@@ -136,7 +137,7 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
     // then finds an empty domain and reports no match. Inside a comment, a
     // backslash and the byte immediately after it are consumed together as
     // one RFC 5322 quoted-pair -- that byte is never itself tested as a
-    // depth-changing '(' or ')' (round-2 finding F1, 2026-09-23: an escaped
+    // depth-changing '(' or ')' (round-3 finding F1, 2026-09-23: an escaped
     // ')' inside a comment was closing the comment early, truncating the
     // domain scan that follows).
     auto skip_cfws = [value](std::size_t& i) {

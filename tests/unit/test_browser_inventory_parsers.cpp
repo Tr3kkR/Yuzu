@@ -279,7 +279,7 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     // domain, no match (same contract as any other empty domain above).
     CHECK_FALSE(looks_like_email_address("alice@(unterminated example.com"));
 
-    // Round-2 code-review finding F1 (2026-09-23): an escaped '(' or ')'
+    // Round-3 code-review finding F1 (2026-09-23): an escaped '(' or ')'
     // inside a comment is a quoted-pair, not a depth-changing paren -- the
     // orchestrator's compiled probe against the pre-fix comment walk.
     CHECK(looks_like_email_address("alice@(escaped\\)paren)example.com"));
@@ -290,6 +290,18 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     // A lone trailing backslash must not step past the end of `value` --
     // it reads as an unterminated comment (empty domain), same as before.
     CHECK_FALSE(looks_like_email_address("alice@(trailing\\"));
+    // Governance round-3 unhappy-path (2026-09-23): an ODD count of
+    // backslashes before the comment's only ')' pairs the last backslash
+    // with that ')' as a quoted-pair, so the ')' is consumed as escaped
+    // content rather than the closing delimiter -- per RFC 5322 grammar
+    // this genuinely is an unterminated comment (no closing paren was ever
+    // found), not a new bypass: the same accepted contract as the
+    // no-closing-paren-at-all case above, just reached via a different
+    // malformation. An EVEN count correctly pairs off and leaves a real
+    // closing paren, so the domain after it is found.
+    CHECK_FALSE(looks_like_email_address("x@(\\)y.com"));
+    CHECK(looks_like_email_address("x@(\\\\)y.com"));
+    CHECK_FALSE(looks_like_email_address("x@(\\\\\\)y.com"));
     CHECK_FALSE(looks_like_email_address("alice@ "));
     CHECK_FALSE(looks_like_email_address("alice@()"));
 }
