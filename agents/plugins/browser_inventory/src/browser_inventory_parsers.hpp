@@ -118,7 +118,12 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 /// domain or around a dot (`alice@ (comment)example.com`,
 /// `alice@example . com`) produced an empty or truncated domain and
 /// returned false -- an unterminated comment still consumes the rest of
-/// `value`, yielding an empty domain and no match, same as before.
+/// `value`, yielding an empty domain and no match, same as before. Round-2
+/// code-review finding F1 (2026-09-23): a backslash-escaped byte inside a
+/// comment is consumed as one RFC 5322 quoted-pair and never changes depth,
+/// so an escaped `(`/`)` (`alice@(a\(b)example.com`,
+/// `alice@(escaped\)paren)example.com`) does not open/close the comment
+/// early and truncate the domain scan that follows.
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
     auto is_domain_char = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
@@ -128,7 +133,12 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
     // (nested comments tracked by depth) starting at `i`, repeating until
     // neither advances. An unterminated comment consumes the rest of
     // `value` (depth never returns to 0), which is intentional: the caller
-    // then finds an empty domain and reports no match.
+    // then finds an empty domain and reports no match. Inside a comment, a
+    // backslash and the byte immediately after it are consumed together as
+    // one RFC 5322 quoted-pair -- that byte is never itself tested as a
+    // depth-changing '(' or ')' (round-2 finding F1, 2026-09-23: an escaped
+    // ')' inside a comment was closing the comment early, truncating the
+    // domain scan that follows).
     auto skip_cfws = [value](std::size_t& i) {
         for (;;) {
             bool advanced = false;
@@ -144,7 +154,14 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
             if (i < value.size() && value[i] == '(') {
                 std::size_t depth = 0;
                 while (i < value.size()) {
-                    if (value[i] == '(') {
+                    if (value[i] == '\\') {
+                        // Quoted-pair: consume the backslash and the next
+                        // byte as one unit, never as a depth-changing
+                        // paren. A trailing lone backslash must not step
+                        // past the end -- it then reads as an unterminated
+                        // comment (depth stays open), same as before.
+                        i += (i + 1 < value.size()) ? 2 : 1;
+                    } else if (value[i] == '(') {
                         ++depth;
                         ++i;
                     } else if (value[i] == ')') {

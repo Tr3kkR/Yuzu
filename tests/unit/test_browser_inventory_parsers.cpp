@@ -235,12 +235,18 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     // G-3: RFC 5322 comment syntax.
     CHECK(looks_like_email_address("alice(comment)@example.com"));
 
-    // S-1: a `continue`->`break` mutation on the multi-'@' skip branch would
-    // make each of these false by stopping at the first (invalid) '@'
-    // instead of moving on to the valid one later in the string.
-    CHECK(looks_like_email_address("@alice@example.com"));       // local-side skip, then valid
-    CHECK(looks_like_email_address("alice@[ bob@example.com"));  // unterminated "@[", then valid
-    CHECK(looks_like_email_address("x@; alice@example.com"));    // domain-side skip, then valid
+    // S-1: cases 1-2 pin the two explicit `continue` sites on the multi-'@'
+    // skip path -- swapping either for a `break` would abort the whole
+    // scan instead of moving on to the valid '@' later in the string. Case
+    // 3 pins something different (round-2 finding F2, 2026-09-23): its
+    // '@' has no dotted domain, so the domain-scan loop exits via `break`,
+    // not a `continue` -- there is no `continue` on that path at all, it
+    // falls straight through to the for-loop's own next find('@'). The
+    // property under test is the same either way: neither exit aborts the
+    // outer scan before it reaches the valid '@' later in the string.
+    CHECK(looks_like_email_address("@alice@example.com"));       // local-side `continue`, then valid
+    CHECK(looks_like_email_address("alice@[ bob@example.com"));  // domain-literal `continue`, then valid
+    CHECK(looks_like_email_address("x@; alice@example.com"));    // domain-scan `break` (no dotted domain), then valid
 
     // S-3: domain-literal address -- is_domain_char excludes '[', so this
     // needs its own branch alongside the dotted-domain scan.
@@ -272,6 +278,18 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     // An unterminated comment consumes the rest of the value -- empty
     // domain, no match (same contract as any other empty domain above).
     CHECK_FALSE(looks_like_email_address("alice@(unterminated example.com"));
+
+    // Round-2 code-review finding F1 (2026-09-23): an escaped '(' or ')'
+    // inside a comment is a quoted-pair, not a depth-changing paren -- the
+    // orchestrator's compiled probe against the pre-fix comment walk.
+    CHECK(looks_like_email_address("alice@(escaped\\)paren)example.com"));
+    CHECK(looks_like_email_address("alice@(a\\(b)example.com"));
+    // Escaped backslash (quoted-pair "\\") then a real close -- the
+    // quoted-pair consumes only the first backslash's pair, not past it.
+    CHECK(looks_like_email_address("alice@(x\\\\)example.com"));
+    // A lone trailing backslash must not step past the end of `value` --
+    // it reads as an unterminated comment (empty domain), same as before.
+    CHECK_FALSE(looks_like_email_address("alice@(trailing\\"));
     CHECK_FALSE(looks_like_email_address("alice@ "));
     CHECK_FALSE(looks_like_email_address("alice@()"));
 }
