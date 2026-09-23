@@ -28,6 +28,16 @@
  * version_dir_name_ok (dot-prefixed `.metadata`/`.keepme`, separators, control
  * characters) are skipped by design: Homebrew creates real directories.
  *
+ * SYMLINKS ARE NEVER FOLLOWED. Every marker is reached the same way: the prefix
+ * root is opened with O_NOFOLLOW (its own parents, /opt and /usr, are owned by
+ * the OS), then each marker component is one openat + O_NOFOLLOW hop. A
+ * symlinked prefix, Library, Taps, Cellar or Caskroom is therefore refused and
+ * reported as a constraint (`symlink_refused` / `not_a_directory`), never read.
+ *
+ * BOUNDED. Both actions share one whole-ACTION budget (entries read and wall
+ * clock) on top of the per-directory cap; exhausting it is a `walk_budget`
+ * constraint, never a silently shorter result.
+ *
  * Per-user Homebrew stores are out of scope (machine scope only).
  *
  * Compiled on POSIX only; the portable row/text layer is
@@ -47,6 +57,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -62,6 +73,17 @@ inline constexpr std::string_view kOs = "macos";
 /// leading slash, so `root / prefix` composes with any injected root.
 inline constexpr std::array<std::string_view, 2> kPrefixes{"opt/homebrew", "usr/local"};
 
+/// The two package containers under a prefix, in walk order.
+struct Container {
+    std::string_view rel;
+    std::string_view source;
+    PackageKind kind;
+};
+inline constexpr std::array<Container, 2> kContainers{{
+    {"Cellar", "homebrew_cellar", PackageKind::formula},
+    {"Caskroom", "homebrew_caskroom", PackageKind::cask},
+}};
+
 [[nodiscard]] inline std::string under(const std::filesystem::path& root, std::string_view rel) {
     std::error_code ec;
     auto base = std::filesystem::absolute(root, ec);
@@ -73,6 +95,53 @@ inline constexpr std::array<std::string_view, 2> kPrefixes{"opt/homebrew", "usr/
     return "/" + std::string{prefix};
 }
 
+/// Whole-ACTION entries + wall-clock budget, one per action (constructed once,
+/// before the prefix loop) and threaded by reference through every listing that
+/// action performs. Each directory listing is bounded on its own by
+/// lim.max_entries_per_dir, but nothing else bounds how many such listings a
+/// whole action performs: a tree of max_entries_per_dir id/org directories x
+/// max_entries_per_dir entries each (or a Cellar full of plain files that never
+/// classify as a version directory, so row_cap never trips) would otherwise be
+/// read in full on every call. Not agents/core/include/yuzu/agent/
+/// confined_fs_rules.hpp's `EnumBudget`: that type is scoped, by its own banner,
+/// to confined recursive DELETE (a different subsystem) -- this is a small
+/// pkg_inventory-local equivalent of the same shape, not a shared import.
+struct WalkBudget {
+    std::size_t remaining_entries;
+    std::chrono::steady_clock::time_point deadline;
+
+    [[nodiscard]] static WalkBudget from(const Limits& lim) {
+        return {lim.max_walk_entries,
+                std::chrono::steady_clock::now() + std::chrono::seconds(lim.max_walk_seconds)};
+    }
+    [[nodiscard]] bool exhausted() const noexcept {
+        return remaining_entries == 0 || std::chrono::steady_clock::now() >= deadline;
+    }
+    void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
+};
+
+/// Opens <root>/<prefix>/<components...> one hop at a time: the prefix root with
+/// an O_NOFOLLOW open, then each component with openat + O_NOFOLLOW. Opening the
+/// joined string in one call would guard only its FINAL component -- the kernel
+/// still resolves every intermediate one through symlink-following path
+/// resolution -- so a swapped-in prefix or Library link would be read as the
+/// real thing (mirrors autoruns_macos.cpp's open_dir_no_follow_at_checked chain
+/// for the identical reason). The prefix root's own parents (/opt, /usr) are
+/// owned by the OS, so the one-string open of it is the trusted injected root
+/// plus a fixed literal. `absent` means some hop is ENOENT; `detail` names any
+/// other failure (a symlink is `symlink_refused` / `not_a_directory`).
+[[nodiscard]] inline posix::OpenDirResult
+open_under_prefix(const std::filesystem::path& root, std::string_view prefix,
+                  std::initializer_list<std::string_view> components) {
+    auto cur = posix::open_dir_no_follow(under(root, prefix));
+    for (const auto component : components) {
+        if (!cur.dir.valid()) return cur; // absent, or a real failure: stop at this hop
+        const std::string name{component};
+        cur = posix::open_dir_no_follow_at(cur.dir, name.c_str());
+    }
+    return cur;
+}
+
 /// Result of counting the real, well-named subdirectories of an open directory.
 struct SubdirCount {
     std::size_t count = 0;
@@ -80,13 +149,16 @@ struct SubdirCount {
 };
 
 /// Counts the subdirectories of `dir` that pass version_dir_name_ok, recording
-/// listing truncation and per-entry stat failures under `source`.
+/// listing truncation and per-entry stat failures under `source`. The listing
+/// is charged to `budget`; the caller decides when to check it.
 [[nodiscard]] inline SubdirCount count_subdirs(const posix::Dir& dir, std::string_view source,
                                                const Limits& lim,
-                                               yuzu::shared::ConstraintAccumulator& acc) {
+                                               yuzu::shared::ConstraintAccumulator& acc,
+                                               WalkBudget& budget) {
     SubdirCount out;
     const auto listing = posix::list_names(dir, lim.max_entries_per_dir);
     posix::note_listing(acc, kOs, source, listing);
+    budget.charge(listing.names.size());
     for (const auto& name : listing.names) {
         if (!version_dir_name_ok(name)) continue;
         const auto cls = posix::classify_entry(dir, name.c_str());
@@ -112,8 +184,8 @@ struct MarkerState {
 [[nodiscard]] inline std::optional<std::size_t>
 count_marker(const std::filesystem::path& root, std::string_view prefix, std::string_view rel,
              std::string_view source, MarkerState& state, const Limits& lim,
-             yuzu::shared::ConstraintAccumulator& acc) {
-    auto opened = posix::open_dir_no_follow(under(root, std::string{prefix} + "/" + std::string{rel}));
+             yuzu::shared::ConstraintAccumulator& acc, WalkBudget& budget) {
+    auto opened = open_under_prefix(root, prefix, {rel});
     if (opened.absent) return std::size_t{0};
     state.exists = true;
     if (!opened.detail.empty()) {
@@ -121,41 +193,22 @@ count_marker(const std::filesystem::path& root, std::string_view prefix, std::st
         return std::nullopt;
     }
     state.readable = true;
-    const auto c = count_subdirs(opened.dir, source, lim, acc);
+    const auto c = count_subdirs(opened.dir, source, lim, acc, budget);
     // A per-entry stat failure makes the count a lower bound: omit it.
     if (!c.ok) return std::nullopt;
     return c.count;
 }
 
 /// Counts Library/Taps/<org>/<repo>: the well-named directories one level down
-/// inside each org directory.
+/// inside each org directory. This is the one NESTED walk in `managers` (up to
+/// max_entries_per_dir orgs x max_entries_per_dir repos), so the whole-action
+/// budget is checked before every org: tripping it records `walk_budget` and
+/// omits the count (a lower bound is not a fact), like a per-entry stat failure.
 [[nodiscard]] inline std::optional<std::size_t>
 count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerState& state,
-           const Limits& lim, yuzu::shared::ConstraintAccumulator& acc) {
+           const Limits& lim, yuzu::shared::ConstraintAccumulator& acc, WalkBudget& budget) {
     constexpr std::string_view source = "homebrew_taps";
-    // Walk Library then Taps component-by-component (openat + O_NOFOLLOW at
-    // each hop) rather than opening the joined "<prefix>/Library/Taps" string
-    // in one call: a single joined-path open only guards the FINAL component
-    // (Taps) -- the kernel still resolves the intermediate "Library" through
-    // normal, symlink-following path resolution, so an attacker-owned
-    // "Library" symlink escapes confinement (mirrors autoruns_macos.cpp's
-    // open_dir_no_follow_at_checked chain for the identical reason). The
-    // prefix root itself is opened as one string: it is the trusted injected
-    // root plus a fixed literal, not attacker-controlled (every other
-    // prefix-root open in this file does the same).
-    auto prefix_dir = posix::open_dir_no_follow(under(root, prefix));
-    if (prefix_dir.absent) return std::size_t{0};
-    if (!prefix_dir.detail.empty()) {
-        acc.add_failure(make_token(kOs, source, prefix_dir.detail));
-        return std::nullopt;
-    }
-    auto library_dir = posix::open_dir_no_follow_at(prefix_dir.dir, "Library");
-    if (library_dir.absent) return std::size_t{0};
-    if (!library_dir.detail.empty()) {
-        acc.add_failure(make_token(kOs, source, library_dir.detail));
-        return std::nullopt;
-    }
-    auto opened = posix::open_dir_no_follow_at(library_dir.dir, "Taps");
+    auto opened = open_under_prefix(root, prefix, {"Library", "Taps"});
     if (opened.absent) return std::size_t{0};
     state.exists = true;
     if (!opened.detail.empty()) {
@@ -165,6 +218,7 @@ count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerSta
     state.readable = true;
     const auto orgs = posix::list_names(opened.dir, lim.max_entries_per_dir);
     posix::note_listing(acc, kOs, source, orgs);
+    budget.charge(orgs.names.size());
     std::size_t taps = 0;
     bool ok = true;
     for (const auto& org : orgs.names) {
@@ -176,6 +230,12 @@ count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerSta
             continue;
         }
         if (cls.kind != posix::EntryKind::directory) continue;
+        if (budget.exhausted()) {
+            acc.add_failure(make_token(kOs, source, "walk_budget"));
+            acc.mark_incomplete();
+            ok = false;
+            break;
+        }
         auto org_dir = posix::open_dir_no_follow_at(opened.dir, org.c_str());
         if (!org_dir.dir.valid()) {
             if (!org_dir.absent) {
@@ -184,7 +244,7 @@ count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerSta
             }
             continue;
         }
-        const auto c = count_subdirs(org_dir.dir, source, lim, acc);
+        const auto c = count_subdirs(org_dir.dir, source, lim, acc, budget);
         taps += c.count;
         if (!c.ok) ok = false;
     }
@@ -192,41 +252,24 @@ count_taps(const std::filesystem::path& root, std::string_view prefix, MarkerSta
     return taps;
 }
 
-/// Whole-ACTION entries + wall-clock budget for macos_package_rows_at's walk,
-/// threaded by reference through every append_package_rows call for both
-/// prefixes x Cellar/Caskroom (constructed once, before that loop). Not
-/// agents/core/include/yuzu/agent/confined_fs_rules.hpp's `EnumBudget`: that
-/// type is scoped, by its own banner, to confined recursive DELETE (a
-/// different subsystem) -- this is a small pkg_inventory-local equivalent of
-/// the same shape/idea, not a shared import.
-struct WalkBudget {
-    std::size_t remaining_entries;
-    std::chrono::steady_clock::time_point deadline;
-
-    [[nodiscard]] bool exhausted() const noexcept {
-        return remaining_entries == 0 || std::chrono::steady_clock::now() >= deadline;
-    }
-    void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
-};
-
 /// Appends one package row per <container>/<name>/<version> directory under
 /// <prefix>/<rel> (rel = "Cellar" or "Caskroom"). Stops at lim.max_package_rows
-/// (`row_cap`) or, first, at `budget` (`walk_budget`): each directory listing
-/// (top-level id names AND every per-id version listing) is bounded on its
-/// own by lim.max_entries_per_dir, but nothing else bounds how many such
-/// listings the whole action performs -- a tree with max_entries_per_dir
-/// id-directories x max_entries_per_dir version-entries-each (or a Cellar
-/// full of plain files that never classify as a version directory, so
-/// row_cap never trips) is otherwise read in full every call.
-inline void append_package_rows(const std::filesystem::path& root, std::string_view prefix,
-                                std::string_view rel, std::string_view source, PackageKind kind,
-                                const Limits& lim, std::vector<std::string>& rows,
-                                yuzu::shared::ConstraintAccumulator& acc, WalkBudget& budget) {
-    auto top = posix::open_dir_no_follow(under(root, std::string{prefix} + "/" + std::string{rel}));
-    if (top.absent) return;
+/// (`row_cap`) or, first, at `budget` (`walk_budget`); see WalkBudget for why
+/// the per-directory cap alone does not bound the action. Returns true when it
+/// stopped on the budget and recorded `walk_budget` itself, so the caller does
+/// not also have to. Exhaustion that leaves NOTHING of this container unread
+/// (the last id was already walked, or only non-directory entries remained)
+/// records nothing here: the caller records it iff a later container is skipped.
+[[nodiscard]] inline bool
+append_package_rows(const std::filesystem::path& root, std::string_view prefix,
+                    std::string_view rel, std::string_view source, PackageKind kind,
+                    const Limits& lim, std::vector<std::string>& rows,
+                    yuzu::shared::ConstraintAccumulator& acc, WalkBudget& budget) {
+    auto top = open_under_prefix(root, prefix, {rel});
+    if (top.absent) return false;
     if (!top.detail.empty()) {
         acc.add_failure(make_token(kOs, source, top.detail));
-        return;
+        return false;
     }
     const auto names = posix::list_names(top.dir, lim.max_entries_per_dir);
     posix::note_listing(acc, kOs, source, names);
@@ -245,7 +288,7 @@ inline void append_package_rows(const std::filesystem::path& root, std::string_v
             // stay: this is a constraint, not a discard.
             acc.add_failure(make_token(kOs, source, "walk_budget"));
             acc.mark_incomplete();
-            return;
+            return true;
         }
         auto id_dir = posix::open_dir_no_follow_at(top.dir, id.c_str());
         if (!id_dir.dir.valid()) {
@@ -266,11 +309,12 @@ inline void append_package_rows(const std::filesystem::path& root, std::string_v
             if (rows.size() >= lim.max_package_rows) {
                 acc.add_failure(make_token(kOs, source, "row_cap"));
                 acc.mark_incomplete();
-                return;
+                return false;
             }
             rows.push_back(format_package_row(id, version, kind));
         }
     }
+    return false;
 }
 
 /// Folds `from`'s comma-joined tokens into `into` (ConstraintAccumulator has no
@@ -295,23 +339,25 @@ inline void merge_tokens(yuzu::shared::ConstraintAccumulator& into,
 /// `taps=N;formulae=N;casks=N` (a fact is omitted when its directory could not
 /// be read). No Homebrew anywhere -> zero rows and no constraint. `token` is
 /// set (comma-joined failure tokens) iff any read failed. `lim` is the
-/// resource-bound set (production: the defaults).
+/// resource-bound set (production: the defaults); the whole-action
+/// entries/wall-clock budget covers every prefix and marker.
 [[nodiscard]] inline std::vector<std::string>
 macos_manager_rows_at(const std::filesystem::path& root, std::optional<std::string>& token,
                       const Limits& lim = Limits{}) {
     token.reset();
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
+    auto budget = detail::WalkBudget::from(lim);
     for (const auto prefix : detail::kPrefixes) {
         // Per-prefix accumulator: an `unavailable` row's reason must name only
         // this prefix's failures, while the status row sees every prefix's.
         yuzu::shared::ConstraintAccumulator pacc;
         detail::MarkerState state;
-        const auto taps = detail::count_taps(root, prefix, state, lim, pacc);
-        const auto formulae =
-            detail::count_marker(root, prefix, "Cellar", "homebrew_cellar", state, lim, pacc);
-        const auto casks =
-            detail::count_marker(root, prefix, "Caskroom", "homebrew_caskroom", state, lim, pacc);
+        const auto taps = detail::count_taps(root, prefix, state, lim, pacc, budget);
+        const auto formulae = detail::count_marker(root, prefix, "Cellar", "homebrew_cellar", state,
+                                                   lim, pacc, budget);
+        const auto casks = detail::count_marker(root, prefix, "Caskroom", "homebrew_caskroom", state,
+                                                lim, pacc, budget);
         detail::merge_tokens(acc, pacc);
         if (!state.exists) continue; // no Homebrew marker under this prefix
         Facts f;
@@ -343,16 +389,28 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
     token.reset();
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
-    detail::WalkBudget budget{lim.max_walk_entries, std::chrono::steady_clock::now() +
-                                                         std::chrono::seconds(lim.max_walk_seconds)};
-    for (const auto prefix : detail::kPrefixes) {
-        if (budget.exhausted()) break;
-        detail::append_package_rows(root, prefix, "Cellar", "homebrew_cellar", PackageKind::formula,
-                                    lim, rows, acc, budget);
-        if (budget.exhausted()) break;
-        detail::append_package_rows(root, prefix, "Caskroom", "homebrew_caskroom",
-                                    PackageKind::cask, lim, rows, acc, budget);
-    }
+    auto budget = detail::WalkBudget::from(lim);
+    // `walk_budget` is recorded once: by append_package_rows when it trips inside a
+    // container, otherwise here, at the first container the exhausted budget makes
+    // us skip (a budget that dies exactly at a container boundary, or on a listing
+    // of only non-directory entries, would otherwise skip the rest silently).
+    bool budget_recorded = false;
+    [&] {
+        for (const auto prefix : detail::kPrefixes) {
+            for (const auto& c : detail::kContainers) {
+                if (budget.exhausted()) {
+                    if (!budget_recorded) {
+                        acc.add_failure(make_token(detail::kOs, c.source, "walk_budget"));
+                        acc.mark_incomplete();
+                    }
+                    return;
+                }
+                if (detail::append_package_rows(root, prefix, c.rel, c.source, c.kind, lim, rows,
+                                                acc, budget))
+                    budget_recorded = true;
+            }
+        }
+    }();
     if (acc.any_failure()) token = acc.reason();
     return rows;
 }
