@@ -39,8 +39,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `code_integrity` | ✅ supported · rung 1 · HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy and Control\DeviceGuard registry values | ✅ supported · rung 2 · spctl --status + csrutil status via run_bounded_subprocess | ✅ supported · rung 1 · securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) |
-| `secure_boot` | ✅ supported · rung 1 · HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State registry (UEFISecureBootEnabled) | ⛔ unsupported | ✅ supported · rung 1 · efivarfs reads of /sys/firmware/efi/efivars/SecureBoot-* and SetupMode-* (4-byte attributes + 1 data byte; errno-classified absent/unreadable) |
+| `code_integrity` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values | ✅ supported · rung 2 · spctl --status + csrutil status via run_bounded_subprocess | ✅ supported · rung 1 · securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) |
+| `secure_boot` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled) | ⛔ unsupported | ✅ supported · rung 1 · efivarfs reads of /sys/firmware/efi/efivars/SecureBoot-* and SetupMode-* (4-byte attributes + 1 data byte; errno-classified absent/unreadable) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 

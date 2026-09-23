@@ -20,7 +20,7 @@
         },
         "windows": {
           "fallback": "",
-          "mechanism": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values",
+          "mechanism": "HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\CI\\\\Policy and Control\\\\DeviceGuard registry values",
           "rung": "1",
           "support": "supported"
         }
@@ -46,7 +46,7 @@
         },
         "windows": {
           "fallback": "",
-          "mechanism": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled)",
+          "mechanism": "HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\SecureBoot\\\\State registry (UEFISecureBootEnabled)",
           "rung": "1",
           "support": "supported"
         }
@@ -114,7 +114,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "98358aa6dbaf",
+  "leg_hash": "fb2bb3055717",
   "manifest_version": 1,
   "name": "platform_security",
   "outputs": [
@@ -382,7 +382,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "98358aa6dbaf",
+        "leg_hash": "fb2bb3055717",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -427,7 +427,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "98358aa6dbaf",
+        "leg_hash": "fb2bb3055717",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -475,7 +475,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "98358aa6dbaf",
+        "leg_hash": "fb2bb3055717",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
