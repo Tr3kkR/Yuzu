@@ -314,6 +314,7 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                      const WalkLimits& limits = {}) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
+    std::size_t total_bytes = 0; // policy-file content read so far, against limits.max_total_bytes
     failure_reason.clear();
 
     auto finish = [&]() {
@@ -368,6 +369,15 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                 if (file.status == posix::OpenStatus::failed) {
                     acc.add_failure(std::string{"linux:"} + std::string{file.detail});
                     continue;
+                }
+                // The run's I/O, parse work and retained row text are bounded by this
+                // budget, not by the per-file and per-directory caps (whose product is
+                // enormous). The file that crosses it is not parsed and the walk stops:
+                // rows already read stand, the result is a lower bound.
+                total_bytes += file.bytes.size();
+                if (total_bytes > limits.max_total_bytes) {
+                    acc.add_failure("linux:byte_cap");
+                    return finish();
                 }
                 const std::string source = base + lvl.dir + "/" + fname;
                 auto parsed = rows_from_json_policy_text(file.bytes, vendor.browser, lvl.level,

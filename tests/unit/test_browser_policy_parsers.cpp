@@ -40,6 +40,11 @@
  *     truncated at the C-string boundary and the `nul_replaced` tail is lost;
  *   - read-to-EOF (Linux only, /proc reports st_size 0): read exactly st_size
  *     -> the /proc read returns empty.
+ *   - UTF-8 (protobuf transport): drop repair_utf8 from wire_field -> the invalid-byte
+ *     cases keep the raw bytes and the CommandResponse round trip fails (Linux also has the
+ *     real raw-byte-file-name case; no other OS can create such a name);
+ *   - aggregate read budget: drop the max_total_bytes check in linux_policy_rows_at ->
+ *     the one-under case reads every file and reports OK;
  *   - non-regular objects (root-safe, no chmod): delete the S_ISREG check in
  *     read_file_at -> the FIFO reads as EOF (json_unparseable) and the directory
  *     read fails with EISDIR (read_failed), so the exact not_regular pin fails;
@@ -48,6 +53,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "agent.pb.h" // CommandResponse: the transport that rejects invalid UTF-8
 #include "browser_policy_parsers.hpp"
 
 #include <nlohmann/json.hpp>
@@ -248,6 +254,93 @@ TEST_CASE("browser_policy: an embedded NUL cannot truncate a wire row",
     r.value = unmodelled_value("date");
     CHECK(format_policy_row(r) ==
           "policy|chrome|mandatory|machine|n\xEF\xBF\xBD|unmodelled|-|/x|date,nul_replaced");
+}
+
+namespace {
+
+/// The real acceptance test for a row: the command output travels in a proto3 `string` field and
+/// the receiver rejects the WHOLE response when it holds invalid UTF-8.
+bool survives_transport(const std::string& text) {
+    yuzu::agent::v1::CommandResponse out;
+    out.set_output(text);
+    std::string wire;
+    if (!out.SerializeToString(&wire))
+        return false;
+    yuzu::agent::v1::CommandResponse in;
+    return in.ParseFromString(wire) && in.output() == text;
+}
+
+std::string fffd(int n) {
+    std::string s;
+    for (int i = 0; i < n; ++i)
+        s += "\xEF\xBF\xBD";
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("browser_policy: bytes that are not valid UTF-8 are repaired so the row survives the "
+          "transport",
+          "[browser_policy][parsers]") {
+    // A Linux file name is arbitrary bytes and lands in `source`; every case below is rejected
+    // by the protobuf `string` field raw. The last four are the forms a lone-byte repair (the
+    // sdk's sanitize_utf8) lets through: overlong, surrogate, above U+10FFFF, bad lead byte.
+    // Each offending byte becomes one U+FFFD. MUTATION: drop repair_utf8 from wire_field ->
+    // the raw bytes reach the row and the round trip (and the exact row) fail.
+    struct Case {
+        const char* label;
+        std::string bytes;
+        std::string repaired;
+    };
+    const std::vector<Case> cases = {
+        {"lone 0xFF", "x\xFFz", "x" + fffd(1) + "z"},
+        {"stray continuation byte", "x\x80z", "x" + fffd(1) + "z"},
+        {"truncated 3-byte sequence at the end", "x\xE2\x82", "x" + fffd(2)},
+        {"overlong 2-byte C0 80", "x\xC0\x80z", "x" + fffd(2) + "z"},
+        {"overlong 3-byte E0 80 80", "x\xE0\x80\x80z", "x" + fffd(3) + "z"},
+        {"overlong 4-byte F0 80 80 80", "x\xF0\x80\x80\x80z", "x" + fffd(4) + "z"},
+        {"surrogate ED A0 80", "x\xED\xA0\x80z", "x" + fffd(3) + "z"},
+        {"above U+10FFFF, F4 90 80 80", "x\xF4\x90\x80\x80z", "x" + fffd(4) + "z"},
+        {"bad lead byte F5", "x\xF5\x80\x80\x80z", "x" + fffd(4) + "z"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.label);
+        PolicyRow r;
+        r.name = "N";
+        r.scope = "machine";
+        r.value = PolicyValue{PolicyType::String, "v", {}};
+        r.source = "/etc/opt/chrome/policies/managed/" + c.bytes + ".json";
+        const auto row = format_policy_row(r);
+        CHECK(row == "policy|chrome|mandatory|machine|N|string|v|"
+                     "/etc/opt/chrome/policies/managed/" +
+                         c.repaired + ".json|utf8_replaced");
+        CHECK(survives_transport(row));
+        CHECK(split_fields(row).size() == 9);
+    }
+
+    // Well-formed sequences at every boundary pass through untouched and are not flagged.
+    for (const char* ok : {"\xC2\x80", "\xDF\xBF", "\xE0\xA0\x80", "\xED\x9F\xBF", "\xEE\x80\x80",
+                           "\xEF\xBF\xBD", "\xF0\x90\x80\x80", "\xF4\x8F\xBF\xBF", "\xE2\x82\xAC"}) {
+        PolicyRow r;
+        r.name = "N";
+        r.scope = "machine";
+        r.value = PolicyValue{PolicyType::String, std::string{"v"} + ok, {}};
+        r.source = "/x";
+        const auto row = format_policy_row(r);
+        CHECK(row == std::string{"policy|chrome|mandatory|machine|N|string|v"} + ok + "|/x|-");
+        CHECK(survives_transport(row));
+    }
+
+    // Every free-text field is repaired, and both flags are reported (NUL first, then UTF-8).
+    PolicyRow r;
+    r.name = std::string("n\0\xFF", 3);
+    r.scope = "machine";
+    r.value = PolicyValue{PolicyType::String, "v\xFF", {}};
+    r.source = "/x";
+    const auto row = format_policy_row(r);
+    CHECK(row == "policy|chrome|mandatory|machine|n" + fffd(2) + "|string|v" + fffd(1) +
+                     "|/x|nul_replaced,utf8_replaced");
+    CHECK(survives_transport(row));
 }
 
 #if !defined(_WIN32)
@@ -707,6 +800,35 @@ TEST_CASE("browser_policy linux: a regular file where a policy directory is expe
     CHECK(reason == "linux:not_a_directory"); // both hops dedupe to the one token
 }
 
+#if defined(__linux__)
+TEST_CASE("browser_policy linux: a policy file whose NAME is not valid UTF-8 is read and its row "
+          "survives the transport",
+          "[browser_policy][linux][tree]") {
+    // Linux file names are arbitrary bytes (macOS and Windows refuse to create one), so only
+    // this leg can meet one, and it lands verbatim in `source`. MUTATION: drop repair_utf8 from
+    // wire_field -> the row keeps the raw 0xFF, so the exact source and the round trip fail.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_utf8name_"};
+    const fs::path managed = dir.path / "etc/opt/chrome/policies/managed";
+    fs::create_directories(managed);
+    const int fd = ::open((managed / "corp_\xFF.json").c_str(), O_CREAT | O_WRONLY | O_CLOEXEC,
+                          0644);
+    if (fd < 0) {
+        SKIP("this filesystem refuses a file name that is not valid UTF-8");
+    }
+    const std::string body = R"({"ShowHomeButton": true})";
+    REQUIRE(::write(fd, body.data(), body.size()) == static_cast<ssize_t>(body.size()));
+    ::close(fd);
+
+    std::string reason;
+    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    REQUIRE(rows.size() == 1);
+    CHECK(reason.empty()); // the file read fine; only its name needed repair
+    CHECK(rows[0] == "policy|chrome|mandatory|machine|ShowHomeButton|bool|true|"
+                     "/etc/opt/chrome/policies/managed/corp_\xEF\xBF\xBD.json|utf8_replaced");
+    CHECK(survives_transport(rows[0]));
+}
+#endif
+
 // ── failure -> command status (the seam every degraded read reports through) ──
 
 TEST_CASE("browser_policy linux leg: acquisition failure reaches the command as CONSTRAINED/PARTIAL",
@@ -839,6 +961,34 @@ TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",
     CHECK(run.rows.empty());
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.provenance == "linux:oversized");
+}
+
+TEST_CASE("browser_policy linux leg: the total read budget is exact and reported",
+          "[browser_policy][linux][cap]") {
+    // Every file is far below the per-file cap and the tree far below the row and entry caps:
+    // only the aggregate budget can stop this walk. MUTATION: drop the max_total_bytes check in
+    // linux_policy_rows_at -> the one-under case reads all three files and reports OK.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_bytecap_"};
+    const std::string a = R"({"A": 1})";
+    const std::string b = R"({"B": 2})";
+    const std::string c = R"({"C": 3})";
+    write_file(dir.path, "etc/opt/chrome/policies/managed/a.json", a);
+    write_file(dir.path, "etc/opt/chrome/policies/managed/b.json", b);
+    write_file(dir.path, "etc/opt/chrome/policies/managed/c.json", c);
+
+    WalkLimits limits;
+    limits.max_total_bytes = a.size() + b.size() + c.size(); // exactly the total: the control
+    auto run = run_leg(dir.path, limits);
+    CHECK(run.rows.size() == 3);
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+    CHECK(run.provenance.empty());
+
+    limits.max_total_bytes = a.size() + b.size() + c.size() - 1; // the last file crosses it
+    run = run_leg(dir.path, limits);
+    CHECK(run.rows.size() == 2); // rows read before the budget ran out stand; c.json is not parsed
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(run.provenance == "linux:byte_cap"); // the run-wide read bound, not the per-file cap
 }
 
 #if defined(__linux__)

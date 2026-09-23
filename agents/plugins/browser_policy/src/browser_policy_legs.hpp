@@ -41,10 +41,13 @@ inline constexpr std::string_view kExceptionToken = "linux:leg:exception";
 /// The ONE place a leg's exception is contained (frozen-seam rule: nothing
 /// crosses the plugin ABI). Runs `leg(ctx)`; if it throws, reports
 /// UNAVAILABLE/PARTIAL with kExceptionToken and returns 1. The plugin TU runs
-/// its WHOLE execute body through this — the unknown-action refusal included —
-/// and the unit suite drives it with a throwing leg. MUTATION: dropping the
-/// catch, the set_result_status call or the token fails the exception case in
-/// test_browser_policy_local_dispatcher.cpp.
+/// its WHOLE execute body through this — the unknown-action refusal included.
+/// The unit suite drives THIS template with a throwing leg (MUTATION: dropping
+/// the catch, the set_result_status call or the token fails the exception case
+/// in test_browser_policy_local_dispatcher.cpp). It cannot drive the plugin
+/// TU's use of it: the real legs cannot be made to throw on demand, so that one
+/// call site (browser_policy_plugin.cpp `execute`) is guarded by construction
+/// and by review, not by a test.
 template <typename Leg>
 [[nodiscard]] inline int run_guarded(yuzu::CommandContext& ctx, Leg&& leg) {
     try {

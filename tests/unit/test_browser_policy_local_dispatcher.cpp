@@ -34,8 +34,9 @@
  * drift of the row_kind-first column list, is caught here. On Linux the status case also
  * looks, read-only, for a `*.json` under the vendor policy directories to decide whether its
  * populated-read tier applies (a host with a policy file must yield a row or a CONSTRAINED
- * status; a host with none gets a WARN, never a vacuous pass). No process is spawned,
- * nothing sleeps, and no temp file is written.
+ * status; a host with none gets a WARN, never a vacuous pass), and the shipped leg's whole
+ * result is compared with run_linux_at(ctx, "/") -- the differential oracle that holds on every
+ * Linux host. No process is spawned, nothing sleeps, and no temp file is written.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -46,6 +47,9 @@
 
 #include "browser_policy_parsers.hpp"
 #include "browser_policy_legs.hpp" // run_guarded, kExceptionToken
+#if defined(__linux__)
+#include "browser_policy_linux_parsers.hpp" // run_linux_at: the oracle for the production leg
+#endif
 
 #include <algorithm>
 #include <array>
@@ -405,6 +409,18 @@ bool host_has_policy_file() {
     }
     return false;
 }
+
+/// The differential oracle for the production leg. The exported plugin's run_linux is one line,
+/// run_linux_at(ctx, "/"), and run_linux_at itself is proven row by row over an injected root in
+/// test_browser_policy_parsers.cpp. Running that same call here, on a real CommandContext, gives
+/// the result the shipped leg must reproduce exactly on THIS host -- so a run_linux that diverges
+/// (wrong root, an unconditional status, an added or dropped row) fails on every Linux host,
+/// including a policy-less CI runner where the populated-read tier can only warn.
+int production_root_execute(YuzuCommandContext* raw, const char* /*action*/,
+                            const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return bp::run_linux_at(ctx, "/");
+}
 #endif
 
 /// Drives run_guarded with a leg that throws: the real plugin's legs cannot be made to throw on
@@ -563,8 +579,10 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
 // MUTATION (Linux): drop the mark_result_read call in run_linux_at (UNDECLARED), report the
 // planned outcome (UNAVAILABLE) or a wrong-OS token from the Linux leg -> the OK-or-CONSTRAINED
 // and `linux:` token checks fail. A wrong production root or an unconditional empty OK -> the
-// populated-read tier fails on a host with a policy file. Row source/scope are read from the
-// host's real files, so they are asserted only when rows exist.
+// populated-read tier fails on a host with a policy file. Any run_linux that differs from
+// run_linux_at(ctx, "/") (an unconditional CONSTRAINED status included, which the tier accepts) ->
+// the differential oracle fails on every host. Row source/scope are read from the host's real
+// files, so they are asserted only when rows exist.
 TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeholder or the read "
           "status",
           "[browser_policy][status]") {
@@ -612,6 +630,19 @@ TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeho
     } else {
         WARN("no *.json under /etc/{opt/chrome,chromium,opt/edge}/policies/{managed,recommended} "
              "on this host -- the populated-read tier does not apply");
+    }
+    // The differential oracle (holds on every host): the shipped leg must be exactly
+    // run_linux_at(ctx, "/"). MUTATION: run_linux reporting an unconditional status, emitting or
+    // dropping a row, or returning nonzero -> one of these fails, even on a policy-less host.
+    {
+        YuzuPluginDescriptor oracle{};
+        oracle.execute = &production_root_execute;
+        const auto expected = dispatcher.run(&oracle, "policies");
+        CHECK(result.rc == expected.rc);
+        CHECK(result.captured == expected.captured);
+        CHECK(result.result_status == expected.result_status);
+        CHECK(result.result_completeness == expected.result_completeness);
+        CHECK(result.result_provenance == expected.result_provenance);
     }
 #elif defined(__APPLE__)
     check_planned_placeholder(result, "macos:planned");

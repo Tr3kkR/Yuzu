@@ -31,7 +31,7 @@
     "**No documented customer driver.** Zero documented driver anywhere - a full sweep of all four planning docs (capability-map, enterprise-parity-plan, the SOC 2 doc, roadmap.md) found not one mention of \"browser,\" a browser name, or \"extension\"/\"shadow IT\" in any browser-security sense. Pure capability-gap reasoning, identical caveat to PR8.1 through PR8.5.",
     "**No kill switch, by design.** `browser_policy` reads operator/IT-authored config, not personal data, and carries neither gate: the action is an ordinary `Inventory` read (`Inventory:Read`, no execute gate), unlike `browser_inventory`, whose installed-extension data can reveal user identity and behaviour.",
     "**Windows and macOS legs planned.** Each follows as its own PR; until then `policies` on those hosts returns zero rows with result status `UNAVAILABLE` and provenance `windows:planned` or `macos:planned`, so a host that was not inspected never reads as having no policy.",
-    "**Linux reads machine-level JSON policy files only.** Only the `managed` and `recommended` `*.json` files under `/etc/opt/chrome`, `/etc/chromium` and `/etc/opt/edge` are read; per-user policy, snap and flatpak Chromium paths and Firefox `policies.json` are not, and every row reports scope `machine`.",
+    "**Linux reads machine-level JSON policy files only.** Only the `managed` and `recommended` `*.json` files under `/etc/opt/chrome`, `/etc/chromium` and `/etc/opt/edge` are read; per-user policy, snap and flatpak Chromium paths and Firefox `policies.json` are not, and every row reports scope `machine`. The leg is stricter than Chromium's own loader in four places, and every one fails safe (a constrained or extra row, never a false `OK`) except the second: Chromium tolerates trailing commas in these files (this leg reports `linux:json_unparseable` for the file); Chromium parses every file in the directory, not only `*.json`, so a valid policy file with another name is applied by the browser but skipped here; Chromium follows symlinks, this leg refuses them (`linux:symlink_refused`); and where two files set the same policy Chromium applies the last file in name order, while this leg reports one row per file with its `source`.",
     "**Values are reported, not validated.** A policy name is emitted as written and is not checked against the browser's policy schema, so a misspelt or unsupported policy still appears as a row; lists and dicts are emitted as compact JSON text, and an embedded backslash in a value is folded to `/` by the escaper."
   ],
   "definitions": [
@@ -58,7 +58,7 @@
     }
   ],
   "description": "Enterprise-managed Chrome and Edge browser policy inventory",
-  "how_it_works": "`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. One `policy` row is written per configured policy: the browser (Chrome, Chromium or Edge), whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under `/etc/opt/chrome/policies`, `/etc/chromium/policies` and `/etc/opt/edge/policies`, in their `managed` and `recommended` subdirectories. Every directory below the root is opened without following symlinks, every file is read with a 1 MiB cap, and the parse is done with the vendored `nlohmann` JSON library. The plugin reads local configuration and nothing else: no subprocess, no network, no write. It enforces nothing and judges nothing; a policy is a row, not a verdict. The Windows and macOS legs are placeholders (see Caveats).\n\nThe plugin carries no default-off kill switch, on purpose: it reads operator/IT-authored config, not personal data, and carries neither gate.",
+  "how_it_works": "`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. One `policy` row is written per configured policy: the browser (Chrome, Chromium or Edge), whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under `/etc/opt/chrome/policies`, `/etc/chromium/policies` and `/etc/opt/edge/policies`, in their `managed` and `recommended` subdirectories. Every directory below the root is opened without following symlinks, every file is read with a 1 MiB cap (16 MiB in total per run), and the parse is done with the vendored `nlohmann` JSON library. The plugin reads local configuration and nothing else: no subprocess, no network, no write. It enforces nothing and judges nothing; a policy is a row, not a verdict. The Windows and macOS legs are placeholders (see Caveats).\n\nThe plugin carries no default-off kill switch, on purpose: it reads operator/IT-authored config, not personal data, and carries neither gate.",
   "inputs": [],
   "kind": {
     "collector": true,
@@ -186,7 +186,7 @@
           "values": null
         },
         {
-          "description": "A short qualifier, or \"-\" when there is none. json_type marks an unmodelled value; nul_replaced (appended, comma-joined) marks a free-text field that held an embedded NUL byte, replaced by U+FFFD.",
+          "description": "A short qualifier, or \"-\" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD.",
           "example": "-",
           "name": "detail",
           "platforms": [
@@ -201,7 +201,7 @@
       "definition_id": "crossplatform.browser_policy.policies"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited and has nine fields; field 0 is always the literal `policy`. There is no status row kind: the result status carries the outcome, and a host with no managed policy returns zero rows. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design), a field with an embedded NUL byte has it replaced by U+FFFD and is flagged in `detail`, and a value that cannot be represented is typed `unmodelled` (`detail` `json_type`) instead of being dropped. `browser_policy` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`.",
+  "outputs_note": "Every row is pipe-delimited and has nine fields; field 0 is always the literal `policy`. There is no status row kind: the result status carries the outcome, and a host with no managed policy returns zero rows. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design), a field with an embedded NUL byte, or with a byte that is not valid UTF-8 (only a Linux file name can carry one, in `source`), has it replaced by U+FFFD and is flagged in `detail` (`nul_replaced`, `utf8_replaced`), and a value that cannot be represented is typed `unmodelled` (`detail` `json_type`) instead of being dropped. `browser_policy` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`.",
   "platforms": {
     "linux": "supported",
     "macos": "planned",
@@ -240,9 +240,9 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined)",
+      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:byte_cap` (more than 16 MiB of policy files read in one run), `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined)",
       "status": "`CONSTRAINED`",
-      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, nesting depth) was hit"
+      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, 16 MiB total read cap, nesting depth) was hit"
     },
     {
       "completeness": "`PARTIAL`",

@@ -121,7 +121,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced (appended, comma-joined) marks a free-text field that held an embedded NUL byte, replaced by U+FFFD.'
+        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD.'
         example: "-"
         platforms: [windows, linux, darwin]
     aggregation:
