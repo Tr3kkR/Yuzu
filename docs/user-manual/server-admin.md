@@ -270,6 +270,29 @@ reason=parent_gone` case: create a fresh result set from the intended parent ins
 re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
 at creation) still broadcasts on re-eval, unchanged.
 
+### vNEXT — `GET /api/v1/result-sets` can now answer `503`; the async result-set producers' post-dispatch fault code changes from `400` to `500` on REST (#4306, breaking)
+
+**What changed.** `GET /api/v1/result-sets` previously always answered `200`, even when the
+underlying store read was degraded — `ResultSetStore::list_by_owner` returned a plain (possibly
+empty) container rather than surfacing the failure, so a degraded Postgres read answered `200`
+with an empty `result_sets` array indistinguishable from a genuinely-empty owner. It now answers
+`503 RESULT_SET_STORE_UNAVAILABLE` (`Retry-After` present) on a genuine store-level read failure.
+Separately, on REST, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`/from-instruction-result`, and `/{id}/re-eval`) previously mapped a post-dispatch store fault —
+the pending result-set row failing to persist *after* a real command had already dispatched to
+agents — to `400`. That was a client-error status for a server-side fault; it is now
+`500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`, matching MCP's `rs_run_async`, which already used its
+`kInternalError` branch for the identical case and did not change. The same three REST routes
+also gained a new PRE-dispatch `503 RESULT_SET_STORE_UNAVAILABLE` when the per-owner quota cannot
+be verified before dispatch — nothing is sent in that case, and the request is safe to retry.
+
+**Who this affects.** Any REST caller that treats `GET /api/v1/result-sets` as never-erroring, or
+that pattern-matches the old `400` on the three async producers' post-dispatch failure path. A
+`503` should be retried (`Retry-After` header present); a `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`
+means a command already dispatched — do not re-send, poll `GET /api/v1/executions/{id}` for its
+outcome instead. MCP callers are unaffected — `rs_run_async`'s post-dispatch fault mapping is
+unchanged.
+
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
 **What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.
