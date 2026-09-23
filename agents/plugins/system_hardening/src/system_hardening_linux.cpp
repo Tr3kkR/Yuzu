@@ -8,6 +8,15 @@
  * the pure collect loop (system_hardening_parsers.hpp), which classifies it.
  * Only a successful read yields a value. No shell, no sysctl binary, no
  * directory walk: the key -> path table is kLinuxAllowlist.
+ *
+ * A leaf ENOENT is only trusted as genuine absence when /proc/sys is confirmed to be
+ * a procfs mount (statfs magic) -- otherwise it is remapped to ENODEV before it
+ * reaches the pure layer (remap_enoent_for_surface), so a runtime that hides or
+ * replaces /proc/sys (ProcSubset=pid, a container or chroot that does not expose it)
+ * never reports a clean absent/OK for hardening it never probed. Same rule as the
+ * sibling platform_security plugin's efivarfs/securityfs check (PR #4792 review).
+ * In a default container /proc/sys IS procfs, and these eleven keys are kernel-global
+ * (not namespaced), so a containerised agent reads the host kernel's real values.
  */
 #include "system_hardening_legs.hpp"
 
@@ -16,11 +25,13 @@
 #include <yuzu/agent/scoped_fd.hpp>
 
 #include <fcntl.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::system_hardening {
 
@@ -30,14 +41,30 @@ namespace {
 // this table models (it maps to `unmodelled`, not a failure).
 constexpr std::size_t kMaxValueBytes = 256;
 
+// linux/magic.h's ABI-stable PROC_SUPER_MAGIC, not included directly to avoid a
+// kernel-header build dependency this TU otherwise has no need for.
+constexpr decltype(std::declval<struct statfs>().f_type) kProcSuperMagic = 0x9fa0;
+
+// True iff /proc/sys is currently a procfs mount. False on ANY statfs failure --
+// including the directory not existing at all -- never guessed true.
+bool proc_sys_is_procfs() {
+    struct statfs buf {};
+    if (::statfs("/proc/sys", &buf) != 0) return false;
+    return buf.f_type == kProcSuperMagic;
+}
+
 ReadOutcome read_proc_sys(std::string_view path) {
     const std::string p{path};
     int raw;
     do {
         raw = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
     } while (raw < 0 && errno == EINTR);
+    if (raw < 0) {
+        const int open_errno = errno; // captured before the statfs probe can touch errno
+        const bool mounted = open_errno == ENOENT ? proc_sys_is_procfs() : true;
+        return {remap_enoent_for_surface(open_errno, mounted), 0, {}};
+    }
     yuzu::agent::ScopedFd fd(raw);
-    if (!fd) return {errno, 0, {}};
 
     char buf[kMaxValueBytes];
     ssize_t n;

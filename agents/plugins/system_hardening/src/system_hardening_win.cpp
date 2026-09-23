@@ -12,8 +12,10 @@
  * FAILURE SEMANTICS ("failure never reads as absent; absence is never a failure"):
  *   ABSENT -- the OS definitively reports the thing is not there. The row reads
  *   `absent`, adds NO token and does not lower the status:
- *   ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on a registry value
- *                        -> `absent`
+ *   ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on a registry VALUE
+ *                        -> `absent` (a not-found on the Session Manager\kernel KEY
+ *                           itself is NOT absence: that key exists on every install,
+ *                           so it reads `unreadable`, <row>:key_missing)
  *   GetProcessMitigationPolicy ERROR_INVALID_PARAMETER/ERROR_NOT_SUPPORTED
  *                        -> `absent`
  *   UNREADABLE -- the read failed; the row reads `unreadable` with one token per cause:
@@ -137,10 +139,12 @@ void collect_registry(yuzu::CommandContext& ctx, Probe& p) {
     const LSTATUS orc =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKernelKey, 0, KEY_READ | KEY_WOW64_64KEY, key.put());
     if (orc != ERROR_SUCCESS) {
+        // The key itself, not a value inside it: a not-found here is never legitimate
+        // absence (ReadSource::structural_key), so both rows read unreadable.
         for (const char* name : {"mitigation_options", "mitigation_audit_options"})
             report_failure(ctx, p, name,
                            mit::classify_win32_failure(name, static_cast<std::uint32_t>(orc),
-                                                       mit::ReadSource::registry));
+                                                       mit::ReadSource::structural_key));
         return;
     }
     collect_blob(ctx, p, key.get(), L"MitigationOptions", "mitigation_options", "mitigation.");

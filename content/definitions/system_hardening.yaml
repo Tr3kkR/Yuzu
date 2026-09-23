@@ -26,7 +26,11 @@ metadata:
     `absent`, which is a normal answer and not a failure; a key that exists
     but could not be read reads `unreadable` and downgrades the result to
     CONSTRAINED/PARTIAL (PERMISSION_DENIED/PARTIAL when the read was refused)
-    rather than failing the command.
+    rather than failing the command. A not-found only reads `absent` where
+    the surface itself is confirmed present: on Linux a hidden or unmounted
+    /proc/sys makes every key `unreadable`, and on Windows a missing Session
+    Manager\kernel key (present on every install) reads `unreadable`. In a
+    container the Linux keys are the host kernel's values.
   tags: [system_hardening, security, posture]
 
 spec:
@@ -69,7 +73,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: 'Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here. unreadable = the read failed.'
+        description: 'Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here (only where the surface being read is confirmed present). unreadable = the read failed, or the surface itself (a hidden /proc/sys, a missing Session Manager\kernel key) was not there.'
         values: [enabled, disabled, partial, 'on', 'off', default, unmodelled, absent, unreadable]
         example: enabled
         platforms: [windows, linux, darwin]

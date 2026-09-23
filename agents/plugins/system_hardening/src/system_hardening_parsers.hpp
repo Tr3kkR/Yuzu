@@ -29,7 +29,10 @@
  *   <key>:eacces          -> unreadable (EACCES or EPERM) AND the run reports
  *                            PERMISSION_DENIED/PARTIAL
  *   <key>:errno_<n>       -> unreadable (any other errno)
- * ENOENT is the only errno that reads as `absent`, and it carries no token. A
+ * ENOENT is the only errno that reads as `absent`, and it carries no token. The
+ * Linux leg only ever hands this layer an ENOENT it has confirmed: a leaf ENOENT
+ * whose /proc/sys is not a procfs mount arrives as ENODEV (remap_enoent_for_surface
+ * below) and reads `unreadable` + `<key>:errno_19`, never a clean `absent`. A
  * run whose every key is a value or `absent` therefore reports OK/FULL; a run
  * with an `unreadable` key reports PERMISSION_DENIED/PARTIAL when any read was
  * refused (a denial outranks every other cause), else CONSTRAINED/PARTIAL --
@@ -214,6 +217,18 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
     return err == ENOENT ? PostureState::absent : PostureState::unreadable;
 }
 
+/// A leaf ENOENT is only evidence that a key is absent when the pseudo-filesystem it lives
+/// on is actually there. `/proc/sys` hidden or replaced by the runtime (a `ProcSubset=pid`
+/// mount, a container or chroot that does not expose it, a tmpfs overmount) turns EVERY read
+/// into ENOENT without saying anything about the host's hardening, so an unconfirmed surface
+/// remaps ENOENT to ENODEV: `unreadable` + `<key>:errno_19`, never a clean `absent`. Every
+/// other errno passes through untouched. `surface_mounted` is decided by the Linux leg
+/// (statfs magic of /proc/sys); this function is the pure half of that decision. The
+/// sibling platform_security plugin applies the same rule to efivarfs/securityfs.
+[[nodiscard]] constexpr int remap_enoent_for_surface(int err, bool surface_mounted) noexcept {
+    return (err == ENOENT && !surface_mounted) ? ENODEV : err;
+}
+
 /// EACCES/EPERM: the read was refused. The one pair failure_token spells `:eacces`
 /// and select_status turns into PERMISSION_DENIED.
 [[nodiscard]] constexpr bool is_denied_errno(int err) noexcept {
@@ -313,11 +328,13 @@ struct PostureStatus {
 
 /// `read(path)` -> ReadOutcome. One row per kLinuxAllowlist entry, in order.
 ///
-/// Canary: any ONE key legitimately not existing is a real, per-key `absent` (some
-/// kernels lack `kernel.yama.ptrace_scope`, for instance, and that alone is not
+/// Canary (a backstop): any ONE key legitimately not existing is a real, per-key `absent`
+/// (some kernels lack `kernel.yama.ptrace_scope`, for instance, and that alone is not
 /// suspicious). ALL ELEVEN keys reading ENOENT together is a different fact -- it means
-/// `/proc/sys` itself is not the tree this plugin expects (a `ProcSubset=pid` mount, a
-/// restricted container/chroot), not that every hardening knob coincidentally vanished.
+/// `/proc/sys` itself is not the tree this plugin expects, not that every hardening knob
+/// coincidentally vanished. The Linux leg already remaps ENOENT from an unconfirmed
+/// /proc/sys (remap_enoent_for_surface), so the ordinary hidden-surface case never reaches
+/// here as ENOENT; the canary stays for a confirmed procfs mount that still hides every key.
 /// That aggregate case adds one `proc_sys:not_visible` token so the result downgrades to
 /// CONSTRAINED; it does not change any individual row, which is still reporting a true fact.
 template <typename Reader>

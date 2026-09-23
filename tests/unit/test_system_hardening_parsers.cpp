@@ -364,6 +364,43 @@ TEST_CASE("system_hardening: a mostly-present host with a few legitimately-absen
     CHECK(acc.reason().empty());
 }
 
+// Fails under: remap_enoent_for_surface trusting a leaf ENOENT without the surface check
+// (unmounted -> absent), remapping a confirmed ENOENT (mounted -> unreadable), or touching
+// any errno other than ENOENT. The PR #4792 review's HIGH on the sibling plugin.
+TEST_CASE("system_hardening: a leaf ENOENT is absence only when /proc/sys is confirmed mounted",
+          "[system_hardening][classify]") {
+    CHECK(remap_enoent_for_surface(ENOENT, true) == ENOENT);
+    CHECK(remap_enoent_for_surface(ENOENT, false) == ENODEV);
+    for (int err : {0, EACCES, EPERM, EIO, EINVAL, ENODEV}) {
+        INFO("errno " << err);
+        CHECK(remap_enoent_for_surface(err, false) == err);
+        CHECK(remap_enoent_for_surface(err, true) == err);
+    }
+    CHECK(classify_read_errno(remap_enoent_for_surface(ENOENT, false)) == PostureState::unreadable);
+    CHECK(classify_read_errno(remap_enoent_for_surface(ENOENT, true)) == PostureState::absent);
+}
+
+// Fails under: a hidden /proc/sys (what the Linux leg hands the pure layer after the surface
+// check) reading as absent/OK, losing a per-key token, or double-reporting via the canary.
+TEST_CASE("system_hardening: a hidden /proc/sys is eleven unreadable rows, never absent/OK",
+          "[system_hardening][collect]") {
+    ConstraintAccumulator acc;
+    const auto rows = collect_linux_posture(
+        [](std::string_view) { return ReadOutcome{remap_enoent_for_surface(ENOENT, false), 0, {}}; },
+        acc);
+    REQUIRE(rows.size() == kLinuxAllowlist.size());
+    for (const auto& r : rows) {
+        INFO(r.key);
+        CHECK(r.state == PostureState::unreadable);
+        CHECK(r.raw == "-");
+        CHECK(has_token_for(acc, r.key));
+    }
+    CHECK(acc.reason().find(std::string{kLinuxAllowlist[0].key} + ":errno_" +
+                            std::to_string(ENODEV)) != std::string::npos);
+    CHECK(acc.reason().find("proc_sys:not_visible") == std::string::npos); // canary not needed
+    CHECK(select_status(acc, any_denied(rows)).status == YUZU_RESULT_STATUS_CONSTRAINED);
+}
+
 TEST_CASE("system_hardening: a mixed absent + EACCES run reports exactly the EACCES token",
           "[system_hardening][collect]") {
     auto reader = [](std::string_view path) -> ReadOutcome {

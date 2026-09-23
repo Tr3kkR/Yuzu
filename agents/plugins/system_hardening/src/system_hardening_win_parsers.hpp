@@ -36,7 +36,10 @@
  *    (decode_self_policy): effective policy, on/off only.
  * 3. A failed Win32 read (classify_win32_failure): the OS definitively saying
  *    the value / policy is not there is `absent` and carries NO failure token;
- *    every other failure is `unreadable` with exactly one token.
+ *    every other failure is `unreadable` with exactly one token. The one
+ *    exception is the Session Manager\kernel KEY itself (ReadSource::structural_key):
+ *    it exists on every install, so a not-found open is `unreadable` +
+ *    `<name>:key_missing`, never a clean `absent`.
  *
  * ROW: posture|windows|<policy>|<raw>|<state>, state in {on, off, default,
  * unmodelled, absent, unreadable}. `absent` = the OS says it does not exist;
@@ -247,7 +250,16 @@ inline constexpr std::uint32_t kErrorInvalidParameter = 87;
 
 /// Which Win32 call failed: ERROR_INVALID_PARAMETER / ERROR_NOT_SUPPORTED mean "this policy
 /// does not exist here" from GetProcessMitigationPolicy, but are real failures of a registry read.
-enum class ReadSource { registry, process_policy };
+///
+/// `structural_key` is the OPEN of a registry key that exists on every Windows install --
+/// `Session Manager\kernel` (rig session A compared that key's full contents before and after
+/// on a fresh Windows 11 install: the key was there, only the two mitigation VALUES were not;
+/// tests/unit/fixtures/wave8/system_hardening/windows/mitigation_options.hex.provenance.txt).
+/// A not-found there is never a legitimate absence (a corrupt hive, a stripped image), so it
+/// reads `unreadable` + `<name>:key_missing`, unlike a missing VALUE inside the opened key,
+/// which stays `absent`. Same possibility-gate rule as the sibling platform_security plugin's
+/// Control\Lsa key.
+enum class ReadSource { registry, process_policy, structural_key };
 
 /// How one failed Win32 read is reported. `state` is "absent" when the OS definitively says the
 /// thing is not there (`token` empty: no failure, status unaffected) and "unreadable" otherwise
@@ -263,6 +275,8 @@ inline ReadFailure classify_win32_failure(std::string_view name, std::uint32_t e
     const bool not_found = err == kErrorFileNotFound || err == kErrorPathNotFound;
     const bool unsupported = source == ReadSource::process_policy &&
                              (err == kErrorInvalidParameter || err == kErrorNotSupported);
+    if (not_found && source == ReadSource::structural_key)
+        return {"unreadable", std::string{name} + ":key_missing", false};
     if (not_found || unsupported)
         return {"absent", {}, false};
     if (err == kErrorAccessDenied)

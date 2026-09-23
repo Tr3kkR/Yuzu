@@ -243,6 +243,34 @@ TEST_CASE("win32 failures: not found is absent with NO token, on the registry an
     }
 }
 
+// Fails under: a not-found Session Manager\kernel KEY reading as a clean absent (the key exists
+// on every install -- rig-verified), the gate leaking onto a missing VALUE (which must stay a
+// token-free absent), or the structural source changing access-denied / other-error handling.
+TEST_CASE("win32 failures: a not-found structural KEY is unreadable key_missing, never absent",
+          "[system_hardening][win_parsers]") {
+    for (const auto err : {kErrorFileNotFound, kErrorPathNotFound}) {
+        INFO("err=" << err);
+        const auto key = classify_win32_failure("mitigation_options", err, ReadSource::structural_key);
+        CHECK(key.state == "unreadable");
+        CHECK(key.token == "mitigation_options:key_missing");
+        CHECK_FALSE(key.access_denied);
+        CHECK(format_posture_row("mitigation_options", "-", key.state) ==
+              "posture|windows|mitigation_options|-|unreadable");
+
+        const auto value = classify_win32_failure("mitigation_options", err, ReadSource::registry);
+        CHECK(value.state == "absent");
+        CHECK(value.token.empty());
+    }
+    const auto denied =
+        classify_win32_failure("mitigation_options", kErrorAccessDenied, ReadSource::structural_key);
+    CHECK(denied.state == "unreadable");
+    CHECK(denied.token == "mitigation_options:access_denied");
+    CHECK(denied.access_denied);
+    const auto other = classify_win32_failure("mitigation_options", 1005, ReadSource::structural_key);
+    CHECK(other.token == "mitigation_options:win32_1005");
+    CHECK_FALSE(other.access_denied);
+}
+
 TEST_CASE("win32 failures: GetProcessMitigationPolicy INVALID_PARAMETER / NOT_SUPPORTED are absent, "
           "no token; a registry read of the same errors is a real failure",
           "[system_hardening][win_parsers]") {

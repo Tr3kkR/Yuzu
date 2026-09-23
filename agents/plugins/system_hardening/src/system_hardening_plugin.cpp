@@ -46,7 +46,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "posture",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
-         "allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable)", nullptr},
+         "allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable; a missing "
+         "key is absent only when statfs confirms /proc/sys is procfs)",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "allowlisted sysctlbyname reads (kern.securelevel/coredump/sugid_coredump/bootargs)",
