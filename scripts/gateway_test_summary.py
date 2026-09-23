@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Zero-executed guard for the Meson gateway test wrapper (#4800).
 
-Imported by scripts/test_gateway.py and pinned by
-tests/test_gateway_test_summary.py. Kept in its own module (not inline in
-the wrapper) because the wrapper runs rebar3 at import time and so cannot
-be imported by a test.
+The one summary parser for every gateway test gate: imported by
+scripts/test_gateway.py (the Meson gate, via require_tests_executed), and run
+as a CLI (`cancel-tolerant`) by scripts/test/eunit-gate.sh (/test) and the
+release workflow's EUnit step. Pinned by tests/test_gateway_test_summary.py.
+Kept in its own module (not inline in the wrapper) because the wrapper runs
+rebar3 at import time and so cannot be imported by a test.
 
 """
 import re

@@ -32,7 +32,8 @@
 #       sets were cancelled)
 #   1 — EUnit ran and Failed: >0, OR no summary line found, OR 0 tests
 #       executed (real failure)
-#   2 — toolchain or invocation error (rebar3 missing, gateway/ missing)
+#   2 — toolchain or invocation error (rebar3 or python3 missing, gateway/
+#       missing, capture file unreadable)
 
 set -uo pipefail
 
@@ -58,6 +59,11 @@ if ! command -v rebar3 >/dev/null 2>&1; then
     echo "eunit-gate: rebar3 not on PATH" >&2
     exit 2
 fi
+# Checked up front so a missing parser fails before minutes of tests run.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "eunit-gate: python3 not on PATH (needed for the summary parser)" >&2
+    exit 2
+fi
 
 # Default args mirror the /test SKILL.md invocation. Callers can append
 # their own — e.g. `--module=foo,bar` — by passing them as positional
@@ -77,14 +83,10 @@ REBAR_BASE_DIR="${REBAR_BASE_DIR:-$PWD/_build_eunit}" \
     rebar3 eunit "$@" 2>&1 | tee "$capture"
 rebar3_rc=${PIPESTATUS[0]}
 
-# The verdict comes from the SAME parser the Meson wrapper uses
-# (scripts/gateway_test_summary.py, pinned by tests/test_gateway_test_summary.py),
-# so the gates cannot drift apart: whole-line summary matching, the LAST
-# summary wins, >= 1 test must have EXECUTED (#4800), and a non-zero rebar3
-# exit is tolerated only for eunit's "Failed: 0" line with tests passed
-# (cancelled sets, #1005).
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "eunit-gate: python3 not on PATH (needed for the summary parser)" >&2
-    exit 2
-fi
+# The verdict comes from the same summary PARSER the Meson wrapper uses
+# (scripts/gateway_test_summary.py, pinned by tests/test_gateway_test_summary.py):
+# whole-line summary matching, the LAST summary wins, and >= 1 test must have
+# EXECUTED (#4800). Unlike the Meson gate, this gate (like the release
+# workflow's) tolerates a non-zero rebar3 exit when eunit's "Failed: 0" line
+# shows tests passed (cancelled sets, #1005); the Meson gate stays strict.
 python3 "$REPO_ROOT/scripts/gateway_test_summary.py" cancel-tolerant "$rebar3_rc" "$capture"

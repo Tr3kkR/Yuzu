@@ -13,7 +13,8 @@ cannot silently come back:
   3. each suite's wrapper deadline stays BELOW its meson timeout, so the
      wrapper's pre-kill process-tree dump is reachable.
 
-Hermetic: parses sources, runs nothing.
+Hermetic: parses sources and runs only the parser CLI under sys.executable
+(no rebar3, no network, no shared paths).
 """
 import os
 import re
