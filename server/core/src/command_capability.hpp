@@ -153,7 +153,7 @@ public:
     /// programmer error — fail loud via an exception, never silently drop a
     /// fragment (a dropped fragment would make every one of its rows
     /// `Unclassified`, indistinguishable from an honest miss).
-    static constexpr std::size_t kMaxSources = 16;
+    static constexpr std::size_t kMaxSources = 32;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {
