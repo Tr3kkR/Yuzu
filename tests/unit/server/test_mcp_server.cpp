@@ -28620,6 +28620,7 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a degraded members-table 
     McpTestServer ts;
     ts.result_set_store_for_test = &short_lock_store;
     ts.inventory_store_for_test = &inventory;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
     ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered
 
     auto res = ts.call(
@@ -28633,6 +28634,11 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a degraded members-table 
               "could not read the parent set's members") != std::string::npos);
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    // gov-4306-S3 fix: this branch previously called `(void)audit_fn(...)`,
+    // discarding the return value, so a dropped audit row could never surface
+    // as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
@@ -28666,6 +28672,7 @@ TEST_CASE("MCP list_result_sets: a degraded read refuses (kInternalError), never
 
     McpTestServer ts;
     ts.result_set_store_for_test = &short_lock_store;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
     ts.start();
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_result_sets"}})");
@@ -28675,6 +28682,10 @@ TEST_CASE("MCP list_result_sets: a degraded read refuses (kInternalError), never
     CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("could not list result sets") !=
           std::string::npos);
+    // gov-4306-S3 fix: mcp_audit's return was previously discarded, so a
+    // dropped audit row here could never surface as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
@@ -28715,6 +28726,7 @@ TEST_CASE("MCP get_result_set_members: a degraded members-table read refuses "
     // instead; see the lineage test below for the discrimination caveat).
     McpTestServer ts;
     ts.result_set_store_for_test = &short_lock_store;
+    ts.audit_succeeds_ = false; // gov-4306-S3: the failure-row audit is itself dropped
     ts.start();
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_members","arguments":{"id":")" +
@@ -28725,6 +28737,10 @@ TEST_CASE("MCP get_result_set_members: a degraded members-table read refuses "
     CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("could not read result-set "
                                                             "members") != std::string::npos);
+    // gov-4306-S3 fix: mcp_audit's return was previously discarded, so a
+    // dropped audit row here could never surface as audit_persisted:false.
+    REQUIRE(body["error"]["data"].contains("audit_persisted"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);

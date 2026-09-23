@@ -10059,7 +10059,7 @@ void RestApiV1::register_routes(
         };
 
         // GET /api/v1/result-sets — owner-scoped list.
-        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json, rs_err,
+        sink.Get("/api/v1/result-sets", [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
                                          deny_fleet_wide_service_scoped](
                                             const httplib::Request& req, httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding: owner-scoped via
@@ -10096,6 +10096,18 @@ void RestApiV1::register_routes(
             // owner.
             auto page = result_set_store->list_by_owner_checked(session->username, cursor, limit);
             if (!page) {
+                // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                // degraded-read branch. This route previously never captured
+                // audit_fn at all, so the new 503 degraded-read refusal never
+                // attempted to audit. Scoped narrowly to this branch only; the
+                // existing 200 success path stays unaudited (a separate,
+                // out-of-scope question).
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.list", "failure", "ResultSet", "",
+                                        "reason=store_degraded");
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 rs_err(res, 503,
                        "RESULT_SET_STORE_UNAVAILABLE: could not list result sets",
                        {.retry_after_ms = 5000});
@@ -11157,7 +11169,7 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, result_set_store, rs_err, load_owned,
+                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11190,6 +11202,14 @@ void RestApiV1::register_routes(
                      // from a genuine last/empty page.
                      auto page = result_set_store->members_checked(id, cursor, limit);
                      if (!page) {
+                         // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                         // degraded-read branch, scoped to this branch only.
+                         bool audit_ok = true;
+                         if (audit_fn)
+                             audit_ok = audit_fn(req, "result_set.members", "failure", "ResultSet",
+                                                 id, "reason=store_degraded");
+                         if (!audit_ok)
+                             res.set_header("Sec-Audit-Failed", "true");
                          rs_err(res, 503,
                                 "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
                                 "members",
@@ -11208,7 +11228,7 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/lineage
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
-                 [auth_fn, result_set_store, rs_err, load_owned,
+                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11230,6 +11250,14 @@ void RestApiV1::register_routes(
                      // empty/truncated chain on a degraded read.
                      auto chain_result = result_set_store->lineage_checked(id, session->username);
                      if (!chain_result) {
+                         // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                         // degraded-read branch, scoped to this branch only.
+                         bool audit_ok = true;
+                         if (audit_fn)
+                             audit_ok = audit_fn(req, "result_set.lineage", "failure", "ResultSet",
+                                                 id, "reason=store_degraded");
+                         if (!audit_ok)
+                             res.set_header("Sec-Audit-Failed", "true");
                          rs_err(res, 503,
                                 "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
                                 "lineage",

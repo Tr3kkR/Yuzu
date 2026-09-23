@@ -11616,12 +11616,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto page = result_set_store_->list_by_owner_checked(
                     session->username, cursor, static_cast<int>(limit));
                 if (!page) {
-                    mcp_audit("failure");
+                    const bool audit_ok = mcp_audit("failure");
                     res.set_content(
                         a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not list "
                                                   "result sets",
                                  "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
                         "application/json");
                     return;
                 }
@@ -11955,15 +11955,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // set. Mirrors REST's identical fix.
                         auto page_result = result_set_store_->members_checked(pid, cur, 5000);
                         if (!page_result) {
-                            (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
-                                           "reason=store_degraded source_kind=inventory_query");
+                            const bool audit_ok = audit_fn(
+                                req, "result_set.create", "failure", "ResultSet", "",
+                                "reason=store_degraded source_kind=inventory_query");
                             res.set_content(
                                 a4_error(kInternalError,
                                          "RESULT_SET_STORE_UNAVAILABLE: could not read the "
                                          "parent set's members; refusing to materialise a "
                                          "partial result set",
                                          "retry once the server reports ready",
-                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                         audit_ok),
                                 "application/json");
                             return;
                         }
@@ -12680,12 +12682,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto page =
                     result_set_store_->members_checked(rs_id, cursor, static_cast<int>(limit));
                 if (!page) {
-                    mcp_audit("failure", rs_id);
+                    const bool audit_ok = mcp_audit("failure", rs_id);
                     res.set_content(
                         a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
                                                   "result-set members",
                                  "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
                         "application/json");
                     return;
                 }
@@ -12721,12 +12723,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // with an empty/truncated chain on a degraded read.
                 auto chain_result = result_set_store_->lineage_checked(rs_id, session->username);
                 if (!chain_result) {
-                    mcp_audit("failure", rs_id);
+                    const bool audit_ok = mcp_audit("failure", rs_id);
                     res.set_content(
                         a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
                                                   "result-set lineage",
                                  "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
                         "application/json");
                     return;
                 }
