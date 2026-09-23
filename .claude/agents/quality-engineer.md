@@ -20,7 +20,7 @@ You ensure that every new store, manager, engine, and plugin ships with comprehe
 - **Fuzz targets** — Identify parsers that should have fuzz targets but don't: scope engine expressions, YAML DSL parsing, JSON input parsing, proto deserialization.
 - **Coverage tracking** — Audit `docs/test-coverage.md` and flag where it drifts from reality (modules added without coverage entries, modules with phantom entries).
 - **Coverage thresholds** — Track progress toward enforced minimum coverage in CI. Flag changes that decrease overall coverage.
-- **Erlang tests** — Identify EUnit + Common Test coverage gaps for the gateway. Verify `rebar3 ct --dir apps/yuzu_gw/test` pattern is followed.
+- **Erlang tests** — Identify EUnit + Common Test coverage gaps for the gateway. Verify `rebar3 ct --dir apps/yuzu_gw/test/ct` pattern is followed (ct does not recurse, #4800).
 - **Test isolation** — Flag tests that depend on external state, filesystem artifacts from other tests, or execution order. Each test must create and clean up its own state.
 - **Integration tests** — Audit `scripts/integration-test.sh` for end-to-end scenario coverage.
 - **Regression tests** — When a bug is fixed, verify a regression test was added.

@@ -7,6 +7,15 @@
 #   ./test_runner.sh ct              # Run only Common Test suites
 #   ./test_runner.sh cover           # Run with coverage
 #
+# `ct` includes yuzu_gw_perf_SUITE at its FULL default sizing (10k agents,
+# 50k heartbeats, 300 s endurance) unless YUZU_PERF_* is set, so expect it
+# to run for many minutes -- it is not hung. For a quick functional pass use
+# the reduced sizing the Meson gate uses (scripts/test_gateway.py), e.g.
+#   YUZU_PERF_AGENTS=10 YUZU_PERF_HEARTBEATS=100 YUZU_PERF_FANOUT=10 \
+#   YUZU_PERF_CHURN_AGENTS=10 YUZU_PERF_CHURN_CYCLES=1 \
+#   YUZU_PERF_ENDURANCE_AGENTS=10 YUZU_PERF_ENDURANCE_SECS=1 ./test_runner.sh ct
+# The full-sizing run is tracked in #4821.
+#
 
 set -euo pipefail
 
@@ -65,19 +74,22 @@ FAILURES=0
 if $RUN_EUNIT; then
     log "Running EUnit tests..."
     if $RUN_COVER; then
-        rebar3 as test do eunit,cover || FAILURES=$((FAILURES + 1))
+        rebar3 as test do eunit --dir apps/yuzu_gw/test,cover || FAILURES=$((FAILURES + 1))
     else
-        rebar3 as test eunit || FAILURES=$((FAILURES + 1))
+        rebar3 as test eunit --dir apps/yuzu_gw/test || FAILURES=$((FAILURES + 1))
     fi
 fi
 
-# Run Common Test suites
+# Run Common Test suites. They live in apps/yuzu_gw/test/ct/ and ct does not
+# recurse: without this --dir, rebar3 discovers zero suites, prints
+# "All 0 tests passed." and exits 0, and this script would report ALL TESTS
+# PASSED having run nothing (#4800).
 if $RUN_CT; then
     log "Running Common Test suites..."
     if $RUN_COVER; then
-        rebar3 as test do ct,cover || FAILURES=$((FAILURES + 1))
+        rebar3 as test do ct --dir apps/yuzu_gw/test/ct,cover || FAILURES=$((FAILURES + 1))
     else
-        rebar3 as test ct || FAILURES=$((FAILURES + 1))
+        rebar3 as test ct --dir apps/yuzu_gw/test/ct || FAILURES=$((FAILURES + 1))
     fi
 fi
 

@@ -65,7 +65,7 @@ cd gateway
 rebar3 compile                                                           # compile only
 rebar3 eunit --dir apps/yuzu_gw/test                                     # unit tests (current expected: 148)
 rebar3 dialyzer                                                          # MANDATORY after any .erl change
-rebar3 ct --dir apps/yuzu_gw/test --suite yuzu_gw_integration_SUITE      # integration (no real upstream)
+rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_integration_SUITE      # integration (no real upstream)
 rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE  # needs YUZU_GW_TEST_TOKEN + live server
 ```
 
