@@ -2082,9 +2082,10 @@ jobs:
       # runner's OS; macos26 matches the BigMags Mac Minis (macOS 26, arm64).
       # Step-scoped so the rest of the job does not see it.
       # RUNNER_TOOL_CACHE is re-pointed for this step only. Both BigMags agents
-      # share /opt/ci/tool_cache, and setup-beam deletes + re-copies its OTP tree
-      # there, so a concurrent debug/release pair on one box could wipe each
-      # other's OTP mid-job: scope it per agent. A trusted-fork run must not write
+      # share /opt/ci/tool_cache, and setup-beam populates it with rmRF + copy, so a
+      # concurrent debug/release pair on one box could race while populating or
+      # copying from the shared cache (the OTP each job then RUNS is its own copy
+      # under RUNNER_TEMP): scope it per agent. A trusted-fork run must not write
       # a persistent erl into a cache later normal jobs execute (the "Do not read
       # or write runner.tool_cache" rule above), so it gets a per-run temp dir.
       - name: Install Erlang/OTP and rebar3
