@@ -1166,8 +1166,25 @@ TEST_CASE("CaStore: a root swap waits for an in-flight publish to commit",
         (void)replica_a.set_root(sample_root("FP:NEW")); // the "import"
         swap_done = true;
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
-    CHECK_FALSE(swap_done); // blocked by the publish's FOR SHARE on the root row
+    // Positive evidence that the swap is WAITING ON A LOCK (not merely slow): its backend shows a
+    // Lock wait in this database while the publish sits in its builder.
+    bool swap_waiting = false;
+    {
+        PgConn probe{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
+        for (int i = 0; i < 300 && !swap_waiting; ++i) {
+            PgResult w{PQexec(probe.get(),
+                              "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                              "current_database() AND wait_event_type = 'Lock' "
+                              "AND query ILIKE '%INSERT INTO ca_store.ca_root%'")};
+            REQUIRE(w.status() == PGRES_TUPLES_OK);
+            swap_waiting = std::string(PQgetvalue(w.get(), 0, 0)) != "0";
+            if (!swap_waiting)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    CHECK(swap_waiting);    // blocked by the publish's FOR SHARE on the root row
+    CHECK_FALSE(swap_done);
     release_builder = true;
     threads[0].join();
     threads[1].join();

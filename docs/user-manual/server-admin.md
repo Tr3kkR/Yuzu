@@ -420,7 +420,11 @@ freshness re-publish) now runs as one Postgres transaction under a lock on the
 `ca_store.ca_crl_versions` table, instead of behind a lock inside one server
 process. The `ca_store` schema migrates to v4: v3 adds a nullable
 `revoked_count` column on `ca_crl_versions` (nothing is backfilled), v4 adds a
-trigger that refuses to delete or change a revoked `ca_issued` row.
+trigger that refuses to delete or change a revoked `ca_issued` row. A
+subordinate-CA import (`POST /api/v1/ca/import-chain`) now waits for any CRL
+publish already in progress before it swaps the root; if that takes longer than
+the database's lock timeout (10 s by default) the import fails with a
+database error and can simply be retried.
 
 What changes on **every** deployment, including single-server:
 

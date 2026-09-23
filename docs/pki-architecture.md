@@ -80,7 +80,10 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
 - Trigger `ca_issued_keep_revoked` (migration v4): any `DELETE`, or `UPDATE`, of a
   row whose `status` is `revoked` is rejected, so the revoked set is append-only in
   the database itself. Row triggers do not fire on `TRUNCATE`, so the clean
-  re-root below still works.
+  re-root below still works. Because it blocks any update of a revoked row, a
+  future migration backfilling a `ca_issued` column must skip revoked rows (or
+  disable the trigger inside that migration's own transaction), and pruning
+  expired revoked rows would need a deliberate change to the trigger.
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust

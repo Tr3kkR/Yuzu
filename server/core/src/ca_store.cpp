@@ -340,8 +340,13 @@ const std::vector<pg::PgMigration>& migrations() {
         // WHERE clause in delete_issued_by(): an older binary sharing this schema during a
         // rolling upgrade or rollback still runs the unconditional pre-6.1 DELETE, which would
         // un-revoke the cert (is_revoked() accepts it again, later CRLs drop it). Row triggers
-        // do not fire on TRUNCATE, so the documented clean re-root still works.
-        {4, "CREATE FUNCTION ca_issued_keep_revoked() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        // do not fire on TRUNCATE, so the documented clean re-root still works. It rejects ANY
+        // update of a revoked row, so a future migration that backfills a ca_issued column must
+        // account for it (skip revoked rows, or ALTER TABLE ... DISABLE TRIGGER inside that
+        // migration's own transaction), and an expiry-based prune of revoked rows would need a
+        // deliberate change here. The lock_timeout bounds CREATE TRIGGER's wait on ca_issued.
+        {4, "SET LOCAL lock_timeout = '30s'; "
+            "CREATE FUNCTION ca_issued_keep_revoked() RETURNS trigger LANGUAGE plpgsql AS $$ "
             "BEGIN "
             "  RAISE EXCEPTION 'ca_issued: a revoked certificate row (serial %) cannot be % "
             "(revocations are append-only)', OLD.serial_hex, lower(TG_OP) "
