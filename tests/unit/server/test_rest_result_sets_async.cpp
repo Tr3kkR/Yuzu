@@ -122,6 +122,13 @@ struct AsyncHarness {
     int dispatch_sent{2}; // agents "reached" by each dispatch
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
+    /// #4306 fold-in B: fires INSIDE the fake dispatch closure, between the
+    /// (already-passed) pre-dispatch quota check and create_pending's own
+    /// INSERT below it — the one point in the request lifecycle where a test
+    /// can inject a real Postgres fault that lands strictly AFTER a real
+    /// dispatch already fired. A test sets this to take a table lock on a
+    /// second raw connection.
+    std::function<void()> on_dispatch;
     /// CWE-862: these producers DISPATCH, so they must gate on
     /// Execution:Execute. Set false to model an authenticated caller who
     /// holds no such grant — the case that previously reached the fleet.
@@ -219,6 +226,8 @@ struct AsyncHarness {
                     {plugin, action, scope_expr, agent_ids, params, exec_id, caller.exec_visible});
                 if (dispatch_throws)
                     throw std::runtime_error("simulated dispatch failure");
+                if (on_dispatch)
+                    on_dispatch();
                 return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
             };
         }
@@ -3023,6 +3032,57 @@ TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any di
             PGRES_COMMAND_OK);
 
     // No pending row was ever created.
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful dispatch maps "
+          "to 500, not 400 — a server fault after real agents were already reached is not a "
+          "client error (#4306 fold-in B)",
+          "[pg][result_set][async][tar][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    // Take the table lock INSIDE the fake dispatch closure — strictly AFTER
+    // the (already-passed) quota pre-check and BEFORE create_pending's own
+    // INSERT, so the pre-check succeeds and dispatch genuinely fires before
+    // the fault lands.
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.on_dispatch = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE result_set_store.result_sets IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query",
+                    R"({"sql":"SELECT 1","name":"foldinb"})", status);
+    REQUIRE(status == 500);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "result-set store unavailable after dispatch already succeeded") !=
+          std::string::npos);
+
+    // Dispatch DID fire -- the whole point of this branch: create_pending
+    // failed AFTER a real command already reached agents.
+    REQUIRE(h.calls.size() == 1);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // The execution was cancelled, not left running forever.
+    auto exec = h.tracker->get_execution(h.calls[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+
+    // No pending row was ever persisted (the whole point of this branch).
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }

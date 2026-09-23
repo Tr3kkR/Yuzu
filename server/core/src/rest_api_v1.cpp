@@ -10020,8 +10020,19 @@ void RestApiV1::register_routes(
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
                 }
-                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
-                rs_err(res, status,
+                if (created.error() == ResultSetError::DbError) {
+                    // #4306 fold-in B: this is a SERVER fault after a real
+                    // dispatch already succeeded (sent > 0, set_agents_targeted
+                    // already called above) — not a client error, so 400 was
+                    // wrong. 500, matching MCP rs_run_async's identical
+                    // post-dispatch DbError branch for parity.
+                    rs_err(res, 500,
+                           "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable after "
+                           "dispatch already succeeded - do not re-send; poll executions for "
+                           "the dispatched command's outcome execution_id=" + exec_id);
+                    return;
+                }
+                rs_err(res, 429,
                        std::string(to_string(created.error())) + " execution_id=" + exec_id);
                 return;
             }
