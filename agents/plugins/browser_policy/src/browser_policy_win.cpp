@@ -3,9 +3,9 @@
  *
  * PLANNED — follows as its own PR. The HKLM\SOFTWARE\Policies registry read is
  * not implemented; until it lands the leg reports the honest planned status
- * (zero rows, UNAVAILABLE, provenance `windows:planned`) rather than an empty
- * success, so a host never reads as "no policy configured" from a leg that did
- * not look.
+ * (one `status` row, UNAVAILABLE, provenance `windows:planned`) rather than an
+ * empty success, so a host never reads as "no policy configured" from a leg
+ * that did not look.
  */
 #include "browser_policy_legs.hpp"
 

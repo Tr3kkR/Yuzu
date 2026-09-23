@@ -5,7 +5,10 @@
  * browser_policy_linux_parsers.hpp), which takes the filesystem root as a
  * parameter (peripherals_linux.cpp is the precedent): production passes "/",
  * the unit suite drives run_linux_at against a temp tree through a real
- * CommandContext and never links this TU (it only builds on __linux__).
+ * CommandContext. `run_linux` itself is defined only under __linux__; the
+ * header it includes is POSIX code and compiles (and is tested) on macOS too.
+ * The one-line body is deliberate and pinned by a unit test: it must stay
+ * exactly `return run_linux_at(ctx, "/");`.
  */
 #include "browser_policy_legs.hpp"
 #include "browser_policy_linux_parsers.hpp"

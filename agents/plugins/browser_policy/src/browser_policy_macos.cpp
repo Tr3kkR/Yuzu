@@ -3,9 +3,9 @@
  *
  * PLANNED — follows as its own PR. The /Library/Managed Preferences plist read
  * is not implemented; until it lands the leg reports the honest planned status
- * (zero rows, UNAVAILABLE, provenance `macos:planned`) rather than an empty
- * success, so a host never reads as "no policy configured" from a leg that did
- * not look.
+ * (one `status` row, UNAVAILABLE, provenance `macos:planned`) rather than an
+ * empty success, so a host never reads as "no policy configured" from a leg
+ * that did not look.
  */
 #include "browser_policy_legs.hpp"
 

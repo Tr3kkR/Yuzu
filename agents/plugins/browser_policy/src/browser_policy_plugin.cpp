@@ -17,13 +17,18 @@
  *            {,<user>/}{com.google.Chrome,com.microsoft.Edge}.plist
  *                                                       [macos.cpp]
  *
- * The Windows and macOS legs are placeholders: each reports zero rows with
- * result status UNAVAILABLE/PARTIAL and provenance `<os>:planned`
- * (mark_result_planned), never an empty success.
+ * The Windows and macOS legs are placeholders: each reports ONE in-band
+ * `status` row (`unavailable`, `<os>:planned`) and result status
+ * UNAVAILABLE/PARTIAL with that provenance (mark_result_planned), never an
+ * empty success. Any read that could not be completed is reported the same
+ * way as `constrained` (mark_result_read).
  *
  * This is operator/IT-authored configuration, not personal data, so it is an
- * ordinary `Inventory` read with no default-off kill switch (that gate is
- * for plugins that read user-identifying data, which this one does not).
+ * ordinary `Inventory` read with no default-OFF kill switch seeded (that gate
+ * is for plugins that read user-identifying data, which this one does not; the
+ * operator-settable per-plugin kill switch still applies to every plugin).
+ * Policy values are reported verbatim: a value can carry a credential-bearing
+ * URL or an enrollment token an administrator put in a world-readable file.
  *
  * Portable except for the single dispatch #if selecting the host leg; all
  * three descriptor legs are declared unconditionally so the capability-matrix
@@ -69,7 +74,7 @@ public:
     std::string_view name() const noexcept override { return "browser_policy"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Enterprise-managed Chrome and Edge browser policy inventory";
+        return "Enterprise-managed Chrome, Chromium and Edge browser policy inventory";
     }
 
     const char* const* actions() const noexcept override {

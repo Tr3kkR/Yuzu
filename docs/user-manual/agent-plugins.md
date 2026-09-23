@@ -18,7 +18,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `asset_tags` | ✅ ✅ ✅ | Structured asset tag awareness — syncs server-assigned tags locally and detects changes | [README](../../agents/plugins/asset_tags/README.md) |
 | `autoruns` | ✅ ✅ ✅ | Enumerates persistence sources (what starts automatically) across Windows, Linux and macOS | [README](../../agents/plugins/autoruns/README.md) |
 | `bitlocker` | ✅ ✅ ✅ | Disk encryption status — BitLocker, LUKS, FileVault | [README](../../agents/plugins/bitlocker/README.md) |
-| `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
+| `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |

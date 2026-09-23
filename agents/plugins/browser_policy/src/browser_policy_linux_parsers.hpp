@@ -42,6 +42,7 @@
 
 #include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -64,33 +65,7 @@ namespace yuzu::browser_policy {
 
 namespace posix {
 
-/// Move-only owner of one POSIX fd; closes exactly once.
-class Fd {
-public:
-    Fd() noexcept = default;
-    explicit Fd(int fd) noexcept : fd_(fd) {}
-    ~Fd() { reset(); }
-    Fd(const Fd&) = delete;
-    Fd& operator=(const Fd&) = delete;
-    Fd(Fd&& o) noexcept : fd_(std::exchange(o.fd_, -1)) {}
-    Fd& operator=(Fd&& o) noexcept {
-        if (this != &o) {
-            reset();
-            fd_ = std::exchange(o.fd_, -1);
-        }
-        return *this;
-    }
-    [[nodiscard]] int get() const noexcept { return fd_; }
-    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
-    void reset() noexcept {
-        if (fd_ >= 0)
-            ::close(fd_);
-        fd_ = -1;
-    }
-
-private:
-    int fd_ = -1;
-};
+using Fd = yuzu::agent::ScopedFd; // the shared move-only fd owner (close on destruct, release())
 
 /// Move-only owner of one DIR* (closedir also closes the underlying fd).
 class Dir {
@@ -140,14 +115,19 @@ struct DirOpen {
     std::string_view detail{};
 };
 
-[[nodiscard]] inline DirOpen dir_from_fd(int fd) {
-    int err = errno;
-    if (fd >= 0) {
-        DIR* d = ::fdopendir(fd);
-        if (d != nullptr)
-            return DirOpen{Dir{d}, OpenStatus::ok, {}};
-        err = errno;
-        ::close(fd);
+/// Turns the result of an `open`/`openat(O_DIRECTORY)` into a `DirOpen`. `open_errno` is the
+/// errno of THAT call (captured by the caller before anything else can clobber it). On success
+/// the fd is handed to `fdopendir`, which adopts it only if it succeeds; on failure `fd` is still
+/// owned by the guard, so it is closed exactly once by its destructor and never by hand.
+[[nodiscard]] inline DirOpen dir_from_fd(Fd fd, int open_errno) {
+    int err = open_errno;
+    if (fd.valid()) {
+        if (DIR* d = ::fdopendir(fd.get()); d != nullptr) {
+            Dir dir{d};                      // name the new owner before giving the old one up
+            (void)fd.release();              // closedir() closes the fd from here on
+            return DirOpen{std::move(dir), OpenStatus::ok, {}};
+        }
+        err = errno; // read before ~Fd's close() can overwrite it
     }
     if (err == ENOENT)
         return DirOpen{Dir{}, OpenStatus::absent, {}};
@@ -157,12 +137,23 @@ struct DirOpen {
 /// The injected root itself: opened WITHOUT O_NOFOLLOW (a caller-supplied
 /// root such as /tmp may legitimately be a symlink).
 [[nodiscard]] inline DirOpen open_root_dir(const std::filesystem::path& root) {
-    return dir_from_fd(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Fd fd{::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    return dir_from_fd(std::move(fd), errno);
 }
 
-/// One component, never following a symlink.
+/// One component, never following a symlink. `O_DIRECTORY|O_NOFOLLOW` on a symlink fails with
+/// ENOTDIR (not ELOOP) on Linux and macOS alike, which would report a refused symlink as "not a
+/// directory"; a failed open with ENOTDIR is therefore looked at once more (`fstatat` without
+/// following) so a symlinked directory is reported as what it is.
 [[nodiscard]] inline DirOpen open_dir_at(int parent_fd, const char* name) {
-    return dir_from_fd(::openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    Fd fd{::openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+    int err = errno;
+    if (!fd.valid() && err == ENOTDIR) {
+        struct stat st{};
+        if (::fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode))
+            return DirOpen{Dir{}, OpenStatus::failed, "symlink_refused"};
+    }
+    return dir_from_fd(std::move(fd), err);
 }
 
 /// Hop-by-hop chain of open_dir_at from `parent_fd`; stops at the first hop
@@ -202,9 +193,7 @@ struct FileRead {
         if (err == ENOENT)
             return out; // raced deletion / genuinely absent
         out.status = OpenStatus::failed;
-        out.detail = err == EACCES || err == EPERM ? "permission_denied"
-                     : err == ELOOP               ? "symlink_refused"
-                                                  : "open_failed";
+        out.detail = errno_detail(err);
         return out;
     }
     struct stat st{};
@@ -273,10 +262,6 @@ template <typename Keep>
     return names;
 }
 
-[[nodiscard]] inline bool ends_with(std::string_view s, std::string_view suffix) noexcept {
-    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
-}
-
 } // namespace posix
 
 namespace lnx {
@@ -293,6 +278,23 @@ inline constexpr VendorDir kVendorDirs[] = {
     {Browser::chromium, {"chromium", nullptr}, 1},
     {Browser::edge, {"opt", "edge"}, 2},
 };
+static_assert(
+    [] {
+        for (const auto& v : kVendorDirs) {
+            if (v.n == 0 || v.n > v.parts.size())
+                return false;
+            for (std::size_t i = 0; i < v.n; ++i)
+                if (v.parts[i] == nullptr)
+                    return false; // a used component is never the nullptr filler
+        }
+        return true;
+    }(),
+    "every VendorDir uses 1..parts.size() non-null components");
+
+/// `linux:<detail>` — the failure-token spelling every leg failure shares.
+[[nodiscard]] inline std::string linux_token(std::string_view detail) {
+    return std::string{"linux:"} + std::string{detail};
+}
 
 struct LevelDir {
     Level level;
@@ -319,14 +321,14 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
 
     auto finish = [&]() {
         failure_reason = acc.reason();
-        return rows;
+        return std::move(rows); // every caller returns straight after: hand the vector over, not a copy
     };
 
     posix::DirOpen root_open = posix::open_root_dir(root);
     if (root_open.status == posix::OpenStatus::absent)
         return finish(); // no such root: nothing managed
     if (root_open.status == posix::OpenStatus::failed) {
-        acc.add_failure(std::string{"linux:"} + std::string{root_open.detail});
+        acc.add_failure(linux_token(root_open.detail));
         return finish();
     }
 
@@ -346,20 +348,20 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
 
         posix::DirOpen policies = posix::open_dir_chain(root_open.dir.fd(), chain);
         if (policies.status == posix::OpenStatus::failed)
-            acc.add_failure(std::string{"linux:"} + std::string{policies.detail});
+            acc.add_failure(linux_token(policies.detail));
         if (policies.status != posix::OpenStatus::ok)
             continue;
 
         for (const auto& lvl : kLevelDirs) {
             posix::DirOpen level_dir = posix::open_dir_at(policies.dir.fd(), lvl.dir);
             if (level_dir.status == posix::OpenStatus::failed)
-                acc.add_failure(std::string{"linux:"} + std::string{level_dir.detail});
+                acc.add_failure(linux_token(level_dir.detail));
             if (level_dir.status != posix::OpenStatus::ok)
                 continue;
 
             const auto names = posix::list_names(
                 level_dir.dir,
-                [](const struct dirent* e) { return posix::ends_with(e->d_name, ".json"); }, acc,
+                [](const struct dirent* e) { return std::string_view{e->d_name}.ends_with(".json"); }, acc,
                 "linux", limits.max_entries_per_dir);
             for (const auto& fname : names) {
                 auto file = posix::read_file_at(level_dir.dir.fd(), fname.c_str(),
@@ -367,11 +369,11 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                 if (file.status == posix::OpenStatus::absent)
                     continue;
                 if (file.status == posix::OpenStatus::failed) {
-                    acc.add_failure(std::string{"linux:"} + std::string{file.detail});
+                    acc.add_failure(linux_token(file.detail));
                     continue;
                 }
-                // The run's I/O, parse work and retained row text are bounded by this
-                // budget, not by the per-file and per-directory caps (whose product is
+                // The run's file I/O, parser input and retained row text scale with this
+                // budget, not with the per-file and per-directory caps (whose product is
                 // enormous). The file that crosses it is not parsed and the walk stops:
                 // rows already read stand, the result is a lower bound.
                 total_bytes += file.bytes.size();
@@ -380,8 +382,11 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                     return finish();
                 }
                 const std::string source = base + lvl.dir + "/" + fname;
+                // Build at most one row past the budget that is left: enough to notice an
+                // overrun below, without turning every key of a huge file into a row first.
                 auto parsed = rows_from_json_policy_text(file.bytes, vendor.browser, lvl.level,
-                                                         machine_scope(), source);
+                                                         machine_scope(), source,
+                                                         limits.max_rows - rows.size() + 1);
                 if (parsed.failure) {
                     acc.add_failure(*parsed.failure);
                     continue;
@@ -409,8 +414,8 @@ inline int run_linux_at(yuzu::CommandContext& ctx, const std::filesystem::path& 
                         const WalkLimits& limits = {}) {
     std::string failure_reason;
     const auto rows = lnx::linux_policy_rows_at(root, failure_reason, limits);
+    mark_result_read(ctx, failure_reason); // the outcome (status row + typed status) leads the stream
     write_rows(ctx, rows);
-    mark_result_read(ctx, failure_reason);
     return 0;
 }
 

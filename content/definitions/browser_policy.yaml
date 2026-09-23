@@ -15,24 +15,21 @@
 ##            a 1 MiB cap.
 ##   Windows: PLANNED - follows as its own PR (HKLM\SOFTWARE\Policies\
 ##            {Google\Chrome,Microsoft\Edge} and their Recommended subkeys).
-##            Until then `policies` on Windows returns zero rows with result
-##            status UNAVAILABLE and provenance `windows:planned`.
+##            Until then `policies` on Windows returns one `status` row and
+##            result status UNAVAILABLE with provenance `windows:planned`.
 ##   macOS:   PLANNED - follows as its own PR (/Library/Managed Preferences).
-##            Until then `policies` on macOS returns zero rows with result
-##            status UNAVAILABLE and provenance `macos:planned`.
-##
-## WHY: zero documented driver anywhere - a full sweep of all four planning
-## docs (capability-map, enterprise-parity-plan, the SOC 2 doc, roadmap.md)
-## found not one mention of "browser," a browser name, or "extension"/"shadow
-## IT" in any browser-security sense. Pure capability-gap reasoning, identical
-## caveat to PR8.1 through PR8.5.
+##            Until then `policies` on macOS returns one `status` row and
+##            result status UNAVAILABLE with provenance `macos:planned`.
 ##
 ## Absent versus constrained: a host with no managed policy files (browser not
 ## installed, nothing managed) returns ZERO rows and result status OK/FULL - a
 ## genuinely absent thing. A directory or file that exists but cannot be read or
 ## decoded makes the result CONSTRAINED/PARTIAL with a reason token, never an
 ## empty success. A planned leg reports UNAVAILABLE/PARTIAL: that host was not
-## inspected, which is not the same as "no policy configured".
+## inspected, which is not the same as "no policy configured". Every one of those
+## non-OK outcomes is ALSO written as one in-band `status` row, because the
+## server's response queries (REST, MCP, the dashboard) do not return the typed
+## result status today: zero rows and no status row means the read completed.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -48,9 +45,11 @@ metadata:
     and the file it was read from. On Linux the rows come from the JSON policy
     files under /etc/opt/chrome, /etc/chromium and /etc/opt/edge. Windows and
     macOS legs planned - each follows as its own PR; on those hosts the action
-    returns zero rows with result status UNAVAILABLE and provenance
+    returns one `status` row and result status UNAVAILABLE with provenance
     `<os>:planned`. A host with no managed policy returns zero rows and a clean
-    result status. The plugin never enforces, fetches or changes anything.
+    result status; a read that could not be completed adds one `constrained`
+    status row. Values are reported verbatim. The plugin never enforces, fetches
+    or changes anything.
   tags: [browser, policy, inventory, software]
 
 spec:
@@ -67,18 +66,21 @@ spec:
     properties: {}
 
   result:
-    # One row shape, discriminated by field 0 (row_kind), which is always the
-    # literal `policy`. This plugin has no status row kind: the result status
-    # (OK, CONSTRAINED, UNAVAILABLE) carries the outcome, and a host with no
-    # managed policy returns zero rows. Free text is escaped for the server's
-    # pipe grammar (safe_output_field; lossy on backslash by design).
+    # Two row kinds, discriminated by field 0 (row_kind), both nine fields wide:
     #
     #   policy|<browser>|<level>|<scope>|<name>|<value_type>|<value>|<source>|<detail>
+    #   status|-|-|-|policies|-|<constrained|unavailable>|-|<reason tokens>
+    #
+    # A `status` row is written FIRST and only when the read was not complete (a
+    # read that could not be finished, a planned leg, a leg that threw); it
+    # repeats the typed result status in band. A complete read writes none, and a
+    # host with no managed policy returns zero rows. Free text is escaped for the
+    # server's pipe grammar (safe_output_field; lossy on backslash by design).
     columns:
       - name: row_kind
         type: string
-        values: [policy]
-        description: 'Row shape discriminator (field 0). Always the literal policy: this plugin has no status row kind, the result status carries the outcome.'
+        values: [policy, status]
+        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (at most one, written first and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-".'
         example: policy
         platforms: [windows, linux, darwin]
       - name: browser
@@ -86,21 +88,21 @@ spec:
         values: [chrome, chromium, edge]
         description: 'Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge).'
         example: chrome
-        platforms: [windows, linux, darwin]
+        platforms: [linux]
       - name: level
         type: string
         values: [mandatory, recommended]
         description: 'Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change).'
         example: mandatory
-        platforms: [windows, linux, darwin]
+        platforms: [linux]
       - name: scope
         type: string
         description: 'Where the policy applies. Values: machine, or user:<name> where a leg reads per-user policy (the Linux leg reads machine policy only, so it always reports machine). The user name is untrusted text.'
         example: machine
-        platforms: [windows, linux, darwin]
+        platforms: [linux]
       - name: name
         type: string
-        description: 'Policy name exactly as the browser documents it.'
+        description: 'Policy name exactly as the browser documents it. On a status row: the action name, policies.'
         example: HomepageLocation
         platforms: [windows, linux, darwin]
       - name: value_type
@@ -108,20 +110,20 @@ spec:
         values: [bool, int, real, string, list, dict, "null", unmodelled]
         description: 'Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail).'
         example: string
-        platforms: [windows, linux, darwin]
+        platforms: [linux]
       - name: value
         type: string
-        description: 'The policy value as text: true or false for a bool, decimal text for int and real, the string verbatim, compact JSON text for a list or dict, the literal null for null, and "-" for unmodelled.'
+        description: 'The policy value as text: true or false for a bool, decimal text for int and real, the string verbatim, compact JSON text for a list or dict, the literal null for null, and "-" for unmodelled. Reported verbatim: a value can carry a credential-bearing URL or an enrollment token an administrator put in the file. On a status row: the state, constrained or unavailable.'
         example: https://intranet.example.com
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: 'The logical file the policy was read from, never an injected test root (Linux). The Windows and macOS legs will report the registry key or plist path.'
+        description: 'The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path.'
         example: /etc/opt/chrome/policies/managed/corp.json
-        platforms: [windows, linux, darwin]
+        platforms: [linux]
       - name: detail
         type: string
-        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD.'
+        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.'
         example: "-"
         platforms: [windows, linux, darwin]
     aggregation:

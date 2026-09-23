@@ -7,7 +7,7 @@
  * mapper (including the literal `unmodelled` outcome) and the JSON failure
  * tokens. Nothing here touches disk.
  *
- * `#if !defined(_WIN32)` (X2, a scoped exception to "never platform-guard a
+ * `#if !defined(_WIN32)` (a scoped exception to "never platform-guard a
  * test TU": the walk shell uses posix_dir_walk.hpp/openat, which do not exist
  * on Windows): the tree-manifest cases. They materialize
  * tests/unit/fixtures/wave10/browser_policy/linux/tree.manifest into a
@@ -40,6 +40,10 @@
  *     truncated at the C-string boundary and the `nul_replaced` tail is lost;
  *   - read-to-EOF (Linux only, /proc reports st_size 0): read exactly st_size
  *     -> the /proc read returns empty.
+ *   - in-band outcome row: drop the write from mark_result_read (or write it on an OK
+ *     read) -> the pairing check inside run_leg fails on every constrained run;
+ *   - depth guard: end the line comment at LF only in max_nesting_depth, or shift its
+ *     comparison -> the CR/NUL-comment and exact-boundary cases fail;
  *   - UTF-8 (protobuf transport): drop repair_utf8 from wire_field -> the invalid-byte
  *     cases keep the raw bytes and the CommandResponse round trip fails (Linux also has the
  *     real raw-byte-file-name case; no other OS can create such a name);
@@ -58,7 +62,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
+#include <cerrno>
+#include <cstdint>
 #include <string>
+#include <type_traits>
 #include <string_view>
 #include <vector>
 
@@ -343,6 +351,202 @@ TEST_CASE("browser_policy: bytes that are not valid UTF-8 are repaired so the ro
     CHECK(survives_transport(row));
 }
 
+namespace {
+
+// An INDEPENDENT reference for the sweep below: decode by bit arithmetic (a different algorithm
+// from repair_utf8's Table 3-7 ranges). The length of the well-formed sequence at s[i], or 0.
+std::size_t reference_sequence_length(const std::string& s, std::size_t i) {
+    const auto b = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+    const unsigned c = b(i);
+    if (c < 0x80)
+        return 1;
+    std::size_t n = 0;
+    std::uint32_t cp = 0;
+    std::uint32_t min = 0;
+    if ((c & 0xE0) == 0xC0) {
+        n = 2;
+        cp = c & 0x1F;
+        min = 0x80;
+    } else if ((c & 0xF0) == 0xE0) {
+        n = 3;
+        cp = c & 0x0F;
+        min = 0x800;
+    } else if ((c & 0xF8) == 0xF0) {
+        n = 4;
+        cp = c & 0x07;
+        min = 0x10000;
+    } else {
+        return 0;
+    }
+    if (i + n > s.size())
+        return 0;
+    for (std::size_t k = 1; k < n; ++k) {
+        if ((b(i + k) & 0xC0) != 0x80)
+            return 0;
+        cp = (cp << 6) | (b(i + k) & 0x3F);
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+        return 0;
+    return n;
+}
+
+std::string reference_repair(const std::string& s, bool& replaced) {
+    std::string out;
+    for (std::size_t i = 0; i < s.size();) {
+        const auto n = reference_sequence_length(s, i);
+        if (n == 0) {
+            out += "\xEF\xBF\xBD";
+            replaced = true;
+            ++i;
+        } else {
+            out.append(s, i, n);
+            i += n;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("browser_policy: repair_utf8 agrees with an independent reference on every boundary "
+          "sequence of one to four bytes",
+          "[browser_policy][parsers]") {
+    // The 21 bytes that sit on a boundary of Unicode Table 3-7 (ASCII edge, every continuation
+    // and lead boundary); every 1..4-byte sequence over them is compared, ~204k inputs.
+    // MUTATION: drop the E0/ED/F0/F4 second-byte range, an unchecked continuation byte, or
+    // the F1-F3 branch -> some sequence disagrees with the reference.
+    const std::array<unsigned char, 21> alphabet = {0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0,
+                                                    0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0, 0xE1,
+                                                    0xED, 0xEF, 0xF0, 0xF1, 0xF4, 0xF5, 0xFF};
+    std::size_t valid_seen = 0;
+    std::size_t mismatches = 0;
+    const auto check = [&](const std::string& in) {
+        bool got_replaced = false;
+        bool want_replaced = false;
+        const auto got = detail::repair_utf8(in, got_replaced);
+        const auto want = reference_repair(in, want_replaced);
+        if (got != want || got_replaced != want_replaced)
+            ++mismatches;
+        if (!want_replaced)
+            ++valid_seen;
+    };
+    for (const auto a : alphabet) {
+        std::string s1{static_cast<char>(a)};
+        check(s1);
+        for (const auto b : alphabet) {
+            std::string s2 = s1 + static_cast<char>(b);
+            check(s2);
+            for (const auto c : alphabet) {
+                std::string s3 = s2 + static_cast<char>(c);
+                check(s3);
+                for (const auto d : alphabet)
+                    check(s3 + static_cast<char>(d));
+            }
+        }
+    }
+    CHECK(mismatches == 0);
+    CHECK(valid_seen > 0); // the sweep does cover well-formed input, not only garbage
+}
+
+TEST_CASE("browser_policy: the status row is nine fields, escapes its reason, and never holds a NUL",
+          "[browser_policy][parsers]") {
+    const auto planned = format_status_row(kStateUnavailable, "macos:planned");
+    CHECK(planned == "status|-|-|-|policies|-|unavailable|-|macos:planned");
+    CHECK(split_fields(planned).size() == 9);
+
+    const auto constrained =
+        format_status_row(kStateConstrained, "linux:permission_denied,linux:json_unparseable");
+    CHECK(constrained ==
+          "status|-|-|-|policies|-|constrained|-|linux:permission_denied,linux:json_unparseable");
+    CHECK(split_fields(constrained).size() == 9);
+
+    // The reason is a token list today, but the formatter still owns the wire grammar: a pipe,
+    // a NUL or a bad byte in it can neither shift the field count nor truncate the row.
+    const auto hostile = format_status_row(kStateConstrained, std::string("a|b\0\xFF", 5));
+    CHECK(hostile.find('\0') == std::string::npos);
+    CHECK(split_fields(hostile).size() == 9);
+    CHECK(survives_transport(hostile));
+}
+
+TEST_CASE("browser_policy: max_nesting_depth counts brackets outside strings and comments exactly "
+          "as the parser does",
+          "[browser_policy][parsers]") {
+    using detail::max_nesting_depth;
+    CHECK(max_nesting_depth("") == 0);
+    CHECK(max_nesting_depth("{}") == 1);
+    CHECK(max_nesting_depth(R"({"a":[[1],{"b":[]}]})") == 4);
+    CHECK(max_nesting_depth(R"({"a":"[[[[ {{{{ \" ]]]] "})") == 1); // brackets inside a string
+    CHECK(max_nesting_depth(R"({"a":"\\"}[[)") == 2);               // \\ then the closing quote
+    CHECK(max_nesting_depth("{// [[[[\n}") == 1);                   // line comment, ended by LF
+    CHECK(max_nesting_depth("/* [[[[ */{}") == 1);                  // block comment
+    // nlohmann ends a line comment at CR and at NUL as well as LF (lexer.hpp scan_comment); a
+    // scan that waited for LF would hide the brackets after the CR from the depth guard while
+    // the parser still builds them. MUTATION: end the comment at LF only -> these read as 1.
+    CHECK(max_nesting_depth("{// x\r[[[[") == 5);
+    CHECK(max_nesting_depth(std::string_view{"{// x\0[[[[", 10}) == 5);
+    CHECK(max_nesting_depth("{/* unterminated [[[[") == 1);        // ends the scan; the parse fails
+    CHECK(max_nesting_depth("]]]]{") == 1);                        // closers never go negative
+}
+
+TEST_CASE("browser_policy: the depth cap has an exact boundary for arrays AND objects, and holds "
+          "with comments",
+          "[browser_policy][parsers]") {
+    const auto nest = [](char open, char close, int n) {
+        std::string s = R"({"k":)"; // the root object is container 1
+        for (int i = 0; i < n; ++i) {
+            s += open;
+            if (open == '{')
+                s += "\"k\":";
+        }
+        s += "1";
+        for (int i = 0; i < n; ++i)
+            s += close;
+        s += "}";
+        return s;
+    };
+    const auto parse = [](const std::string& text) {
+        return rows_from_json_policy_text(text, Browser::chrome, Level::mandatory, "machine",
+                                          "/x");
+    };
+    // 32 containers in all parse; a 33rd is json_too_deep. MUTATION: shift the comparison by one
+    // in rows_from_json_policy_text -> one of these four flips.
+    CHECK_FALSE(parse(nest('[', ']', kMaxNestingDepth - 1)).failure.has_value());
+    CHECK(parse(nest('[', ']', kMaxNestingDepth)).failure == kTokenJsonTooDeep);
+    CHECK_FALSE(parse(nest('{', '}', kMaxNestingDepth - 1)).failure.has_value());
+    CHECK(parse(nest('{', '}', kMaxNestingDepth)).failure == kTokenJsonTooDeep);
+    // A CR-ended line comment does not hide the nesting after it from the guard.
+    std::string sneaky = "// c\r" + nest('[', ']', kMaxNestingDepth);
+    CHECK(parse(sneaky).failure == kTokenJsonTooDeep);
+}
+
+TEST_CASE("browser_policy: a megabyte of sibling containers parses in linear time and is bounded "
+          "by max_rows",
+          "[browser_policy][parsers]") {
+    // The shape nlohmann's callback parser handled QUADRATICALLY (over two minutes for 1 MiB):
+    // one key holding a huge list of small objects. The depth guard is now a linear pre-scan and
+    // the parse has no callback, so this returns at once; a regression back to the callback
+    // parser shows up as a suite that does not finish, not as a timing assertion.
+    std::string text = R"({"a":[)";
+    while (text.size() < 1024 * 1024)
+        text += R"({"x":1},)";
+    text += R"({"x":1}]})";
+    const auto p = rows_from_json_policy_text(text, Browser::chrome, Level::mandatory, "machine",
+                                              "/x");
+    REQUIRE_FALSE(p.failure.has_value());
+    REQUIRE(p.rows.size() == 1);
+    CHECK(p.rows[0].value.type == PolicyType::List);
+
+    // And a file with many keys stops building rows at the budget it is given.
+    std::string keys = "{";
+    for (int i = 0; i < 5000; ++i)
+        keys += (i ? "," : "") + std::string{"\"K"} + std::to_string(i) + "\":1";
+    keys += "}";
+    const auto capped = rows_from_json_policy_text(keys, Browser::chrome, Level::mandatory,
+                                                   "machine", "/x", 3);
+    REQUIRE_FALSE(capped.failure.has_value());
+    CHECK(capped.rows.size() == 3); // MUTATION: ignore max_rows -> 5000
+}
+
 #if !defined(_WIN32)
 
 namespace {
@@ -494,7 +698,8 @@ constexpr std::string_view kChromeManaged = "/etc/opt/chrome/policies/managed/ch
 
 struct LegRun {
     int rc = -1;
-    std::vector<std::string> rows;
+    std::vector<std::string> rows;  // the `policy|` rows only
+    std::string status_row;         // the in-band `status|` row, or "" when the read completed
     YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
     YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
     std::string provenance;
@@ -525,9 +730,25 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
     out.completeness = result.result_completeness;
     out.provenance = result.result_provenance;
     std::istringstream lines(result.captured);
-    for (std::string line; std::getline(lines, line);)
-        if (!line.empty())
+    for (std::string line; std::getline(lines, line);) {
+        if (line.empty())
+            continue;
+        if (line.rfind("status|", 0) == 0) {
+            CHECK(out.status_row.empty()); // at most ONE outcome row per run
+            out.status_row = line;
+        } else {
             out.rows.push_back(line);
+        }
+    }
+    // The pairing invariant, checked on EVERY leg run in this file: a CONSTRAINED read carries
+    // exactly one `constrained` status row naming the same tokens as the typed provenance; a
+    // completed read (OK/FULL, populated or empty) carries none. MUTATION: drop the row write
+    // from mark_result_read, or write it on an OK read -> every case that runs a leg fails here.
+    if (out.status == YUZU_RESULT_STATUS_CONSTRAINED) {
+        CHECK(out.status_row == "status|-|-|-|policies|-|constrained|-|" + out.provenance);
+    } else {
+        CHECK(out.status_row.empty());
+    }
     return out;
 }
 
@@ -713,7 +934,18 @@ TEST_CASE("browser_policy linux: symlinks below the root are refused, the root i
     std::string reason;
     auto rows = lnx::linux_policy_rows_at(dir.path / "root_a", reason);
     CHECK(rows.empty());
-    CHECK_FALSE(reason.empty()); // refused loudly (mutation: drop O_NOFOLLOW -> rows appear)
+    // O_DIRECTORY|O_NOFOLLOW on a symlink is ENOTDIR on Linux AND macOS, so open_dir_at looks
+    // again (fstatat, no follow) to name it. MUTATIONS: drop O_NOFOLLOW -> rows appear; drop the
+    // fstatat look -> the token degrades to linux:not_a_directory.
+    CHECK(reason == "linux:symlink_refused");
+
+    // (a2) the same at the LEVEL hop: `managed` itself is a symlink.
+    fs::create_directories(dir.path / "root_a2" / "etc" / "opt" / "chrome" / "policies");
+    fs::create_directory_symlink(dir.path / "elsewhere" / "policies" / "managed",
+                                 dir.path / "root_a2" / "etc" / "opt" / "chrome" / "policies" / "managed");
+    rows = lnx::linux_policy_rows_at(dir.path / "root_a2", reason);
+    CHECK(rows.empty());
+    CHECK(reason == "linux:symlink_refused");
 
     // (b) a symlinked policy FILE is not followed.
     write_file(dir.path, "target.json", R"({"A": 1})");
@@ -988,6 +1220,192 @@ TEST_CASE("browser_policy linux leg: the total read budget is exact and reported
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:byte_cap"); // the run-wide read bound, not the per-file cap
+}
+
+TEST_CASE("browser_policy linux leg: a cap stops the walk, so a later sibling adds no failure token",
+          "[browser_policy][linux][cap]") {
+    // MUTATION: turn either `return finish()` at a cap into `continue` -> the rows stay the same
+    // but the later sibling is still visited and adds its own token, so the exact pin fails.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_capstop_"};
+    const std::string body = R"({"A": 1})";
+    for (const char* name : {"a", "b", "c"})
+        write_file(dir.path, std::string{"etc/opt/chrome/policies/managed/"} + name + ".json", body);
+    // Sorted after c.json: would add linux:symlink_refused if the walk reached it.
+    fs::create_symlink("nowhere", dir.path / "etc/opt/chrome/policies/managed/d.json");
+    WalkLimits limits;
+    limits.max_total_bytes = 2 * body.size();
+    auto run = run_leg(dir.path, limits);
+    CHECK(run.rows.size() == 2);
+    CHECK(run.provenance == "linux:byte_cap");
+
+    yuzu::test::TempDir dir2{"yuzu_test_browser_policy_leg_capstop2_"};
+    write_file(dir2.path, "etc/opt/chrome/policies/managed/a.json", R"({"A": 1, "B": 2, "C": 3})");
+    write_file(dir2.path, "etc/opt/chrome/policies/managed/b.json", "{ nope"); // json_unparseable if reached
+    WalkLimits row_limits;
+    row_limits.max_rows = 2;
+    run = run_leg(dir2.path, row_limits);
+    CHECK(run.rows.size() == 2);
+    CHECK(run.provenance == "linux:row_cap");
+}
+
+TEST_CASE("browser_policy linux leg: rows come out in sorted file order, whatever readdir returns",
+          "[browser_policy][linux][tree]") {
+    // MUTATION: drop the std::sort in list_names -> readdir order (newest-first on tmpfs, hash
+    // order on ext4) leaks into the rows.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_order_"};
+    for (char c = 'a'; c <= 'p'; ++c)
+        write_file(dir.path, std::string{"etc/opt/chrome/policies/managed/"} + c + ".json",
+                   std::string{"{\"P_"} + c + "\": 1}");
+    std::string reason;
+    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    REQUIRE(rows.size() == 16);
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        CHECK(rows[i].find(std::string{"|P_"} + static_cast<char>('a' + i) + "|") !=
+              std::string::npos);
+}
+
+TEST_CASE("browser_policy linux leg: a root that is not a directory is constrained, never absent",
+          "[browser_policy][linux][tree]") {
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_fileroot_"};
+    write_file(dir.path, "iamafile", "x");
+    std::string reason;
+    const auto rows = lnx::linux_policy_rows_at(dir.path / "iamafile", reason);
+    CHECK(rows.empty());
+    CHECK(reason == "linux:not_a_directory");
+}
+
+TEST_CASE("browser_policy linux leg: the README's statements about Chromium's looser reader hold",
+          "[browser_policy][linux][tree]") {
+    // Caveat 1 says: a trailing comma is unparseable here; a file without a .json suffix is
+    // skipped SILENTLY (the one fail-wrong direction); two files setting one policy give two
+    // rows, one per file. Each is pinned so the README cannot drift from the behaviour.
+    yuzu::test::TempDir trailing{"yuzu_test_browser_policy_leg_comma_"};
+    write_file(trailing.path, "etc/opt/chrome/policies/managed/a.json", R"({"A": 1,})");
+    auto run = run_leg(trailing.path);
+    CHECK(run.rows.empty());
+    CHECK(run.provenance == "linux:json_unparseable");
+
+    yuzu::test::TempDir suffix{"yuzu_test_browser_policy_leg_suffix_"};
+    write_file(suffix.path, "etc/opt/chrome/policies/managed/00-defaults", R"({"A": 1})");
+    write_file(suffix.path, "etc/opt/chrome/policies/managed/b.json.bak", R"({"B": 2})");
+    run = run_leg(suffix.path);
+    CHECK(run.rows.empty());
+    CHECK(run.status == YUZU_RESULT_STATUS_OK); // silent: Chromium would load both
+    CHECK(run.provenance.empty());
+
+    yuzu::test::TempDir twice{"yuzu_test_browser_policy_leg_twice_"};
+    write_file(twice.path, "etc/opt/chrome/policies/managed/00-base.json",
+               R"({"HomepageLocation": "https://a.example/"})");
+    write_file(twice.path, "etc/opt/chrome/policies/managed/90-override.json",
+               R"({"HomepageLocation": "https://b.example/"})");
+    run = run_leg(twice.path);
+    REQUIRE(run.rows.size() == 2);
+    CHECK(run.rows[0].find("https://a.example/|/etc/opt/chrome/policies/managed/00-base.json|") !=
+          std::string::npos);
+    CHECK(run.rows[1].find("https://b.example/|/etc/opt/chrome/policies/managed/90-override.json|") !=
+          std::string::npos);
+}
+
+TEST_CASE("browser_policy linux leg: a valid file longer than one read chunk is read whole",
+          "[browser_policy][linux][read]") {
+    // MUTATION: `append` -> `assign` in read_file_at keeps only the last 16 KiB chunk.
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_bigvalid_"};
+    std::string body = "{";
+    for (int i = 0; i < 3000; ++i)
+        body += (i ? "," : "") + std::string{"\"K"} + std::to_string(i) + "\": " + std::to_string(i);
+    body += "}";
+    REQUIRE(body.size() > 2 * 16384);
+    write_file(dir.path, "etc/opt/chrome/policies/managed/big.json", body);
+    std::string reason;
+    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    CHECK(reason.empty());
+    CHECK(rows.size() == 3000);
+}
+
+namespace {
+int open_fd_count() {
+    int n = 0;
+    for (int fd = 0; fd < 1024; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1)
+            ++n;
+    return n;
+}
+bool fd_is_open(int fd) {
+    return ::fcntl(fd, F_GETFD) != -1;
+}
+} // namespace
+
+TEST_CASE("browser_policy linux leg: the walk leaks no file descriptor on the happy path or any "
+          "failure path",
+          "[browser_policy][linux][tree]") {
+    // LeakSanitizer sees heap only, so an unclosed fd is invisible to the sanitizer legs: count
+    // the process's descriptors around the walk. MUTATION: drop closedir in ~Dir, or a close in
+    // the fd owner or in dir_from_fd's failure path -> the count grows.
+    yuzu::test::TempDir ok{"yuzu_test_browser_policy_leg_fdleak_"};
+    for (char c = 'a'; c <= 'e'; ++c)
+        write_file(ok.path, std::string{"etc/opt/chrome/policies/managed/"} + c + ".json", R"({"K": 1})");
+    write_file(ok.path, "etc/opt/edge/policies/recommended/x.json", "{ nope");             // unparseable
+    write_file(ok.path, "etc/chromium/policies/managed/big.json", std::string(2048, 'a'));  // oversized below
+    REQUIRE(::mkfifo((ok.path / "etc/opt/chrome/policies/managed/f.json").c_str(), 0644) == 0);
+    fs::create_symlink("nowhere", ok.path / "etc/opt/chrome/policies/managed/l.json");      // symlink leaf
+    WalkLimits limits;
+    limits.max_file_bytes = 1024;
+    yuzu::test::TempDir bad{"yuzu_test_browser_policy_leg_fdleak_bad_"};
+    write_file(bad.path, "etc/opt/edge", "a file where a directory belongs");
+    fs::create_directories(bad.path / "etc" / "opt" / "chrome" / "policies");
+    fs::create_directory_symlink(bad.path / "etc", bad.path / "etc" / "opt" / "chrome" / "policies" / "managed");
+
+    const int before = open_fd_count();
+    for (int i = 0; i < 3; ++i) {
+        std::string reason;
+        (void)lnx::linux_policy_rows_at(ok.path, reason, limits);
+        (void)lnx::linux_policy_rows_at(bad.path, reason);
+        (void)lnx::linux_policy_rows_at(bad.path / "no_such_root", reason);
+    }
+    CHECK(open_fd_count() == before);
+}
+
+TEST_CASE("browser_policy posix: dir_from_fd closes the fd itself when fdopendir fails",
+          "[browser_policy][linux][tree]") {
+    // fdopendir leaves the fd open on failure; the owner must close it exactly once (the guard,
+    // never by hand). /dev/null is not a directory, so fdopendir fails with ENOTDIR.
+    const int raw = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(raw >= 0);
+    const auto r = posix::dir_from_fd(posix::Fd{raw}, 0);
+    CHECK(r.status == posix::OpenStatus::failed);
+    CHECK(r.detail == "not_a_directory");
+    CHECK_FALSE(fd_is_open(raw));
+}
+
+TEST_CASE("browser_policy posix: Dir is move-only and a moved-from owner closes nothing",
+          "[browser_policy][linux][tree]") {
+    static_assert(!std::is_copy_constructible_v<posix::Dir> && !std::is_copy_assignable_v<posix::Dir>);
+    static_assert(std::is_nothrow_move_constructible_v<posix::Dir> &&
+                  std::is_nothrow_move_assignable_v<posix::Dir>);
+    posix::Dir a{::opendir("/")};
+    REQUIRE(a.get() != nullptr);
+    const int a_fd = a.fd();
+    posix::Dir b{std::move(a)};
+    CHECK(a.get() == nullptr);
+    CHECK(fd_is_open(a_fd)); // the move transferred it; nothing closed it
+
+    posix::Dir c{::opendir("/")};
+    REQUIRE(c.get() != nullptr);
+    const int c_old_fd = c.fd();
+    c = std::move(b); // must close c's previous directory and adopt a's
+    CHECK_FALSE(fd_is_open(c_old_fd));
+    CHECK(fd_is_open(a_fd));
+    CHECK(b.get() == nullptr);
+}
+
+TEST_CASE("browser_policy posix: errno_detail maps every documented errno to its token",
+          "[browser_policy][linux][tree]") {
+    static_assert(posix::errno_detail(EACCES) == "permission_denied");
+    static_assert(posix::errno_detail(EPERM) == "permission_denied");
+    static_assert(posix::errno_detail(ELOOP) == "symlink_refused");
+    static_assert(posix::errno_detail(ENOTDIR) == "not_a_directory");
+    static_assert(posix::errno_detail(EMFILE) == "open_failed");
+    SUCCEED();
 }
 
 #if defined(__linux__)

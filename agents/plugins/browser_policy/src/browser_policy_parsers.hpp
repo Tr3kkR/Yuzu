@@ -19,12 +19,13 @@
  *   type     bool | int | real | string | list | dict | null | unmodelled
  *   value    bool "true"/"false"; int/real as decimal text; string verbatim;
  *            list/dict as compact JSON text; null "null"; unmodelled "-"
- *   source   root-relative file (or registry key) the policy was read from
- *   detail   "-" normally; a short qualifier for an `unmodelled` value
- *            (`date`, `data`, `cf_type`, `too_deep`, ...), a degraded
- *            container (`nested_unmodelled`), or `nul_replaced` /
- *            `utf8_replaced` (appended, comma-joined, when any free-text
- *            field held an embedded NUL / a byte that is not valid UTF-8)
+ *   source   the LOGICAL absolute file (or registry key) the policy was read
+ *            from, e.g. /etc/opt/chrome/policies/managed/corp.json — never an
+ *            injected test root
+ *   detail   "-" normally; `json_type` for an `unmodelled` value (the only
+ *            unmodelled qualifier emitted today), and `nul_replaced` /
+ *            `utf8_replaced` (appended, comma-joined) when any free-text field
+ *            held an embedded NUL / a byte that is not valid UTF-8
  *
  * Every free-text field goes through yuzu::util::safe_output_field
  * (sdk/include/yuzu/string_utils.hpp): a value ending in a backslash or
@@ -43,12 +44,19 @@
  * repaired (repair_utf8: each offending byte becomes U+FFFD, flagged in
  * `detail`) before it is written.
  *
- * NO PLACEHOLDER ROWS. A host with no managed policy (browser not installed,
- * no policy files) reports ZERO rows and a clean OK status; a read that could
- * not be completed reports CONSTRAINED with a reason instead (see legs.hpp),
- * and a PLANNED leg that has not shipped reports UNAVAILABLE with an
- * `<os>:planned` reason (mark_result_planned). The three are never conflated:
- * a failure, or a host that was not inspected, must never read as absent.
+ * OUTCOME, IN BAND. A host with no managed policy (browser not installed, no
+ * policy files) reports ZERO rows and a clean OK status — an absent policy set
+ * is a complete answer, so no placeholder row is written for it. Every other
+ * outcome is reported twice: through the typed result status (CC-07) AND as ONE
+ * `status` row (format_status_row, written first by the legs.hpp seams): a read
+ * that could not be completed is `constrained` with the failure tokens, a
+ * PLANNED leg or a leg that threw is `unavailable`. The row exists because the
+ * server's response queries (REST, MCP, the dashboard) do not return the typed
+ * status today, so without it a host that was not inspected, or a read that
+ * failed, is indistinguishable from "no policy configured". The outcomes are
+ * never conflated: zero rows and no `status` row means the read completed.
+ *
+ *   status|-|-|-|policies|-|<constrained|unavailable>|-|<reason tokens>
  *
  * TYPE MAPPING. Every JSON value maps into PolicyType (the planned legs' native
  * registry/plist values will map into the same enum), and anything the mapper
@@ -69,7 +77,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -87,13 +97,17 @@ inline constexpr std::size_t kMaxPolicyRows = 8192;
 /// Total bytes of policy-file content one leg reads per run; beyond it the leg
 /// records `byte_cap`. The per-file, per-directory and row caps are independent
 /// and their product is far too large to be a real bound (thousands of files at
-/// the per-file cap), so this is the one that bounds the run's I/O, parse work
-/// and retained row text.
+/// the per-file cap), so this is the one that bounds the run's file I/O and the
+/// input to the parser. It is an INPUT bound: retained row text can be roughly
+/// twice it (pipe escaping doubles a worst-case value), and the parser's
+/// document tree for one file is a small multiple of that file's size.
 inline constexpr std::size_t kMaxPolicyTotalBytes = 16 * 1024 * 1024;
 /// Directory entries examined per directory (walk_dir_capped cap).
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
 /// Container nesting the mapper will descend; deeper is a constraint
-/// (bounds nlohmann's recursive dump() and the CF recursion alike).
+/// (bounds nlohmann's recursive dump() and the CF recursion alike). The root
+/// object counts as the first container, so 32 nested containers parse and a
+/// 33rd is `json_too_deep`.
 inline constexpr int kMaxNestingDepth = 32;
 
 /// The walk bounds as a parameter so the unit suite can prove the saturation
@@ -229,7 +243,7 @@ namespace detail {
 [[nodiscard]] inline std::string wire_field(std::string_view value, bool& nul_seen,
                                             bool& utf8_seen) {
     const std::string repaired = repair_utf8(value, utf8_seen);
-    const std::string escaped = yuzu::util::safe_output_field(repaired);
+    std::string escaped = yuzu::util::safe_output_field(repaired);
     if (escaped.find('\0') == std::string::npos)
         return escaped;
     std::string out;
@@ -272,7 +286,41 @@ namespace detail {
         det += det.empty() ? "nul_replaced" : ",nul_replaced";
     if (utf8)
         det += det.empty() ? "utf8_replaced" : ",utf8_replaced";
-    out += det.empty() ? std::string{"-"} : det;
+    out += det.empty() ? std::string_view{"-"} : std::string_view{det};
+    return out;
+}
+
+// ── the in-band outcome row ──────────────────────────────────────────────
+
+/// Field 0 of the outcome row (a policy row's field 0 is the literal `policy`).
+inline constexpr std::string_view kStatusRowTag = "status";
+/// The only action this plugin serves; it is the outcome row's `name` field.
+inline constexpr std::string_view kActionName = "policies";
+/// `state` values: the typed result status the row repeats, lower-cased.
+inline constexpr std::string_view kStateConstrained = "constrained";
+inline constexpr std::string_view kStateUnavailable = "unavailable";
+
+/// The ONE in-band outcome row, nine fields wide like a policy row so the
+/// definition's columns line up:
+///
+///   status|-|-|-|policies|-|<state>|-|<reason>
+///
+/// `state` is `constrained` (a read that could not be completed) or
+/// `unavailable` (a planned leg, or a leg that threw); `reason` is the same
+/// comma-joined `<os>:<detail>` string the typed result status carries as its
+/// provenance. Only ever written when the outcome is NOT a complete read (see
+/// the header note). The result never contains a NUL byte.
+[[nodiscard]] inline std::string format_status_row(std::string_view state,
+                                                   std::string_view reason) {
+    bool nul = false;
+    bool utf8 = false;
+    std::string out{kStatusRowTag};
+    out += "|-|-|-|";
+    out += kActionName;
+    out += "|-|";
+    out += detail::wire_field(state, nul, utf8);
+    out += "|-|";
+    out += detail::wire_field(reason, nul, utf8);
     return out;
 }
 
@@ -283,6 +331,43 @@ namespace detail {
 /// (a hostile or mis-encoded policy file must not abort the leg).
 [[nodiscard]] inline std::string dump_json(const nlohmann::json& j) {
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+/// The deepest container nesting in `text`, counted over `[`/`{` outside string
+/// literals and outside the `//` and `/* */` comments the parse tolerates. ONE
+/// linear pass with no allocation: it replaces nlohmann's parser callback as the
+/// depth guard, because the callback parser is QUADRATIC on a wide container of
+/// child containers (a 1 MiB `{"a":[{},{},...]}` takes minutes), which is exactly
+/// the shape a hostile policy file would use. An unterminated string or comment
+/// simply ends the scan; the parse that follows reports it as unparseable.
+[[nodiscard]] inline std::size_t max_nesting_depth(std::string_view text) noexcept {
+    std::size_t depth = 0;
+    std::size_t deepest = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '"') {
+            for (++i; i < text.size() && text[i] != '"'; ++i) {
+                if (text[i] == '\\')
+                    ++i; // the escaped character, which may itself be a quote
+            }
+        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+            // nlohmann ends a line comment at LF, CR or NUL (lexer.hpp scan_comment); ending it
+            // anywhere later would hide brackets the parser counts, so mirror it exactly.
+            i = text.find_first_of(std::string_view{"\n\r\0", 3}, i + 2);
+            if (i == std::string_view::npos)
+                break;
+        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+            const auto end = text.find("*/", i + 2);
+            if (end == std::string_view::npos)
+                break;
+            i = end + 1;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return deepest;
 }
 } // namespace detail
 
@@ -320,33 +405,25 @@ struct JsonPolicyParse {
 /// sorted by name (nlohmann objects are key-ordered). `//` and block
 /// comments are tolerated (Chromium's file policy loader accepts them).
 /// Top-level must be an object; nesting deeper than kMaxNestingDepth is a
-/// constraint, enforced through the parser callback so the deep value is
-/// never materialised.
+/// constraint, decided by a linear pre-scan BEFORE the parse so a deep value is
+/// never materialised. At most `max_rows` rows are built (the leg passes the row
+/// budget it has left plus one, so a file that would overrun the cap is noticed
+/// without first turning every one of its keys into a row).
 [[nodiscard]] inline JsonPolicyParse
 rows_from_json_policy_text(std::string_view text, Browser browser, Level level,
-                           std::string_view scope, std::string_view source) {
+                           std::string_view scope, std::string_view source,
+                           std::size_t max_rows = std::numeric_limits<std::size_t>::max()) {
     JsonPolicyParse out;
-    bool too_deep = false;
-    nlohmann::json doc;
-    try {
-        doc = nlohmann::json::parse(
-            text.begin(), text.end(),
-            [&too_deep](int depth, nlohmann::json::parse_event_t event, nlohmann::json&) {
-                if ((event == nlohmann::json::parse_event_t::object_start ||
-                     event == nlohmann::json::parse_event_t::array_start) &&
-                    depth >= kMaxNestingDepth) {
-                    too_deep = true;
-                    return false;
-                }
-                return true;
-            },
-            /*allow_exceptions=*/false, /*ignore_comments=*/true);
-    } catch (...) {
-        out.failure = kTokenJsonUnparseable;
+    if (detail::max_nesting_depth(text) > static_cast<std::size_t>(kMaxNestingDepth)) {
+        out.failure = kTokenJsonTooDeep;
         return out;
     }
-    if (too_deep) {
-        out.failure = kTokenJsonTooDeep;
+    nlohmann::json doc;
+    try {
+        doc = nlohmann::json::parse(text.begin(), text.end(), /*cb=*/nullptr,
+                                    /*allow_exceptions=*/false, /*ignore_comments=*/true);
+    } catch (...) {
+        out.failure = kTokenJsonUnparseable;
         return out;
     }
     if (doc.is_discarded()) {
@@ -359,6 +436,8 @@ rows_from_json_policy_text(std::string_view text, Browser browser, Level level,
     }
     try {
         for (const auto& [key, val] : doc.items()) {
+            if (out.rows.size() >= max_rows)
+                break;
             PolicyRow row;
             row.browser = browser;
             row.level = level;

@@ -2,8 +2,7 @@
  * test_browser_policy_local_dispatcher.cpp — loads the ACTUAL built browser_policy
  * plugin (browser_policy.dylib / .so / .dll) via PluginHandle::load and drives its one
  * action, `policies`, through yuzu::agent::LocalDispatcher, exercising the real
- * per-OS leg on the build host (modelled on test_pkg_inventory_local_dispatcher.cpp and
- * test_peripherals_local_dispatcher.cpp).
+ * per-OS leg on the build host (modelled on test_peripherals_local_dispatcher.cpp).
  *
  * RUNS ON ALL THREE PLATFORMS, deliberately: no `#ifndef _WIN32` / `#ifdef __APPLE__`
  * around the TU. A platform-guarded dispatcher TU is how a sibling plugin once shipped a
@@ -22,10 +21,12 @@
  * test_browser_policy_parsers.cpp; this file proves the built plugin loads, registers the
  * action its definition names, and that a real dispatch reports the outcome the host's own
  * leg promises:
- *  - Windows and macOS (planned placeholders): rc 0, ZERO rows, UNAVAILABLE/PARTIAL and
- *    provenance exactly `windows:planned` / `macos:planned`;
- *  - Linux (the shipping leg): rc 0, OK/FULL or CONSTRAINED/PARTIAL with `linux:` tokens,
- *    and every row (if any) conforms to the nine-field row model, `policy` first.
+ *  - Windows and macOS (planned placeholders): rc 0, exactly ONE in-band `status` row
+ *    (`unavailable`), UNAVAILABLE/PARTIAL and provenance exactly `windows:planned` /
+ *    `macos:planned`, no policy rows;
+ *  - Linux (the shipping leg): rc 0, OK/FULL with no `status` row, or CONSTRAINED/PARTIAL with
+ *    `linux:` tokens and exactly one matching `constrained` `status` row; every other row (if
+ *    any) conforms to the nine-field row model, `policy` first.
  * When the Windows or macOS leg ships, its own cases replace the matching planned block
  * below.
  *
@@ -34,9 +35,10 @@
  * drift of the row_kind-first column list, is caught here. On Linux the status case also
  * looks, read-only, for a `*.json` under the vendor policy directories to decide whether its
  * populated-read tier applies (a host with a policy file must yield a row or a CONSTRAINED
- * status; a host with none gets a WARN, never a vacuous pass), and the shipped leg's whole
- * result is compared with run_linux_at(ctx, "/") -- the differential oracle that holds on every
- * Linux host. No process is spawned, nothing sleeps, and no temp file is written.
+ * status; a host with none gets a WARN), and the shipped leg's whole result is compared with
+ * run_linux_at(ctx, "/") -- the differential oracle. Neither of those can see a WRONG ROOT or an
+ * unconditional empty OK on a host with no policy file (all three read the same empty tree), so
+ * a source tripwire also pins run_linux's one line. No process is spawned and nothing sleeps.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -125,6 +127,16 @@ std::vector<std::string> captured_rows(const std::string& captured) {
     return out;
 }
 
+bool is_status_row(const std::string& row) {
+    return row.rfind("status|", 0) == 0;
+}
+
+/// The one in-band outcome row a non-OK result must carry, spelled out independently of
+/// format_status_row (the exact wire text, so a change to it is a visible test edit).
+std::string expected_status_row(std::string_view state, std::string_view reason) {
+    return "status|-|-|-|policies|-|" + std::string{state} + "|-|" + std::string{reason};
+}
+
 bool is_browser_token(std::string_view s) {
     for (const auto b : {bp::Browser::chrome, bp::Browser::chromium, bp::Browser::edge}) {
         if (bp::browser_token(b) == s) {
@@ -166,6 +178,34 @@ void check_policy_row_shape(const std::string& row) {
     CHECK((f[3] == "machine" || f[3].rfind("user:", 0) == 0));
     CHECK(is_type_token(f[5]));
     CHECK_FALSE(f[8].empty()); // detail is "-" when there is no qualifier, never empty
+}
+
+/// The in-band/typed pairing, on a real dispatch result: a CONSTRAINED result carries exactly one
+/// `constrained` status row with the typed provenance, an UNAVAILABLE result exactly one
+/// `unavailable` row, and a complete read (OK) none; every OTHER row is a policy row that fits
+/// the row model. Returns the policy rows.
+std::vector<std::string> check_outcome_rows(const yuzu::agent::LocalDispatcher::Result& result) {
+    std::vector<std::string> status_rows;
+    std::vector<std::string> policy_rows;
+    for (const auto& row : captured_rows(result.captured)) {
+        (is_status_row(row) ? status_rows : policy_rows).push_back(row);
+    }
+    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+        REQUIRE(status_rows.size() == 1);
+        CHECK(status_rows[0] == expected_status_row("constrained", result.result_provenance));
+    } else if (result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE) {
+        REQUIRE(status_rows.size() == 1);
+        CHECK(status_rows[0] == expected_status_row("unavailable", result.result_provenance));
+    } else {
+        CHECK(status_rows.empty()); // a complete read writes no outcome row
+    }
+    for (const auto& row : status_rows) {
+        CHECK(split_fields_escape_aware(row).size() == kPolicyFieldCount);
+    }
+    for (const auto& row : policy_rows) {
+        check_policy_row_shape(row);
+    }
+    return policy_rows;
 }
 
 // ── locating the built plugin ────────────────────────────────────────────
@@ -339,9 +379,9 @@ DefinitionFacts parse_definition(std::istream& in) {
     return facts;
 }
 
-/// Same shape as the plugin finder: named candidates, FAIL (never skip) when none exists.
-DefinitionFacts load_definition_facts() {
-    const fs::path rel = fs::path{"content"} / "definitions" / "browser_policy.yaml";
+/// Reads a committed source file by its repo-relative path. Same shape as the plugin finder:
+/// named candidates, FAIL (never skip) when none exists.
+std::string read_repo_file(const fs::path& rel) {
     std::vector<fs::path> candidates;
 #ifdef YUZU_TEST_FIXTURE_DIR
     // <source root>/tests/unit/fixtures -> <source root>; `..` keeps a trailing slash harmless.
@@ -367,22 +407,33 @@ DefinitionFacts load_definition_facts() {
         if (!in) {
             FAIL("could not open " << c.string());
         }
-        return parse_definition(in);
+        std::ostringstream text;
+        text << in.rdbuf();
+        return text.str();
     }
-    FAIL("content/definitions/browser_policy.yaml not found (searched: " << searched << ")");
+    FAIL(rel.string() << " not found (searched: " << searched << ")");
     return {}; // unreachable: FAIL aborts the case
 }
 
+DefinitionFacts load_definition_facts() {
+    std::istringstream in(
+        read_repo_file(fs::path{"content"} / "definitions" / "browser_policy.yaml"));
+    return parse_definition(in);
+}
+
 #if defined(_WIN32) || defined(__APPLE__)
-/// The planned-leg contract: rc 0, ZERO rows (this plugin has no status row kind, the typed
-/// status alone carries the outcome), UNAVAILABLE/PARTIAL (never CONSTRAINED, which would count
-/// a planned leg as a degraded read, and never OK, which would read as "no policy configured")
-/// and provenance exactly `<os>:planned`.
+/// The planned-leg contract: rc 0, exactly ONE row -- the in-band `unavailable` status row
+/// (the response queries do not return the typed status, so without it a planned host reads as
+/// "nothing managed") -- and no policy rows; UNAVAILABLE/PARTIAL (never CONSTRAINED, which would
+/// count a planned leg as a degraded read, and never OK, which would read as "no policy
+/// configured"); provenance exactly `<os>:planned`, repeated in the row.
 void check_planned_placeholder(const yuzu::agent::LocalDispatcher::Result& result,
                                std::string_view token) {
     INFO("captured: " << result.captured);
     CHECK(result.rc == 0);
-    CHECK(captured_rows(result.captured).empty());
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == expected_status_row("unavailable", token));
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance == std::string{token});
@@ -413,9 +464,12 @@ bool host_has_policy_file() {
 /// The differential oracle for the production leg. The exported plugin's run_linux is one line,
 /// run_linux_at(ctx, "/"), and run_linux_at itself is proven row by row over an injected root in
 /// test_browser_policy_parsers.cpp. Running that same call here, on a real CommandContext, gives
-/// the result the shipped leg must reproduce exactly on THIS host -- so a run_linux that diverges
-/// (wrong root, an unconditional status, an added or dropped row) fails on every Linux host,
-/// including a policy-less CI runner where the populated-read tier can only warn.
+/// the result the shipped leg must reproduce exactly on THIS host. That catches a run_linux that
+/// reports an unconditional non-OK status, adds or drops a row, or returns nonzero -- on any Linux
+/// host. It does NOT catch a wrong root or an unconditional empty OK on a host with no policy
+/// file: all three read the same empty tree. Those two are covered by the populated-read tier on
+/// a host that has a policy file, by the source tripwire below on every host, and by the container
+/// evidence recorded in the review notes.
 int production_root_execute(YuzuCommandContext* raw, const char* /*action*/,
                             const YuzuParam* /*params*/, std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
@@ -547,11 +601,11 @@ TEST_CASE("browser_policy plugin: an unknown action is refused, and its echo can
     }
 }
 
-// MUTATION: a leg that emits a stray status/placeholder row, or a row with a dropped or extra
-// field or an out-of-vocabulary browser / level / type token -> the shape checks fail on any
-// host where the leg emits rows. On a host with no managed policy (and on a planned host, where
-// the status case below pins ZERO rows) this loop is a no-op by design: shape, not content. The
-// populated row shape is proven over the injected root in test_browser_policy_parsers.cpp.
+// MUTATION: a leg that emits a stray extra status row, an outcome row that disagrees with the typed
+// status, or a policy row with a dropped or extra field or an out-of-vocabulary browser / level /
+// type token -> check_outcome_rows fails on any host where the leg emits rows. On a host with no
+// managed policy this is a no-op for policy rows by design: shape, not content. The populated row
+// shape is proven over the injected root in test_browser_policy_parsers.cpp.
 TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit the row model",
           "[browser_policy][actions]") {
     auto plugin = load_browser_policy_plugin();
@@ -567,9 +621,9 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
         WARN("capture hit LocalDispatcher::kCaptureMaxBytes on this host -- shape-checking the "
              "whole rows before the sentinel");
     }
-    for (const auto& row : captured_rows(result.captured)) {
-        check_policy_row_shape(row);
-    }
+    // Policy rows fit the row model; the one in-band status row (if any) pairs with the typed
+    // status exactly. Shape, not content, on a host whose real policy files are unknown.
+    (void)check_outcome_rows(result);
 }
 
 // MUTATION (Windows / macOS): revert the placeholder to a CONSTRAINED status (or to
@@ -580,9 +634,9 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
 // planned outcome (UNAVAILABLE) or a wrong-OS token from the Linux leg -> the OK-or-CONSTRAINED
 // and `linux:` token checks fail. A wrong production root or an unconditional empty OK -> the
 // populated-read tier fails on a host with a policy file. Any run_linux that differs from
-// run_linux_at(ctx, "/") (an unconditional CONSTRAINED status included, which the tier accepts) ->
-// the differential oracle fails on every host. Row source/scope are read from the host's real
-// files, so they are asserted only when rows exist.
+// run_linux_at(ctx, "/") in what it reports (an unconditional CONSTRAINED status included, which
+// the tier accepts) -> the differential oracle fails on any host. Row source/scope are read from
+// the host's real files, so they are asserted only when policy rows exist.
 TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeholder or the read "
           "status",
           "[browser_policy][status]") {
@@ -611,29 +665,31 @@ TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeho
             CHECK(token.rfind("linux:", 0) == 0);
         }
     }
-    for (const auto& row : captured_rows(result.captured)) {
+    const auto policy_rows = check_outcome_rows(result);
+    for (const auto& row : policy_rows) {
         INFO("row: " << row);
         const auto f = split_fields_escape_aware(row);
         REQUIRE(f.size() == kPolicyFieldCount);
         CHECK(f[3] == "machine");           // the Linux leg reads machine policy only
         CHECK(f[7].rfind("/etc/", 0) == 0); // the logical source path, never an injected root
     }
-    // The populated-read tier (X11). On a host that HAS a readable policy file the production
-    // root binding ("/") must surface it: rows, or a CONSTRAINED status if the file exists but
+    // The populated-read tier. On a host that HAS a readable policy file the production root
+    // binding ("/") must surface it: policy rows, or a CONSTRAINED status if the file exists but
     // cannot be decoded. On a host with none (most CI runners) the tier does not apply and says
-    // so; it never passes vacuously. MUTATION: run_linux passing any root but "/", or reporting
-    // an unconditional empty OK/FULL, yields zero rows + OK on a seeded host -> fails here
-    // (proven in the seeded container run recorded in the PR body).
+    // so. MUTATION: run_linux passing any root but "/", or reporting an unconditional empty
+    // OK/FULL, yields zero rows + OK on a host that has a policy file -> fails here (recorded
+    // for this leg in the seeded-container runs; on a policy-less host only the source tripwire
+    // below catches those two).
     if (host_has_policy_file()) {
-        CHECK((!captured_rows(result.captured).empty() ||
-               result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+        CHECK((!policy_rows.empty() || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
     } else {
         WARN("no *.json under /etc/{opt/chrome,chromium,opt/edge}/policies/{managed,recommended} "
              "on this host -- the populated-read tier does not apply");
     }
-    // The differential oracle (holds on every host): the shipped leg must be exactly
-    // run_linux_at(ctx, "/"). MUTATION: run_linux reporting an unconditional status, emitting or
-    // dropping a row, or returning nonzero -> one of these fails, even on a policy-less host.
+    // The differential oracle: the shipped leg must be exactly run_linux_at(ctx, "/"). MUTATION:
+    // run_linux reporting an unconditional non-OK status, emitting or dropping a row, or returning
+    // nonzero -> one of these fails on any host, policy-less included. (A wrong root or an
+    // unconditional empty OK is NOT caught here on a policy-less host; see the tripwire case.)
     {
         YuzuPluginDescriptor oracle{};
         oracle.execute = &production_root_execute;
@@ -656,7 +712,7 @@ TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeho
 // MUTATION: delete the catch in run_guarded (browser_policy_legs.hpp) -> the throw escapes the
 // synthetic descriptor's execute and this case fails on an unexpected exception; drop the
 // set_result_status call -> UNDECLARED, the status check fails; change the token -> the exact
-// per-OS literal fails; write a placeholder row from the catch -> the zero-rows check fails.
+// per-OS literal fails; drop the in-band status row from the catch -> the one-row check fails.
 TEST_CASE("browser_policy plugin: an exception inside a leg is reported as UNAVAILABLE with the "
           "host's exception token, never thrown across the plugin ABI",
           "[browser_policy][status]") {
@@ -666,7 +722,9 @@ TEST_CASE("browser_policy plugin: an exception inside a leg is reported as UNAVA
     const auto result = dispatcher.run(&descriptor, "policies");
 
     CHECK(result.rc == 1);
-    CHECK(captured_rows(result.captured).empty()); // no row, no placeholder
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1); // no policy row, exactly the one in-band outcome row
+    CHECK(rows[0] == expected_status_row("unavailable", bp::kExceptionToken));
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance == std::string{bp::kExceptionToken});
@@ -677,4 +735,43 @@ TEST_CASE("browser_policy plugin: an exception inside a leg is reported as UNAVA
 #else
     CHECK(result.result_provenance == "linux:leg:exception");
 #endif
+}
+
+// MUTATION: narrow run_guarded's `catch (...)` to `catch (const std::exception&)` -> a throw of a
+// type that is not a std::exception escapes the plugin ABI and this case fails.
+namespace {
+int throwing_non_std_execute(YuzuCommandContext* raw, const char* /*action*/,
+                             const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return bp::run_guarded(ctx, [](yuzu::CommandContext&) -> int { throw 42; });
+}
+} // namespace
+
+TEST_CASE("browser_policy plugin: run_guarded contains an exception that is not a std::exception",
+          "[browser_policy][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &throwing_non_std_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, "policies");
+    CHECK(result.rc == 1);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_provenance == std::string{bp::kExceptionToken});
+}
+
+// The production root binding, pinned as source. run_linux is ONE line, `return
+// run_linux_at(ctx, "/");`, and on a host with no policy file every wrong version of it (another
+// root, an unconditional OK) reads the same empty tree as the right one, so no runtime check on
+// such a host can tell them apart. This test fails the moment that line changes, on every OS; an
+// intentional change to it is meant to be a reviewed edit of this test. MUTATION: any edit of the
+// call's root argument or body -> the exact text below is no longer the whole function.
+TEST_CASE("browser_policy plugin: run_linux is exactly run_linux_at(ctx, \"/\")",
+          "[browser_policy][status]") {
+    const auto source = read_repo_file(fs::path{"agents"} / "plugins" / "browser_policy" / "src" /
+                                       "browser_policy_linux.cpp");
+    const std::string needle = "int run_linux(yuzu::CommandContext& ctx) {\n"
+                               "    return run_linux_at(ctx, \"/\");\n"
+                               "}";
+    CHECK(source.find(needle) != std::string::npos);
+    // ...and it is the only definition of run_linux.
+    CHECK(source.find("run_linux(", source.find("run_linux(") + 1) == std::string::npos);
 }
