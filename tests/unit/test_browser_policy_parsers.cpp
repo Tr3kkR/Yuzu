@@ -491,6 +491,20 @@ TEST_CASE("browser_policy: a field longer than the cap is cut on a character bou
     CHECK(split_fields(pipes)[8] == "truncated");
     CHECK(pipes.size() < 2 * kMaxFieldBytes + 1024);
 
+    // The case that actually distinguishes "cut before escaping" from "cut after": a value
+    // ending in two pipes, one byte over the cap. Cut-then-escape keeps ONE clean pipe (escaped
+    // to `\|`, decodes back whole). MUTATION: escape-then-cut instead -> the field is first
+    // turned into `...a\|\|` (each pipe becomes two bytes) and THEN cut to the byte cap, which
+    // lands mid-escape and leaves the field ending in a lone `\` -- that backslash then escapes
+    // the FOLLOWING field separator instead of a character inside the value, merging two fields
+    // into one and dropping the row to 8 fields.
+    const auto boundary = fields_of(std::string(kMaxFieldBytes - 1, 'a') + "||");
+    const auto boundary_fields = split_fields(boundary);
+    REQUIRE(boundary_fields.size() == 9);
+    CHECK(boundary_fields[6] == std::string(kMaxFieldBytes - 1, 'a') + "|");
+    CHECK(boundary_fields[8] == "truncated");
+    CHECK(survives_transport(boundary));
+
     // Every free-text field is capped, and the flags combine in a fixed order.
     r.name = std::string(kMaxFieldBytes + 5, 'n') + '\xFF';
     r.value = PolicyValue{PolicyType::String, std::string("v\0", 2), {}};
@@ -621,7 +635,11 @@ TEST_CASE("browser_policy: the container scan never counts less nesting than nlo
     // parser's own peak depth on a fixed pseudo-random corpus: bracket-heavy random bytes and
     // random token sequences that include every comment form, escapes and NUL. A vcpkg bump of
     // nlohmann that changes a lexer rule fails here. MUTATION: any of the scan's rules changed
-    // so it counts less (LF-only comment end, no NUL end, no backslash skip, no comments).
+    // so it counts less. The deterministic cases above already pin the two mutations that
+    // actually produce an undercount here (LF-only comment end, no NUL end, last-opener instead
+    // of deepest); this corpus is the general-input backstop for those and any other rule drift
+    // (dropping the backslash skip or the comment handling entirely makes the scan OVERcount,
+    // which is the safe direction and is not what this case exists to catch).
     std::uint64_t state = 0x9E3779B97F4A7C15ull;
     const auto next = [&state]() {
         state = state * 6364136223846793005ull + 1442695040888963407ull;

@@ -107,11 +107,14 @@ inline constexpr std::size_t kMaxPolicyRows = 8192;
 /// the per-file cap), so this is the one that bounds the run's parser input.
 /// The file that crosses it has been read (at most one extra file cap) but is
 /// not parsed. It is an INPUT bound, not a memory bound: one file's parsed
-/// document costs tens of times its text (measured: 16 files, each a 1 MiB array
-/// of empty strings, peak about 46 MiB resident; a 1 MiB array of `{}` would
-/// cost more, which is what kMaxJsonContainers prevents), and the retained row
-/// text is at most about twice the parsed input, because every field is capped
-/// (kMaxFieldBytes) and pipe escaping at most doubles what is left.
+/// document costs several times its text, and the appended, unescaped row text
+/// costs several times that again (a float array dumps `1e14` as
+/// `100000000000000.0`; `format_policy_row`'s `+=` chain does not reserve).
+/// Measured worst case at this input cap: on the order of one hundred MiB
+/// resident, well short of unbounded, but MUCH more than kMaxFieldBytes'
+/// per-row cap alone would suggest -- the per-run input bound is what actually
+/// keeps this finite. kMaxJsonContainers keeps a `{}`-heavy file, the single
+/// most expensive shape, from costing still more per input byte.
 inline constexpr std::size_t kMaxPolicyTotalBytes = 16 * 1024 * 1024;
 /// Containers (`[` or `{`) one policy file may hold. A parsed container costs
 /// roughly thirty times the three bytes of `{}` that describe it, so the file
@@ -120,8 +123,9 @@ inline constexpr std::size_t kMaxPolicyTotalBytes = 16 * 1024 * 1024;
 /// file is `json_too_complex`.
 inline constexpr std::size_t kMaxJsonContainers = 65536;
 /// Bytes of any one free-text field (name, value, source, detail) before it is
-/// cut and flagged `truncated`; with escaping a row is at most nine times twice
-/// this, far below the server's 2 MiB per-chunk ingest cap.
+/// cut and flagged `truncated`; five such fields, each expanded at most three-
+/// fold by escaping (an all-NUL field, U+FFFD per byte), still land a whole row
+/// far below the server's 2 MiB per-chunk ingest cap.
 inline constexpr std::size_t kMaxFieldBytes = 64 * 1024;
 /// Directory entries examined per directory (walk_dir_capped cap).
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;

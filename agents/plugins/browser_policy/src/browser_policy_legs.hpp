@@ -17,13 +17,16 @@
  *
  * WHEN A LEG LANDS (Windows registry, macOS plist): replace its `mark_result_planned`
  * body with a real read that reports through `mark_result_read` BEFORE writing rows, then
- * touch every place that still describes the leg as planned: the descriptor legs in
- * browser_policy_plugin.cpp (support level, mechanism, notes; the leg-hash changes, so
- * run `plugin_doc_gen.py --stamp` for both samples), the yaml `platforms` of the columns
- * the leg fills and the `scope`/`source` wording, the README (Privileges, Result status,
- * Sample, Caveats 3), the planned blocks in test_browser_policy_local_dispatcher.cpp, the
+ * grep the tree for "planned" and "follows as its own PR" and update every hit -- known
+ * sites at the time this was written: the descriptor legs in browser_policy_plugin.cpp
+ * (support level, mechanism, notes; the leg-hash changes, so run `plugin_doc_gen.py
+ * --stamp` for both samples), the yaml header comment, `platforms` and the `scope`/`source`
+ * column wording, the README (How it works, the mermaid diagram, Privileges, Result
+ * status, Sensitivity, Sample, Caveats 3), the planned blocks in
+ * test_browser_policy_local_dispatcher.cpp, docs/agent-privilege-model.md's row, the
  * capability matrix row and counts, the capability-map cell, the catalogue header comment,
- * the agent_registry description, and the changelog fragment.
+ * the agent_registry description, and the changelog fragment. The grep is the actual
+ * completeness check; this list is a starting point, not a closed set.
  */
 #pragma once
 
