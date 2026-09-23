@@ -9597,8 +9597,17 @@ TEST_CASE("File mechanism (Windows, direct): a join storm on one directory while
         REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
     }
     REQUIRE(mech->set_established_sink(log.sink()));
-    mech->start([](const std::string&, SparkData) {},
-               [](const std::string&, bool, std::string_view) {});
+    // Capture `st` here (unused otherwise) so the MECHANISM OBJECT ITSELF anchors it for as
+    // long as the mechanism exists — including if `leak_if_wedged` below releases it without
+    // calling stop() first. Unlike CH-8's `stopper` thread (which stays blocked inside stop()
+    // for exactly as long as a genuine wedge persists, keeping its own [st, mp] capture alive
+    // the whole time), `joiner` below runs a BOUNDED loop (each watch_incarnation call has its
+    // own 5s caller_wait_budget) and returns — dropping its `st` copy — even if the leaked
+    // mechanism's internal worker is still genuinely wedged forever afterward. Anchoring `st`
+    // in the mechanism's own stored callbacks ties its lifetime to the one object that could
+    // still dispatch into it, regardless of which test thread finishes first.
+    mech->start([st](const std::string&, SparkData) {},
+               [st](const std::string&, bool, std::string_view) {});
 
     const auto spec1 = file_spec(scratch.file.string());
     const std::string key1 = spark_key(spec1);
