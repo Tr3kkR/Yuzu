@@ -1039,8 +1039,11 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
-     "dispatches a real command to the fleet; poll instead.",
+     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Exception: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
+     "degraded before anything was sent) says so explicitly and carries a positive "
+     "retry_after_ms - that one IS safe to retry.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1057,7 +1060,10 @@ static const ToolDef kTools[] = {
      "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
-     "error — it dispatches a real command to the fleet; poll instead.",
+     "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Exception: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
+     "degraded before anything was sent) says so explicitly and carries a positive "
+     "retry_after_ms - that one IS safe to retry.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1079,7 +1085,11 @@ static const ToolDef kTools[] = {
      "to every visible device (#4306) — create a new set from the intended parent instead. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
-     "NEVER re-send this call on a timeout or error.",
+     "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
+     "re-dispatches a real command to the fleet. Exception: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "says so explicitly and carries a positive retry_after_ms - that one IS safe to "
+     "retry.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
