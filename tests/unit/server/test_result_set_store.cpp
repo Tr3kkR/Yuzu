@@ -226,8 +226,19 @@ TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_
 }
 
 TEST_CASE("ResultSetStore: lineage_checked matches the plain wrapper on the healthy path, "
-          "and fails closed (DbError) on a mid-walk query failure rather than returning the "
-          "partial chain the pre-#4306 plain lineage() used to (#4306 finding 3)",
+          "and fails closed (DbError) on a FIRST-hop query failure rather than returning the "
+          "partial chain the pre-#4306 plain lineage() used to (#4306 finding 3) -- gov-4306-S2: "
+          "renamed from a prior title that claimed 'mid-walk' coverage; a table-wide lock (the "
+          "fault-injection technique below) necessarily faults every hop including the first, "
+          "so old and new lineage_checked() code behave IDENTICALLY here (both return empty on "
+          "a first-hop failure) and this test cannot by itself distinguish them. The actual "
+          "shipped semantic shift -- a failure AFTER >=1 successful hop now discards the whole "
+          "accumulated chain instead of returning it partial -- has no test coverage; a genuine "
+          "2nd-hop fault would need a per-row injection (e.g. Postgres row-level security), "
+          "which was attempted and dropped: the shared test DSN's role is a superuser with "
+          "rolbypassrls=true, so RLS policies are unconditionally bypassed on every connection "
+          "these tests can construct from it, and provisioning a dedicated non-superuser role "
+          "with its own credentials/pool is materially more than a contained fix-round diff",
           "[pg][result_set][lineage][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -271,12 +282,15 @@ TEST_CASE("ResultSetStore: lineage_checked matches the plain wrapper on the heal
     REQUIRE_FALSE(degraded.has_value());
     CHECK(degraded.error() == ResultSetError::DbError);
 
-    // The plain wrapper's fallback shape is unchanged in KIND (empty), but
-    // this is the documented semantic shift (#4306): the pre-existing plain
+    // The plain wrapper's fallback shape is unchanged in KIND (empty) at
+    // THIS (first-hop) fault point specifically, since a first hop always
+    // accumulates zero prior nodes either way. The documented semantic shift
+    // (#4306) this general contract describes -- the pre-existing plain
     // lineage() returned whatever partial chain it had accumulated before a
-    // mid-walk failure, whereas the wrapper built on lineage_checked returns
-    // EMPTY instead — more honest (no silent partial breadcrumb), a real
-    // behavior change for any caller still on the plain wrapper.
+    // mid-walk (2nd+ hop) failure, whereas the wrapper built on
+    // lineage_checked discards it and returns EMPTY instead -- is real and
+    // shipped but not distinguishable from old behavior by this particular
+    // fault injection; see the TEST_CASE name for why.
     auto plain = degraded_store.lineage(leaf->id, "alice");
     CHECK(plain.empty());
 
