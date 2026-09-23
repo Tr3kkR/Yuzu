@@ -428,9 +428,12 @@ yuzu_server_core_lib = static_library(
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
+    'src/approval_model.cpp',
     'src/schedule_engine.cpp',
     'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',
+    'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
+    'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
@@ -477,6 +480,7 @@ yuzu_server_core_lib = static_library(
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
     'src/guardian_model.cpp',
+    'src/guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
@@ -570,6 +574,7 @@ yuzu_server_core_lib = static_library(
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',

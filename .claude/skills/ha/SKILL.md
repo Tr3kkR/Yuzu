@@ -128,7 +128,7 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
-**Verified 2026-09-20 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
+**Verified 2026-09-21 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
 4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
 stream-generation fence (PR #4492, merge commit `c37306113`, 2026-09-17T22:05:58Z,
@@ -146,8 +146,30 @@ review rejected the originally-proposed design and surfaced that
 `ProxyRegister` was unconditionally wiping placement on every replay-adopted
 registration (a live, single-replica bug, not just a multi-replica gap) — see
 the blockquote below and ADR-2002 §7c for the full mechanism.
-Next gate items: the rest of WS-4 (4.3 cross-cluster fan-out), WS-5, WS-6,
-WS-8-readyz.**
+**WS-4 rest of 4.3 DONE** (2026-09-21, ADR-2002 §7d): cross-cluster gateway
+fan-out — `AgentSession`/`GatewayPendingCmd` now carry `cluster_id` end-to-end
+from the common `send_to`/`send_to_all` path (not just the 4.2b directory
+fallback), a new eager `GatewayMgmtStubPool` dials the OWNING cluster per
+command instead of the single legacy stub, `--gateway-cluster-addr` config,
+a response-agent forgery guard (closes ONE forgery shape — a cluster answering
+as a different agent — NOT a rogue gateway claiming an agent's own identity via
+`ProxyRegister`, which needs no per-agent secret; **multi-cluster mode does NOT
+yet provide trust-zone isolation between clusters for a given agent, tracked
+as `#4669`, pr-rev-caught pre-merge**), and one small required Erlang fix
+(`stream_responses/3` threads the real `command_id` so a gateway-side
+"not connected on this cluster" error is no longer invisible). **Closes WS-4's
+dial-selection half** — the durable re-drive-on-failure half of §7's design
+remains open (`#4672`), and `#4669` above is a separate, not-yet-closed item
+(non-blocking today: zero production multi-cluster deployments). The
+remaining safe-to-scale gate items are WS-5, WS-6, WS-8-readyz. See the
+blockquote below and ADR-2002 §7d for the full mechanism, including the 5
+findings a pre-implementation Fable review caught before any code was written
+(the original resolution rule would have broken every upgrade), and the
+pr-rev (FortitudeEtc/Codex+Kimi) round that caught the response-forgery
+overclaim plus two real code bugs (terminal-outcome double-counting; an
+oversized `cluster_id` silently routing to the default cluster instead of
+being rejected) before merge.
+Next gate items: WS-5, WS-6, WS-8-readyz. Also open: `#4669`, `#4672`.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -379,19 +401,30 @@ constraint. Delivery phases (dependency-ordered):
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
-**Suggested next slices** (as of 2026-09-20 — `docs/ha-delivery-matrix.md` row
+**Suggested next slices** (as of 2026-09-21 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
-- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
-  (3.1–3.4, #4011/#4134/#4169/#4194), WS-4 4.1+4.2a+4.2b+`#4324`+`#4555`
-  (gateway multi-node cluster formation, `495cf24c4`)+4.3a (intra-cluster
-  `pg`-group agent→node lookup, no longer inert)+4.4 (`gateway_node`
-  convergence + `#4246` #6 writeback, ADR-2002 §7c), WS-7 (#3627),
-  WS-10 10.1/10.2. The storage axis is complete.
-- The **highest-leverage next** is the **rest of WS-4** — cross-cluster
-  gateway fan-out (today one `gw_mgmt_stub_`) — it also unblocks the
-  cross-replica session lookup that WS-5 needs. Then the remaining gate set:
-  **WS-5** (presence), **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free
-  cross-replica reconnect (durable outbox replay) is the open 2a-2 follow-up.
+- **Done (dial-selection, the safe-to-scale gate's WS-4 item):** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a
+  (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4's
+  dial-selection half** (4.1+4.2a+4.2b+`#4324`+`#4555` (gateway multi-node
+  cluster formation, `495cf24c4`)+4.3a (intra-cluster `pg`-group agent→node
+  lookup)+4.4 (`gateway_node` convergence + `#4246` #6 writeback, ADR-2002
+  §7c)+rest-of-4.3 (cross-cluster gateway fan-out, ADR-2002 §7d)), WS-7
+  (#3627), WS-10 10.1/10.2. The storage axis is complete. **WS-4 is NOT
+  entirely done** — two named items remain open and are tracked, not
+  disclosed-only: `#4669` (multi-cluster mode has no agent↔cluster
+  affinity/peer-identity binding, so it does not yet provide trust-zone
+  isolation — caught by pr-rev, FortitudeEtc/Codex+Kimi, pre-merge on the
+  rest-of-4.3 PR) and `#4672` (§7's durable outbox re-drive was never wired
+  into `forward_gateway_pending`'s terminal-failure branches). Neither blocks
+  the safe-to-scale gate today (multi-cluster mode has zero production
+  deployments; the re-drive gap is inherited from before 4.3, not introduced
+  by it), but do not read "WS-4 done" as "WS-4's every design goal closed."
+- The **highest-leverage next** is now the remaining gate set directly:
+  **WS-5** (presence — durable cross-replica session lookup; NOT unblocked by
+  4.3's own work, contra an earlier version of this note — 4.3 built the
+  per-cluster DIAL mechanism, not the durable cross-replica READ WS-5 needs),
+  **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free cross-replica reconnect
+  (durable outbox replay) is the open 2a-2 follow-up.
 
 **Shared with ADR-1005 (do not duplicate):** engine-tier HA (incl. NVD/CVE
 sync, withdrawn from WS-1), the MCP Decision-15 pre-commitments WS-2 inherits,

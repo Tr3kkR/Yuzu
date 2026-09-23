@@ -14,6 +14,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `agent_actions` | ✅ ✅ ✅ | Agent runtime actions — set log level, query agent info | [README](../../agents/plugins/agent_actions/README.md) |
 | `agent_logging` | ✅ ✅ ✅ | Remote agent log access — retrieve log tail, list key agent files | [README](../../agents/plugins/agent_logging/README.md) |
 | `antivirus` | ✅ ✅ ✅ | Antivirus product detection, status, and Defender exclusions | [README](../../agents/plugins/antivirus/README.md) |
+| `app_control` | ✅ ⛔ ⛔ | Read-only WDAC and AppLocker application-control policy posture as configured (Windows-only) | [README](../../agents/plugins/app_control/README.md) |
 | `app_usage` | ✅ 🟡 ✅ | Read-only machine-scope app usage inventory derived from TAR's usage fold (no pid, command line, or user names in output) | [README](../../agents/plugins/app_usage/README.md) |
 | `asset_tags` | ✅ ✅ ✅ | Structured asset tag awareness — syncs server-assigned tags locally and detects changes | [README](../../agents/plugins/asset_tags/README.md) |
 | `autoruns` | ✅ ✅ ✅ | Enumerates persistence sources (what starts automatically) across Windows, Linux and macOS | [README](../../agents/plugins/autoruns/README.md) |
@@ -47,7 +48,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
 | `peripherals` | ✅ ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
-| `printing` | ✅ ✅ ✅ | Printer and print-job inventory | [README](../../agents/plugins/printing/README.md) |
+| `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
 | `quarantine` | ✅ ✅ ✅ | Device network isolation (quarantine) with per-IP whitelisting | [README](../../agents/plugins/quarantine/README.md) |
