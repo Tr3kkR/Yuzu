@@ -455,17 +455,17 @@ campaign's inline-route-extraction goal is complete.
 
 **Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** As of the
 flip (#1320 PR 3) the server **constructs a shared PostgreSQL pool at startup and fails closed
-without it** — the substrate is live, not aspirational, and the rows above marked "per-store PG
-migration pending" still open their own SQLite files only because each store migrates
-incrementally behind its own ADR. The SQLite-everywhere principle has been **retired for the
-server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
+without it** — the substrate is live, not aspirational, and the per-store migration ladder has since
+closed: every server store in the table above is on the shared pool, with `NvdDatabase` the
+single remaining SQLite exception (a recorded deferral, `docs/postgres-migration-ladder.md`).
+The SQLite-everywhere principle has been **retired for the server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
 joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
 scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
 is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the federated edge
 warehouse (ADR-0003) and `agent.db` KV/identity — because endpoint locality is exactly what
 makes SQLite right there.
 
-New server stores default to Postgres; the existing server SQLite stores migrate
+New server stores default to Postgres. The existing server stores were migrated
 incrementally, each behind its own per-store ADR + migration plan (`SqliteTxn`/`SqliteStmt`
 → a pg transaction owner; `MigrationRunner` → a pg schema-migration mechanism). This is a
 **breaking deployment change** — the server gains an external database dependency (compose,
