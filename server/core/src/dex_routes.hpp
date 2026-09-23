@@ -331,7 +331,7 @@ public:
     /// be empty → the scope selector is omitted (whole-fleet only).
     using GroupListFn = std::function<std::vector<DexGroupOption>()>;
 
-    /// GAP-1 (#4626): the app-perf trend page's device-MODEL scope selector
+    /// GAP-1 (#4857): the app-perf trend page's device-MODEL scope selector
     /// values (`GET /fragments/dex/perf/app`'s `model_values`) — resolves the
     /// distinct values of the conventional cohort tag key (`kDexDefaultCohortKey`,
     /// "model"), server.cpp wiring the SAME `TagStore::get_distinct_values`

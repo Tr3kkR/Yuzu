@@ -3232,7 +3232,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             versions = app_perf_version_summaries(*trend);
         }
-        // GAP-1 (#4626): model-selector values — a narrow, disclosed
+        // GAP-1 (#4857): model-selector values — a narrow, disclosed
         // presentation-side data dependency OUTSIDE the DexPerfApi seam (see
         // TagValuesFn's own doc comment). Best-effort: an unwired/degraded
         // tag_values_fn_ just hides the selector (empty vector), same

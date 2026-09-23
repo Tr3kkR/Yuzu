@@ -16352,7 +16352,7 @@ private:
         // device/group/tag_cohort/version_devices) internally, and is the SOLE
         // consumer every surface (REST, MCP, dashboard) reads.
         //
-        // GAP-1 (#4626): `.tag_values` has NO home in `DexPerfApi` (no public
+        // GAP-1 (#4857): `.tag_values` has NO home in `DexPerfApi` (no public
         // fleet-wide "distinct tag values" resource exists yet — see
         // `DexRoutes::TagValuesFn`'s own doc comment) — kept here, standalone,
         // as a disclosed presentation-side data dependency outside the seam.
@@ -16510,7 +16510,7 @@ private:
             // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
             // surfaces resolve visibility identically.
             fleet_read_fn,
-            // GAP-1 (#4626): the device-model scope selector's distinct-tag-
+            // GAP-1 (#4857): the device-model scope selector's distinct-tag-
             // values reader (see TagValuesFn's own doc comment).
             dex_tag_values_fn);
 

@@ -181,8 +181,8 @@ public:
     /// `ManagementGroupStore::get_members` returns an empty vector rather than
     /// a distinguishable error on a store degrade, so `LocalDexPerfApi` cannot
     /// tell "genuinely zero members" from "the read failed" and renders the
-    /// former (an empty trend, "no member reported…") in both cases — follow-up
-    /// issue to be filed. `tag_trend` below does NOT share this gap: `TagStore`
+    /// former (an empty trend, "no member reported…") in both cases — tracked as
+    /// #1762. `tag_trend` below does NOT share this gap: `TagStore`
     /// returns `std::optional` and a degraded tag read fails closed to
     /// `nullopt`.
     [[nodiscard]] virtual std::optional<std::vector<AppPerfTrendPoint>>
