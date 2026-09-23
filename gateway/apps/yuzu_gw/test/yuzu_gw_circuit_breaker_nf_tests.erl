@@ -95,10 +95,17 @@ trip_circuit() ->
 %% sleeps in BOTH directions: "half_open by now" (an upper bound; run
 %% 35879401664) and "still open at N ms" (a lower bound; run 35894938773).
 %% So these tests do not time the backoff at all. They:
-%%   - read the backoff AMOUNT from the breaker's own state (next_backoff/0).
+%%   - read the backoff AMOUNT from the breaker's own state (check_backoff/2).
 %%     trip_circuit/1 schedules send_after(CurTimeout) and stores
 %%     min(2 * CurTimeout, MaxTimeout) as the next one, which is exactly the
 %%     doubling-and-cap behaviour under test, and it is deterministic;
+%%   - check the timer was scheduled with (at most) the expected delay:
+%%     erlang:read_timer/1 on the breaker's timer must be `false` (already
+%%     fired) or =< the expected ms. A late test process can only LOWER the
+%%     remaining time, so this upper bound cannot flake. It rejects scheduling
+%%     the next value (or an uncapped 800ms), but NOT a too-SHORT delay (e.g.
+%%     always the base 100ms). Proving that would need a lower bound, which is
+%%     the wall-clock race this rewrite removes. That residual gap is accepted;
 %%   - prove the timer actually drives open -> half_open by polling for it with
 %%     a generous deadline (await_state/1). That wait checks "it happens", not
 %%     how long it took.
@@ -115,17 +122,29 @@ poll_state(Want, Deadline) ->
             end
     end.
 
-%% The backoff the NEXT trip will schedule: #state.cb_cur_timeout. The record is
-%% private to yuzu_gw_upstream, so read it by position, and fail loudly (rather
-%% than read the wrong field) if the record ever changes shape.
-next_backoff() ->
+%% Right after a trip: the breaker scheduled `ScheduledMs` and stores `NextMs`
+%% as the backoff the NEXT trip will use (#state.cb_cur_timeout). The record is
+%% private to yuzu_gw_upstream, so it is read by position. The size, the tag,
+%% and the base/max fields pinned to setup/0's 100/500 make a record change fail
+%% loudly as "record changed" rather than as an apparent backoff bug.
+check_backoff(ScheduledMs, NextMs) ->
     S = sys:get_state(yuzu_gw_upstream),
     %% #state{} = {state, notify_pids, cb_state, cb_failures, cb_threshold,
     %%   cb_base_timeout, cb_max_timeout, cb_cur_timeout, cb_timer,
     %%   replay_spacing, replay_queue, guardian_pids, cluster_id}
-    ?assertMatch({13, state}, {tuple_size(S), element(1, S)}),
+    ?assertMatch({13, state, 100, 500},
+                 {tuple_size(S), element(1, S), element(6, S), element(7, S)}),
     ?assert(lists:member(element(3, S), [closed, open, half_open])),
-    element(8, S).
+    ?assertEqual(NextMs, element(8, S)),
+    case element(9, S) of
+        TRef when is_reference(TRef) ->
+            case erlang:read_timer(TRef) of
+                false -> ok;   % already fired
+                Remaining -> ?assert(Remaining =< ScheduledMs)
+            end;
+        undefined ->
+            ok                 % already fired and handled (half_open)
+    end.
 
 %%%===================================================================
 %%% Tests
@@ -134,20 +153,20 @@ next_backoff() ->
 backoff_doubles() ->
     %% Cycle 1: trip. It schedules the 100ms base and stores 200ms as the next.
     trip_circuit(),
-    ?assertEqual(200, next_backoff()),
+    check_backoff(100, 200),
     ?assertEqual(half_open, await_state(half_open)),
 
     %% Probe fails -> reopens with 200ms, next doubles to 400ms.
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-    ?assertEqual(400, next_backoff()),
+    check_backoff(200, 400),
     ?assertEqual(half_open, await_state(half_open)),
 
     %% Probe fails again -> reopens with 400ms; the next doubling (800ms) is
     %% capped at max_reset_timeout (500ms in setup/0).
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-    ?assertEqual(500, next_backoff()),
+    check_backoff(400, 500),
     ?assertEqual(half_open, await_state(half_open)).
 
 backoff_capped() ->
@@ -156,23 +175,23 @@ backoff_capped() ->
 
     %% Cycle 1: trip (schedules 100ms).
     trip_circuit(),
-    ?assertEqual(200, next_backoff()),
+    check_backoff(100, 200),
     ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 2: reopened with 200ms.
-    ?assertEqual(400, next_backoff()),
+    check_backoff(200, 400),
     ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 3: reopened with 400ms; the next is capped at 500, not 800.
-    ?assertEqual(500, next_backoff()),
+    check_backoff(400, 500),
     ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 4: reopened with the capped 500ms; the next stays 500.
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-    ?assertEqual(500, next_backoff()),
+    check_backoff(500, 500),
     ?assertEqual(half_open, await_state(half_open)).
 
 concurrent_rejection() ->
