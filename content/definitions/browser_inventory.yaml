@@ -176,9 +176,9 @@ spec:
           row: the profile directory name (the Local State info_cache
           key), e.g. "Default", "Profile 1" — redacted whole to
           "[redacted-email]" when the raw value contains an e-mail-shaped
-          substring (bare, decorated or several addresses, not only a
-          bare address — some Chromium builds key a signed-in profile by
-          its account e-mail).
+          substring — bare, decorated or several addresses (some
+          Chromium builds key a signed-in profile by its account
+          e-mail).
         example: "Default"
       - name: field_4
         type: string

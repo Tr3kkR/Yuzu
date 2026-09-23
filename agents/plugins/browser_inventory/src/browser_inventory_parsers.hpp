@@ -85,8 +85,8 @@ struct BrowserProfileRow {
     bool ephemeral{false};    // info_cache[dir].is_ephemeral, default false
 };
 
-/// Substituted for `profile_dir`/`display_name` when the raw value has the
-/// shape of an e-mail address (see `looks_like_email_address` below).
+/// Substituted for `profile_dir`/`display_name` when the raw value
+/// contains an e-mail address (see `looks_like_email_address` below).
 /// Irreversible by construction -- unlike the accepted personal-name
 /// residual risk on `display_name`, an e-mail address is a
 /// browsing-account identifier and the PRIVACY CONTRACT above forbids it
@@ -95,57 +95,46 @@ inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]"
 
 /// True when `value` CONTAINS an e-mail-shaped substring anywhere -- bare
 /// (`account@example.com`), decorated (`Alice <alice@example.com>`,
-/// `alice@example.com (Work)`), embedded (`x alice@example.com`) or
-/// several (`a@x.org,b@y.org`); coarse by design, over-match is the safe
-/// direction; round-2 adversarial finding 2026-09-23: the earlier
-/// whole-value test under-matched every decorated form. For every '@' in
-/// `value`, it requires a non-empty local-part character immediately
-/// before it and a dotted domain (label '.' label, non-empty either side)
-/// immediately after it; any hit redacts the whole field.
+/// `alice@example.com (Work)`), embedded (`x alice@example.com`),
+/// several (`a@x.org,b@y.org`), quoted (`"alice.smith"@example.com`),
+/// RFC 5322 comment-syntax (`alice(comment)@example.com`), or separated
+/// from the domain by folding whitespace/control characters
+/// (`alice\n@example.com`); coarse by design, over-match is the safe
+/// direction. Round-2 governance finding G-1 (2026-09-23): the earlier
+/// local-part exclusion list rejected exactly the whitespace/quote/
+/// comment characters a decorated or folded address puts immediately
+/// before '@', which is backwards for a filter whose stated principle is
+/// over-match-is-safe -- the ONLY local-side condition is now that '@' is
+/// not at position 0. The domain side still has to look email-shaped: a
+/// dotted label immediately after '@' (label '.' label, non-empty either
+/// side; domain bytes are ASCII alnum/-/._ or any byte >= 0x80, so a raw
+/// non-punycode IDN domain still matches), or a non-empty bracketed
+/// domain literal (`@[203.0.113.5]`); any hit redacts the whole field.
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
-    auto is_local_part_char = [](char c) {
-        switch (c) {
-        case ' ':
-        case '\t':
-        case '\n':
-        case '\r':
-        case '\f':
-        case '\v':
-        case '@':
-        case '<':
-        case '>':
-        case '(':
-        case ')':
-        case ',':
-        case ';':
-        case ':':
-        case '"':
-        case '[':
-        case ']':
-            return false;
-        default:
-            return true;
-        }
-    };
     auto is_domain_char = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-               c == '-' || c == '.' || c == '_';
+               c == '-' || c == '.' || c == '_' || static_cast<unsigned char>(c) >= 0x80;
     };
 
     for (auto at = value.find('@'); at != std::string_view::npos; at = value.find('@', at + 1)) {
-        if (at == 0 || !is_local_part_char(value[at - 1])) {
+        if (at == 0) {
             continue;
         }
-        std::size_t end = at + 1;
+        const std::size_t domain_start = at + 1;
+        if (domain_start < value.size() && value[domain_start] == '[') {
+            const auto close = value.find(']', domain_start + 1);
+            if (close != std::string_view::npos && close > domain_start + 1) {
+                return true;
+            }
+            continue;
+        }
+        std::size_t end = domain_start;
         while (end < value.size() && is_domain_char(value[end])) {
             ++end;
         }
-        const auto domain = value.substr(at + 1, end - at - 1);
-        for (std::size_t p = 0; p < domain.size(); ++p) {
-            if (domain[p] != '.') {
-                continue;
-            }
-            if (p > 0 && p < domain.size() - 1 && domain[p - 1] != '.' && domain[p + 1] != '.') {
+        const auto domain = value.substr(domain_start, end - domain_start);
+        for (std::size_t p = 1; p + 1 < domain.size(); ++p) {
+            if (domain[p] == '.' && domain[p - 1] != '.' && domain[p + 1] != '.') {
                 return true;
             }
         }

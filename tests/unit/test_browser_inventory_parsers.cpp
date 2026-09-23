@@ -199,7 +199,11 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     CHECK_FALSE(looks_like_email_address("account@"));      // nothing after '@'
     CHECK_FALSE(looks_like_email_address("account@example")); // no '.' in domain
     CHECK(looks_like_email_address("a@b@c.com"));     // contains b@c.com -- over-match is safe
-    CHECK_FALSE(looks_like_email_address("contact @ x.com")); // whitespace before '@'
+    // Domain-side failure, not local-side: local-side is position-only
+    // (at > 0) since the G-1 fix, so this stays false because the space
+    // right after '@' leaves an empty domain, not because of the space
+    // before it.
+    CHECK_FALSE(looks_like_email_address("contact @ x.com"));
 
     // Round-2 adversarial finding (2026-09-23): the whole-value test under-
     // matched every decorated form -- these are the reviewer's four
@@ -217,6 +221,42 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     CHECK_FALSE(looks_like_email_address("user@localhost"));
     CHECK_FALSE(looks_like_email_address("a@.com"));  // empty domain label before the dot
     CHECK_FALSE(looks_like_email_address("a@b."));    // trailing dot alone doesn't qualify
+
+    // Round-2 governance finding G-1 (2026-09-23): the local-part exclusion
+    // list rejected exactly the characters a folding-whitespace or
+    // decorated address puts immediately before '@' -- deleting that list
+    // (local-side condition is now `at > 0` only) closes the bypass.
+    CHECK(looks_like_email_address("alice\n@example.com"));
+    CHECK(looks_like_email_address("alice\r@example.com"));
+    CHECK(looks_like_email_address("alice\t@example.com"));
+    CHECK(looks_like_email_address("alice @example.com"));
+    // G-2: RFC 5322 quoted local-part.
+    CHECK(looks_like_email_address("\"alice.smith\"@example.com"));
+    // G-3: RFC 5322 comment syntax.
+    CHECK(looks_like_email_address("alice(comment)@example.com"));
+
+    // S-1: a `continue`->`break` mutation on the multi-'@' skip branch would
+    // make each of these false by stopping at the first (invalid) '@'
+    // instead of moving on to the valid one later in the string.
+    CHECK(looks_like_email_address("@alice@example.com"));       // local-side skip, then valid
+    CHECK(looks_like_email_address("alice@[ bob@example.com"));  // unterminated "@[", then valid
+    CHECK(looks_like_email_address("x@; alice@example.com"));    // domain-side skip, then valid
+
+    // S-3: domain-literal address -- is_domain_char excludes '[', so this
+    // needs its own branch alongside the dotted-domain scan.
+    CHECK(looks_like_email_address("alice@[203.0.113.5]"));
+    CHECK_FALSE(looks_like_email_address("alice@[]")); // empty domain literal
+
+    // N-1: raw (non-punycode) Unicode/IDN domain -- a byte >= 0x80 is a
+    // valid domain character so the scan doesn't truncate at "m". Escaped
+    // bytes, not a raw UTF-8 source literal (MSVC leg).
+    CHECK(looks_like_email_address("alice@m\xC3\xBCnchen.example"));
+
+    // N-2: untested edge, safe direction -- dropping the local-part
+    // exclusion list makes '@' itself a valid (if unusual) local-part
+    // predecessor, so a literal "@@" now over-matches rather than
+    // under-matching.
+    CHECK(looks_like_email_address("a@@b.com"));
 }
 
 TEST_CASE("profiles_from_local_state: SYNTHETIC (Chrome) — two profiles, second is ephemeral "

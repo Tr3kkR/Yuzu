@@ -548,6 +548,40 @@ TEST_CASE("browser_inventory linux: a decorated / multi-address e-mail is redact
 #endif // !defined(_WIN32)
 }
 
+TEST_CASE("browser_inventory linux: a folding-whitespace / quoted-local-part e-mail is redacted "
+          "in the FULL wire row -- round-2 governance G-1",
+          "[browser_inventory][linux][privacy]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Round-2 governance finding G-1 (2026-09-23): a literal '\n' (a JSON
+    // \n escape here) immediately before '@' was rejected by the earlier
+    // local-part exclusion list, and safe_output_field folds CR/LF to a
+    // space -- an unredacted value would have reached the wire as
+    // "alice @example.com". The fix deletes that list (the only
+    // local-side condition is now `at > 0`), so this key is redacted
+    // BEFORE it ever reaches safe_output_field. Also carries a quoted
+    // local-part (G-2) in the display name.
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_wire_email3_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "google-chrome";
+    std::filesystem::create_directories(browser_dir);
+    {
+        std::ofstream f(browser_dir / "Local State", std::ios::binary);
+        f << R"json({"profile":{"info_cache":{"alice\n@example.com":{)json"
+             R"json("name":"\"alice.smith\"@example.com"}}}})json";
+    }
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front() == "profile|alice|chrome|[redacted-email]|[redacted-email]");
+    CHECK(rows.front().find('@') == std::string::npos);
+#endif // !defined(_WIN32)
+}
+
 TEST_CASE("browser_inventory linux: an absent root is supported with zero rows, not a failure",
           "[browser_inventory][linux][walk]") {
 #if defined(_WIN32)
