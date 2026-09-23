@@ -94,7 +94,15 @@ if app_ebin.exists():
     shutil.rmtree(app_ebin)
 
 cmd = rebar3_prefix() + ["as", "test", suite]
-if suite == "eunit":
+if suite == "ct":
+    # Every CT suite lives in apps/yuzu_gw/test/ct/. `rebar3 ct` with no
+    # `--dir` (or with `--dir apps/yuzu_gw/test`, which ct does NOT recurse)
+    # discovers ZERO suites, prints "All 0 tests passed." and exits 0 --
+    # the #4800 false green that hid #4707 and #4708 from every Meson/CI
+    # run. The zero-executed guard at the bottom of this file fails the run
+    # if a future path move ever recreates that.
+    cmd += ["--dir", "apps/yuzu_gw/test/ct"]
+elif suite == "eunit":
     cmd += ["--dir", "apps/yuzu_gw/test"]
 
     # Pre-create the eunit_surefire report dir (gateway/rebar.config
@@ -145,13 +153,21 @@ if suite == "ct":
 # ──────────────────────────────────────────────────────────────────────
 HEX_FAIL_PATTERN = "Failed to fetch and copy dep:"
 
-# Below meson's own 600s suite-level timeout (docs/erlang-gateway-build.md /
-# the gateway test() definitions) so a hang is diagnosed HERE — with a
-# process-tree dump and a targeted kill — rather than reported as
-# featureless "TIMEOUT 600s, zero output" by the outer harness. This gap
-# between the two timeouts is itself load-bearing: it is what makes the
-# marker+dump below reachable before meson's own kill fires.
-_RUN_DEADLINE_SECS = 540
+# PER SUITE, and each value must stay BELOW that suite's own meson
+# `timeout:` in the root meson.build `test('gateway eunit'|'gateway ct')`
+# definitions, so a hang is diagnosed HERE — with a process-tree dump and a
+# targeted kill — rather than reported as featureless "TIMEOUT, zero output"
+# by the outer harness. This gap between the two timeouts is itself
+# load-bearing: it is what makes the marker+dump below reachable before
+# meson's own kill fires. A single 540s value used to serve both suites
+# while `gateway ct` had a 300s meson timeout, so for ct meson always killed
+# first and the dump was unreachable (#4800). Change a meson timeout and
+# its value here together.
+_SUITE_DEADLINE_SECS = {
+    "eunit": 540,  # meson timeout 600
+    "ct": 540,     # meson timeout 600
+}
+_RUN_DEADLINE_SECS = _SUITE_DEADLINE_SECS[suite]
 
 
 class _ProcessDeadlineExceeded(Exception):
@@ -319,6 +335,73 @@ def run_with_retry(args, label, max_attempts=4):
 result = run_with_retry(cmd, suite, max_attempts=4)
 output = result.stdout or ""
 
+# ──────────────────────────────────────────────────────────────────────
+# Zero-executed guard (#4800)
+# ──────────────────────────────────────────────────────────────────────
+# rebar3 exits 0 when it discovers nothing to run, so a green exit code
+# alone proves nothing. A run is only a pass if its final summary line
+# reports at least one EXECUTED (passed + failed) test. Summary shapes:
+#   ct:    "All 52 tests passed."
+#          "Failed 6 tests. Skipped 2 (0, 2) tests. Passed 44 tests."
+#   eunit: "All 311 tests passed."
+#          "Failed: 2.  Skipped: 0.  Passed: 309."
+#          "There were no tests to run."
+# The LAST summary wins (rebar3 prints one per run; anything earlier is
+# test-emitted noise). No recognisable summary on an otherwise-green run
+# is ALSO a failure: we cannot confirm anything ran.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SUMMARY_RE = re.compile(
+    # ct and eunit, all green
+    r"All (?P<all>\d+) tests? passed\."
+    # eunit, exactly one test
+    r"|(?P<one>\bTest passed\.)"
+    # ct: each clause is printed only when its count is non-zero, except
+    # "Passed", which is always printed
+    r"|(?:Failed (?P<cf>\d+) tests?\. )?(?:Skipped \d+ \(\d+, \d+\) tests?\. )?"
+    r"Passed (?P<cp>\d+) tests?\."
+    # eunit, any failure/skip
+    r"|Failed: (?P<ef>\d+)\.\s+Skipped: \d+\.\s+Passed: (?P<ep>\d+)\."
+    r"|(?P<none>There were no tests to run)"
+)
+
+
+def _executed_count(text):
+    """Executed (passed + failed) count from the last summary, or None."""
+    last = None
+    for m in _SUMMARY_RE.finditer(_ANSI_RE.sub("", text)):
+        last = m
+    if last is None:
+        return None
+    g = last.group
+    if g("all") is not None:
+        return int(g("all"))
+    if g("one") is not None:
+        return 1
+    if g("none") is not None:
+        return 0
+    if g("cp") is not None:
+        return int(g("cf") or 0) + int(g("cp"))
+    return int(g("ef")) + int(g("ep"))
+
+
+def _require_tests_executed(text, label, returncode):
+    """Turn a green exit with zero executed tests into a failure."""
+    if returncode != 0:
+        return returncode
+    executed = _executed_count(text)
+    if executed is None:
+        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but printed no "
+              "recognisable test summary -- cannot confirm any test ran. "
+              "Failing (#4800).", file=sys.stderr)
+        return 1
+    if executed == 0:
+        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but executed ZERO "
+              "tests -- the suite directory or --dir is wrong. Failing so this "
+              "cannot pass as a false green (#4800).", file=sys.stderr)
+        return 1
+    print(f"\n[test_gateway.py] {label}: {executed} tests executed.")
+    return 0
+
 # OTP 25 has a known race where the CT I/O handler (test_server_io)
 # terminates before all suite completion messages are written, causing
 # rebar3 to exit with code 1 even though all tests passed.  Detect this
@@ -332,6 +415,6 @@ if result.returncode != 0 and suite == "ct":
         print("\n[test_gateway.py] OTP 25 CT I/O race detected — "
               "all tests passed but CT runner crashed on teardown. "
               "Treating as success.")
-        sys.exit(0)
+        sys.exit(_require_tests_executed(output, suite, 0))
 
-sys.exit(result.returncode)
+sys.exit(_require_tests_executed(output, suite, result.returncode))

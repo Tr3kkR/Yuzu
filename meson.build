@@ -659,11 +659,18 @@ if _rebar3.found()
     timeout: 600,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
+  # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
+  # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
+  # fires before meson's blind kill; the old 300s sat below the wrapper's
+  # then-shared 540s deadline, making the dump unreachable (#4800). Measured
+  # 2026-09-23 with the suites actually running (52 cases, cold _build_ct,
+  # self-hosted CI concurrently busy on the same host): 65s Windows, 44s
+  # Linux. Change this and the wrapper's value together.
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
-    timeout: 300,
+    timeout: 600,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
   )
   message('Erlang gateway: enabled (rebar3 found)')
