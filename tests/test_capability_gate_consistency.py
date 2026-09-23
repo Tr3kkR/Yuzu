@@ -97,6 +97,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -119,11 +120,12 @@ FRAGMENT_FILES = [
 # Wave 9 PR9.1b (follow-up): +1 printing.clear_queue.
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
+# Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (printing.clear_queue) + 2 (app_control) = 212.
-EXPECTED_TOTAL_ROWS = 212
+# 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) = 214.
+EXPECTED_TOTAL_ROWS = 214
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
