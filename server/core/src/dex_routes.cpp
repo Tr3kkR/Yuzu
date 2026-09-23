@@ -2641,7 +2641,7 @@ bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Respo
 
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
                                 FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
@@ -2650,14 +2650,14 @@ void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
-                    std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
+                    std::move(scoped_perm_fn), std::move(visible_set_fn),
                     std::move(dex_perf_api), std::move(group_list_fn), std::move(fleet_read_fn),
                     std::move(tag_values_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
-                                DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
+                                DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
                                 FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
@@ -2670,7 +2670,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     audit_fn_ = std::move(audit_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
-    perf_fn_ = std::move(perf_fn); // dead — see PerfFn's own doc comment (#4626)
     dex_perf_api_ = std::move(dex_perf_api);
     fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
@@ -2901,12 +2900,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                             "Agent", id, "DEX per-device signal history");
         // PR2: feed the percentile strips from the perf snapshot (default
         // cohort key — the strips compare against the conventional cohort).
-        // #4626: dex_perf_api_->fleet_snapshot() replaces perf_fn_(key) — a null
-        // dex_perf_api_ (unwired) omits the strips, exactly like the old
-        // !perf_fn_ check; a wired-but-empty dex_perf_fn inside collapses to an
-        // all-empty DexPerfSnapshot{} instead of omitting the section (an
-        // accepted delta, #4626 Concern A — the strips section already renders
-        // an honest "no comparison data" over an empty snapshot).
+        // A null dex_perf_api_ (unwired) omits the strips section entirely; a
+        // wired-but-empty dex_perf_fn inside instead collapses to an all-empty
+        // DexPerfSnapshot{}, so the strips section renders (an accepted,
+        // disclosed delta — see the split delivery matrix's WS-A4 row — the
+        // strips section already renders an honest "no comparison data" over
+        // an empty snapshot, so this is not a "fake empty").
         std::optional<DexPerfSnapshot> snap;
         if (dex_perf_api_)
             snap = dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey);
@@ -2981,10 +2980,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        // #4626: dex_perf_api_ replaces perf_fn_ — unwired is the same
-        // misconfiguration case the old !perf_fn_ check answered (server.cpp
-        // constructs dex_perf_api_ UNCONDITIONALLY in production; a null value
-        // here is a test-only/misconfigured-deployment case, never "no data").
+        // server.cpp constructs dex_perf_api_ UNCONDITIONALLY in production; a
+        // null value here is a test-only/misconfigured-deployment case, never
+        // "no data".
         if (!dex_perf_api_) {
             res.set_content(placeholder("Fleet performance unavailable",
                                         "This server has no perf snapshot provider wired."),
@@ -3683,11 +3681,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "dex.device.app_perf.view", "success", "Agent", id,
                      "device app-perf-over-time drill (B1 retained)");
-                 // GAP-2: DexPerfApi::device_app_summaries replaces
-                 // app_perf_providers_.device(id) + the local app_perf_device_summaries
-                 // call — the seam derives the summary from the SAME raw B1 read
-                 // device_app_perf_json (the REST/MCP drill) uses, never a second
-                 // independent reduction.
+                 // Note (#4626): DexPerfApi::device_app_summaries derives from the
+                 // SAME raw B1 read device_app_perf_json (the REST/MCP drill) uses,
+                 // never a second independent reduction.
                  const auto summaries =
                      dex_perf_api_ ? dex_perf_api_->device_app_summaries(id) : std::nullopt;
                  if (!summaries) {
@@ -3698,10 +3694,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      // already counted the degrade (yuzu_app_perf_read_degrade_total)
                      // before returning nullopt, so monitoring is unaffected. The REST
                      // twin keeps its fail-closed 503 (its JSON consumer reads status).
-                     res.set_content(
-                         "<div class=\"gp-note\">Application performance history could not be read "
-                         "right now &mdash; the store degraded. Retry shortly.</div>",
-                         "text/html; charset=utf-8");
+                     // SAME unified F2b wording the trend/app-list fragments use
+                     // (/fragments/dex/perf/apps + /fragments/dex/perf/app) — one
+                     // consistent message across every unwired-or-degraded app-perf
+                     // fragment, not a bespoke per-fragment string.
+                     res.set_content(placeholder("Application performance unavailable",
+                                                 "App performance data unavailable (not "
+                                                 "configured or degraded) — retry shortly."),
+                                     "text/html; charset=utf-8");
                      return;
                  }
                  res.set_content(render_dex_device_app_perf(*summaries),

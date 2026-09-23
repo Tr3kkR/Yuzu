@@ -102,7 +102,7 @@ public:
         return dex_device_app_perf_json(agent_id, app_filter, *rows, audit_persisted);
     }
 
-    // GAP-2 (#4626): derives from the SAME device_rows() helper as
+    // Note (#4626): derives from the SAME device_rows() helper as
     // device_app_perf_json above — neither method derives from the other,
     // both read the store exactly once and reduce independently.
     std::optional<std::vector<AppPerfDeviceApp>>

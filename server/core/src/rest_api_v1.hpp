@@ -14,7 +14,6 @@
 #include "authz_model.hpp"
 #include "dispatch_caller.hpp"
 #include "device_token_store.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam

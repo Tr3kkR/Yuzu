@@ -305,10 +305,11 @@ EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
 IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
-# (the FOURTH, #4484) and `dex` (the FIFTH — the DEX signals seam). Each set
-# covers the
+# (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
+# (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
+# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot

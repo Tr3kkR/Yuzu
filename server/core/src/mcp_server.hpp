@@ -25,7 +25,6 @@
 // reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam

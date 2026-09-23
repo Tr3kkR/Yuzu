@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -313,16 +314,6 @@ public:
     /// includer, with ONE definition.
     using ResponsesFn = DexResponsesFn;
 
-    /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
-    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). NO LONGER
-    /// READ by the route handlers (#4626 — they call `DexPerfApi::fleet_snapshot`
-    /// instead, the SAME `dex_perf_fn` closure wired one level down inside
-    /// `dex_perf_api`); kept as a parameter/member purely for source stability
-    /// of existing `register_routes` call sites (mirrors the equally-dead
-    /// `DexPerfFn dex_perf_fn` parameter `RestApiV1`/`McpServer` kept for the
-    /// same reason).
-    using PerfFn = DexPerfFn;
-
     /// ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-
     /// time API seam (`dex_perf_api.hpp`) — backs BOTH the F2a heartbeat-now
     /// fragments (`fleet_snapshot`) and the F2b over-time fragments (`apps`/
@@ -385,7 +376,7 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
                          TagValuesFn tag_values_fn = {});
@@ -396,7 +387,7 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
+                         ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
                          TagValuesFn tag_values_fn = {});
@@ -429,7 +420,6 @@ private:
     AuditFn audit_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
-    PerfFn perf_fn_; ///< dead — see PerfFn's own doc comment (#4626)
     DexPerfApiPtr dex_perf_api_;
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;

@@ -16498,10 +16498,6 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            // F2a: dead — see DexRoutes::PerfFn's own doc comment (#4626). Kept
-            // for source stability only; the fragments now read dex_perf_api
-            // below instead.
-            dex_perf_fn,
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
