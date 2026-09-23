@@ -14,6 +14,7 @@ plugins that load into the Yuzu agent at runtime.
 | `include/yuzu/metrics.hpp` | `MetricsRegistry` — counters, gauges, histograms |
 | `include/yuzu/secure_zero.hpp` | Guaranteed-not-elided memory scrubbing |
 | `include/yuzu/string_utils.hpp` | Common string helpers |
+| `include/yuzu/version_string.hpp` | SDK/ABI version string, shared by agent-core and server-core |
 
 ## ABI compatibility
 

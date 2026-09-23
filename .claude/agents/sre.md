@@ -71,7 +71,7 @@ Produce an **Operational Readiness Review** with:
 - **Verdict**: PASS, or findings with severity
 
 ## Key Files
-- `sdk/include/yuzu/metrics.hpp` — `MetricsRegistry` (header-only; shared by server, agent and plugins)
+- `sdk/include/yuzu/metrics.hpp` — `MetricsRegistry` (header-only; shared by server and agent)
 - `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl` — Gateway metrics
 - `deploy/systemd/` — Service definitions
 - `deploy/docker/` — Container configs

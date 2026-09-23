@@ -6,4 +6,4 @@
   gateway Python harness (`scripts/`, not `gateway/`), the Chrome-IR chain fixture
   (`tests/unit/server/`, not `tests/integration/`, and it now exists rather than being aspirational),
   and `sdk/README.md`'s `include/yuzu/sdk.hpp` row — a header the SDK has never shipped, now
-  replaced by the five helper headers it actually installs.
+  replaced by the helper headers it actually exposes through `yuzu_sdk_dep`.

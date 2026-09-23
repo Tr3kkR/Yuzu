@@ -42,7 +42,7 @@ You perform a **mandatory deep-dive review of every code change**. You read ever
 - `server/core/src/api_token_store.cpp` — API token management
 - `server/core/src/oidc_provider.cpp` — OIDC SSO integration
 - `server/core/src/rest_api_v1.cpp` — All REST endpoints
-- `agents/core/src/cert_store.cpp` — Certificate management
+- `server/core/src/ca_store.cpp` + `server/core/src/x509_ca.cpp` — Internal CA: issuance, revocation, CRL
 - `server/core/src/audit_store.cpp` — Audit event storage
 - `server/core/src/scope_engine.cpp` — Expression parser (injection surface)
 - `server/core/src/instruction_store.cpp` — YAML parsing (deserialization surface)
