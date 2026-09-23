@@ -336,6 +336,20 @@ const std::vector<pg::PgMigration>& migrations() {
         // that holds the lock (5 s lock wait + statements under a 30 s statement_timeout).
         {3, "SET LOCAL lock_timeout = '30s'; "
             "ALTER TABLE ca_crl_versions ADD COLUMN revoked_count BIGINT;"},
+        // The revoked set is append-only, enforced by the database rather than by the one
+        // WHERE clause in delete_issued_by(): an older binary sharing this schema during a
+        // rolling upgrade or rollback still runs the unconditional pre-6.1 DELETE, which would
+        // un-revoke the cert (is_revoked() accepts it again, later CRLs drop it). Row triggers
+        // do not fire on TRUNCATE, so the documented clean re-root still works.
+        {4, "CREATE FUNCTION ca_issued_keep_revoked() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN "
+            "  RAISE EXCEPTION 'ca_issued: a revoked certificate row (serial %) cannot be % "
+            "(revocations are append-only)', OLD.serial_hex, lower(TG_OP) "
+            "    USING ERRCODE = 'integrity_constraint_violation'; "
+            "END $$; "
+            "CREATE TRIGGER ca_issued_keep_revoked BEFORE DELETE OR UPDATE ON ca_issued "
+            "FOR EACH ROW WHEN (OLD.status = 'revoked') "
+            "EXECUTE FUNCTION ca_issued_keep_revoked();"},
     };
     return kMigrations;
 }
@@ -791,8 +805,11 @@ std::expected<CrlVersionRecord, CaStore::PublishError>
 CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
                           const std::string& issuer_key_id,
                           std::chrono::milliseconds local_wait) {
-    if (!build || !open_)
+    if (!build || !open_) {
+        spdlog::error("CaStore::publish_next_crl: {} — CRL not published",
+                      !open_ ? "store not open" : "no CRL builder supplied");
         return std::unexpected(PublishError::Failed);
+    }
     // Bounded, not "until the holder finishes": a holder can legitimately run longer (up to
     // kCrlStatementTimeout per statement), and giving up here is healed by the freshness pass.
     std::unique_lock local(publish_mu_, std::defer_lock);
@@ -840,10 +857,12 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         // The caller read the root and loaded its key before the lock. A subordinate import that
         // committed in between would otherwise let this publish record a CRL signed under the
         // superseded issuer AFTER the import's own CRL, so the latest CRL would carry the wrong
-        // issuer until the next publish.
+        // issuer until the next publish. FOR SHARE also holds the root row until this
+        // transaction ends, so an import cannot swap it between this check and our COMMIT (its
+        // UPDATE waits, then publishes its own CRL after ours).
         if (!issuer_fingerprint.empty()) {
             pg::PgResult root = pg::exec_params(
-                conn, "SELECT fingerprint_sha256 FROM ca_store.ca_root WHERE id = 1",
+                conn, "SELECT fingerprint_sha256 FROM ca_store.ca_root WHERE id = 1 FOR SHARE",
                 std::vector<std::string>{});
             if (root.status() != PGRES_TUPLES_OK) {
                 spdlog::error("CaStore::publish_next_crl: root re-read failed: {} — aborting",

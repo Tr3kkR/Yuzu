@@ -327,7 +327,9 @@ was built from — with no backfill (NULL reads as "not covered"). `has_unpublis
 compares it with the current revoked count in one statement, and the leader's freshness pass
 republishes when they differ, so a revoke whose own publish failed reaches the CRL without a
 second revoke. That comparison relies on the revoked set being append-only, so
-`delete_issued_by()` now keeps revoked rows — before this change, regenerating the default certs
+`delete_issued_by()` now keeps revoked rows, and **migration v4** adds a `BEFORE DELETE OR
+UPDATE` row trigger (`ca_issued_keep_revoked`) rejecting any change to a revoked row — the
+guarantee holds against an older binary during a rolling upgrade, not just in this code — before this change, regenerating the default certs
 deleted a revoked default leaf's row, which also made `is_revoked()` accept it again. The v3 DDL
 runs under `SET LOCAL lock_timeout = '30s'`, and each publish also sets
 `idle_in_transaction_session_timeout` so a frozen holder cannot keep the lock.

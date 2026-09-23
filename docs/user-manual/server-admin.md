@@ -418,8 +418,9 @@ for the decision record.
 Every CRL publish (startup, an operator revoke, a subordinate-CA import, and the
 freshness re-publish) now runs as one Postgres transaction under a lock on the
 `ca_store.ca_crl_versions` table, instead of behind a lock inside one server
-process. The `ca_store` schema migrates to v3 (a nullable `revoked_count`
-column on `ca_crl_versions`); nothing is backfilled.
+process. The `ca_store` schema migrates to v4: v3 adds a nullable
+`revoked_count` column on `ca_crl_versions` (nothing is backfilled), v4 adds a
+trigger that refuses to delete or change a revoked `ca_issued` row.
 
 What changes on **every** deployment, including single-server:
 
@@ -441,12 +442,17 @@ What changes on **every** deployment, including single-server:
   regenerating the built-in default certificates (for example after changing
   `--cert-san`) deleted their old inventory rows, including revoked ones, so a
   revoked default leaf was accepted again and dropped from the CRL. Revoked rows
-  are now kept. **This does not restore a revocation already lost that way:** the
+  are now kept, and the database now refuses to delete them (migration v4
+  trigger) — during a rolling upgrade an older server's default-cert purge fails
+  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
   purged serial is no longer in the inventory, so revoking it again returns
   `404`. This only affects you if you revoked a default server certificate (for
   example because its key may have leaked) **and** the default certificates were
   regenerated **before you upgraded to this release**. Check first: find the
-  serial in the audit log (the `ca.cert.revoked` event for that revocation), then
+  serial in the audit log (the `ca.cert.revoked` event for that revocation; if
+  that event has aged out of audit retention — 365 days by default — and you
+  cannot establish the serial another way, you cannot tell whether it was lost:
+  treat it as lost), then
   page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
   false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
   -noout -text`). If the serial is still listed as revoked, nothing was lost. If
@@ -463,9 +469,11 @@ revocation the newer binary just recorded; the newer binary's freshness pass
 republishes to cover it (and can do so on every tick for as long as the older
 binary keeps publishing).
 
-**Rollback** to the previous release is safe: v3 only adds a nullable column, and
-an older binary boots against it and ignores it. It will not self-heal a missed
-CRL; rolling forward again republishes once. Multi-replica PKI also still
+**Rollback** to the previous release is safe: an older binary boots against the
+v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
+forward again republishes once), and its default-cert inventory purge fails
+while any revoked default leaf exists (logged, harmless) because the trigger stays
+in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
 needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
 freshness pass runs only on the elected leader, and a leader whose CA directory
 lacks the CA key can never publish.
@@ -2436,7 +2444,9 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
    *Revoked* and the public CRL is republished automatically. If that publish
-   fails (the panel says so), the server republishes it on its own: on the next
+   fails (the panel does not show this; the REST/MCP revoke response returns
+   `crl_republished:false` and a `ca.crl.published` failure is audited), the
+   server republishes it on its own: on the next
    15-second freshness tick once the cause clears, or up to about 5 minutes later
    if that attempt fails too. You do not need to revoke again.
 

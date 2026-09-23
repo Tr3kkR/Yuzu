@@ -323,7 +323,9 @@ public:
     /// substitute a default number (ADR-0053 "CRL version continuity").
     [[nodiscard]] std::expected<std::uint64_t, std::string> next_crl_number();
 
-    /// TEST SEEDING ONLY: persist a CRL version with a caller-chosen number. Never a production
+    /// TEST SEEDING ONLY: persist a CRL version with a caller-chosen number. Plain autocommit
+    /// INSERT with none of publish_next_crl's transaction-scoped timeouts (it queues behind the
+    /// CRL table lock bounded only by the pool's own lock_timeout). Never a production
     /// publish path — composing this with `next_crl_number()` reads the revoked set outside the
     /// lock and breaks the superset guarantee `publish_next_crl` gives (PKI routed concern).
     /// Refuses version < 1, empty DER, and a duplicate version (never a silent clobber).

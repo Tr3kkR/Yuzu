@@ -75,7 +75,12 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id,
   cert_pem, issuer_fingerprint, issuer_key_id)`.
 - `ca_crl_versions(version PRIMARY KEY, der BYTEA, this_update, next_update,
-  published_at, issuer_fingerprint, issuer_key_id)`.
+  published_at, issuer_fingerprint, issuer_key_id, revoked_count)` — `revoked_count`
+  (migration v3, nullable) is how many revoked certs the CRL was built from.
+- Trigger `ca_issued_keep_revoked` (migration v4): any `DELETE`, or `UPDATE`, of a
+  row whose `status` is `revoked` is rejected, so the revoked set is append-only in
+  the database itself. Row triggers do not fire on `TRUNCATE`, so the clean
+  re-root below still works.
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust
@@ -178,25 +183,33 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not);
   the operator-revoke paths additionally return `crl_republished:false` and write a
   `ca.crl.published` failure audit. The import-chain, boot and freshness paths
-  write no `ca.crl.published` audit row, success or failure.
+  write no `ca.crl.published` audit row, success or failure (#4829). A failure of
+  the freshness pass's own unpublished-revocation *check* is not a publish failure:
+  it is logged (warn, at most once a minute) and not counted (#4830). Repeated
+  subordinate-CA imports can make publishes fail with "CA root changed" (logged
+  distinctly; admin-only) until the imports stop.
 - **Self-heal.** Each CRL row records how many revoked certs it was built from
   (`revoked_count`, migration v3). The leader's freshness pass republishes, on its
   next 15 s tick (or up to 5 minutes later after a failed attempt), whenever that
   count differs from the current revoked count — so a revocation whose own publish
   failed reaches the served CRL without a second revoke (which would return
   "already revoked"). The check compares counts, never timestamps written by
-  different replicas' clocks. It relies on the revoked set being append-only:
-  `revoke()` never un-revokes, and `delete_issued_by()` (the default-cert
-  inventory purge) never deletes a revoked row.
+  different replicas' clocks. It relies on the revoked set being append-only,
+  which the database enforces (trigger `ca_issued_keep_revoked`, migration v4) —
+  so even an older binary's unconditional default-cert purge during a rolling
+  upgrade cannot delete a revoked row; that purge statement fails instead and the
+  older binary logs "failed to purge prior default-cert inventory rows" and
+  continues with a few stale non-revoked rows.
 - **Boot.** Replicas booting together each publish once, leaving up to N
   consecutive CRL versions for N replicas — harmless.
 - **What the lock does not cover.** Restoring the database to an earlier point in
   time, losing an asynchronously replicated commit in a failover, or the
   `default_certs` runbook clearing `ca_crl_versions`, all restart numbering from
   the surviving `MAX(version)+1`, which can reuse a crlNumber that was already
-  served. Separately, **never delete a revoked `ca_issued` row by hand**: it
-  un-revokes that certificate (`is_revoked()` no longer sees it, and it drops out
-  of every later CRL) and defeats the self-heal count. It does not affect numbering. During a rolling upgrade, a publish from an older binary does not take
+  served. Separately, **never delete a revoked `ca_issued` row by hand** (the
+  database refuses it; disabling the trigger to force it un-revokes that
+  certificate — `is_revoked()` no longer sees it, it drops out of every later CRL —
+  and defeats the self-heal count). It does not affect numbering. During a rolling upgrade, a publish from an older binary does not take
   the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
   a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
 

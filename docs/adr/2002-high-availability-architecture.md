@@ -1453,7 +1453,8 @@ below)*:
   signing runs under it. A publish that fails (e.g. lock timeout) is healed by the leader's
   freshness pass, which republishes whenever the latest CRL's recorded `revoked_count` differs from
   the current revoked count — a count comparison, never cross-replica timestamps, which holds
-  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows). A publisher
+  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows, and a migration-v4
+  row trigger rejects deleting or updating a revoked `ca_issued` row). A publisher
   frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
 - **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
   `pending-agents.cfg` once at first boot rather than starting fresh.
