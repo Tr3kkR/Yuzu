@@ -17,9 +17,17 @@
 /// set is deliberately narrow — `list_devices`/`lookup_device` only, mirroring
 /// the public `GET /api/v1/devices[/{id}]` resource). Folding DEX/Guardian
 /// reads into `DeviceApi` would widen that seam past its own 1:1
-/// method-per-public-resource contract (INV-31-4). Until DEX/Guardian get
-/// their own seam, this file keeps direct `GuaranteedStateStore*` access —
-/// exactly the access `device_routes.cpp` had before this split, just moved.
+/// method-per-public-resource contract (INV-31-4). Both `DexApi` (5th
+/// family) and `GuardianApi` (9th family) have since landed, but this file
+/// is STILL deliberately unrewired onto either — the original "until DEX/
+/// Guardian get their own seam" framing is stale now that both exist; the
+/// live reason is that rewiring a lens fragment onto its family's seam is
+/// its OWN change, tracked separately per family (DEX: ISSUE #4576;
+/// Guardian: same deferral, disclosed in the `guardian` family's own
+/// landing) rather than a side effect of the seam merging. Until each
+/// fragment is actually rewired, this file keeps direct
+/// `GuaranteedStateStore*` access — exactly the access `device_routes.cpp`
+/// had before this split, just moved.
 ///
 /// See the "Device pages" routed-concern row (`.claude/routed-concerns.md`)
 /// for the shared invariants this file must preserve verbatim: the per-lens

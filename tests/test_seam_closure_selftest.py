@@ -126,6 +126,13 @@ EXPECTED_FAMILIES = {
             "server/core/src/workflow_api_local.hpp",
         ],
     },
+    "guardian": {
+        "tus": [
+            "server/core/src/guardian_types.hpp",
+            "server/core/src/guardian_api.hpp",
+            "server/core/src/guardian_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
@@ -164,6 +171,8 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/workflow_api.cpp",
     "server/core/src/dex_read_model.cpp",
     "server/core/src/dex_app_perf_model.cpp",
+    "server/core/src/guardian_api.cpp",
+    "server/core/src/guardian_model.cpp",
 ]
 EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
 # Abstract-header store-type probe (PR #4582 FIX 3).
@@ -176,6 +185,7 @@ EXPECTED_ABSTRACT_API_HEADERS = [
     "server/core/src/dex_perf_api.hpp",
     "server/core/src/schedule_api.hpp",
     "server/core/src/workflow_api.hpp",
+    "server/core/src/guardian_api.hpp",
 ]
 EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                                     "AgentRegistry", "ExecutionTracker", "PgPool",

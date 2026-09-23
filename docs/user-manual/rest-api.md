@@ -3503,7 +3503,7 @@ Create a new policy fragment from YAML.
 
 Delete a policy fragment.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3658,7 +3658,7 @@ Get policy detail including compliance summary.
 
 Delete a policy and all associated compliance data.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3680,7 +3680,7 @@ Enable a previously disabled policy.
 
 ```json
 {
-  "status": "enabled"
+  "status": "ok"
 }
 ```
 
@@ -3700,7 +3700,7 @@ Disable a policy, pausing compliance checks.
 
 ```json
 {
-  "status": "disabled"
+  "status": "ok"
 }
 ```
 
@@ -3714,13 +3714,13 @@ included in the body.
 
 Invalidate agent-side compliance cache for a specific policy. Resets all agent statuses to `pending`, forcing re-evaluation.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "agents_invalidated": 42
 }
 ```
@@ -3734,13 +3734,13 @@ retry, internal error string never included in the body.
 
 Invalidate compliance cache for all policies across all agents.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "total_invalidated": 210
 }
 ```
@@ -6004,12 +6004,32 @@ the existing missing-field 400 path, rather than surfacing as an uncaught
 exception (#4406, fixed on both `from-tar-query` and `from-instruction-result`
 in the same change).
 
+**`{id}/re-eval` is refused, never broadcast, when the recorded parent is gone (#4306).**
+`re-eval` synthesises the sibling's dispatch scope from the original's *live* `parent_id`
+FK, which is nulled (`ON DELETE SET NULL`) if the parent set is later deleted. An absent
+`parent_id` reaching dispatch synthesis normally means "broadcast to `__all__`" — the same
+rule the parent_id-empty guard above enforces for a caller-supplied empty string — so
+letting that happen here would silently turn "re-ask the same narrow question" into "ask
+the whole visible fleet". If the live parent is gone **and** the original's stored
+`source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id` --
+recorded by every result-set create route that accepts `parent_id` — `from-tar-query`/
+`from-instruction-result`/`from-inventory-query` (which always build a well-formed object
+payload) and the generic `POST /api/v1/result-sets` (#4306 follow-up), except when the
+generic route's caller-supplied `source_payload` is itself not a JSON object, in which case
+re-eval's own sql/instruction_id-presence check independently refuses such a row before
+dispatch regardless), the
+call is refused rather than re-resolved (the recorded value may be an alias that has since
+been re-bound to a different, newer set) or silently broadcast. A genuinely parentless
+original (no `parent_id` was ever supplied, by any creation path) still broadcasts on
+re-eval, unchanged.
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -6276,7 +6296,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 |---|---|---|---|
 | `name` | string | No | Human-readable name |
 | `source_kind` | string | No | Defaults to `manual_curate` |
-| `source_payload` | object | No | Stored as JSON; defaults to `{}` |
+| `source_payload` | object | No | Stored as JSON; defaults to `{}` — if `parent_id` is also supplied AND `source_payload` is itself a JSON object, a `scope_input_id` key recording it is merged in (overwriting any caller-supplied key of that name), #4306 |
 | `parent_id` | string | No | Must reference a set the caller owns (else `404`) |
 | `device_ids` | array of string | No | The initial member set |
 
