@@ -443,10 +443,15 @@ What changes on **every** deployment, including single-server:
   revoked default leaf was accepted again and dropped from the CRL. Revoked rows
   are now kept. **This does not restore a revocation already lost that way:** the
   purged serial is no longer in the inventory, so revoking it again returns
-  `404`. If you ever revoked a default server certificate (for example because
-  its key may have leaked) and the default certificates have been regenerated
-  since, re-root the internal CA (`docs/pki-architecture.md`, "Deliberate clean
-  re-root").
+  `404`. This only affects you if you revoked a default server certificate (for
+  example because its key may have leaked) **and** the default certificates were
+  regenerated **before you upgraded to this release**. Check first: if that
+  certificate's serial is still listed as revoked in `GET /api/v1/ca/issued` (or
+  appears in `GET /api/v1/ca/crl`), nothing was lost. If it is missing, re-root
+  the internal CA with the clean re-root in `docs/pki-architecture.md`
+  ("Deliberate clean re-root") — `POST /api/v1/ca/import-chain` is not enough,
+  because it keeps the issuing key the leaked certificate chains to. A re-root
+  re-enrolls the whole fleet.
 
 Single-server remains the only supported topology. If you nevertheless run two
 server versions against one database during an upgrade, a publish from the

@@ -684,7 +684,9 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   them together. This orphans every currently-enrolled agent (their leaves chain to the destroyed
   root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
-  goal is re-keying under a new authority without an enrollment outage.
+  goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
+  to stop trusting a leaf whose revocation was lost: import-chain keeps the issuing key, so that
+  leaf still chains — only this clean re-root removes it.
 - **A bootstrap that seems permanently stuck** (multi-replica default-cert self-heal, ADR-0053
   C5-1/Gate 8 — an unsupported topology, `docs/user-manual/upgrading.md`'s HA note): check
   `pg_locks` for a lingering `yuzu:default_certs_bootstrap` session advisory lock —
