@@ -21,6 +21,7 @@
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
+#include "mcp_retry.hpp" // mcp::kMcpStoreFaultRetryMs - shared retry_after_ms floor (#4306 gov-4306-N4)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
@@ -9924,6 +9925,15 @@ void RestApiV1::register_routes(
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
                 }
+                // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
+                // Deliberately minimal, not the full
+                // <store>_read_degrade_total{reason} convention other stores
+                // use, which would require wiring ResultSetStore itself with
+                // a MetricsRegistry member, out of scope for this fix round;
+                // a future PR can decide whether to upgrade it.
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_check_degraded_total")
+                        .increment();
                 bool audit_ok = true;
                 if (audit_fn)
                     audit_ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
@@ -9934,7 +9944,7 @@ void RestApiV1::register_routes(
                 rs_err(res, 503,
                        "RESULT_SET_STORE_UNAVAILABLE: could not verify the per-owner "
                        "result-set quota; nothing was dispatched execution_id=" + exec_id,
-                       {.retry_after_ms = 5000});
+                       {.retry_after_ms = mcp::kMcpStoreFaultRetryMs});
                 return;
             }
             if (*quota >= ResultSetStore::kMaxPerOwner) {

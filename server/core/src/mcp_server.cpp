@@ -11458,6 +11458,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!quota.has_value()) {
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
+                    // Deliberately minimal, not the full
+                    // <store>_read_degrade_total{reason} convention other
+                    // stores use, which would require wiring ResultSetStore
+                    // itself with a MetricsRegistry member, out of scope for
+                    // this fix round; a future PR can decide whether to
+                    // upgrade it.
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_check_degraded_total").increment();
                     const bool audit_ok = audit_fn(
                         req, "result_set.create", "failure", "ResultSet", "",
                         "reason=quota_check_degraded source_kind=" + std::string(src_kind));
