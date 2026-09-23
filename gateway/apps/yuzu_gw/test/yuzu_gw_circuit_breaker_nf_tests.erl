@@ -87,6 +87,34 @@ trip_circuit() ->
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
+%% The open -> half_open transition is driven by an erlang:send_after timer in
+%% yuzu_gw_upstream, so on a loaded runner the timer can fire late, or its
+%% message can queue behind this test's circuit_state call. A fixed
+%% `timer:sleep(N)` then `half_open` check is an UPPER-bound race: it failed on
+%% the first macOS CI run (#4841; BigMags shares its CPU between two agents, and
+%% macOS coalesces background timers). Poll with a generous deadline instead.
+%% The LOWER-bound checks ("still open at N ms") keep their fixed sleeps. Delay
+%% can only make those safer, and they are what prove the backoff doubles.
+%% Where a wait pins the backoff AMOUNT, the caller passes an upper bound
+%% (`WithinMs`) that is ~3x the old margin but still shorter than the wrong
+%% amount it must reject (e.g. the 500ms cap vs an uncapped 800ms). Elsewhere
+%% the wait only proves the transition happens, so it gets 2s.
+await_state(Want) ->
+    await_state(Want, 2000).
+
+await_state(Want, WithinMs) ->
+    poll_state(Want, erlang:monotonic_time(millisecond) + WithinMs).
+
+poll_state(Want, Deadline) ->
+    case yuzu_gw_upstream:circuit_state() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), poll_state(Want, Deadline)
+            end
+    end.
+
 %%%===================================================================
 %%% Tests
 %%%===================================================================
@@ -94,9 +122,8 @@ trip_circuit() ->
 backoff_doubles() ->
     %% Cycle 1: trip -> open -> half_open (100ms timeout)
     trip_circuit(),
-    %% The base timeout is 100ms. Wait slightly over 100ms for half_open.
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    %% The base timeout is 100ms; wait for the timer-driven half_open.
+    ?assertEqual(half_open, await_state(half_open)),
 
     %% Probe fails -> reopens. Now timeout should be 200ms.
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -106,9 +133,9 @@ backoff_doubles() ->
     timer:sleep(150),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
 
-    %% At 250ms total (> 200ms), it should be half_open.
-    timer:sleep(100),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    %% By ~250ms total (> 200ms) it must be half_open. The 200ms bound still
+    %% rejects a 4x backoff (half_open at 400ms, 250ms after this point).
+    ?assertEqual(half_open, await_state(half_open, 200)),
 
     %% Probe fails again -> reopens. Timeout should be 400ms.
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -118,9 +145,9 @@ backoff_doubles() ->
     timer:sleep(300),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
 
-    %% At 450ms total (> 400ms), should be half_open.
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
+    %% By ~450ms total (> 400ms) it must be half_open. The 300ms bound still
+    %% rejects a 4x backoff (half_open at 1600ms).
+    ?assertEqual(half_open, await_state(half_open, 300)).
 
 backoff_capped() ->
     %% Max timeout is 500ms. After enough reopen cycles, the timeout
@@ -133,27 +160,24 @@ backoff_capped() ->
 
     %% Cycle 1: trip, wait 100ms+margin, fail probe
     trip_circuit(),
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 2: timeout now 200ms. Wait 200ms+margin, fail probe.
-    timer:sleep(250),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 3: timeout now 400ms. Wait 400ms+margin, fail probe.
-    timer:sleep(450),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
 
     %% Cycle 4: timeout should be capped at 500ms (not 800ms).
     %% At 400ms it should still be open.
     timer:sleep(400),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-    %% At 550ms total (> 500ms cap), should be half_open.
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
+    %% By ~550ms total (> 500ms cap) it must be half_open. The 250ms bound still
+    %% rejects an UNcapped 800ms backoff (400ms after this point).
+    ?assertEqual(half_open, await_state(half_open, 250)).
 
 concurrent_rejection() ->
     trip_circuit(),
@@ -182,8 +206,7 @@ concurrent_rejection() ->
 
 concurrent_half_open_probe() ->
     trip_circuit(),
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
 
     %% Make grpcbox succeed but add a small delay to simulate real RPC.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
@@ -242,15 +265,13 @@ telemetry_on_half_open() ->
     meck:reset(telemetry),
     trip_circuit(),
     %% Wait for the half_open timer to fire.
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
     ?assert(has_telemetry_state(<<"half_open">>)).
 
 telemetry_on_close() ->
     meck:reset(telemetry),
     trip_circuit(),
-    timer:sleep(150),
-    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
     %% Probe succeeds -> close.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"ok">>}, #{}}
