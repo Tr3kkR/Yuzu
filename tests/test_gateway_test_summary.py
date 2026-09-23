@@ -16,6 +16,7 @@ cannot silently come back:
 Hermetic: parses sources and runs only the parser CLI under sys.executable
 (no rebar3, no network, no shared paths).
 """
+import json
 import os
 import re
 import subprocess
@@ -187,6 +188,51 @@ class WrapperWiring(unittest.TestCase):
                 self.assertIn(suite, deadlines)
                 # Leave room for the dump + kill + 15s wait in _run_streamed.
                 self.assertLessEqual(deadlines[suite] + 30, int(t.group(1)))
+
+
+class AssertGatewayTests(unittest.TestCase):
+    # #4841: every CI leg asserts, right after `meson setup`, that the gateway
+    # tests were registered (a missing rebar3 otherwise skips them silently).
+
+    SCRIPT = os.path.join(ROOT, 'scripts', 'ci', 'assert-gateway-tests.py')
+    WORKFLOWS = ('ci.yml', 'nightly.yml', 'sanitizer-tests.yml')
+    # The workflow canary (ci.yml `canary`, gcc-13) only compiles; it never
+    # runs `meson test`, so it has no gateway tests to lose.
+    EXEMPT = {('ci.yml', 'build-linux')}
+
+    def _run(self, tests):
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            if tests is not None:
+                os.makedirs(os.path.join(d, 'meson-info'))
+                with open(os.path.join(d, 'meson-info', 'intro-tests.json'), 'w', encoding='utf-8') as f:
+                    json.dump(tests, f)
+            return subprocess.run([sys.executable, self.SCRIPT, d],
+                                  capture_output=True, text=True).returncode
+
+    def test_verdicts(self):
+        both = [{'name': 'gateway eunit'}, {'name': 'gateway ct'}, {'name': 'x'}]
+        self.assertEqual(self._run(both), 0)
+        self.assertEqual(self._run([{'name': 'gateway eunit'}]), 1)
+        self.assertEqual(self._run([]), 1)
+        self.assertEqual(self._run(None), 1)   # not configured / unreadable
+
+    def test_every_meson_setup_is_followed_by_the_assertion(self):
+        # And never by -Drequire_gateway: a non-default project option stored
+        # in a persistent, branch-shared build dir breaks every later
+        # `--reconfigure` from a branch whose meson.options predates it.
+        for wf in self.WORKFLOWS:
+            text = _read(os.path.join(ROOT, '.github', 'workflows', wf))
+            self.assertNotIn('-Drequire_gateway', text, wf)
+            lines = text.split('\n')
+            for i, line in enumerate(lines):
+                m = re.match(r'\s*meson setup (?:\$reconfig )?(\S+)', line)
+                if not m or (wf, m.group(1)) in self.EXEMPT:
+                    continue
+                j = i
+                while lines[j].rstrip().endswith('\\'):
+                    j += 1
+                with self.subTest(workflow=wf, line=i + 1):
+                    self.assertRegex(lines[j + 1], r'python3? scripts/ci/assert-gateway-tests\.py ')
 
 
 if __name__ == '__main__':

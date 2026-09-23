@@ -678,7 +678,10 @@ else
   if get_option('require_gateway')
     # A skipped gateway is invisible: the build and every test leg stay green
     # with no gateway compiled and no gateway test registered. macOS CI ran
-    # that way from the start (#4841). CI turns this on so the skip cannot hide.
+    # that way from the start (#4841). This option is for local fresh setups;
+    # CI legs use scripts/ci/assert-gateway-tests.py after configure instead,
+    # because a non-default option stored in a persistent, branch-shared CI build
+    # dir makes every older branch's --reconfigure fail ("Unknown options").
     error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
           + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: erlef/setup-beam).')
   endif

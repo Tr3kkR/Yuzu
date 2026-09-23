@@ -869,8 +869,8 @@ jobs:
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
-            -Drequire_gateway=true \
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Cross-OS capture certification guard (PR #4112 review, blocker),
@@ -1680,8 +1680,8 @@ jobs:
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
             -Dbuild_tests=true \
-            -Drequire_gateway=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Affinity controls placement, not Ninja's processor-count discovery;
@@ -2076,8 +2076,9 @@ jobs:
       # the Linux leg (and release.yml's gateway job) so an OTP bump moves every
       # leg together. Until #4841 this job had NO Erlang: meson's
       # find_program('rebar3', required: false) silently skipped the gateway, so
-      # macOS stayed green without ever compiling or testing it. -Drequire_gateway
-      # on the Configure step below now turns that skip into a configure error.
+      # macOS stayed green without ever compiling or testing it. The Configure step
+      # below now runs scripts/ci/assert-gateway-tests.py, which fails the leg when
+      # the gateway tests were not registered.
       # ImageOS is required because setup-beam cannot auto-detect a self-hosted
       # runner's OS; macos26 matches the BigMags Mac Minis (macOS 26, arm64).
       # Step-scoped so the rest of the job does not see it.
@@ -2154,8 +2155,8 @@ jobs:
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
-            -Drequire_gateway=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py build-macos
 
       - name: Build
         # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the

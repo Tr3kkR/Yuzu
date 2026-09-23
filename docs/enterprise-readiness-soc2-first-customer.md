@@ -522,9 +522,9 @@ and the release workflow's EUnit step were brought under the same rule. A hermet
 self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. The same
 change closes a second, older gap (#4841): the macOS CI leg never had Erlang, so Meson
 silently skipped the gateway there and the leg passed without building or testing it. The
-macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (ci.yml, nightly, sanitizer-tests) configures with
-`-Drequire_gateway=true`, so a runner missing the gateway toolchain fails at configure
-instead of passing without the gateway.
+macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (ci.yml, nightly, sanitizer-tests) checks, right after
+configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
+so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
 ---
 
