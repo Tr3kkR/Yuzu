@@ -8,6 +8,7 @@
 
 #include "local_security_policy_parsers.hpp"
 
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
 
 #include <spdlog/spdlog.h>
@@ -36,6 +37,26 @@
 #endif
 
 namespace yuzu::local_security_policy {
+
+/// The runner's termination reason as the pure layer's RunEnd (both rung-2 legs).
+inline RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
+    using T = yuzu::agent::TerminationReason;
+    switch (r) {
+    case T::exited:
+        return RunEnd::Exited;
+    case T::deadline:
+        return RunEnd::Deadline;
+    case T::cancelled:
+        return RunEnd::Cancelled;
+    case T::signaled:
+        return RunEnd::Signaled;
+    case T::spawn_error:
+        return RunEnd::SpawnError;
+    case T::line_limit:
+        break;
+    }
+    return RunEnd::Other; // line_limit cannot occur: neither leg sets stop_after_max_lines
+}
 
 int collect_linux_policy(yuzu::CommandContext& ctx, std::string_view action);
 int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action);
@@ -195,6 +216,7 @@ inline std::optional<std::string> cf_scalar_text(CFTypeRef v) {
 struct CfDictEntries {
     std::vector<std::pair<std::string, CFTypeRef>> entries; // key-sorted
     bool non_string_key = false; // a key that is not a CFString was skipped -- reported, not dropped
+    bool unconvertible_key = false; // a CFString key with no UTF-8 rendering -- reported, not renamed
 };
 
 inline CfDictEntries cf_dict_entries(CFDictionaryRef d) {
@@ -207,8 +229,12 @@ inline CfDictEntries cf_dict_entries(CFDictionaryRef d) {
             out.non_string_key = true;
             continue;
         }
-        out.entries.emplace_back(cf_to_utf8(static_cast<CFStringRef>(keys[i])).value_or("unmodelled"),
-                                 static_cast<CFTypeRef>(vals[i]));
+        auto key = cf_to_utf8(static_cast<CFStringRef>(keys[i]));
+        if (!key) {
+            out.unconvertible_key = true;
+            continue;
+        }
+        out.entries.emplace_back(std::move(*key), static_cast<CFTypeRef>(vals[i]));
     }
     std::sort(out.entries.begin(), out.entries.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -218,6 +244,11 @@ inline CfDictEntries cf_dict_entries(CFDictionaryRef d) {
 inline void add_defect(PwPolicyItem& it, std::string_view d) {
     if (std::find(it.defects.begin(), it.defects.end(), d) == it.defects.end())
         it.defects.emplace_back(d);
+}
+
+inline void add_key_defects(PwPolicyItem& it, const CfDictEntries& e) {
+    if (e.non_string_key) add_defect(it, "non_string_key");
+    if (e.unconvertible_key) add_defect(it, "unconvertible_key");
 }
 
 } // namespace detail
@@ -239,9 +270,9 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
 
     std::vector<PwPolicyItem> items;
     const auto root = detail::cf_dict_entries(static_cast<CFDictionaryRef>(plist.get()));
-    if (root.non_string_key) {
+    if (root.non_string_key || root.unconvertible_key) {
         PwPolicyItem it; // no category text to name: routed to both actions
-        detail::add_defect(it, "non_string_key");
+        detail::add_key_defects(it, root);
         items.push_back(std::move(it));
     }
     for (const auto& [category, value] : root.entries) {
@@ -261,7 +292,7 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
                 continue;
             }
             const auto fields = detail::cf_dict_entries(static_cast<CFDictionaryRef>(el));
-            if (fields.non_string_key) detail::add_defect(it, "non_string_key");
+            detail::add_key_defects(it, fields);
             for (const auto& [k, v] : fields.entries) {
                 // "unmodelled" only on a genuine conversion failure (nullopt) -- a real
                 // empty string from CF still comes back as an empty std::string, not
@@ -276,7 +307,7 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
                         continue;
                     }
                     const auto params = detail::cf_dict_entries(static_cast<CFDictionaryRef>(v));
-                    if (params.non_string_key) detail::add_defect(it, "non_string_key");
+                    detail::add_key_defects(it, params);
                     for (const auto& [pk, pv] : params.entries)
                         it.params.emplace_back(pk, detail::cf_scalar_text(pv).value_or("unmodelled"));
                 }

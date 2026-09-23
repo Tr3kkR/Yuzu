@@ -12,7 +12,7 @@
  *
  * Why a sweep: the CHILD (secedit) writes the export, so a crash or service
  * stop between export and the agent's RAII delete orphans a copy of the
- * machine's policy under agent.data_dir. Every dispatch sweeps stale
+ * machine's policy under agent.data_dir. Every Windows policy dispatch that reaches the export sweeps stale
  * `local_security_policy-<32 hex>` directories BEFORE spawning.
  *
  * The selection policy is shaped after execution_artifacts' (prefix + 32 hex +
@@ -71,6 +71,8 @@
  * by the dispatch holding it open without FILE_SHARE_DELETE; the floor only
  * covers the create-to-open window of a concurrent dispatch.
  */
+
+#include "local_security_policy_parsers.hpp" // RunEnd
 
 #include <cstddef>
 #include <cstdint>
@@ -196,10 +198,6 @@ inline constexpr std::size_t kExportMaxBytes = 1024 * 1024; // 1 MiB
 inline constexpr unsigned long kWin32FileNotFound = 2;
 inline constexpr unsigned long kWin32PathNotFound = 3;
 inline constexpr unsigned long kWin32AccessDenied = 5;
-
-/// How the runner reported the child ending, mirrored so this header stays
-/// free of agent-core types.
-enum class RunEnd { Exited, Deadline, Cancelled, Signaled, SpawnError, Other };
 
 /// Empty string = the run succeeded; otherwise the CONSTRAINED token.
 [[nodiscard]] inline std::string classify_export_run(RunEnd end, int exit_code) {

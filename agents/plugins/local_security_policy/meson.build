@@ -12,8 +12,7 @@ elif host_machine.system() == 'darwin'
                                            include_type: 'system')
 endif
 
-# Assigned so tests/meson.build's link_depends can name this output.
-local_security_policy_plugin_lib = shared_library(
+shared_library(
   'local_security_policy',
   files(
     'src/local_security_policy_plugin.cpp',

@@ -37,7 +37,8 @@ Collected collect_pwpolicy(LocalPolicyAction action) {
     const auto run = yuzu::agent::run_bounded_subprocess(
         {"/usr/bin/pwpolicy", "-getaccountpolicies"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
-    if (auto bad = classify_pwpolicy_run(run.tool_ran, run.timed_out, run.output_truncated, run.exit_code);
+    if (auto bad = classify_pwpolicy_run(to_run_end(run.termination_reason), run.output_truncated,
+                                         run.exit_code);
         !bad.empty())
         return constrained(std::move(bad));
     const auto xml = strip_to_xml(run.output);

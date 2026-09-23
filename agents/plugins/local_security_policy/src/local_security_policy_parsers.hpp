@@ -820,7 +820,9 @@ struct PwPolicyItem {
     /// `malformed_category` (the category's value is not an array), `malformed_policy`
     /// (an array element is not a dictionary), `malformed_parameters` (policyParameters
     /// is not a dictionary), `non_string_key` (a dictionary key that is not a string was
-    /// skipped; at the plist root the item's category is empty). A known category that
+    /// skipped; at the plist root the item's category is empty), `unconvertible_key` (a
+    /// string key with no UTF-8 rendering was skipped). pwpolicy_rows adds `missing_content`
+    /// for an element that carries nothing reportable. A known category that
     /// is malformed would otherwise yield no rows and read as `policies|none`, a clean
     /// "nothing configured" -- so every defect becomes a row and a token, never silence.
     std::vector<std::string> defects;
@@ -835,9 +837,27 @@ inline std::optional<std::string_view> strip_to_xml(std::string_view raw) {
 }
 
 /// Failure token for a finished pwpolicy run, or empty when the output is usable.
-inline std::string classify_pwpolicy_run(bool tool_ran, bool timed_out, bool truncated, int exit_code) {
-    if (!tool_ran) return "pwpolicy:spawn_error";
-    if (timed_out) return "pwpolicy:deadline";
+/// How the runner reported a child ending (yuzu::agent::TerminationReason, mirrored so this
+/// header stays free of agent-core types; to_run_end in the legs header maps it). Both rung-2
+/// legs classify from this, never from the runner's convenience flags, so a signalled or
+/// cancelled run is named for what it was (agents/shared/subprocess_degradation.hpp).
+enum class RunEnd { Exited, Deadline, Cancelled, Signaled, SpawnError, Other };
+
+inline std::string classify_pwpolicy_run(RunEnd end, bool truncated, int exit_code) {
+    switch (end) {
+    case RunEnd::SpawnError:
+        return "pwpolicy:spawn_error";
+    case RunEnd::Deadline:
+        return "pwpolicy:deadline";
+    case RunEnd::Cancelled:
+        return "pwpolicy:cancelled";
+    case RunEnd::Signaled:
+        return "pwpolicy:signaled";
+    case RunEnd::Other:
+        return "pwpolicy:unexpected_termination";
+    case RunEnd::Exited:
+        break;
+    }
     if (truncated) return "pwpolicy:output_truncated";
     if (exit_code != 0) return "pwpolicy:exit_" + std::to_string(exit_code);
     return "";
@@ -888,6 +908,14 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             continue;
         }
         if (lock != (action == LocalPolicyAction::Lockout)) continue;
+        if (it.content.empty() && it.params.empty() && it.defects.empty()) {
+            // A policy element carrying nothing this action can report is a shape defect,
+            // not "no policy": without this row it would vanish, and could leave the clean
+            // `policies|none` answer below.
+            rows.push_back(format_kv_row(prefix, "source_state", "unreadable:missing_content", src));
+            acc.add_failure("pwpolicy:missing_content");
+            continue;
+        }
         if (!it.content.empty()) rows.push_back(format_kv_row(prefix, "policy_content", it.content, src));
         if (const auto n = pwpolicy_min_length(it.content))
             rows.push_back(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));

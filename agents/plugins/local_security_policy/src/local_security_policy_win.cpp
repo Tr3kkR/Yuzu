@@ -4,7 +4,7 @@
  * `secedit /export` of the SECURITYPOLICY area, parsed from its UTF-16LE INI.
  *
  * RUNG 2 (an honest argv leaf, not rung 1): no in-tree LSA policy-query
- * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md:245
+ * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md "Audit and review"
  * names `secedit /export` the authoritative source on a running box. Spawned via
  * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), argv[0] the
  * absolute `<system directory>\secedit.exe` resolved through
@@ -316,7 +316,10 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
 /// directory handle: RemoveDirectory fails with a sharing violation while a
 /// no-FILE_SHARE_DELETE handle is open, so that handle must destruct first.
 /// A failed removal is logged (never thrown from a destructor) and left for
-/// the next dispatch's sweep.
+/// the next dispatch's sweep. Removal is by path, unlike the handle-relative
+/// sweep: this directory was created by this dispatch with CREATE_NEW and an
+/// owner-only DACL, so no other principal can have swapped its contents; the
+/// sweep handles directories it did not create, which is why it is confined.
 class ScratchDirGuard {
 public:
     explicit ScratchDirGuard(std::wstring path) : path_(std::move(path)) {}
@@ -407,24 +410,6 @@ ExportBytes read_export(const std::wstring& file) {
     return out;
 }
 
-RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
-    using T = yuzu::agent::TerminationReason;
-    switch (r) {
-    case T::exited:
-        return RunEnd::Exited;
-    case T::deadline:
-        return RunEnd::Deadline;
-    case T::cancelled:
-        return RunEnd::Cancelled;
-    case T::signaled:
-        return RunEnd::Signaled;
-    case T::spawn_error:
-        return RunEnd::SpawnError;
-    case T::line_limit:
-        break;
-    }
-    return RunEnd::Other; // line_limit cannot occur here (no stop_after_max_lines)
-}
 
 } // namespace
 

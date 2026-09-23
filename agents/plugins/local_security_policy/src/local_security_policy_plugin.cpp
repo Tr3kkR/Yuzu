@@ -23,7 +23,7 @@
 
 namespace {
 
-// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md:245);
+// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md "Audit and review");
 // the wording is finalised from the Windows leg's rig-probe banner. Every leg names each
 // file it reads and, on Windows, the scratch file it stages and the sweep that removes it.
 const YuzuActionDescriptor kActionDescriptors[] = {
@@ -53,7 +53,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "LOCAL security database after GPO application; domain-account policy is not reported. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
-         "directory removed on return; every dispatch first sweeps such directories older than "
+         "directory removed on return; each policy dispatch first sweeps such directories older than "
          "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
          "elevated, on a standalone host; see the Windows leg banner"},
     },
@@ -81,7 +81,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "LOCAL security database after GPO application; domain-account policy is not reported. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
-         "directory removed on return; every dispatch first sweeps such directories older than "
+         "directory removed on return; each policy dispatch first sweeps such directories older than "
          "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
          "elevated, on a standalone host; see the Windows leg banner"},
     },
@@ -109,7 +109,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "not read. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
-         "directory removed on return; every dispatch first sweeps such directories older than "
+         "directory removed on return; each policy dispatch first sweeps such directories older than "
          "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
          "elevated, on a standalone host; see the Windows leg banner"},
     },
