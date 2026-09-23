@@ -7,8 +7,17 @@
 /// REST endpoints, and the MCP tools all read the SAME numbers. Declared here (not
 /// in the already-large dex_routes.hpp) so the renderer + its scope-selector type
 /// stay a small, separately-testable unit.
+///
+/// #4626 Concern B: includes the PURE halves directly (`dex_app_perf_pure.hpp`
+/// for `AppPerfVersionSummary`/`AppPerfDeviceApp`, `app_perf_types.hpp` for
+/// `AppPerfAppSummary`/`AppPerfVersionDeviceRow`) rather than the store-coupled
+/// umbrella `dex_app_perf_model.hpp` (which also pulls `dex_app_perf_builders.hpp`
+/// — the B1/B2 store headers) — this header + `dex_app_perf_ui.cpp` are enrolled
+/// in `scripts/ci/check-seam-closure.py`'s `dex_perf` family, so a store
+/// `#include` here is now lint-caught, not just reviewed.
 
-#include "dex_app_perf_model.hpp" // AppPerfVersionSummary, AppPerfAppSummary (via fleet store)
+#include "app_perf_types.hpp"    // AppPerfAppSummary, AppPerfVersionDeviceRow
+#include "dex_app_perf_pure.hpp" // AppPerfVersionSummary, AppPerfDeviceApp
 
 #include <cstdint>
 #include <string>

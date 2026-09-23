@@ -414,11 +414,17 @@ FAMILIES = {
     # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
     # sequel to `dex` (DEX signals). REST and MCP ARE rewired through this
     # seam (zero remaining direct AppPerfProviders/DexPerfFn calls in
-    # rest_api_v1.cpp/mcp_server.cpp) — same header-only posture as `dex` for
-    # a DIFFERENT reason: those two consumer TUs are multi-family and stay
-    # inspected-not-enforced (same as every family), not because the rewire is
-    # outstanding. Only the dashboard (dex_app_perf_ui.*, dex_perf_ui.cpp) is
-    # unrewired, tracked #4626 (mirroring `dex`'s #4576).
+    # rest_api_v1.cpp/mcp_server.cpp). #4626 additionally rewired and ENROLLED
+    # the dashboard consumer TUs (`dex_perf_ui.cpp`, `dex_app_perf_ui.hpp`,
+    # `dex_app_perf_ui.cpp`) — the retired `AppPerfProviders` bundle's last
+    # production consumer — so this family now enforces its UI TUs too,
+    # narrowing the gap to `network`'s five-consumer-enforced posture.
+    # `dex_routes.cpp`/`.hpp` (the ROUTE-registration half) stay OUTSIDE this
+    # set, same as `dex`'s own `dex_routes.cpp` — that TU also registers the
+    # still-store-coupled DEX-SIGNALS fragments (GuaranteedStateStore-backed,
+    # out of scope for both `dex` and `dex_perf`'s own seam builds), so
+    # enforcing it would require splitting the DEX-signals dashboard rewire
+    # (tracked #4576) into this family's scope, which it is not.
     "dex_perf": {
         "tus": [
             "server/core/src/app_perf_types.hpp",
@@ -426,6 +432,9 @@ FAMILIES = {
             "server/core/src/dex_perf_model.hpp",
             "server/core/src/dex_perf_api.hpp",
             "server/core/src/dex_perf_api_local.hpp",
+            "server/core/src/dex_perf_ui.cpp",
+            "server/core/src/dex_app_perf_ui.hpp",
+            "server/core/src/dex_app_perf_ui.cpp",
         ],
     },
     # `schedule` (ADR-0031 WS-A4, the SEVENTH family through the seam) — the
