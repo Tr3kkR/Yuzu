@@ -123,7 +123,7 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[pg][device][routes]")
     auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, scoped_perm, dex_api.get(), guardian_api.get(), audit);
+    routes.register_routes(sink, scoped_perm, dex_api, guardian_api, audit);
 
     SECTION("Read denied -> 403, nothing rendered, no audit") {
         allow_read = false;
@@ -205,7 +205,7 @@ TEST_CASE("device lenses: out-of-scope DEX lens is 403, no PII read (not audited
     auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, scoped_perm, dex_api.get(), guardian_api.get(), audit);
+    routes.register_routes(sink, scoped_perm, dex_api, guardian_api, audit);
 
     auto r = sink.Get("/fragments/device/dex?id=other-team");
     REQUIRE(r);
@@ -299,7 +299,7 @@ TEST_CASE("device lenses: DEX lens renders the per-device score + known signal c
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
 
     auto r = sink.Get("/fragments/device/dex?id=" + agent + "&bare=1");
     REQUIRE(r);
@@ -330,7 +330,7 @@ TEST_CASE("device lenses: DEX lens — no signals in-window renders the honest-e
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
 
     auto r = sink.Get("/fragments/device/dex?id=dex-empty-1&bare=1");
     REQUIRE(r);
@@ -366,7 +366,7 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
 
     auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
     REQUIRE(r);
@@ -405,7 +405,7 @@ TEST_CASE("device lenses: Guardian lens — zero statuses renders the honest-emp
                        const std::string&, const std::string&) { return true; };
     yuzu::server::test::TestRouteSink sink;
     DeviceLensRoutes routes;
-    routes.register_routes(sink, okScoped, dex_api.get(), guardian_api.get());
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
 
     auto r = sink.Get("/fragments/device/guardian?id=guardian-empty-1&bare=1");
     REQUIRE(r);

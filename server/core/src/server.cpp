@@ -16704,8 +16704,10 @@ private:
         // Same scope/audit wiring the lenses had inside DeviceRoutes.
         device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
         device_lens_routes_->register_routes(
-            *web_server_, scoped_perm_fn, dex_api.get(),
-            guaranteed_state_store_ ? guardian_api.get() : nullptr, audit_fn);
+            *web_server_, scoped_perm_fn, dex_api,
+            guaranteed_state_store_ ? DeviceLensRoutes::GuardianApiPtr{guardian_api}
+                                    : DeviceLensRoutes::GuardianApiPtr{},
+            audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on

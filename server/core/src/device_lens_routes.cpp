@@ -12,18 +12,19 @@
 namespace yuzu::server {
 
 void DeviceLensRoutes::register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
-                                       const DexApi* dex_api, const GuardianApi* guardian_api,
+                                       DexApiPtr dex_api, GuardianApiPtr guardian_api,
                                        AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(scoped_perm_fn), dex_api, guardian_api, std::move(audit_fn));
+    register_routes(sink, std::move(scoped_perm_fn), std::move(dex_api), std::move(guardian_api),
+                    std::move(audit_fn));
 }
 
 void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
-                                       const DexApi* dex_api, const GuardianApi* guardian_api,
+                                       DexApiPtr dex_api, GuardianApiPtr guardian_api,
                                        AuditFn audit_fn) {
     scoped_perm_fn_ = std::move(scoped_perm_fn);
-    dex_api_ = dex_api;
-    guardian_api_ = guardian_api;
+    dex_api_ = std::move(dex_api);
+    guardian_api_ = std::move(guardian_api);
     audit_fn_ = std::move(audit_fn);
 
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --

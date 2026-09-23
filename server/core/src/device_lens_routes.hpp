@@ -22,7 +22,7 @@
 /// seam-closure enforcement (`scripts/ci/check-seam-closure.py`) — this
 /// file's transitive include closure is checked to contain no store header.
 ///
-/// A null `DexApi*`/`GuardianApi*` renders the SAME "store unavailable"
+/// A null `DexApiPtr`/`GuardianApiPtr` renders the SAME "store unavailable"
 /// placeholder the old `!store_` guard did (server.cpp passes `nullptr` for
 /// either seam exactly when its backing store is absent — see
 /// `ServerImpl`'s lens-registration wiring). One BEHAVIOUR DELTA from the
@@ -52,6 +52,7 @@
 #include <httplib.h>
 
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace yuzu::server {
@@ -65,6 +66,13 @@ class DeviceLensRoutes {
 public:
     using ScopedPermFn = DeviceRoutes::ScopedPermFn;
     using AuditFn = DeviceRoutes::AuditFn;
+    /// SHARED ownership, matching every other seam consumer (DexRoutes'
+    /// DexPerfApiPtr, RestApiV1, McpServer): the route lambdas outlive the
+    /// ServerImpl init scope that constructs the seams, so the lens co-owns
+    /// them rather than borrowing a pointer another consumer happens to keep
+    /// alive.
+    using DexApiPtr = std::shared_ptr<const DexApi>;
+    using GuardianApiPtr = std::shared_ptr<const GuardianApi>;
 
     /// `dex_api`/`guardian_api` back the DEX/Guardian lens respectively
     /// (either nullptr → an honest "store unavailable" placeholder, matching
@@ -73,19 +81,19 @@ public:
     /// other seam's null-means-unavailable convention);
     /// `scoped_perm_fn`/`audit_fn` are the same per-device gate + behavioural-
     /// PII audit chokepoints every other per-device device-page route uses.
-    void register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn, const DexApi* dex_api,
-                         const GuardianApi* guardian_api, AuditFn audit_fn = {});
+    void register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn, DexApiPtr dex_api,
+                         GuardianApiPtr guardian_api, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no
     /// httplib acceptor, the #438 TSan trap). The httplib::Server& overload
     /// wraps + delegates.
-    void register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn, const DexApi* dex_api,
-                         const GuardianApi* guardian_api, AuditFn audit_fn = {});
+    void register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn, DexApiPtr dex_api,
+                         GuardianApiPtr guardian_api, AuditFn audit_fn = {});
 
 private:
     ScopedPermFn scoped_perm_fn_;
-    const DexApi* dex_api_ = nullptr;
-    const GuardianApi* guardian_api_ = nullptr;
+    DexApiPtr dex_api_;
+    GuardianApiPtr guardian_api_;
     AuditFn audit_fn_;
 };
 
