@@ -58,8 +58,11 @@ class CommandRequest;
 // Forward-declared rather than #include-d: these live under agents/core/src/
 // (agent-internal implementation headers), and no header under
 // agents/core/include/yuzu/agent/ has ever crossed that boundary - this stays
-// consistent. Only used here as std::function<SendResult(const OutboxEntry&)>
-// parameter types, which do not need complete types to declare (only to call).
+// consistent. Only used here as std::function<SendResult(const OutboxEntry&)> /
+// std::function<LegacySendOutcome(const GuaranteedStateEvent&)> (EventSink, #4783)
+// parameter types, which do not need complete types to declare (only to call) -
+// an enum class with a fixed underlying type is itself a complete type once
+// forward-declared this way, so LegacySendOutcome can appear by value in EventSink.
 namespace yuzu::agent {
 class SparkEngine;
 class GuardianSparkRuntime;
@@ -72,8 +75,10 @@ struct GuardianJournalAgeStats;
 struct GuardianArmStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
+class GuardianLegacySinkExecutor;
 struct OutboxEntry;
 enum class SendResult;
+enum class LegacySendOutcome : std::uint8_t;
 } // namespace yuzu::agent
 
 namespace yuzu::agent {
@@ -269,8 +274,13 @@ public:
     /// the Subscribe stream is open and BEFORE any push arrives, so a guard started
     /// by apply_rules captures a live sink. The sink writes a
     /// CommandResponse{plugin:"__guard__", action:"event", payload:<event>} on the
-    /// stream. Guards capture a copy at start, so this is set-once-then-read.
-    using EventSink = std::function<void(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
+    /// stream and reports the delivery outcome (#4783: Sent / LinkDown / WriteFailed)
+    /// so a failed Write() is countable instead of silently swallowed. Guards capture
+    /// a copy at start, so this is set-once-then-read. Called ONLY from
+    /// legacy_sink_executor_'s own detached worker, never from a guard's own thread
+    /// or from emit_guard_event() directly - see guardian_legacy_sink_executor.hpp.
+    using EventSink =
+        std::function<LegacySendOutcome(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
     void set_event_sink(EventSink sink);
 
     /// Replace (full_sync=true) or merge (full_sync=false) the active
@@ -527,6 +537,30 @@ public:
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
 
+    /// TEST-ONLY (#4783): direct access to the legacy-sink executor itself, for its
+    /// own test seams (pending_count_for_test/pending_bytes_for_test/stats()/
+    /// active_worker_count()/etc - see guardian_legacy_sink_executor.hpp). No
+    /// production caller; production code funnels through emit_guard_event()/stop()/
+    /// active_io_workers() only, never this accessor. A test using this must
+    /// `#include "guardian_legacy_sink_executor.hpp"` itself for the complete type -
+    /// this header only forward-declares it.
+    [[nodiscard]] GuardianLegacySinkExecutor& legacy_sink_executor_for_test() const;
+
+    /// TEST-ONLY (#4783): true once the legacy-sink executor's queue is IDLE (empty
+    /// && nothing in flight) within `timeout` - see
+    /// GuardianLegacySinkExecutor::wait_idle_for_test's own doc comment for why this
+    /// is NOT the same as physical worker retirement (retire_legacy_sink_workers_for_test
+    /// below is that seam). Use this to make a delivery assertion deterministic
+    /// instead of racing the detached worker.
+    [[nodiscard]] bool flush_legacy_sink_for_test(std::chrono::milliseconds timeout) const;
+
+    /// TEST-ONLY (#4783): true once every legacy-sink executor worker has PHYSICALLY
+    /// retired (active_worker_count()==0) within `timeout`. Call this - not just
+    /// flush_legacy_sink_for_test above - before any fixture/capture a sink's SendFn
+    /// still references destructs (plan hygiene rule 6): a worker can remain
+    /// momentarily alive even after the queue reports idle.
+    [[nodiscard]] bool retire_legacy_sink_workers_for_test(std::chrono::milliseconds timeout) const;
+
 private:
     KvStore* kv_;
     std::string agent_id_;
@@ -690,10 +724,15 @@ private:
     void rollback_spark_wiring_locked(SparkEngine* engine, bool registered,
                                       std::uint64_t consumer_id);
 
-    /// Build a GuaranteedStateEvent from a guard's drift report and ship it to
-    /// the current event sink. Called from guard worker threads, so it takes
-    /// ONLY sink_mtx_ (never mtx_): guards may fire during apply_rules / stop
-    /// which hold mtx_, and taking mtx_ here would deadlock the stop-join.
+    /// Build a GuaranteedStateEvent from a guard's drift report and ENQUEUE it on
+    /// legacy_sink_executor_ for delivery on a detached worker (#4783) - the
+    /// hand-off itself (offer()) never blocks on network I/O and never throws;
+    /// everything BEFORE that hand-off (the event_id string build, the
+    /// health-detail JSON encode, the EventSink copy) keeps whatever throw surface
+    /// it already had - this function is not newly noexcept overall, only the
+    /// final hand-off is. Called from guard worker threads, so it takes ONLY
+    /// sink_mtx_ (never mtx_): guards may fire during apply_rules / stop which
+    /// hold mtx_, and taking mtx_ here would deadlock the stop-join.
     void emit_guard_event(const GuardDrift& drift);
 
     // Test seam: drift emission is otherwise reachable only through an armed
@@ -711,6 +750,12 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// #4783: count of emit_guard_event() calls that bailed because no sink was wired
+    /// yet (event_sink_ null - the pre-network-arm A3 drop, unchanged semantics).
+    /// Previously a silent, uncounted return; now countable so "the sink was never
+    /// wired" is distinguishable from "wired and delivered". No production consumer
+    /// yet (that is commit 4's heartbeat-tag wiring); read directly in tests.
+    std::atomic<std::uint64_t> legacy_sink_dropped_unwired_{0};
     /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
     /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
@@ -736,6 +781,18 @@ private:
     /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
     /// file-hash-equals arm attempt has run yet.
     bool last_file_on_baseline_wired_for_test_{false};
+
+    /// #4783: the detached, bounded, FIFO, gap-accounting sender legacy guard
+    /// producers' events are enqueued on (emit_guard_event() -> offer()). Constructed
+    /// UNCONDITIONALLY in the constructor (always live, regardless of prefer_spark_ -
+    /// the legacy IGuard path is the one this executor exists for). Declared BEFORE
+    /// guards_ deliberately: a guard's own worker thread may still call
+    /// emit_guard_event() -> offer() during its OWN stop() (stop_all_guards_locked()
+    /// joins guards_ one at a time, and an in-flight report on guard N+1 can still be
+    /// racing that join while guard N's teardown is offer()-ing its own final event),
+    /// so this executor must outlive every guards_ entry - reverse-declaration-order
+    /// destruction means a member declared here is destroyed AFTER guards_.
+    std::unique_ptr<GuardianLegacySinkExecutor> legacy_sink_executor_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported

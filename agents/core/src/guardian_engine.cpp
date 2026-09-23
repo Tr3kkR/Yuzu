@@ -38,6 +38,7 @@
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
+#include "guardian_legacy_sink_executor.hpp" // #4783: detached legacy-sink sender
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
 #include "guardian_rule_eval.hpp" // clamp_max_hash_bytes, kMaxFileHashBytes (#2233 item 6)
@@ -430,18 +431,31 @@ std::string make_rule_key(std::string_view rule_id) {
 } // namespace
 
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
-    : kv_{kv}, agent_id_{std::move(agent_id)}, prefer_spark_{prefer_spark},
-      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+    : kv_{kv}, agent_id_{std::move(agent_id)},
+      legacy_sink_executor_{std::make_unique<GuardianLegacySinkExecutor>()},
+      prefer_spark_{prefer_spark}, ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
     // Workers call emit_guard_event(), which reads THIS engine's own
     // event_sink_/sink_mtx_/event_seq_ — GuardianEngine members, so they outlive
-    // this join regardless of declaration order. NOTE (H4 / #1209): the sink
-    // callback also reaches AgentImpl-side state (stream_write_mu_ +
-    // guardian_sink_stream_); that is kept safe by AgentImpl declaring `guardian_`
-    // AFTER those members (engine tears down — and joins — first) and by
-    // AgentImpl::stop() joining guards before its own teardown. stop() is idempotent.
+    // this join regardless of declaration order.
+    //
+    // #4783 UPDATE: that join is now prompt — emit_guard_event() only enqueues onto
+    // legacy_sink_executor_ (offer() never blocks on network I/O), so a guard's own
+    // detection thread no longer parks inside a stalled Write() and stop_all_guards_
+    // locked()'s join is no longer at the mercy of the network. What this join no
+    // longer bounds is the AgentImpl-side sink state (stream_write_mu_ +
+    // guardian_sink_stream_, H4 / #1209): the actual send now runs on
+    // legacy_sink_executor_'s own DETACHED worker, which this stop() call does not
+    // join and which can outlive both this engine and the AgentImpl instance that
+    // owns those members. Safety for that no longer rests on thread-join ordering —
+    // it rests on the orphan-exit contract instead: legacy_sink_executor_->
+    // active_worker_count() is summed into active_io_workers() (below), and
+    // main.cpp/service_win.cpp's hard_exit.hpp guard refuses normal C++ teardown of
+    // AgentImpl while that count is nonzero, hard_exit()ing instead after a bounded
+    // grace — exactly the same contract guardian_outbox_send_executor.hpp's Spark
+    // send executor already relies on, not a join. stop() is idempotent.
     stop();
 }
 
@@ -653,6 +667,18 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
+    // #4783: stop legacy_sink_executor_ from admitting NEW sends only AFTER the
+    // guards above have joined — by the time stop_all_guards_locked() returns, every
+    // guard's own detection thread has already made its last emit_guard_event() call
+    // (offer() never blocks, so nothing here is actually waiting ON a guard thread;
+    // this is purely about ordering the two teardown steps). This does NOT flush the
+    // backlog: any event still QUEUED (not yet in flight) at this point is DISCARDED
+    // by the executor's own stop(), counted via its discarded_at_stop stat — only a
+    // send already IN FLIGHT is left running, detached, covered by the orphan-exit
+    // accounting active_io_workers() sums below. See
+    // guardian_legacy_sink_executor.hpp's own stop() doc comment for the full
+    // contract; never blocks.
+    legacy_sink_executor_->stop();
     // F7: stop() is terminal - nothing reconciles again afterward, so there is no
     // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
     // precisely instead). Blanket-clearing here just keeps a heartbeat composed
@@ -1504,17 +1530,22 @@ void GuardianEngine::set_event_sink(EventSink sink) {
 }
 
 void GuardianEngine::emit_guard_event(const GuardDrift& d) {
-    // Snapshot the sink under sink_mtx_, then release BEFORE the (potentially
-    // blocking) network send — never hold the lock across the sink call, and
-    // never take mtx_ here (a guard worker can fire while apply_rules/stop hold
+    // Snapshot the sink under sink_mtx_, then release BEFORE handing off to
+    // legacy_sink_executor_ (#4783) — never hold the lock any longer than needed,
+    // and never take mtx_ here (a guard worker can fire while apply_rules/stop hold
     // mtx_ and join this thread).
     EventSink sink;
     {
         std::lock_guard lock(sink_mtx_);
         sink = event_sink_;
     }
-    if (!sink)
-        return; // sink not wired yet (pre-network arm) — drop; durable buffering is A3
+    if (!sink) {
+        // sink not wired yet (pre-network arm) — drop; durable buffering is A3.
+        // #4783: now COUNTED (previously a silent return) so "never wired" is
+        // distinguishable from "wired and delivered/lost".
+        ++legacy_sink_dropped_unwired_;
+        return;
+    }
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -1575,7 +1606,29 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
 #else
     ev.set_platform("linux");
 #endif
-    sink(ev);
+    // #4783: enqueue-only from here — offer() itself never blocks on network I/O and
+    // never throws (an escaping exception from THIS specific call would end the
+    // calling guard's detection loop permanently, see guard_file.cpp's outer catch);
+    // everything ABOVE this line keeps whatever throw surface it already had.
+    // Delivery, loss accounting and the sticky per-rule integrity gap are
+    // legacy_sink_executor_'s job from here — see guardian_legacy_sink_executor.hpp.
+    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink));
+}
+
+// #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
+// take mtx_: legacy_sink_executor_ is set once at construction and never reset, and
+// every method they delegate to is the executor's OWN thread-safe surface — no
+// GuardianEngine-owned state is touched, so there is nothing here for mtx_ to guard.
+GuardianLegacySinkExecutor& GuardianEngine::legacy_sink_executor_for_test() const {
+    return *legacy_sink_executor_;
+}
+
+bool GuardianEngine::flush_legacy_sink_for_test(std::chrono::milliseconds timeout) const {
+    return legacy_sink_executor_->wait_idle_for_test(timeout);
+}
+
+bool GuardianEngine::retire_legacy_sink_workers_for_test(std::chrono::milliseconds timeout) const {
+    return legacy_sink_executor_->wait_workers_retired_for_test(timeout);
 }
 
 void GuardianEngine::stop_all_guards_locked() {
@@ -2252,16 +2305,23 @@ std::size_t GuardianEngine::active_io_workers() const {
     // (guardian_outbox_send_executor.hpp) - its `send` callback captures AgentImpl
     // state directly and is safe ONLY because this sum is what keeps main.cpp /
     // service_win.cpp from tearing that state down while a send is still detached
-    // and running (see guardian_outbox_drain_worker.hpp's class doc). All three
-    // must be summed here: this is the orphan-exit contract's sole source of truth
-    // (hard_exit.hpp / guardian_io_executor.hpp) - main.cpp/service_win.cpp refuse
-    // normal C++ teardown while this is nonzero, and a source left out of the sum
-    // would let a detached worker survive teardown undetected.
+    // and running (see guardian_outbox_drain_worker.hpp's class doc). #4783 adds a
+    // FOURTH: legacy_sink_executor_'s own detached sender for the legacy IGuard
+    // producers' events - always live (constructed unconditionally, not gated on
+    // prefer_spark_), and its injected `send` callback reaches AgentImpl state the
+    // exact same way (guardian_sink_stream_ + stream_write_mu_ via emit_guardian_
+    // event()). All FOUR must be summed here: this is the orphan-exit contract's
+    // sole source of truth (hard_exit.hpp / guardian_io_executor.hpp) -
+    // main.cpp/service_win.cpp refuse normal C++ teardown while this is nonzero, and
+    // a source left out of the sum would let a detached worker survive teardown
+    // undetected. legacy_sink_executor_->active_worker_count() takes only its OWN
+    // internal lock (never mtx_), so this stays mtx_ -> executor-mu, non-invertible.
     std::size_t n = spark_reader_ ? spark_reader_->active_io_workers() : 0;
     if (spark_runtime_)
         n += spark_runtime_->active_backend_op_workers();
     if (spark_drain_worker_)
         n += spark_drain_worker_->active_send_workers();
+    n += legacy_sink_executor_->active_worker_count();
     return n;
 }
 
