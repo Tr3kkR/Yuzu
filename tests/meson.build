@@ -2252,6 +2252,20 @@ test('proto gen_proto version check',
   timeout: 30,
 )
 
+# ── Gateway build wrapper ──────────────────────────────────────────────────
+# scripts/build_gateway.py (+ the shared erlang_toolchain.py) driven with a
+# fake Python child — no Erlang needed, so it runs on every leg, including the
+# Windows one whose stdio/timeout/Ctrl-C behaviour it mostly pins. ~51s
+# measured (Windows and Linux); several cases deliberately wait out a
+# grandchild to prove the whole tree was killed, so the timeout leaves room
+# for a loaded shared runner box.
+test('gateway build wrapper',
+  _python3_test,
+  args: [files('test_build_gateway.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
