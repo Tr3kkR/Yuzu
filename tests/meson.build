@@ -309,6 +309,7 @@ agent_test_exe = executable(
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
     'unit/test_guardian_outbox_send_executor.cpp',
+    'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_guardian_arm_ack.cpp',
