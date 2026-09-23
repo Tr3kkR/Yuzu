@@ -279,7 +279,8 @@ factorial(0) -> 1.
 | `ctx` dependency | `ctx:background/0` is a transitive dep of `grpcbox` but called directly; dialyzer can't find it in the PLT | List `ctx` in `yuzu_gw.app.src` `applications`. **Rule: if you call a function from a transitive dep, add it to applications.** |
 | `prometheus_httpd` | `start/1` does not exist | Use `start/0` with `application:set_env` |
 | `prometheus_httpd` | First scrape returns 500 | Call `application:ensure_all_started(prometheus_httpd)` before first scrape |
-| `rebar3 ct` | Suite not found | Always pass `--dir apps/yuzu_gw/test` with `--suite` flags |
+| `prometheus_text_format` | EVERY scrape returns 500 (`badarg` in `escape_string/2`) | A non-ASCII char in a metric `{help, ...}` string (#4707) — keep HELP text ASCII-only |
+| `rebar3 ct` | Suite not found, or `All 0 tests passed.` with rc 0 | Always pass `--dir apps/yuzu_gw/test/ct` — CT suites live there and ct does not recurse, so `--dir apps/yuzu_gw/test` (or no `--dir`) silently runs zero suites (#4800) |
 | `gen_server:stop` vs `exit(Pid, shutdown)` | `exit(Pid, shutdown)` is async; `timer:sleep(50)` guesses are racy on WSL2 | Use synchronous `gen_server:stop(Pid, shutdown, 5000)` in test cleanup (#336) |
 | `spawn_monitor` inside gen_server handle_cast | Child processes outlive their parent gen_server after `exit/shutdown`, continue running mocked RPCs, leak log lines into later test modules | `gen_server:stop` (which calls `terminate/2` and waits) is still only half the fix — if handlers spawn unlinked children, the cleanup must track and kill them explicitly |
 | Proto compat | Erlang gpb vs C++ protoc | Validate field numbers and types match across both codegen outputs |
