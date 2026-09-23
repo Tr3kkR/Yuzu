@@ -13,9 +13,16 @@
  * partial-coverage precedent): `apps`/`app_fleet_trend`/`app_version_devices`/
  * `device_app_perf_json`/`device_app_summaries`/`fleet_snapshot` are
  * parity-tested against seeded B1/B2 data. `group_trend`/`tag_trend` are
- * covered for the null-reader/null-store degrade only in this slice (full
- * ManagementGroupStore/TagStore seeding is exercised indirectly by
- * `AppPerfGroupReader`'s own test suite, which this seam calls unchanged).
+ * covered for the null-reader/null-store degrade AND, since the sec-1/qa-2
+ * governance follow-up, for the REAL member-resolution + kDexCohortFloor
+ * composition — seeding a live ManagementGroupStore/TagStore + AppPerfDailyStore
+ * + AppPerfGroupReader through LocalDexPerfApi itself, proving a sub-floor
+ * named group/tagged cohort is floored (count only) and an at-floor one is
+ * not, at the SAME seam the route-level test double
+ * (`test_dex_routes.cpp`'s "kDexCohortFloor suppresses a sub-floor point")
+ * re-implements the floor over. `AppPerfGroupReader`'s own member-filter SQL
+ * correctness (the ANY($1::text[]) filter, the histogram aggregate) stays
+ * `test_app_perf_group_reader.cpp`'s job — not re-proven here.
  * The REST/MCP consumer rewire landed in the same change as this seam (see
  * `dex_perf_api.hpp`'s "Consumer rewire status" note); the dashboard
  * fragments were rewired in a follow-up (#4626, GAP-2 added
@@ -54,6 +61,9 @@ using yuzu::server::AppPerfGroupReader;
 using yuzu::server::AppPerfRollup;
 using yuzu::server::DexPerfSnapshot;
 using yuzu::server::make_local_dex_perf_api;
+using yuzu::server::ManagementGroup;
+using yuzu::server::ManagementGroupStore;
+using yuzu::server::TagStore;
 using yuzu::server::pg::PgPool;
 
 namespace {
@@ -65,6 +75,14 @@ yuzu::test::PgTestTemplate dex_perf_api_tpl{"dexperfapi", [](const std::string& 
     AppPerfRollup rollup{pool};
     if (!daily.is_open() || !fleet.is_open())
         throw std::runtime_error("dexperfapi template: store failed to migrate");
+    // Pre-migrated for the group_trend()/tag_trend() real-impl floor test
+    // below (LocalDexPerfApi::group_trend resolves members via
+    // ManagementGroupStore, tag_trend via TagStore, BEFORE the B1 aggregate
+    // read) — additive, harmless to every other test using this template.
+    ManagementGroupStore mgmt{pool};
+    TagStore tags{pool};
+    if (!mgmt.is_open() || !tags.is_open())
+        throw std::runtime_error("dexperfapi template: mgmt/tag store failed to migrate");
 }};
 
 std::int64_t today_utc() {
@@ -282,10 +300,108 @@ TEST_CASE("DexPerfApi fleet_snapshot() empty-DexPerfFn degrade", "[dex_perf_api]
 }
 
 TEST_CASE("DexPerfApi group_trend()/tag_trend() null-reader degrade", "[dex_perf_api]") {
-    // Full ManagementGroupStore/TagStore seeding is exercised by
-    // AppPerfGroupReader's own suite (test_app_perf_group_reader.cpp), which
-    // this seam's group_trend/tag_trend call unchanged — see the file banner.
+    // The REAL group_trend()/tag_trend() composition (ManagementGroupStore/
+    // TagStore member resolution + AppPerfGroupReader aggregate + the SAME
+    // kDexCohortFloor gate app_fleet_trend uses) is exercised below, in
+    // "DexPerfApi group_trend()/tag_trend() REAL member resolution +
+    // kDexCohortFloor" — this case covers only the null-reader/null-store
+    // degrade path.
     auto api = make_local_dex_perf_api({}, nullptr, nullptr, nullptr, nullptr, nullptr);
     CHECK_FALSE(api->group_trend("g1", "chrome.exe", "124.0.0.0").has_value());
     CHECK_FALSE(api->tag_trend("model", "laptop-x", "chrome.exe", "124.0.0.0").has_value());
+}
+
+// Real-impl PG coverage for group_trend()/tag_trend() — the seam's OWN
+// ManagementGroupStore::get_members()/TagStore::agents_with_tag() member
+// resolution + AppPerfGroupReader::get_group_trend() aggregate + the SAME
+// kDexCohortFloor gate app_fleet_trend applies, all exercised through
+// LocalDexPerfApi (not a raw AppPerfGroupReader/store call, and not the
+// FnDexPerfApi test double the route-level floor test
+// (test_dex_routes.cpp's "kDexCohortFloor suppresses a sub-floor point")
+// re-implements the floor over). Closes the gap sec-1/qa-2 flagged: the real
+// LocalDexPerfApi::group_trend/tag_trend composition previously had zero PG
+// coverage of its own.
+TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCohortFloor",
+         "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfGroupReader reader{pool};
+    ManagementGroupStore mgmt{pool};
+    TagStore tags{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(mgmt.is_open());
+    REQUIRE(tags.is_open());
+
+    auto api = make_local_dex_perf_api({}, nullptr, &b1, &reader, &mgmt, &tags);
+    const std::int64_t day = today_utc() - 86400;
+
+    SECTION("group_trend: sub-floor member count suppresses (count only, metrics withheld)") {
+        ManagementGroup g;
+        g.name = "SubFloorGroup";
+        g.membership_type = "static";
+        auto group_id = mgmt.create_group(g);
+        REQUIRE(group_id.has_value());
+        // 3 members — below kDexCohortFloor (10).
+        for (const char* a : {"gsub-1", "gsub-2", "gsub-3"}) {
+            REQUIRE(mgmt.add_member(*group_id, a).has_value());
+            seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 5.0, 100000000);
+        }
+        auto trend = api->group_trend(*group_id, "chrome.exe", "124.0.0.0");
+        REQUIRE(trend.has_value());
+        REQUIRE(!trend->empty());
+        CHECK((*trend)[0].device_count == 3);
+        CHECK((*trend)[0].suppressed);
+        // Suppressed clears the exact mean — the real single-device value
+        // (5.0%) must never reach a caller for a sub-floor named group.
+        CHECK((*trend)[0].cpu_mean == 0.0);
+    }
+
+    SECTION("group_trend: at-floor member count passes (real metrics visible)") {
+        ManagementGroup g;
+        g.name = "AtFloorGroup";
+        g.membership_type = "static";
+        auto group_id = mgmt.create_group(g);
+        REQUIRE(group_id.has_value());
+        // 10 members == kDexCohortFloor: passes, not suppressed.
+        for (int i = 0; i < 10; ++i) {
+            const std::string a = "gfloor-" + std::to_string(i);
+            REQUIRE(mgmt.add_member(*group_id, a).has_value());
+            seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 8.0, 100000000);
+        }
+        auto trend = api->group_trend(*group_id, "chrome.exe", "124.0.0.0");
+        REQUIRE(trend.has_value());
+        REQUIRE(!trend->empty());
+        CHECK((*trend)[0].device_count == 10);
+        CHECK_FALSE((*trend)[0].suppressed);
+        CHECK((*trend)[0].cpu_mean > 0.0); // real mean survives once at floor
+    }
+
+    SECTION("tag_trend: sub-floor tagged cohort suppresses (count only, metrics withheld)") {
+        for (const char* a : {"tsub-1", "tsub-2"}) {
+            REQUIRE(tags.set_tag(a, "model", "Latitude5420").has_value());
+            seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 6.0, 100000000);
+        }
+        auto trend = api->tag_trend("model", "Latitude5420", "chrome.exe", "124.0.0.0");
+        REQUIRE(trend.has_value());
+        REQUIRE(!trend->empty());
+        CHECK((*trend)[0].device_count == 2);
+        CHECK((*trend)[0].suppressed);
+        CHECK((*trend)[0].cpu_mean == 0.0);
+    }
+
+    SECTION("tag_trend: at-floor tagged cohort passes (real metrics visible)") {
+        for (int i = 0; i < 10; ++i) {
+            const std::string a = "tfloor-" + std::to_string(i);
+            REQUIRE(tags.set_tag(a, "model", "Latitude7420").has_value());
+            seed_b1(b1, a, "chrome.exe", "124.0.0.0", day, 12.0, 100000000);
+        }
+        auto trend = api->tag_trend("model", "Latitude7420", "chrome.exe", "124.0.0.0");
+        REQUIRE(trend.has_value());
+        REQUIRE(!trend->empty());
+        CHECK((*trend)[0].device_count == 10);
+        CHECK_FALSE((*trend)[0].suppressed);
+        CHECK((*trend)[0].cpu_mean > 0.0);
+    }
 }
