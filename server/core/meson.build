@@ -494,6 +494,7 @@ yuzu_server_core_lib = static_library(
     'src/compliance_routes.cpp',
     'src/policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin — outside the seam)
     'src/guardian_routes.cpp',
+    'src/guardian_benchmark.cpp',
     'src/dex_routes.cpp',
     'src/dex_read_model.cpp',
     'src/execution_statistics_model.cpp', # #2146 Batch B3 -- shared REST+MCP builder (Rule 1)

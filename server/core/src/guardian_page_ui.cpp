@@ -800,6 +800,70 @@ extern const char* const kGuardianDetailPageHtml =
   </script>
 )HTM"
     R"HTM(
+<script>
+var benchmarkOffset = 0;
+function benchmarkFilter(reset) {
+  var search = document.getElementById('bm-search');
+  if (!search) return;
+  if (reset !== false) benchmarkOffset = 0;
+  var query = search.value.toLowerCase().trim();
+  var profile = document.getElementById('bm-profile').value;
+  var section = document.getElementById('bm-section').value;
+  var status = document.getElementById('bm-status').value;
+  var cards = Array.from(document.querySelectorAll('.bm-card'));
+  var eligible = cards.filter(function(c) {
+    return (profile === 'all' || c.dataset.profile === profile) && (!section || c.dataset.section === section);
+  });
+  var matches = eligible.filter(function(c) {
+    var text = c.textContent + ' ' + c.querySelector('[name=value]').value + ' ' + c.querySelector('[name=rationale]').value;
+    return (!status || c.dataset.status === status) && (!query || text.toLowerCase().includes(query));
+  });
+  benchmarkOffset = Math.max(0, Math.min(benchmarkOffset, Math.floor(Math.max(0, matches.length - 1) / 10) * 10));
+  cards.forEach(function(c) { c.style.display = 'none'; });
+  matches.slice(benchmarkOffset, benchmarkOffset + 10).forEach(function(c) { c.style.display = ''; });
+  var reviewed = eligible.filter(function(c) { return c.dataset.status !== 'proposed'; }).length;
+  document.getElementById('bm-count').textContent = (matches.length ? 'Showing ' + (benchmarkOffset + 1) + '–' + Math.min(benchmarkOffset + 10, matches.length) : 'No matching controls') +
+    ' of ' + matches.length + ' controls. ' + reviewed + ' of ' + eligible.length + ' decisions reviewed in this scope.';
+  document.getElementById('bm-prev').disabled = benchmarkOffset === 0;
+  document.getElementById('bm-next').disabled = benchmarkOffset + 10 >= matches.length;
+}
+function benchmarkBatch(delta) { benchmarkOffset += delta * 10; benchmarkFilter(false); }
+function benchmarkDirty(input) {
+  var card = input.closest('.bm-card'); card.dataset.dirty = 'true';
+  card.querySelector('.bm-save-status').textContent = 'Unsaved changes';
+}
+function benchmarkOpenSummary(event) {
+  if (!document.querySelector('.bm-card[data-dirty="true"]')) return true;
+  event.preventDefault();
+  showToast('Save your edited decisions before opening the summary.', 'error');
+  return false;
+}
+async function benchmarkSave(button) {
+  var card = button.closest('.bm-card'), notice = card.querySelector('.bm-save-status');
+  var fields = Array.from(card.querySelectorAll('textarea,select'));
+  var body = {expected_revision: Number(card.dataset.revision), catalog_revision: Number(card.dataset.catalog),
+    value: card.querySelector('[name=value]').value, rationale: card.querySelector('[name=rationale]').value,
+    status: card.querySelector('[name=status]').value};
+  button.disabled = true; fields.forEach(function(f) { f.disabled = true; }); notice.textContent = 'Saving…';
+  try {
+    var response = await fetch(card.dataset.api, {method:'PUT', credentials:'same-origin',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    var result = await response.json();
+    if (!response.ok) throw new Error(response.status === 409 ? 'This record changed. Reload before saving; keep a copy of your edits.' :
+      (typeof result.error === 'string' ? result.error : result.error?.message) || 'Save failed (' + response.status + ').');
+    card.dataset.revision = result.data.revision; card.dataset.status = result.data.status; card.dataset.dirty = 'false';
+    card.querySelector('.bm-decision-state').textContent = result.data.status;
+    notice.textContent = 'Saved. Endpoint settings unchanged.';
+    benchmarkFilter(false);
+  } catch (error) { notice.textContent = error.message; }
+  finally { button.disabled = false; fields.forEach(function(f) { f.disabled = false; }); }
+}
+document.addEventListener('DOMContentLoaded', function() { benchmarkFilter(); });
+document.addEventListener('htmx:afterSettle', function() { benchmarkFilter(); });
+window.addEventListener('beforeunload', function(e) {
+  if (document.querySelector('.bm-card[data-dirty="true"]')) { e.preventDefault(); e.returnValue = ''; }
+});
+</script>
 </body>
 </html>
 )HTM";

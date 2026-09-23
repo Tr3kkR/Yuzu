@@ -289,6 +289,8 @@ const std::vector<pg::PgMigration>& migrations() {
             CREATE TABLE guaranteed_state_rules (
                 rule_id          TEXT PRIMARY KEY,
                 name             TEXT NOT NULL UNIQUE,
+                description      TEXT NOT NULL DEFAULT '',
+                rationale        TEXT NOT NULL DEFAULT '',
                 yaml_source      TEXT NOT NULL,
                 version          BIGINT NOT NULL DEFAULT 1,
                 enabled          BOOLEAN NOT NULL DEFAULT TRUE,
@@ -431,9 +433,9 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         "INSERT INTO guaranteed_state_store.guaranteed_state_rules "
         "(rule_id, name, yaml_source, version, enabled, enforcement_mode, severity, os_target, "
         " scope_expr, signature, created_at, updated_at, created_by, updated_by, spec_json, "
-        " prerequisites) "
+        " prerequisites, description, rationale) "
         "VALUES ($1,$2,$3,$4::bigint,$5::boolean,$6,$7,$8,$9,decode($10,'hex'),$11,$12,$13,$14,"
-        "$15,$16)",
+        "$15,$16,$17,$18)",
         std::vector<std::optional<std::string>>{
             row.rule_id, row.name, row.yaml_source, std::to_string(row.version),
             std::string(row.enabled ? "true" : "false"), row.enforcement_mode, row.severity,
@@ -441,7 +443,7 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
             row.signature.empty() ? std::nullopt
                                   : std::optional<std::string>(bytes_to_hex(row.signature)),
             row.created_at, row.updated_at, row.created_by, row.updated_by, row.spec_json,
-            row.prerequisites});
+            row.prerequisites, row.description, row.rationale});
     if (res.status() != PGRES_COMMAND_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
@@ -476,14 +478,15 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
         "name = $1, yaml_source = $2, version = $3::bigint, enabled = $4::boolean, "
         "enforcement_mode = $5, severity = $6, os_target = $7, scope_expr = $8, "
         "signature = decode($9,'hex'), updated_at = $10, updated_by = $11, spec_json = $12, "
-        "prerequisites = $13 WHERE rule_id = $14 RETURNING rule_id",
+        "prerequisites = $13, description = $15, rationale = $16 WHERE rule_id = $14 RETURNING rule_id",
         std::vector<std::optional<std::string>>{
             row.name, row.yaml_source, std::to_string(row.version),
             std::string(row.enabled ? "true" : "false"), row.enforcement_mode, row.severity,
             row.os_target, row.scope_expr,
             row.signature.empty() ? std::nullopt
                                   : std::optional<std::string>(bytes_to_hex(row.signature)),
-            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id});
+            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id,
+            row.description, row.rationale});
     if (res.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
@@ -568,7 +571,7 @@ namespace {
 constexpr const char* kRuleCols =
     "rule_id, name, yaml_source, version, enabled, enforcement_mode, severity, os_target, "
     "scope_expr, encode(signature,'hex'), created_at, updated_at, created_by, updated_by, "
-    "spec_json, prerequisites";
+    "spec_json, prerequisites, description, rationale";
 
 GuaranteedStateRuleRow read_rule_row(PGresult* res, int i) {
     GuaranteedStateRuleRow r;
@@ -589,6 +592,8 @@ GuaranteedStateRuleRow read_rule_row(PGresult* res, int i) {
     r.updated_by = text_col(res, i, c++);
     r.spec_json = text_col(res, i, c++);
     r.prerequisites = text_col(res, i, c++);
+    r.description = text_col(res, i, c++);
+    r.rationale = text_col(res, i, c++);
     return r;
 }
 } // namespace

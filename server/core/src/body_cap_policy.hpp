@@ -426,6 +426,15 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"PUT", "/api/v1/guaranteed-state/rules/", 16u * 1024 * 1024, false,
      "guardian_rule_authoring"},
 
+    // Benchmark catalog imports and decision updates under the baseline id.
+    // guardian_benchmark.cpp rejects the RAW JSON body above kCatalogBytes
+    // (4 MiB), so this matches the actual request contract without a decoding
+    // margin. The segment-boundary prefix includes both regex route suffixes.
+    // Other methods retain their existing catch-all contract; these are the
+    // only body-bearing public baseline routes registered by this helper.
+    {"PUT", "/api/v1/guaranteed-state/baselines/", 4u * 1024 * 1024, false,
+     "guardian_benchmark_authoring"},
+
     // POST /api/workflows — workflow authoring from a YAML bundle
     // (workflow_routes.cpp:1023). Same "no aggregate contract yet" shape as
     // guardian rule authoring above — deliberate, generous, explicit.

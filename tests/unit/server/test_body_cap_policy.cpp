@@ -140,6 +140,9 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/guaranteed-state/rules",          16u * 1024 * 1024,  false, "guardian_rule_authoring"},
     // rest_api_v1.cpp:7904 regex PUT update — same class, same bound.
     {"PUT",    "/api/v1/guaranteed-state/rules/rule-1",   16u * 1024 * 1024,  false, "guardian_rule_authoring"},
+    // guardian_benchmark.cpp caps the raw JSON body at 4 MiB.
+    {"PUT",    "/api/v1/guaranteed-state/baselines/b1/benchmark", 4u * 1024 * 1024, false, "guardian_benchmark_authoring"},
+    {"PUT",    "/api/v1/guaranteed-state/baselines/b1/benchmark/decisions/1.1", 4u * 1024 * 1024, false, "guardian_benchmark_authoring"},
     // workflow_routes.cpp:1023.
     {"POST",   "/api/workflows",                          16u * 1024 * 1024,  false, "workflow_yaml"},
     // workflow_routes.cpp:1746 / product_pack_store.cpp:122.
@@ -191,6 +194,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "plugin_config",
     "tar_result_set_sql",
     "guardian_rule_authoring",
+    "guardian_benchmark_authoring",
     "workflow_yaml",
     "product_pack_yaml",
     "instruction_import",
@@ -322,7 +326,7 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 28 = mcp(1) +
+    // check while still silently growing the table. 30 = mcp(1) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
     // ca_revoke(1) +
@@ -331,12 +335,22 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // POST/PUT/PATCH) + saml_acs(1) + response_templates(2: POST/PUT) +
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
+    // guardian_benchmark_authoring(1: catalog import + decision update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
     // instruction_yaml(3: save/validate/preview) + upload_session(1: the
     // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
     // secret plane) + hardware(1: the Hardware CI list/record/sync REST v1
     // twin, governance Gate 2) + default(1).
-    CHECK(std::size(kBodyCapTable) == 29);
+    CHECK(std::size(kBodyCapTable) == 30);
+}
+
+TEST_CASE("Benchmark body cap distinguishes the baseline prefix and PUT method", "[body_cap]") {
+    CHECK(resolve_body_cap("PUT", "/api/v1/guaranteed-state/baselines/b1/benchmark").path_class ==
+          "guardian_benchmark_authoring");
+    CHECK(resolve_body_cap("PUT", "/api/v1/guaranteed-state/baselinesevil/b1/benchmark").path_class ==
+          "default");
+    CHECK(resolve_body_cap("GET", "/api/v1/guaranteed-state/baselines/b1/benchmark").path_class ==
+          "default");
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

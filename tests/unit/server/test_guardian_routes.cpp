@@ -34,6 +34,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_route_sink.hpp"
+#include "web_utils.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -48,6 +49,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -118,6 +120,20 @@ struct AuditRecord {
     std::string detail;
 };
 
+// Original fictional application data; not derived from a third-party benchmark.
+nlohmann::json benchmark_test_catalog() {
+    return {{"expected_revision", 0}, {"catalog", {
+        {"name", "Example application settings"}, {"version", "1.0"},
+        {"controls", nlohmann::json::array({{
+            {"control_id", "demo.cache.1"}, {"title", "Demo cache slots <script>alert(1)</script>"},
+            {"profile", "L1"}, {"benchmark_value", "7 or more"}, {"suggested_value", "7"},
+            {"suggested_rationale", "Example cache capacity for a fictional application"},
+            {"sources", nlohmann::json::array({{{"url", "https://example.org/demo-settings"},
+                {"title", "Synthetic example catalog"}, {"kind", "Benchmark"}}})}
+        }})}
+    }}};
+}
+
 struct PushCall {
     std::string scope;
     bool full_sync;
@@ -164,6 +180,7 @@ struct Harness {
     std::string agents_json{"[]"};
 
     std::vector<AuditRecord> audit_log;
+    bool throw_audit{false};
     std::vector<PushCall> pushes;
 
     // Real MetricsRegistry (#4252) so tests can assert on
@@ -222,6 +239,7 @@ struct Harness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) {
+            if (throw_audit) throw std::runtime_error("test audit unavailable");
             audit_log.push_back({action, result, target_id, detail});
         };
         auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
@@ -845,6 +863,378 @@ TEST_CASE("the per-guard drilldown emits a guaranteed_state.rule.view audit-on-o
     // Every other fragment is NOT the worst-disclosure surface and stays
     // un-audited (matches its existing set-and-proceed dashboard-read posture).
     CHECK(h.audit_log.size() == 1);
+}
+
+TEST_CASE("Guardian descriptions and risk rationale render as text on guard and baseline pages",
+          "[pg][guardian_routes][page][metadata]") {
+    Harness h;
+    auto row = make_rule("g1", "Example guard metadata");
+    row.description = "Require signing <script>alert(1)</script> & verification";
+    row.rationale = "Mitigate relay <img src=x onerror=alert(1)> attacks";
+    h.seed_rule(row);
+    h.seed_baseline("bl1", "BL1", {"g1"});
+
+    for (const auto* path : {"/fragments/guardian/guard/g1/page",
+                             "/fragments/guardian/baseline/bl1/page"}) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("Example guard metadata") != std::string::npos);
+        CHECK(res->body.find("Risk rationale") != std::string::npos);
+        CHECK(res->body.find("&lt;script&gt;alert(1)&lt;/script&gt; &amp; verification") != std::string::npos);
+        CHECK(res->body.find("&lt;img src=x onerror=alert(1)&gt;") != std::string::npos);
+        CHECK(res->body.find("<script>alert(1)</script>") == std::string::npos);
+        CHECK(res->body.find("<img src=x onerror=alert(1)>") == std::string::npos);
+    }
+    CHECK(h.pushes.empty()); // Metadata display never dispatches to an endpoint.
+}
+
+TEST_CASE("Guardian form persists description and rationale without changing audit posture",
+          "[pg][guardian_routes][form][metadata]") {
+    Harness h;
+    auto res = h.sink.dispatch("POST", "/fragments/guardian/guards",
+        "name=DescribedGuard&description=Required+configuration&rationale=Reduce+exposure&"
+        "mode=watch&trigger_type=file-exists&file-exists__path=C%3A%5Cconfig.txt",
+        "application/x-www-form-urlencoded");
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    auto rules = h.store->list_rules();
+    REQUIRE(rules.has_value());
+    REQUIRE(rules->size() == 1);
+    CHECK(rules->front().description == "Required configuration");
+    CHECK(rules->front().rationale == "Reduce exposure");
+    CHECK(rules->front().enforcement_mode == "audit");
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Benchmark routes import review and export decisions without deploying policy",
+          "[pg][guardian_routes][benchmark]") {
+    Harness h;
+    h.seed_guard("g1", "Existing guard");
+    h.seed_baseline("bl1", "Existing baseline", {"g1"});
+    REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                            "application/x-www-form-urlencoded")->status == 200);
+    h.pushes.clear();
+    const auto before = h.baselines->get_baseline("bl1");
+    REQUIRE(before);
+    const auto generation = h.store->current_policy_generation();
+    REQUIRE(generation);
+    const auto guard_before = h.store->get_rule("g1");
+    REQUIRE(guard_before);
+    REQUIRE(*guard_before);
+    const std::string api = "/api/v1/guaranteed-state/baselines/bl1/benchmark";
+    REQUIRE(h.sink.Get(api)->status == 404);
+    const auto empty_page = h.sink.Get("/fragments/guardian/baseline/bl1/decisions/page");
+    REQUIRE(empty_page->status == 200);
+    CHECK(empty_page->body.find("No benchmark catalog has been imported.") != std::string::npos);
+    CHECK(empty_page->body.find("import_guardian_benchmark") != std::string::npos);
+    CHECK(h.sink.Get("/fragments/guardian/baseline/missing/decisions/page")->status == 404);
+    auto catalog = benchmark_test_catalog();
+    catalog["catalog"]["controls"][0]["profile"] = "L2";
+    catalog["catalog"]["controls"][0]["research_status"] = "Partial review <unverified>";
+    auto imported = h.sink.Put(api, catalog.dump());
+    REQUIRE(imported);
+    REQUIRE(imported->status == 200);
+    CHECK(nlohmann::json::parse(imported->body)["data"]["catalog_revision"] == 1);
+    auto read = h.sink.Get(api);
+    REQUIRE(read->status == 200);
+    auto document = nlohmann::json::parse(read->body)["data"];
+    CHECK(document["catalog"] == catalog["catalog"]);
+    CHECK(document["decisions"].empty());
+    CHECK(h.sink.Put(api, catalog.dump())->status == 409);
+
+    const std::string decision_path = api + "/decisions/demo.cache.1";
+    nlohmann::json decision{{"value", "7"}, {"rationale", "Example capacity <img src=x onerror=alert(1)>"},
+        {"status", "reviewed"}, {"expected_revision", 0}, {"catalog_revision", 1}};
+    auto saved = h.sink.Put(decision_path, decision.dump());
+    REQUIRE(saved->status == 200);
+    auto saved_data = nlohmann::json::parse(saved->body)["data"];
+    CHECK(saved_data["revision"] == 1);
+    CHECK(saved_data["catalog_revision"] == 1);
+    CHECK(saved_data["updated_by"] == "alice");
+    CHECK(h.sink.Put(decision_path, decision.dump())->status == 409);
+    CHECK(h.sink.Put(api + "/decisions/unknown", decision.dump())->status == 404);
+
+    for (const auto* path : {"/guardian/baseline/bl1/decisions/export",
+                             "/fragments/guardian/baseline/bl1/decisions/page"}) {
+        auto html = h.sink.Get(path);
+        REQUIRE(html->status == 200);
+        CHECK(html->body.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos);
+        CHECK(html->body.find("&lt;img src=x onerror=alert(1)&gt;") != std::string::npos);
+        CHECK(html->body.find("<img src=x onerror=alert(1)>") == std::string::npos);
+    }
+    auto exported = h.sink.Get(api + "/export?format=markdown");
+    REQUIRE(exported->status == 200);
+    CHECK(nlohmann::json::parse(exported->body)["data"]["format"] == "markdown");
+    const auto markdown = nlohmann::json::parse(exported->body)["data"]["content"].get<std::string>();
+    CHECK(markdown.find("<script>alert(1)</script>") == std::string::npos);
+    CHECK(markdown.find("<img src=x onerror=alert(1)>") == std::string::npos);
+    CHECK(markdown.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos);
+    CHECK(markdown.find("&lt;img src=x onerror=alert(1)&gt;") != std::string::npos);
+    CHECK(markdown.find("Level 2 additional hardening") != std::string::npos);
+    CHECK(markdown.find("Research: Partial review &lt;unverified&gt;") != std::string::npos);
+    CHECK(markdown.find("not benchmark authority") != std::string::npos);
+    auto summary = h.sink.Get("/guardian/baseline/bl1/decisions/export");
+    REQUIRE(summary->status == 200);
+    CHECK(summary->body.find("Level 2 additional hardening") != std::string::npos);
+    CHECK(summary->body.find("Research: Partial review &lt;unverified&gt;") != std::string::npos);
+    CHECK(summary->body.find("not benchmark authority") != std::string::npos);
+    CHECK(h.sink.Get(api + "/export?format=executable")->status == 400);
+
+    catalog["expected_revision"] = 1;
+    REQUIRE(h.sink.Put(api, catalog.dump())->status == 200);
+    decision["expected_revision"] = 1;
+    CHECK(h.sink.Put(decision_path, decision.dump())->status == 409); // Old catalog.
+    auto stale_html = h.sink.Get("/guardian/baseline/bl1/decisions/export");
+    REQUIRE(stale_html->status == 200);
+    CHECK(stale_html->body.find("Catalog changed; review this previous decision.") != std::string::npos);
+    auto after = h.baselines->get_baseline("bl1");
+    REQUIRE(after);
+    CHECK(after->deployed_snapshot == before->deployed_snapshot);
+    CHECK(after->deployed_at == before->deployed_at);
+    CHECK(after->lifecycle == before->lifecycle);
+    CHECK(h.store->current_policy_generation() == generation);
+    auto guard_after = h.store->get_rule("g1");
+    REQUIRE(guard_after);
+    REQUIRE(*guard_after);
+    CHECK((**guard_after).version == (**guard_before).version);
+    CHECK((**guard_after).spec_json == (**guard_before).spec_json);
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Benchmark routes reject unsafe catalogs and malformed decisions before storage",
+          "[pg][guardian_routes][benchmark][validation]") {
+    Harness h;
+    h.seed_baseline("bl1", "Baseline", {});
+    const std::string api = "/api/v1/guaranteed-state/baselines/bl1/benchmark";
+    for (const auto& url : {"javascript:alert(1)", "data:text/html,test", "https://example.org/\nattack"}) {
+        auto body = benchmark_test_catalog();
+        body["catalog"]["controls"][0]["sources"][0]["url"] = url;
+        CHECK(h.sink.Put(api, body.dump())->status == 400);
+    }
+    for (const auto& invalid : {nlohmann::json(4), nlohmann::json(nullptr), nlohmann::json::array()}) {
+        auto body = benchmark_test_catalog();
+        body["catalog"]["controls"][0]["title"] = invalid;
+        CHECK(h.sink.Put(api, body.dump())->status == 400);
+    }
+    auto absent = h.baselines->benchmark_catalog("bl1");
+    REQUIRE(absent);
+    CHECK_FALSE(absent->has_value());
+    REQUIRE(h.sink.Put(api, benchmark_test_catalog().dump())->status == 200);
+    nlohmann::json valid{{"value", "7"}, {"rationale", "Reason"}, {"status", "reviewed"},
+                         {"expected_revision", 0}, {"catalog_revision", 1}};
+    for (const auto& invalid : {nlohmann::json(4), nlohmann::json(nullptr), nlohmann::json(std::string("x\0y", 3))}) {
+        auto body = valid;
+        body["value"] = invalid;
+        CHECK(h.sink.Put(api + "/decisions/demo.cache.1", body.dump())->status == 400);
+    }
+    valid["rationale"] = "";
+    CHECK(h.sink.Put(api + "/decisions/demo.cache.1", valid.dump())->status == 400);
+    auto decisions = h.baselines->benchmark_decisions("bl1");
+    REQUIRE(decisions);
+    CHECK(decisions->empty());
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Benchmark reviewed values enforce numeric bounds while exceptions remain explicit",
+          "[pg][guardian_routes][benchmark][constraints]") {
+    Harness h;
+    h.seed_baseline("bl1", "Baseline", {});
+    const std::string api = "/api/v1/guaranteed-state/baselines/bl1/benchmark";
+    auto catalog = benchmark_test_catalog();
+    auto& control = catalog["catalog"]["controls"][0];
+    control["value_kind"] = "integer";
+    control["minimum"] = 7;
+    control["maximum"] = 14;
+    REQUIRE(h.sink.Put(api, catalog.dump())->status == 200);
+    nlohmann::json decision{{"value", "6"}, {"rationale", "Legacy compatibility"},
+        {"status", "reviewed"}, {"expected_revision", 0}, {"catalog_revision", 1}};
+    for (const auto* invalid : {"6", "15", "7x", "7.0", "999999999999999999999999999"}) {
+        decision["value"] = invalid;
+        CHECK(h.sink.Put(api + "/decisions/demo.cache.1", decision.dump())->status == 400);
+    }
+    auto empty = h.baselines->benchmark_decisions("bl1");
+    REQUIRE(empty);
+    CHECK(empty->empty());
+    decision["value"] = "6";
+    decision["status"] = "exception";
+    auto saved = h.sink.Put(api + "/decisions/demo.cache.1", decision.dump());
+    REQUIRE(saved->status == 200);
+    auto data = nlohmann::json::parse(saved->body)["data"];
+    CHECK(data["status"] == "exception");
+    CHECK(data["value"] == "6");
+    decision["expected_revision"] = 1;
+    decision["status"] = "reviewed";
+    decision["value"] = "7";
+    CHECK(h.sink.Put(api + "/decisions/demo.cache.1", decision.dump())->status == 200);
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Benchmark audit failure refuses import decisions and reads",
+          "[pg][guardian_routes][benchmark][audit]") {
+    Harness h;
+    h.seed_baseline("bl1", "Baseline", {});
+    const std::string api = "/api/v1/guaranteed-state/baselines/bl1/benchmark";
+    h.throw_audit = true;
+    const auto failed_import = h.sink.Put(api, benchmark_test_catalog().dump());
+    REQUIRE(failed_import->status == 503);
+    CHECK(nlohmann::json::parse(failed_import->body)["error"]["retry_after_ms"] == 5000);
+    auto catalog = h.baselines->benchmark_catalog("bl1");
+    REQUIRE(catalog);
+    CHECK_FALSE(catalog->has_value());
+    h.throw_audit = false;
+    REQUIRE(h.sink.Put(api, benchmark_test_catalog().dump())->status == 200);
+    h.throw_audit = true;
+    nlohmann::json decision{{"value", "7"}, {"rationale", "Example capacity"},
+        {"status", "reviewed"}, {"expected_revision", 0}, {"catalog_revision", 1}};
+    CHECK(h.sink.Put(api + "/decisions/demo.cache.1", decision.dump())->status == 503);
+    auto rows = h.baselines->benchmark_decisions("bl1");
+    REQUIRE(rows);
+    CHECK(rows->empty());
+    CHECK(h.sink.Get(api)->status == 503);
+    CHECK(h.sink.Get(api + "/export")->status == 503);
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Benchmark routes enforce read write and service token boundaries",
+          "[pg][guardian_routes][benchmark][rbac]") {
+    Harness h;
+    h.seed_baseline("bl1", "Baseline", {});
+    const std::string api = "/api/v1/guaranteed-state/baselines/bl1/benchmark";
+    REQUIRE(h.sink.Put(api, benchmark_test_catalog().dump())->status == 200);
+    h.denied.insert("GuaranteedState:Write");
+    CHECK(h.sink.Put(api, benchmark_test_catalog().dump())->status == 403);
+    CHECK(h.sink.Put(api + "/decisions/demo.cache.1", "{}")->status == 403);
+    CHECK(h.sink.Get(api)->status == 200);
+    h.denied.insert("GuaranteedState:Read");
+    CHECK(h.sink.Get(api)->status == 403);
+    CHECK(h.sink.Get(api + "/export")->status == 403);
+    CHECK(h.sink.Get("/fragments/guardian/baseline/bl1/decisions/page")->status == 403);
+    h.denied.clear();
+    h.session_token_scope_service = "some-service";
+    CHECK(h.sink.Get(api)->status == 403);
+    CHECK(h.sink.Put(api, benchmark_test_catalog().dump())->status == 403);
+    CHECK(h.sink.Put(api + "/decisions/demo.cache.1", "{}")->status == 403);
+    auto decisions = h.baselines->benchmark_decisions("bl1");
+    REQUIRE(decisions);
+    CHECK(decisions->empty());
+    CHECK(h.pushes.empty());
+}
+
+TEST_CASE("Guardian overview counts unique online drifting agents across live guards",
+          "[pg][guardian_routes][page][drift_counts][overview]") {
+    Harness h;
+    h.seed_guard("g1", "First control");
+    h.seed_guard("g2", "Second control");
+    h.agents_json = R"([{"agent_id":"one","hostname":"One","os":"windows"},
+                         {"agent_id":"two","hostname":"Two","os":"windows"},
+                         {"agent_id":"orphan","hostname":"Orphan","os":"windows"}])";
+    const auto start = now_epoch_seconds() - 60;
+    h.seed_status("e1", "one", "g1", "drift.detected", format_iso_utc(start));
+    h.seed_status("e2", "one", "g2", "drift.detected", format_iso_utc(start + 1));
+    h.seed_status("e3", "two", "g1", "guard.unhealthy", format_iso_utc(start + 2));
+    h.seed_status("e4", "offline", "g1", "drift.detected", format_iso_utc(start + 3));
+    // An online endpoint with only an orphan/deleted rule does not belong to
+    // the fleet's live-rule rollup, even though its stale status remains stored.
+    h.seed_status("e5", "orphan", "deleted-rule", "drift.detected", format_iso_utc(start + 4));
+
+    auto check_overview = [&](int guards, int agents) {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        REQUIRE(res->status == 200);
+        const auto label_pos = res->body.find("<div class=\"stat-label\">Guards drifting</div>");
+        REQUIRE(label_pos != std::string::npos);
+        const auto number_pos = res->body.rfind("<div class=\"stat-num ", label_pos);
+        REQUIRE(number_pos != std::string::npos);
+        const auto value_pos = res->body.find('>', number_pos);
+        const auto value_end = res->body.find("</div>", value_pos);
+        REQUIRE(value_end < label_pos);
+        CHECK(res->body.substr(value_pos + 1, value_end - value_pos - 1) == std::to_string(guards));
+        const auto next_card = res->body.find("stat-card", label_pos);
+        const auto card = res->body.substr(label_pos, next_card - label_pos);
+        CHECK(card.find("on " + std::to_string(agents) + " agent(s) now") != std::string::npos);
+    };
+    check_overview(2, 1); // Two drifting controls on one endpoint; errors aren't drift.
+    h.seed_status("e6", "two", "g1", "drift.detected", format_iso_utc(start + 5));
+    check_overview(2, 2); // A second endpoint counts once despite sharing a control.
+    h.agents_json = R"([{"agent_id":"two","hostname":"Two","os":"windows"},
+                         {"agent_id":"orphan","hostname":"Orphan","os":"windows"}])";
+    check_overview(1, 1); // Endpoint one is now offline, so its two states are unknown.
+    h.seed_status("e7", "two", "g1", "guard.compliant", format_iso_utc(start + 6));
+    check_overview(0, 0); // The remaining orphan row must not keep attention raised.
+}
+
+TEST_CASE("Guardian current drifting devices are distinct from repeated historical detections",
+          "[pg][guardian_routes][page][drift_counts]") {
+    Harness h;
+    h.seed_guard("g1", "Example first control");
+    h.seed_guard("g2", "Example second control");
+    h.seed_guard("outside", "Unrelated control");
+    h.seed_baseline("bl1", "Example baseline", {"g1", "g2"});
+    h.agents_json = R"([{"agent_id":"example-device","hostname":"Example device","os":"windows"},
+                         {"agent_id":"other","hostname":"Other","os":"windows"}])";
+    const auto start = now_epoch_seconds() - 60;
+    // Stay inside the rolling 7-day window, with strict timestamp ordering.
+    h.seed_status("e1", "example-device", "g1", "drift.detected", format_iso_utc(start));
+    h.seed_status("e2", "example-device", "g1", "drift.detected", format_iso_utc(start + 1));
+    h.seed_status("e3", "example-device", "g1", "drift.detected", format_iso_utc(start + 2));
+    h.seed_status("e4", "example-device", "g2", "drift.detected", format_iso_utc(start + 3));
+    h.seed_status("e5", "other", "outside", "drift.detected", format_iso_utc(start + 4));
+
+    auto page = [&](const char* path) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res != nullptr);
+        REQUIRE(res->status == 200);
+        return res->body;
+    };
+    auto check_tile = [](const std::string& html, const std::string& label, int expected) {
+        const auto label_pos = html.find("<div class=\"l\">" + label + "</div>");
+        REQUIRE(label_pos != std::string::npos);
+        const auto tile_pos = html.rfind("<div class=\"gp-tile\">", label_pos);
+        REQUIRE(tile_pos != std::string::npos);
+        const auto number_pos = html.find("<div class=\"n ", tile_pos);
+        REQUIRE(number_pos != std::string::npos);
+        const auto value_pos = html.find('>', number_pos);
+        REQUIRE(value_pos < label_pos);
+        const auto value_end = html.find("</div>", value_pos);
+        REQUIRE(value_end < label_pos);
+        CHECK(html.substr(value_pos + 1, value_end - value_pos - 1) == std::to_string(expected));
+    };
+    auto baseline = page("/fragments/guardian/baseline/bl1/page");
+    check_tile(baseline, "Devices drifting", 1); // Two guards, one device; outsider excluded.
+    CHECK(baseline.find("<th class=\"gp-num\">Devices drifting</th>") != std::string::npos);
+    CHECK(baseline.find("Detected 7d") == std::string::npos);
+    CHECK(baseline.find("Detection events (last 7 days): <b>4</b>") != std::string::npos);
+    const auto member_pos = baseline.find("href=\"/guardian/guard/g1\"");
+    REQUIRE(member_pos != std::string::npos);
+    const auto member_end = baseline.find("</tr>", member_pos);
+    REQUIRE(member_end != std::string::npos);
+    const auto member = baseline.substr(member_pos, member_end - member_pos);
+    CHECK(member.find("<td class=\"gp-num\">1</td>") != std::string::npos);
+
+    auto guard = page("/fragments/guardian/guard/g1/page");
+    check_tile(guard, "Devices drifting", 1);
+    check_tile(guard, "Detection events", 3);
+    CHECK(guard.find("last 7 days") != std::string::npos);
+    CHECK(guard.find("repeated reports") != std::string::npos);
+
+    // Recovery changes the current count, not the historical detection count.
+    h.seed_status("e6", "example-device", "g1", "guard.compliant", format_iso_utc(start + 5));
+    guard = page("/fragments/guardian/guard/g1/page");
+    check_tile(guard, "Devices drifting", 0);
+    check_tile(guard, "Detection events", 3);
+    check_tile(page("/fragments/guardian/baseline/bl1/page"), "Devices drifting", 1);
+
+    // An offline device's last known drift is unknown, not currently drifting.
+    h.agents_json = R"([{"agent_id":"other","hostname":"Other","os":"windows"}])";
+    baseline = page("/fragments/guardian/baseline/bl1/page");
+    check_tile(baseline, "Devices drifting", 0);
+    CHECK(baseline.find("Detection events (last 7 days): <b>4</b>") != std::string::npos);
+    guard = page("/fragments/guardian/guard/g1/page");
+    check_tile(guard, "Devices drifting", 0);
+    check_tile(guard, "Detection events", 3);
+    CHECK(guard.find("&#9679; unknown") != std::string::npos);
+    check_tile(page("/fragments/guardian/guard/g2/page"), "Devices drifting", 0);
 }
 
 TEST_CASE("guard/baseline /page fragments render a seeded id",

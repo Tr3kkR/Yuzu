@@ -104,6 +104,8 @@ inline constexpr const char* kObservationRuleId = "__observation__";
 struct GuaranteedStateRuleRow {
     std::string rule_id;           // UUID
     std::string name;              // unique, human-authored
+    std::string description;       // human-readable control requirement (server metadata)
+    std::string rationale;         // organisational risk mitigated (server metadata)
     std::string yaml_source;       // human-readable rendering (generated; see spec_json)
     // Canonical structured JSON of the Guard (spark/assertion/remediation) —
     // the AUTHORITATIVE form the agent enforces from and that the push proto is

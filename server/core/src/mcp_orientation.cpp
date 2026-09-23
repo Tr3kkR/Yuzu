@@ -169,7 +169,9 @@ constexpr std::string_view kGuardian[] = {
     "get_guardian_device_guards",  "create_guardian_rule",
     "get_guardian_rule",           "update_guardian_rule",
     "delete_guardian_rule",        "push_guardian_rules",
-    "get_guardian_agent_status",   "get_guardian_device_compliance"};
+    "get_guardian_agent_status",   "get_guardian_device_compliance",
+    "get_guardian_benchmark",      "import_guardian_benchmark",
+    "set_guardian_benchmark_decision", "export_guardian_benchmark"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the

@@ -1,0 +1,1 @@
+- **Guardian benchmark decisions** supports separately imported catalogs, reviewable organisation choices and rationale, REST/MCP access, and HTML/Markdown summaries without changing endpoint policy. Includes Guard description/rationale fields and correct distinct-device drift counts. Ships no third-party benchmark content.

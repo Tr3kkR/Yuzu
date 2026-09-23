@@ -1,0 +1,43 @@
+{
+  "name": "Example application settings (fictional)",
+  "version": "1.0",
+  "controls": [
+    {
+      "control_id": "demo.cache.1",
+      "title": "Choose demo cache capacity",
+      "profile": "L1",
+      "section": "Demo application",
+      "description": "A fictional setting used only to demonstrate decision recording.",
+      "rationale": "Record how the team chose an example capacity.",
+      "location": "Demo application / cache slots",
+      "benchmark_value": "7 to 14",
+      "suggested_value": "7",
+      "suggested_rationale": "An arbitrary starting value for this example.",
+      "value_kind": "integer",
+      "minimum": 7,
+      "maximum": 14,
+      "coverage": "Decision support only; no endpoint check.",
+      "benchmark_source": "Original synthetic Yuzu example; not a third-party benchmark."
+    },
+    {
+      "control_id": "demo.detail.1",
+      "title": "Choose demo diagnostic detail",
+      "profile": "L2",
+      "section": "Demo application",
+      "description": "Another fictional setting demonstrating the optional profile.",
+      "benchmark_value": "verbose",
+      "suggested_value": "verbose",
+      "allowed_values": ["verbose"],
+      "impact": "Illustrative only.",
+      "coverage": "Decision support only; no endpoint check.",
+      "benchmark_source": "Original synthetic Yuzu example; not a third-party benchmark.",
+      "alternatives": [
+        {
+          "value": "summary",
+          "reason": "An example exception for documenting a different choice.",
+          "tradeoff": "Less detail in this fictional application."
+        }
+      ]
+    }
+  ]
+}

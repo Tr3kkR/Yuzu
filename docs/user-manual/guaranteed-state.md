@@ -19,6 +19,30 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 | **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate; shown as **Observe** in the dashboard). The wire/stored values are only `enforce` / `audit` — `observe` is a display label, not an API value. **Immutable after creation** — a different posture is a different Guard. |
 | **Scope expression** | A Scope DSL expression (same engine as Instructions) selecting which agents a rule applies to. |
 
+## Guard descriptions and drift counts
+
+Each Guard can carry a **description** explaining its requirement and a **risk
+rationale** explaining the organisational exposure it mitigates. Baseline member
+rows show searchable previews; the Guard detail page shows the full text. These
+are plain-text, server-side metadata and do not change endpoint assertions or
+remediation.
+
+**Devices drifting** counts devices whose latest reported state is drifted;
+offline devices are shown as unknown. A baseline counts each device once even
+when it fails several member checks. Each member row counts devices drifting on
+that check. **Detection events** is separate seven-day history: repeated reports
+from the same device can add events without adding another drifting device.
+
+REST rule create/update and MCP `create_guardian_rule`/`update_guardian_rule`
+accept optional `description` and `rationale` strings (each at most 16,384 UTF-8
+bytes, without NUL characters). List/get return both fields. Updates preserve
+omitted fields; an empty string clears a field. The New Guard browser form limits
+each field to 2,048 bytes within its smaller request-body budget.
+
+Fresh databases include both columns in the initial PostgreSQL schema. Existing
+development databases need the columns added before running this build; no
+versioned compatibility migration is provided.
+
 ## Permissions
 
 Guardian introduces a new securable type (`GuaranteedState`) and a new operation (`Push`). Seeded role grants:
@@ -238,6 +262,101 @@ All four actions above additionally deny a service-scoped API token outright (40
 > **Targeting is fleet-wide for now.** A Baseline carries an *assignment* (included − excluded management groups), but management-group targeting is **not yet wired** — every deploy currently converges the **whole fleet**, and the dashboard labels the assignment area as coming-soon. Do not rely on the assignment to contain a Baseline's blast radius yet.
 
 **Rule delivery respects an emergency kill switch.** Every Guardian push to an agent — a Baseline deploy, the normal `/api/v1/guaranteed-state/push` call, and the periodic reconcile re-push — dispatches through the server's one internal `__guard__.push_rules` capability, which an operator can disable as an emergency stop via `PUT /api/v1/plugin-config/__guard__/kill-switch?action=push_rules` (body `{"enabled": false, "reason": "..."}`) or the MCP `set_plugin_kill_switch` tool, and re-enable the same way. It defaults to **enabled** (rule delivery flows normally) until an operator explicitly throws it — throwing it does not touch any already-armed Guard on an agent, it only stops **future** pushes/reconciles from reaching agents. `GET .../kill-switch` (or `get_plugin_kill_switch`) shows the current state. See [ADR-3005](../adr/3005-plugin-config-store.md) for the full plugin-config/kill-switch design (the REST/MCP surface itself is not yet documented in the user manual — tracked as #3275, a pre-existing gap, not introduced here).
+
+## Benchmark decisions
+
+Yuzu supplies the decision workflow without bundled third-party benchmark
+content. Catalogs are imported separately by an operator who has the rights
+to use that material. No CIS benchmark text, recommendations, extracted
+catalogs, or derived policy packs are included with this feature. Importing a
+catalog does not grant content rights; exports contain imported material and
+remain subject to its applicable terms.
+
+The [example catalog](../examples/guardian-benchmark.json) contains fictional
+application settings for demonstrating the workflow, not security guidance.
+Submit it as the catalog in the import request below. This version accepts
+profiles L1 and L2; other profile taxonomies require adaptation.
+
+A baseline's **Benchmark decisions** page (`/guardian/baseline/{id}/decisions`)
+records the configuration choices and reasoning used to assess a benchmark.
+It shows each control's requirement, configuration location, benchmark value,
+suggested value and rationale, alternatives and trade-offs, supporting sources,
+and known coverage limits. Suggestions are proposals for review. Saving a
+decision records assessment metadata: it does not create a Guard, change a
+baseline's membership or deployment, or send work to endpoints.
+
+The page starts with **Level 1** controls and shows up to **10 controls at a
+time**. Switch to **Level 1 + Level 2 hardening** to include the additional
+hardening controls. Use the policy-section filter and search to focus the
+review. For each control, record a value and rationale, then choose a status:
+
+| Status | Meaning |
+|---|---|
+| `proposed` | A suggestion or choice still awaiting review. |
+| `reviewed` | The recorded choice has been reviewed for this assessment. |
+| `exception` | A documented exception to the benchmark recommendation. |
+| `not_applicable` | The control does not apply to this assessment. |
+
+These statuses describe the operator's assessment; they do not grant deployment
+approval or establish endpoint compliance. Saved decisions retain their author,
+timestamp, decision revision and the catalog revision reviewed. After a catalog
+import changes the catalog revision, the page and exports present older
+decisions as proposed and flag them for another review; the stored decision and
+its original provenance remain available through the API.
+
+Every status except `proposed` requires both a nonempty selected value and a
+rationale, including an explanation for exceptions and non-applicable controls.
+
+Reading and exporting require `GuaranteedState:Read`. Importing a catalog or
+saving a decision requires `GuaranteedState:Write`. Service-scoped API tokens
+are refused because this metadata belongs to the fleet-wide baseline catalog.
+Writes record an audit attempt before persistence and a success outcome after
+the write. The authenticated session supplies the author.
+
+REST and MCP expose the same assessment workflow:
+
+| REST operation | MCP tool |
+|---|---|
+| `GET /api/v1/guaranteed-state/baselines/{id}/benchmark` | `get_guardian_benchmark` |
+| `PUT /api/v1/guaranteed-state/baselines/{id}/benchmark` | `import_guardian_benchmark` |
+| `PUT /api/v1/guaranteed-state/baselines/{id}/benchmark/decisions/{control_id}` | `set_guardian_benchmark_decision` |
+| `GET /api/v1/guaranteed-state/baselines/{id}/benchmark/export?format=html` | `export_guardian_benchmark` |
+
+REST responses place the result under `data`; MCP returns structured content.
+The read result contains `baseline_id`, `catalog`, `catalog_revision`,
+`catalog_updated_by`, `catalog_updated_at` and `decisions`. Timestamps are Unix
+epoch seconds. The catalog requires `name`, `version` and 1–1,000 `controls`,
+each with a unique `control_id`, `title` and `profile`. The optional prose,
+alternatives and sources carry the assessment material shown on the page.
+The OpenAPI specification documents the field limits. Catalog and decision PUT
+requests have a 4 MiB raw JSON body cap; decision values are limited to 4,096
+UTF-8 bytes and rationales to 16,384 bytes, without NUL characters.
+
+Import with `{"catalog": {...}, "expected_revision": 0}` for a baseline's
+first catalog. Subsequent imports use the current `catalog_revision` as
+`expected_revision`. A decision write supplies:
+
+```json
+{
+  "value": "Selected setting",
+  "rationale": "Why this setting suits the organisation",
+  "status": "reviewed",
+  "expected_revision": 0,
+  "catalog_revision": 1
+}
+```
+
+Use zero for a first decision's `expected_revision`; use its current revision
+when editing. Both the decision revision and catalog revision must still match
+when the write commits. A conflict returns HTTP 409: read the latest data and
+review the differences before resubmitting. MCP callers also supply
+`baseline_id` and, for a decision, `control_id` as arguments.
+
+Export accepts `format=html` (the REST default) or `format=markdown` and returns
+`{format, content}` inside the response envelope. HTML is escaped for review and
+printing. Exports include suggestions and unresolved decisions so a document
+does not imply that every control has been reviewed. The browser export at
+`/guardian/baseline/{id}/decisions/export` serves the HTML document directly.
 
 ## Assignment
 

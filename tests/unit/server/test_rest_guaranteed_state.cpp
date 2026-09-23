@@ -786,6 +786,39 @@ TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
     CHECK(h.audit_log[0].target_id == "r-001");
 }
 
+TEST_CASE("REST gs.rules: descriptive metadata round-trips and validates",
+          "[pg][rest][guaranteed_state][metadata]") {
+    RestGsHarness h;
+    auto body = nlohmann::json::parse(RestGsHarness::make_rule_body("r-meta", "Example metadata"));
+    body["enforcement_mode"] = "audit";
+    body["description"] = "Require signed traffic.\nKeep this paragraph.";
+    body["rationale"] = "Reduce tampering <risk> & relay exposure.";
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", body.dump())->status == 201);
+    const std::string path = "/api/v1/guaranteed-state/rules/r-meta";
+    auto first = nlohmann::json::parse(h.sink.Get(path)->body)["data"];
+    CHECK(first["description"] == body["description"]);
+    CHECK(first["rationale"] == body["rationale"]);
+    REQUIRE(h.sink.Put(path, R"({"severity":"low"})")->status == 200);
+    auto preserved = nlohmann::json::parse(h.sink.Get(path)->body)["data"];
+    CHECK(preserved["description"] == body["description"]);
+    CHECK(preserved["rationale"] == body["rationale"]);
+    CHECK(preserved["enforcement_mode"] == "audit");
+    CHECK(preserved["spec_json"] == first["spec_json"]);
+    REQUIRE(h.sink.Put(path, R"({"description":"New requirement","rationale":""})")->status == 200);
+    auto rows = nlohmann::json::parse(h.sink.Get("/api/v1/guaranteed-state/rules")->body)["data"];
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0]["description"] == "New requirement");
+    CHECK(rows[0]["rationale"] == "");
+    for (const auto& invalid : {nlohmann::json(42), nlohmann::json(nullptr),
+                               nlohmann::json(std::string(16385, 'x')),
+                               nlohmann::json(std::string("bad\0text", 8))}) {
+        nlohmann::json patch = {{"rationale", invalid}};
+        CHECK(h.sink.Put(path, patch.dump())->status == 400);
+        body["rationale"] = invalid;
+        CHECK(h.sink.Post("/api/v1/guaranteed-state/rules", body.dump())->status == 400);
+    }
+}
+
 TEST_CASE("REST gs.rules: missing required fields → 400",
           "[pg][rest][guaranteed_state][create][validation]") {
     RestGsHarness h;

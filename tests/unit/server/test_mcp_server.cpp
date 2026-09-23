@@ -761,6 +761,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 #include "baseline_store.hpp" // #2146 Batch B1: BaselineStore/Baseline/kBaselineDeployed (get_guardian_device_compliance)
+#include "guardian_benchmark.hpp"
+#include "mcp_retry.hpp"
 
 #include <httplib.h>
 #include <libpq-fe.h> // PGRES_COMMAND_OK
@@ -4646,7 +4648,7 @@ TEST_CASE("MCP Guardian: create_guardian_rule creates a legacy yaml_source rule,
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":200,"params":{"name":"create_guardian_rule",)"
-        R"("arguments":{"rule_id":"r1","name":"rule-one","yaml_source":"# legacy\n"}}})");
+        R"("arguments":{"rule_id":"r1","name":"rule-one","description":"Require signing","rationale":"Reduce relay risk","yaml_source":"# legacy\n"}}})");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -4667,6 +4669,231 @@ TEST_CASE("MCP Guardian: create_guardian_rule creates a legacy yaml_source rule,
     CHECK(get_data["rule_id"] == "r1");
     CHECK(get_data["name"] == "rule-one");
     CHECK(get_data["yaml_source"] == "# legacy\n");
+    CHECK(get_data["description"] == "Require signing");
+    CHECK(get_data["rationale"] == "Reduce relay risk");
+}
+
+TEST_CASE("MCP Guardian prose metadata updates preserve omitted fields and reject invalid values",
+          "[pg][mcp][integration][guardian][metadata]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    auto call = [&](const char* tool, const nlohmann::json& args) {
+        nlohmann::json request{{"jsonrpc", "2.0"}, {"method", "tools/call"}, {"id", 260},
+                              {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(request.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    REQUIRE(call("update_guardian_rule", {{"rule_id", "r1"}, {"description", "Require signing"},
+                                         {"rationale", "Reduce relay risk"}}).contains("result"));
+    REQUIRE(call("update_guardian_rule", {{"rule_id", "r1"}, {"description", ""}}).contains("result"));
+    auto existing = store.get_rule("r1");
+    REQUIRE(existing);
+    REQUIRE(*existing);
+    CHECK((**existing).description.empty());
+    CHECK((**existing).rationale == "Reduce relay risk");
+
+    auto list = call("list_guardian_rules", nlohmann::json::object());
+    REQUIRE(list.contains("result"));
+    auto listed = nlohmann::json::parse(list["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(listed["rules"].size() == 1);
+    CHECK(listed["rules"][0]["description"] == "");
+    CHECK(listed["rules"][0]["rationale"] == "Reduce relay risk");
+
+    for (const auto* tool : {"create_guardian_rule", "update_guardian_rule"}) {
+        for (const auto* key : {"description", "rationale"}) {
+            for (const auto& invalid : {nlohmann::json(42), nlohmann::json(nullptr),
+                                       nlohmann::json(std::string(16385, 'x')),
+                                       nlohmann::json(std::string("a\0b", 3))}) {
+                nlohmann::json args{{"rule_id", "r1"}, {"name", "rule-one"}, {"yaml_source", "x"}};
+                args[key] = invalid;
+                auto body = call(tool, args);
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == kInvalidParams);
+                CHECK(ts.audit_log.back() == (std::string(tool) == "create_guardian_rule"
+                    ? "guaranteed_state.rule.create|denied" : "guaranteed_state.rule.update|denied"));
+            }
+        }
+    }
+    auto unchanged = store.get_rule("r1");
+    REQUIRE(unchanged);
+    REQUIRE(*unchanged);
+    CHECK((**unchanged).rationale == "Reduce relay risk");
+    CHECK((**unchanged).version == (**existing).version);
+}
+
+TEST_CASE("MCP Guardian benchmark: every metadata tool denies service-scoped tokens",
+          "[mcp][integration][guardian][benchmark][security]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("");
+    for (const auto* name : {"get_guardian_benchmark", "import_guardian_benchmark",
+                             "set_guardian_benchmark_decision", "export_guardian_benchmark"}) {
+        CAPTURE(name);
+        nlohmann::json request = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 1},
+            {"params", {{"name", name}, {"arguments", {{"baseline_id", "baseline-one"}}}}}};
+        auto res = ts.call(request.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        REQUIRE_FALSE(ts.audit_log.empty());
+        CHECK(ts.audit_log.back() == std::string("mcp.") + name + "|denied");
+    }
+}
+
+TEST_CASE("MCP Guardian benchmark: readonly tier refuses metadata writes before store access",
+          "[mcp][integration][guardian][benchmark][security]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    for (const auto* name : {"import_guardian_benchmark", "set_guardian_benchmark_decision"}) {
+        CAPTURE(name);
+        nlohmann::json request = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 1},
+            {"params", {{"name", name}, {"arguments", {{"baseline_id", "baseline-one"}}}}}};
+        auto res = ts.call(request.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    }
+}
+
+TEST_CASE("MCP Guardian benchmark: advertised schemas and annotations distinguish metadata edits",
+          "[mcp][integration][guardian][benchmark]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int found = 0;
+    for (const auto& tool : tools) {
+        const auto name = tool["name"].get<std::string>();
+        if (name != "get_guardian_benchmark" && name != "import_guardian_benchmark" &&
+            name != "set_guardian_benchmark_decision" && name != "export_guardian_benchmark")
+            continue;
+        ++found;
+        CAPTURE(name);
+        const bool writing =
+            name == "import_guardian_benchmark" || name == "set_guardian_benchmark_decision";
+        CHECK(tool["annotations"]["readOnlyHint"] == !writing);
+        CHECK(tool["annotations"]["destructiveHint"] == false);
+        CHECK(tool["annotations"]["idempotentHint"] == !writing);
+        CHECK(tool["inputSchema"]["properties"]["baseline_id"]["maxLength"] == 256);
+        CHECK(tool["outputSchema"].contains("properties"));
+        if (name == "set_guardian_benchmark_decision") {
+            CHECK(tool["inputSchema"]["properties"]["value"]["maxLength"] == 4096);
+            CHECK(tool["inputSchema"]["properties"]["rationale"]["maxLength"] == 16384);
+            CHECK(tool["outputSchema"]["properties"].contains("revision"));
+        }
+    }
+    CHECK(found == 4);
+}
+
+TEST_CASE("MCP Guardian benchmark: RBAC gates read and write before baseline lookup",
+          "[mcp][integration][guardian][benchmark][security]") {
+    McpTestServer ts;
+    std::string requested_operation;
+    ts.perm_override_for_test = [&](const std::string& securable, const std::string& operation) {
+        CHECK(securable == "GuaranteedState");
+        requested_operation = operation;
+        return false;
+    };
+    ts.start("");
+    for (const auto* name : {"get_guardian_benchmark", "import_guardian_benchmark",
+                             "set_guardian_benchmark_decision", "export_guardian_benchmark"}) {
+        CAPTURE(name);
+        nlohmann::json request = {{"jsonrpc", "2.0"}, {"method", "tools/call"}, {"id", 1},
+            {"params", {{"name", name}, {"arguments", {{"baseline_id", "baseline-one"}}}}}};
+        auto res = ts.call(request.dump());
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const bool writing = std::string_view(name) == "import_guardian_benchmark" ||
+                             std::string_view(name) == "set_guardian_benchmark_decision";
+        CHECK(requested_operation == (writing ? "Write" : "Read"));
+    }
+}
+
+TEST_CASE("MCP Guardian benchmark: roundtrip preserves author, CAS and export without deployment",
+          "[pg][mcp][integration][guardian][benchmark]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store(pool);
+    Baseline baseline;
+    baseline.name = "Benchmark decision assessment";
+    auto bid = store.create_baseline(baseline);
+    REQUIRE(bid.has_value());
+    McpTestServer ts;
+    ts.baseline_store_for_test = &store;
+    ts.mock_username = "benchmark-reviewer";
+    ts.start("");
+    auto call = [&](const char* name, nlohmann::json args) {
+        args["baseline_id"] = *bid;
+        nlohmann::json request = {{"jsonrpc", "2.0"}, {"method", "tools/call"}, {"id", 1},
+            {"params", {{"name", name}, {"arguments", std::move(args)}}}};
+        auto res = ts.call(request.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    nlohmann::json catalog = {{"name", "Example benchmark"}, {"version", "1.0"},
+        {"controls", nlohmann::json::array({{{"control_id", "demo.cache.1"}, {"title", "Example control"},
+                                            {"profile", "L1"}}})}};
+    const nlohmann::json import_args = {{"catalog", catalog}, {"expected_revision", 0}};
+    auto imported = call("import_guardian_benchmark", import_args);
+    REQUIRE(imported.contains("result"));
+    CHECK(imported["result"]["structuredContent"]["catalog_revision"] == 1);
+    CHECK(imported["result"]["structuredContent"]["catalog_updated_by"] == "benchmark-reviewer");
+    auto duplicate = call("import_guardian_benchmark", import_args);
+    REQUIRE(duplicate.contains("error"));
+    CHECK(duplicate["error"]["data"]["http_status"] == 409);
+    CHECK(duplicate["error"]["data"]["retry_after_ms"].is_null());
+    nlohmann::json decision = {{"control_id", "demo.cache.1"}, {"value", "<selected>"},
+        {"rationale", "Review & document"}, {"status", "reviewed"},
+        {"expected_revision", 0}, {"catalog_revision", 1}};
+    auto saved = call("set_guardian_benchmark_decision", decision);
+    REQUIRE(saved.contains("result"));
+    CHECK(saved["result"]["structuredContent"]["revision"] == 1);
+    CHECK(saved["result"]["structuredContent"]["updated_by"] == "benchmark-reviewer");
+    auto stale = call("set_guardian_benchmark_decision", decision);
+    REQUIRE(stale.contains("error"));
+    CHECK(stale["error"]["data"]["http_status"] == 409);
+    auto read = call("get_guardian_benchmark", nlohmann::json::object());
+    REQUIRE(read.contains("result"));
+    auto shared = yuzu::server::read_benchmark(store, *bid);
+    REQUIRE(shared.has_value());
+    CHECK(read["result"]["structuredContent"] == *shared);
+    auto exported = call("export_guardian_benchmark", {{"format", "html"}});
+    REQUIRE(exported.contains("result"));
+    const auto html = exported["result"]["structuredContent"]["content"].get<std::string>();
+    CHECK(html == yuzu::server::benchmark_export_html(*shared));
+    CHECK(html.find("<selected>") == std::string::npos);
+    CHECK(html.find("&lt;selected&gt;") != std::string::npos);
+
+    ts.audit_succeeds_ = false;
+    decision["expected_revision"] = 1;
+    decision["value"] = "must not persist";
+    auto denied = call("set_guardian_benchmark_decision", decision);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["data"]["http_status"] == 503);
+    CHECK(denied["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    auto unchanged = yuzu::server::read_benchmark(store, *bid);
+    REQUIRE(unchanged.has_value());
+    CHECK(*unchanged == *shared);
+    auto after = store.get_baseline(*bid);
+    REQUIRE(after.has_value());
+    CHECK(after->lifecycle == baseline.lifecycle);
+    CHECK(after->deployed_snapshot == baseline.deployed_snapshot);
 }
 
 TEST_CASE("MCP Guardian: create_guardian_rule denies a service-scoped token "

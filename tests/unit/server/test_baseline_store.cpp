@@ -109,6 +109,104 @@ TEST_CASE("BaselineStore opens and applies its schema", "[pg][baseline_store]") 
     REQUIRE(store.baseline_count() == 0);
 }
 
+TEST_CASE("Benchmark metadata round-trips with revision CAS and no deployment side effects",
+          "[pg][baseline_store][benchmark]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    const auto id = store.create_baseline(make_baseline("Example benchmark"));
+    REQUIRE(id);
+    REQUIRE(store.set_members(*id, {"guard-one"}));
+    deploy(store, *id);
+    const auto before = store.get_baseline(*id);
+    REQUIRE(before);
+    auto absent = store.benchmark_catalog(*id);
+    REQUIRE(absent);
+    CHECK_FALSE(absent->has_value());
+    REQUIRE(store.put_benchmark_catalog(*id, R"({"title":"Example"})", "alice", 0));
+    auto catalog = store.benchmark_catalog(*id);
+    REQUIRE(catalog);
+    REQUIRE(*catalog);
+    CHECK((**catalog).catalog_json == R"({"title":"Example"})");
+    CHECK((**catalog).revision == 1);
+    CHECK((**catalog).updated_by == "alice");
+    CHECK((**catalog).updated_at > 0);
+    auto duplicate = store.put_benchmark_catalog(*id, "overwrite", "bob", 0);
+    REQUIRE_FALSE(duplicate);
+    CHECK(is_conflict_error(duplicate.error()));
+    REQUIRE(store.put_benchmark_catalog(*id, "replacement", "bob", 1));
+    auto stale = store.put_benchmark_catalog(*id, "stale", "eve", 1);
+    REQUIRE_FALSE(stale);
+    CHECK(is_conflict_error(stale.error()));
+
+    BenchmarkDecision decision;
+    decision.control_id = "demo.cache.1";
+    decision.value = "7'; DROP TABLE baselines; --";
+    decision.rationale = "Organisational decision\nPreserve this paragraph.";
+    decision.status = "proposed";
+    decision.revision = 99; // Only expected_revision controls the CAS.
+    auto saved = store.save_benchmark_decision(*id, decision, "alice", 0, 2);
+    REQUIRE(saved);
+    CHECK(saved->value == decision.value);
+    CHECK(saved->rationale == decision.rationale);
+    CHECK(saved->revision == 1);
+    CHECK(saved->catalog_revision == 2);
+    CHECK(saved->updated_by == "alice");
+    CHECK(saved->updated_at > 0);
+    auto duplicate_decision = store.save_benchmark_decision(*id, decision, "bob", 0, 2);
+    REQUIRE_FALSE(duplicate_decision);
+    CHECK(is_conflict_error(duplicate_decision.error()));
+    decision.status = "reviewed";
+    auto revised = store.save_benchmark_decision(*id, decision, "bob", 1, 2);
+    REQUIRE(revised);
+    CHECK(revised->revision == 2);
+    CHECK(revised->status == "reviewed");
+    CHECK(revised->updated_by == "bob");
+    decision.status = "exception";
+    auto stale_decision = store.save_benchmark_decision(*id, decision, "eve", 1, 2);
+    REQUIRE_FALSE(stale_decision);
+    CHECK(is_conflict_error(stale_decision.error()));
+
+    // Updating a catalog must retain separately reviewed decisions.
+    REQUIRE(store.put_benchmark_catalog(*id, "third edition", "carol", 2));
+    auto stale_catalog_decision = store.save_benchmark_decision(*id, decision, "eve", 2, 2);
+    REQUIRE_FALSE(stale_catalog_decision);
+    CHECK(is_conflict_error(stale_catalog_decision.error()));
+    BenchmarkDecision another = decision;
+    another.control_id = "demo.cache.2";
+    auto stale_catalog_insert = store.save_benchmark_decision(*id, another, "eve", 0, 2);
+    REQUIRE_FALSE(stale_catalog_insert);
+    CHECK(is_conflict_error(stale_catalog_insert.error()));
+    auto decisions = store.benchmark_decisions(*id);
+    REQUIRE(decisions);
+    REQUIRE(decisions->size() == 1);
+    CHECK(decisions->front().control_id == "demo.cache.1");
+    CHECK(decisions->front().status == "reviewed");
+    CHECK(decisions->front().revision == 2);
+    CHECK(decisions->front().catalog_revision == 2); // Remains tied to prior edition.
+    auto rereviewed = store.save_benchmark_decision(*id, decision, "carol", 2, 3);
+    REQUIRE(rereviewed);
+    CHECK(rereviewed->revision == 3);
+    CHECK(rereviewed->catalog_revision == 3);
+    auto after = store.get_baseline(*id);
+    REQUIRE(after);
+    CHECK(after->lifecycle == before->lifecycle);
+    CHECK(after->deployed_snapshot == before->deployed_snapshot);
+    CHECK(after->deployed_at == before->deployed_at);
+    CHECK(after->updated_at == before->updated_at);
+    CHECK(store.get_members(*id) == std::vector<std::string>{"guard-one"});
+
+    REQUIRE(store.delete_baseline(*id));
+    auto deleted_catalog = store.benchmark_catalog(*id);
+    REQUIRE(deleted_catalog);
+    CHECK_FALSE(deleted_catalog->has_value());
+    auto deleted_decisions = store.benchmark_decisions(*id);
+    REQUIRE(deleted_decisions);
+    CHECK(deleted_decisions->empty());
+    CHECK_FALSE(store.put_benchmark_catalog(*id, "missing parent", "alice", 0));
+    CHECK_FALSE(store.save_benchmark_decision(*id, decision, "alice", 0, 3));
+}
+
 TEST_CASE("Baseline CRUD round-trip", "[pg][baseline_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -592,6 +690,10 @@ TEST_CASE("Bad path (unroutable DSN) yields a closed store with sentinel returns
     // empty container.
     CHECK_FALSE(bad.deployed_member_rule_ids().has_value());
     CHECK_FALSE(bad.deployed_member_rule_ids("x").has_value());
+    CHECK_FALSE(bad.benchmark_catalog("x").has_value());
+    CHECK_FALSE(bad.benchmark_decisions("x").has_value());
+    CHECK_FALSE(bad.put_benchmark_catalog("x", "{}", "alice", 0).has_value());
+    CHECK_FALSE(bad.save_benchmark_decision("x", BenchmarkDecision{}, "alice", 0, 1).has_value());
     CHECK(bad.baseline_count() == 0);
     CHECK(bad.member_count("x") == 0);
 }

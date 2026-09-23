@@ -183,6 +183,12 @@ std::string render_guard_form(const std::string& error_html) {
     if (!error_html.empty())
         h += error_html;
     h += "<label>Name</label><input name=\"name\" placeholder=\"block-smb-445\" required>"
+         "<label for=\"guard-description\">Description</label>"
+         "<textarea id=\"guard-description\" name=\"description\" rows=\"3\" maxlength=\"2048\" "
+         "placeholder=\"Explain what this guard checks\"></textarea>"
+         "<label for=\"guard-rationale\">Risk rationale</label>"
+         "<textarea id=\"guard-rationale\" name=\"rationale\" rows=\"3\" maxlength=\"2048\" "
+         "placeholder=\"Explain the organisational risk this guard mitigates\"></textarea>"
          "<div class=\"form-row\">"
          "<div><label>Severity</label><select name=\"severity\">"
          "<option>critical</option><option selected>high</option><option>medium</option>"

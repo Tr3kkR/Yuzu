@@ -35,6 +35,7 @@
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
+#include "guardian_benchmark.hpp"
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -244,6 +245,19 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
     return def;
 }
 
+// Guardian prose metadata uses the same strict byte/NUL bounds as the REST twin.
+std::string guardian_metadata_error(const nlohmann::json& args) {
+    for (const char* key : {"description", "rationale"}) {
+        if (!args.contains(key)) continue;
+        if (!args[key].is_string())
+            return std::string(key) + " must be a string";
+        const auto& value = args[key].get_ref<const std::string&>();
+        if (value.size() > 16384 || value.find('\0') != std::string::npos)
+            return std::string(key) + " must be at most 16384 bytes and contain no NUL characters";
+    }
+    return {};
+}
+
 int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0) {
     if (params.contains(key) && params[key].is_number_integer())
         return params[key].get<int64_t>();
@@ -418,6 +432,13 @@ struct ToolDef {
 };
 
 constexpr const char* kObjectOutputSchema = R"({"type":"object","additionalProperties":true})";
+
+constexpr const char* kBenchmarkDecisionOutputSchema =
+    R"({"type":"object","properties":{"control_id":{"type":"string"},"value":{"type":"string"},"rationale":{"type":"string"},"status":{"type":"string","enum":["proposed","reviewed","exception","not_applicable"]},"revision":{"type":"integer","minimum":1},"catalog_revision":{"type":"integer","minimum":1},"updated_by":{"type":"string"},"updated_at":{"type":"integer"},"audit_persisted":{"type":"boolean"}},"required":["control_id","value","rationale","status","revision","updated_by","updated_at"]})";
+constexpr const char* kBenchmarkOutputSchema =
+    R"({"type":"object","properties":{"baseline_id":{"type":"string"},"catalog":{"type":["object","null"]},"catalog_revision":{"type":"integer","minimum":0},"catalog_updated_by":{"type":"string"},"catalog_updated_at":{"type":"integer"},"decisions":{"type":"array","items":{"type":"object","properties":{"control_id":{"type":"string"},"value":{"type":"string"},"rationale":{"type":"string"},"status":{"type":"string","enum":["proposed","reviewed","exception","not_applicable"]},"revision":{"type":"integer","minimum":1},"catalog_revision":{"type":"integer","minimum":1},"updated_by":{"type":"string"},"updated_at":{"type":"integer"}},"required":["control_id","value","rationale","status","revision","updated_by","updated_at"]}},"audit_persisted":{"type":"boolean"}},"required":["baseline_id","catalog","catalog_revision","catalog_updated_by","catalog_updated_at","decisions"]})";
+constexpr const char* kBenchmarkExportOutputSchema =
+    R"({"type":"object","properties":{"format":{"type":"string","enum":["html","markdown"]},"content":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["format","content"]})";
 
 std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
     JObj result;
@@ -1146,6 +1167,42 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"last_sync_at":{"type":"integer"},"user_count":{"type":"integer"},"group_count":{"type":"integer"},"last_error":{"type":"string"},"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"},"mapped_role":{"type":"string"},"synced_at":{"type":"integer"}},"required":["id","display_name","description","mapped_role","synced_at"]}}},"required":["provider","status","last_sync_at","user_count","group_count","last_error","groups"]})j"},
 
+    {"get_guardian_benchmark",
+     "Read a baseline's benchmark catalog and recorded operator decisions. Requires "
+     "GuaranteedState:Read; fleet-wide metadata denies service-scoped tokens. Does not "
+     "evaluate compliance or contact endpoints. Read revisions before importing or "
+     "editing.",
+     R"({"type":"object","properties":{"baseline_id":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline identifier returned by baseline discovery."}},"required":["baseline_id"],"additionalProperties":false})",
+     kBenchmarkOutputSchema},
+    {"import_guardian_benchmark",
+     "Import a benchmark catalog as baseline metadata with optimistic concurrency. "
+     "Requires GuaranteedState:Write and an unscoped principal. expected_revision is "
+     "zero "
+     "for the first import; otherwise use the current catalog_revision. Conflicts "
+     "require "
+     "a fresh read and review, not blind retry. Does not create guards or dispatch "
+     "endpoint work.",
+     R"({"type":"object","properties":{"baseline_id":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline identifier returned by baseline discovery."},"catalog":{"type":"object","description":"Benchmark catalog; shared validator also bounds optional prose, alternatives, sources and total bytes.","properties":{"name":{"type":"string","minLength":1,"maxLength":512,"description":"Catalog display name."},"version":{"type":"string","minLength":1,"maxLength":128,"description":"Operator-supplied catalog version."},"controls":{"type":"array","minItems":1,"maxItems":1000,"items":{"type":"object","properties":{"control_id":{"type":"string","minLength":1,"maxLength":128,"description":"Unique catalog control identifier."},"title":{"type":"string","minLength":1,"maxLength":2048,"description":"Control display title."},"profile":{"type":"string","minLength":1,"maxLength":64,"description":"Starting or additional-hardening profile.","enum":["L1","L2"]}},"required":["control_id","title","profile"]},"description":"Controls to review; importing does not create executable guards."}},"required":["name","version","controls"]},"expected_revision":{"type":"integer","minimum":0,"description":"Zero for first write; otherwise the current record revision. Reread after conflicts."}},"required":["baseline_id","catalog","expected_revision"],"additionalProperties":false})",
+     kBenchmarkOutputSchema},
+    {"set_guardian_benchmark_decision",
+     "Record an operator's benchmark control value, rationale and review status; this "
+     "is "
+     "metadata, not an enforcement approval or a compliance verdict. Requires "
+     "GuaranteedState:Write and an unscoped principal. Supply the current "
+     "catalog_revision "
+     "and decision expected_revision (zero for a first decision). On conflict, reread "
+     "and "
+     "review the changes. Authenticated identity is recorded as author; no endpoint is "
+     "contacted.",
+     R"({"type":"object","properties":{"baseline_id":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline identifier returned by baseline discovery."},"control_id":{"type":"string","minLength":1,"maxLength":128,"description":"Unique catalog control identifier."},"value":{"type":"string","maxLength":4096,"description":"Organisation choice; reviewed choices must satisfy catalog constraints."},"rationale":{"type":"string","maxLength":16384,"description":"Reason for the choice; required for any non-proposed status."},"status":{"type":"string","enum":["proposed","reviewed","exception","not_applicable"],"description":"Assessment state only; does not approve deployment."},"expected_revision":{"type":"integer","minimum":0,"description":"Zero for first write; otherwise the current record revision. Reread after conflicts."},"catalog_revision":{"type":"integer","minimum":1,"description":"Catalog revision against which the choice was reviewed."}},"required":["baseline_id","control_id","value","rationale","status","expected_revision","catalog_revision"],"additionalProperties":false})",
+     kBenchmarkDecisionOutputSchema},
+    {"export_guardian_benchmark",
+     "Export a baseline's benchmark catalog and recorded decisions as escaped HTML or "
+     "Markdown for review. Requires GuaranteedState:Read and an unscoped principal. "
+     "Returns {format,content}; creates no server file and performs no endpoint work.",
+     R"({"type":"object","properties":{"baseline_id":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline identifier returned by baseline discovery."},"format":{"type":"string","enum":["html","markdown"],"description":"Document format; exports include imported material and recorded choices."}},"required":["baseline_id","format"],"additionalProperties":false})",
+     kBenchmarkExportOutputSchema},
+
     {"get_guardian_schemas",
      "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
      "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
@@ -1170,7 +1227,7 @@ static const ToolDef kTools[] = {
      "exactly, same store read. Fleet-wide rule catalogue (a rule has no single owning "
      "device/service); a service-scoped API token is refused outright.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"rules":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]}},"total":{"type":"integer"}},"required":["rules","total"]})j"},
+     R"j({"type":"object","properties":{"rules":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"rationale":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]}},"total":{"type":"integer"}},"required":["rules","total"]})j"},
 
     {"list_guardian_events",
      "Query Guaranteed State events (rule violations, remediations, agent sync events; also "
@@ -1226,6 +1283,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
+     R"j("description":{"type":"string","maxLength":16384,"description":"What the Guard checks; plain text without NUL characters"},)j"
+     R"j("rationale":{"type":"string","maxLength":16384,"description":"Organisational risk mitigated by this Guard; plain text without NUL characters"},)j"
      R"j("version":{"type":"integer","minimum":1,"default":1},)j"
      R"j("enabled":{"type":"boolean","default":true},)j"
      R"j("enforcement_mode":{"type":"string","enum":["enforce","audit"],"default":"enforce"},)j"
@@ -1245,7 +1304,7 @@ static const ToolDef kTools[] = {
      "Fleet-wide (a Guard has no single owning device/service); a service-scoped API token is "
      "refused outright.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
-     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]})j"},
+     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"rationale":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]})j"},
 
     {"update_guardian_rule",
      "Update an existing Guaranteed State Guard. Mirrors PUT "
@@ -1265,6 +1324,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("description":{"type":"string","maxLength":16384,"description":"What the Guard checks; omitted preserves the current value, empty clears it; no NUL characters"},)j"
+     R"j("rationale":{"type":"string","maxLength":16384,"description":"Organisational risk mitigated; omitted preserves the current value, empty clears it; no NUL characters"},)j"
      R"j("enabled":{"type":"boolean"},)j"
      R"j("enforcement_mode":{"type":"string","enum":["enforce","audit"],"description":"Must equal the Guard's current mode; a different value is rejected (see description above)"},)j"
      R"j("severity":{"type":"string","enum":["critical","high","medium","low"]},)j"
@@ -3329,6 +3390,7 @@ static const char* const kWriteToolsRaw[] = {
     // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
     // delete: Delete; push: Push. get_guardian_rule/get_guardian_agent_status/
     // get_guardian_device_compliance are Read and deliberately absent.
+    "import_guardian_benchmark", "set_guardian_benchmark_decision",
     "create_guardian_rule", "update_guardian_rule", "delete_guardian_rule",
     "push_guardian_rules",
     // B4 (#2146 API-parity) — management-group mutations; get_management_group
@@ -3577,6 +3639,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_pending_approvals", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
+    {"get_guardian_benchmark", {"GuaranteedState", "Read"}},
+    {"import_guardian_benchmark", {"GuaranteedState", "Write"}},
+    {"set_guardian_benchmark_decision", {"GuaranteedState", "Write"}},
+    {"export_guardian_benchmark", {"GuaranteedState", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     // #4037 — get_guardian_status/list_guardian_rules/get_guardian_rule_status
     // deny a service-scoped token outright: fleet-wide reads (status/rules) or
@@ -4288,6 +4354,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
+    {"get_guardian_benchmark", {ToolEffect::ReadOnly, true, "Get Guardian benchmark"}},
+    {"import_guardian_benchmark", {ToolEffect::Additive, false, "Import Guardian benchmark"}},
+    {"set_guardian_benchmark_decision", {ToolEffect::Additive, false, "Record benchmark decision"}},
+    {"export_guardian_benchmark", {ToolEffect::ReadOnly, true, "Export Guardian benchmark"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"get_guardian_status", {ToolEffect::ReadOnly, true, "Get Guardian status rollup"}},
     {"list_guardian_rules", {ToolEffect::ReadOnly, true, "List Guardian rules"}},
@@ -12767,6 +12837,103 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // Benchmark metadata never dispatches or changes deployed guards.
+            if (tool_name == "get_guardian_benchmark" || tool_name == "import_guardian_benchmark" ||
+                tool_name == "set_guardian_benchmark_decision" ||
+                tool_name == "export_guardian_benchmark") {
+                const bool importing = tool_name == "import_guardian_benchmark";
+                const bool deciding = tool_name == "set_guardian_benchmark_decision";
+                const bool exporting = tool_name == "export_guardian_benchmark";
+                const bool writing = importing || deciding;
+                const char* operation = writing ? "Write" : "Read";
+                const std::string action = importing  ? "guaranteed_state.benchmark.import"
+                                           : deciding ? "guaranteed_state.benchmark.decision.update"
+                                           : exporting ? "guaranteed_state.benchmark.export"
+                                                       : "guaranteed_state.benchmark.read";
+                if (!tier_allows(tier, "GuaranteedState", operation)) {
+                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
+                                             kTierRemediation),
+                                    "application/json");
+                    return;
+                }
+                if (deny_fleet_wide_service_scoped(
+                        action, "GuaranteedState", "Benchmark metadata is fleet-wide",
+                        "service-scoped tokens may not access benchmark metadata"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", operation))
+                    return;
+                auto fail = [&](int status, const std::string& message) {
+                    const bool transient = status == 503;
+                    nlohmann::json data{
+                        {"correlation_id", yuzu::server::detail::make_correlation_id()},
+                        {"http_status", status},
+                        {"retry_after_ms",
+                         transient ? nlohmann::json(mcp::kMcpStoreFaultRetryMs) : nlohmann::json(nullptr)},
+                        {"remediation", status == 409 ? "Read the current catalog and decisions, "
+                                                        "review changes, then resubmit."
+                                        : transient
+                                            ? "Retry after the indicated delay."
+                                            : "Check the baseline, control and request fields."}};
+                    // retry-hint-exempt: this A4 data explicitly supplies the shared store retry hint
+                    // only for transient 503s; validation/not-found/CAS conflicts are null.
+                    res.set_content(error_response(id,
+                                                   status >= 500 ? kInternalError : kInvalidParams,
+                                                   message, data.dump()),
+                                    "application/json");
+                };
+                if (!baseline_store_) {
+                    // retry-hint-exempt: unwired dependency needs configuration, not polling.
+                    res.set_content(
+                        a4_error(kInternalError, "Baseline store unavailable",
+                                 "Configure the baseline store and restart the server."),
+                        "application/json");
+                    return;
+                }
+                const auto baseline_id = param_str(args, "baseline_id");
+                const auto control_id = param_str(args, "control_id");
+                const auto format = param_str(args, "format");
+                if (baseline_id.empty() || baseline_id.size() > 256 ||
+                    (deciding && (control_id.empty() || control_id.size() > 256)) ||
+                    (exporting && format != "html" && format != "markdown")) {
+                    fail(400, "A valid baseline_id, control_id and export format are required");
+                    return;
+                }
+                const auto audit = [&](const std::string& outcome) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, action, outcome, "GuaranteedState", baseline_id, control_id);
+                };
+                if (writing && !audit("attempt")) {
+                    fail(503, "Audit persistence unavailable; benchmark metadata was not changed");
+                    return;
+                }
+                auto result =
+                    importing
+                        ? import_benchmark(*baseline_store_, baseline_id, args, session->username)
+                    : deciding ? update_benchmark_decision(*baseline_store_, baseline_id,
+                                                           control_id, args, session->username)
+                               : read_benchmark(*baseline_store_, baseline_id);
+                if (!result) {
+                    (void)audit("failure");
+                    fail(result.error().status, result.error().message);
+                    return;
+                }
+                const char* schema =
+                    deciding ? kBenchmarkDecisionOutputSchema : kBenchmarkOutputSchema;
+                if (exporting) {
+                    auto content = format == "html" ? benchmark_export_html(*result)
+                                                    : benchmark_export_markdown(*result);
+                    *result = {{"format", format}, {"content", std::move(content)}};
+                    schema = kBenchmarkExportOutputSchema;
+                }
+                // A completed CAS is not reported as a retryable failure if its
+                // outcome audit drops; the persisted attempt still records intent.
+                if (!audit("success"))
+                    (*result)["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(result->dump(), schema)),
+                                "application/json");
+                return;
+            }
+
             // ── get_guardian_schemas ──────────────────────────────────────
             if (tool_name == "get_guardian_schemas") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
@@ -12881,6 +13048,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     arr.add(JObj()
                                 .add("rule_id", r.rule_id)
                                 .add("name", r.name)
+                                .add("description", r.description)
+                                .add("rationale", r.rationale)
                                 .add("yaml_source", r.yaml_source)
                                 .add("spec_json", r.spec_json)
                                 .add("version", static_cast<int64_t>(r.version))
@@ -13196,6 +13365,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 GuaranteedStateRuleRow row;
                 row.rule_id = param_str(args, "rule_id");
                 row.name = param_str(args, "name");
+                if (const auto error = guardian_metadata_error(args); !error.empty()) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id, error);
+                    // retry-hint-exempt: invalid metadata is a caller-input error.
+                    res.set_content(error_response(id, kInvalidParams, error), "application/json");
+                    return;
+                }
+                row.description = param_str(args, "description");
+                row.rationale = param_str(args, "rationale");
                 row.version = param_int(args, "version", 1);
                 row.enabled = args.value("enabled", true);
                 row.enforcement_mode = param_str(args, "enforcement_mode", "enforce");
@@ -13331,6 +13510,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj payload;
                 payload.add("rule_id", r.rule_id)
                     .add("name", r.name)
+                    .add("description", r.description)
+                    .add("rationale", r.rationale)
                     .add("yaml_source", r.yaml_source)
                     .add("spec_json", r.spec_json)
                     .add("version", static_cast<int64_t>(r.version))
@@ -13392,8 +13573,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const GuaranteedStateRuleRow& existing_rule = **existing;
+                if (const auto error = guardian_metadata_error(args); !error.empty()) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.update", "denied",
+                        "GuaranteedState", rule_id, error);
+                    // retry-hint-exempt: invalid metadata is a caller-input error.
+                    res.set_content(error_response(id, kInvalidParams, error), "application/json");
+                    return;
+                }
                 auto updated = existing_rule;
                 updated.name = param_str(args, "name", existing_rule.name.c_str());
+                if (args.contains("description")) updated.description = args["description"].get<std::string>();
+                if (args.contains("rationale")) updated.rationale = args["rationale"].get<std::string>();
                 updated.enabled = args.value("enabled", existing_rule.enabled);
                 // Mode (Watch/Enforce) is IMMUTABLE after creation — a different
                 // posture is a different Guard. Mirrors REST's PUT handler exactly.

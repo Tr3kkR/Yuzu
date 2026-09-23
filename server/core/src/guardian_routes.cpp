@@ -3,6 +3,7 @@
 /// for the coordination/mock contract.
 
 #include "guardian_routes.hpp"
+#include "guardian_benchmark.hpp"
 
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
@@ -701,7 +702,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
 
             std::string right = "<div class=\"big\">" +
                 (enforcing ? std::to_string(a ? a->remediated : 0) : std::to_string(a ? a->detected : 0)) +
-                "</div><div>" + (enforcing ? "remediated" : "detected") + " &middot; 7d</div>"
+                "</div><div>" + (enforcing ? "remediated" : "detection events") + " &middot; 7d</div>"
                 "<div style=\"margin-top:0.35rem\">" +
                 (dep ? std::to_string(deployed_by_rule[r.rule_id].size()) + " Baseline(s)" : "not deployed") +
                 "</div><div class=\"gs-view\">View &rarr;</div>";
@@ -828,15 +829,25 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // rollup is the status table (not the prunable event log), a quiet guard does not
     // vanish from "needs attention" once its events age out.
     int64_t cc_ok = 0, cc_drift = 0, cc_err = 0, cc_unk = 0, cc_notimpl = 0;
-    int guards_drifting = 0, drift_instances = 0, guards_errored = 0;
+    int guards_drifting = 0, guards_errored = 0;
+    std::unordered_set<std::string> current_rule_ids;
     for (const auto& r : rules) {
+        current_rule_ids.insert(r.rule_id);
         auto it = by_rule.find(r.rule_id);
         if (it == by_rule.end()) continue;
         const StateRollup& c = it->second;
         cc_ok += c.ok; cc_drift += c.drift; cc_err += c.err; cc_unk += c.unk; cc_notimpl += c.notimpl;
-        if (c.drift > 0) { ++guards_drifting; drift_instances += static_cast<int>(c.drift); }
+        if (c.drift > 0) ++guards_drifting;
         if (c.err > 0) ++guards_errored;
     }
+    // Count devices, not (device, rule) pairs: one endpoint may drift on many
+    // guards. Use the same status snapshot, live rule set and liveness scope
+    // as the fleet rollup, excluding errors, offline devices and orphan rows.
+    std::unordered_set<std::string> drifting_agents;
+    for (const auto& status : *statuses_result)
+        if (status.state == "drifted" && online.count(status.agent_id) &&
+            current_rule_ids.count(status.rule_id))
+            drifting_agents.insert(status.agent_id);
     // notimpl is IN the denominator on purpose: you are not "100% compliant" when
     // targeted Macs/Linux boxes can't be enforced, so the headline % must drop.
     const int64_t cc_total = cc_ok + cc_drift + cc_err + cc_unk + cc_notimpl;
@@ -963,7 +974,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     html += sech("Needs attention");
     html += "<div class=\"stat-cards\">";
     html += navcard(std::to_string(guards_drifting), guards_drifting ? "warn" : "good", "Guards drifting",
-                    "on " + std::to_string(drift_instances) + " agent(s) now",
+                    "on " + std::to_string(drifting_agents.size()) + " agent(s) now",
                     "gsGoView('guard','drift')");
     // "Enforcement failures" is a 7-day remediation-failure count, which is a
     // different population than the current-state `unhealthy` (err>0) chip — route
@@ -977,7 +988,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
 
     html += sech("Enforcement effectiveness (7d)");
     html += "<div class=\"stat-cards\">";
-    html += card(std::to_string(det), "warn", "Drift detected", "");
+    html += card(std::to_string(det), "warn", "Detection events", "includes repeated reports");
     html += card(std::to_string(rem), "good", "Remediated", "");
     html += card(std::to_string(fail), "bad", "Enforcement failed", "");
     html += card(std::to_string(success_pct) + "%", "good", "Enforcement success",
@@ -1215,6 +1226,14 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     const std::string name = get("name");
     if (name.empty())
         return fail("Name is required.");
+    const std::string description = get("description");
+    const std::string rationale = get("rationale");
+    // The browser form has an 8 KiB URL-encoded body cap, so its prose limit is
+    // deliberately smaller than REST/MCP's 16 KiB per field.
+    if (description.size() > 2048 || rationale.size() > 2048)
+        return fail("Description and risk rationale must each be at most 2048 bytes.");
+    if (description.find('\0') != std::string::npos || rationale.find('\0') != std::string::npos)
+        return fail("Description and risk rationale must contain no NUL characters.");
     // One "Mode" control (Watch | Enforce) replaces the old enforcement-mode +
     // remediation-action pair. Watch = observe & alert (no write-back); Enforce =
     // auto-remediate. The dashboard speaks "Watch"; the stored enforcement_mode
@@ -1264,6 +1283,8 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     GuaranteedStateRuleRow row;
     row.rule_id = slugify(name) + "-" + short_id(); // matches [A-Za-z0-9._-]+
     row.name = name;
+    row.description = description;
+    row.rationale = rationale;
     row.spec_json = std::move(spec.spec_json);
     row.yaml_source = std::move(spec.yaml_source);
     row.version = 1;
@@ -1874,6 +1895,8 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     // deliberately unchanged case — this page still renders Baseline
     // metadata with an empty rollup when GuaranteedStateStore isn't wired.
     std::unordered_map<std::string, StateRollup> by_rule;
+    std::unordered_set<std::string> drifting_devices;
+    const std::unordered_set<std::string> member_ids(members.begin(), members.end());
     // Pairs that already own a REAL status row — the #4252 exclusion index (see
     // has_real_status below), built from the SAME statuses read as by_rule, never
     // a second store query.
@@ -1884,6 +1907,12 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
             return stub("Guardian store degraded");
         by_rule = rollup_by_rule(*statuses, online);
         real_status_pairs = status_pair_index(*statuses);
+        // A device failing several member checks counts once. Historical
+        // detections and offline/unknown reports are not current drift.
+        for (const auto& status : *statuses)
+            if (member_ids.count(status.rule_id) && online.count(status.agent_id) &&
+                status.state == "drifted")
+                drifting_devices.insert(status.agent_id);
     }
 
     // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
@@ -1963,6 +1992,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     // Actions use onclick + fetch (gpAction), not htmx hx-on: the page CSP forbids
     // 'unsafe-eval' and htmx compiles hx-on handlers with new Function.
     h += "</div></div><div class=\"gp-actions\">"
+         "<a class=\"gp-btn\" href=\"/guardian/baseline/" + bid + "/decisions\">Benchmark decisions</a>"
          "<button class=\"gp-btn accent\" onclick=\"gpAction('POST','/fragments/guardian/baseline/" + bid +
          "/deploy')\">" + std::string(deployed ? "Re-deploy" : "Deploy") +
          "</button><button class=\"gp-btn danger\" onclick=\"gpAction('POST','/fragments/guardian/baseline/" +
@@ -2015,7 +2045,8 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
               std::to_string(guards_drifting) + " drifting &middot; " + std::to_string(guards_ok) + " clean");
     h += tile(std::to_string(agents), "", "Agents", "reporting now");
     h += tile(std::to_string(guards_drifting), guards_drifting ? "warn" : "good", "Guards drifting", "");
-    h += tile(std::to_string(det), det ? "warn" : "mute", "Drift detected", "7d");
+    h += tile(std::to_string(drifting_devices.size()), drifting_devices.empty() ? "good" : "warn",
+              "Devices drifting", "as of latest check-in");
     if (enforce_members > 0) {
         const int success_pct = (rem + fail > 0) ? static_cast<int>((rem * 100) / (rem + fail)) : 100;
         h += tile(std::to_string(rem), "good", "Remediated", "7d");
@@ -2023,6 +2054,9 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         h += tile(std::to_string(success_pct) + "%", "good", "Enforcement success", "");
     }
     h += "</div>";
+    h += "<div class=\"gp-note\">Detection events (last 7 days): <b>" + std::to_string(det) +
+         "</b>. Event history includes repeated reports from the same device; it is not a count "
+         "of devices currently drifting.</div>";
     if (enforce_members == 0)
         h += "<div class=\"gp-note\"><b>Observe baseline</b> &mdash; no auto-remediation, so no "
              "enforcement-success tiles. Add an Enforce-mode Guard and a remediation block appears here.</div>";
@@ -2043,13 +2077,15 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
              "<input class=\"gp-search\" type=\"search\" placeholder=\"Search guards&hellip;\" "
              "data-gpf=\"m\" oninput=\"gpSearch(this)\"></div>";
         h += "<table class=\"gp-table\"><thead><tr><th>Guard</th><th>Severity</th><th>Mode</th>"
-             "<th>State now</th><th class=\"gp-num\">Detected 7d</th><th>Last activity</th></tr></thead><tbody>";
+             "<th>State now</th><th class=\"gp-num\">Devices drifting</th><th>Last activity</th></tr></thead><tbody>";
         for (const auto& rid : members) {
-            std::string name = rid, sev;
+            std::string name = rid, sev, description, rationale;
             bool enf = false;
             if (auto it = rule_by_id.find(rid); it != rule_by_id.end()) {
                 if (!it->second.name.empty()) name = it->second.name;
                 sev = it->second.severity;
+                description = it->second.description;
+                rationale = it->second.rationale;
                 enf = (it->second.enforcement_mode == "enforce");
             }
             StateRollup c;
@@ -2065,12 +2101,20 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
                 sev.empty() ? "<span class=\"gp-mute\">&mdash;</span>"
                             : "<span class=\"gp-pill sev-" + html_escape(sev) + "\">" + html_escape(sev) + "</span>";
             const std::string rurl = "/guardian/guard/" + html_escape(rid);
+            auto preview = [](const std::string& value, const char* label) {
+                if (value.empty()) return std::string{};
+                return "<div class=\"gp-mute\" style=\"max-width:42rem;white-space:normal;"
+                       "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
+                       "overflow:hidden;margin-top:0.3rem;line-height:1.4\">" +
+                       std::string(label) + html_escape(value) + "</div>";
+            };
             h += "<tr class=\"click\" data-gpf=\"m\" data-gpstate=\"" + rowstate + "\" data-gpname=\"" +
-                 html_escape(lower(name)) + "\" onclick=\"window.location='" + rurl + "'\">"
-                 "<td><a href=\"" + rurl + "\">" + html_escape(name) + "</a></td><td>" + sevpill +
+                 html_escape(lower(name + " " + description + " " + rationale)) + "\" onclick=\"window.location='" + rurl + "'\">"
+                 "<td><a href=\"" + rurl + "\">" + html_escape(name) + "</a>" +
+                 preview(description, "") + preview(rationale, "<b>Risk rationale:</b> ") + "</td><td>" + sevpill +
                  "</td><td><span class=\"gp-pill " + std::string(enf ? "enforce" : "observe") + "\">" +
                  (enf ? "Enforce" : "Observe") + "</span></td><td>" + state + "</td><td class=\"gp-num\">" +
-                 std::to_string(a ? a->detected : 0) + "</td><td class=\"gp-mute\">" +
+                 std::to_string(c.drift) + "</td><td class=\"gp-mute\">" +
                  (a && !a->last_activity.empty() ? html_escape(a->last_activity.substr(0, 16)) : "&mdash;") +
                  "</td></tr>";
         }
@@ -2123,6 +2167,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
 
 std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_id) const {
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
+    std::string description, rationale;
     bool real_rule = false, enabled = true, enforcing = false;
     if (store_ && store_->is_open()) {
         // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
@@ -2132,6 +2177,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             const auto& rr = **r;
             real_rule = true;
             name = rr.name;
+            description = rr.description;
+            rationale = rr.rationale;
             severity = rr.severity;
             enforcing = (rr.enforcement_mode == "enforce");
             enabled = rr.enabled;
@@ -2314,6 +2361,15 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
          html_escape(guard_id) + "/enabled?value=" + (enabled ? "0" : "1") + "')\">" +
          (enabled ? "Disable" : "Enable") + "</button></div></div>";
 
+    if (!description.empty())
+        h += "<div class=\"gp-sech\">Description</div>"
+             "<div class=\"gp-note\" style=\"white-space:pre-wrap;line-height:1.6\">" +
+             html_escape(description) + "</div>";
+    if (!rationale.empty())
+        h += "<div class=\"gp-sech\">Risk rationale</div>"
+             "<div class=\"gp-note\" style=\"white-space:pre-wrap;line-height:1.6\">" +
+             html_escape(rationale) + "</div>";
+
     // What it checks.
     h += "<div class=\"gp-sech\">What it checks</div>";
     if (spec_poisoned) {
@@ -2364,9 +2420,9 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                    (sx.empty() ? "" : "<div class=\"sx\">" + sx + "</div>") + "</div>";
         };
         h += "<div class=\"gp-tiles\">";
-        h += tile(std::to_string(d_drift), d_drift ? "warn" : "good", "Agents drifted",
-                  "of " + std::to_string(d_total));
-        h += tile(std::to_string(det), det ? "warn" : "mute", "Drift detected", "7d");
+        h += tile(std::to_string(d_drift), d_drift ? "warn" : "good", "Devices drifting",
+                  "of " + std::to_string(d_total) + " &middot; latest check-in");
+        h += tile(std::to_string(det), "mute", "Detection events", "last 7 days; includes repeated reports");
         h += tile(last_activity.empty() ? "&mdash;" : html_escape(last_activity.substr(0, 16)), "", "Last activity", "");
         h += tile(std::to_string(baseline_count), "info", "Baselines", "delivering this guard");
         h += "</div>";
@@ -2516,6 +2572,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     agents_json_fn_ = std::move(agents_json_fn);
     push_fn_ = std::move(push_fn);
     metrics_ = metrics;
+    register_guardian_benchmark_routes(sink, auth_fn_, perm_fn_, audit_fn_, baseline_store_);
     if (metrics_) {
         // Pre-seed the closed spark_type label set (#4252), per
         // docs/observability-conventions.md: a bounded-label counter is

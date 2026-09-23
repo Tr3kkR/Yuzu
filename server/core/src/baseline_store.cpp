@@ -129,6 +129,26 @@ const std::vector<pg::PgMigration>& migrations() {
             -- group (deploy slice's affected-set recompute + cross-store cleanup).
             CREATE INDEX idx_baseline_rules_rule ON baseline_rules(rule_id);
             CREATE INDEX idx_baseline_groups_group ON baseline_groups(group_id);
+
+            CREATE TABLE benchmark_catalogs (
+                baseline_id TEXT PRIMARY KEY REFERENCES baselines(baseline_id) ON DELETE CASCADE,
+                catalog_json TEXT NOT NULL,
+                updated_by TEXT NOT NULL DEFAULT '',
+                revision BIGINT NOT NULL DEFAULT 1,
+                updated_at BIGINT NOT NULL
+            );
+            CREATE TABLE benchmark_decisions (
+                baseline_id TEXT NOT NULL REFERENCES baselines(baseline_id) ON DELETE CASCADE,
+                control_id TEXT NOT NULL,
+                value TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                status TEXT NOT NULL,
+                catalog_revision BIGINT NOT NULL,
+                revision BIGINT NOT NULL DEFAULT 1,
+                updated_by TEXT NOT NULL DEFAULT '',
+                updated_at BIGINT NOT NULL,
+                PRIMARY KEY (baseline_id, control_id)
+            );
         )"},
         // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) — the
         // backfill idempotency marker it was the sole purpose of no longer has a
@@ -190,6 +210,118 @@ std::string BaselineStore::generate_id() const {
     for (int i = 0; i < 12; ++i)
         id += chars[dist(rng)];
     return id;
+}
+
+// Assessment metadata has no policy-generation or deployment side effects.
+std::expected<std::optional<BenchmarkCatalog>, std::string>
+BaselineStore::benchmark_catalog(const std::string& baseline_id) const {
+    if (!open_) return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) return std::unexpected("no database connection: " + pool_.last_error());
+    auto res = pg::exec_params(lease.get(),
+        "SELECT catalog_json, revision, updated_by, updated_at "
+        "FROM baseline_store.benchmark_catalogs WHERE baseline_id=$1",
+        std::vector<std::optional<std::string>>{sanitize_pg_text(baseline_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("benchmark catalog read failed: " + std::string(PQresultErrorMessage(res.get())));
+    if (PQntuples(res.get()) == 0) return std::optional<BenchmarkCatalog>{};
+    return BenchmarkCatalog{text_col(res.get(), 0, 0), to_i64(PQgetvalue(res.get(), 0, 1)),
+                            text_col(res.get(), 0, 2), to_i64(PQgetvalue(res.get(), 0, 3))};
+}
+
+std::expected<void, std::string>
+BaselineStore::put_benchmark_catalog(const std::string& baseline_id, const std::string& catalog_json,
+                                      const std::string& author, int64_t expected_revision) {
+    if (!open_) return std::unexpected("database not open");
+    if (expected_revision < 0) return std::unexpected("revision must not be negative");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) return std::unexpected("no database connection: " + pool_.last_error());
+    const std::string sql = expected_revision == 0
+        ? "INSERT INTO baseline_store.benchmark_catalogs "
+          "(baseline_id,catalog_json,updated_by,updated_at,revision) VALUES ($1,$2,$3,$4::bigint,1) "
+          "ON CONFLICT (baseline_id) DO NOTHING RETURNING revision"
+        : "UPDATE baseline_store.benchmark_catalogs SET catalog_json=$2,updated_by=$3,"
+          "updated_at=$4::bigint,revision=revision+1 WHERE baseline_id=$1 AND revision=$5::bigint "
+          "RETURNING revision";
+    std::vector<std::optional<std::string>> params{sanitize_pg_text(baseline_id),
+        sanitize_pg_text(catalog_json), sanitize_pg_text(author), std::to_string(now_epoch())};
+    if (expected_revision > 0) params.emplace_back(std::to_string(expected_revision));
+    auto res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("benchmark catalog write failed: " + std::string(PQresultErrorMessage(res.get())));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(format_conflict("benchmark catalog revision changed; reload before saving"));
+    return {};
+}
+
+std::expected<std::vector<BenchmarkDecision>, std::string>
+BaselineStore::benchmark_decisions(const std::string& baseline_id) const {
+    if (!open_) return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) return std::unexpected("no database connection: " + pool_.last_error());
+    auto res = pg::exec_params(lease.get(),
+        "SELECT control_id,value,rationale,status,revision,updated_by,updated_at,catalog_revision "
+        "FROM baseline_store.benchmark_decisions WHERE baseline_id=$1 ORDER BY control_id",
+        std::vector<std::optional<std::string>>{sanitize_pg_text(baseline_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("benchmark decisions read failed: " + std::string(PQresultErrorMessage(res.get())));
+    std::vector<BenchmarkDecision> rows;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        rows.push_back({text_col(res.get(), i, 0), text_col(res.get(), i, 1), text_col(res.get(), i, 2),
+            text_col(res.get(), i, 3), to_i64(PQgetvalue(res.get(), i, 4)), text_col(res.get(), i, 5),
+            to_i64(PQgetvalue(res.get(), i, 6)), to_i64(PQgetvalue(res.get(), i, 7))});
+    return rows;
+}
+
+std::expected<BenchmarkDecision, std::string>
+BaselineStore::save_benchmark_decision(const std::string& baseline_id, const BenchmarkDecision& row,
+                                       const std::string& author, int64_t expected_revision,
+                                       int64_t catalog_revision) {
+    if (!open_) return std::unexpected("database not open");
+    if (expected_revision < 0) return std::unexpected("revision must not be negative");
+    if (catalog_revision < 1) return std::unexpected("catalog revision must be positive");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) return std::unexpected("no database connection: " + pool_.last_error());
+    pg::PgResult begin{PQexec(lease.get(), "BEGIN")};
+    if (begin.status() != PGRES_COMMAND_OK)
+        return std::unexpected("benchmark decision transaction failed: " + std::string(PQerrorMessage(lease.get())));
+    pg::PgTxn txn{lease.get()}; // Rolls back on every rejection, error or exception.
+    // Lock the revision we validated until the decision commits. A catalog
+    // update takes a conflicting row lock, so it cannot slip between this
+    // check and the decision write; concurrent decisions may share this lock.
+    auto catalog = pg::exec_params(lease.get(),
+        "SELECT revision FROM baseline_store.benchmark_catalogs "
+        "WHERE baseline_id=$1 AND revision=$2::bigint FOR SHARE",
+        std::vector<std::optional<std::string>>{sanitize_pg_text(baseline_id), std::to_string(catalog_revision)});
+    if (catalog.status() != PGRES_TUPLES_OK)
+        return std::unexpected("benchmark catalog lock failed: " + std::string(PQresultErrorMessage(catalog.get())));
+    if (PQntuples(catalog.get()) == 0)
+        return std::unexpected(format_conflict("benchmark catalog revision changed; reload before saving"));
+    const std::string sql = expected_revision == 0
+        ? "INSERT INTO baseline_store.benchmark_decisions "
+          "(baseline_id,control_id,value,rationale,status,updated_by,updated_at,catalog_revision,revision) "
+          "VALUES ($1,$2,$3,$4,$5,$6,$7::bigint,$8::bigint,1) ON CONFLICT (baseline_id,control_id) DO NOTHING "
+          "RETURNING control_id,value,rationale,status,revision,updated_by,updated_at,catalog_revision"
+        : "UPDATE baseline_store.benchmark_decisions SET value=$3,rationale=$4,status=$5,"
+          "updated_by=$6,updated_at=$7::bigint,catalog_revision=$8::bigint,revision=revision+1 "
+          "WHERE baseline_id=$1 AND control_id=$2 AND revision=$9::bigint "
+          "RETURNING control_id,value,rationale,status,revision,updated_by,updated_at,catalog_revision";
+    std::vector<std::optional<std::string>> params{sanitize_pg_text(baseline_id),
+        sanitize_pg_text(row.control_id), sanitize_pg_text(row.value), sanitize_pg_text(row.rationale),
+        sanitize_pg_text(row.status), sanitize_pg_text(author), std::to_string(now_epoch()),
+        std::to_string(catalog_revision)};
+    if (expected_revision > 0) params.emplace_back(std::to_string(expected_revision));
+    auto res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("benchmark decision write failed: " + std::string(PQresultErrorMessage(res.get())));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(format_conflict("benchmark decision revision changed; reload before saving"));
+    BenchmarkDecision saved{text_col(res.get(), 0, 0), text_col(res.get(), 0, 1), text_col(res.get(), 0, 2),
+        text_col(res.get(), 0, 3), to_i64(PQgetvalue(res.get(), 0, 4)), text_col(res.get(), 0, 5),
+        to_i64(PQgetvalue(res.get(), 0, 6)), to_i64(PQgetvalue(res.get(), 0, 7))};
+    if (!txn.commit())
+        return std::unexpected("benchmark decision commit failed: " + std::string(PQerrorMessage(lease.get())));
+    return saved;
 }
 
 // ── Baseline CRUD ──────────────────────────────────────────────────────────

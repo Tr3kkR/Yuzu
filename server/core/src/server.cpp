@@ -315,6 +315,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <ranges>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <string_view>
 #include <thread>
@@ -15598,7 +15599,16 @@ private:
         // (rule CRUD + event query on GuaranteedStateStore).
         guardian_routes_ = std::make_unique<GuardianRoutes>();
         guardian_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
+            *web_server_, auth_fn, perm_fn,
+            [audit_fn](const httplib::Request& req, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail) {
+                // Guardian's legacy callback is void. Preserve audit failure for
+                // benchmark authoring, whose attempt must persist before a write.
+                if (!audit_fn(req, action, result, target_type, target_id, detail) &&
+                    action.starts_with("guaranteed_state.benchmark."))
+                    throw std::runtime_error("Benchmark audit persistence failed");
+            },
             [this](const std::string& event_type, const httplib::Request& req,
                    const nlohmann::json& attrs, const nlohmann::json& payload_data) {
                 emit_event(event_type, req, attrs, payload_data);

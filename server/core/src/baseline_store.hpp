@@ -52,7 +52,7 @@
 /// thread here.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0055) ─────────────────────────────────────────
-/// Every table is operator-authored Guardian enforcement config — uniformly
+/// Baseline configuration tables are operator-authored enforcement config — uniformly
 /// AUTHORITATIVE (unlike ADR-0038's split-by-table-family, there is no
 /// bounded/re-derivable telemetry table here to carve out a fail-soft tier).
 ///  - **Baseline CRUD writes — fail-hard** (unchanged from pre-migration):
@@ -81,6 +81,9 @@
 ///  - Every other read (`list_baselines`/`get_assignment`/`baselines_containing_rule`/
 ///    counts) stays plain container/size_t, empty-on-degrade — dashboard
 ///    display only, never an enforce/target decision.
+///  - Benchmark catalogs and decisions are assessment-only metadata, never
+///    enforcement inputs. Reads distinguish storage failures from absent data;
+///    writes are revision-checked and do not touch deployment or member records.
 
 #include <cstddef>
 #include <cstdint>
@@ -131,6 +134,25 @@ struct BaselineGroupAssignment {
     std::string disposition;       // "include" | "exclude"
 };
 
+// Assessment metadata only: these records never modify members or deployment.
+struct BenchmarkCatalog {
+    std::string catalog_json;
+    int64_t revision{0};
+    std::string updated_by;
+    int64_t updated_at{0};
+};
+
+struct BenchmarkDecision {
+    std::string control_id;
+    std::string value;
+    std::string rationale;
+    std::string status;
+    int64_t revision{0};
+    std::string updated_by;
+    int64_t updated_at{0};
+    int64_t catalog_revision{0}; // Catalog against which this decision was reviewed.
+};
+
 class BaselineStore {
 public:
     /// Borrows the shared pool and runs the `baseline_store` schema migration
@@ -142,6 +164,23 @@ public:
     BaselineStore& operator=(const BaselineStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    // Degrade-distinguishable assessment reads. Service callers validate the
+    // opaque catalog/decision values. Writes use revision 0 for insert; positive
+    // revisions require an exact match, otherwise return kConflictPrefix.
+    std::expected<std::optional<BenchmarkCatalog>, std::string>
+    benchmark_catalog(const std::string& baseline_id) const;
+    std::expected<void, std::string>
+    put_benchmark_catalog(const std::string& baseline_id, const std::string& catalog_json,
+                          const std::string& author, int64_t expected_revision);
+    std::expected<std::vector<BenchmarkDecision>, std::string>
+    benchmark_decisions(const std::string& baseline_id) const;
+    // Catalog revision is fenced with a shared row lock through decision CAS
+    // and commit, and persisted as provenance for later catalog replacements.
+    std::expected<BenchmarkDecision, std::string>
+    save_benchmark_decision(const std::string& baseline_id, const BenchmarkDecision& row,
+                            const std::string& author, int64_t expected_revision,
+                            int64_t catalog_revision);
 
     // ── Baseline CRUD ──────────────────────────────────────────────────────
     // create_baseline generates a 12-hex baseline_id when `b.baseline_id` is

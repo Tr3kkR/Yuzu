@@ -661,11 +661,23 @@ const std::string& openapi_spec() {
           "default": {"type": "boolean", "description": "At most one operator template may be marked default per definition."}
         }
       },
+)json"
+        // Keep each literal below the MSVC C2026 string-literal limit.
+        R"json(
+      "GuardianBenchmarkControl": {"type": "object", "properties": {"control_id": {"type": "string", "maxLength": 128, "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$"}, "title": {"type": "string", "maxLength": 2048, "minLength": 1}, "profile": {"type": "string", "maxLength": 64, "minLength": 1}, "section": {"type": "string", "maxLength": 16384}, "benchmark_value": {"type": "string", "maxLength": 16384}, "suggested_value": {"type": "string", "maxLength": 4096}, "suggested_rationale": {"type": "string", "maxLength": 16384}, "description": {"type": "string", "maxLength": 16384}, "rationale": {"type": "string", "maxLength": 16384}, "location": {"type": "string", "maxLength": 16384}, "impact": {"type": "string", "maxLength": 16384}, "coverage": {"type": "string", "maxLength": 16384}, "applicability": {"type": "string", "maxLength": 16384}, "research_status": {"type": "string", "maxLength": 16384}, "benchmark_source": {"type": "string", "maxLength": 16384}, "alternatives": {"type": "array", "maxItems": 12, "items": {"type": "object", "properties": {"value": {"type": "string", "maxLength": 4096, "minLength": 1}, "reason": {"type": "string", "maxLength": 8192, "minLength": 1}, "tradeoff": {"type": "string", "maxLength": 8192, "minLength": 1}}, "required": ["value", "reason", "tradeoff"]}}, "sources": {"type": "array", "maxItems": 24, "items": {"type": "object", "properties": {"url": {"type": "string", "maxLength": 2048, "format": "uri"}, "title": {"type": "string", "maxLength": 1024, "minLength": 1}, "kind": {"type": "string", "maxLength": 128, "minLength": 1}}, "required": ["url", "title", "kind"]}}}, "required": ["control_id", "title", "profile"]},
+      "GuardianBenchmarkCatalog": {"type": "object", "properties": {"name": {"type": "string", "maxLength": 512, "minLength": 1}, "version": {"type": "string", "maxLength": 128, "minLength": 1}, "controls": {"type": "array", "minItems": 1, "maxItems": 1000, "items": {"$ref": "#/components/schemas/GuardianBenchmarkControl"}}}, "required": ["name", "version", "controls"]},
+      "GuardianBenchmarkDecision": {"type": "object", "properties": {"control_id": {"type": "string", "maxLength": 128}, "value": {"type": "string", "maxLength": 4096}, "rationale": {"type": "string", "maxLength": 16384}, "status": {"type": "string", "enum": ["proposed", "reviewed", "exception", "not_applicable"]}, "revision": {"type": "integer", "format": "int64", "minimum": 1}, "catalog_revision": {"type": "integer", "format": "int64", "minimum": 1}, "updated_by": {"type": "string"}, "updated_at": {"type": "integer", "format": "int64", "minimum": 0}}, "required": ["control_id", "value", "rationale", "status", "revision", "catalog_revision", "updated_by", "updated_at"]},
+      "GuardianBenchmarkDocument": {"type": "object", "properties": {"baseline_id": {"type": "string"}, "catalog": {"$ref": "#/components/schemas/GuardianBenchmarkCatalog"}, "catalog_revision": {"type": "integer", "format": "int64", "minimum": 1}, "catalog_updated_by": {"type": "string"}, "catalog_updated_at": {"type": "integer", "format": "int64", "minimum": 0}, "decisions": {"type": "array", "items": {"$ref": "#/components/schemas/GuardianBenchmarkDecision"}}}, "required": ["baseline_id", "catalog", "catalog_revision", "catalog_updated_by", "catalog_updated_at", "decisions"]},
+)json"
+        // Keep each literal below the MSVC C2026 string-literal limit.
+        R"json(
       "GuaranteedStateRule": {
         "type": "object",
         "properties": {
           "rule_id": {"type": "string", "description": "Stable operator-chosen id ([A-Za-z0-9._-]+)"},
           "name": {"type": "string"},
+          "description": {"type": "string", "maxLength": 16384, "description": "Control requirement; maximum 16384 UTF-8 bytes, no NUL. Server-only metadata."},
+          "rationale": {"type": "string", "maxLength": 16384, "description": "Organisational risk mitigated; maximum 16384 UTF-8 bytes, no NUL. Server-only metadata."},
           "yaml_source": {"type": "string", "description": "Authoritative rule body (kind: GuaranteedStateRule)"},
           "version": {"type": "integer"},
           "enabled": {"type": "boolean"},
@@ -1107,6 +1119,22 @@ const std::string& openapi_spec() {
         // C2026 cap. Adjacent string literals are concatenated at compile time,
         // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
         R"json(,
+)json"
+        // Keep each literal below the MSVC C2026 string-literal limit.
+        R"json(
+    "/guaranteed-state/baselines/{id}/benchmark": {
+      "get": {"summary": "Read benchmark catalog and decisions", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Service-scoped tokens are refused. Returns stored decision revisions and catalog provenance. Assessment metadata only; does not evaluate compliance or contact endpoints.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}}], "responses": {"200": {"description": "Read benchmark catalog and decisions", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/GuardianBenchmarkDocument"}}, "required": ["data"]}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing GuaranteedState permission or service-scoped token; benchmark metadata is fleet-wide"}, "404": {"description": "Baseline or benchmark catalog not found"}, "503": {"description": "Baseline, benchmark or audit store unavailable; A4 error envelope"}}},
+      "put": {"summary": "Import benchmark catalog", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Service-scoped tokens are refused. Import assessment metadata into an existing baseline. expected_revision is zero for first import, otherwise the current catalog_revision. A conflict requires rereading and reviewing the changes. Existing decisions retain their original catalog_revision and need review after a catalog change. Does not create Guards, change members or deploy a baseline. Raw JSON body limit: 4 MiB.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}}], "responses": {"200": {"description": "Import benchmark catalog", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/GuardianBenchmarkDocument"}}, "required": ["data"]}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing GuaranteedState permission or service-scoped token; benchmark metadata is fleet-wide"}, "404": {"description": "Baseline or benchmark catalog not found"}, "503": {"description": "Baseline, benchmark or audit store unavailable; A4 error envelope"}, "400": {"description": "Invalid catalog, revision, body size or JSON nesting"}, "409": {"description": "Catalog revision conflict; reread before resubmitting"}, "413": {"description": "Request exceeds the 4 MiB body cap"}}, "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"catalog": {"$ref": "#/components/schemas/GuardianBenchmarkCatalog"}, "expected_revision": {"type": "integer", "format": "int64", "minimum": 0}}, "required": ["catalog", "expected_revision"]}}}}}
+    },
+    "/guaranteed-state/baselines/{id}/benchmark/decisions/{control_id}": {
+      "put": {"summary": "Record benchmark control decision", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Service-scoped tokens are refused. Records value, rationale and review status under the authenticated author. expected_revision is zero for the first decision, otherwise the stored decision revision. catalog_revision must match the current catalog. Review status is documentation, not enforcement approval or a compliance verdict; no endpoint work is dispatched.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}}, {"name": "control_id", "in": "path", "required": true, "schema": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}}], "responses": {"200": {"description": "Record benchmark control decision", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/GuardianBenchmarkDecision"}}, "required": ["data"]}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing GuaranteedState permission or service-scoped token; benchmark metadata is fleet-wide"}, "404": {"description": "Baseline, catalog or control not found"}, "503": {"description": "Baseline, benchmark or audit store unavailable; A4 error envelope"}, "400": {"description": "Invalid decision fields, revision, body size or JSON nesting"}, "409": {"description": "Decision or catalog revision conflict; reread and review before resubmitting"}, "413": {"description": "Request exceeds the 4 MiB body cap"}}, "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"value": {"type": "string", "maxLength": 4096}, "rationale": {"type": "string", "maxLength": 16384}, "status": {"type": "string", "enum": ["proposed", "reviewed", "exception", "not_applicable"]}, "expected_revision": {"type": "integer", "format": "int64", "minimum": 0}, "catalog_revision": {"type": "integer", "format": "int64", "minimum": 1}}, "required": ["value", "rationale", "status", "expected_revision", "catalog_revision"]}}}}}
+    },
+    "/guaranteed-state/baselines/{id}/benchmark/export": {
+      "get": {"summary": "Export benchmark decisions for review", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Service-scoped tokens are refused. Returns an export document inside the JSON data envelope. HTML content is escaped. Proposed suggestions and stale decisions are distinguished from reviewed choices; no file is created and no endpoint work is dispatched.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["html", "markdown"], "default": "html"}}], "responses": {"200": {"description": "Export benchmark decisions for review", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"format": {"type": "string", "enum": ["html", "markdown"]}, "content": {"type": "string"}}, "required": ["format", "content"]}}, "required": ["data"]}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing GuaranteedState permission or service-scoped token; benchmark metadata is fleet-wide"}, "404": {"description": "Baseline or benchmark catalog not found"}, "503": {"description": "Baseline, benchmark or audit store unavailable; A4 error envelope"}, "400": {"description": "Unsupported export format"}}}
+    },
+)json"
+        // Keep each literal below the MSVC C2026 string-literal limit.
+        R"json(
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "403": {"description": "Service-scoped API token — the rule catalogue isn't owned by any one IT service, so this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Guaranteed-state store degraded, retryable (A4 envelope, retry_after_ms: 5000)"}}},
       "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
@@ -11837,6 +11865,8 @@ void RestApiV1::register_routes(
         JObj o;
         o.add("rule_id", r.rule_id)
             .add("name", r.name)
+            .add("description", r.description)
+            .add("rationale", r.rationale)
             .add("yaml_source", r.yaml_source)
             .add("spec_json", r.spec_json)
             .add("version", static_cast<int64_t>(r.version))
@@ -11980,6 +12010,21 @@ void RestApiV1::register_routes(
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
+        for (const auto* field : {"description", "rationale"}) {
+            if (body.contains(field) &&
+                (!body[field].is_string() || body[field].get_ref<const std::string&>().size() > 16384 ||
+                 body[field].get_ref<const std::string&>().find('\0') != std::string::npos)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid Guardian descriptive metadata", cid,
+                    "description and rationale must be strings of at most 16384 bytes without NUL"),
+                    "application/json");
+                audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                         "invalid descriptive metadata");
+                return;
+            }
+        }
+        row.description = body.value("description", std::string{});
+        row.rationale = body.value("rationale", std::string{});
         row.version = body.value("version", int64_t{1});
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
@@ -12295,6 +12340,21 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto updated = existing_rule;
+                 for (const auto* field : {"description", "rationale"}) {
+                     if (body.contains(field) &&
+                         (!body[field].is_string() || body[field].get_ref<const std::string&>().size() > 16384 ||
+                          body[field].get_ref<const std::string&>().find('\0') != std::string::npos)) {
+                         res.status = 400;
+                         res.set_content(detail::error_json_a4(400, "invalid Guardian descriptive metadata", cid,
+                             "description and rationale must be strings of at most 16384 bytes without NUL"),
+                             "application/json");
+                         audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                                  "invalid descriptive metadata");
+                         return;
+                     }
+                 }
+                 updated.description = body.value("description", updated.description);
+                 updated.rationale = body.value("rationale", updated.rationale);
                  // Use body.value<T>(k, default) rather than body["k"].get<T>()
                  // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
                  // falls back to the existing value rather than throwing
