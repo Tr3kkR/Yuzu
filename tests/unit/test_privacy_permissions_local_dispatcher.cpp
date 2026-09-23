@@ -11,6 +11,7 @@
 
 #include "local_dispatcher.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -104,4 +105,31 @@ TEST_CASE("privacy_permissions: permissions always returns at least one 8-field 
         CHECK(row.rfind("permissions|", 0) == 0);
         CHECK(field_count(row) == 8);
     }
+}
+
+TEST_CASE("privacy_permissions: no category is silently omitted -- each of the four has its "
+          "own row, or a whole-source row (category '-') stands for it",
+          "[privacy_permissions][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) return;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor(), "permissions");
+    std::vector<std::string> categories;
+    for (const auto& row : rows_of(result.captured)) {
+        // field 3 (0-based) is `category`; app_id (field 2) never contains an unescaped '|'.
+        std::size_t start = 0;
+        for (int i = 0; i < 3; ++i) start = row.find('|', start) + 1;
+        categories.push_back(row.substr(start, row.find('|', start) - start));
+    }
+    const auto has = [&](std::string_view c) {
+        return std::find(categories.begin(), categories.end(), c) != categories.end();
+    };
+    const bool whole_source_row = has("-");
+    for (const char* cat : {"camera", "microphone", "location", "full_disk_access"}) {
+        INFO(cat);
+        CHECK((has(cat) || whole_source_row));
+    }
+#if defined(__APPLE__)
+    CHECK(has("location")); // macOS: location is its own `unsupported` row on every collection
+#endif
 }

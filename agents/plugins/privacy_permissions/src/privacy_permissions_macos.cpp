@@ -1,66 +1,82 @@
 /**
  * privacy_permissions_macos.cpp -- macOS leg: TCC.db read-only, in-process (sqlite3_open_v2
- * SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX, the app_usage_plugin.cpp precedent) -- never a
- * `sqlite3` CLI shellout (zero precedent anywhere in this tree for that shape).
+ * SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX|SQLITE_OPEN_NOFOLLOW + PRAGMA query_only, the
+ * app_usage_plugin.cpp precedent) -- never a `sqlite3` CLI shellout.
  *
- * UNKNOWNS pending a real-hardware probe (see the plan): the exact `access` table schema and
- * `auth_value` integer mapping on the probed macOS version (has drifted across releases --
- * this file assumes the commonly-documented 0=denied/2=allowed/3=limited shape but treats any
- * other value as prompt_undetermined rather than guessing), and whether the shipped agent
- * identity (root LaunchDaemon today) can open TCC.db at all -- SIP-protected, so `denied` is
- * the charter's own expected outcome for an unentitled process.
+ * TWO KINDS OF SOURCE, both read the same way:
+ *   - the SYSTEM db, /Library/Application Support/com.apple.TCC/TCC.db -- machine-wide
+ *     services (full_disk_access); rows unqualified.
+ *   - one PER-USER db per real home, /Users/<name>/Library/Application Support/com.apple.TCC/
+ *     TCC.db -- camera and microphone grants live HERE, not in the system db (empirically
+ *     confirmed on this Mac, 2026-09-23: the per-user db held kTCCServiceMicrophone rows the
+ *     system db never has). Rows are qualified `<name>\<client>` (qualify_app_id, the same
+ *     shape the Windows leg uses per profile). Homes are enumerated the autoruns_macos.cpp
+ *     collect_user_launchagents way: directories directly under /Users, not followed through a
+ *     symlink, owned by uid >= 500, the directory name as the user name (no Open Directory call).
+ * A per-user db that does not exist is `absent` for that user; a refusal (EPERM/EACCES on the
+ * lstat, or SQLITE_CANTOPEN/AUTH/PERM on a file that IS there) is `denied`; anything else is
+ * `unreadable` with a `<source>:<cause>` token (macos_parsers.hpp decides; this file only reads).
+ *
+ * RESIDUALS, stated rather than assumed away:
+ *   - Every TCC.db (system AND per-user) is TCC-protected. An agent identity without Full Disk
+ *     Access reads `denied` for every source -- the charter's expected outcome, recorded
+ *     honestly; the production LaunchDaemon (root) is not known to hold FDA today.
+ *   - A home outside /Users (a relocated or network home) is not read, and a user whose home
+ *     directory is directly under /Users but owned by a uid < 500 is skipped as a system entry.
+ *   - The lstat pre-check and SQLITE_OPEN_NOFOLLOW refuse a symlinked FINAL component only; the
+ *     intermediate components under a user's own home are path-resolved, so a user who controls
+ *     their home can make their own rows come from a different file. Attribution of per-user
+ *     rows is therefore best-effort against that user; confinement of the READ is unaffected
+ *     (read-only, query_only, no write).
+ *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
+ *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
+ *     prompt_undetermined, never guessed.
  *
  * `location` is NOT queried here at all (CDX-R2-005) -- ADR-3003's platform investigation
- * established macOS Location Services is administered by `locationd`, OUTSIDE TCC; there is no
- * kTCCServiceLocation row to ask for. It ships as its own explicit `unsupported` row instead
- * (see kTccServices' own banner), same shape as the Linux leg's full_disk_access row.
+ * established macOS Location Services is administered by `locationd`, OUTSIDE TCC; it ships as
+ * one explicit `unsupported` row on every collection, whatever else failed.
  *
  * REAL PROBE, this Mac (`braga`, macOS 26.6.2), 2026-09-22, via the unit test binary's own
- * ambient identity (a Terminal/VSCode-launched process, NOT the production agent identity --
- * this proves the READ MECHANISM works end to end, not that the production LaunchDaemon can
- * open TCC.db; that remains a still-open acceptance item requiring the real service identity):
- * open + query against `access` succeeded and returned real `full_disk_access` rows --
- * sshd-keygen-wrapper and com.microsoft.VSCode both `allowed` (auth_value 2);
- * com.nordvpn.macos, com.spotify.client and net.whatsapp.WhatsApp all `denied` (auth_value 0).
- * No camera/microphone rows were present for any queried app on this host at capture time --
- * consistent with the query itself being schema-correct rather than silently false-empty,
- * since the identical query DID return real full_disk_access rows.
+ * ambient identity (a Terminal/VSCode-launched process with FDA, NOT the production agent
+ * identity): open + query against the system db's `access` table returned real
+ * `full_disk_access` rows (auth_value 2 and 0).
  */
 #include "privacy_permissions_legs.hpp"
 
 #if defined(__APPLE__)
 
-#include <array>
+#include "privacy_permissions_macos_parsers.hpp"
+
+#include <algorithm>
+#include <cerrno>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <sqlite3.h>
+
+#include <posix_dir_walk.hpp>
 
 namespace yuzu::privacy_permissions {
 
 namespace {
 
+static_assert(macos::kSqlitePerm == SQLITE_PERM);
+static_assert(macos::kSqliteCantOpen == SQLITE_CANTOPEN);
+static_assert(macos::kSqliteAuth == SQLITE_AUTH);
+
 constexpr std::string_view kTccDbPath = "/Library/Application Support/com.apple.TCC/TCC.db";
-
-struct TccService {
-    std::string_view service; // literal TCC service identifier
-    std::string_view category;
-};
-
-// Only three of the four charter categories are TCC services; every other TCC service
-// (kTCCServiceContacts, kTCCServiceAppleEvents, kTCCServiceScreenCapture, ...) is out of scope
-// by deliberate filter, not a decode failure -- the query below simply never asks for them.
-// `location` is NOT here (CDX-R2-005): ADR-3003's platform investigation established macOS
-// Location Services is administered by `locationd`, OUTSIDE TCC entirely -- there is no
-// kTCCServiceLocation row to query, so this was previously a fake lookup that always silently
-// returned zero rows, indistinguishable from "the app never asked". It ships as its own
-// explicit `unsupported` row below instead, matching the Linux full_disk_access precedent.
-inline constexpr std::array<TccService, 3> kTccServices{{
-    {"kTCCServiceCamera", "camera"},
-    {"kTCCServiceMicrophone", "microphone"},
-    {"kTCCServiceSystemPolicyAllFiles", "full_disk_access"},
-}};
+constexpr std::string_view kUsersDir = "/Users";
+constexpr std::string_view kUserTccRelPath = "/Library/Application Support/com.apple.TCC/TCC.db";
+// Outer cap on /Users entries -- the same bounded-walk shape autoruns uses for its own /Users
+// walk; a host with more than this many entries reports `users:truncated`, never silently.
+constexpr std::size_t kMaxUserHomes = 4096;
 
 class DbHandle {
 public:
@@ -117,22 +133,19 @@ private:
     sqlite3_stmt* stmt_{nullptr};
 };
 
-/// Opens `db_path` (default: the real TCC.db) read-only. `err_msg` is filled from
-/// sqlite3_errmsg() on failure -- the real, observed diagnostic, not a guessed one (the plan's
-/// acceptance criterion for this leg is recording the ACTUAL denied/constrained outcome, not
-/// asserting one). `db_path` is a parameter (not baked in) so a unit test can force the exact
-/// open-failure branch deterministically against a path this process genuinely cannot open,
-/// without needing a non-FDA identity or touching the real TCC.db. `out_rc`, if non-null,
-/// receives the real sqlite3_open_v2 result code on failure (C4-CODEX-004): the file's
-/// previous banner claimed "sqlite3_open_v2 treats file-missing and permission-refused
-/// identically, no finer-grained code to branch on" -- that was simply wrong. SQLITE_CANTOPEN/
-/// SQLITE_AUTH/SQLITE_PERM ARE distinct from e.g. SQLITE_NOMEM/SQLITE_IOERR; the caller now
-/// uses this to stop reporting every open failure as a refusal.
+/// Opens `db_path` (default: the system TCC.db) read-only. `err_msg` is filled from
+/// sqlite3_errmsg() on failure -- the real, observed diagnostic, not a guessed one. `db_path`
+/// is a parameter so a unit test can force the exact open-failure branch deterministically
+/// against a path this process genuinely cannot open, without a non-FDA identity or the real
+/// TCC.db. `out_rc`, if non-null, receives the real sqlite3_open_v2 result code on failure
+/// (C4-CODEX-004: SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM are distinct from e.g.
+/// SQLITE_NOMEM/SQLITE_IOERR, and macos::classify_tcc_sqlite_rc branches on exactly that).
 DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPath,
                        int* out_rc = nullptr) {
     sqlite3* raw = nullptr;
-    const int rc = sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
-                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
+    const int rc =
+        sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
     DbHandle db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
                       // carry the error message; RAII from here regardless of `rc`.
     if (rc != SQLITE_OK) {
@@ -145,16 +158,113 @@ DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPa
     return db;
 }
 
-PermissionState decode_auth_value(int v) {
-    // Commonly-documented mapping across recent macOS releases; NOT verified against this
-    // build's actual schema (unknown #1 in the plan). Any value outside this table is a real,
-    // visible prompt_undetermined rather than a silent misclassification.
-    switch (v) {
-    case 0: return PermissionState::denied;
-    case 2: return PermissionState::allowed;
-    case 3: return PermissionState::allowed; // "limited" -- still a grant, just scoped
-    default: return PermissionState::prompt_undetermined;
+/// Reads ONE TCC.db source (`owner` empty = the system db) into `rows`. Every outcome lands as
+/// rows: a whole-source row when the file is missing/refused/unopenable/unpreparable, else
+/// every mapped category's rows (macos::append_tcc_source_rows).
+void read_tcc_source(std::string_view owner, const std::string& path, bool missing_is_absent,
+                     std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc) {
+    struct stat st{};
+    const int lstat_errno = (::lstat(path.c_str(), &st) == 0) ? 0 : errno;
+    if (const auto f = macos::classify_tcc_presence(lstat_errno, lstat_errno == 0 && S_ISREG(st.st_mode),
+                                                    missing_is_absent)) {
+        rows.push_back(macos::tcc_source_failed_row(owner, *f, acc));
+        return;
     }
+
+    std::string err_msg;
+    int open_rc = SQLITE_OK;
+    DbHandle db = open_readonly(err_msg, path, &open_rc);
+    if (!db) {
+        rows.push_back(macos::tcc_source_failed_row(
+            owner, {macos::classify_tcc_sqlite_rc(open_rc), "open_failed:" + err_msg}, acc));
+        return;
+    }
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    static constexpr char kQuery[] =
+        "SELECT service, client, auth_value FROM access WHERE service = ?";
+    const int prep_rc = sqlite3_prepare_v2(db.get(), kQuery, -1, &raw_stmt, nullptr);
+    StmtHandle stmt{raw_stmt}; // owns it from here -- finalized on every path, incl. an exception
+    if (prep_rc != SQLITE_OK) {
+        // 7.6: a TCC refusal can surface lazily, at the first page read, as CANTOPEN/AUTH --
+        // classified the same as an open failure, never a flat `unreadable`.
+        rows.push_back(macos::tcc_source_failed_row(
+            owner,
+            {macos::classify_tcc_sqlite_rc(prep_rc),
+             std::string{"prepare_failed:"} + sqlite3_errmsg(db.get())},
+            acc));
+        return;
+    }
+
+    std::vector<macos::TccServiceRead> reads;
+    for (const auto& svc : macos::kTccServices) {
+        macos::TccServiceRead read{svc.category, {}, false};
+        sqlite3_reset(stmt.get());
+        sqlite3_bind_text(stmt.get(), 1, svc.service.data(), static_cast<int>(svc.service.size()),
+                          SQLITE_STATIC);
+        for (;;) {
+            const int step_rc = sqlite3_step(stmt.get());
+            if (step_rc == SQLITE_DONE) break;
+            if (step_rc != SQLITE_ROW) {
+                read.step_failed = true;
+                break;
+            }
+            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+            std::optional<int> auth_value;
+            if (sqlite3_column_type(stmt.get(), 2) == SQLITE_INTEGER)
+                auth_value = sqlite3_column_int(stmt.get(), 2);
+            read.grants.push_back({client ? client : "-", auth_value});
+        }
+        reads.push_back(std::move(read));
+    }
+    macos::append_tcc_source_rows(owner, reads, rows, acc);
+}
+
+/// Real per-user homes directly under `users_dir` (autoruns_macos.cpp's
+/// collect_user_launchagents rule): a directory entry, not a symlink, owned by uid >= 500,
+/// named by the directory itself. Failures that lose a whole user or the whole walk are
+/// reported as rows (never silence); the returned names are sorted for stable output.
+std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
+                                              yuzu::shared::ConstraintAccumulator& acc,
+                                              const std::string& users_dir = std::string{kUsersDir}) {
+    std::vector<std::string> names;
+    const int fd = ::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        const int err = errno;
+        rows.push_back(failure_row("macos", "-", "-", err == EPERM || err == EACCES,
+                                   "users:open_errno_" + std::to_string(err), acc));
+        return names;
+    }
+    DIR* d = ::fdopendir(fd);
+    if (d == nullptr) {
+        const int err = errno;
+        ::close(fd);
+        rows.push_back(failure_row("macos", "-", "-", false,
+                                   "users:fdopendir_errno_" + std::to_string(err), acc));
+        return names;
+    }
+    const auto walk = yuzu::shared::walk_dir_capped(d, kMaxUserHomes, [&](const struct dirent* e) {
+        const std::string name{e->d_name};
+        if (name.empty() || name.front() == '.') return true;
+        struct stat st{};
+        if (::fstatat(::dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            const int err = errno;
+            if (err != ENOENT) // vanished between readdir and fstatat: nothing lost
+                rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-",
+                                           err == EPERM || err == EACCES,
+                                           name + ":home_stat_errno_" + std::to_string(err), acc));
+            return true;
+        }
+        if (!S_ISDIR(st.st_mode) || st.st_uid < 500) return true; // Shared, symlinks, system
+        names.push_back(name);
+        return true;
+    });
+    ::closedir(d);
+    if (walk.truncated) rows.push_back(failure_row("macos", "-", "-", false, "users:truncated", acc));
+    if (walk.enumeration_error)
+        rows.push_back(failure_row("macos", "-", "-", false, "users:readdir_error", acc));
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 } // namespace
@@ -162,9 +272,9 @@ PermissionState decode_auth_value(int v) {
 // `collect_macos_permissions` itself (below) is excluded when
 // YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY is defined -- the seam
 // test_privacy_permissions_macos_internals.cpp uses to #include this TU directly and reach the
-// internal-linkage `open_readonly` for a deterministic open-failure unit test (denied-path
-// composition, K2/COD-FV-5), without pulling collect_macos_permissions's own symbol into a
-// second definition. This TU never statically links the real plugin either way
+// internal-linkage `open_readonly`/`read_tcc_source` for deterministic open-failure unit tests
+// (denied-path composition, K2/COD-FV-5), without pulling collect_macos_permissions's own
+// symbol into a second definition. This TU never statically links the real plugin either way
 // (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
 // runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
 // symbol conflict. Never defined by this TU's own (real) build -- meson.build does not set it.
@@ -176,71 +286,17 @@ int collect_macos_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
 
-    std::string err_msg;
-    int open_rc = SQLITE_OK;
-    DbHandle db = open_readonly(err_msg, kTccDbPath, &open_rc);
-    if (!db) {
-        // C4-CODEX-004: only SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM on a SIP-protected file
-        // are a genuine refusal (the charter's expected outcome for an unentitled process);
-        // any other open failure (SQLITE_NOMEM, SQLITE_IOERR, ...) is a real resource/storage
-        // fault this process did not cause and cannot fix by gaining FDA -- reporting it as
-        // `denied` would send an operator chasing a TCC entitlement that was never the
-        // problem. Never `absent` either way -- a system file that is always present on a
-        // modern macOS host.
-        const bool this_denied = (open_rc == SQLITE_CANTOPEN || open_rc == SQLITE_AUTH ||
-                                  open_rc == SQLITE_PERM);
-        rows.push_back(whole_read_failed_row(
-            "macos", this_denied ? PermissionState::denied : PermissionState::unreadable,
-            "tcc_db:open_failed:" + err_msg, acc, this_denied));
-        return emit_rows(ctx, rows, acc, false);
-    }
+    // The system db keeps its unqualified rows; a missing system db is `unreadable`, never absent.
+    read_tcc_source({}, std::string{kTccDbPath}, /*missing_is_absent=*/false, rows, acc);
 
-    sqlite3_stmt* raw_stmt = nullptr;
-    static constexpr char kQuery[] =
-        "SELECT service, client, auth_value FROM access WHERE service = ?";
-    if (sqlite3_prepare_v2(db.get(), kQuery, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        rows.push_back(whole_read_failed_row(
-            "macos", PermissionState::unreadable,
-            std::string{"tcc_db:prepare_failed:"} + sqlite3_errmsg(db.get()), acc, false));
-        return emit_rows(ctx, rows, acc, false);
-    }
-    StmtHandle stmt{raw_stmt}; // owns it from here -- finalized on every path, incl. an exception
+    for (const auto& user : enumerate_user_homes(rows, acc))
+        read_tcc_source(user, std::string{kUsersDir} + "/" + user + std::string{kUserTccRelPath},
+                        /*missing_is_absent=*/true, rows, acc);
 
-    bool any_row_found = false;
-    for (const auto& svc : kTccServices) {
-        sqlite3_reset(stmt.get());
-        sqlite3_bind_text(stmt.get(), 1, svc.service.data(), static_cast<int>(svc.service.size()),
-                          SQLITE_STATIC);
-        for (;;) {
-            const int step_rc = sqlite3_step(stmt.get());
-            if (step_rc == SQLITE_DONE) break;
-            if (step_rc != SQLITE_ROW) {
-                acc.add_failure(std::string{svc.category} + ":query_step_failed");
-                break;
-            }
-            any_row_found = true;
-            const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
-            const int auth_value = sqlite3_column_int(stmt.get(), 2);
-            rows.push_back({"macos", client ? client : "-", svc.category,
-                            decode_auth_value(auth_value), std::to_string(auth_value), "-", "-",
-                            false});
-        }
-    }
-
-    // Fixed four-category vocabulary (CDX-R2-005, same shape as Linux full_disk_access,
-    // CDX-P1-006): location has no TCC service to query at all (see kTccServices' own banner),
-    // so it ships its own explicit `unsupported` row on every collection -- never silently
-    // omitted, which a consumer cannot distinguish from a missed collector row.
+    // Fixed four-category vocabulary (CDX-R2-005): location has no TCC service at all, so it
+    // ships its own explicit `unsupported` row on EVERY collection -- including when every
+    // TCC.db read above failed -- never silently omitted.
     rows.push_back({"macos", "-", "location", PermissionState::unsupported, "-", "-", "-", false});
-
-    if (rows.empty()) {
-        // Query ran cleanly but found nothing for any of the three mapped TCC services, and
-        // the unconditional location row above never fires (dead in practice, kept as a
-        // defensive fallback) -- a definitive, honest "no grants recorded": absent, not
-        // unreadable.
-        rows.push_back({"macos", "-", "-", PermissionState::absent, "-", "-", "-", false});
-    }
-    (void)any_row_found;
     return emit_rows(ctx, rows, acc, false);
 }
 

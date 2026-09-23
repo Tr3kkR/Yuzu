@@ -5,13 +5,11 @@
  * a refused TCC.db open must never collapse into `absent` -- was proven only at the pure layer,
  * never against the real sqlite3_open_v2 call this leg actually makes).
  *
- * `open_readonly` now takes `db_path` as a parameter (default: the real TCC.db) specifically so
- * this test can force the exact open-failure branch deterministically, without a non-FDA
- * identity: sqlite3_open_v2 with SQLITE_OPEN_READONLY on a path that genuinely cannot be opened
- * (missing directory, permission-denied file) fails through the SAME generic path a real SIP/TCC
- * refusal would -- the leg's own comment on `collect_macos_permissions` states there is no
- * finer-grained code to distinguish them, so a deterministic "path absent" failure exercises
- * exactly the code a real denial exercises.
+ * `open_readonly` and `read_tcc_source` take the db path as a parameter (default: the real
+ * TCC.db) specifically so this test can force each outcome branch deterministically, without a
+ * non-FDA identity and without touching any real TCC.db: a missing per-user db must read
+ * `absent`, a missing SYSTEM db `unreadable`, and a present-but-unopenable file (mode 000,
+ * the same SQLITE_CANTOPEN an SIP/TCC refusal produces) `denied` -- never absent.
  *
  * #if defined(__APPLE__) guards the WHOLE body -- empty TU elsewhere, mirroring every other
  * Apple-only internals-seam test in this tree (test_autoruns_macos_local.cpp's #4241 seam is the
@@ -25,19 +23,27 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "test_helpers.hpp"
 
 // Direct source inclusion, macOS-only, mirroring autoruns_macos.cpp's
 // YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY seam (see that file's own banner, and
 // YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY's definition comment in
-// privacy_permissions_macos.cpp): `open_readonly`, `DbHandle`, `decode_auth_value` and
-// `kTccServices` all have internal (anonymous-namespace or file-static) linkage, so there is no
-// header seam to reach them through otherwise. This TU never statically links the real plugin
-// either way (test_privacy_permissions_local_dispatcher.cpp loads it via
-// PluginHandle::load/dlopen at runtime), so a second compilation of the same free functions here
-// creates no ODR/duplicate-symbol conflict.
-// Excluding collect_macos_permissions leaves decode_auth_value/kTccServices/DbHandle's move
-// assignment with no caller in THIS compilation of the TU -- real, used call sites in the actual
+// privacy_permissions_macos.cpp): `open_readonly`, `read_tcc_source` and `DbHandle` have
+// internal (anonymous-namespace) linkage, so there is no header seam to reach them through
+// otherwise. This TU never statically links the real plugin either way
+// (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
+// runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
+// symbol conflict.
+// Excluding collect_macos_permissions leaves enumerate_user_homes/DbHandle's move assignment
+// with no caller in THIS compilation of the TU -- real, used call sites in the actual
 // (non-test) build of this same file. -Wunused-function is non-fatal project-wide but is
 // silenced narrowly here, scoped to just the include.
 #define YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY 1
@@ -63,43 +69,49 @@ TEST_CASE("privacy_permissions macOS: open_readonly on a genuinely unopenable pa
     CHECK_FALSE(err_msg.empty());
 }
 
-TEST_CASE("privacy_permissions macOS: open_readonly against the real TCC.db path either "
-          "succeeds (FDA-granted host) or fails through the same denied-shaped path test #1 "
-          "already proves deterministically -- never a bare CHECK on a host-privilege property",
+TEST_CASE("privacy_permissions macOS: read_tcc_source on a MISSING per-user db is one absent "
+          "row with no token; a missing SYSTEM db is unreadable, never absent",
           "[privacy_permissions][macos][internals]") {
-    // CDX-R2-003 (both external reviewers independently): a bare CHECK(open succeeds) turns
-    // this test red on any CI runner identity without Full Disk Access -- a host-privilege
-    // property, not a code defect (the plugin's own contract says a refused open is the
-    // CORRECT, expected outcome for an unentitled process). Branch instead: a success here is
-    // real corroboration of the dispatcher test's success-path evidence on THIS host; a
-    // failure is just re-confirming what test #1 already proves with a synthetic path, and is
-    // not itself a finding.
-    std::string err_msg;
-    auto db = open_readonly(err_msg);
-    if (db) {
-        SUCCEED("real TCC.db opened -- this host/identity holds FDA");
-    } else {
-        CHECK_FALSE(err_msg.empty());
-    }
+    const std::string missing =
+        yuzu::test::unique_temp_path("yuzu_test_pp_missing_").string() + "/TCC.db";
+
+    yuzu::shared::ConstraintAccumulator user_acc;
+    std::vector<PermissionRow> user_rows;
+    read_tcc_source("alice", missing, /*missing_is_absent=*/true, user_rows, user_acc);
+    REQUIRE(user_rows.size() == 1);
+    CHECK(format_row(user_rows[0]) == "permissions|macos|alice/-|-|absent|-|-|-");
+    CHECK_FALSE(user_acc.any_failure());
+
+    yuzu::shared::ConstraintAccumulator sys_acc;
+    std::vector<PermissionRow> sys_rows;
+    read_tcc_source({}, missing, /*missing_is_absent=*/false, sys_rows, sys_acc);
+    REQUIRE(sys_rows.size() == 1);
+    CHECK(sys_rows[0].state == PermissionState::unreadable);
+    CHECK(sys_rows[0].raw == "tcc_db:missing");
+    CHECK(select_status(sys_acc, any_denied(sys_rows), false).status ==
+          YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
-TEST_CASE("privacy_permissions macOS: composing a real open_readonly failure through "
-          "whole_read_failed_row/select_status -- the exact two-statement shape "
-          "collect_macos_permissions's open-failure branch uses -- yields denied, never absent",
+TEST_CASE("privacy_permissions macOS: read_tcc_source on a PRESENT file the process cannot open "
+          "(mode 000 -- the same SQLITE_CANTOPEN a TCC refusal produces) is denied and promotes "
+          "PERMISSION_DENIED, never absent",
           "[privacy_permissions][macos][internals]") {
+    if (::geteuid() == 0) SKIP("root ignores mode 000 -- the refusal cannot be forced here");
+    const auto path = yuzu::test::unique_temp_path("yuzu_test_pp_tcc_");
+    { std::ofstream{path} << "x"; }
+    REQUIRE(::chmod(path.c_str(), 0) == 0);
+
     yuzu::shared::ConstraintAccumulator acc;
-    std::string err_msg;
-    auto db = open_readonly(err_msg, "/nonexistent/deliberately-broken/privacy_permissions_test.db");
-    REQUIRE_FALSE(static_cast<bool>(db));
+    std::vector<PermissionRow> rows;
+    read_tcc_source("alice", path.string(), /*missing_is_absent=*/true, rows, acc);
+    ::chmod(path.c_str(), 0600);
+    std::filesystem::remove(path);
 
-    // Same call collect_macos_permissions's `if (!db) { ... }` branch makes, verbatim.
-    const auto row = whole_read_failed_row("macos", PermissionState::denied,
-                                           "tcc_db:open_failed:" + err_msg, acc, true);
-    CHECK(row.state == PermissionState::denied);
-    CHECK(row.read_denied);
-    CHECK(row.raw.rfind("tcc_db:open_failed:", 0) == 0);
-
-    const std::vector<PermissionRow> rows{row};
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].app_id == "alice\\-");
+    CHECK(rows[0].state == PermissionState::denied);
+    CHECK(rows[0].read_denied);
+    CHECK(rows[0].raw.rfind("alice:tcc_db:open_failed:", 0) == 0);
     const auto st = select_status(acc, any_denied(rows), false);
     CHECK(st.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
     CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);

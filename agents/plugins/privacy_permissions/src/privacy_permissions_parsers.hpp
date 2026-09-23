@@ -4,9 +4,19 @@
  * selector. No OS call, no I/O, no platform header: the leg TUs supply the real
  * SQLite/registry/D-Bus read, this file only decides what a result MEANS.
  *
- * ROW (always 8 fields): permissions|<os>|<app_id>|<category>|<state>|<raw>|<last_used_start>
- * |<last_used_stop>. The two `last_used_*` fields are Windows-only (epoch-ms, "-" elsewhere) --
- * always present so every row from this plugin has the same field count, never omitted.
+ * ROW (always 8 fields, pinned to content/definitions/privacy_permissions.yaml's `result.columns`
+ * by kColumns + the unit test): <row_kind>|<os>|<app_id>|<category>|<state>|<raw>
+ * |<last_used_start>|<last_used_stop>. `row_kind` is `permissions` on every data row and
+ * `constrained` only on the one internal_error row the plugin's catch-all writes (same field
+ * count, so the YAML columns never shift). The two `last_used_*` fields are Windows-only
+ * (epoch-ms, "-" elsewhere) -- always present so every row has the same field count.
+ *
+ * FAILURE ROWS: a row whose state is `unreadable` or `denied` because a READ failed carries its
+ * own `<subject>:<cause>` failure token in `raw` (the same token lands in the result
+ * provenance), so a failure row is never mistaken for a decoded grant. `category` is "-" only
+ * on a whole-SOURCE row (a whole TCC.db, profile hive, HKLM root, the portal/session bus) --
+ * that one row stands for every category of that source, so no category is ever silently
+ * omitted: each category either gets its own row or is covered by a whole-source row.
  *
  * <category> is a FIXED, cross-OS vocabulary: camera | microphone | location |
  * full_disk_access. Each leg owns its own native-identifier -> category table and silently
@@ -28,6 +38,7 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -44,6 +55,16 @@
 namespace yuzu::privacy_permissions {
 
 inline constexpr std::string_view kPermissionsAction = "permissions";
+
+// Row families (the leading `row_kind` field). Every data row is `permissions`; `constrained`
+// is written only by the plugin's catch-all (format_internal_error_row).
+inline constexpr std::string_view kRowKindPermissions = kPermissionsAction;
+inline constexpr std::string_view kRowKindConstrained = "constrained";
+
+// The wire row's fields, in order -- MUST equal the YAML definition's `result.columns` names
+// (pinned by test_privacy_permissions_parsers.cpp, which reads the YAML itself).
+inline constexpr std::array<std::string_view, 8> kColumns{
+    "row_kind", "os", "app_id", "category", "state", "raw", "last_used_start", "last_used_stop"};
 
 enum class PermissionState { allowed, denied, prompt_undetermined, absent, unreadable, unsupported };
 
@@ -68,25 +89,36 @@ inline constexpr std::array<std::string_view, 4> kCategories{"camera", "micropho
 
 // ── rows ───────────────────────────────────────────────────────────────
 
-/// `app_id` is owned (a per-app identifier -- an exe path, a bundle id, a PFN); `category` and
-/// `os` borrow literals. `denied` = the read was refused (distinct from PermissionState::denied,
-/// which means "this app's grant for this category is denied" -- a normal, non-failure result).
-/// On Windows, `app_id` is qualified with the owning profile's name (`<profile>\<app_id>`,
-/// never a SID -- ADR-0024 D11) since the agent runs as LocalSystem and reads MULTIPLE real
-/// users' ConsentStore hives, so the same app across two profiles must not collide.
+/// `app_id` is owned (a per-app identifier -- an exe path, a bundle id, a PFN, or "-" for "no
+/// specific app"); `category` and `os` borrow literals. `read_denied` = the read was refused
+/// (distinct from PermissionState::denied alone, which on a decoded row means "this app's grant
+/// for this category is denied" -- a normal, non-failure result). A row read from a PER-USER
+/// source (a Windows profile hive, a macOS per-user TCC.db) has its app_id qualified with that
+/// user's name via qualify_app_id (never a SID -- ADR-0024 D11), so the same app across two
+/// users never collides.
 struct PermissionRow {
     std::string_view os;
     std::string app_id;
-    std::string_view category; // must be one of kCategories
+    std::string_view category; // one of kCategories, or "-" on a whole-source row only
     PermissionState state;
-    std::string raw;              // "-" when nothing meaningful beyond the state itself
-    std::string last_used_start;  // "-" except Windows (epoch-ms)
-    std::string last_used_stop;   // "-" except Windows (epoch-ms)
+    std::string raw;              // "-" when nothing meaningful; the failure token on a failure row
+    std::string last_used_start;  // "-" except Windows (epoch-ms, or `unreadable`)
+    std::string last_used_stop;   // "-" except Windows (epoch-ms, or `unreadable`)
     bool read_denied = false;     // the READ was refused, not "this grant is denied"
 };
 
+/// `<owner>\<app_id>` -- the one per-user qualification shape every leg uses. An owner name
+/// that could not be resolved renders as "-" (user_profile_model.hpp's display convention),
+/// never an empty prefix that would read as an unqualified machine-wide row. On the wire the
+/// row sanitizer (safe_output_field) folds the `\` to `/`, as it does for every path.
+[[nodiscard]] inline std::string qualify_app_id(std::string_view owner, std::string_view app_id) {
+    std::string out = owner.empty() ? std::string{"-"} : std::string{owner};
+    out += '\\';
+    return out.append(app_id);
+}
+
 [[nodiscard]] inline std::string format_row(const PermissionRow& r) {
-    std::string out{kPermissionsAction};
+    std::string out{kRowKindPermissions};
     (out += '|').append(r.os) += '|';
     (out += yuzu::util::safe_output_field(r.app_id)) += '|';
     (out += r.category) += '|';
@@ -96,15 +128,86 @@ struct PermissionRow {
     return out.append(r.last_used_stop);
 }
 
-/// One row naming the whole read as failed (no per-app rows could be produced at all --
-/// e.g. TCC.db itself couldn't be opened, ConsentStore root key is missing, the portal bus
-/// call failed outright). `category` is "-" since no specific category is implicated.
+/// The internal_error row the plugin's catch-all writes: the SAME 8-field shape as a data row
+/// (row_kind `constrained`), so a consumer binding the YAML columns positionally never shifts.
+[[nodiscard]] inline std::string format_internal_error_row(std::string_view os) {
+    std::string out{kRowKindConstrained};
+    (out += '|').append(os);
+    out += "|-|-|";
+    out += state_token(PermissionState::unreadable);
+    return out += "|internal_error|-|-";
+}
+
+/// A row whose READ failed: `denied` (the read was refused -- promotes PERMISSION_DENIED) or
+/// `unreadable` (any other failure -- CONSTRAINED). Never `absent`. The failure token is both
+/// accumulated and carried in `raw`, so the row names its own cause.
+[[nodiscard]] inline PermissionRow failure_row(std::string_view os, std::string app_id,
+                                               std::string_view category, bool denied,
+                                               std::string token,
+                                               yuzu::shared::ConstraintAccumulator& acc) {
+    acc.add_failure(token);
+    return {os,
+            std::move(app_id),
+            category,
+            denied ? PermissionState::denied : PermissionState::unreadable,
+            std::move(token),
+            "-",
+            "-",
+            denied};
+}
+
+/// One row naming a whole SOURCE's read as failed (TCC.db wouldn't open, a profile hive or the
+/// HKLM ConsentStore root refused, the portal bus call failed outright). `category` is "-"
+/// since the row stands for every category of that source.
 [[nodiscard]] inline PermissionRow whole_read_failed_row(std::string_view os, PermissionState state,
                                                          std::string_view cause,
                                                          yuzu::shared::ConstraintAccumulator& acc,
                                                          bool denied) {
     if (state == PermissionState::unreadable || denied) acc.add_failure(std::string{cause});
     return {os, "-", "-", state, std::string{cause}, "-", "-", denied};
+}
+
+/// Coverage backstop: appends an `absent` row for every category no row mentions -- but ONLY
+/// when nothing failed. If any read failed or was refused, the failure rows (a whole-source
+/// row covers every category of its source) already account for the gap, and an `absent` here
+/// would be exactly the failure-reads-as-absent collapse this plugin must never make.
+inline void fill_uncovered_categories(std::string_view os, std::vector<PermissionRow>& rows,
+                                      const yuzu::shared::ConstraintAccumulator& acc) {
+    if (acc.any_failure()) return;
+    for (const auto& r : rows)
+        if (r.read_denied) return;
+    for (const auto cat : kCategories) {
+        bool covered = false;
+        for (const auto& r : rows)
+            if (r.category == cat) covered = true;
+        if (!covered) rows.push_back({os, "-", cat, PermissionState::absent, "-", "-", "-", false});
+    }
+}
+
+// ── Linux session-bus open (pure; errno values are portable <cerrno> constants) ──
+
+enum class BusOpenOutcome { unavailable, denied, failed };
+
+/// Classifies sd_bus_open_user's NEGATED return (pass the positive errno). No session bus to
+/// reach (no XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, no socket, nobody listening) is the
+/// honest UNAVAILABLE case; a refused socket is `denied`, never folded into "no session";
+/// anything else is a real failure.
+[[nodiscard]] constexpr BusOpenOutcome classify_session_bus_open(int err) noexcept {
+    switch (err) {
+    case ENOENT:
+    case ENOTDIR:
+    case ECONNREFUSED:
+    case ENXIO:
+#if defined(ENOMEDIUM)
+    case ENOMEDIUM: // systemd's "no XDG_RUNTIME_DIR" answer (Linux-only errno)
+#endif
+        return BusOpenOutcome::unavailable;
+    case EACCES:
+    case EPERM:
+        return BusOpenOutcome::denied;
+    default:
+        return BusOpenOutcome::failed;
+    }
 }
 
 // ── status selection (pure; the one decision every leg shares) ──────────

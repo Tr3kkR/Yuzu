@@ -1,13 +1,15 @@
 /**
  * privacy_permissions_plugin.cpp -- per-app sensitive-permission grant visibility
  * (camera/microphone/location/full-disk-access equivalents), read-only. One action,
- * `permissions`, emitting `permissions|<os>|<app_id>|<category>|<state>|<raw>
- * |<last_used_start>|<last_used_stop>` rows (states in privacy_permissions_parsers.hpp):
- *   Linux:   xdg-desktop-portal PermissionStore.Lookup over the session bus (rung 1)
- *   macOS:   TCC.db read-only, in-process sqlite3 (rung 1) -- SIP-protected; an unentitled
- *            agent is expected to read `denied`, recorded honestly, never claimed working
- *            without real-hardware evidence
- *   Windows: per-profile + HKLM ...\CapabilityAccessManager\ConsentStore registry walk (rung 1)
+ * `permissions`, emitting `permissions|<os>|<app_id>|<category>|<state>|<raw>|<last_used_start>
+ * |<last_used_stop>` rows (the leading field is the YAML's `row_kind` column; states and the
+ * row contract in privacy_permissions_parsers.hpp):
+ *   Linux:   xdg-desktop-portal PermissionStore.Lookup over the agent's OWN session bus (rung 1)
+ *   macOS:   the system TCC.db + every /Users home's per-user TCC.db, read-only, in-process
+ *            sqlite3 (rung 1) -- TCC-protected; an agent without Full Disk Access reads `denied`,
+ *            recorded honestly, never claimed working without real-hardware evidence
+ *   Windows: HKLM ProfileList -> each real profile's ConsentStore (live HKU hive or offline
+ *            NTUSER.DAT mount) + the HKLM ...\CapabilityAccessManager\ConsentStore mirror (rung 1)
  *
  * Default-off (Forensics class, same posture as execution_artifacts) -- the server-side
  * kill-switch seed (server.cpp) gates whether this plugin's dispatch is even reachable; this
@@ -37,21 +39,39 @@
 
 namespace {
 
+#if defined(_WIN32)
+constexpr std::string_view kOsName = "windows";
+#elif defined(__APPLE__)
+constexpr std::string_view kOsName = "macos";
+#else
+constexpr std::string_view kOsName = "linux";
+#endif
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"permissions",
      /* linux_leg   = */
      {YUZU_SUPPORT_CONSTRAINED, 1,
-      "xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the session "
-      "bus; unavailable (no daemon/no session) on most non-sandboxed desktops", nullptr},
+      "xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the agent "
+      "process's own session bus (sd_bus_open_user)",
+      "never another user's session: a system-service agent normally has no session bus and "
+      "reports unavailable, which says nothing about interactive users' grants; "
+      "full_disk_access is unsupported (no portal equivalent)"},
      /* macos_leg   = */
      {YUZU_SUPPORT_CONSTRAINED, 1,
-      "TCC.db read-only, in-process sqlite3; SIP-protected, an unentitled agent is expected "
-      "to read denied", nullptr},
+      "TCC.db read-only, in-process sqlite3: the system /Library/Application Support/"
+      "com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user "
+      "Library/Application Support/com.apple.TCC/TCC.db",
+      "every TCC.db is TCC-protected: without Full Disk Access each read is denied; camera and "
+      "microphone grants live only in the per-user dbs; location is unsupported (locationd, "
+      "outside TCC)"},
      /* windows_leg = */
      {YUZU_SUPPORT_SUPPORTED, 1,
-      "per-profile (with_user_hive, LocalSystem's own HKCU is not a real user's) + HKLM "
-      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore "
-      "registry walk", nullptr}},
+      "HKLM ProfileList enumeration, then each real profile's "
+      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore via its "
+      "loaded HKU\\<SID> hive or an offline NTUSER.DAT mount (RegLoadKeyW, SeBackup/SeRestore), "
+      "plus the same HKLM ConsentStore path",
+      "LocalSystem's own HKCU is not read; an HKLM value overrides a profile's only when "
+      "successfully read; the HKLM mirror's shape is unconfirmed on real hardware"}},
 };
 
 } // namespace
@@ -100,9 +120,11 @@ public:
 #endif
             return 1;
         } catch (...) {
+            // Same 8-field shape as a data row (row_kind `constrained`), so the YAML columns
+            // still line up on the one row a consumer is most likely to be puzzled by.
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "internal_error");
-            ctx.write_output("constrained|internal_error");
+            ctx.write_output(pp::format_internal_error_row(kOsName));
             return 1;
         }
     }

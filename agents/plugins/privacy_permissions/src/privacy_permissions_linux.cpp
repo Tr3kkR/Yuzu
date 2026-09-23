@@ -17,8 +17,19 @@
  * `filesystem` portal permission is a per-directory grant, not a single boolean, so
  * full_disk_access may need to ship `unsupported` on Linux permanently).
  *
- * No daemon / no session bus is the EXPECTED common case on most non-sandboxed Linux
- * desktops, per the roadmap -- `unavailable`, no failure token, never a constrained result.
+ * SCOPE -- THE AGENT'S OWN SESSION BUS ONLY: sd_bus_open_user connects to the session bus of
+ * the account the agent process runs as. It never reaches another user's session, and each
+ * user's portal permission store lives in that user's own session -- so this leg reports, at
+ * most, the grants of the agent's own account. The agent normally runs as a system service
+ * with no session bus at all, so the honest result there is UNAVAILABLE, and UNAVAILABLE says
+ * nothing about any interactive user's grants.
+ *
+ * No daemon / no session bus (no XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, no socket, nobody
+ * listening) is the EXPECTED common case -- `unsupported` + UNAVAILABLE, no failure token. A
+ * refused session-bus socket is `denied` and any other open failure `unreadable`
+ * (classify_session_bus_open), never folded into "no session". Once the bus is up, every
+ * mapped category gets a row: its decoded app rows, `absent` (the portal answered NotFound or
+ * an empty table), or a `denied`/`unreadable` row carrying its own `<category>:<cause>` token.
  */
 #include "privacy_permissions_legs.hpp"
 
@@ -99,14 +110,16 @@ PermissionState decode_portal_permissions(std::string_view joined) {
     return PermissionState::prompt_undetermined; // unrecognized token(s) -- visible, not guessed
 }
 
+enum class LookupOutcome { accounted, service_unknown };
+
 /// One Lookup(table, id) call. Reply shape: a{sas} permissions (app_id -> [perm strings]),
-/// then a variant `data` this leg ignores. A shape mismatch anywhere is `unreadable:shape`,
-/// never a partial/guessed row. Returns false ONLY for ServiceUnknown (the portal backend
-/// itself isn't registered on the bus at all) -- the caller treats that as a whole-mechanism
-/// unavailability (CDX-P1-005), same class as no-session-bus, rather than a per-table row; a
-/// true return means this call is fully accounted for in `rows`/`acc` already.
-bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& rows,
-               yuzu::shared::ConstraintAccumulator& acc) {
+/// then a variant `data` this leg ignores. Every outcome except ServiceUnknown lands as rows
+/// here (`accounted`); ServiceUnknown (no portal backend registered on the bus) is returned to
+/// the caller, which decides between whole-mechanism unavailability (every lookup got it,
+/// CDX-P1-005) and a per-category failure (only some did).
+LookupOutcome do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& rows,
+                        yuzu::shared::ConstraintAccumulator& acc) {
+    const std::string cat{t.category};
     SdBusErrorGuard err;
     SdBusMessageGuard reply;
     const int rc = sd_bus_call_method(bus, kPortalDest, kPortalPath, kPortalIface, "Lookup",
@@ -114,43 +127,34 @@ bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& ro
                                       std::string{t.id}.c_str());
     if (rc < 0) {
         const std::string_view name = err.err.name ? err.err.name : "";
-        // ServiceUnknown (the session bus is up but no portal backend is registered on it at
-        // all) is handled by the caller as a whole-mechanism unavailability, not returned
-        // here as a row -- see the function banner and CDX-P1-005.
-        if (name == "org.freedesktop.DBus.Error.ServiceUnknown") return false;
+        if (name == "org.freedesktop.DBus.Error.ServiceUnknown")
+            return LookupOutcome::service_unknown;
         if (name == "org.freedesktop.portal.Error.NotFound") {
             // The portal answered; nothing recorded for this table/id yet -- honest absence.
             rows.push_back({"linux", "-", t.category, PermissionState::absent, "-", "-", "-", false});
-            return true;
+            return LookupOutcome::accounted;
         }
         if (name == "org.freedesktop.DBus.Error.AccessDenied") {
-            rows.push_back(whole_read_failed_row("linux", PermissionState::denied,
-                                                 std::string{t.category} + ":access_denied", acc,
-                                                 true));
-            return true;
+            rows.push_back(failure_row("linux", "-", t.category, true, cat + ":access_denied", acc));
+            return LookupOutcome::accounted;
         }
-        acc.add_failure(std::string{t.category} + ":lookup_failed");
-        rows.push_back({"linux", "-", t.category, PermissionState::unreadable, "-", "-", "-", false});
-        return true;
+        rows.push_back(failure_row("linux", "-", t.category, false, cat + ":lookup_failed", acc));
+        return LookupOutcome::accounted;
     }
 
-    // CDX-R2-004: sd_bus_message_enter_container returns >0 entered, 0 a genuine type
-    // MISMATCH at the current position (not an error, but NOT entered either), <0 an error --
-    // both guards below previously accepted 0 as success (`< 0` / `>= 0`), so a reply whose
-    // shape didn't actually match the expected `{sas}`/`s` container silently fell through as
-    // if it had, producing a fabricated `absent` (or an empty-string `denied`) instead of the
-    // `unreadable:shape` a malformed reply must report.
+    // CDX-R2-004: sd_bus_message_enter_container returns >0 entered, 0 a genuine type MISMATCH
+    // at the current position (NOT entered), <0 an error -- only >0 is success.
     if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "{sas}") <= 0) {
-        acc.add_failure(std::string{t.category} + ":shape");
-        rows.push_back({"linux", "-", t.category, PermissionState::unreadable, "-", "-", "-", false});
-        return true;
+        rows.push_back(failure_row("linux", "-", t.category, false, cat + ":shape", acc));
+        return LookupOutcome::accounted;
     }
     bool any = false;
+    bool entry_failed = false;
     int r;
     while ((r = sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_DICT_ENTRY, "sas")) > 0) {
         const char* app_id = nullptr;
-        sd_bus_message_read(reply.m, "s", &app_id);
-        if (sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "s") > 0) {
+        if (sd_bus_message_read(reply.m, "s", &app_id) > 0 &&
+            sd_bus_message_enter_container(reply.m, SD_BUS_TYPE_ARRAY, "s") > 0) {
             std::string joined;
             const char* perm = nullptr;
             while (sd_bus_message_read(reply.m, "s", &perm) > 0) {
@@ -160,21 +164,25 @@ bool do_lookup(sd_bus* bus, const PortalTable& t, std::vector<PermissionRow>& ro
             sd_bus_message_exit_container(reply.m);
             any = true;
             // decode_portal_permissions (CDX-P1-001): explicit no/ask/unrecognized tokens are
-            // NOT allowed, only a real "yes" (or an unconfirmed-but-affirmative token) is.
+            // NOT allowed, only a real "yes" is.
             const auto state = decode_portal_permissions(joined);
             rows.push_back({"linux", app_id ? app_id : "-", t.category, state,
                             joined.empty() ? "-" : joined, "-", "-", false});
         } else {
-            // This one dict-entry's inner array didn't match the expected shape -- named and
-            // visible, not silently skipped.
-            acc.add_failure(std::string{t.category} + ":entry_shape");
+            // This dict entry's key or inner array didn't match the expected shape -- reported
+            // as a row below, never silently skipped.
+            entry_failed = true;
         }
         sd_bus_message_exit_container(reply.m);
     }
     sd_bus_message_exit_container(reply.m);
-    if (r < 0) acc.add_failure(std::string{t.category} + ":shape");
-    if (!any) rows.push_back({"linux", "-", t.category, PermissionState::absent, "-", "-", "-", false});
-    return true;
+    // 1.8: a reply that failed part-way is never `absent` -- the table was not fully read.
+    if (r < 0) rows.push_back(failure_row("linux", "-", t.category, false, cat + ":shape", acc));
+    if (entry_failed)
+        rows.push_back(failure_row("linux", "-", t.category, false, cat + ":entry_shape", acc));
+    if (!any && r >= 0 && !entry_failed)
+        rows.push_back({"linux", "-", t.category, PermissionState::absent, "-", "-", "-", false});
+    return LookupOutcome::accounted;
 }
 
 #endif // YUZU_HAVE_LIBSYSTEMD
@@ -189,37 +197,45 @@ int collect_linux_permissions(yuzu::CommandContext& ctx) {
     BusGuard bus;
     const int open_rc = sd_bus_open_user(&bus.bus);
     if (open_rc < 0 || !bus.bus) {
-        // No session bus (headless, no logged-in session) -- the expected common case on most
-        // non-sandboxed Linux desktops per the roadmap. Honest unavailable, no token.
-        rows.push_back({"linux", "-", "-", PermissionState::unsupported, "-", "-", "-", false});
-        return emit_rows(ctx, rows, acc, true);
+        const int err = open_rc < 0 ? -open_rc : 0;
+        const auto outcome = classify_session_bus_open(err);
+        if (outcome == BusOpenOutcome::unavailable) {
+            // No session bus for the agent's own account (headless, system service) -- the
+            // expected common case. Honest unavailable, no token.
+            rows.push_back({"linux", "-", "-", PermissionState::unsupported, "-", "-", "-", false});
+            return emit_rows(ctx, rows, acc, true);
+        }
+        rows.push_back(outcome == BusOpenOutcome::denied
+                           ? failure_row("linux", "-", "-", true, "session_bus:access_denied", acc)
+                           : failure_row("linux", "-", "-", false,
+                                         "session_bus:open_errno_" + std::to_string(err), acc));
+        return emit_rows(ctx, rows, acc, false);
     }
-    // If EVERY lookup hits ServiceUnknown, the portal backend itself is unreachable -- fold
-    // that into the same whole-mechanism-unavailable shape as no-session-bus above (CDX-P1-005),
-    // rather than the previous per-lookup absent rows that made a missing daemon
-    // indistinguishable from a daemon that genuinely has no grants recorded.
-    bool any_service_reachable = false;
+    // If EVERY lookup hits ServiceUnknown, the portal backend itself is unreachable -- the same
+    // whole-mechanism-unavailable shape as no-session-bus above (CDX-P1-005). If only SOME do,
+    // the backend answered the others, so those categories are a real failure, not absence.
+    std::vector<std::string_view> service_unknown;
     for (const auto& t : kPortalLookups)
-        any_service_reachable = do_lookup(bus.bus, t, rows, acc) || any_service_reachable;
-    if (!any_service_reachable) {
+        if (do_lookup(bus.bus, t, rows, acc) == LookupOutcome::service_unknown)
+            service_unknown.push_back(t.category);
+    if (service_unknown.size() == kPortalLookups.size()) {
         rows.clear();
         rows.push_back({"linux", "-", "-", PermissionState::unsupported, "-", "-", "-", false});
         return emit_rows(ctx, rows, acc, true);
     }
+    for (const auto cat : service_unknown)
+        rows.push_back(failure_row("linux", "-", cat, false,
+                                   std::string{cat} + ":service_unknown", acc));
     // Fixed four-category vocabulary (CDX-P1-006): no known Linux portal mechanism maps to
     // full_disk_access (Flatpak's `filesystem` permission is per-directory, not one boolean),
-    // so this category is declared `unsupported` explicitly on every reachable collection --
-    // never silently omitted, which a consumer cannot distinguish from a missed collector row.
+    // so this category is declared `unsupported` explicitly on every reachable collection.
     rows.push_back({"linux", "-", "full_disk_access", PermissionState::unsupported, "-", "-", "-", false});
 #else
     // Built without libsystemd (-Dsystemd_guard=auto|disabled): a build-time absence, not an
     // OS statement -- this plugin cannot know whether a portal daemon exists on this host.
-    acc.add_failure("portal:not_built");
-    rows.push_back({"linux", "-", "-", PermissionState::unreadable, "-", "-", "-", false});
+    rows.push_back(failure_row("linux", "-", "-", false, "portal:not_built", acc));
 #endif
 
-    if (rows.empty())
-        rows.push_back({"linux", "-", "-", PermissionState::absent, "-", "-", "-", false});
     return emit_rows(ctx, rows, acc, false);
 }
 

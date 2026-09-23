@@ -1,37 +1,50 @@
 /**
- * privacy_permissions_win.cpp -- Windows leg: per-user HKCU (via the shared live-hive-first/
- * offline-NTUSER.DAT-fallback ladder, NOT the process's own HKEY_CURRENT_USER) plus machine-
- * wide HKLM, walking ...\CapabilityAccessManager\ConsentStore (rung 1, registry only, no spawn).
+ * privacy_permissions_win.cpp -- Windows leg: each real user profile's ConsentStore (reached
+ * via the shared live-hive-first/offline-NTUSER.DAT-fallback ladder, NOT the process's own
+ * HKEY_CURRENT_USER) plus the machine-wide HKLM mirror, walking
+ * ...\CapabilityAccessManager\ConsentStore (rung 1, registry only, no spawn).
  *
  * CDX-R2-001: the Windows agent service registers and runs as LocalSystem, not a per-user
  * identity (docs/agent-privilege-model.md TL;DR, #1442) -- HKEY_CURRENT_USER therefore
  * resolves to LocalSystem's own (irrelevant, near-always-empty) profile, never an interactive
- * user's real ConsentStore. Every other per-user Windows collector in this repo already
- * accounts for this: license_scan's run_per_user_surfaces and registry's do_get_user_value
- * both enumerate real profiles (agents/shared/win_profiles.hpp's enumerate_profile_records +
- * build_profile_list, which filters the LocalSystem/LocalService/NetworkService system SIDs)
- * and read each one's registry via with_user_hive (loaded HKU\<SID> first, an offline
- * NTUSER.DAT mount as the fallback) -- this file now does the same, once per real profile.
+ * user's real ConsentStore. Like license_scan's run_per_user_surfaces and registry's
+ * do_get_user_value, this leg enumerates real profiles from HKLM ...\ProfileList
+ * (agents/shared/win_profiles.hpp's enumerate_profile_records + build_profile_list, which
+ * filters the LocalSystem/LocalService/NetworkService SIDs, cross-referenced with the HKU
+ * subkey list) and reads each one's hive via with_user_hive: the loaded HKU\<SID> first, else an
+ * offline RegLoadKeyW mount of <profile>\NTUSER.DAT under SeBackup/SeRestore (held for the
+ * whole mount under the process-wide offline_hive_mutex()).
  *
- * UNKNOWNS pending a real the-rig capture (see the plan): the exact NonPackaged
- * path-escaping scheme (unescape_nonpackaged_app_id is a best-effort `#`->`\` pass), whether
- * the HKLM policy mirror exists un-configured on a non-MDM host (expected: absent), and the
- * real `Value` literal vocabulary (decode_consent_value never assumes only Allow/Deny exist).
+ * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): an HKLM value overrides a
+ * profile's entry for the same (CapabilityName, app_id) ONLY when that HKLM value was
+ * successfully read and decoded -- an absent/unreadable/refused HKLM value never displaces a
+ * profile's real grant, and a FAILED profile entry is never hidden behind an HKLM value.
+ * `app_id` is qualified with the owning profile's name (qualify_app_id, never the SID --
+ * ADR-0024 D11); an unqualified app_id is HKLM's own row.
  *
- * HKLM takes precedence over a user's own HKCU-equivalent entry for the same (CapabilityName,
- * app_id) pair when both are present -- an MDM/GPO-locked policy overriding the user's own
- * choice -- applied per profile now that there can be more than one HKCU-equivalent source.
- * `app_id` is qualified with the owning profile's name (never its SID -- ADR-0024 D11) so the
- * same app across two different users' profiles never collides in the merge or the output.
+ * EVERY outcome is a row: a profile that could not be reached, a refused/failed ConsentStore
+ * root, a capability key or app key that refused/failed to open, an enumeration that failed or
+ * hit its cap -- each is a `denied` (refusal, PERMISSION_DENIED) or `unreadable` (CONSTRAINED)
+ * row carrying its own token in `raw`; a capability key that genuinely is not there is an
+ * `absent` row for that category. Only two failures are not rows of their own: a failed hive
+ * UNLOAD (a token -- the read itself succeeded) and a LastUsedTime* failure (a token, and the
+ * field itself reads `unreadable`; a refused one still promotes PERMISSION_DENIED).
+ *
+ * UNKNOWNS pending a real the-rig capture: the exact NonPackaged path-escaping scheme
+ * (unescape_nonpackaged_app_id is a best-effort pass), whether the HKLM ConsentStore mirror
+ * exists at all on a non-MDM host and what shape it takes when it does (there is NO Windows
+ * evidence for it yet -- this leg reads it with the same walk as a profile hive and applies
+ * the precedence above, nothing more), and the real `Value` literal vocabulary
+ * (decode_consent_value never assumes only Allow/Deny exist).
  */
 #include "privacy_permissions_legs.hpp"
 #include "privacy_permissions_win_parsers.hpp"
 
 #if defined(_WIN32)
 
-#include <algorithm>
-#include <map>
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <win_profiles.hpp>
@@ -42,24 +55,16 @@ namespace yuzu::privacy_permissions {
 
 namespace {
 
+using win::RawGrant;
+
+static_assert(win::kErrorSuccess == ERROR_SUCCESS);
+static_assert(win::kErrorFileNotFound == ERROR_FILE_NOT_FOUND);
+static_assert(win::kErrorAccessDenied == ERROR_ACCESS_DENIED);
+static_assert(win::kRegSz == REG_SZ);
+static_assert(win::kRegQword == REG_QWORD);
+
 constexpr wchar_t kConsentStorePath[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore";
-
-/// One (app_id, category) grant as read from ONE registry root (HKCU or HKLM).
-struct RawGrant {
-    std::string app_id; // "-" for the capability-level (no specific app) row
-    std::string category;
-    PermissionState state;
-    std::string raw_value;
-    std::string last_used_start;
-    std::string last_used_stop;
-    // The READ of this grant's `Value` was refused (ERROR_ACCESS_DENIED) -- NOT the same thing
-    // as `state == PermissionState::denied`, which also (correctly) means "the read succeeded
-    // and decoded to a stored `Deny` grant". Conflating the two turns an ordinary, successfully
-    // read `Deny` value into a whole-action PERMISSION_DENIED/PARTIAL, which is wrong: the read
-    // worked and the data is complete.
-    bool read_denied = false;
-};
 
 // COD-P1-03: a ConsentStore subtree is under the OWNING USER's write access (packaged/
 // NonPackaged app keys), so an unbounded enumeration lets that same user pin the instruction
@@ -105,175 +110,203 @@ std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc 
     return out;
 }
 
-/// Reads one app-level grant's `Value` (+ LastUsedTime* if present) from `app_key`.
+/// Reads one grant's `Value` (+ LastUsedTime*) from `app_key`. Every non-success outcome other
+/// than "no Value here" (absent) sets a `cause`, so it is reported, never silently kept.
 RawGrant read_one_grant(HKEY app_key, std::string app_id, std::string_view category) {
-    RawGrant g{std::move(app_id), std::string{category}, PermissionState::unreadable, "-", "-", "-"};
+    RawGrant g{std::move(app_id), category, PermissionState::unreadable, "-"};
 
     DWORD type = 0, size = 0;
     const LONG probe_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type, nullptr, &size);
-    if (probe_rc == ERROR_SUCCESS && size > 0 && size > yuzu::win::kMaxRegValueBytes) {
-        // C4-CODEX-002: this subtree is under the OWNING USER's write access (the file
-        // banner's own words), so an unbounded allocation sized from a provider-reported
-        // DWORD lets that user make the privileged agent retain an arbitrarily large buffer
-        // per value -- the same class of problem win_profiles.hpp's own kMaxRegValueBytes
-        // (1 MiB) exists to cap. Reported honestly (unreadable, via the caller's existing
-        // value_unreadable token -- see merge_and_emit), never silently truncated/guessed.
-        g.state = PermissionState::unreadable;
+    if (probe_rc == ERROR_SUCCESS && size > yuzu::win::kMaxRegValueBytes) {
+        // C4-CODEX-002: this subtree is under the OWNING USER's write access, so an unbounded
+        // allocation sized from a provider-reported DWORD would let that user make the
+        // privileged agent retain an arbitrarily large buffer per value -- capped the same way
+        // win_profiles.hpp's kMaxRegValueBytes (1 MiB) caps it, and reported, never truncated.
+        g.cause = "value_oversized";
     } else if (probe_rc == ERROR_SUCCESS && size > 0) {
         std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
         DWORD sz = size;
         const LONG real_rc = RegQueryValueExW(app_key, L"Value", nullptr, &type,
                                               reinterpret_cast<BYTE*>(buf.data()), &sz);
         if (real_rc == ERROR_SUCCESS) {
+            // `sz` (the size the SECOND read returned) bounds the decode, not the probe's size.
             const std::string val = yuzu::win::reg_sz_to_utf8(buf.data(), sz);
             g.state = win::decode_consent_value(val, type == REG_SZ);
             g.raw_value = val.empty() ? "-" : val;
+            if (g.state == PermissionState::unreadable)
+                g.cause = (type != REG_SZ) ? "value_type_" + std::to_string(type) : "value_empty";
         } else if (real_rc == ERROR_ACCESS_DENIED) {
-            // CDX-R2-002: the second (real) read can itself be denied even though the
-            // size-probe just above succeeded (an ACL change between the two calls) --
-            // previously silently kept as `unreadable`, indistinguishable from an ordinary
-            // read failure.
+            // CDX-R2-002: the second read can itself be refused even though the size probe
+            // succeeded (an ACL change between the two calls).
             g.state = PermissionState::denied;
             g.read_denied = true;
+            g.cause = "value_access_denied";
+        } else {
+            // ERROR_MORE_DATA (the value grew between the two calls) or any other error.
+            g.cause = "value_" + win::win32_cause(real_rc);
         }
-        // else: any other Win32 error on the second read -- keep the default `unreadable`
-        // rather than guess; an unusual TOCTOU-shaped registry race.
+    } else if (probe_rc == ERROR_SUCCESS) {
+        g.cause = "value_empty"; // a zero-size Value: present, but carries nothing to decode
     } else if (probe_rc == ERROR_FILE_NOT_FOUND) {
-        g.state = PermissionState::absent; // no Value under this app's own key -- genuinely not there
+        g.state = PermissionState::absent; // no Value under this key -- genuinely not there
     } else if (probe_rc == ERROR_ACCESS_DENIED) {
         g.state = PermissionState::denied; // the read was refused, never collapsed into absent
-        g.read_denied = true;              // -- and it really was the READ that failed here
+        g.read_denied = true;
+        g.cause = "value_access_denied";
+    } else {
+        g.cause = "value_" + win::win32_cause(probe_rc);
     }
-    // else: any other Win32 error (or a zero-size value) stays `unreadable`, its default --
-    // a refusal we can't name more precisely, not "not there".
 
-    const auto read_filetime = [&](const wchar_t* name) -> std::string {
+    const auto read_last_used = [&](const wchar_t* name) {
         std::uint64_t ft = 0;
         DWORD t = 0, sz = sizeof(ft);
-        if (RegQueryValueExW(app_key, name, nullptr, &t, reinterpret_cast<BYTE*>(&ft), &sz) ==
-              ERROR_SUCCESS &&
-            t == REG_QWORD)
-            return win::filetime_to_epoch_ms_string(ft);
-        return "-";
+        const LONG rc =
+            RegQueryValueExW(app_key, name, nullptr, &t, reinterpret_cast<BYTE*>(&ft), &sz);
+        return win::decode_last_used(rc, t, sz, ft);
     };
-    g.last_used_start = read_filetime(L"LastUsedTimeStart");
-    g.last_used_stop = read_filetime(L"LastUsedTimeStop");
+    g.last_used_start = read_last_used(L"LastUsedTimeStart");
+    g.last_used_stop = read_last_used(L"LastUsedTimeStop");
     return g;
 }
 
-/// Opens `child` under `parent`. A denial anywhere below the ConsentStore root used to be
-/// silently swallowed (`continue`/skip) same as a genuine "not there" -- this is the ONE
-/// helper every open call below the root now goes through, so a real refusal is never lost
-/// again (CDX-P1-003): ERROR_FILE_NOT_FOUND is the sole "fine, skip it" outcome; anything else
-/// (ERROR_ACCESS_DENIED foremost) is folded into `acc` as a named token (CONSTRAINED/PARTIAL
-/// via `acc.any_failure()` -- the rest of the tree still reads, so this stays one severity
-/// below a root-level denial, which escalates all the way to PERMISSION_DENIED below), and the
-/// open still fails (the caller still skips that one subtree -- best-effort against a keyed-out
-/// branch -- but the incompleteness is now VISIBLE, never silent).
-bool try_open_subkey(HKEY parent, const wchar_t* child, yuzu::win::RegKey& out,
-                     std::string_view token_prefix, yuzu::shared::ConstraintAccumulator& acc) {
-    const LONG rc = RegOpenKeyExW(parent, child, 0, KEY_READ, out.put());
-    if (rc == ERROR_SUCCESS) return true;
-    if (rc == ERROR_FILE_NOT_FOUND) return false; // genuinely absent on this host -- fine
-    acc.add_failure(std::string{token_prefix} +
-                    (rc == ERROR_ACCESS_DENIED ? ":access_denied" : (":win32_" + std::to_string(rc))));
-    return false;
+/// A category-level failure that is not one Value read (a key that refused/failed to open, an
+/// enumeration that failed or hit its cap). Kept apart from the (app_id, category)-keyed grants
+/// so the precedence merge can never overwrite or drop it.
+RawGrant structural_failure(std::string app_id, std::string_view category, std::string cause,
+                            bool denied) {
+    RawGrant g{std::move(app_id), category,
+               denied ? PermissionState::denied : PermissionState::unreadable, "-"};
+    g.cause = std::move(cause);
+    g.read_denied = denied;
+    return g;
 }
 
-/// Walks every mapped CapabilityName under `root`, and under each one the capability-level
-/// Value plus every NonPackaged/packaged app child. `root_open_err` (0 = opened fine) lets the
-/// caller distinguish ConsentStore-itself-missing from a per-capability miss. Every open/
-/// enumerate below the root threads through `acc` (see try_open_subkey) so a refusal anywhere
-/// in the tree surfaces, not just at the root.
-std::vector<RawGrant> walk_consent_store(HKEY hive, LONG* root_open_err,
-                                         yuzu::shared::ConstraintAccumulator& acc) {
-    std::vector<RawGrant> out;
+/// One ConsentStore root's walk.
+struct ConsentWalk {
+    LONG root_rc = ERROR_SUCCESS;
+    std::vector<RawGrant> grants;     // keyed by (app_id, category); "-" = capability level
+    std::vector<RawGrant> structural; // never merged -- always emitted as their own rows
+};
+
+/// Walks every mapped CapabilityName under `hive`'s ConsentStore: the capability-level Value
+/// (an `absent` entry when the capability key itself is not there, so every category is
+/// represented) plus every packaged and NonPackaged app child.
+ConsentWalk walk_consent_store(HKEY hive) {
+    ConsentWalk w;
     yuzu::win::RegKey store;
-    const LONG rc = RegOpenKeyExW(hive, kConsentStorePath, 0, KEY_READ, store.put());
-    if (root_open_err) *root_open_err = rc;
-    if (rc != ERROR_SUCCESS) return out;
+    w.root_rc = RegOpenKeyExW(hive, kConsentStorePath, 0, KEY_READ, store.put());
+    if (w.root_rc == ERROR_FILE_NOT_FOUND) {
+        for (const auto& cap : win::kCapabilities)
+            w.grants.push_back({"-", cap.category, PermissionState::absent, "-"});
+        return w;
+    }
+    if (w.root_rc != ERROR_SUCCESS) return w; // the caller reports the whole-source row
 
     for (const auto& cap : win::kCapabilities) {
         yuzu::win::RegKey cap_key;
-        if (!try_open_subkey(store.get(), yuzu::win::to_wide(cap.capability_name).c_str(),
-                             cap_key, std::string{cap.category} + ":capability", acc))
-            continue; // absent, or denied (recorded above) -- either way nothing more to read here
+        const LONG cap_rc = RegOpenKeyExW(store.get(), yuzu::win::to_wide(cap.capability_name).c_str(),
+                                          0, KEY_READ, cap_key.put());
+        if (cap_rc == ERROR_FILE_NOT_FOUND) {
+            w.grants.push_back({"-", cap.category, PermissionState::absent, "-"});
+            continue;
+        }
+        if (cap_rc != ERROR_SUCCESS) {
+            w.structural.push_back(structural_failure("-", cap.category,
+                                                      "capability:" + win::win32_cause(cap_rc),
+                                                      cap_rc == ERROR_ACCESS_DENIED));
+            continue;
+        }
 
         // The capability-level grant itself (no specific app -- "the global default").
-        out.push_back(read_one_grant(cap_key.get(), "-", cap.category));
+        w.grants.push_back(read_one_grant(cap_key.get(), "-", cap.category));
+
+        // One app child: a key that vanished since enumeration (FILE_NOT_FOUND) is simply gone;
+        // any other open failure is that app's own failure row.
+        const auto read_app = [&](HKEY parent, const std::wstring& child, std::string app_id,
+                                  std::string_view kind) {
+            yuzu::win::RegKey app_key;
+            const LONG rc = RegOpenKeyExW(parent, child.c_str(), 0, KEY_READ, app_key.put());
+            if (rc == ERROR_SUCCESS)
+                w.grants.push_back(read_one_grant(app_key.get(), std::move(app_id), cap.category));
+            else if (rc != ERROR_FILE_NOT_FOUND)
+                w.structural.push_back(structural_failure(
+                    std::move(app_id), cap.category,
+                    std::string{kind} + ":" + win::win32_cause(rc), rc == ERROR_ACCESS_DENIED));
+        };
+        // Enumeration completeness: ERROR_NO_MORE_ITEMS is the only clean stop.
+        const auto note_enum = [&](std::string_view kind, LONG enum_rc, bool truncated) {
+            if (truncated)
+                w.structural.push_back(structural_failure(
+                    "-", cap.category, std::string{kind} + "_enum_truncated", false));
+            else if (enum_rc != ERROR_NO_MORE_ITEMS)
+                w.structural.push_back(structural_failure(
+                    "-", cap.category, std::string{kind} + "_enum_" + std::to_string(enum_rc),
+                    enum_rc == ERROR_ACCESS_DENIED));
+        };
 
         // Packaged apps: direct children of the capability key OTHER than "NonPackaged".
         LONG packaged_enum_rc = ERROR_SUCCESS;
         bool packaged_truncated = false;
         for (const auto& child :
-            enumerate_subkey_names(cap_key.get(), &packaged_enum_rc, &packaged_truncated)) {
+             enumerate_subkey_names(cap_key.get(), &packaged_enum_rc, &packaged_truncated)) {
             if (child == L"NonPackaged") continue;
-            yuzu::win::RegKey app_key;
-            if (try_open_subkey(cap_key.get(), child.c_str(), app_key,
-                                std::string{cap.category} + ":packaged_app", acc))
-                out.push_back(read_one_grant(app_key.get(), yuzu::win::from_wide(child.c_str()),
-                                             cap.category));
+            read_app(cap_key.get(), child, yuzu::win::from_wide(child.c_str()), "packaged_app");
         }
-        if (packaged_truncated)
-            acc.add_failure(std::string{cap.category} + ":packaged_enum_truncated");
-        else if (packaged_enum_rc != ERROR_NO_MORE_ITEMS)
-            acc.add_failure(std::string{cap.category} + ":packaged_enum_" +
-                            std::to_string(packaged_enum_rc));
+        note_enum("packaged", packaged_enum_rc, packaged_truncated);
 
         // Win32 (non-packaged) apps, keyed by an escaped executable path.
         yuzu::win::RegKey nonpkg;
-        if (try_open_subkey(cap_key.get(), L"NonPackaged", nonpkg,
-                            std::string{cap.category} + ":nonpackaged_container", acc)) {
+        const LONG nonpkg_rc =
+            RegOpenKeyExW(cap_key.get(), L"NonPackaged", 0, KEY_READ, nonpkg.put());
+        if (nonpkg_rc == ERROR_SUCCESS) {
             LONG nonpkg_enum_rc = ERROR_SUCCESS;
             bool nonpkg_truncated = false;
             for (const auto& child :
-                enumerate_subkey_names(nonpkg.get(), &nonpkg_enum_rc, &nonpkg_truncated)) {
-                yuzu::win::RegKey app_key;
-                if (try_open_subkey(nonpkg.get(), child.c_str(), app_key,
-                                    std::string{cap.category} + ":nonpackaged_app", acc))
-                    out.push_back(read_one_grant(
-                        app_key.get(),
-                        win::unescape_nonpackaged_app_id(yuzu::win::from_wide(child.c_str())),
-                        cap.category));
-            }
-            if (nonpkg_truncated)
-                acc.add_failure(std::string{cap.category} + ":nonpackaged_enum_truncated");
-            else if (nonpkg_enum_rc != ERROR_NO_MORE_ITEMS)
-                acc.add_failure(std::string{cap.category} + ":nonpackaged_enum_" +
-                                std::to_string(nonpkg_enum_rc));
+                 enumerate_subkey_names(nonpkg.get(), &nonpkg_enum_rc, &nonpkg_truncated))
+                read_app(nonpkg.get(), child,
+                         win::unescape_nonpackaged_app_id(yuzu::win::from_wide(child.c_str())),
+                         "nonpackaged_app");
+            note_enum("nonpackaged", nonpkg_enum_rc, nonpkg_truncated);
+        } else if (nonpkg_rc != ERROR_FILE_NOT_FOUND) {
+            w.structural.push_back(structural_failure(
+                "-", cap.category, "nonpackaged_container:" + win::win32_cause(nonpkg_rc),
+                nonpkg_rc == ERROR_ACCESS_DENIED));
         }
     }
-    return out;
+    return w;
 }
 
-/// Merges `hklm_by_key` into `base` (HKLM wins for a matching (app_id,category)), emits
-/// PermissionRows into `rows`, and records value-level failure tokens into `acc`. `qualify`
-/// prefixes an app_id (empty string = no prefix, used for HKLM-only/no-profile-context output).
-void merge_and_emit(const std::vector<RawGrant>& base,
-                    const std::map<std::pair<std::string, std::string>, RawGrant>& hklm_by_key,
-                    const std::string& qualify, std::vector<PermissionRow>& rows,
-                    yuzu::shared::ConstraintAccumulator& acc) {
-    std::map<std::pair<std::string, std::string>, RawGrant> merged;
-    for (const auto& g : base) merged[{g.app_id, g.category}] = g;
-    for (const auto& [key, g] : hklm_by_key) merged[key] = g; // overwrite: HKLM precedence
-    for (const auto& [key, g] : merged) {
-        // C4-CODEX-003/K1: a capability-level "-" row is the owning profile's OWN global
-        // default for that category, NOT a machine-wide fact -- exempting it from
-        // qualification (as the original round-2 rewrite did) let two different profiles'
-        // opposing defaults for the same category collide into indistinguishable rows. Only
-        // truly qualify-less output (empty `qualify`, the no-reachable-profile HKLM fallback,
-        // where there IS no profile to attribute a default to) keeps the bare "-".
-        const std::string app_id =
-            qualify.empty() ? g.app_id : (qualify + "\\" + g.app_id);
-        if (g.state == PermissionState::unreadable)
-            acc.add_failure(app_id + ":" + g.category + ":value_unreadable");
-        else if (g.read_denied)
-            acc.add_failure(app_id + ":" + g.category + ":value_access_denied");
-        // g.read_denied (NOT g.state == denied) is the row's read_denied -- a successfully
-        // read `Deny` grant is complete, correct data, not a read failure (CDX-P1-002).
-        rows.push_back({"windows", app_id, g.category, g.state, g.raw_value, g.last_used_start,
-                        g.last_used_stop, g.read_denied});
+/// Emits one grant as a row. `source` is the profile name (or "hklm"); `qualify` = prefix the
+/// row's app_id with it (false only for HKLM's own, machine-wide rows). Every failure token is
+/// `<source>\<app_id>:<category>:<cause>` and is also the row's `raw`.
+void emit_grant(std::string_view source, bool qualify, const RawGrant& g,
+                std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc) {
+    const std::string subject = qualify_app_id(source, g.app_id) + ":" + std::string{g.category};
+    PermissionRow row{"windows",
+                      qualify ? qualify_app_id(source, g.app_id) : g.app_id,
+                      g.category,
+                      g.state,
+                      g.raw_value,
+                      g.last_used_start.value,
+                      g.last_used_stop.value,
+                      g.read_denied};
+    if (!g.cause.empty()) {
+        row.raw = subject + ":" + g.cause;
+        acc.add_failure(row.raw);
     }
+    if (!g.last_used_start.cause.empty())
+        acc.add_failure(subject + ":last_used_start_" + g.last_used_start.cause);
+    if (!g.last_used_stop.cause.empty())
+        acc.add_failure(subject + ":last_used_stop_" + g.last_used_stop.cause);
+    row.read_denied = row.read_denied || g.last_used_start.denied || g.last_used_stop.denied;
+    rows.push_back(std::move(row));
+}
+
+/// The one whole-source row for a ConsentStore root that could not be opened (not "not there").
+void emit_root_failure(std::string_view source, std::string app_id, LONG rc,
+                       std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc) {
+    rows.push_back(failure_row("windows", std::move(app_id), "-", rc == ERROR_ACCESS_DENIED,
+                               std::string{source} + ":" + win::win32_cause(rc), acc));
 }
 
 } // namespace
@@ -282,49 +315,39 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
 
-    // HKLM: machine-wide, no per-user dimension -- collected once, then applied as an
-    // override into EVERY profile's own merge below (and, if no profile is reachable at all,
-    // emitted directly so an MDM/GPO policy is never silently dropped just because nobody is
-    // logged in).
-    LONG hklm_rc = 0;
-    const auto hklm = walk_consent_store(HKEY_LOCAL_MACHINE, &hklm_rc, acc);
-    std::map<std::pair<std::string, std::string>, RawGrant> hklm_by_key;
-    for (const auto& g : hklm) hklm_by_key[{g.app_id, g.category}] = g;
+    // HKLM: machine-wide, collected once. Only its AUTHORITATIVE (successfully read) grants are
+    // applied into each profile's merge; everything else HKLM holds is reported once below as
+    // HKLM's own unqualified rows.
+    const ConsentWalk hklm = walk_consent_store(HKEY_LOCAL_MACHINE);
+    std::vector<RawGrant> hklm_authoritative;
+    for (const auto& g : hklm.grants)
+        if (win::hklm_value_authoritative(g)) hklm_authoritative.push_back(g);
 
     // Real interactive users, not the agent process's own (LocalSystem) HKEY_CURRENT_USER --
-    // see the file banner (CDX-R2-001). Same enumerate-then-with_user_hive shape as
-    // license_scan's run_per_user_surfaces / registry's do_get_user_value.
+    // see the file banner (CDX-R2-001).
     bool profiles_ok = false;
     bool truncated = false;
     const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok, &truncated);
-    if (truncated) acc.add_failure("profiles:truncated");
+    if (truncated) rows.push_back(failure_row("windows", "-", "-", false, "profiles:truncated", acc));
     const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
     const auto profiles =
         profiles_ok ? yuzu::profiles::build_profile_list(raw_profiles, hku_subkeys)
                     : std::vector<yuzu::profiles::ProfileInfo>{};
-    if (!profiles_ok) acc.add_failure("profiles:profile_list_unreadable");
+    if (!profiles_ok)
+        rows.push_back(
+            failure_row("windows", "-", "-", false, "profiles:profile_list_unreadable", acc));
 
-    // Counts profiles whose hive was ACTUALLY reached (status == ok), not merely enumerated --
-    // COD-P1-02/K1 (both external reviewers independently): the previous version fell back to
-    // direct, unqualified HKLM emission only when `profiles` (the ENUMERATED list) was empty,
-    // so a host with real profiles that were ALL unreachable (privilege_missing/not_found/
-    // mount_failed) silently dropped HKLM policy data entirely instead of falling back.
+    // Profiles whose hive was ACTUALLY reached (COD-P1-02/K1): when none was, HKLM's
+    // authoritative grants are emitted directly (unqualified) rather than silently dropped.
     std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
-        // C4-CODEX-001: with_user_hive's live-hive check tests only `== ERROR_SUCCESS` --
-        // ERROR_ACCESS_DENIED on the LIVE HKU\<SID> root and ERROR_FILE_NOT_FOUND (no such
-        // live entry, the ordinary case) are indistinguishable to its caller, and if the
-        // offline fallback then ALSO fails (privilege_missing/mount_failed), the original
-        // live-root denial is lost entirely -- reported as a generic CONSTRAINED token
-        // instead of the contract-required PERMISSION_DENIED a refused root read gets
-        // everywhere else in this file. This is a genuine gap in the SHARED with_user_hive
-        // primitive (also affects license_scan/registry, out of scope to fix here without a
-        // wider, separately-reviewed change), so it is worked around plugin-locally: a cheap
-        // peek at the live root BEFORE calling with_user_hive, used only to enrich a
-        // subsequent non-ok status with the real reason when it was specifically denied.
-        // Benign TOCTOU: ACLs changing between the peek and with_user_hive's own attempt in
-        // the few-microsecond window is exactly as safe/unsafe as every other check-then-act
-        // registry read in this file, and the peek never gates or replaces the real call.
+        const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
+        const std::string profile_row_id = qualify_app_id(pname, "-");
+
+        // C4-CODEX-001: with_user_hive's live-hive check tests only `== ERROR_SUCCESS`, so a
+        // refused LIVE HKU\<SID> root is indistinguishable from "not loaded" to its caller, and
+        // if the offline fallback then also fails the denial would be lost. A cheap peek at the
+        // live root (never gating or replacing the real call; benign TOCTOU) recovers it.
         LONG peek_rc = ERROR_SUCCESS;
         {
             yuzu::win::RegKey peek;
@@ -332,91 +355,67 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
                                     KEY_READ, peek.put());
         }
 
-        std::vector<RawGrant> user_grants;
-        LONG user_rc = ERROR_SUCCESS;
+        ConsentWalk user;
         yuzu::win::HiveAccessReport report;
         const auto status = yuzu::win::with_user_hive(
-            profile.sid, profile.profile_path,
-            [&](HKEY root) { user_grants = walk_consent_store(root, &user_rc, acc); }, &report);
-        if (report.unload_failed) acc.add_failure(profile.profile_name + ":hive_unload_failed");
+            profile.sid, profile.profile_path, [&](HKEY root) { user = walk_consent_store(root); },
+            &report);
+        // The read itself completed; a failed unload is an operational residue (a mount left
+        // behind), reported as a token, not a data gap.
+        if (report.unload_failed) acc.add_failure(pname + ":hive_unload_failed");
 
-        // Exhaustive switch over the FOUR HiveAccessStatus outcomes (COD-P1-02/K1): the previous
-        // version handled only two, so `mount_failed` fell through and merge_and_emit ran with
-        // an EMPTY user_grants (fn was never called) as if the profile had been read cleanly --
-        // fabricating an OK/FULL "this profile has no grants" for a hive that was never actually
-        // opened (a locked/corrupt NTUSER.DAT, or an orphaned ProfileList record -- routine on a
-        // real fleet, not a rare edge case).
+        // Exhaustive over the FOUR HiveAccessStatus outcomes (COD-P1-02/K1): a profile whose hive
+        // was never opened must never read as "this profile has no grants" -- each failure is
+        // its own row.
+        const auto profile_failed = [&](std::string_view cause) {
+            const bool denied = (peek_rc == ERROR_ACCESS_DENIED);
+            rows.push_back(failure_row("windows", profile_row_id, "-", denied,
+                                       pname + ":" + (denied ? std::string{"access_denied"}
+                                                             : std::string{cause}),
+                                       acc));
+        };
         switch (status) {
         case yuzu::win::HiveAccessStatus::ok:
             ++reachable_profiles;
             break;
         case yuzu::win::HiveAccessStatus::privilege_missing:
-            if (peek_rc == ERROR_ACCESS_DENIED) {
-                rows.push_back(whole_read_failed_row("windows", PermissionState::denied,
-                                                      profile.profile_name + ":access_denied",
-                                                      acc, true));
-            } else {
-                acc.add_failure(profile.profile_name + ":privilege_missing");
-            }
+            profile_failed("privilege_missing");
             continue;
         case yuzu::win::HiveAccessStatus::not_found:
-            // Enumerated but genuinely unreachable (no live HKU entry, no offline NTUSER.DAT
-            // path). `profile_path_unreadable` (carried from the raw ProfileList record) means
-            // even the PATH itself couldn't be resolved -- name that distinctly rather than
-            // conflating it with "no path was ever recorded".
-            acc.add_failure(profile.profile_name +
-                            (profile.profile_path_unreadable ? ":profile_path_unreadable"
-                                                             : ":hive_not_found"));
+            // `profile_path_unreadable` (carried from the raw ProfileList record) means even the
+            // PATH itself couldn't be resolved -- named distinctly from "no hive to reach".
+            profile_failed(profile.profile_path_unreadable ? "profile_path_unreadable"
+                                                           : "hive_not_found");
             continue;
         case yuzu::win::HiveAccessStatus::mount_failed:
-            if (peek_rc == ERROR_ACCESS_DENIED) {
-                rows.push_back(whole_read_failed_row("windows", PermissionState::denied,
-                                                      profile.profile_name + ":access_denied",
-                                                      acc, true));
-            } else {
-                acc.add_failure(profile.profile_name + ":hive_mount_failed");
-            }
+            profile_failed("hive_mount_failed");
             continue;
         }
 
-        merge_and_emit(user_grants, hklm_by_key, profile.profile_name, rows, acc);
+        if (user.root_rc != ERROR_SUCCESS && user.root_rc != ERROR_FILE_NOT_FOUND)
+            emit_root_failure(pname, profile_row_id, user.root_rc, rows, acc);
+        for (const auto& g : win::merge_with_hklm(user.grants, hklm_authoritative))
+            emit_grant(pname, true, g, rows, acc);
+        for (const auto& g : user.structural) emit_grant(pname, true, g, rows, acc);
+    }
 
-        if (user_rc != ERROR_SUCCESS && user_rc != ERROR_FILE_NOT_FOUND) {
-            const bool this_denied = (user_rc == ERROR_ACCESS_DENIED);
-            rows.push_back(whole_read_failed_row(
-                "windows", this_denied ? PermissionState::denied : PermissionState::unreadable,
-                profile.profile_name +
-                    (this_denied ? ":access_denied" : (":win32_" + std::to_string(user_rc))),
-                acc, this_denied));
+    // HKLM's own rows, unqualified, once: its failures and app-level non-authoritative entries
+    // always; its authoritative grants only when no profile was reachable to carry them. Its
+    // capability-level `absent` coverage entries are left to fill_uncovered_categories below.
+    for (const auto& g : hklm.grants) {
+        if (win::hklm_value_authoritative(g)) {
+            if (reachable_profiles == 0) emit_grant("hklm", false, g, rows, acc);
+        } else if (win::grant_failed(g) || g.app_id != "-") {
+            emit_grant("hklm", false, g, rows, acc);
         }
     }
+    for (const auto& g : hklm.structural) emit_grant("hklm", false, g, rows, acc);
+    if (hklm.root_rc != ERROR_SUCCESS && hklm.root_rc != ERROR_FILE_NOT_FOUND)
+        emit_root_failure("hklm", "-", hklm.root_rc, rows, acc);
 
-    if (reachable_profiles == 0) {
-        // No interactive user's hive was actually reached -- no profiles enumerated at all (a
-        // server/unattended host), the profile list itself couldn't be read, or every
-        // enumerated profile hit privilege_missing/not_found/mount_failed above -- still
-        // surface any HKLM machine policy directly, rather than silently dropping it because
-        // no per-user row existed to merge it into.
-        merge_and_emit({}, hklm_by_key, "", rows, acc);
-    }
-
-    // HKLM root-level denial, reported once regardless of the per-profile loop -- an
-    // MDM/GPO-authoritative refusal is the more consequential one to lose silently (CDX-P1-003).
-    if (hklm_rc != ERROR_SUCCESS && hklm_rc != ERROR_FILE_NOT_FOUND) {
-        const bool this_denied = (hklm_rc == ERROR_ACCESS_DENIED);
-        rows.push_back(whole_read_failed_row(
-            "windows", this_denied ? PermissionState::denied : PermissionState::unreadable,
-            std::string{"hklm"} +
-                (this_denied ? ":access_denied" : (":win32_" + std::to_string(hklm_rc))),
-            acc, this_denied));
-    }
-
-    if (rows.empty()) {
-        // No profiles, no HKLM data, HKLM itself genuinely not there -- a legitimate, if
-        // unusual, host state.
-        rows.push_back({"windows", "-", "-", PermissionState::absent, "-", "-", "-", false});
-    }
-
+    // A category no row mentions is `absent` ONLY when nothing failed -- otherwise the failure
+    // rows above (each whole-source row stands for all four categories) already account for it.
+    fill_uncovered_categories("windows", rows, acc);
     return emit_rows(ctx, rows, acc, false);
 }
 

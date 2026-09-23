@@ -14,11 +14,17 @@
 ## `PUT /api/v1/plugin-config/privacy_permissions/kill-switch {"enabled":true}` before this
 ## action will dispatch.
 ##
-## macOS: TCC.db, SIP-protected -- an unentitled agent identity is expected to read `denied`
-## for the whole read. Windows: the CapabilityAccessManager\ConsentStore registry subtree.
-## Linux: xdg-desktop-portal's PermissionStore over the session bus -- `unsupported` (no
-## session/no daemon) is the honest, expected outcome on most non-sandboxed desktops.
-
+## macOS: the system TCC.db plus every /Users home's per-user TCC.db (camera and microphone
+## grants live per-user) -- all TCC-protected, so an agent without Full Disk Access reads
+## `denied`. Windows: each real profile's CapabilityAccessManager\ConsentStore (live HKU hive
+## or offline NTUSER.DAT mount) plus the HKLM mirror. Linux: xdg-desktop-portal's
+## PermissionStore over the AGENT'S OWN session bus only -- `unsupported`/UNAVAILABLE (no
+## session, no daemon) is the expected outcome for a system-service agent and says nothing
+## about interactive users' grants.
+##
+## Every row leads with `row_kind` (`permissions`; `constrained` only on the plugin's
+## internal_error row), so these columns line up with the wire row positionally -- see
+## autoruns.yaml's precedent comment for why an omitted row_kind shifts every column left.
 ---
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
@@ -30,11 +36,12 @@ metadata:
     Per-app sensitive-permission grants as `permissions|os|app_id|category|state|raw
     |last_used_start|last_used_stop` rows. `category` is a fixed cross-OS vocabulary: camera,
     microphone, location, full_disk_access. `state`: allowed, denied, prompt_undetermined
-    (mechanism-native, not yet a clear yes/no), absent (the app never asked -- not a failure),
+    (mechanism-native, not yet a clear yes/no), absent (no record -- not a failure),
     unreadable (the read failed) or unsupported (no mechanism on this OS/host). A refused read
-    (SIP/TCC denial, registry access denied, a portal AccessDenied error) is always `denied`,
-    never collapsed into `absent`. The two `last_used_*` fields are Windows-only
-    (epoch-milliseconds; "-" elsewhere).
+    (a TCC.db denial, registry access denied, a portal AccessDenied error) is always a `denied`
+    row whose `raw` names the refusal, never collapsed into `absent`. Every category gets a
+    row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields are
+    Windows-only (epoch-milliseconds; "-" elsewhere).
   tags: [privacy_permissions, security, posture, privacy, forensics]
 
 spec:
@@ -52,7 +59,14 @@ spec:
 
   result:
     # permissions|<os>|<app_id>|<category>|<state>|<raw>|<last_used_start>|<last_used_stop>
+    # (also: constrained|<os>|-|-|unreadable|internal_error|-|-)
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `permissions` (every data row) or `constrained` (the one row the plugin writes when it fails internally: `raw` is `internal_error`, the result is CONSTRAINED).'
+        values: [permissions, constrained]
+        example: permissions
+        platforms: [windows, linux, darwin]
       - name: os
         type: string
         description: The reporting OS.
@@ -63,30 +77,36 @@ spec:
         type: string
         description: >
           Per-app identifier: a TCC client id (bundle id or path, macOS), an executable path
-          or Package Family Name (Windows), a portal-reported app id (Linux). On Windows,
-          non-"-" identifiers AND the "-" capability-level default are both qualified with the
-          owning profile's name (`<profile>\<app_id>` / `<profile>\-`) -- the agent runs as
-          LocalSystem and reads every real profile's ConsentStore, so a bare "-" default would
-          be ambiguous between two profiles with different defaults for the same category.
-          Bare "-" (no qualifier) means the whole read failed before any app-level row could
-          be produced, or (Windows only, no reachable profile) a machine-wide HKLM default
-          with no profile to attribute it to.
+          or Package Family Name (Windows), a portal-reported app id (Linux). "-" means no
+          specific app: a Windows capability-level default, a per-category `absent`/
+          `unsupported` row, or a failure row. A row read from a PER-USER source is qualified
+          with that user's name -- `<user>/<app_id>` or `<user>/-` on the wire (the row
+          sanitizer writes the separator `\` as `/`, as it does inside every path): each
+          Windows profile's ConsentStore and each macOS per-user TCC.db. An unqualified
+          app_id comes from a machine-wide source: the macOS system TCC.db, the Windows HKLM
+          ConsentStore mirror, or the Linux portal (the agent's own session).
         example: com.example.App
         platforms: [windows, linux, darwin]
       - name: category
         type: string
-        description: The fixed cross-OS permission category. "-" only on a whole-read-failed row.
-        values: [camera, microphone, location, full_disk_access]
+        description: >
+          The fixed cross-OS permission category. "-" only on a whole-source row -- one row
+          standing for every category of a source that could not be read at all (a TCC.db, a
+          Windows profile hive or ConsentStore root, the session bus/portal), or that holds no
+          file (a macOS user with no per-user TCC.db).
+        values: [camera, microphone, location, full_disk_access, "-"]
         example: camera
         platforms: [windows, linux, darwin]
       - name: state
         type: string
         description: >
-          allowed/denied: a real, decoded grant. prompt_undetermined: the mechanism reported a
-          value this plugin doesn't map to allowed/denied (never guessed). absent: no record
-          for this app+category -- the app never asked, not a failure. unreadable: the read
-          itself failed. unsupported: no mechanism reaches this category on this OS/host (e.g.
-          no portal daemon running).
+          allowed/denied: a real, decoded grant -- except that a READ that was refused is also
+          `denied`, with `raw` naming the refusal (a `<subject>:<cause>` token) instead of a
+          decoded value. prompt_undetermined: the mechanism reported a value this plugin doesn't
+          map to allowed/denied (never guessed). absent: no record for this app+category (or
+          this source) -- not a failure. unreadable: the read itself failed; `raw` names why.
+          unsupported: no mechanism reaches this category on this OS/host (macOS location; Linux
+          full_disk_access; Linux with no session bus or portal daemon).
         values: [allowed, denied, prompt_undetermined, absent, unreadable, unsupported]
         example: allowed
         platforms: [windows, linux, darwin]
@@ -94,18 +114,25 @@ spec:
         type: string
         description: >
           The mechanism-native value behind `state` (a TCC auth_value integer, a ConsentStore
-          Value string, a joined portal permission list) -- "-" when nothing meaningful beyond
-          the state itself.
+          Value string, a joined portal permission list); on a failure row (`denied` from a
+          refused read, or `unreadable`) the failure token that also appears in the result
+          provenance; "-" when nothing meaningful beyond the state itself.
         example: "2"
         platforms: [windows, linux, darwin]
       - name: last_used_start
         type: string
-        description: Windows ConsentStore LastUsedTimeStart, epoch milliseconds. "-" elsewhere.
+        description: >
+          Windows ConsentStore LastUsedTimeStart, epoch milliseconds; "-" when never set or on
+          any other OS; `unreadable` when the value exists but is not an 8-byte REG_QWORD or
+          could not be read (a `...:last_used_start_<cause>` token names it).
         example: "1700000000000"
         platforms: [windows]
       - name: last_used_stop
         type: string
-        description: Windows ConsentStore LastUsedTimeStop, epoch milliseconds. "-" elsewhere.
+        description: >
+          Windows ConsentStore LastUsedTimeStop, epoch milliseconds; "-" when never set or on
+          any other OS; `unreadable` when the value exists but is not an 8-byte REG_QWORD or
+          could not be read (a `...:last_used_stop_<cause>` token names it).
         example: "1700000100000"
         platforms: [windows]
 
