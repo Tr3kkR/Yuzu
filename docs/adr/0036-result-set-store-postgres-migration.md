@@ -292,7 +292,10 @@ fragments in `result_set_routes.cpp` (no decision downstream of a dashboard rend
 `docs/postgres-store-playbook.md` rule 4's render-only carve-out). `members` and
 `count_for_owner` have no production caller left — every site that could
 grant/target/dispatch on their result now goes through the `_checked` twin; the plain forms
-exist only for `test_result_set_store.cpp`'s own healthy-path assertions.
+exist only for test files' own assertions (mixed healthy- and degraded-path, not healthy-path
+only): `count_for_owner`'s sole remaining caller is `test_result_set_store.cpp`, while `members`'
+test callers span three files — `test_result_set_store.cpp`, `test_rest_result_sets_async.cpp`,
+and `test_mcp_server.cpp`.
 
 **Correction to the "short lineage breadcrumb" characterisation on the Follow-ups list
 above:** the pre-#4306
