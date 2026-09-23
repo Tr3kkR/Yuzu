@@ -20,7 +20,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 using namespace yuzu::server;
 
@@ -149,34 +148,22 @@ TEST_CASE("CommandCapabilityRegistry: classify is case-insensitive on both plugi
     CHECK(upper->dispatch_class == lower->dispatch_class);
 }
 
-namespace {
-// std::initializer_list cannot be built at runtime (no (count, value)
-// constructor like std::vector); it only exists as a brace-enclosed list at
-// the call site. Expanding an index_sequence pack inside the braces derives
-// the element count from a constant, so the ceiling test never needs a
-// literal list that must be kept in step with kMaxSources.
-template <std::size_t... I>
-CommandCapabilityRegistry registry_with_n_sources(std::span<const CommandCapability> s,
-                                                  std::index_sequence<I...>) {
-    return CommandCapabilityRegistry{(static_cast<void>(I), s)...};
-}
-} // namespace
-
 TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silently dropping "
           "one",
           "[server][dispatch][capability]") {
-    // Pinned exactly, as this test pinned 16 before Wave 8: the live composition is 16
-    // sources here and 17 once both Wave 8 posture plugins (app_control, system_hardening)
-    // are on dev, so a revert to 16 would overflow at that landing. Update deliberately.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 32,
-                  "kMaxSources changed: re-derive the landing constraint above");
+    // std::initializer_list cannot be built programmatically (no (count,
+    // value) constructor like std::vector) — it only exists as a brace-enclosed
+    // literal at the call site, so exceeding kMaxSources means literally
+    // writing kMaxSources + 1 elements. The static_assert keeps that literal
+    // count honest if kMaxSources ever changes.
+    static_assert(CommandCapabilityRegistry::kMaxSources == 24,
+                 "this test hardcodes 25 literal sources (kMaxSources + 1); update the "
+                 "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
-    // Exactly kMaxSources fits; kMaxSources + 1 throws — derived from the constant, never a literal.
-    CHECK_NOTHROW(registry_with_n_sources(
-        s, std::make_index_sequence<CommandCapabilityRegistry::kMaxSources>{}));
-    CHECK_THROWS_AS(registry_with_n_sources(
-                        s, std::make_index_sequence<CommandCapabilityRegistry::kMaxSources + 1>{}),
-                    std::invalid_argument);
+    CHECK_THROWS_AS(
+        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
+                                    s, s, s, s}),
+        std::invalid_argument);
 }
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────

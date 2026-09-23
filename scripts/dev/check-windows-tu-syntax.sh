@@ -60,6 +60,8 @@ tus=(
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
+    agents/plugins/app_control/src/app_control_plugin.cpp
+    agents/plugins/app_control/src/app_control_win.cpp
     agents/plugins/system_hardening/src/system_hardening_win.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")

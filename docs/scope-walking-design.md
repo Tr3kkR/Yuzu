@@ -212,6 +212,44 @@ point, and only one of them wants everything. Refusals are counted as
 `yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
 `result_set.create|denied`.
 
+**`{id}/re-eval` is refused, never broadcast, when the original's recorded parent no longer
+exists (#4306).** `re-eval` synthesises the sibling's dispatch scope from the LIVE, nullable
+`parent_id` FK column on the original — `parent_id TEXT REFERENCES result_sets(id) ON DELETE SET
+NULL`. If the original's parent set is later deleted, `parent_id` is nulled and an absent
+`parent_id` reaching the shared dispatch synthesis reads as "omitted → broadcast to `__all__`",
+the same rule the `#2500` guard above applies to a caller-supplied empty string. Left unhandled,
+"re-ask the same narrow question" would silently become "ask the whole visible fleet" — the same
+target-erasure shape as `#2500`. Both REST and MCP check the original's *persisted*
+`source_payload` for a non-empty `scope_input_id` (the RAW caller-supplied `parent_id` at
+creation time, independent of the live FK) before falling through to broadcast: if the live
+parent is gone AND `scope_input_id` shows the original was narrowed at creation, the call is
+refused with `400 RESULT_SET_BAD_REQUEST` (REST) / `kInvalidParams` (MCP) rather than either
+re-resolving `scope_input_id` or broadcasting. Re-resolution is deliberately not attempted —
+`scope_input_id` may be an alias rather than a canonical `rs_` id, and `resolve_alias`'s
+`ORDER BY created_at DESC LIMIT 1` means the alias may since have been re-bound to a different,
+newer set; resolving it at re-eval time would retarget the dispatch to whatever the alias means
+*today*, not what it meant when the original was created. `scope_input_id` is recorded whenever
+`parent_id` was supplied at creation, on all four creation paths -- the dedicated
+`from-tar-query`/`from-instruction-result`/`from-inventory-query` producers (which always build a
+well-formed JSON object payload themselves) and the generic `POST /api/v1/result-sets` / MCP
+`create_result_set` create routes (#4306 follow-up), all mirroring the identical
+`payload["scope_input_id"] = ...` persistence -- **except** that the two generic routes only merge
+the marker when the caller's `source_payload` was itself supplied as a JSON object; a non-object
+`source_payload` (a string/array/number) skips the merge. This is safe today: the same
+`is_object()` predicate independently gates the `sql`/`instruction_id`-presence check at re-eval
+time on the identical stored value, so a non-object payload is refused ("no re-runnable source")
+before ever reaching dispatch, regardless of whether `scope_input_id` was recorded. This is a
+coincidence rather than a documented joint invariant (a regression test locks it down --
+`tests/unit/server/test_rest_result_sets_async.cpp`/`test_mcp_server.cpp`, `#4306` governance
+follow-up), so a future change to either check in isolation should re-verify the other. A genuinely
+parentless original -- no `parent_id` was ever supplied at creation, by *any* creation path -- still
+broadcasts on re-eval, unchanged, existing behaviour for a deliberately fleet-wide original. The
+refusal happens before `run_async`/`rs_run_async` — no execution row is created, nothing is
+dispatched, nothing needs cancelling — and is audited as `result_set.create|denied` with
+`reason=parent_gone`. It is **not** counted on `yuzu_server_dispatch_target_rejected_total`
+(that family's `reason` label set is closed and boot-pre-seeded from `dispatch_target_shape.hpp`;
+widening it is a separate, reviewed decision).
+
 Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
 ## 7. YAML DSL surface
@@ -293,7 +331,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`. `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |

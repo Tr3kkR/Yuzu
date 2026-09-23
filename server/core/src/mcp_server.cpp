@@ -31,7 +31,6 @@
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
-#include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
@@ -1003,7 +1002,7 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
-     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -1074,7 +1073,11 @@ static const ToolDef kTools[] = {
      "follow-up). If the stored source_payload nests past the JSON depth guard (#4493), the "
      "row is healed in place (payload discarded, status/members untouched) as a side effect "
      "of the rejection, so a later re-eval attempt is refused for a different reason (no "
-     "re-runnable source) instead of repeating the same depth error. REST v1 twin: POST "
+     "re-runnable source) instead of repeating the same depth error. If the original was "
+     "narrowed to a parent set at creation time and that parent has since been deleted, this "
+     "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
+     "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or error.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
@@ -11593,8 +11596,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = param_str(args, "source_kind", "manual_curate");
-                cr.source_payload =
-                    args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                // #4306 follow-up (Kimi/Codex adversarial review): this tool
+                // accepts an UNRESTRICTED source_kind/source_payload (no
+                // allowlist) plus a caller-supplied parent_id, so a row
+                // minted here is otherwise indistinguishable at re-eval time
+                // from a genuinely parentless original once its parent is
+                // deleted (ON DELETE SET NULL) -- the same #4306/#2500
+                // target-erasure shape the dedicated
+                // create_result_set_from_tar_query/_instruction_result tools
+                // are already protected against. Parse into a mutable object
+                // so scope_input_id can be merged in below, once pid's
+                // ownership check (rs_load_owned) succeeds -- mirrors those
+                // tools' identical payload["scope_input_id"] = ... pattern.
+                // Named req_payload (not payload) - this handler separately
+                // builds a RESPONSE-body `payload` further down from the
+                // created row, an unrelated JSON object with the same
+                // conventional name.
+                nlohmann::json req_payload =
+                    args.contains("source_payload") ? args["source_payload"] : nlohmann::json::object();
                 // #4353 follow-up: this tool is never approval-gated (Write, but
                 // no ManagementGroup/UserManagement/Security/Policy/Execution
                 // securable_type here - see requires_approval()), so the
@@ -11659,7 +11678,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return; // rs_load_owned already wrote the error
                     cr.parent_id = *pid;
+                    // #4306 follow-up: do NOT add the marker for a parent_id
+                    // that failed ownership above -- that request is already
+                    // rejected before reaching here.
+                    if (req_payload.is_object())
+                        req_payload["scope_input_id"] = *pid;
                 }
+                cr.source_payload = req_payload.dump();
                 if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
@@ -11859,7 +11884,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = std::string(source_kind::kInventoryQuery);
-                cr.source_payload = args.dump();
+                // #4306 governance follow-up (Gate 2 security-guardian LOW): mirrors
+                // the identical REST fix on POST /api/v1/result-sets/from-inventory-query
+                // (rest_api_v1.cpp) -- see that comment for the full rationale.
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     // Length already checked above, ahead of the store gates.
@@ -11868,6 +11895,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return;
                     cr.parent_id = pid;
+                    args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
                     std::string cur;
                     while (true) {
@@ -11880,6 +11908,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     parent_members = std::move(ms);
                 }
+                // `args` is not read anywhere below this point in this handler.
+                cr.source_payload = args.dump();
                 InventoryQuery iq;
                 iq.limit = 5000;
                 bool inv_truncated = false;
@@ -12297,12 +12327,85 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                // #4306 follow-up (adversarial review, Kimi+Codex): the
+                // source_kind support check must run BEFORE the parent-gone /
+                // scope_input_id guard below, or a manual_curate (or any
+                // other unsupported-source_kind) row minted via the generic
+                // create_result_set tool with a crafted
+                // source_payload={"scope_input_id":"..."} but no real parent
+                // gets misclassified as RESULT_SET_BAD_REQUEST
+                // (reason=parent_gone) instead of RESULT_SET_REEVAL_UNSUPPORTED.
+                // Both outcomes are refusals with nothing dispatched either
+                // way (not a dispatch-safety bug -- an error/audit-reason
+                // correctness bug), but the unsupported-kind rejection takes
+                // priority: it depends on nothing computed below (no synth,
+                // no reeval_name), so hoist it to an early return right after
+                // sp is parsed. Mirrors REST's identical reorder on this
+                // route (rest_api_v1.cpp).
+                if (orig->source_kind != source_kind::kTarQuery &&
+                    orig->source_kind != source_kind::kInstructionResult) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                       "is not yet supported"),
+                        "application/json");
+                    return;
+                }
                 // Synthesise the parent so the sibling shares the original's
                 // parent (re-eval re-asks the same question against today's
                 // estate).
                 nlohmann::json synth = nlohmann::json::object();
-                if (orig->parent_id && !orig->parent_id->empty())
-                    synth["parent_id"] = *orig->parent_id;
+                if (orig->parent_id && !orig->parent_id->empty()) {
+                    synth["parent_id"] = *orig->parent_id; // live parent: canonical, exact
+                } else if (sp.is_object() && sp.contains("scope_input_id") &&
+                           sp["scope_input_id"].is_string() &&
+                           !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
+                    // #4306 / #2500-class target erasure: the original was
+                    // NARROWED at creation (scope_input_id persisted into
+                    // source_payload by create_result_set_from_tar_query /
+                    // create_result_set_from_instruction_result, OR by the
+                    // generic create_result_set -- #4306 follow-up, all three
+                    // mirror the same payload["scope_input_id"] = ... pattern),
+                    // but its live parent_id FK is now null (schema: `parent_id ... ON DELETE
+                    // SET NULL`, result_set_store.cpp) because the parent set was
+                    // deleted since. An absent parent_id reaching rs_run_async
+                    // below reads as "omitted -> broadcast to __all__" (the SAME
+                    // rule rs_run_async's own parent_id-empty guard applies to a
+                    // caller-supplied empty string), so "re-ask the same narrow
+                    // question" would silently become "ask the whole visible
+                    // fleet". Mirrors REST's identical guard on this route
+                    // (rest_api_v1.cpp).
+                    //
+                    // Deliberately NOT re-resolving scope_input_id as a fresh
+                    // alias lookup: it is the RAW caller-supplied value at
+                    // creation time and may be an ALIAS, not a canonical rs_ id.
+                    // rs_resolve_owned_parent routes a non-rs_-prefixed string
+                    // through resolve_alias(), whose SQL is `ORDER BY created_at
+                    // DESC LIMIT 1` — newest-wins — so the alias may since have
+                    // been re-bound to a DIFFERENT, newer set. Resolving it now
+                    // would retarget the dispatch to whatever the alias means
+                    // TODAY, not what it meant when this original was created: a
+                    // precision regression, not a fix. Refuse instead, before
+                    // rs_run_async / exec_visible derivation — nothing is
+                    // dispatched, no execution row is created, nothing needs
+                    // cancelling.
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", rs_id,
+                        "reason=parent_gone source_kind=" + audit_token(orig->source_kind) +
+                            " scope_input_id=" +
+                            audit_token(sp["scope_input_id"].get<std::string>()));
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
+                                 "exists; re-eval cannot reconstruct its target scope -- create "
+                                 "a new set from the intended parent instead",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                // else: genuinely parentless original (no scope_input_id was ever
+                // recorded) -> broadcast, today's behaviour, unchanged (an
+                // omitted parent_id is deliberately "the whole fleet").
                 // Skip the suffix if it's already there, else repeated
                 // re-evals of a sibling grow "foo (re-eval) (re-eval) ..."
                 // unboundedly.
@@ -12445,13 +12548,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                     rs_run_async(def->plugin, def->action, params, source_kind::kInstructionResult,
                                 orig->source_payload, orig->matcher, synth, reeval_name);
-                } else {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
-                                       "is not yet supported"),
-                        "application/json");
                 }
+                // else: unreachable -- the early return above already refused
+                // every source_kind other than kTarQuery/kInstructionResult
+                // before we got here.
                 return;
             }
 
@@ -12971,16 +13071,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status.
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                // #4037: guardian_status_rollup (guardian_model.hpp) is the SAME function
-                // REST's GET /guaranteed-state/status calls — cannot drift on
+                // #4037/ADR-0031 WS-A4 (ninth family): GuardianApi::status wraps the
+                // SAME guardian_status_rollup function REST's
+                // GET /guaranteed-state/status calls — cannot drift on
                 // total_rules/errored_rules derivation by construction.
-                auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
+                auto rollup = guardian_api_->status(gate.scope);
                 if (!rollup) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13022,13 +13123,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guaranteed_state_store->list_rules();
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_rules.
+                auto rows = guardian_api_->list_rules();
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13077,7 +13179,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13143,7 +13245,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "dex.device.view", "success",
                     fleet ? "GuaranteedState" : "Agent", q.agent_id,
                     "Guaranteed State events via MCP list_guardian_events");
-                auto rows = guaranteed_state_store->query_events(q);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
+                // plain-vector, empty-on-degrade contract (ADR-0038 "deferred
+                // widening", #2659; see guardian_api.hpp).
+                auto rows = guardian_api_->list_events(q);
                 JArr arr;
                 for (const auto& e : rows) {
                     arr.add(JObj()
@@ -13191,7 +13296,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13205,8 +13310,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely
                 // absent / degraded — a degrade must error, never collapse
-                // into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // into "not found". ADR-0031 WS-A4 (ninth family):
+                // GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13230,7 +13336,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
+                auto rows = guardian_api_->rule_status(rule_id);
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13289,13 +13395,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guardian_device_all_guards(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
+                auto rows = guardian_api_->device_guards(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/agents/{agent_id}/rules and the
                 // dashboard Guardian device lens. MCP set-and-proceed
@@ -13469,7 +13576,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13477,7 +13584,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely absent /
                 // degraded — a degrade must error, never collapse into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13862,13 +13970,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::agent_status.
+                auto rollup = guardian_api_->agent_status(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/status/{agent_id}. MCP set-and-proceed posture
                 // (audit_persisted:false on a dropped row, never fail closed — MCP
@@ -13949,7 +14058,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store || !baseline_store_) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13961,11 +14070,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // fires below - the prior inline version audited "success" right
                 // after the first read, so a degrade in any of the other three
                 // still surfaced a 500 the audit had already called successful.
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance
+                // wraps guardian_device_compliance_rollup verbatim.
                 bool store_degraded = false;
                 bool pii_access_began = false;
-                auto rollup = guardian_device_compliance_rollup(
-                    *baseline_store_, *guaranteed_state_store, baseline_name, agent_id,
-                    &store_degraded, &pii_access_began);
+                auto rollup = guardian_api_->device_compliance(baseline_name, agent_id,
+                                                                &store_degraded, &pii_access_began);
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
