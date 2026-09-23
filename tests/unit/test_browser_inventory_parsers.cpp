@@ -165,6 +165,29 @@ TEST_CASE("profiles_from_local_state: an e-mail-shaped profile_dir (the info_cac
     CHECK(rows->front().display_name == "[redacted-email]");
 }
 
+TEST_CASE("profiles_from_local_state: a DECORATED or multi-address e-mail in profile_dir or "
+          "display_name is redacted whole -- round-2 blocker",
+          "[browser_inventory][profiles][privacy]") {
+    // Round-2 adversarial finding (2026-09-23): the round-1 whole-value
+    // filter passed a decorated or multi-address value straight through.
+    // "Alice <alice@example.com>" < "Profile 2" lexically, so map order
+    // (nlohmann::json's default object is ordered by key) pins row order.
+    const auto text = std::string{R"json({"profile":{"info_cache":{)json"} +
+                       R"json("Alice <alice@example.com>":{"name":"alice@example.com (Work)"},)json" +
+                       R"json("Profile 2":{"name":"alice@example.com,bob@example.org"}}}})json";
+    const auto rows = profiles_from_local_state(text);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    CHECK((*rows)[0].profile_dir == "[redacted-email]");
+    CHECK((*rows)[0].display_name == "[redacted-email]");
+    CHECK((*rows)[1].profile_dir == "Profile 2");
+    CHECK((*rows)[1].display_name == "[redacted-email]");
+    for (const auto& row : *rows) {
+        CHECK(row.profile_dir.find('@') == std::string::npos);
+        CHECK(row.display_name.find('@') == std::string::npos);
+    }
+}
+
 TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profiles][privacy]") {
     CHECK(looks_like_email_address("account@example.com"));
     CHECK(looks_like_email_address("a@b.co"));
@@ -175,8 +198,25 @@ TEST_CASE("looks_like_email_address: shape checks", "[browser_inventory][profile
     CHECK_FALSE(looks_like_email_address("@example.com"));  // nothing before '@'
     CHECK_FALSE(looks_like_email_address("account@"));      // nothing after '@'
     CHECK_FALSE(looks_like_email_address("account@example")); // no '.' in domain
-    CHECK_FALSE(looks_like_email_address("a@b@c.com"));     // second '@'
-    CHECK_FALSE(looks_like_email_address("contact @ x.com")); // whitespace
+    CHECK(looks_like_email_address("a@b@c.com"));     // contains b@c.com -- over-match is safe
+    CHECK_FALSE(looks_like_email_address("contact @ x.com")); // whitespace before '@'
+
+    // Round-2 adversarial finding (2026-09-23): the whole-value test under-
+    // matched every decorated form -- these are the reviewer's four
+    // counterexamples verbatim.
+    CHECK(looks_like_email_address("Alice <alice@example.com>"));
+    CHECK(looks_like_email_address("alice@example.com (Work)"));
+    CHECK(looks_like_email_address("x alice@example.com"));
+    CHECK(looks_like_email_address("alice@example.com,bob@example.org"));
+
+    // Round-1 bare shapes retained.
+    CHECK(looks_like_email_address("ALICE@EXAMPLE.COM"));
+    CHECK(looks_like_email_address("alice+work@sub.example.co.uk"));
+
+    // Still false: no dotted domain anywhere.
+    CHECK_FALSE(looks_like_email_address("user@localhost"));
+    CHECK_FALSE(looks_like_email_address("a@.com"));  // empty domain label before the dot
+    CHECK_FALSE(looks_like_email_address("a@b."));    // trailing dot alone doesn't qualify
 }
 
 TEST_CASE("profiles_from_local_state: SYNTHETIC (Chrome) — two profiles, second is ephemeral "

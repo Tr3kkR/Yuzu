@@ -34,11 +34,17 @@
  * acquisition failure, never silently folded into "zero rows".
  *
  * PRIVACY: every JSON-derived field this leg writes onto the wire comes
- * from BrowserProfileRow (browser_inventory_parsers.hpp), which
- * structurally carries no gaia_id/e-mail/info_cache user_name — see that
- * header's PRIVACY CONTRACT (including its display_name exception:
- * BrowserProfileRow.display_name, forwarded here as-is, CAN legitimately
- * carry the signed-in account's real name). This leg's OWN row builder
+ * from BrowserProfileRow (browser_inventory_parsers.hpp). The dedicated-
+ * identifier half (gaia_id/user_name/gaia_name) is structural — the
+ * struct simply has no such field. The e-mail-address half arrives
+ * ALREADY REDACTED: `profile_dir`/`display_name` are forwarded here only
+ * after `profiles_from_local_state` has replaced either field WHOLE with
+ * `[redacted-email]` when it contains an e-mail-shaped substring — see
+ * that header's PRIVACY CONTRACT. This leg adds no e-mail filtering of its
+ * own, only `safe_output_field` escaping (including the display_name
+ * exception: a NON-e-mail personal name, forwarded here as-is, CAN
+ * legitimately be the signed-in account's real name — an accepted
+ * residual risk, not something this leg filters). This leg's OWN row builder
  * additionally prepends the LOCAL OS/home-directory name (the walk's
  * "user") ahead of every profile row — a second deliberate, documented
  * exception (decided 2026-09-22, see the plugin's README "PRIVACY

@@ -513,6 +513,41 @@ TEST_CASE("browser_inventory linux: an e-mail-shaped display_name is redacted in
 #endif // !defined(_WIN32)
 }
 
+TEST_CASE("browser_inventory linux: a decorated / multi-address e-mail is redacted in the FULL "
+          "wire row -- round-2 blocker",
+          "[browser_inventory][linux][privacy]") {
+#if defined(_WIN32)
+    SKIP("browser_inventory_linux_parsers.hpp's O_NOFOLLOW walk shell is POSIX-only (run-context.md "
+        "X2) -- not compiled on Windows");
+#else
+    using namespace yuzu::browser_inventory::lnx;
+    // Round-2 adversarial finding (2026-09-23): the sibling wire-row test
+    // above only carries a bare e-mail shape; this closes the decorated/
+    // multi-address gap through the real Linux leg end to end (walk + read
+    // + parse + safe_output_field).
+    yuzu::test::TempDir dir{"yuzu_test_browser_inventory_wire_email2_"};
+    const auto browser_dir = dir.path / "home" / "alice" / ".config" / "google-chrome";
+    std::filesystem::create_directories(browser_dir);
+    {
+        std::ofstream f(browser_dir / "Local State", std::ios::binary);
+        f << R"json({"profile":{"info_cache":{)json"
+             R"json("Alice <alice@example.com>":{"name":"alice@example.com (Work)"},)json"
+             R"json("Profile 2":{"name":"x alice@example.com,bob@example.org"}}}})json";
+    }
+
+    std::optional<std::string> token;
+    const auto rows = linux_profile_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0] == "profile|alice|chrome|[redacted-email]|[redacted-email]");
+    CHECK(rows[1] == "profile|alice|chrome|Profile 2|[redacted-email]");
+    for (const auto& row : rows) {
+        CHECK(row.find('@') == std::string::npos);
+        CHECK(row.find('<') == std::string::npos);
+    }
+#endif // !defined(_WIN32)
+}
+
 TEST_CASE("browser_inventory linux: an absent root is supported with zero rows, not a failure",
           "[browser_inventory][linux][walk]") {
 #if defined(_WIN32)

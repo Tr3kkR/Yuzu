@@ -17,12 +17,16 @@
  * enforced by VALUE, not by absence: `profile_dir` and `display_name` ARE
  * free-text fields Chromium populates from the account (a signed-in Edge
  * profile in particular is often keyed by its account e-mail), so
- * `looks_like_email_address` below redacts either field to
- * `kRedactedEmailPlaceholder` before it ever reaches BrowserProfileRow
- * (adversarial-review finding, 2026-09-22 -- the original structural-only
- * claim was incomplete). See test_browser_inventory_parsers.cpp for a
- * fixture that carries those keys, and an e-mail-shaped profile_dir/
- * display_name, and asserts none of them reach a row unredacted.
+ * `looks_like_email_address` below redacts either field WHOLE to
+ * `kRedactedEmailPlaceholder` when it CONTAINS an e-mail-shaped substring
+ * before it ever reaches BrowserProfileRow (adversarial-review findings
+ * 2026-09-22/2026-09-23 -- the original structural-only claim was
+ * incomplete, and the first by-value fix under-matched every decorated
+ * form: "Alice <alice@example.com>", "alice@example.com (Work)", an
+ * embedded address, or several addresses in one field). See
+ * test_browser_inventory_parsers.cpp for a fixture that carries those
+ * keys, and an e-mail-shaped profile_dir/display_name, and asserts none of
+ * them reach a row unredacted.
  * TWO EXCEPTIONS (decided 2026-09-22, not part of this contract): (1) the
  * Linux leg's wire-row builder (browser_inventory_linux_parsers.hpp)
  * prepends the LOCAL OS/home-directory username to disambiguate profiles
@@ -50,6 +54,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -88,27 +93,64 @@ struct BrowserProfileRow {
 /// unconditionally, so this is a filter, not a documented exception.
 inline constexpr std::string_view kRedactedEmailPlaceholder = "[redacted-email]";
 
-/// True when `value` has the shape of an e-mail address. Deliberately a
-/// coarse heuristic, never full RFC 5322 validation: exactly one '@', at
-/// least one character on each side of it, and the domain side contains a
-/// '.' with a non-empty label on each side of THAT, with no whitespace
-/// anywhere. A privacy filter's safe failure direction is over-matching
-/// (redacting a value that merely looks like an address), never
-/// under-matching -- this checks the shape adversarial review actually
-/// reproduced ("account@example.com"), not a value merely containing '@'.
+/// True when `value` CONTAINS an e-mail-shaped substring anywhere -- bare
+/// (`account@example.com`), decorated (`Alice <alice@example.com>`,
+/// `alice@example.com (Work)`), embedded (`x alice@example.com`) or
+/// several (`a@x.org,b@y.org`); coarse by design, over-match is the safe
+/// direction; round-2 adversarial finding 2026-09-23: the earlier
+/// whole-value test under-matched every decorated form. For every '@' in
+/// `value`, it requires a non-empty local-part character immediately
+/// before it and a dotted domain (label '.' label, non-empty either side)
+/// immediately after it; any hit redacts the whole field.
 [[nodiscard]] inline bool looks_like_email_address(std::string_view value) {
-    if (value.find(' ') != std::string_view::npos || value.find('\t') != std::string_view::npos)
-        return false;
-    const auto at = value.find('@');
-    if (at == std::string_view::npos || at == 0 || at == value.size() - 1)
-        return false;
-    if (value.find('@', at + 1) != std::string_view::npos)
-        return false; // a second '@' isn't a bare local@domain shape
-    const auto domain = value.substr(at + 1);
-    const auto dot = domain.find('.');
-    if (dot == std::string_view::npos || dot == 0 || dot == domain.size() - 1)
-        return false;
-    return true;
+    auto is_local_part_char = [](char c) {
+        switch (c) {
+        case ' ':
+        case '\t':
+        case '\n':
+        case '\r':
+        case '\f':
+        case '\v':
+        case '@':
+        case '<':
+        case '>':
+        case '(':
+        case ')':
+        case ',':
+        case ';':
+        case ':':
+        case '"':
+        case '[':
+        case ']':
+            return false;
+        default:
+            return true;
+        }
+    };
+    auto is_domain_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '-' || c == '.' || c == '_';
+    };
+
+    for (auto at = value.find('@'); at != std::string_view::npos; at = value.find('@', at + 1)) {
+        if (at == 0 || !is_local_part_char(value[at - 1])) {
+            continue;
+        }
+        std::size_t end = at + 1;
+        while (end < value.size() && is_domain_char(value[end])) {
+            ++end;
+        }
+        const auto domain = value.substr(at + 1, end - at - 1);
+        for (std::size_t p = 0; p < domain.size(); ++p) {
+            if (domain[p] != '.') {
+                continue;
+            }
+            if (p > 0 && p < domain.size() - 1 && domain[p - 1] != '.' && domain[p + 1] != '.') {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 namespace detail {

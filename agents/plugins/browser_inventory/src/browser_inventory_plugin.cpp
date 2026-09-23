@@ -22,18 +22,26 @@
  *
  * PRIVACY CONTRACT (binding for every leg, every OS): never emit gaia_id,
  * e-mail addresses, Chromium info_cache user_name/gaia_name, browsing
- * history, cookies or bookmarks in any row. Enforced structurally in
+ * history, cookies or bookmarks in any row. The dedicated-identifier half
+ * (gaia_id/user_name/gaia_name) is enforced structurally in
  * browser_inventory_parsers.hpp -- BrowserProfileRow simply has no such
- * fields. TWO EXCEPTIONS (decided 2026-09-22): (1) the Linux leg's
- * wire-row builder (browser_inventory_linux_parsers.hpp) prepends the
+ * fields. The e-mail-address half is enforced BY VALUE, not by absence:
+ * `profile_dir` and `display_name` are free-text fields Chromium populates
+ * from the account, so `profiles_from_local_state` redacts either field
+ * WHOLE to `[redacted-email]` when it CONTAINS an e-mail-shaped substring
+ * (`looks_like_email_address`/`kRedactedEmailPlaceholder`, adversarial-
+ * review findings 2026-09-22/2026-09-23) before it ever reaches
+ * BrowserProfileRow. TWO EXCEPTIONS (decided 2026-09-22): (1) the Linux
+ * leg's wire-row builder (browser_inventory_linux_parsers.hpp) prepends the
  * LOCAL OS/home-directory username to disambiguate profiles across users
  * sharing a machine -- machine-local, not a browsing-account identifier,
- * and never a BrowserProfileRow field. (2) BrowserProfileRow.display_name
- * (sourced from info_cache[dir].name) CAN legitimately carry the
- * signed-in account's real name -- Chromium-family browsers commonly
- * auto-populate it that way; emitted as-is, an accepted residual risk, not
- * filtered. No file inside a profile directory is opened by any leg in
- * this release; the per-profile `extensions` action follows as its own PR.
+ * and never a BrowserProfileRow field. (2) a NON-e-mail personal name in
+ * BrowserProfileRow.display_name (sourced from info_cache[dir].name) is
+ * emitted as-is -- Chromium-family browsers commonly auto-populate it from
+ * the signed-in account's real name; this is an accepted residual risk,
+ * not something this filter removes. No file inside a profile directory is
+ * opened by any leg in this release; the per-profile `extensions` action
+ * follows as its own PR.
  *
  * WAVE 1 (this package, P2a-1): plugin scaffold + descriptor (2 actions x
  * 3 OS legs, all declared unconditionally per the capability-matrix
@@ -43,7 +51,7 @@
  * descriptor's PLANNED mechanism strings below). No CFPropertyList copy,
  * no subprocess, no Firefox/Safari code in this package.
  * WAVE 2 (P2a-2) replaces the Linux leg's stub body with the real
- * ~/.config/{google-chrome,microsoft-edge} walk.
+ * ~/.config/{google-chrome,chromium,microsoft-edge} walk.
  * WAVE 3 (P2a-3) wires registration/README/YAML/server kill-switch seed.
  *
  * This TU is portable except for its single dispatch #if, which selects

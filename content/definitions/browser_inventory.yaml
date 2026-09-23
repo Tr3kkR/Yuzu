@@ -174,18 +174,19 @@ spec:
         description: >
           status row: the constraint reason, "-" when supported. profile
           row: the profile directory name (the Local State info_cache
-          key), e.g. "Default", "Profile 1" — redacted to
-          "[redacted-email]" when the raw value has the shape of an
-          e-mail address (some Chromium builds key a signed-in profile by
+          key), e.g. "Default", "Profile 1" — redacted whole to
+          "[redacted-email]" when the raw value contains an e-mail-shaped
+          substring (bare, decorated or several addresses, not only a
+          bare address — some Chromium builds key a signed-in profile by
           its account e-mail).
         example: "Default"
       - name: field_4
         type: string
         description: >
           status row: empty. profile row: the profile's user-editable
-          display name — redacted to "[redacted-email]" under the same
-          e-mail-shape rule as field_3, otherwise emitted as-is (may
-          legitimately be a personal name).
+          display name — redacted whole to "[redacted-email]" under the
+          same rule as field_3, otherwise emitted as-is (may legitimately
+          be a personal name).
         example: "Work"
     aggregation:
       groupBy:
