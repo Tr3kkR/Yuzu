@@ -11,16 +11,18 @@
  *
  * Coverage note (disclosed, not silent — mirrors the DEX signals seam's own
  * partial-coverage precedent): `apps`/`app_fleet_trend`/`app_version_devices`/
- * `device_app_perf_json`/`fleet_snapshot` are parity-tested against seeded B1/B2
- * data. `group_trend`/`tag_trend` are covered for the null-reader/null-store
- * degrade only in this slice (full ManagementGroupStore/TagStore seeding is
- * exercised indirectly by `AppPerfGroupReader`'s own test suite, which this
- * seam calls unchanged). The REST/MCP consumer rewire is NOT deferred — it
- * landed in the same change as this seam (see `dex_perf_api.hpp`'s "Consumer
- * rewire status" note) — only the dashboard fragments remain unrewired
- * (tracked #4626); this file's own scope is the seam's parity contract, not
- * end-to-end REST/MCP coverage (that's `test_rest_dex_app_perf_devices.cpp`/
- * `test_mcp_server.cpp`, which already exercise the rewired handlers).
+ * `device_app_perf_json`/`device_app_summaries`/`fleet_snapshot` are
+ * parity-tested against seeded B1/B2 data. `group_trend`/`tag_trend` are
+ * covered for the null-reader/null-store degrade only in this slice (full
+ * ManagementGroupStore/TagStore seeding is exercised indirectly by
+ * `AppPerfGroupReader`'s own test suite, which this seam calls unchanged).
+ * The REST/MCP consumer rewire landed in the same change as this seam (see
+ * `dex_perf_api.hpp`'s "Consumer rewire status" note); the dashboard
+ * fragments were rewired in a follow-up (#4626, GAP-2 added
+ * `device_app_summaries` for the dashboard's per-device drill). This file's
+ * own scope is the seam's parity contract, not end-to-end REST/MCP/dashboard
+ * coverage (that's `test_rest_dex_app_perf_devices.cpp` / `test_mcp_server.cpp`
+ * / `test_dex_routes.cpp`, which exercise the rewired handlers).
  */
 
 #include "dex_perf_api_local.hpp"
