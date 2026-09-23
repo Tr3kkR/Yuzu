@@ -1542,7 +1542,9 @@ void GuardianEngine::set_event_sink(EventSink sink) {
     event_sink_ = std::move(sink);
 }
 
-void GuardianEngine::emit_guard_event(const GuardDrift& d, bool is_gap_repair) {
+void GuardianEngine::emit_guard_event(
+    const GuardDrift& d, bool is_gap_repair,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override) {
     // Snapshot the sink under sink_mtx_, then release BEFORE handing off to
     // legacy_sink_executor_ (#4783) — never hold the lock any longer than needed,
     // and never take mtx_ here (a guard worker can fire while apply_rules/stop hold
@@ -1609,7 +1611,18 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d, bool is_gap_repair) {
         // stay stamped here (idempotency- and host-specific).
         apply_drift_to_event(d, ev);
     }
-    ev.mutable_timestamp()->set_seconds(now_ms / 1000);
+    // #4783 follow-up review, part (c): the wire `timestamp` field is stamped
+    // from `timestamp_override` when the caller supplied one (ONLY
+    // legacy_sink_kick(), with the gap's `last_lost` — see this function's own
+    // doc comment in guardian_engine.hpp) rather than from `now_ms` above -
+    // `event_id` keeps using `now_ms` regardless, so this touches ONLY the
+    // event's timestamp, not its identity.
+    const auto timestamp_secs = timestamp_override.has_value()
+                                    ? std::chrono::duration_cast<std::chrono::seconds>(
+                                          timestamp_override->time_since_epoch())
+                                          .count()
+                                    : now_ms / 1000;
+    ev.mutable_timestamp()->set_seconds(timestamp_secs);
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
 #if defined(_WIN32)
@@ -1645,7 +1658,7 @@ void GuardianEngine::legacy_sink_kick() noexcept {
         const auto gaps =
             legacy_sink_executor_->gapped_rules_needing_repair(kMaxGapRepairsPerKick);
         for (const auto& [rule_id, gap] : gaps) {
-            if (gap.repair_in_flight)
+            if (gap.repair_seq != 0)
                 continue;
             GuardDrift d;
             d.guard_type = gap.guard_type;
@@ -1653,7 +1666,10 @@ void GuardianEngine::legacy_sink_kick() noexcept {
             d.rule_name = gap.rule_name;
             d.health = GuardDrift::Health::Unhealthy;
             d.health_detail = kLegacySinkDeliveryGapDetail;
-            emit_guard_event(d, /*is_gap_repair=*/true);
+            // #4783 follow-up review, part (c): stamp the repair with the gap's
+            // OWN last_lost, not this kick's wall-clock now — see
+            // emit_guard_event()'s doc comment in guardian_engine.hpp for why.
+            emit_guard_event(d, /*is_gap_repair=*/true, gap.last_lost);
         }
     } catch (...) {
         // Firewalled: runs on the bare heartbeat thread (agent.cpp) - same posture

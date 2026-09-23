@@ -640,7 +640,7 @@ TEST_CASE("ticket rollback on a refused launch has no self-deadlock",
 }
 
 TEST_CASE("gap repair lifecycle: recorded, listed, Sent clears it, anything else "
-          "leaves the gap but clears repair_in_flight",
+          "leaves the gap but resets repair_seq to 0",
           "[guardian][legacy_sink]") {
     GuardianLegacySinkExecutor exec;
 
@@ -654,10 +654,10 @@ TEST_CASE("gap repair lifecycle: recorded, listed, Sent clears it, anything else
     auto gaps = exec.gapped_rules_needing_repair(10);
     REQUIRE(gaps.size() == 1);
     CHECK(gaps[0].first == "A");
-    CHECK_FALSE(gaps[0].second.repair_in_flight);
+    CHECK(gaps[0].second.repair_seq == 0);
 
-    // A repair that fails (WriteFailed again) leaves the gap but clears
-    // repair_in_flight so the NEXT kick can retry.
+    // A repair that fails (WriteFailed again) leaves the gap but resets
+    // repair_seq to 0 so the NEXT kick can retry.
     CHECK(exec.offer(make_event("A", "guard.unhealthy"),
                      [](const Event&) { return LegacySendOutcome::WriteFailed; },
                      /*is_gap_repair=*/true) == OfferOutcome::Queued);
@@ -665,7 +665,7 @@ TEST_CASE("gap repair lifecycle: recorded, listed, Sent clears it, anything else
     REQUIRE(exec.wait_workers_retired_for_test(5s));
     gaps = exec.gapped_rules_needing_repair(10);
     REQUIRE(gaps.size() == 1);
-    CHECK_FALSE(gaps[0].second.repair_in_flight);
+    CHECK(gaps[0].second.repair_seq == 0);
     CHECK(gaps[0].second.lost == 2);
 
     // A repair that succeeds (Sent) clears the gap entirely.
@@ -675,6 +675,199 @@ TEST_CASE("gap repair lifecycle: recorded, listed, Sent clears it, anything else
     REQUIRE(spin_until([&] { return exec.stats().gap_rules == 0; }));
     REQUIRE(exec.wait_workers_retired_for_test(5s));
     CHECK(exec.gapped_rules_needing_repair(10).empty());
+}
+
+// ── #4783 follow-up review: seq-guarded clearing + dequeue-time supersession ─
+//
+// These four cases prove the fix's parts (a) (seq-guarded clearing) and (b)
+// (dequeue-time supersession) at the executor level, independently of one
+// another - see this file's own header comment and the class doc comment in
+// guardian_legacy_sink_executor.hpp for the full design. Test 1 and test 4
+// would each fail under the REJECTED "clear on any Sent" naive fix (part (a)
+// alone, without the seq guard); test 3 would fail if supersession were only
+// checked at kick/fire time instead of at dequeue (part (b)).
+
+TEST_CASE("#4783 gap: an in-flight OLDER send completing Sent does not clear a "
+          "NEWER loss recorded for the same rule while it was still in flight",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor::Config cfg;
+    cfg.max_events = 1;
+    GuardianLegacySinkExecutor exec{cfg};
+    StallingSend blocking;
+    ScopeExit cleanup{[&] {
+        blocking.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+
+    // A1: dequeued into flight almost immediately - the queue is empty again by
+    // the time A2 is offered.
+    CHECK(exec.offer(make_event("A", "drift.detected"), std::ref(blocking)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return blocking.invocations.load() >= 1; }));
+
+    // A2: admitted into the now-empty (max_events=1) queue - a filler that
+    // drains normally once A1 completes.
+    RecordingSend filler;
+    CHECK(exec.offer(make_event("A", "drift.detected"), std::ref(filler)) ==
+         OfferOutcome::Queued);
+
+    // A3: the queue already holds A2 -> refused capacity, opening a gap whose
+    // lost_seq is A3's own (newest) admission-time seq.
+    auto refused = exec.offer(make_event("A", "drift.detected"),
+                              [](const Event&) { return LegacySendOutcome::Sent; });
+    CHECK(refused == OfferOutcome::RefusedCapacity);
+
+    auto gaps_before = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_before.size() == 1);
+    const auto lost_seq_before = gaps_before[0].second.lost_seq;
+
+    // Release A1 - both A1's and A2's Sent completions carry a STRICTLY OLDER
+    // seq than A3's refusal, so NEITHER may clear the gap A3 opened. Under the
+    // rejected "clear on any Sent" fix, A1 alone (let alone A2) would have
+    // erased it here.
+    blocking.release();
+    REQUIRE(spin_until([&] { return filler.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    auto gaps_after = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_after.size() == 1);
+    CHECK(gaps_after[0].second.lost_seq == lost_seq_before);
+    CHECK(gaps_after[0].second.lost == 1); // still just the one recorded loss (A3)
+}
+
+TEST_CASE("#4783 gap: a fresh real Sent that postdates the loss clears the gap, "
+          "and a subsequent kick() does not resurrect it",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+
+    // Open a gap for A via a WriteFailed send.
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // A fresh, ORDINARY (non-repair) event for A that succeeds - its
+    // admission-time seq is strictly newer than the loss that opened the gap.
+    RecordingSend send;
+    CHECK(exec.offer(make_event("A", "drift.detected"), std::ref(send)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    CHECK(exec.gapped_rules_needing_repair(10).empty());
+    CHECK(exec.stats().gap_rules == 0);
+
+    // kick() must not resurrect a gap a real delivery already closed - it only
+    // relaunches a stranded worker / observes a stall, never rebuilds gaps.
+    exec.kick();
+    CHECK(exec.gapped_rules_needing_repair(10).empty());
+    CHECK(exec.stats().gap_rules == 0);
+}
+
+TEST_CASE("#4783 gap: a queued repair superseded by a newer real Sent before "
+          "reaching the front is suppressed at dequeue, never sent",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+
+    // Open a gap for A.
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // A fresh REAL event for A that will block - dequeued into flight
+    // immediately (the queue is otherwise empty).
+    StallingSend real_send;
+    ScopeExit cleanup{[&] {
+        real_send.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+    CHECK(exec.offer(make_event("A", "drift.detected"), std::ref(real_send)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return real_send.invocations.load() >= 1; }));
+
+    // Queue a repair for A behind the in-flight real event - its repair_seq is
+    // stamped as the (currently) live one.
+    RecordingSend repair_send;
+    CHECK(exec.offer(make_event("A", "guard.unhealthy"), std::ref(repair_send),
+                     /*is_gap_repair=*/true) == OfferOutcome::Queued);
+    auto gaps_mid = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_mid.size() == 1);
+    CHECK(gaps_mid[0].second.repair_seq != 0);
+
+    // Release the real event - it completes Sent with a NEWER seq than the
+    // gap's lost_seq, clearing the gap per the previous test's mechanism.
+    real_send.release();
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 0; }));
+
+    // The queued repair now reaches the front of the FIFO - the gap it was
+    // meant to repair is already gone, so it must be suppressed at dequeue,
+    // never actually sent. A kick/fire-time-only check could not have caught
+    // this: the repair was already queued (and thus already past any
+    // kick-time check) before the real event's Sent cleared the gap.
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+    CHECK(repair_send.count() == 0);
+    CHECK(exec.stats().repairs_suppressed == 1);
+}
+
+TEST_CASE("#4783 gap: a repair's own Sent does not clear a loss NEWER than the "
+          "repair, and resets repair_seq so the next kick requeues a fresh one",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor::Config cfg;
+    cfg.max_events = 1;
+    GuardianLegacySinkExecutor exec{cfg};
+
+    // Open a gap for A via an ordinary WriteFailed send.
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // Queue a repair R for A - dequeued into flight immediately (queue empty).
+    StallingSend blocking_repair;
+    ScopeExit cleanup{[&] {
+        blocking_repair.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+    CHECK(exec.offer(make_event("A", "guard.unhealthy"), std::ref(blocking_repair),
+                     /*is_gap_repair=*/true) == OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return blocking_repair.invocations.load() >= 1; }));
+
+    auto gaps_mid = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_mid.size() == 1);
+    REQUIRE(gaps_mid[0].second.repair_seq != 0);
+    const auto repair_seq = gaps_mid[0].second.repair_seq;
+
+    // A filler for A, admitted into the now-empty (max_events=1) queue.
+    RecordingSend filler;
+    CHECK(exec.offer(make_event("A", "drift.detected"), std::ref(filler)) ==
+         OfferOutcome::Queued);
+
+    // A fresh real offer for A - the queue is already full (filler) -> refused,
+    // bumping lost_seq past R's own seq.
+    auto refused = exec.offer(make_event("A", "drift.detected"),
+                              [](const Event&) { return LegacySendOutcome::Sent; });
+    CHECK(refused == OfferOutcome::RefusedCapacity);
+
+    auto gaps_before_release = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_before_release.size() == 1);
+    CHECK(gaps_before_release[0].second.lost_seq > repair_seq);
+
+    // Release R - its Sent carries an OLDER seq than the newest loss, so it
+    // must NOT clear the gap; the repair itself completed, so repair_seq
+    // resets to 0 so the next kick requeues a fresh repair covering the newer
+    // loss. Under the rejected "clear on any Sent" fix, this Sent would have
+    // erased the gap and silently lost the newer loss's evidence.
+    blocking_repair.release();
+    REQUIRE(spin_until([&] { return filler.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    auto gaps_after = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps_after.size() == 1);
+    CHECK(gaps_after[0].second.repair_seq == 0);
 }
 
 TEST_CASE("wait_idle_for_test can read true while a retiring worker is still "

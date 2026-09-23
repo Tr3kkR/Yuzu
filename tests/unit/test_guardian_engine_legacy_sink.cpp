@@ -686,6 +686,176 @@ TEST_CASE("legacy_sink_kick(): the gap-repair path runs and repairs a gap with "
     CHECK(f.engine->active_io_workers() == 0);
 }
 
+// ── #4783 follow-up review: seq-guarded clearing + last_lost stamping ───────
+//
+// End-to-end proof of the reported regression and its fix: a stale synthetic
+// gap-repair must never overwrite an already-delivered, newer real verdict.
+// See guardian_legacy_sink_executor.hpp's class doc comment (SEQ-GUARDED
+// CLEARING / DEQUEUE-TIME SUPERSESSION) and emit_guard_event()'s doc comment
+// in guardian_engine.hpp (part (c), the last_lost timestamp override) for the
+// full design this pair of cases exercises at the GuardianEngine level.
+
+TEST_CASE("#4783 gap: a repair never overwrites a real recovery - a real verdict "
+          "delivered after a loss clears the gap, and legacy_sink_kick() then "
+          "offers no repair for that rule",
+          "[guardian][engine][legacy_sink][chaos]") {
+    BlockingSink blocking;
+    // max_events=1: forces the third offer below to be RefusedCapacity once the
+    // queue already holds one item, exactly as in the capacity-refusal case
+    // above.
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/1};
+    yuzu::test::ScopeExit cleanup([&] {
+        require_legacy_sink_retired(*f.engine, blocking,
+                                    "#4783 gap: repair never overwrites recovery cleanup");
+    });
+
+    f.engine->set_event_sink(blocking.sink());
+
+    auto drift_for = [](const std::string& rule_id) {
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = rule_id;
+        d.rule_name = rule_id;
+        return d;
+    };
+
+    // #1: dequeued almost immediately - its SEND is what parks inside
+    // `blocking`.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-1"));
+    REQUIRE(
+        yuzu::test::spin_until([&] { return blocking.entered() >= 1; }, std::chrono::seconds{30}));
+
+    // #2: admitted - occupies the sole max_events=1 slot.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-2"));
+    REQUIRE(f.engine->legacy_sink_executor_for_test().pending_count_for_test() == 1);
+
+    // #3: refused - opens a sticky integrity gap for "gapped-rule".
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("gapped-rule"));
+    REQUIRE(f.engine->legacy_sink_gap_rules() == 1);
+
+    blocking.release();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    CHECK(blocking.delivered() == 2);
+
+    // A REAL guard.compliant verdict for "gapped-rule", delivered successfully
+    // over a plain (non-blocking, always-Sent) sink - strictly AFTER the loss
+    // that opened its gap, so its admission-time seq is strictly newer than the
+    // gap's lost_seq.
+    f.engine->set_event_sink(
+        [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+    yuzu::agent::GuardDrift compliant = drift_for("gapped-rule");
+    compliant.compliant = true;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, compliant);
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+
+    // The real recovery already closed the gap on its own - no repair was ever
+    // dispatched for it.
+    CHECK(f.engine->legacy_sink_gap_rules() == 0);
+
+    // Swap in a capturing sink: legacy_sink_kick() must offer NOTHING for
+    // "gapped-rule" - the gap it would have repaired is already gone, so it is
+    // not even a candidate in gapped_rules_needing_repair().
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+
+    f.engine->legacy_sink_kick(); // the method under test
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    {
+        std::lock_guard lk(cap_mu);
+        CHECK(captured.empty());
+    }
+
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    CHECK(f.engine->active_io_workers() == 0);
+}
+
+TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
+          "the gap's own last_lost, never the kick's own wall-clock now",
+          "[guardian][engine][legacy_sink][chaos]") {
+    BlockingSink blocking;
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/1};
+    yuzu::test::ScopeExit cleanup([&] {
+        require_legacy_sink_retired(*f.engine, blocking, "#4783 gap: repair timestamp cleanup");
+    });
+
+    f.engine->set_event_sink(blocking.sink());
+
+    auto drift_for = [](const std::string& rule_id) {
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = rule_id;
+        d.rule_name = rule_id;
+        return d;
+    };
+
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-1"));
+    REQUIRE(
+        yuzu::test::spin_until([&] { return blocking.entered() >= 1; }, std::chrono::seconds{30}));
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-2"));
+    REQUIRE(f.engine->legacy_sink_executor_for_test().pending_count_for_test() == 1);
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("gapped-rule"));
+    REQUIRE(f.engine->legacy_sink_gap_rules() == 1);
+
+    // The gap's last_lost, recorded at the moment the refusal above opened it -
+    // read BEFORE releasing/kicking, since a Sent repair would erase the gap
+    // record entirely (nothing left to read afterward).
+    auto gaps = f.engine->legacy_sink_executor_for_test().gapped_rules_needing_repair(10);
+    REQUIRE(gaps.size() == 1);
+    const auto last_lost_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                    gaps[0].second.last_lost.time_since_epoch())
+                                    .count();
+
+    blocking.release();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+
+    // Timestamps here are second-granular (GuaranteedStateEvent.timestamp is a
+    // google.protobuf.Timestamp with only `seconds` ever set - see
+    // emit_guard_event()). Without letting real wall-clock time move into a
+    // LATER second than last_lost, a kick() firing immediately after the loss
+    // would stamp the same second whether it used `now` or `last_lost`, and the
+    // assertion below would not actually discriminate between the fix and the
+    // pre-fix `now`-stamping behaviour.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    const auto now_at_kick_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+    REQUIRE(now_at_kick_secs > last_lost_secs);
+
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+
+    f.engine->legacy_sink_kick(); // the method under test
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    {
+        std::lock_guard lk(cap_mu);
+        REQUIRE(captured.size() == 1);
+        CHECK(captured[0].rule_id() == "gapped-rule");
+        CHECK(captured[0].event_type() == "guard.unhealthy");
+        // Stamped from the gap's last_lost - NOT the kick's own wall-clock now,
+        // which by construction (the sleep above) is in a strictly LATER second.
+        CHECK(captured[0].timestamp().seconds() == last_lost_secs);
+        CHECK(captured[0].timestamp().seconds() < now_at_kick_secs);
+    }
+
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    CHECK(f.engine->active_io_workers() == 0);
+}
+
 #ifdef _WIN32
 
 // ── CH-1(a) Windows: detection resumes once the block releases ──────────────

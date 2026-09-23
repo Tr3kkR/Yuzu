@@ -188,14 +188,27 @@ public:
     /// kick() relaunches a stranded worker and observes a quiet-queue stall, using
     /// only the executor's own internal lock; (2) gap repair — for up to
     /// kMaxGapRepairsPerKick sticky integrity gaps (gapped_rules_needing_repair())
-    /// not already mid-repair, synthesizes a guard.unhealthy report
-    /// (kLegacySinkDeliveryGapDetail, a fixed short constant) via
-    /// emit_guard_event(..., is_gap_repair=true) — which itself takes only
-    /// sink_mtx_, then the executor's own lock, exactly like a real guard's own
-    /// emission. The server's census goes fail-closed (errored) for a gapped rule
-    /// until either the repair is confirmed delivered or the rule's next real
-    /// verdict clears it (same-or-newer timestamp `>=` ordering — D11's "first
-    /// verdict clears" semantics, docs/spark-legacy-delta-registry.md). noexcept:
+    /// not already mid-repair (GapRecord::repair_seq != 0), synthesizes a
+    /// guard.unhealthy report (kLegacySinkDeliveryGapDetail, a fixed short
+    /// constant) via emit_guard_event(..., is_gap_repair=true, gap.last_lost) —
+    /// which itself takes only sink_mtx_, then the executor's own lock, exactly
+    /// like a real guard's own emission, EXCEPT this call also passes the gap's
+    /// `last_lost` as the event's timestamp override (#4783 follow-up review,
+    /// part (c) — never the kick's own wall-clock `now`; a real verdict delivered
+    /// between two losses is legitimately older than the SECOND loss and should
+    /// still be overwritten by a repair covering that second loss, which stamping
+    /// with `now` instead of `last_lost` would otherwise let a stale repair do to
+    /// a NEWER, already-delivered real verdict, via the server's own
+    /// `updated_at >=` upsert guard — belt-and-braces alongside the executor's own
+    /// seq-guarded clearing and dequeue-time supersession check, see
+    /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
+    /// census goes fail-closed (errored) for a gapped rule until either the
+    /// repair is confirmed delivered or the rule's next real verdict clears it
+    /// (same-or-newer timestamp `>=` ordering — D11's "first verdict clears"
+    /// semantics, docs/spark-legacy-delta-registry.md); locally, the executor's
+    /// own gap ledger can ALSO be cleared by that same next real verdict, before
+    /// any repair for it is ever dispatched — see
+    /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:
     /// runs on the bare heartbeat thread (agent.cpp), same posture as
     /// journal_maintenance_tick()'s own firewalling.
     void legacy_sink_kick() noexcept;
@@ -298,8 +311,12 @@ public:
     /// the one production code (agent.cpp's heartbeat) actually calls.
     [[nodiscard]] std::uint64_t legacy_sink_events_lost() const;
 
-    /// #4783 commit 4: CURRENT count of rules with an open sticky integrity gap
-    /// (shrinks back to 0 once each gap's repair report is confirmed Sent — see
+    /// #4783 commit 4: CURRENT count of rules with an open sticky integrity gap -
+    /// a rule's gap shrinks back to 0 as soon as EITHER its repair report is
+    /// confirmed Sent (and not itself since superseded), OR the rule's own next
+    /// real verdict is delivered with a strictly-newer admission-time seq than
+    /// the loss it covers, whichever happens first (#4783 follow-up: SEQ-GUARDED
+    /// CLEARING — see guardian_legacy_sink_executor.hpp's class doc comment and
     /// legacy_sink_kick() above). Surfaced as `yuzu.guardian_legacy_sink_gap_rules`
     /// (sparse). Production accessor, same rationale as legacy_sink_events_lost()
     /// above.
@@ -792,10 +809,26 @@ private:
     /// parameter of the same name — set ONLY by legacy_sink_kick() when building a
     /// synthesized guard.unhealthy report for a sticky integrity gap; every real
     /// guard callsite (and the guardian_emit_drift_for_test friend helper) uses the
-    /// default. This flag is what lets the executor mark repair_in_flight / clear
-    /// the gap on Sent without the executor having to reconstruct "is this drift
-    /// report actually a repair" from the event's own content.
-    void emit_guard_event(const GuardDrift& drift, bool is_gap_repair = false);
+    /// default. This flag is what lets the executor stamp GapRecord::repair_seq /
+    /// clear the gap on a strictly-newer Sent without the executor having to
+    /// reconstruct "is this drift report actually a repair" from the event's own
+    /// content (see guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING).
+    ///
+    /// `timestamp_override` (#4783 follow-up review, part (c)): when present,
+    /// stamps the built event's `timestamp` field from THIS time point instead of
+    /// `std::chrono::system_clock::now()` — `event_id` still mints from `now_ms`
+    /// regardless, only the wire `timestamp` field changes. ONLY
+    /// legacy_sink_kick() ever passes this, with the gap's `last_lost` (never
+    /// `first_lost` — a real verdict delivered between two losses is legitimately
+    /// older than the SECOND loss and should still be overwritten by a repair
+    /// covering that second loss); every real guard callsite leaves it at
+    /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
+    /// executor's own seq-guarded clearing and dequeue-time supersession check —
+    /// it lets the server's existing `updated_at >=` upsert guard independently
+    /// reject a stale repair, even if it somehow still reached the wire.
+    void emit_guard_event(const GuardDrift& drift, bool is_gap_repair = false,
+                          std::optional<std::chrono::system_clock::time_point>
+                              timestamp_override = std::nullopt);
 
     // Test seam: drift emission is otherwise reachable only through an armed
     // guard, and guards are Windows-only / no-op elsewhere — so the event_id
