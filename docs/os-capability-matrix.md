@@ -545,7 +545,7 @@ implementation is.
 | platform_security | secure_boot | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled) | - |
 | platform_security | code_integrity | linux | supported | 1 | securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) | - |
 | platform_security | code_integrity | macos | supported | 2 | spctl --status + csrutil status via run_bounded_subprocess | - |
-| platform_security | code_integrity | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values | - |
+| platform_security | code_integrity | windows | supported | 1 | HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy, Control\\DeviceGuard and Control\\Lsa\\LsaCfgFlags registry values | - |
 | power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
 | power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
 | power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging |

@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash fb2bb3055717
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 9cf003de2f97
 == action=secure_boot
 secure_boot|windows|UEFISecureBootEnabled|1|enabled
 [result_status] OK / FULL / 

@@ -39,7 +39,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `code_integrity` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values | ✅ supported · rung 2 · spctl --status + csrutil status via run_bounded_subprocess | ✅ supported · rung 1 · securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) |
+| `code_integrity` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy, Control\\DeviceGuard and Control\\Lsa\\LsaCfgFlags registry values | ✅ supported · rung 2 · spctl --status + csrutil status via run_bounded_subprocess | ✅ supported · rung 1 · securityfs reads of /sys/kernel/security/lsm and /sys/kernel/security/lockdown (errno-classified absent/unreadable) |
 | `secure_boot` | ✅ supported · rung 1 · HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State registry (UEFISecureBootEnabled) | ⛔ unsupported | ✅ supported · rung 1 · efivarfs reads of /sys/firmware/efi/efivars/SecureBoot-* and SetupMode-* (4-byte attributes + 1 data byte; errno-classified absent/unreadable) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -111,7 +111,7 @@ Pipe-delimited rows written via `write_output()`, in read order. The first field
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash fb2bb3055717
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash 9cf003de2f97
 
 ```
 == action=secure_boot
@@ -131,7 +131,7 @@ code_integrity|windows|lsa.LsaCfgFlags|-|absent
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash fb2bb3055717
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 9cf003de2f97
 
 ```
 == action=secure_boot
@@ -144,7 +144,7 @@ code_integrity|macos|sip|System Integrity Protection status: enabled.|enabled
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash fb2bb3055717
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 9cf003de2f97
 
 ```
 == action=secure_boot
