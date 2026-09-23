@@ -1543,9 +1543,11 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
         // field on a health report is ignored outright (guard.hpp's doc comment).
         // Shape pinned byte-for-byte to guardian_spark_send.cpp's Health/!healthy case
         // (#2237) so the two wire producers cannot drift apart; extracting a shared
-        // apply_health_to_event() helper is a named follow-up, not done here, because
+        // apply_health_to_event() helper is tracked as #4782, not done here, because
         // test_guardian_spark_send.cpp pins that serializer's exact literal output and
-        // a shared-helper refactor is out of scope for this fix.
+        // a shared-helper refactor was out of scope for this fix. No coupling test
+        // exists between the two copies today (dormant risk while prefer_spark_
+        // defaults false) — #4782 is exactly that gap.
         ev.set_guard_type(d.guard_type);
         ev.set_rule_name(d.rule_name);
         ev.set_event_type("guard.unhealthy");
