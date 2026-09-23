@@ -24,10 +24,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <span>
@@ -59,13 +61,17 @@ inline std::vector<std::string_view> split_lines(std::string_view text) {
 }
 
 /// Lines with trailing-backslash continuations joined (single space), each trimmed.
-inline std::vector<std::string> logical_lines(std::string_view text) {
+/// `cut_comment` runs on each PHYSICAL line BEFORE the continuation test, as sudo's
+/// lexer and libpam's _pam_assemble_line both do: a comment ending in `\` must not
+/// swallow the next line (a `# note \` above a NOPASSWD grant hid the grant).
+template <class CutComment>
+std::vector<std::string> logical_lines(std::string_view text, CutComment cut_comment) {
     std::vector<std::string> out;
     std::string cur;
     for (auto raw : split_lines(text)) {
-        raw = trim_ws(raw);
+        raw = trim_ws(cut_comment(trim_ws(raw)));
         const bool cont = !raw.empty() && raw.back() == '\\';
-        if (cont) raw.remove_suffix(1);
+        if (cont) raw = trim_ws(raw.substr(0, raw.size() - 1));
         if (!cur.empty()) cur += ' ';
         cur.append(raw);
         if (!cont) {
@@ -181,12 +187,14 @@ struct PamLine {
 };
 
 /// Skips comments, blanks and `@include`. A line that is not `type control module`
-/// is dropped (PAM itself would reject it) -- pam.d holds no other policy.
+/// is dropped (PAM itself would reject it) -- pam.d holds no other policy. A `#`
+/// anywhere starts a comment, as in libpam.
 inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
     std::vector<PamLine> out;
-    for (const auto& line : logical_lines(text)) {
+    const auto cut = [](std::string_view l) { return l.substr(0, l.find('#')); };
+    for (const auto& line : logical_lines(text, cut)) {
         std::string_view s = line;
-        if (s.empty() || s.front() == '#' || s.front() == '@') continue;
+        if (s.empty() || s.front() == '@') continue;
         const auto word = [&s]() {
             s = trim_ws(s);
             const auto e = s.find_first_of(" \t");
@@ -306,8 +314,12 @@ inline std::vector<std::string> split_unescaped_commas(std::string_view s) {
     return out;
 }
 
-/// Cuts a trailing `# comment` (preceded by whitespace, not `#<digits>` which is a uid).
+/// Cuts a `# comment` from one physical line: a whole-line comment (not `#<digits>`,
+/// a uid, nor `#include`/`#includedir`) or a trailing one preceded by whitespace.
 inline std::string_view cut_sudoers_comment(std::string_view s) {
+    if (!s.empty() && s.front() == '#' && !(s.size() > 1 && s[1] >= '0' && s[1] <= '9') &&
+        !s.starts_with("#include"))
+        return {};
     for (std::size_t i = 1; i < s.size(); ++i)
         if (s[i] == '#' && (s[i - 1] == ' ' || s[i - 1] == '\t') &&
             !(i + 1 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '9'))
@@ -341,64 +353,154 @@ inline std::size_t tag_prefix_len(std::string_view s) {
     return end;
 }
 
-/// `user host = (runas) TAG: cmd, cmd ...` -> one entry per contiguous (runas, NOPASSWD) run.
-inline bool parse_user_spec(std::string_view line, std::vector<SudoersEntry>& out) {
+/// Length of a leading sudoers(5) Option_Spec word (`CWD=/tmp`, `TIMEOUT=5m`,
+/// `ROLE=sysadm_r`, `NOTBEFORE=...`, `APPARMOR_PROFILE=...`): `[A-Z_]+=` plus the
+/// non-blank value; 0 when `s` does not start with one.
+inline std::size_t option_prefix_len(std::string_view s) {
+    const auto eq = s.find('=');
+    if (eq == std::string_view::npos || !is_tag_name(s.substr(0, eq))) return 0;
+    const auto end = s.find_first_of(" \t", eq);
+    return end == std::string_view::npos ? s.size() : end;
+}
+
+/// True when `s` still carries an unescaped `NOPASSWD:` / `PASSWD:` tag (blanks
+/// allowed before the colon). A decoded tag is removed from the row's text, so
+/// one found here was NOT decoded into the `nopasswd` column.
+inline bool has_passwd_tag(std::string_view s) {
+    for (std::size_t at = 0; (at = s.find("PASSWD", at)) != std::string_view::npos; ++at) {
+        const std::size_t b = at >= 2 && s.substr(at - 2, 2) == "NO" ? at - 2 : at;
+        if (b > 0 && (std::isalnum(static_cast<unsigned char>(s[b - 1])) || s[b - 1] == '_'))
+            continue;
+        std::size_t e = at + 6;
+        while (e < s.size() && (s[e] == ' ' || s[e] == '\t')) ++e;
+        if (e < s.size() && s[e] == ':') return true;
+    }
+    return false;
+}
+
+/// sudoers(5) Tag_Spec names and Digest_Spec types: a `:` after one of these is
+/// part of the Cmnd_Spec, never a Host_List clause separator.
+inline constexpr std::string_view kColonWords[] = {
+    "EXEC", "NOEXEC", "FOLLOW", "NOFOLLOW", "LOG_INPUT", "NOLOG_INPUT", "LOG_OUTPUT",
+    "NOLOG_OUTPUT", "MAIL", "NOMAIL", "INTERCEPT", "NOINTERCEPT", "PASSWD", "NOPASSWD",
+    "SETENV", "NOSETENV", "sha224", "sha256", "sha384", "sha512"};
+
+/// Splits a user spec's right-hand side into its `Host_List = Cmnd_Spec_List`
+/// clauses (sudoers(5): `User_List Host_List = Cmnd_Spec_List (: Host_List =
+/// Cmnd_Spec_List)*`). A `:` separates clauses only when it is unescaped, outside a
+/// Runas_Spec, not after a tag name or digest type, and followed by a non-empty
+/// host list and `=`. Returns {host, cmnd_spec_list} pairs; the first host is `host`.
+inline std::vector<std::pair<std::string, std::string>> split_host_clauses(std::string_view host,
+                                                                           std::string_view rhs) {
+    std::vector<std::pair<std::string, std::string>> out{{std::string{host}, {}}};
+    int depth = 0;
+    for (std::size_t i = 0; i < rhs.size(); ++i) {
+        if (rhs[i] == '\\' && i + 1 < rhs.size()) {
+            out.back().second.append(rhs.substr(i++, 2));
+            continue;
+        }
+        if (rhs[i] == '(') ++depth;
+        if (rhs[i] == ')' && depth > 0) --depth;
+        if (rhs[i] == ':' && depth == 0) {
+            std::size_t w_end = i;
+            while (w_end > 0 && (rhs[w_end - 1] == ' ' || rhs[w_end - 1] == '\t')) --w_end;
+            std::size_t w = w_end;
+            while (w > 0 && std::string_view{" \t,()"}.find(rhs[w - 1]) == std::string_view::npos) --w;
+            const auto word = rhs.substr(w, w_end - w);
+            std::size_t eq = i + 1;
+            while (eq < rhs.size() && rhs[eq] != '=' && rhs[eq] != '\\') ++eq;
+            const auto next_host = eq < rhs.size() && rhs[eq] == '='
+                                       ? trim_ws(rhs.substr(i + 1, eq - i - 1)) : std::string_view{};
+            if (std::find(std::begin(kColonWords), std::end(kColonWords), word) == std::end(kColonWords) &&
+                !next_host.empty() && next_host.find_first_of(":()") == std::string_view::npos) {
+                out.emplace_back(std::string{next_host}, std::string{});
+                i = eq;
+                continue;
+            }
+        }
+        out.back().second += rhs[i];
+    }
+    return out;
+}
+
+/// `user host = (runas) OPTION=v TAG: cmd, cmd ... [: host2 = ...]` -> one entry per
+/// contiguous (runas, NOPASSWD) run of each Host_List clause; nullopt when the line is
+/// not decodable as a user spec.
+///
+/// FAIL SAFE: nopasswd is the one field a reader filters on, so a NOPASSWD:/PASSWD:
+/// tag this function did not decode must never leave a `false` row under OK. If one
+/// survives into any field (a shape the scan does not model), the whole line is
+/// nullopt -- parse_sudoers then reports it `unmodelled`, and the collector adds the
+/// `<file>:undecoded_passwd_tag` token (CONSTRAINED).
+inline std::optional<std::vector<SudoersEntry>> parse_user_spec(std::string_view line) {
     const auto eq = line.find('=');
-    if (eq == std::string_view::npos) return false;
+    if (eq == std::string_view::npos) return std::nullopt;
     const auto left = trim_ws(line.substr(0, eq));
     const auto ws = left.find_last_of(" \t");
-    if (ws == std::string_view::npos) return false;
-    const std::string subject = std::string{trim_ws(left.substr(0, ws))} + "@" +
-                                std::string{trim_ws(left.substr(ws))};
-    std::string runas = "-", nopasswd = "false";
-    std::vector<std::string> run;
-    const auto flush = [&] {
-        if (run.empty()) return;
-        std::string cmds;
-        for (const auto& c : run) cmds += (cmds.empty() ? "" : ", ") + c;
-        out.push_back({"user_spec", subject, runas, nopasswd, std::move(cmds)});
-        run.clear();
-    };
-    for (auto item : split_unescaped_commas(line.substr(eq + 1))) {
-        std::string_view it = item;
-        std::string next_runas = runas, next_nopw = nopasswd;
-        if (!it.empty() && it.front() == '(') {
-            const auto close = it.find(')');
-            if (close == std::string_view::npos) return false;
-            next_runas = std::string{trim_ws(it.substr(1, close - 1))};
-            it = trim_ws(it.substr(close + 1));
-        }
-        // sudoers(5) lets a Tag_Spec carry its tags in ANY order, so the scan must not
-        // stop at the first tag it does not decode: `SETENV: NOPASSWD: /usr/bin/bar`
-        // grants passwordless root exactly as `NOPASSWD: SETENV: ...` does, and halting
-        // on SETENV: would report nopasswd `false` for it -- the one field of this row a
-        // reader most needs to be right, inverted, with status OK and no failure token.
-        // Only NOPASSWD:/PASSWD: are decoded into the typed column; every OTHER tag
-        // (SETENV: and NOEXEC: among them, both sudo privilege-escalation vectors) is
-        // carried into the stored command text verbatim -- the same "never dropped"
-        // treatment unmodelled_parameter gets elsewhere in this file -- so neither
-        // property is ever traded for the other.
-        std::string kept_tags;
-        for (;;) {
-            const std::size_t len = tag_prefix_len(it);
-            if (len == 0) break;
-            const auto name = trim_ws(it.substr(0, it.find(':')));
-            if (name == "NOPASSWD") next_nopw = "true";
-            else if (name == "PASSWD") next_nopw = "false";
-            else {
-                kept_tags.append(name); // normalised to `TAG: `, whatever spacing it had
-                kept_tags.append(": ");
+    if (ws == std::string_view::npos) return std::nullopt;
+    const std::string users{trim_ws(left.substr(0, ws))};
+    std::vector<SudoersEntry> out;
+    for (const auto& [host, list] : split_host_clauses(trim_ws(left.substr(ws)), line.substr(eq + 1))) {
+        // Runas and tags carry across one Cmnd_Spec_List, never into the next clause.
+        const std::string subject = users + "@" + host;
+        std::string runas = "-", nopasswd = "false";
+        std::vector<std::string> run;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            std::string cmds;
+            for (const auto& c : run) cmds += (cmds.empty() ? "" : ", ") + c;
+            out.push_back({"user_spec", subject, runas, nopasswd, std::move(cmds)});
+            run.clear();
+        };
+        for (auto item : split_unescaped_commas(list)) {
+            std::string_view it = item;
+            std::string next_runas = runas, next_nopw = nopasswd;
+            if (!it.empty() && it.front() == '(') {
+                const auto close = it.find(')');
+                if (close == std::string_view::npos) return std::nullopt;
+                next_runas = std::string{trim_ws(it.substr(1, close - 1))};
+                it = trim_ws(it.substr(close + 1));
             }
-            it = trim_ws(it.substr(len));
+            // sudoers(5) lets a Tag_Spec carry its tags in ANY order, so the scan must not
+            // stop at the first tag it does not decode: `SETENV: NOPASSWD: /usr/bin/bar`
+            // grants passwordless root exactly as `NOPASSWD: SETENV: ...` does. Option_Spec
+            // words (`CWD=/tmp`, `TIMEOUT=5m`, ...) precede the tags and are consumed the
+            // same way. Only NOPASSWD:/PASSWD: are decoded into the typed column; every
+            // OTHER tag (SETENV: and NOEXEC: among them, both sudo privilege-escalation
+            // vectors) and every option is carried into the stored command text verbatim
+            // -- the same "never dropped" treatment unmodelled_parameter gets elsewhere
+            // in this file -- so neither property is ever traded for the other.
+            std::string kept_tags;
+            for (;;) {
+                if (const std::size_t len = tag_prefix_len(it)) {
+                    const auto name = trim_ws(it.substr(0, it.find(':')));
+                    if (name == "NOPASSWD") next_nopw = "true";
+                    else if (name == "PASSWD") next_nopw = "false";
+                    else {
+                        kept_tags.append(name); // normalised to `TAG: `, whatever spacing it had
+                        kept_tags.append(": ");
+                    }
+                    it = trim_ws(it.substr(len));
+                } else if (const std::size_t opt = option_prefix_len(it)) {
+                    kept_tags.append(it.substr(0, opt));
+                    kept_tags += ' ';
+                    it = trim_ws(it.substr(opt));
+                } else {
+                    break;
+                }
+            }
+            if (it.empty()) return std::nullopt;
+            if (next_runas != runas || next_nopw != nopasswd) flush();
+            runas = std::move(next_runas);
+            nopasswd = std::move(next_nopw);
+            run.emplace_back(kept_tags + std::string{it});
         }
-        if (it.empty()) return false;
-        if (next_runas != runas || next_nopw != nopasswd) flush();
-        runas = std::move(next_runas);
-        nopasswd = std::move(next_nopw);
-        run.emplace_back(kept_tags + std::string{it});
+        flush();
     }
-    flush();
-    return true;
+    for (const auto& e : out)
+        if (has_passwd_tag(e.subject) || has_passwd_tag(e.runas) || has_passwd_tag(e.commands))
+            return std::nullopt;
+    return out;
 }
 
 } // namespace detail
@@ -406,14 +508,13 @@ inline bool parse_user_spec(std::string_view line, std::vector<SudoersEntry>& ou
 /// Parses one sudoers file. `#include`/`#includedir`/`@include*` are listed
 /// (kind include/includedir), never followed; any other line that is not a
 /// Defaults / *_Alias / user spec is kind `unmodelled` with the raw line in
-/// `commands` -- never dropped.
+/// `commands` -- never dropped. An `unmodelled` line that still carries a
+/// NOPASSWD:/PASSWD: tag is the collector's `undecoded_passwd_tag` failure.
 inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
     std::vector<SudoersEntry> out;
-    for (const auto& raw : logical_lines(text)) {
-        std::string_view line = detail::cut_sudoers_comment(trim_ws(raw));
+    for (const auto& line_str : logical_lines(text, detail::cut_sudoers_comment)) {
+        const std::string_view line = line_str;
         if (line.empty()) continue;
-        if (line.front() == '#' && !(line.size() > 1 && line[1] >= '0' && line[1] <= '9') &&
-            line.substr(0, 8) != "#include") continue;
         const auto word = line.substr(0, line.find_first_of(" \t"));
         const auto rest = trim_ws(line.substr(word.size()));
         if (word == "#include" || word == "@include")
@@ -433,7 +534,9 @@ inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
             const auto eq = rest.find('=');
             out.push_back({"alias", std::string{word} + ":" + std::string{trim_ws(rest.substr(0, eq))},
                            "-", "-", eq == std::string_view::npos ? "" : std::string{trim_ws(rest.substr(eq + 1))}});
-        } else if (!detail::parse_user_spec(line, out)) {
+        } else if (auto spec = detail::parse_user_spec(line)) {
+            for (auto& e : *spec) out.push_back(std::move(e));
+        } else {
             out.push_back({"unmodelled", "-", "-", "-", std::string{line}});
         }
     }
@@ -449,6 +552,10 @@ inline bool sudoers_dir_entry_ignored(std::string_view name) {
 
 inline constexpr int kReadOversized = -1;
 inline constexpr int kReadNotRegular = -2;
+/// The file holds a NUL byte. Every C consumer of these files (sudo's lexer, libpam,
+/// shadow's getdef) stops or diverges at it, so no value read past it can be reported
+/// as the one in force, and a NUL crossing write_output's C string would cut the row.
+inline constexpr int kReadEmbeddedNul = -3;
 
 enum class ReadClass { Absent, Denied, Failed };
 struct ReadOutcome {
@@ -466,6 +573,7 @@ inline ReadOutcome classify_read_errno(int err) {
     case EIO: return {ReadClass::Failed, "io_error"};
     case kReadOversized: return {ReadClass::Failed, "oversized"};
     case kReadNotRegular: return {ReadClass::Failed, "not_regular"};
+    case kReadEmbeddedNul: return {ReadClass::Failed, "embedded_nul"};
     default: return {ReadClass::Failed, "errno_" + std::to_string(err)};
     }
 }
@@ -482,12 +590,17 @@ inline PolicyStatus select_status(std::size_t readable, std::size_t denied, std:
 
 // ---- row formatters ---------------------------------------------------------------------
 
+/// A NUL never reaches write_output, which takes a C string and would silently end the
+/// row there. Every source already refuses one upstream (kReadEmbeddedNul, cf_to_utf8,
+/// secedit:embedded_nul), so this substitution (U+FFFD, visible) is defence in depth.
 inline std::string join_row(std::string_view head, std::initializer_list<std::string_view> fields) {
     std::string r{head};
     for (auto f : fields) {
         r += '|';
         r += yuzu::util::safe_output_field(f);
     }
+    for (std::size_t at = 0; (at = r.find('\0', at)) != std::string::npos;)
+        r.replace(at, 1, "\xEF\xBF\xBD");
     return r;
 }
 
@@ -504,7 +617,7 @@ inline std::string format_sudoers_row(std::string_view file, const SudoersEntry&
 // ---- file-source collector (Linux and macOS file legs; reader injected) --------------------
 
 struct FileRead {
-    int err = 0; // 0 = ok; errno, or kReadOversized / kReadNotRegular
+    int err = 0; // 0 = ok; errno, or kReadOversized / kReadNotRegular / kReadEmbeddedNul
     std::string data;
 };
 struct DirList {
@@ -602,12 +715,21 @@ inline std::string kv_state_text(const std::pair<std::string, std::string>& st) 
     return st.second.empty() ? st.first : st.first + ":" + st.second;
 }
 
+/// The one call site of the injected reader: a read that succeeded but holds a NUL
+/// byte is the failure kReadEmbeddedNul (the whole source `unreadable:embedded_nul`
+/// plus a token -- the same convention as oversized or not_regular), never a value.
+inline FileRead checked_read(const FileReader& rd, const std::string& path) {
+    auto r = rd(path);
+    if (r.err == 0 && r.data.find('\0') != std::string::npos) return {kReadEmbeddedNul, {}};
+    return r;
+}
+
 /// Reads `path`; on success returns the text. An absent / failed source hands its
 /// {state, detail} to `state_row` and returns nullopt.
 template <class StateRow>
 std::optional<std::string> read_source(const FileReader& rd, Tally& t, const std::string& path,
                                        StateRow&& state_row) {
-    auto r = rd(path);
+    auto r = checked_read(rd, path);
     if (r.err == 0) {
         ++t.readable;
         return std::move(r.data);
@@ -637,7 +759,7 @@ inline void pam_sources(const FileReader& rd, Tally& t, std::string_view action,
     std::size_t exist = 0; // present, refused or failed -- anything but definitively absent
     for (auto f : files) {
         const std::string path = "/etc/pam.d/" + std::string{f};
-        auto r = rd(path);
+        auto r = checked_read(rd, path);
         if (r.err == 0) {
             ++exist;
             ++t.readable;
@@ -663,7 +785,15 @@ inline void sudoers_file(const FileReader& rd, Tally& t, const std::string& path
         t.row(format_sudoers_row(path, {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
     });
     if (!text) return;
-    for (const auto& e : parse_sudoers(*text)) t.row(format_sudoers_row(path, e));
+    for (const auto& e : parse_sudoers(*text)) {
+        t.row(format_sudoers_row(path, e));
+        // The fail-safe half of parse_user_spec: a NOPASSWD:/PASSWD: tag the parser could
+        // not decode is an unmodelled row AND a failure, never a quiet `false`.
+        if (e.kind == "unmodelled" && has_passwd_tag(e.commands)) {
+            ++t.failed;
+            t.acc.add_failure(path + ":undecoded_passwd_tag");
+        }
+    }
 }
 
 } // namespace detail
@@ -789,10 +919,42 @@ inline std::string secedit_audit_setting(std::string_view raw) {
     return "unmodelled:" + std::string{raw};
 }
 
+/// True only for a WHOLE export. `absent` is a real modal value (LockoutDuration when
+/// LockoutBadCount=0), so a truncated file that exits 0 would otherwise report the keys it
+/// lost as absent under OK. Measured on the-rig (Windows 11 Pro 10.0.26200, LocalSystem,
+/// exit 0, 12828 bytes UTF-16LE, BOM FF FE): the sections run `[System Access]`,
+/// `[Event Audit]`, `[Registry Values]`, `[Version]`, with `[Version]` LAST carrying
+/// `signature="$CHICAGO$"` and `Revision=1`. Complete = both policy sections present and
+/// the final section `[Version]` with that signature; anything else is
+/// `secedit:export_incomplete`. Section/key names compare case-insensitively (INF rule).
+inline bool secedit_export_complete(std::string_view text) {
+    const auto ieq = [](std::string_view a, std::string_view b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+                   return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+               });
+    };
+    bool system_access = false, event_audit = false, signed_version = false;
+    std::string_view last;
+    for (auto raw : split_lines(text)) {
+        const auto line = trim_ws(raw);
+        if (!line.empty() && line.front() == '[' && line.back() == ']') {
+            last = trim_ws(line.substr(1, line.size() - 2));
+            system_access = system_access || ieq(last, "System Access");
+            event_audit = event_audit || ieq(last, "Event Audit");
+            signed_version = false; // only the FINAL section's signature counts
+        } else if (const auto eq = line.find('='); ieq(last, "Version") && eq != std::string_view::npos &&
+                   ieq(trim_ws(line.substr(0, eq)), "signature")) {
+            signed_version = ieq(trim_ws(line.substr(eq + 1)), "\"$CHICAGO$\"");
+        }
+    }
+    return system_access && event_audit && ieq(last, "Version") && signed_version;
+}
+
 /// `<action>|<key>|<value>|secedit` rows (audit: every [Event Audit] category). A key the
 /// export does not carry is the row value `absent` (a modal state, no token); a missing
 /// required section means the export is not the shape we read -- a failure token, never an
-/// empty success.
+/// empty success. A reported key or value holding U+0000 is `secedit:embedded_nul` (the
+/// Windows leg is all-or-nothing): the value past it is unknowable, never truncated.
 inline SeceditRows secedit_policy_rows(std::string_view action, const InfSections& sections) {
     SeceditRows out;
     const auto which = parse_local_policy_action(action);
@@ -808,14 +970,22 @@ inline SeceditRows secedit_policy_rows(std::string_view action, const InfSection
         return out;
     }
     const auto prefix = action_row_prefix(which);
+    const auto nul = [&out](std::string_view k, std::string_view v) {
+        if (k.find('\0') == std::string_view::npos && v.find('\0') == std::string_view::npos) return false;
+        out = {{}, "secedit:embedded_nul"};
+        return true;
+    };
     if (audit) {
-        for (const auto& [k, v] : sec->second)
+        for (const auto& [k, v] : sec->second) {
+            if (nul(k, v)) return out;
             out.rows.push_back(format_kv_row(prefix, k, secedit_audit_setting(v), "secedit"));
+        }
         return out;
     }
     for (const auto key : which == LocalPolicyAction::Lockout ? std::span<const std::string_view>{kSeceditLockoutKeys}
                                                               : std::span<const std::string_view>{kSeceditPasswordKeys}) {
         const auto it = sec->second.find(std::string{key});
+        if (it != sec->second.end() && nul(key, it->second)) return out;
         out.rows.push_back(format_kv_row(prefix, key, it == sec->second.end() ? "absent" : it->second, "secedit"));
     }
     return out;
@@ -892,8 +1062,10 @@ inline std::optional<unsigned> pwpolicy_min_length(std::string_view content) {
 
 /// Rows + status for one action from the parsed policy items. Categories:
 /// *Authentication -> lockout, policyCategoryPassword* -> password, anything else is
-/// `unmodelled_category` in BOTH actions. Only `policyAttribute*` parameter keys carry
-/// a value; other parameter keys are named (`unmodelled_parameter`), never valued. Each
+/// `unmodelled_category` in BOTH actions. A `policyAttribute*` parameter is its own key;
+/// any other scalar parameter (e.g. `autoEnableInSeconds`, the lockout duration) is key
+/// `unmodelled_parameter`, value `<name>=<value>` -- the key set stays closed and the
+/// value is never dropped. Each
 /// item defect (PwPolicyItem::defects) is a `source_state|unreadable:<defect>` row and a
 /// `pwpolicy:<defect>` token (CONSTRAINED) in the action(s) its category routes to. No
 /// matching policy and no defect is the modal row `policies|none`, not an error.
@@ -934,7 +1106,7 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             rows.push_back(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
         for (const auto& [k, v] : it.params) {
             if (k.rfind("policyAttribute", 0) == 0) rows.push_back(format_kv_row(prefix, k, v, src));
-            else rows.push_back(format_kv_row(prefix, "unmodelled_parameter", k, src));
+            else rows.push_back(format_kv_row(prefix, "unmodelled_parameter", k + "=" + v, src));
         }
         defect_rows();
     }

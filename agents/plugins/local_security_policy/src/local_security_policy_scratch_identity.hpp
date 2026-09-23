@@ -62,6 +62,12 @@ inline bool scratch_dir_is_ours(HANDLE dir_handle) {
     const auto owner_buf = current_process_token_owner_buf();
     if (owner_buf.empty())
         return false;
+    // TOKEN_OWNER over vector<BYTE> storage. Alignment: the vector's storage comes from
+    // operator new, aligned for any fundamental type, so a pointer-sized struct at offset 0 is
+    // aligned. Bounds: GetTokenInformation sized the buffer itself (`needed`) and wrote the
+    // TOKEN_OWNER at its start. Aliasing: TOKEN_OWNER is an implicit-lifetime type and
+    // operator-new storage implicitly creates one ([intro.object]). Lifetime: the PSID points
+    // INTO this same buffer, valid while owner_buf lives, which spans every use below.
     const PSID token_owner = reinterpret_cast<const TOKEN_OWNER*>(owner_buf.data())->Owner;
 
     PSECURITY_DESCRIPTOR sd = nullptr;

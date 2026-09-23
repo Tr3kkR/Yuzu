@@ -41,7 +41,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "pwpolicy -getaccountpolicies (CFPropertyList)",
          "global account policies only; rung 2 because no public OpenDirectory global-policy "
-         "API exists; policy expressions are verbatim and only policyAttribute* parameters carry a value; "
+         "API exists; policy expressions are verbatim; a policyAttribute* parameter is its own key and any "
+         "other is unmodelled_parameter <name>=<value>; "
          "a plist item not in the documented shape is an unreadable row and constrained. "
          "Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload "
          "surfaces here is unverified"},
@@ -49,8 +50,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 2,
          "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
          "into an agent.data_dir scratch file",
-         "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
-         "LOCAL security database after GPO application; domain-account policy is not reported. "
+         "argv leaf parsed from the exported UTF-16LE INI: the local security database "
+         "(secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
          "directory removed on return; each policy dispatch first sweeps such directories older than "
@@ -77,8 +78,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 2,
          "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
          "into an agent.data_dir scratch file",
-         "argv leaf parsed from the exported UTF-16LE INI. On a domain-joined member this is the "
-         "LOCAL security database after GPO application; domain-account policy is not reported. "
+         "argv leaf parsed from the exported UTF-16LE INI: the local security database "
+         "(secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
          "directory removed on return; each policy dispatch first sweeps such directories older than "
@@ -106,7 +107,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "subcategories are in force -- the Windows 10/11 default and the norm under GPO -- "
          "these are NOT the effective audit state: a category reading none means the legacy "
          "category is unset, not that the host is not auditing. auditpol subcategories are "
-         "not read. "
+         "not read. It is the local security database (secedit /export without /mergedpolicy); "
+         "domain-joined behaviour is unmeasured. "
          "The export (the whole SECURITYPOLICY area) is staged as "
          "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
          "directory removed on return; each policy dispatch first sweeps such directories older than "
@@ -183,8 +185,14 @@ public:
             return yuzu::local_security_policy::collect_windows_policy(ctx, action, data_dir_);
 #elif defined(__APPLE__)
             return yuzu::local_security_policy::collect_macos_policy(ctx, action);
-#else
+#elif defined(__linux__)
             return yuzu::local_security_policy::collect_linux_policy(ctx, action);
+#else
+            // No leg for this OS (not a supported platform): say so, never a Linux read.
+            ctx.write_output("constrained|unsupported_os");
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "unsupported_os");
+            return 1;
 #endif
         } catch (...) {
             ctx.write_output("constrained|internal_error");

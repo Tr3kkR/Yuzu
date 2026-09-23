@@ -79,8 +79,8 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 ///
 /// Today the fallback is reachable ONLY from the macOS pwpolicy path, and only with
 /// state `constrained`: every file-backed source pairs each denial/failure with its
-/// own row as it records it, so `collect_file_policy` cannot return empty rows with a
-/// non-OK status, and the pwpolicy path never reports PERMISSION_DENIED (a refused
+/// own row as it records it, so `collect_file_policy` returns empty rows with a non-OK
+/// status only from its unreachable `unsupported_action` guard, and the pwpolicy path never reports PERMISSION_DENIED (a refused
 /// run is not distinguishable from any other non-zero exit). The `permission_denied`
 /// arm below is therefore defensive; the docs describe the status row as
 /// `constrained` only. That matters for the `sudoers` action, whose normal row is 7
@@ -182,17 +182,24 @@ inline DirList posix_list_dir(const std::string& path) {
 
 namespace detail {
 
-// nullopt only on a genuine CFStringGetCString conversion failure -- never on a
-// merely-long string. The buffer is sized from the string itself (same pattern
-// as macos_console_user.hpp / peripherals_macos.cpp), so a real policy string
-// longer than a fixed 1024-byte guess can no longer be silently truncated away.
+// nullopt on a CFStringGetCString conversion failure, and when the rendered C string
+// is shorter than the CF string's exact UTF-8 length -- an embedded U+0000, which would
+// otherwise cut the value at the NUL with no defect (the caller reports nullopt as a
+// malformed_* / unconvertible_key defect). Never nullopt on a merely-long string: the
+// buffer is sized from the string itself (macos_console_user.hpp / peripherals_macos.cpp).
 inline std::optional<std::string> cf_to_utf8(CFStringRef s) {
     const CFIndex len = CFStringGetLength(s);
     if (len == 0) return std::string{};
     const CFIndex max_size = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
     std::string buf(static_cast<std::size_t>(max_size), '\0');
     if (!CFStringGetCString(s, buf.data(), max_size, kCFStringEncodingUTF8)) return std::nullopt;
-    return std::string{buf.c_str()};
+    CFIndex utf8_len = 0; // exact byte count; a NULL buffer only measures
+    if (CFStringGetBytes(s, CFRangeMake(0, len), kCFStringEncodingUTF8, 0, false, nullptr, 0,
+                         &utf8_len) != len)
+        return std::nullopt;
+    std::string out{buf.c_str()};
+    if (out.size() != static_cast<std::size_t>(utf8_len)) return std::nullopt;
+    return out;
 }
 
 /// Scalar CF value -> text; nullopt for a nested/unknown type (never guessed).
@@ -204,9 +211,10 @@ inline std::optional<std::string> cf_scalar_text(CFTypeRef v) {
     if (CFGetTypeID(v) == CFNumberGetTypeID()) {
         const auto n = static_cast<CFNumberRef>(v);
         long long i = 0;
-        // Returns false for a value that does not convert losslessly (a plist <real>),
-        // leaving `i` truncated. Emitting that would be a quietly-wrong number; nullopt
-        // reaches the caller as "unmodelled", which is the honest answer.
+        // Returns false for a value that does not convert losslessly (a plist <real> with a
+        // fractional part or out of range; `<real>12.0</real>` converts to 12), leaving `i`
+        // truncated. Emitting that would be a quietly-wrong number; nullopt reaches the
+        // caller as a malformed_* defect, which is the honest answer.
         if (!CFNumberGetValue(n, kCFNumberLongLongType, &i)) return std::nullopt;
         return std::to_string(i);
     }

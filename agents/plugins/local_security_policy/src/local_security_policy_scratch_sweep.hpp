@@ -12,7 +12,8 @@
  *
  * Why a sweep: the CHILD (secedit) writes the export, so a crash or service
  * stop between export and the agent's RAII delete orphans a copy of the
- * machine's policy under agent.data_dir. Every Windows policy dispatch that reaches the export sweeps stale
+ * machine's policy under agent.data_dir. Each Windows policy dispatch with
+ * agent.data_dir set and the system directory resolved sweeps stale
  * `local_security_policy-<32 hex>` directories BEFORE spawning.
  *
  * The selection policy is shaped after execution_artifacts' (prefix + 32 hex +
@@ -180,7 +181,7 @@ classify_sweep_candidate(std::string_view name, bool is_directory,
 }
 
 /// True when a pass did anything worth a log line. A steady-state pass finds
-/// nothing and says nothing: this runs before EVERY Windows dispatch, and an
+/// nothing and says nothing: this runs before each Windows policy dispatch, and an
 /// unconditional per-dispatch info line is noise at fleet scale (the agent core
 /// already logs one line per command with rc, timing and provenance).
 [[nodiscard]] inline bool sweep_worth_logging(const ScratchSweepResult& r) noexcept {
@@ -205,7 +206,7 @@ inline constexpr unsigned long kWin32AccessDenied = 5;
     case RunEnd::SpawnError:
         return "secedit:spawn_error";
     case RunEnd::Deadline:
-        return "secedit:timeout";
+        return "secedit:deadline"; // the same word as pwpolicy:deadline, one fleet query
     case RunEnd::Cancelled:
         return "secedit:cancelled";
     case RunEnd::Signaled:

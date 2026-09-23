@@ -23,12 +23,23 @@
  * data_dir is empty -- no fallback location), holds it open without
  * FILE_SHARE_DELETE, verifies with scratch_dir_is_ours, and removes it (RAII)
  * on every survivable path. A crash or service stop between export and delete
- * orphans that copy, so EVERY dispatch first sweeps stale
- * `local_security_policy-<32hex>` directories older than one hour under data_dir
- * through agents/core confined_fs (open_root / enumerate_at / unlink_at),
- * ownership-verified: a same-named directory owned by another SID is skipped, a
- * non-flat one is left intact. RESIDUAL: an orphan younger than one hour, or one
- * left with no later Windows dispatch, stays on disk until a sweep reaches it. Per
+ * orphans that copy, so each Windows policy dispatch with agent.data_dir set and the
+ * system directory resolved first sweeps stale `local_security_policy-<32hex>`
+ * directories older than one hour under data_dir through agents/core confined_fs
+ * (open_root / enumerate_at / unlink_at), ownership-verified: a same-named directory
+ * owned by another SID is skipped, a non-flat one is left intact. RESIDUAL: an orphan
+ * younger than one hour, or one left with no later Windows dispatch, stays on disk
+ * until a sweep reaches it (an uninstall that keeps the data directory keeps it too).
+ * NO STARTUP SWEEP (declined, unlike execution_artifacts' init-time pass): the sweep
+ * already runs before every export, and an orphan's directory is owner-only, so a
+ * restart-time pass would only shorten that window; deferred.
+ * kCaptureNamePrefix (confined_fs.hpp) orphans cannot exist under this root: that
+ * name is produced only by confined_fs's POSIX rename-then-measure delete path, and
+ * this Windows sweep deletes by handle disposition and never renames -- so there is
+ * nothing of that shape for it to reason about (execution_artifacts' decision too).
+ * A non-default agent.data_dir (an SMB share whose owner reads as HOST$, a non-NTFS
+ * volume, a path over MAX_PATH) is unmeasured and may fail the leg as `dest_dir_acl`
+ * or `secedit:exit_<n>`. Per
  * Microsoft's secedit documentation, with no /log argument secedit also appends to
  * its default log (%windir%\security\logs\scesrv.log); not measured on the rig. The
  * sweep outcome is logged at warn, only when the pass did something, as
@@ -62,6 +73,9 @@
  *                                 BUILTIN\Administrators aged 3 h (SKIPPED, foreign SID) and a
  *                                 fresh SYSTEM-owned one (kept); the log (the earlier
  *                                 removed/skipped format) read 1/2, then 0/2 on the next dispatches.
+ *   export sections, in order   : [System Access] [Event Audit] [Registry Values] [Version];
+ *                                 [Version] last, signature="$CHICAGO$", Revision=1 -- the shape
+ *                                 secedit_export_complete requires (else export_incomplete).
  * No fixture of the export is committed.
  */
 
@@ -78,7 +92,7 @@
 
 #include "local_security_policy_legs.hpp"
 #include "local_security_policy_parsers.hpp" // decode_utf16le_bom, parse_inf_sections,
-                                              // secedit_policy_rows
+                                              // secedit_export_complete, secedit_policy_rows
 #include "local_security_policy_scratch_identity.hpp"
 #include "local_security_policy_scratch_sweep.hpp"
 
@@ -147,6 +161,10 @@ NtOpenFileFn resolve_ntopenfile() {
         const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll == nullptr)
             return nullptr;
+        // The documented GetProcAddress pattern (confined_fs_win.cpp:18-20 does the same for
+        // NtCreateFile): FARPROC -> void* -> the exact NtOpenFile signature declared above.
+        // ntdll is mapped into every process for its whole lifetime, so the pointer never
+        // dangles; it is only ever called through NtOpenFileFn, never as FARPROC.
         return reinterpret_cast<NtOpenFileFn>(
             reinterpret_cast<void*>(GetProcAddress(ntdll, "NtOpenFile")));
     }();
@@ -482,6 +500,10 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
         std::span<const std::uint8_t>{exported.bytes.data(), exported.bytes.size()});
     if (const auto bad = classify_decoded_export(text); !bad.empty())
         return emit_constrained(ctx, bad);
+    // A truncated export can still decode and carry [System Access]: no row is presented
+    // as complete unless the file ends in the signed [Version] section (see the parser).
+    if (!secedit_export_complete(*text))
+        return emit_constrained(ctx, "secedit:export_incomplete");
 
     // The INI -> rows mapping is the parsers header's (the one mapper); never re-add a
     // second mapper in this TU.
