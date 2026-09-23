@@ -3293,11 +3293,14 @@ public:
 
                 // Detach the Guardian event-sink from this (now broken) stream BEFORE
                 // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
-                // in-flight sink Write to finish, then nulls the holder so a guard
-                // worker firing during teardown drops the event instead of writing to
-                // a cancelled stream. Guards keep running across the reconnect; the
-                // next iteration republishes the new stream and the heartbeat reconcile
-                // (M5) catches up any generation missed while the link was down.
+                // in-flight sink Write to finish, then nulls the holder so a send firing
+                // during teardown drops the event instead of writing to a cancelled
+                // stream. #4783: that send no longer runs on a guard's own thread - it
+                // is legacy_sink_executor_'s own detached worker (or the DEX observer's
+                // still-synchronous OS-callback thread) that can be mid-Write here, never
+                // a guard. Guards keep running across the reconnect; the next iteration
+                // republishes the new stream and the heartbeat reconcile (M5) catches up
+                // any generation missed while the link was down.
                 {
                     std::lock_guard lock(stream_write_mu_);
                     guardian_sink_stream_.reset();
