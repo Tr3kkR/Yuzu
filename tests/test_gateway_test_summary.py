@@ -196,9 +196,10 @@ class AssertGatewayTests(unittest.TestCase):
 
     SCRIPT = os.path.join(ROOT, 'scripts', 'ci', 'assert-gateway-tests.py')
     WORKFLOWS = ('ci.yml', 'nightly.yml', 'sanitizer-tests.yml')
-    # The workflow canary (ci.yml `canary`, gcc-13) only compiles; it never
-    # runs `meson test`, so it has no gateway tests to lose.
-    EXEMPT = {('ci.yml', 'build-linux')}
+    # The workflow canary only compiles (it never runs `meson test`), so it
+    # has no gateway tests to lose. Exempted by its STEP NAME, not its build
+    # dir, so a future test-running leg that reuses the dir name is still checked.
+    EXEMPT_STEPS = {('ci.yml', 'Configure (Meson, gcc-13 debug)')}
 
     def _run(self, tests):
         with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
@@ -224,15 +225,23 @@ class AssertGatewayTests(unittest.TestCase):
             text = _read(os.path.join(ROOT, '.github', 'workflows', wf))
             self.assertNotIn('-Drequire_gateway', text, wf)
             lines = text.split('\n')
+            step = None
             for i, line in enumerate(lines):
+                sm = re.match(r'\s*- name:\s*(.+?)\s*$', line)
+                if sm:
+                    step = sm.group(1)
                 m = re.match(r'\s*meson setup (?:\$reconfig )?(\S+)', line)
-                if not m or (wf, m.group(1)) in self.EXEMPT:
+                if not m or (wf, step) in self.EXEMPT_STEPS:
                     continue
                 j = i
                 while lines[j].rstrip().endswith('\\'):
                     j += 1
                 with self.subTest(workflow=wf, line=i + 1):
-                    self.assertRegex(lines[j + 1], r'python3? scripts/ci/assert-gateway-tests\.py ')
+                    a = re.match(r'\s*python3? scripts/ci/assert-gateway-tests\.py (\S+)\s*$', lines[j + 1])
+                    self.assertIsNotNone(a, lines[j + 1])
+                    # It must check the dir meson just configured, not a
+                    # sibling whose intro-tests.json could be stale.
+                    self.assertEqual(a.group(1).strip('"'), m.group(1).strip('"'))
 
 
 if __name__ == '__main__':
