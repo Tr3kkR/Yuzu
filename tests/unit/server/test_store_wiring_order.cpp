@@ -290,3 +290,140 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
                       std::sregex_iterator()));
     CHECK(count == 4);
 }
+
+// HA WS-5 governance hardening (Gate 3 quality-engineer finding, 2026-09-22):
+// `registry_.configure_presence(offline_endpoint_store_.get(), ...)` is the
+// EXACT #3261 shape (a wiring call whose safety depends on running after its
+// member's construction) but doesn't match this file's general setter regex
+// — different receiver (`registry_`, not `agent_service_`/`gateway_service_
+// ->`), a two-argument setter, and a name that isn't `set_X`. Rather than
+// widen the general regex (risking exactly the false-match/false-miss class
+// its own header comment warns block-comment-stripping already caused once),
+// this is a dedicated bespoke-anchor test, following the same
+// ServerImpl-is-not-unit-constructible / source-scan rationale as the
+// #1712 test above.
+TEST_CASE("server.cpp: registry_.configure_presence runs after "
+          "offline_endpoint_store_'s construction (HA WS-5)",
+          "[wiring_order][ha]") {
+    const std::string text = strip_line_comments(read_server_cpp());
+
+    static const std::regex construct_re(
+        R"(offline_endpoint_store_\s*=\s*std::make_unique<)");
+    std::smatch construct_match;
+    REQUIRE(std::regex_search(text, construct_match, construct_re));
+    const int construct_line = line_of(text, static_cast<std::size_t>(construct_match.position(0)));
+
+    static const std::regex wire_re(
+        R"(registry_\.configure_presence\(\s*offline_endpoint_store_\.get\(\))");
+    std::smatch wire_match;
+    REQUIRE(std::regex_search(text, wire_match, wire_re));
+    const int wire_line = line_of(text, static_cast<std::size_t>(wire_match.position(0)));
+
+    INFO("offline_endpoint_store_ constructed at server.cpp:" << construct_line);
+    INFO("registry_.configure_presence(offline_endpoint_store_.get(), ...) at server.cpp:"
+         << wire_line);
+    CHECK(construct_line < wire_line);
+
+    // The teardown null-out (`registry_.configure_presence(nullptr, ...)`)
+    // must run BEFORE offline_endpoint_store_.reset() destroys the object
+    // presence_store_ borrows — the inverse ordering requirement stop()
+    // exists to satisfy (see agent_registry.hpp's presence_store_ doc
+    // comment and the comment on this call site in server.cpp).
+    static const std::regex null_wire_re(R"(registry_\.configure_presence\(\s*nullptr\s*,)");
+    std::smatch null_wire_match;
+    REQUIRE(std::regex_search(text, null_wire_match, null_wire_re));
+    const int null_wire_line = line_of(text, static_cast<std::size_t>(null_wire_match.position(0)));
+
+    static const std::regex reset_re(R"(offline_endpoint_store_\.reset\(\))");
+    std::smatch reset_match;
+    REQUIRE(std::regex_search(text, reset_match, reset_re));
+    const int reset_line = line_of(text, static_cast<std::size_t>(reset_match.position(0)));
+
+    INFO("registry_.configure_presence(nullptr, ...) at server.cpp:" << null_wire_line);
+    INFO("offline_endpoint_store_.reset() at server.cpp:" << reset_line);
+    CHECK(null_wire_line < reset_line);
+}
+
+// HA WS-5 governance hardening (external review finding, 2026-09-22): the
+// PR's own body records that a THIRD production ConfinedDispatchSink
+// construction site (dispatch_scope_ladder.hpp) was missed by the initial
+// diff and found only on a second architect pass — the exact class of bug
+// a source-scan guard exists to catch structurally, not rely on a human
+// re-read to catch a second time. This scans EVERY production
+// ConfinedDispatchSink{...} literal (server.cpp AND dispatch_scope_ladder.hpp
+// — the two files known to construct one) and asserts each one wires BOTH
+// the presence-widening check (has_remote_presence, the field that replaced
+// the original racy local_agent_count design) and the gateway-directory
+// fallback (prepare_route_fallback) — a sink missing either silently
+// reintroduces the exact bug class this slice's governance rounds found
+// three times (the missing third site, the un-fallback'd legacy forwarder,
+// the un-widened fast path). A hardcoded count (not just "at least one")
+// catches a site being REMOVED too, mirroring this file's own #3261
+// presence-pin rationale above.
+TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
+          "ConfinedDispatchSink wires has_remote_presence AND prepare_route_fallback (HA WS-5)",
+          "[wiring_order][ha]") {
+    const std::string server_text = strip_line_comments(read_server_cpp());
+    const fs::path ladder_path = fs::path(YUZU_SERVER_SRC_DIR) / "dispatch_scope_ladder.hpp";
+    REQUIRE(fs::is_regular_file(ladder_path));
+    std::string ladder_text;
+    {
+        std::ifstream in(ladder_path, std::ios::binary);
+        REQUIRE(in.is_open());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        ladder_text = strip_line_comments(ss.str());
+    }
+
+    // Group 1 (optional): a `->` immediately before the type name means this
+    // is a lambda's trailing-return-type annotation (e.g.
+    // make_confined_dispatch_sink_fn's `-> yuzu::server::ConfinedDispatchSink
+    // {` forwarding closure) — that opening brace starts a function BODY,
+    // not an aggregate-init literal, and has none of the fields this test
+    // checks for. Anchoring the arrow directly against the type name (not a
+    // wide lookback window) avoids false-excluding a real construction that
+    // merely has an UNRELATED `->` somewhere nearby (e.g. `this->registry_`
+    // in a preceding statement/comment) — extremely common in this codebase.
+    // The optional `\w+\s*` before the final `\{` covers the named-variable
+    // form (`ConfinedDispatchSink sink{`, used at 2 of the 3 real sites) as
+    // well as the anonymous return-expression form (`ConfinedDispatchSink{`,
+    // used at the third) and the lambda return-type annotation this test
+    // must still exclude (`-> ConfinedDispatchSink {`, no name either).
+    static const std::regex sink_re(
+        R"((->\s*)?(?:yuzu::server::)?ConfinedDispatchSink\s*(?:\w+\s*)?\{)");
+    // Bounded window per literal: large enough to span every known sink's
+    // 5-field aggregate init (measured: the largest, forward_legacy_command's,
+    // runs ~700 chars after its opening brace) without risking a window that
+    // spills into the NEXT unrelated construct in the file.
+    constexpr std::size_t kWindow = 1200;
+
+    int total_sites = 0;
+    auto check_file = [&](const std::string& text, const char* label) {
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), sink_re);
+             it != std::sregex_iterator(); ++it) {
+            if ((*it)[1].matched) // trailing-return-type annotation, not a construction
+                continue;
+            ++total_sites;
+            const std::size_t start = static_cast<std::size_t>(it->position(0));
+            const std::string window = text.substr(start, std::min(kWindow, text.size() - start));
+            const int line = line_of(text, start);
+            INFO(label << ":" << line << " — ConfinedDispatchSink construction");
+            CHECK(window.find("has_remote_presence") != std::string::npos);
+            // The `prepare_route_fallback` FIELD is positional (plain
+            // aggregate-init, no designated-initializer field names written
+            // at any of these 3 sites) — its NAME never appears in the
+            // construction text. Its lambda body's `->prepare(candidates)`
+            // call is the stable, present-at-every-real-site marker instead.
+            CHECK(window.find("->prepare(") != std::string::npos);
+        }
+    };
+    check_file(server_text, "server.cpp");
+    check_file(ladder_text, "dispatch_scope_ladder.hpp");
+
+    // Sanity floor+ceiling (not just ">= 1"): exactly 3 production sites as
+    // of this slice (make_confined_dispatch_sink, forward_legacy_command,
+    // wire_and_dispatch_confined). A 4th site added later without updating
+    // this count is flagged for review, not silently passed; a site removed
+    // is caught the same way.
+    CHECK(total_sites == 3);
+}

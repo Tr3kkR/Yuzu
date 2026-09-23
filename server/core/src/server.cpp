@@ -5,11 +5,28 @@
 // Inner classes extracted: agent_registry, agent_service_impl, gateway_service_impl, event_bus
 // Pre-existing extractions: rest_api_v1, mcp_server
 
+// #4722: this TU's own pre-existing includes pull in <windows.h> transitively somewhere ahead
+// of grpc_tls_credentials.hpp's new grpcpp/security/*.h includes (grpc's own port_platform.h
+// self-guards, but that's no help if windows.h was already fully processed earlier in THIS TU --
+// once min/max are defined by an unguarded windows.h, they stay defined for the rest of the file
+// regardless of what any later header does). Must be first, before any other include: matches
+// key_provider.cpp's established guard, just applied at file scope instead of one include site.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 #include "bundled_content.hpp"
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
+#include "grpc_tls_credentials.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -194,6 +211,7 @@
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
+#include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): make_local_guardian_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -4284,6 +4302,12 @@ public:
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
                 startup_failed_ = true;
+            } else {
+                // HA WS-5 governance hardening (Gate 3 sre finding): this
+                // store is now load-bearing for cross-replica scope
+                // evaluation, not just the viz page, so its fail-soft
+                // degrade paths need a counter, not just a debug log.
+                offline_endpoint_store_->set_metrics(&metrics_);
             }
         }
 
@@ -5195,6 +5219,17 @@ public:
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // HA WS-5 (ADR-2002 §7a): wire cross-replica presence into scope
+            // evaluation / all_ids(). Same window `reap_stale_sessions` uses
+            // for local liveness (cfg_.session_timeout), so a single
+            // replica's presence-derived liveness window matches its own
+            // local one — see AgentRegistry::configure_presence's doc
+            // comment. A null offline_endpoint_store_ (construction failed —
+            // ADR-0007 fails the server closed before reaching here in
+            // production) leaves presence unconfigured: local-only behavior,
+            // unchanged from pre-WS-5.
+            registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
 
             // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
             // applied policy generation on every heartbeat; if it trails the
@@ -7773,22 +7808,23 @@ public:
         start_web_server();
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
-        // startup_failed_ (SCIM boot failure) and return before launching
-        // the web listener, but by this point the agent/management gRPC
-        // listeners are already live (BuildAndStart above). Re-check here,
-        // before spinning up any more threads or reaching
-        // agent_server_->Wait() below, so a SCIM boot failure genuinely
-        // halts the process instead of serving on the gRPC ports with a
-        // broken web/SCIM surface. stop() is safe to call this early — every
-        // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by the
-        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
-        // it here and letting the destructor run again afterward is a deliberate
-        // no-op the second time (same thread, sequential — not a wait).
+        // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
+        // failure) and return before launching the web listener, but by this
+        // point the agent/management gRPC listeners are already live
+        // (BuildAndStart above). Re-check here, before spinning up any more
+        // threads or reaching agent_server_->Wait() below, so a startup
+        // failure genuinely halts the process instead of serving on the gRPC
+        // ports with a broken web/SCIM surface. stop() is safe to call this
+        // early — every thread/store it joins or resets is
+        // joinable()/nullptr-guarded, and it also runs from ~ServerImpl
+        // (guarded against double-entry by the lifecycle_mu_/teardown_complete_
+        // completion barrier — #3007), so calling it here and letting the
+        // destructor run again afterward is a deliberate no-op the second
+        // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure); stopping the already-started agent/management "
-                         "gRPC listeners.");
+                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
+                         "error); stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }
@@ -9523,6 +9559,24 @@ public:
         // never built these tears down cleanly too.
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        // HA WS-5: same discipline as the heartbeat_ingestion_ line above —
+        // registry_ outlives offline_endpoint_store_ (it is torn down much
+        // later, if ever, as part of this object's own member destruction).
+        // Corrected per governance Gate 3 (security-guardian + cpp-safety,
+        // independently, 2026-09-22): this is belt-and-braces, not a claim
+        // of an unresolved reachability gap — every thread class that could
+        // call evaluate_scope()/all_ids() (gRPC handlers via
+        // agent_server_/mgmt_server_->Shutdown(deadline) above; REST/
+        // dashboard/MCP, which share the same httplib worker pool, via
+        // web_thread_.join() a few lines above that; the policy-evaluator
+        // and every other named background thread via their own .join()
+        // calls) is ALREADY drained by this point — cpp-safety traced this
+        // as a genuine happens-before, not a "benign aligned pointer store"
+        // — matching the #2703/#3495 precedent this same stop() sequence
+        // already documents elsewhere. Nulled anyway, matching every sibling
+        // raw-pointer null-out in this block (execution_tracker_,
+        // blast_radius_detector, cert callbacks, session_store).
+        registry_.configure_presence(nullptr, cfg_.session_timeout);
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
@@ -10215,60 +10269,11 @@ private:
                           const std::filesystem::path& key_path,
                           const std::filesystem::path& ca_path, bool insecure_skip_client_verify,
                           bool require_client_cert, std::string_view listener_name) const {
-        if (cert_path.empty() || key_path.empty()) {
-            spdlog::error("{} TLS requires certificate and key", listener_name);
-            return nullptr;
-        }
-
-        if (!detail::validate_key_file_permissions(key_path, listener_name)) {
-            return nullptr;
-        }
-
-        auto cert = detail::read_file_contents(cert_path);
-        auto key = detail::read_file_contents(key_path);
-        if (cert.empty() || key.empty()) {
-            spdlog::error("Failed to read {} TLS cert/key files", listener_name);
-            return nullptr;
-        }
-
-        grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
-        key_cert.private_key = std::move(key);
-        key_cert.cert_chain = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
-
-        if (!ca_path.empty()) {
-            auto ca = detail::read_file_contents(ca_path);
-            if (ca.empty()) {
-                spdlog::error("Failed to read {} CA cert from {}", listener_name, ca_path.string());
-                return nullptr;
-            }
-
-            ssl_opts.pem_root_certs = std::move(ca);
-            // Under built-in default certs the agent has no client cert yet
-            // (per-agent issuance is PR3): REQUEST + VERIFY if presented, but do
-            // NOT REQUIRE — otherwise no agent could connect. Operator-provided
-            // certs keep the strict REQUIRE posture.
-            ssl_opts.client_certificate_request =
-                require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
-                                    : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
-        } else {
-            if (!insecure_skip_client_verify) {
-                spdlog::error("{} TLS requires --ca-cert (or enable "
-                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
-                              listener_name);
-                return nullptr;
-            }
-            spdlog::warn("{} TLS running without client certificate verification "
-                         "(--insecure-skip-client-verify)",
-                         listener_name);
-        }
-
-        auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(kc.private_key);
-        }
-        return creds;
+        // #4722: moved to grpc_tls_credentials.cpp (yuzu::server::detail) so the
+        // real-handshake test suite can drive the production builder directly.
+        return detail::build_server_tls_credentials(cert_path, key_path, ca_path,
+                                                     insecure_skip_client_verify,
+                                                     require_client_cert, listener_name);
     }
 
     // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
@@ -10302,42 +10307,13 @@ private:
     // Residual (tracked on #1422): no CRL/OCSP check on this path yet, so a
     // revoked-but-stolen SERVER leaf still passes until rotation; and
     // through-gateway operator identity stays app-layer.
+    // #4722: body moved to grpc_tls_credentials.cpp (yuzu::server::detail);
+    // see that header for the full #1314/#1422 narrative.
     [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
     build_gateway_command_credentials() const {
-        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
-                          "client cert/key to present for mutual TLS — command forwarding "
-                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
-            return nullptr;
-        }
-        if (cfg_.tls_ca_cert.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
-                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
-            return nullptr;
-        }
-        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
-            return nullptr;
-        }
-        grpc::SslCredentialsOptions ssl_opts;
-        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
-        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
-        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
-        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
-            ssl_opts.pem_private_key.empty()) {
-            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
-                          "command forwarding DISABLED (fail-closed).");
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-            return nullptr;
-        }
-        auto creds = grpc::SslCredentials(ssl_opts);
-        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
-        // key is the sensitive one, the CA/cert are public, but zeroing all three
-        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
-        // metadata resident longer than needed.
-        yuzu::secure_zero(ssl_opts.pem_private_key);
-        yuzu::secure_zero(ssl_opts.pem_cert_chain);
-        yuzu::secure_zero(ssl_opts.pem_root_certs);
-        return creds;
+        return detail::build_mtls_client_credentials(cfg_.tls_ca_cert, cfg_.tls_server_cert,
+                                                      cfg_.tls_server_key,
+                                                      "Gateway command plane");
     }
 
     // -- PKI PR3: per-agent client-cert issuance + revocation ------------------
@@ -11493,6 +11469,24 @@ private:
     /// sites (only the reconcile path metered anything, and only its success).
     /// `sent` means the registry accepted the frame — for a gateway-attached
     /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
+    ///
+    /// HA WS-5 KNOWN LIMITATION (external review, 2026-09-22, accepted —
+    /// not fixed this slice): callers (Guardian rule push, TAR fleet
+    /// snapshot) can select a target `agent_id` from a presence-widened
+    /// candidate set (`AgentRegistry::all_ids()`/`evaluate_scope()`), but
+    /// this helper calls `registry_.send_to` directly with NO
+    /// `GatewayRouteFallback` directory consult — a presence-only
+    /// (cross-replica) target is always `undelivered` here, never queued via
+    /// the directory the way the 3 real `ConfinedDispatchSink` sites do.
+    /// Deliberately NOT treated as blocking: the failure is COUNTED (never
+    /// swallowed — see the metric below), and both callers' own
+    /// heartbeat-reconcile paths compare the same durable policy-generation
+    /// counter on the agent's NEXT heartbeat (wherever it lands), so this
+    /// self-heals rather than leaving a device silently unenforced
+    /// indefinitely. Fixing it properly needs the same "batch-prepare the
+    /// fallback BEFORE the per-id loop" restructuring every other consult in
+    /// this codebase uses — out of scope for a single-id helper; tracked as
+    /// a follow-up, not filed as a separate issue this round.
     [[nodiscard]] bool send_system_reserved(const std::string& agent_id,
                                             const detail::ClassifiedCommand& cmd,
                                             yuzu::server::SystemReservedPush push) {
@@ -11646,6 +11640,9 @@ private:
             },
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
+            },
+            [this](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
             }};
     }
 
@@ -13202,6 +13199,25 @@ private:
             }
             web_server_ = std::make_unique<httplib::SSLServer>(
                 cfg_.https_cert_path.string().c_str(), cfg_.https_key_path.string().c_str());
+
+            // #4722: same TLS 1.2 cipher allow-list as the gRPC listeners.
+            // httplib's create_server_context() already floors at
+            // TLS1_2_VERSION (httplib.h:16411); this pins the suites.
+            // tls_context() is the current accessor (ssl_context() is
+            // [[deprecated]]). Fail closed: an unpinned HTTPS listener must
+            // not serve. (Note: the cert-missing `return`s above deliberately
+            // do NOT set startup_failed_ — this branch is fail-closed on
+            // purpose, do not "harmonise" it away.)
+            auto* ssl_server = static_cast<httplib::SSLServer*>(web_server_.get());
+            if (!yuzu::tls::apply_tls12_cipher_list(
+                    static_cast<SSL_CTX*>(ssl_server->tls_context()))) {
+                spdlog::error("HTTPS: failed to pin the TLS 1.2 cipher list on the dashboard "
+                              "listener — refusing to serve");
+                web_server_.reset();
+                startup_failed_ = true;
+                return;
+            }
+
             spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})", cfg_.https_port,
                          cfg_.https_cert_path.string(), cfg_.https_key_path.string());
         } else {
@@ -16637,6 +16653,25 @@ private:
         std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
         if (workflow_engine_)
             workflow_api = make_local_workflow_api(*workflow_engine_);
+        // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
+        // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
+        // (all but the store-free `schemas`) and their MCP twins, so the two
+        // can never disagree.
+        // Constructed UNCONDITIONALLY (never null) — mirrors dex_perf_api's
+        // own multi-dependency posture, NOT dex_api's/workflow_api's
+        // store-gated one: seven of the eight methods need ONLY
+        // guaranteed_state_store_, and only device_compliance needs both, so
+        // each backing store pointer is checked INDIVIDUALLY inside the impl
+        // (guardian_api.cpp) — a null `guaranteed_state_store_` degrades
+        // every method, a null `baseline_store_` degrades ONLY
+        // device_compliance, exactly matching the pre-seam per-route
+        // `if (!guaranteed_state_store)` guards (never a combined
+        // both-required gate, which would make baseline_store_'s mere
+        // absence 503 the other seven routes too).
+        // `guaranteed_state_store_`/`baseline_store_` stay wired below too,
+        // for the rule/baseline MUTATORS this seam does not cover.
+        auto guardian_api = make_local_guardian_api(guaranteed_state_store_.get(),
+                                                     baseline_store_.get());
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -18884,7 +18919,13 @@ private:
             // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
             // guards produced (app_perf_providers stays wired above too — this
             // is additive until every consumer migrates).
-            dex_perf_api);
+            dex_perf_api,
+            // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam,
+            // constructed unconditionally above — each method individually
+            // degrades when its own backing store is absent, the exact same
+            // per-route degrade the old `!guaranteed_state_store`/
+            // `!baseline_store` guards produced.
+            guardian_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -19120,6 +19161,14 @@ private:
             // unavailable", matching the pre-seam !workflow_engine guard
             // exactly.
             mcp_server_->set_workflow_api(workflow_api);
+            // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
+            // instance the REST GET /api/v1/guaranteed-state/* handlers use
+            // (constructed unconditionally above), so the 8 seamed MCP Guardian
+            // read tools can never disagree with REST v1 — each method
+            // individually degrades when its own backing store is absent,
+            // matching the pre-seam per-route !guaranteed_state_store/
+            // !baseline_store guards exactly.
+            mcp_server_->set_guardian_api(guardian_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see
@@ -19511,7 +19560,13 @@ private:
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.
     void forward_legacy_command(const httplib::Request& req, const std::string& plugin,
                                 const std::string& action, httplib::Response& res) {
-        if (!registry_.has_any()) {
+        // HA WS-5 governance hardening (external review finding, 2026-09-22):
+        // has_any() alone is LOCAL-ONLY — see command_routes.cpp's sibling
+        // check for the full rationale. has_any_reachable() checks presence
+        // too, so a replica with zero local sessions but a healthy
+        // presence-visible fleet no longer rejects every legacy dispatch
+        // before all_ids()/evaluate_scope() ever runs.
+        if (!registry_.has_any_reachable()) {
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",
@@ -19589,18 +19644,45 @@ private:
         }
 
         agent_service_.record_send_time(command_id);
-        // WS-4 4.2b Task D: this sink is deliberately left WITHOUT a fourth
-        // (`prepare_route_fallback`) field — this legacy forwarder is
-        // Broadcast-only (see this dispatch's own DispatchArm::Broadcast call
-        // just below), so `ArmDispatchResult::route_unreadable` can never be
-        // set here regardless; unlike the /api/command and MCP/dashboard/
-        // workflow sites (which DO wire the gateway routing-directory
-        // fallback and so DO need the `route_unreadable` cascade branch
-        // below), this site has no `route_unreadable` branch to add.
+        // WS-4 4.2b Task D note (now SUPERSEDED — see the HA WS-5 comment
+        // below): this sink was originally left WITHOUT a `prepare_route_
+        // fallback` field on the theory that a Broadcast-only forwarder's
+        // candidates are always locally known, so no directory consult was
+        // ever needed and `ArmDispatchResult::route_unreadable` could never
+        // be set here.
+        //
+        // HA WS-5 (governance Gate 4 happy-path finding, 2026-09-22): that
+        // theory broke the moment `registry_.all_ids()` could return a
+        // presence-only (cross-replica) id — this is a REAL BLOCKING bug
+        // WS-5 exposed, not a hypothetical: with no `prepare_route_fallback`
+        // and a bare `registry_.send_to(aid, ...)` (which returns `false`
+        // silently for any id absent from the LOCAL `agents_` map, no log,
+        // no metric — agent_registry.cpp's `send_to`), a presence-only id
+        // reached via this legacy forwarder was dropped with zero signal —
+        // and if at least one OTHER agent was local, the overall dispatch
+        // still reported plain success. Fixed by wiring the same
+        // `GatewayRouteFallback` the other three production
+        // `ConfinedDispatchSink` sites (`make_confined_dispatch_sink`,
+        // `dispatch_scope_ladder.hpp`) already use, so this route now
+        // reaches a cross-replica agent exactly like every other dispatch
+        // surface — see `route_unreadable`'s handling a few lines below,
+        // which this route previously had no branch for and now needs one.
+        auto legacy_route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
+            registry_, gateway_route_store_.get());
         const yuzu::server::ConfinedDispatchSink sink{
-            [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
+            [&](const std::string& aid) {
+                if (auto cluster = legacy_route_fallback->cluster_for(aid))
+                    return registry_.send_via_directory(aid, *classified, *cluster);
+                return registry_.send_to(aid, *classified);
+            },
             [&] { return registry_.send_to_all(*classified); },
-            [&] { return registry_.all_ids(); }};
+            [&] { return registry_.all_ids(); },
+            [legacy_route_fallback](const std::vector<std::string>& candidates) {
+                return legacy_route_fallback->prepare(candidates);
+            },
+            [&](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
+            }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves
@@ -19635,18 +19717,30 @@ private:
                                       command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same four-way split as /api/command (command_routes.cpp as of
+            // Same five-way split as /api/command (command_routes.cpp as of
             // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
-            // operator to the wrong subsystem. NO `route_unreadable` branch
-            // here (WS-4 4.2b Task D) — this Broadcast-only sink never wires
-            // `prepare_route_fallback` (see the sink's own comment above),
-            // so `result.route_unreadable` is always false at this site.
+            // operator to the wrong subsystem.
+            //
+            // HA WS-5 governance hardening (external review finding,
+            // 2026-09-22): this comment used to say this sink never wires
+            // `prepare_route_fallback` and so `route_unreadable` could never
+            // be set here — FALSE as of this same slice's own fix a few
+            // lines above (the sink literal now DOES wire it, the same
+            // BLOCKING bug that fix closed). This branch was the missing
+            // consumer: `result.route_unreadable` being true here means a
+            // degraded gateway-directory read, not a per-agent connectivity
+            // fact, and must not fall through to the generic catch-all
+            // below — mirrors command_routes.cpp's identical branch.
             res.status = 503;
             if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.route_unreadable) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the gateway routing directory could not be read for one or more targets — dispatch is failing closed rather than guessing where to route","reason":"route_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (result.denied_quarantined_count > 0) {
                 res.set_content(

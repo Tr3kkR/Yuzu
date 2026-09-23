@@ -63,6 +63,7 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
 // #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
 // TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
@@ -734,6 +735,25 @@ public:
     /// `!workflow_engine` guard's behaviour exactly.
     void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
 
+    /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
+    /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
+    /// server.cpp wires the IDENTICAL instance so the eight Guardian read
+    /// tools can never disagree with REST v1 (`get_guardian_schemas` stays
+    /// outside the seam, store-free — see guardian_api.hpp). `build_handler`'s
+    /// own `GuaranteedStateStore* guaranteed_state_store` parameter stays
+    /// wired too — the eight Guardian tool bodies below now call
+    /// `guardian_api_` exclusively for their reads, but the rule/baseline
+    /// MUTATOR tools (`create_guardian_rule` etc., no public seam of their
+    /// own) still need the raw store. server.cpp constructs this
+    /// UNCONDITIONALLY (never null) — each of the two backing store
+    /// pointers is checked INDIVIDUALLY inside the impl (guardian_api.cpp),
+    /// mirroring dex_perf_api's own multi-dependency posture: a null
+    /// `guaranteed_state_store_` degrades every method, a null
+    /// `baseline_store_` degrades ONLY device_compliance. The tools' own
+    /// `!guardian_api_` guard is therefore defense-in-depth only, matching
+    /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
+    void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1191,6 +1211,8 @@ private:
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
     std::shared_ptr<const WorkflowApi> workflow_api_;
+    // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
+    std::shared_ptr<const GuardianApi> guardian_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
