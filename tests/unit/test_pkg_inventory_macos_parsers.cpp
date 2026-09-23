@@ -736,8 +736,6 @@ TEST_CASE("pkg_inventory macos: managers under an already-expired wall-clock bud
     // count_subdirs checks the clock per entry, so even ONE big listing cannot outlast
     // the budget on a slow filesystem. Zero seconds is expired deterministically (the
     // steady clock never runs backwards).
-    // MUTATION: dropping the per-entry check in count_subdirs reads the Cellar in
-    // full and reports formulae=2 with no token.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_managers_clock_"};
     fs::create_directories(dir.path / "opt/homebrew/Cellar/a/1.0");
     fs::create_directories(dir.path / "opt/homebrew/Cellar/b/1.0");
@@ -758,8 +756,7 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
     using namespace yuzu::pkg_inventory;
     // The walk's wall clock cannot interrupt a syscall stalled on a hung mount inside
     // the tree, so one stalled walk must not let every later dispatch pin another pool
-    // worker. MUTATION: dropping the WalkSlot from run_macos_guarded walks (and would
-    // pin a worker) instead of answering busy, so the tree's rows appear below.
+    // worker.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_busy_"};
     std::string err;
     REQUIRE(build_macos_tree(dir.path, err));
@@ -803,7 +800,7 @@ TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exact
     using namespace yuzu::pkg_inventory;
     // Peak use is two fds; every early return between acquire and release (a refused
     // symlink hop, a failed openat, a truncated listing, a budget stop) must give
-    // them back. MUTATION: leaking the parent Dir on a failed hop grows the count.
+    // them back.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_fdbalance_"};
     fs::create_directories(dir.path / "elsewhere/Cellar/evil/1.0");
     fs::create_directories(dir.path / "opt");

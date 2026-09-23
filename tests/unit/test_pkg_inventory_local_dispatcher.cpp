@@ -407,12 +407,11 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the h
     REQUIRE(plugin->descriptor->action_descriptor_count == 2);
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
 
-    // The declared support per leg is what the code implements TODAY: macOS
-    // Homebrew is wired, Linux managers and both Windows legs are planned
-    // placeholders, Linux packages is unsupported by design. MUTATION: landing
-    // the Linux managers leg without flipping its descriptor (or the reverse)
-    // fails here, which the capability-matrix gate cannot see (it compares the
-    // doc to the descriptor, not the descriptor to behaviour).
+    // The declared support per leg is what the code implements TODAY (macOS Homebrew
+    // wired; Linux managers and both Windows legs planned; Linux packages unsupported
+    // by design). Landing a leg without flipping its descriptor, or the reverse, fails
+    // here; the capability-matrix gate compares the doc to the descriptor, not the
+    // descriptor to behaviour.
     struct Expected {
         const char* action;
         YuzuSupportLevel linux_leg, macos_leg, windows_leg;
@@ -490,9 +489,6 @@ yuzu::agent::LocalDispatcher::Result run_guarded_execute() {
 TEST_CASE("pkg_inventory firewall: any throw becomes one constrained status row, UNAVAILABLE/PARTIAL and "
           "rc 1, never the exception text",
           "[pkg_inventory][firewall]") {
-    // MUTATION: removing the try/catch in run_guarded lets the throw escape
-    // run_guarded (the dispatcher would then see an exception, not a result);
-    // emitting e.what() instead of the fixed token fails the leak assertion.
     g_body_returns = false;
     for (const auto kind : {Thrown::runtime_error, Thrown::bad_alloc, Thrown::non_std}) {
         g_thrown = kind;

@@ -589,6 +589,8 @@ agent_test_exe = executable(
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
              # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
              # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
+             # Wave 10 PR10.1-c: test_pkg_inventory_macos_parsers.cpp reads the this-Mac REAL
+             # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],

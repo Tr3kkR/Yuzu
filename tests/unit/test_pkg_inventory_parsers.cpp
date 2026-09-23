@@ -468,11 +468,8 @@ TEST_CASE("pkg_inventory walk: macOS Cellar entry cap and package row cap (injec
 TEST_CASE("pkg_inventory walk: Intel Homebrew keeps Library/Taps under <prefix>/Homebrew",
           "[pkg_inventory][walk][macos][taps]") {
     // Homebrew's REPOSITORY (the directory holding Library/) is <prefix>/Homebrew on
-    // current Intel installs (HOMEBREW_DEFAULT_REPOSITORY in Library/Homebrew/utils/os.sh).
-    // Reading only <prefix>/Library/Taps reports taps=0 for an Intel host that has
-    // taps, under a supported/OK result: a wrong fact presented as complete.
-    // MUTATION: dropping the `Homebrew/Library/Taps` probe from count_taps fails the
-    // taps=2 assertion below.
+    // current Intel installs (HOMEBREW_DEFAULT_REPOSITORY in Library/Homebrew/utils/os.sh);
+    // reading only <prefix>/Library/Taps reports taps=0 for a host that has taps.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_intel_taps_"};
     const auto& r = dir.path;
     make_dir(r, "usr/local/Cellar/jq/1.7.1");
@@ -537,8 +534,6 @@ TEST_CASE("pkg_inventory walk: a Homebrew repository with no taps and no other m
 TEST_CASE("pkg_inventory walk: a truncated Cellar or Taps listing omits its count, never reports a "
           "lower bound as a fact",
           "[pkg_inventory][walk][macos][limits]") {
-    // MUTATION: leaving `ok` true after a truncated listing (count_subdirs, or the
-    // org listing in count_taps) reports formulae=2 / taps=2 beside the token.
     {
         yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_trunc_cellar_"};
         make_dir(dir.path, "opt/homebrew/Cellar/jq/1.7.1");
@@ -595,8 +590,6 @@ TEST_CASE("pkg_inventory walk: a /usr/local that cannot be read is not Homebrew,
     // /usr/local exists on every Mac, so a link, a file or an unreadable directory
     // there proves nothing; /opt/homebrew exists only when Homebrew does. Either
     // way the failure is reported, never swallowed.
-    // MUTATION: setting `exists` on any failed hop (including the /usr/local root)
-    // emits a phantom `manager|homebrew|unavailable|...|/usr/local` row.
     {
         yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_usrlocal_link_"};
         make_dir(dir.path, "elsewhere");
@@ -677,8 +670,7 @@ TEST_CASE("pkg_inventory walk: fd exhaustion is a constraint, never a fabricated
     // Only a Library/Taps marker exists, on /usr/local (which exists on every Mac).
     // With exactly ONE free fd the prefix root opens but the hop below it fails with
     // EMFILE (`io_error`): that proves nothing about the disk, so no manager row may
-    // appear, while the failure is still reported. MUTATION: counting an io_error
-    // as evidence emits a phantom `unavailable` row here.
+    // appear, while the failure is still reported.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_emfile_"};
     make_dir(dir.path, "usr/local/Library/Taps/org/repo");
 
@@ -726,10 +718,8 @@ TEST_CASE("pkg_inventory walk: symlinked and oddly named entries inside Cellar, 
           "never reach a row or a count",
           "[pkg_inventory][walk][macos]") {
     // Two defenses hold each other up here: classify_entry (fstatat, no follow) and
-    // the O_NOFOLLOW openat, plus version_dir_name_ok on the names. Neither alone is
-    // observed by the other cases. MUTATION: following symlinks in classify_entry
-    // AND opening without O_NOFOLLOW emits `linkid`/`linkver`; weakening the name
-    // filter to leading-dot-only emits the pipe, backslash, tab and non-ASCII names.
+    // the O_NOFOLLOW openat, plus version_dir_name_ok on the names; no other case
+    // observes them inside the tree.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_hostile_"};
     const auto& r = dir.path;
     make_dir(r, "elsewhere/secret/9.9");
@@ -806,8 +796,7 @@ TEST_CASE("pkg_inventory walk: a Cellar that lists but cannot be searched report
 TEST_CASE("pkg_inventory walk: the output byte cap stops the rows and says so, complete at the cap",
           "[pkg_inventory][walk][macos][limits]") {
     // The row cap alone allows ~10 MB of maximum-length names, and the command path
-    // applies no output cap of its own. MUTATION: dropping the byte charge in
-    // append_package_rows returns all three rows with no token.
+    // applies no output cap of its own.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_bytecap_"};
     for (const char* id : {"pkg-a", "pkg-b", "pkg-c"})
         make_dir(dir.path, std::string{"opt/homebrew/Cellar/"} + id + "/1.0");

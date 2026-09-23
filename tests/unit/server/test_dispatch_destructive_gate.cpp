@@ -591,7 +591,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same fifteen spans compose into a real registry
+    // `build_registry`: the same spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{

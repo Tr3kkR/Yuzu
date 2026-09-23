@@ -42,12 +42,12 @@ metadata:
     subprocess. macOS reports each Homebrew prefix found under
     /opt/homebrew and /usr/local with tap, formula and cask counts. The Linux
     leg (dpkg, apt, rpm, dnf, pacman and apk identity and config facts, never
-    a package roster) follows as its own PR: until then Linux reports
+    a package roster) follows in a later release: until then Linux reports
     `status|managers|unsupported|linux:planned` and no manager rows. Windows
-    is planned this release and reports
+    is not implemented in this release and reports
     `status|managers|unsupported|windows:planned`. Machine scope only:
-    per-user package stores are out of scope, deferred to the user-context
-    bridge. A status row always comes first; a genuinely absent manager
+    per-user package stores are out of scope, deferred to the user-session
+    helper (ADR-3003). A status row always comes first; a genuinely absent manager
     produces no manager row, while an unreadable location makes the status
     row `constrained` with a failure token.
   tags: [software, package-managers, inventory]
@@ -90,24 +90,24 @@ spec:
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied or macos:homebrew_taps:walk_budget), linux:planned or windows:planned.'
+        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget or macos:managers:busy), linux:planned or windows:planned.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: root_path
         type: string
         description: 'Manager rows only: the logical root the facts were read from (e.g. /opt/homebrew, /usr/local; /etc/apt once the Linux managers leg lands), never an injected test root; "-" when the manager has no single root (Linux rpm).'
         example: /opt/homebrew
-        platforms: [linux, darwin]
+        platforms: [darwin]
       - name: facts
         type: string
-        description: 'Manager rows only: semicolon-separated key=value manager-level facts, or "-". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read. Only the homebrew keys are emitted in this release (Linux managers leg planned).'
+        description: 'Manager rows only: semicolon-separated key=value manager-level facts, or "-". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read completely (unreadable, truncated at the entry cap, or out of walk budget). Only the homebrew keys are emitted in this release (Linux managers leg planned).'
         example: "taps=0;formulae=66;casks=0"
-        platforms: [linux, darwin]
+        platforms: [darwin]
       - name: reason
         type: string
         description: 'Manager rows only: failure tokens for an unavailable manager, or "-".'
         example: "-"
-        platforms: [linux, darwin]
+        platforms: [darwin]
     aggregation:
       groupBy:
       # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.
@@ -149,10 +149,10 @@ metadata:
     prefixes yields one row per prefix. Linux is UNSUPPORTED by design:
     installed_apps owns the Linux package roster, so this action reports
     `status|packages|unsupported|linux:owned_by_installed_apps` and no
-    package row. Windows is planned this release and reports
+    package row. Windows is not implemented in this release and reports
     `status|packages|unsupported|windows:planned`. Machine scope only:
-    per-user package stores are out of scope, deferred to the user-context
-    bridge. Homebrew casks install .app bundles that installed_apps' macOS
+    per-user package stores are out of scope, deferred to the user-session
+    helper (ADR-3003). Homebrew casks install .app bundles that installed_apps' macOS
     `list` also reports via system_profiler, and installed_apps'
     `list_per_user` lists Homebrew formulae per user, so this action does not
     claim to be disjoint from either; it adds the manager identity and the
@@ -196,7 +196,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap or macos:homebrew_caskroom:walk_budget), linux:owned_by_installed_apps or windows:planned.'
+        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps or windows:planned.'
         example: "3.4.1"
         platforms: [windows, linux, darwin]
       - name: kind
@@ -212,7 +212,7 @@ spec:
       operations:
         - count
 
-  readablePayload: "List package manager packages"
+  readablePayload: "List packages by package manager"
 
   gather:
     ttlSeconds: 300
