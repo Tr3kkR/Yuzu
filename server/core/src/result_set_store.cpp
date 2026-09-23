@@ -694,8 +694,18 @@ std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
                       pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
+    // #4306 fold-in A: predicate aligned with insert_row_impl's authoritative
+    // in-txn recheck (Gate 4 UP-6) -- expired-but-unswept rows do NOT count
+    // against the quota there, so a pre-check without this filter
+    // OVER-counts relative to the authoritative check and could reject a
+    // dispatch the authoritative check would have allowed (a stalled GC
+    // sweep converting GC debt into a spurious operator quota failure).
+    // Keeping the two predicates identical means this pre-check predicts the
+    // authoritative check exactly.
     pg::PgResult res = pg::exec_params(
-        lease.get(), "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1",
+        lease.get(),
+        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+        "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
         std::vector<std::string>{owner});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::count_for_owner_checked: query failed: {}",

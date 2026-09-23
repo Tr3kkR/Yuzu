@@ -490,6 +490,42 @@ TEST_CASE("ResultSetStore: count_for_owner_checked fails closed (DbError) rather
     CHECK(*recovered == 5);
 }
 
+TEST_CASE("ResultSetStore: count_for_owner_checked's predicate matches insert_row_impl's "
+          "authoritative in-txn recheck exactly -- an expired-but-unswept, unpinned row does "
+          "NOT count against the quota (#4306 fold-in A, Gate 4 UP-6 parity)",
+          "[pg][result_set][quota][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto live = store.create_materialized(req("alice", "live"), {"a"});
+    REQUIRE(live.has_value());
+    auto stale = store.create_materialized(req("alice", "stale"), {"b"});
+    REQUIRE(stale.has_value());
+    auto pinned = store.create_materialized(req("alice", "pinned-but-expired"), {"c"});
+    REQUIRE(pinned.has_value());
+    REQUIRE(store.pin(pinned->id).has_value());
+
+    // Age `stale` past its TTL (unpinned -- must NOT count) and `pinned`'s
+    // ttl_at too, even though it's pinned (pinned rows count regardless of
+    // ttl_at, same as the authoritative check's `pinned OR ...` predicate).
+    // Both created_at and ttl_at move together (same idiom as this file's
+    // other TTL-expiry tests) -- the table's own CHECK (ttl_at >= created_at)
+    // rejects a ttl_at-only update against a real, recent created_at.
+    exec_sql(db.dsn(),
+             "UPDATE result_set_store.result_sets SET created_at = 1, ttl_at = 2 WHERE id IN ('" +
+                 stale->id + "', '" + pinned->id + "')");
+
+    // Before this fix, the pre-check counted all 3 (no ttl/pinned filter);
+    // the authoritative in-txn check in insert_row_impl would only ever have
+    // counted 2 (live + pinned) -- a discrepancy that could reject a
+    // dispatch the authoritative check would have allowed. Now they agree.
+    auto checked = store.count_for_owner_checked("alice");
+    REQUIRE(checked.has_value());
+    CHECK(*checked == 2); // live + pinned-but-expired; stale excluded
+}
+
 TEST_CASE("ResultSetStore: list_by_owner_checked matches the plain wrapper on the healthy "
           "path, and fails closed (DbError) rather than reading a degraded backend as an "
           "empty list (#4306 finding 3 / #4307 finding 2)",
