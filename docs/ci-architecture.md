@@ -1116,7 +1116,7 @@ signing/notarization deferred to Phase B). Only the `pre-release.yml`
 The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
 (`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
 eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
-skipped the gateway. Every PR-validated leg now configures with `-Drequire_gateway=true`, so
+skipped the gateway. Every CI leg that configures the full tree (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan) now configures with `-Drequire_gateway=true`, so
 a missing `rebar3` fails configure rather than skipping.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at

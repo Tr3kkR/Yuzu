@@ -45,7 +45,7 @@ out-of-tree build dir (a review worktree, a scratch checkout) needs the same two
 pointing at a populated `vcpkg_installed`.
 
 ### Build options
-`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a missing `rebar3` is a configure error instead of silently skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — every PR-validated CI leg sets it, #4841), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
+`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a missing `rebar3` is a configure error instead of silently skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — every full-tree CI leg sets it: ci.yml, nightly, sanitizer-tests; #4841), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
 
 ### Per-OS build directory convention
 
