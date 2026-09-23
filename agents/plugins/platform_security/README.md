@@ -144,7 +144,7 @@ code_integrity|macos|sip|System Integrity Protection status: enabled.|enabled
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 9cf003de2f97
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 · leg-hash 9cf003de2f97
 
 ```
 == action=secure_boot
@@ -153,9 +153,9 @@ secure_boot|linux|setup_mode|-|absent
 [result_status] OK / FULL
 
 == action=code_integrity
-code_integrity|linux|lsm|-|absent
-code_integrity|linux|lockdown|-|absent
-[result_status] OK / FULL
+code_integrity|linux|lsm|-|unreadable
+code_integrity|linux|lockdown|-|unreadable
+[result_status] CONSTRAINED / PARTIAL / lsm:errno_19,lockdown:errno_19
 ```
 <!-- END GENERATED -->
 
@@ -165,7 +165,7 @@ code_integrity|linux|lockdown|-|absent
 2. **Configured policy, not runtime proof.** The Windows rows read registry values, which say what is configured; whether Device Guard, HVCI or Credential Guard is actually running is a separate runtime fact (`Win32_DeviceGuard`) that this plugin does not query, and it does not call WLDP.
 3. **macOS `secure_boot` is unsupported.** There is no public API for the boot-security policy and `bputil` is a recovery-environment tool that is not run; SIP is reported under `code_integrity`. On a Mac the `secure_boot` action therefore always reports `UNAVAILABLE`.
 4. **Two rung-2 argv leaves on macOS.** Gatekeeper and SIP have no library API, so both are read from a tool's text; the parsers match an exact line and report `unmodelled` for anything else (SIP's `enabled (Custom Configuration).` reads `partial`). `vuln_scan` runs the same two commands through `popen` at rung 3; folding it onto this reader is a follow-up, not part of this change. Security.framework `SecStaticCode*` is not used: every call in that family validates one named code object's own signature, not a machine-wide code-signing-enforcement toggle, so it cannot answer this action's question.
-5. **Fixed reads, no discovery.** The plugin reads only the keys named above; it does not walk securityfs or the registry (apart from listing the names under `CI\Policy`), and it does not report TPM or measured-boot state.
+5. **Fixed reads, no discovery; and Linux `secure_boot` in a container still reads `absent` even on a real Secure-Boot host.** The plugin reads only the keys named above; it does not walk securityfs or the registry (apart from listing the names under `CI\Policy`), and it does not report TPM or measured-boot state. Separately (review 5289352195): `read_file`'s mount-detection reliably distinguishes "mounted but this specific value is absent" from "the whole surface isn't mounted" for `code_integrity`'s `securityfs` reads, but NOT for `secure_boot`'s `efivarfs` reads -- a default container's `/sys` tree omits `/sys/firmware/efi` entirely regardless of the underlying host's real UEFI state (`deploy/docker/Dockerfile.agent` and this repo's compose files don't bind-mount it), so the check can't tell "genuinely no UEFI" from "UEFI present, not exposed to this container" and conservatively leaves the leaf `ENOENT` as `absent`. Closing this needs a deploy-side fix (bind-mounting `/sys/firmware/efi` read-only into the agent container), not more source logic; the sample below is a container capture and shows exactly this residual gap on `secure_boot`'s two rows.
 
 ## Source and tests
 

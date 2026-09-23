@@ -80,6 +80,18 @@ bool dir_exists(const char* dir) {
 // container scenario PR #4792's own review (fjarvis, 5289352195, HIGH)
 // found: this plugin's real Linux sample capture reported all four rows
 // absent/OK/FULL on a host whose actual posture was never probed.
+//
+// KNOWN RESIDUAL GAP (fjarvis, review re-verification, same PR): a default
+// container's /sys tree omits /sys/firmware/efi ENTIRELY, regardless of
+// whether the underlying host is real UEFI -- so `dir_exists` above returns
+// false there even on a genuine Secure-Boot host, and secure_boot/setup_mode
+// still read absent/OK/FULL uncorrected. This is NOT fixable by more source
+// logic here (there is no way to distinguish the two cases from inside the
+// container's own /sys namespace); it needs deploy/docker/Dockerfile.agent
+// (or the operator's own container config) to bind-mount /sys/firmware/efi
+// read-only into the container. Documented in the README's "Caveats and
+// known gaps" -- do not consider this row's ENOENT-vs-mount handling fully
+// closed for secure_boot until that deploy-side gap is addressed too.
 bool surface_unavailable(std::string_view path) {
     if (path.starts_with("/sys/firmware/efi/efivars/"))
         return dir_exists("/sys/firmware/efi") &&
