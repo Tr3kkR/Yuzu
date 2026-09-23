@@ -121,14 +121,25 @@ struct LegacySinkFixture {
     std::unique_ptr<KvStore> kv;
     std::unique_ptr<GuardianEngine> engine;
 
-    LegacySinkFixture() {
+    /// `legacy_sink_max_events_for_test` (#4783 commit 4): 0 (default) leaves the
+    /// executor's default Config in place, matching every case in this file before
+    /// commit 4; non-zero overrides GuardianLegacySinkExecutor::Config::max_events
+    /// BEFORE start_local() runs (GuardianEngine::set_legacy_sink_max_events_for_test's
+    /// own precondition) so a test can force a deterministic RefusedCapacity without
+    /// pushing thousands of events. `prefer_spark` (#4783 commit 4): defaults false,
+    /// matching every prior case (the legacy IGuard path is the sole live production
+    /// path, routed-concerns.md Spark row) — a test can pass true to prove
+    /// legacy_sink_kick()'s gap-repair path runs regardless of the flip, which is the
+    /// whole reason it does not share journal_maintenance_tick()'s prefer_spark_ gate.
+    explicit LegacySinkFixture(std::size_t legacy_sink_max_events_for_test = 0,
+                               bool prefer_spark = false) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
-        // prefer_spark defaults false: the legacy IGuard path is what #4783 is
-        // about, and it is the sole live path in production (routed-concerns.md
-        // Spark row) — no need to pass true here.
-        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-legacy-sink-test");
+        engine =
+            std::make_unique<GuardianEngine>(kv.get(), "agent-legacy-sink-test", prefer_spark);
+        if (legacy_sink_max_events_for_test != 0)
+            engine->set_legacy_sink_max_events_for_test(legacy_sink_max_events_for_test);
         REQUIRE(engine->start_local().has_value());
     }
 
@@ -519,6 +530,159 @@ TEST_CASE("stop() discards the backlog it never sent, but does not touch a send 
     REQUIRE(delivered.size() == 1);
     CHECK(delivered[0].first == "rule-A");
     CHECK(f.engine->legacy_sink_executor_for_test().stats().discarded_at_stop == 1);
+    CHECK(f.engine->active_io_workers() == 0);
+}
+
+// ── #4783 commit 4: legacy_sink_kick() repairs a sticky gap end to end ──────
+
+TEST_CASE("legacy_sink_kick(): a capacity-refused event opens a sticky gap, and the "
+          "heartbeat kick repairs it with a synthesized guard.unhealthy report "
+          "bearing the fixed detail string; a Sent repair clears the gap and "
+          "events_lost stays cumulative (#4783 commit 4)",
+          "[guardian][engine][legacy_sink][chaos]") {
+    BlockingSink blocking;
+    // max_events=1: forces the THIRD offer below to be RefusedCapacity once the
+    // queue already holds one item — see set_legacy_sink_max_events_for_test's own
+    // doc comment for why this must be supplied before start_local() runs, which is
+    // exactly what LegacySinkFixture's constructor now does on our behalf.
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/1};
+    yuzu::test::ScopeExit cleanup([&] {
+        require_legacy_sink_retired(*f.engine, blocking, "legacy_sink_kick gap-repair cleanup");
+    });
+
+    f.engine->set_event_sink(blocking.sink());
+
+    auto drift_for = [](const std::string& rule_id) {
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = rule_id;
+        d.rule_name = rule_id;
+        return d;
+    };
+
+    // #1: dequeued almost immediately — its SEND is what parks inside `blocking`,
+    // so the queue itself is empty again by the time #2 is offered.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-1"));
+    REQUIRE(
+        yuzu::test::spin_until([&] { return blocking.entered() >= 1; }, std::chrono::seconds{30}));
+
+    // #2: admitted — occupies the sole max_events=1 slot.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-2"));
+    REQUIRE(f.engine->legacy_sink_executor_for_test().pending_count_for_test() == 1);
+
+    // #3: the queue is already at max_events(1) — REFUSED, opening a sticky
+    // integrity gap for "gapped-rule" (never queued, so it is not among the
+    // deliveries `blocking` will see below).
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("gapped-rule"));
+    CHECK(f.engine->legacy_sink_executor_for_test().stats().events_lost == 1);
+    CHECK(f.engine->legacy_sink_gap_rules() == 1);
+    CHECK(f.engine->legacy_sink_events_lost() == 1); // the production accessor, not just stats()
+
+    // Release: #1 and #2 deliver (both admitted before the refusal); #3 was never
+    // queued and cannot appear.
+    blocking.release();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    CHECK(blocking.delivered() == 2);
+
+    // Swap in a capturing sink so legacy_sink_kick()'s synthesized repair report is
+    // observable in full, including detail_json — CountingSink only records
+    // (rule_id, event_type), not enough to pin the fixed detail string.
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+
+    f.engine->legacy_sink_kick(); // the method under test
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    {
+        std::lock_guard lk(cap_mu);
+        REQUIRE(captured.size() == 1);
+        CHECK(captured[0].rule_id() == "gapped-rule");
+        CHECK(captured[0].event_type() == "guard.unhealthy");
+        CHECK(captured[0].guard_type() == "file");
+        // The fixed, short kLegacySinkDeliveryGapDetail constant — D1b: never
+        // built from the gap's own rule/lost-count metadata, so no length cap
+        // applies (same argument PR #4748 relied on for its own health_detail).
+        CHECK(captured[0].detail_json() == R"({"detail":"legacy-sink-delivery-gap"})");
+    }
+
+    // Sent -> the gap closes; events_lost is CUMULATIVE and does not decrement.
+    CHECK(f.engine->legacy_sink_gap_rules() == 0);
+    CHECK(f.engine->legacy_sink_events_lost() == 1);
+    CHECK(f.engine->legacy_sink_executor_for_test().stats().gap_rules == 0);
+
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    CHECK(f.engine->active_io_workers() == 0);
+}
+
+// ── #4783 commit 4: independence from prefer_spark_ ──────────────────────────
+
+TEST_CASE("legacy_sink_kick(): the gap-repair path runs and repairs a gap with "
+          "prefer_spark_==true too — it deliberately does NOT share "
+          "journal_maintenance_tick()'s prefer_spark_ gate (#4783 commit 4)",
+          "[guardian][engine][legacy_sink][chaos]") {
+    BlockingSink blocking;
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/1, /*prefer_spark=*/true};
+    yuzu::test::ScopeExit cleanup([&] {
+        require_legacy_sink_retired(*f.engine, blocking,
+                                    "legacy_sink_kick prefer_spark=true cleanup");
+    });
+    REQUIRE(f.engine->prefer_spark());
+
+    // Negative control: journal_maintenance_tick() itself stays a documented no-op
+    // here (prefer_spark_ true but spark never wired via wire_spark_engine(), so
+    // spark_runtime_/lifecycle_journal_ are still null) - proving this test's
+    // engine really is in the "prefer_spark true, spark unwired" shape the
+    // production flip transiently produces, and that calling it does not crash.
+    f.engine->journal_maintenance_tick();
+
+    f.engine->set_event_sink(blocking.sink());
+
+    auto drift_for = [](const std::string& rule_id) {
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = rule_id;
+        d.rule_name = rule_id;
+        return d;
+    };
+
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-1"));
+    REQUIRE(
+        yuzu::test::spin_until([&] { return blocking.entered() >= 1; }, std::chrono::seconds{30}));
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("rule-2"));
+    REQUIRE(f.engine->legacy_sink_executor_for_test().pending_count_for_test() == 1);
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, drift_for("gapped-rule-2"));
+    REQUIRE(f.engine->legacy_sink_gap_rules() == 1);
+
+    blocking.release();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+
+    f.engine->legacy_sink_kick(); // prefer_spark_==true for this engine instance
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    {
+        std::lock_guard lk(cap_mu);
+        REQUIRE(captured.size() == 1);
+        CHECK(captured[0].rule_id() == "gapped-rule-2");
+        CHECK(captured[0].event_type() == "guard.unhealthy");
+    }
+    CHECK(f.engine->legacy_sink_gap_rules() == 0);
+
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
     CHECK(f.engine->active_io_workers() == 0);
 }
 

@@ -2471,6 +2471,15 @@ public:
                                 // an acknowledgment this tick produces is visible on THIS
                                 // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                                // #4783 commit 4: legacy-sink loss visibility. Deliberately
+                                // NOT inside journal_maintenance_tick()'s prefer_spark_ gate
+                                // (nor any other prefer_spark_ conditional in this block) -
+                                // the legacy IGuard sink is the LIVE production path
+                                // regardless of the Spark flip state, so a stranded worker
+                                // or an open integrity gap must be observed and repaired on
+                                // every heartbeat, not only when Spark is preferred. See
+                                // GuardianEngine::legacy_sink_kick()'s own doc comment.
+                                guardian_->legacy_sink_kick();
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
@@ -2521,7 +2530,15 @@ public:
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
                                         .priority_demoted = guardian_->priority_demoted(),
                                         .outbox_backpressure_drops =
-                                            guardian_->outbox_backpressure_drops()});
+                                            guardian_->outbox_backpressure_drops(),
+                                        // #4783 commit 4: never gated on prefer_spark_ -
+                                        // legacy_sink_executor_ is always live, so these
+                                        // two report truthfully whichever backend is
+                                        // actually enforcing.
+                                        .legacy_sink_events_lost =
+                                            guardian_->legacy_sink_events_lost(),
+                                        .legacy_sink_gap_rules =
+                                            guardian_->legacy_sink_gap_rules()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).

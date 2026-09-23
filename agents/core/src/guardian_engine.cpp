@@ -96,6 +96,19 @@ static_assert(is_reserved_plugin_name(kKvNamespace),
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
 
+// #4783 commit 4 (legacy_sink_kick()'s gap-repair loop): a small fixed cap on how
+// many sticky integrity gaps get a repair report synthesized per heartbeat tick -
+// bounds a single kick's work regardless of how many rules are gapped at once
+// (a reconnect burst caps at this many repairs per tick; R6 in the delivery plan).
+constexpr std::size_t kMaxGapRepairsPerKick = 32;
+
+// The fixed, short health_detail carried by every synthesized gap-repair report
+// (GuardDrift::health_detail -> detail_json {"detail": ...}). Deliberately a
+// CONSTANT, never built from the gap's own lost-count/rule metadata, so the #4748
+// health_detail length-cap concern never applies here (same argument that PR
+// relied on - delivery plan D1b / #3 in this file's own header banner).
+constexpr std::string_view kLegacySinkDeliveryGapDetail = "legacy-sink-delivery-gap";
+
 // The rollback guard used by wire_spark_engine() (rollback runs on EVERY exit path,
 // including a catch handler's own logging throwing - Sol rung-7.5 finding 2) is now
 // the shared, terminate-safe GuardianRollback (guardian_scope_guard.hpp): its cleanup
@@ -1529,7 +1542,7 @@ void GuardianEngine::set_event_sink(EventSink sink) {
     event_sink_ = std::move(sink);
 }
 
-void GuardianEngine::emit_guard_event(const GuardDrift& d) {
+void GuardianEngine::emit_guard_event(const GuardDrift& d, bool is_gap_repair) {
     // Snapshot the sink under sink_mtx_, then release BEFORE handing off to
     // legacy_sink_executor_ (#4783) — never hold the lock any longer than needed,
     // and never take mtx_ here (a guard worker can fire while apply_rules/stop hold
@@ -1612,13 +1625,69 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     // everything ABOVE this line keeps whatever throw surface it already had.
     // Delivery, loss accounting and the sticky per-rule integrity gap are
     // legacy_sink_executor_'s job from here — see guardian_legacy_sink_executor.hpp.
-    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink));
+    // `is_gap_repair` (#4783 commit 4) threads straight through: only
+    // legacy_sink_kick() ever passes true, for a synthesized guard.unhealthy
+    // report rebuilding an existing gap — see that method's own doc comment.
+    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink), is_gap_repair);
+}
+
+void GuardianEngine::legacy_sink_kick() noexcept {
+    // #4783 commit 4: deliberately NOT gated on prefer_spark_ (unlike
+    // journal_maintenance_tick() above, whose gate is specific to the spark-runtime
+    // maintenance passes it drives) and deliberately NOT under mtx_ — see this
+    // method's own doc comment in guardian_engine.hpp for the full rationale.
+    // kick()/gapped_rules_needing_repair() take only the executor's own internal
+    // lock; emit_guard_event() below takes only sink_mtx_ then that same executor
+    // lock, exactly like a real guard's own emission path — never mtx_, so this
+    // cannot contend with (or deadlock against) apply_rules()/stop().
+    try {
+        legacy_sink_executor_->kick();
+        const auto gaps =
+            legacy_sink_executor_->gapped_rules_needing_repair(kMaxGapRepairsPerKick);
+        for (const auto& [rule_id, gap] : gaps) {
+            if (gap.repair_in_flight)
+                continue;
+            GuardDrift d;
+            d.guard_type = gap.guard_type;
+            d.rule_id = rule_id;
+            d.rule_name = gap.rule_name;
+            d.health = GuardDrift::Health::Unhealthy;
+            d.health_detail = kLegacySinkDeliveryGapDetail;
+            emit_guard_event(d, /*is_gap_repair=*/true);
+        }
+    } catch (...) {
+        // Firewalled: runs on the bare heartbeat thread (agent.cpp) - same posture
+        // as journal_maintenance_tick()'s own try/catch (review B4a). A throw here
+        // must never escalate to std::terminate.
+    }
+}
+
+std::uint64_t GuardianEngine::legacy_sink_events_lost() const {
+    // No mtx_: legacy_sink_executor_ is set once at construction (never reset in
+    // production - set_legacy_sink_max_events_for_test() is test-only and runs
+    // strictly before start_local()) and guards this counter with its own internal
+    // lock, same no-mtx_ rationale as legacy_sink_executor_for_test() above.
+    return legacy_sink_executor_->stats().events_lost;
+}
+
+std::uint64_t GuardianEngine::legacy_sink_gap_rules() const {
+    return static_cast<std::uint64_t>(legacy_sink_executor_->stats().gap_rules);
+}
+
+void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
+    assert(!started_ &&
+           "set_legacy_sink_max_events_for_test: must be called before start_local()");
+    GuardianLegacySinkExecutor::Config cfg;
+    cfg.max_events = max_events;
+    legacy_sink_executor_ = std::make_unique<GuardianLegacySinkExecutor>(cfg);
 }
 
 // #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
-// take mtx_: legacy_sink_executor_ is set once at construction and never reset, and
-// every method they delegate to is the executor's OWN thread-safe surface — no
-// GuardianEngine-owned state is touched, so there is nothing here for mtx_ to guard.
+// take mtx_: legacy_sink_executor_ is set once at construction and never reset in
+// production (set_legacy_sink_max_events_for_test() above is the one exception, and
+// it is itself test-only, asserted to run before start_local()), and every method
+// they delegate to is the executor's OWN thread-safe surface — no GuardianEngine-
+// owned state is touched, so there is nothing here for mtx_ to guard.
 GuardianLegacySinkExecutor& GuardianEngine::legacy_sink_executor_for_test() const {
     return *legacy_sink_executor_;
 }

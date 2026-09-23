@@ -178,6 +178,28 @@ public:
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
 
+    /// #4783 commit 4: legacy-sink loss VISIBILITY, driven by the agent heartbeat
+    /// alongside journal_maintenance_tick() above but DELIBERATELY NOT sharing its
+    /// gate — journal_maintenance_tick() no-ops when `!prefer_spark_` (it drives
+    /// spark-only maintenance passes), whereas legacy_sink_executor_ is the LIVE
+    /// production path regardless of the flip (prefer_spark_ defaults false; see
+    /// the Spark row in routed-concerns.md), so its own loss-repair path MUST run
+    /// unconditionally. Not gated behind mtx_ either: (1) legacy_sink_executor_->
+    /// kick() relaunches a stranded worker and observes a quiet-queue stall, using
+    /// only the executor's own internal lock; (2) gap repair — for up to
+    /// kMaxGapRepairsPerKick sticky integrity gaps (gapped_rules_needing_repair())
+    /// not already mid-repair, synthesizes a guard.unhealthy report
+    /// (kLegacySinkDeliveryGapDetail, a fixed short constant) via
+    /// emit_guard_event(..., is_gap_repair=true) — which itself takes only
+    /// sink_mtx_, then the executor's own lock, exactly like a real guard's own
+    /// emission. The server's census goes fail-closed (errored) for a gapped rule
+    /// until either the repair is confirmed delivered or the rule's next real
+    /// verdict clears it (same-or-newer timestamp `>=` ordering — D11's "first
+    /// verdict clears" semantics, docs/spark-legacy-delta-registry.md). noexcept:
+    /// runs on the bare heartbeat thread (agent.cpp), same posture as
+    /// journal_maintenance_tick()'s own firewalling.
+    void legacy_sink_kick() noexcept;
+
     /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
     /// (#2298 gate 1) this KICKS the drain worker rather than paging inline: it takes mtx_
     /// briefly, then notifies. The reconnect thread therefore never touches the KvStore.
@@ -265,6 +287,23 @@ public:
     /// counter). Surfaced as `yuzu.guardian_outbox_backpressure_drops`. Zero when
     /// prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
+
+    /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
+    /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see
+    /// guardian_legacy_sink_executor.hpp's own loss-table doc comment; LinkDown and
+    /// discarded_at_stop are DELIBERATELY excluded, same doc). Never gated on
+    /// prefer_spark_ — legacy_sink_executor_ is always live. Surfaced as
+    /// `yuzu.guardian_legacy_sink_events_lost` (heartbeat, sparse: 0 omits the tag).
+    /// Production accessor — unlike legacy_sink_executor_for_test() above, this is
+    /// the one production code (agent.cpp's heartbeat) actually calls.
+    [[nodiscard]] std::uint64_t legacy_sink_events_lost() const;
+
+    /// #4783 commit 4: CURRENT count of rules with an open sticky integrity gap
+    /// (shrinks back to 0 once each gap's repair report is confirmed Sent — see
+    /// legacy_sink_kick() above). Surfaced as `yuzu.guardian_legacy_sink_gap_rules`
+    /// (sparse). Production accessor, same rationale as legacy_sink_events_lost()
+    /// above.
+    [[nodiscard]] std::uint64_t legacy_sink_gap_rules() const;
 
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
@@ -561,6 +600,21 @@ public:
     /// momentarily alive even after the queue reports idle.
     [[nodiscard]] bool retire_legacy_sink_workers_for_test(std::chrono::milliseconds timeout) const;
 
+    /// TEST-ONLY (#4783 commit 4): replaces legacy_sink_executor_ with a freshly
+    /// constructed instance whose Config::max_events is `max_events` — lets a test
+    /// force a deterministic RefusedCapacity (and the sticky gap it records)
+    /// without pushing thousands of events. GuardianLegacySinkExecutor::Config is
+    /// not usable as a parameter type here directly (this header only
+    /// forward-declares GuardianLegacySinkExecutor, the same ABI-boundary reason
+    /// set_spark_backend_op_deadline_for_test above threads only the one field
+    /// tests need instead of the runtime's own Config type) — so, like that seam,
+    /// only the single field a test needs is threaded through. MUST be called
+    /// BEFORE start_local() (asserted, same pre-start_local() convention as
+    /// set_rearm_fault_hook_for_test above): the fresh executor replaces one that
+    /// may otherwise already have live queued/in-flight state once guards can run.
+    /// No production caller.
+    void set_legacy_sink_max_events_for_test(std::size_t max_events);
+
 private:
     KvStore* kv_;
     std::string agent_id_;
@@ -733,7 +787,15 @@ private:
     /// final hand-off is. Called from guard worker threads, so it takes ONLY
     /// sink_mtx_ (never mtx_): guards may fire during apply_rules / stop which
     /// hold mtx_, and taking mtx_ here would deadlock the stop-join.
-    void emit_guard_event(const GuardDrift& drift);
+    ///
+    /// `is_gap_repair` (#4783 commit 4): threaded straight through to offer()'s own
+    /// parameter of the same name — set ONLY by legacy_sink_kick() when building a
+    /// synthesized guard.unhealthy report for a sticky integrity gap; every real
+    /// guard callsite (and the guardian_emit_drift_for_test friend helper) uses the
+    /// default. This flag is what lets the executor mark repair_in_flight / clear
+    /// the gap on Sent without the executor having to reconstruct "is this drift
+    /// report actually a repair" from the event's own content.
+    void emit_guard_event(const GuardDrift& drift, bool is_gap_repair = false);
 
     // Test seam: drift emission is otherwise reachable only through an armed
     // guard, and guards are Windows-only / no-op elsewhere — so the event_id
