@@ -284,6 +284,35 @@ inline ReadFailure classify_win32_failure(std::string_view name, std::uint32_t e
     return {"unreadable", std::string{name} + ":win32_" + std::to_string(err), false};
 }
 
+/// The two registry-backed rows, in emit order: the Session Manager\kernel VALUE each reads and
+/// the row name it reports under.
+struct RegistryRow {
+    std::wstring_view value_name;
+    std::string_view row_name;
+    std::string_view row_prefix;
+};
+inline constexpr std::array<RegistryRow, 2> kRegistryRows{{
+    {L"MitigationOptions", "mitigation_options", "mitigation."},
+    {L"MitigationAuditOptions", "mitigation_audit_options", "mitigation_audit."},
+}};
+
+/// One row's failure when the Session Manager\kernel KEY itself could not be opened: every
+/// registry row fails with the key's error, classified as ReadSource::structural_key (a
+/// not-found key is `key_missing`, never absence). Decided here rather than in the Win32 shell
+/// so the structural-key rule is unit-tested at the point the shell consumes it.
+struct NamedFailure {
+    std::string_view row_name;
+    ReadFailure failure;
+};
+inline std::array<NamedFailure, kRegistryRows.size()> kernel_key_open_failures(std::uint32_t err) {
+    std::array<NamedFailure, kRegistryRows.size()> out{};
+    for (std::size_t i = 0; i < kRegistryRows.size(); ++i)
+        out[i] = {kRegistryRows[i].row_name,
+                  classify_win32_failure(kRegistryRows[i].row_name, err,
+                                         ReadSource::structural_key)};
+    return out;
+}
+
 /// A read that failed for a cause the shell detected itself (ERROR_MORE_DATA -> "oversized",
 /// a non-REG_BINARY type -> "type_<n>", a decoder token): unreadable, one token, never a denial.
 inline ReadFailure unreadable_failure(std::string_view name, std::string_view cause) {

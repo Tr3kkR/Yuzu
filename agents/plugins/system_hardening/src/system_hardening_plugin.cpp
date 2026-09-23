@@ -5,8 +5,9 @@
  * Action:
  *   "posture" -- one row per allowlisted key:
  *                  posture|<os>|<key>|<raw>|<state>
- *                state is enabled | disabled | partial | unmodelled | absent |
- *                unreadable (see system_hardening_parsers.hpp). Every key
+ *                state is enabled | disabled | partial (Linux, macOS) or
+ *                on | off | default (Windows), plus unmodelled | absent |
+ *                unreadable on every OS (see system_hardening_parsers.hpp). Every key
  *                reads as a value, `absent` or `unreadable` -- one token never
  *                stands for two causes.
  *
@@ -47,7 +48,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "allowlisted /proc/sys reads (open/read, errno-classified absent/unreadable; a missing "
-         "key is absent only when statfs confirms /proc/sys is procfs)",
+         "key is absent only when statfs confirms its directory is procfs)",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,

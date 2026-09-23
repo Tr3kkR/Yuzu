@@ -380,6 +380,28 @@ TEST_CASE("system_hardening: a leaf ENOENT is absence only when /proc/sys is con
     CHECK(classify_read_errno(remap_enoent_for_surface(ENOENT, true)) == PostureState::absent);
 }
 
+// Fails under: the Linux leg only ever statfs()ing /proc/sys (a tmpfs over /proc/sys/kernel then
+// reads as a clean `absent`), probing a directory outside /proc/sys, or dropping the /proc/sys
+// fallback that a legitimately missing directory (kernel/yama without Yama) defers to.
+TEST_CASE("system_hardening: the surface probe walks from the leaf's directory up to /proc/sys",
+          "[system_hardening][classify]") {
+    CHECK(surface_probe_dirs("/proc/sys/kernel/yama/ptrace_scope") ==
+          std::vector<std::string>{"/proc/sys/kernel/yama", "/proc/sys/kernel", "/proc/sys"});
+    CHECK(surface_probe_dirs("/proc/sys/fs/suid_dumpable") ==
+          std::vector<std::string>{"/proc/sys/fs", "/proc/sys"});
+    CHECK(surface_probe_dirs("/proc/sys/kernel") == std::vector<std::string>{"/proc/sys"});
+    CHECK(surface_probe_dirs("/proc/sysfoo/x") == std::vector<std::string>{"/proc/sys"});
+    CHECK(surface_probe_dirs("/etc/passwd") == std::vector<std::string>{"/proc/sys"});
+    // Every allowlisted key probes its own directory first and /proc/sys last.
+    for (const auto& k : kLinuxAllowlist) {
+        INFO(k.path);
+        const auto dirs = surface_probe_dirs(k.path);
+        REQUIRE(dirs.size() >= 2);
+        CHECK(std::string_view{k.path}.starts_with(dirs.front() + "/"));
+        CHECK(dirs.back() == "/proc/sys");
+    }
+}
+
 // Fails under: a hidden /proc/sys (what the Linux leg hands the pure layer after the surface
 // check) reading as absent/OK, losing a per-key token, or double-reporting via the canary.
 TEST_CASE("system_hardening: a hidden /proc/sys is eleven unreadable rows, never absent/OK",

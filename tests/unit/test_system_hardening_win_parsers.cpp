@@ -271,6 +271,30 @@ TEST_CASE("win32 failures: a not-found structural KEY is unreadable key_missing,
     CHECK_FALSE(other.access_denied);
 }
 
+// Fails under: the Win32 shell's key-open path classifying through anything but the
+// structural-key rule, a registry row missing from (or reordered in) the open-failure set, or a
+// row name drifting from the value it reads.
+TEST_CASE("win32 failures: a failed kernel-key open fails every registry row as the key",
+          "[system_hardening][win_parsers]") {
+    REQUIRE(kRegistryRows.size() == 2);
+    CHECK(kRegistryRows[0].row_name == "mitigation_options");
+    CHECK(kRegistryRows[0].value_name == L"MitigationOptions");
+    CHECK(kRegistryRows[1].row_name == "mitigation_audit_options");
+    CHECK(kRegistryRows[1].value_name == L"MitigationAuditOptions");
+
+    const auto missing = kernel_key_open_failures(kErrorFileNotFound);
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        INFO(missing[i].row_name);
+        CHECK(missing[i].row_name == kRegistryRows[i].row_name);
+        CHECK(missing[i].failure.state == "unreadable");
+        CHECK(missing[i].failure.token == std::string{kRegistryRows[i].row_name} + ":key_missing");
+        CHECK_FALSE(missing[i].failure.access_denied);
+    }
+    const auto denied = kernel_key_open_failures(kErrorAccessDenied);
+    CHECK(denied[1].failure.token == "mitigation_audit_options:access_denied");
+    CHECK(denied[1].failure.access_denied);
+}
+
 TEST_CASE("win32 failures: GetProcessMitigationPolicy INVALID_PARAMETER / NOT_SUPPORTED are absent, "
           "no token; a registry read of the same errors is a real failure",
           "[system_hardening][win_parsers]") {

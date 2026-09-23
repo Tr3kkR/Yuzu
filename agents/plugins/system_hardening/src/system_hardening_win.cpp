@@ -109,12 +109,13 @@ void report_failure(yuzu::CommandContext& ctx, Probe& p, std::string_view row_na
 }
 
 /// Reads + decodes one REG_BINARY value, emitting its rows or one absent/unreadable row.
-void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const wchar_t* value_w,
-                  std::string_view row_name, std::string_view row_prefix) {
+void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const mit::RegistryRow& row) {
+    const std::wstring value_w{row.value_name};
+    const std::string_view row_name = row.row_name;
     DWORD type = 0;
     DWORD size = kReadCap;
     std::vector<BYTE> buf(kReadCap);
-    const LSTATUS rc = RegQueryValueExW(kernel_key, value_w, nullptr, &type, buf.data(), &size);
+    const LSTATUS rc = RegQueryValueExW(kernel_key, value_w.c_str(), nullptr, &type, buf.data(), &size);
     if (rc == ERROR_MORE_DATA)
         return report_failure(ctx, p, row_name, mit::unreadable_failure(row_name, "oversized"));
     if (rc != ERROR_SUCCESS)
@@ -126,7 +127,7 @@ void collect_blob(yuzu::CommandContext& ctx, Probe& p, HKEY kernel_key, const wc
                               mit::unreadable_failure(row_name, "type_" + std::to_string(type)));
 
     auto rows = mit::decode_mitigation_options(std::span<const uint8_t>{buf.data(), size},
-                                               row_prefix);
+                                               row.row_prefix);
     if (!rows)
         return report_failure(ctx, p, row_name,
                               mit::unreadable_failure(row_name, rows.error().token));
@@ -139,17 +140,14 @@ void collect_registry(yuzu::CommandContext& ctx, Probe& p) {
     const LSTATUS orc =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKernelKey, 0, KEY_READ | KEY_WOW64_64KEY, key.put());
     if (orc != ERROR_SUCCESS) {
-        // The key itself, not a value inside it: a not-found here is never legitimate
-        // absence (ReadSource::structural_key), so both rows read unreadable.
-        for (const char* name : {"mitigation_options", "mitigation_audit_options"})
-            report_failure(ctx, p, name,
-                           mit::classify_win32_failure(name, static_cast<std::uint32_t>(orc),
-                                                       mit::ReadSource::structural_key));
+        // The key itself, not a value inside it: never legitimate absence (the pure layer
+        // classifies it ReadSource::structural_key), so every registry row reads unreadable.
+        for (const auto& f : mit::kernel_key_open_failures(static_cast<std::uint32_t>(orc)))
+            report_failure(ctx, p, f.row_name, f.failure);
         return;
     }
-    collect_blob(ctx, p, key.get(), L"MitigationOptions", "mitigation_options", "mitigation.");
-    collect_blob(ctx, p, key.get(), L"MitigationAuditOptions", "mitigation_audit_options",
-                 "mitigation_audit.");
+    for (const auto& row : mit::kRegistryRows)
+        collect_blob(ctx, p, key.get(), row);
 }
 
 /// One GetProcessMitigationPolicy call; the pure decoder consumes `Flags`.

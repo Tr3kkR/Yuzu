@@ -223,10 +223,35 @@ inline constexpr std::array<MacosKey, 4> kMacosAllowlist{{
 /// into ENOENT without saying anything about the host's hardening, so an unconfirmed surface
 /// remaps ENOENT to ENODEV: `unreadable` + `<key>:errno_19`, never a clean `absent`. Every
 /// other errno passes through untouched. `surface_mounted` is decided by the Linux leg
-/// (statfs magic of /proc/sys); this function is the pure half of that decision. The
+/// (statfs magic of the leaf's nearest existing directory, surface_probe_dirs); this function
+/// is the pure half of that decision. The
 /// sibling platform_security plugin applies the same rule to efivarfs/securityfs.
 [[nodiscard]] constexpr int remap_enoent_for_surface(int err, bool surface_mounted) noexcept {
     return (err == ENOENT && !surface_mounted) ? ENODEV : err;
+}
+
+inline constexpr std::string_view kProcSysRoot = "/proc/sys";
+
+/// The directories whose filesystem decides whether a leaf ENOENT is trustworthy, nearest
+/// first: the leaf's parent, then each ancestor up to and including /proc/sys. The Linux leg
+/// statfs()es them in order and trusts the FIRST that exists, so an overmount of a subtree (a
+/// tmpfs over /proc/sys/kernel) is caught, while a directory that is legitimately missing
+/// (kernel/yama without Yama built in) defers to its procfs parent. A path outside /proc/sys
+/// yields just /proc/sys.
+[[nodiscard]] inline std::vector<std::string> surface_probe_dirs(std::string_view leaf_path) {
+    std::vector<std::string> dirs;
+    const bool under_root = leaf_path.size() > kProcSysRoot.size() &&
+                            leaf_path.starts_with(kProcSysRoot) &&
+                            leaf_path[kProcSysRoot.size()] == '/';
+    if (under_root) {
+        std::string_view dir = leaf_path.substr(0, leaf_path.rfind('/'));
+        while (dir.size() > kProcSysRoot.size()) {
+            dirs.emplace_back(dir);
+            dir = dir.substr(0, dir.rfind('/'));
+        }
+    }
+    dirs.emplace_back(kProcSysRoot);
+    return dirs;
 }
 
 /// EACCES/EPERM: the read was refused. The one pair failure_token spells `:eacces`

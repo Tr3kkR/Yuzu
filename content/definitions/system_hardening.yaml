@@ -47,7 +47,7 @@ spec:
     properties: {}
 
   result:
-    # posture|<os>|<key>|<raw>|<state>   (also: constrained|<reason> on an internal error)
+    # posture|<os>|<key>|<raw>|<state>   (also: constrained|<os>|internal_error|-|unreadable on an internal error)
     columns:
       - name: row_kind
         type: string
