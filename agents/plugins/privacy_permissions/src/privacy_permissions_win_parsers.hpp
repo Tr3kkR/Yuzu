@@ -6,12 +6,15 @@
  * platform_security_win_parsers.hpp. windows.h-free: the Win32 codes it branches on are
  * mirrored below and static_asserted against the real macros in privacy_permissions_win.cpp.
  *
- * UNKNOWN, pending a real-hardware probe (see the plan's "genuine unknowns" list): the real
- * literal `Value` vocabulary. `Allow`/`Deny` are what the charter names; this file does NOT
- * assume that is the complete set -- any other value decodes as `prompt_undetermined` when it
- * looks plausible (non-empty, no embedded NUL) and `unreadable` only when the type itself is
- * wrong (not REG_SZ) or genuinely empty, so a real third state discovered by the probe fails
- * SAFE (a named, visible state) rather than silently misclassifying as allowed or denied.
+ * MEASURED on the-rig (Windows 11 Pro 10.0.26200, LocalSystem, read-only reg dumps,
+ * 2026-09-23): the `Value` literals seen are `Allow`, `Deny` and `Prompt`; this file does NOT
+ * assume that is the complete set -- any other value decodes as `prompt_undetermined` (a named,
+ * visible state) and `unreadable` only when the type is wrong (not REG_SZ) or the value empty.
+ * The same host showed the ConsentStore's three levels: HKLM `<capability>` `Value` (the device
+ * toggle -- `Allow` on all 33 capabilities of this non-MDM host), the per-user `<capability>`
+ * `Value`, and the per-user `<capability>\NonPackaged` `Value` (the "let desktop apps access"
+ * toggle). A per-app NonPackaged child carries NO `Value` -- only LastUsedTimeStart/Stop -- so it
+ * reads `absent` (no per-app decision; the NonPackaged toggle row governs it).
  */
 #pragma once
 
@@ -19,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,10 +50,17 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
     {"broadFileSystemAccess", "full_disk_access"},
 }};
 
-[[nodiscard]] constexpr std::string_view capability_to_category(std::string_view capability_name) noexcept {
-    for (const auto& c : kCapabilities)
-        if (c.capability_name == capability_name) return c.category;
-    return {};
+/// `<capability>\NonPackaged` is both the container of per-app desktop keys and, through its own
+/// `Value`, the "let desktop apps access" toggle. That toggle is reported as its own row under
+/// this app_id (qualified `<user>\NonPackaged` per profile, bare on HKLM -- qualify_app_id).
+inline constexpr std::string_view kNonPackagedToggleAppId = "NonPackaged";
+
+/// NonPackaged children that are containers, not apps (measured on the-rig:
+/// `NonPackaged\Executables\<exe>` holds only a `GlobalPromptShown` DWORD per executable, never
+/// a `Value`). Skipped by name; any other child is read as an app key, so an unknown shape stays
+/// a visible row rather than vanishing.
+[[nodiscard]] constexpr bool is_nonpackaged_container_key(std::string_view name) noexcept {
+    return name == "Executables";
 }
 
 /// The ConsentStore `Value` REG_SZ decoded to a PermissionState. `type_ok` = the registry
@@ -101,12 +112,82 @@ inline constexpr std::array<CapabilityEntry, 4> kCapabilities{{
 inline constexpr long kErrorSuccess = 0;
 inline constexpr long kErrorFileNotFound = 2;
 inline constexpr long kErrorAccessDenied = 5;
+inline constexpr long kErrorNoMoreItems = 259;
 inline constexpr std::uint32_t kRegSz = 1;
 inline constexpr std::uint32_t kRegQword = 11;
 
 /// `access_denied` or `win32_<rc>` -- the cause suffix every failed registry call reports.
 [[nodiscard]] inline std::string win32_cause(long rc) {
     return rc == kErrorAccessDenied ? std::string{"access_denied"} : "win32_" + std::to_string(rc);
+}
+
+// ── subkey enumeration outcome ─────────────────────────────────────────
+
+enum class EnumOutcome { complete, truncated, failed };
+
+struct EnumVerdict {
+    EnumOutcome outcome;
+    long rc = kErrorSuccess; // the failing code when `failed`
+};
+
+/// How a capped RegEnumKeyExW walk ended. `last_rc` is the code that ended the loop: anything but
+/// ERROR_SUCCESS means the walk stopped on its own (ERROR_NO_MORE_ITEMS is the only clean stop,
+/// every other code a real failure); ERROR_SUCCESS means the loop stopped only because it hit
+/// the cap, and `probe_rc` -- one extra RegEnumKeyExW at the next index -- decides: NO_MORE_ITEMS
+/// = there were EXACTLY cap children (complete, never a failure), SUCCESS = a real next child
+/// exists (truncated), anything else = the probe itself failed (failed, never read as complete).
+[[nodiscard]] constexpr EnumVerdict classify_subkey_enum(long last_rc, long probe_rc) noexcept {
+    if (last_rc != kErrorSuccess) {
+        if (last_rc == kErrorNoMoreItems) return {EnumOutcome::complete, kErrorSuccess};
+        return {EnumOutcome::failed, last_rc};
+    }
+    if (probe_rc == kErrorNoMoreItems) return {EnumOutcome::complete, kErrorSuccess};
+    if (probe_rc == kErrorSuccess) return {EnumOutcome::truncated, kErrorSuccess};
+    return {EnumOutcome::failed, probe_rc};
+}
+
+struct EnumFailure {
+    std::string cause; // `<kind>_enum_truncated` or `<kind>_enum_<rc>`
+    bool denied = false;
+};
+
+/// The failure an enumeration contributes, or nullopt for a complete one -- a complete walk,
+/// including one of exactly the cap, never produces a failure token.
+[[nodiscard]] inline std::optional<EnumFailure> enum_failure(std::string_view kind,
+                                                             const EnumVerdict& v) {
+    switch (v.outcome) {
+    case EnumOutcome::complete:
+        return std::nullopt;
+    case EnumOutcome::truncated:
+        return EnumFailure{std::string{kind} + "_enum_truncated", false};
+    case EnumOutcome::failed:
+        break;
+    }
+    return EnumFailure{std::string{kind} + "_enum_" + std::to_string(v.rc),
+                       v.rc == kErrorAccessDenied};
+}
+
+// ── profile SID validation ──────────────────────────────────────────────
+
+/// A SID string of the `S-1-<authority>(-<subauthority>)*` shape, every component decimal
+/// digits, within a sane length. Checked BEFORE the SID is appended to HKEY_USERS: an empty or
+/// malformed string there would open the HKU root itself (or some other key), never the
+/// profile's own hive.
+[[nodiscard]] constexpr bool is_valid_sid_string(std::string_view sid) noexcept {
+    constexpr std::size_t kMaxSidChars = 256;
+    if (sid.size() > kMaxSidChars || !sid.starts_with("S-1-")) return false;
+    std::size_t digits = 0;
+    for (std::size_t i = 4; i < sid.size(); ++i) {
+        const char c = sid[i];
+        if (c >= '0' && c <= '9') {
+            ++digits;
+        } else if (c == '-' && digits > 0) {
+            digits = 0;
+        } else {
+            return false;
+        }
+    }
+    return digits > 0;
 }
 
 /// One LastUsedTimeStart/LastUsedTimeStop field. `value` is epoch-ms, "-" (the value is not
@@ -153,28 +234,44 @@ struct RawGrant {
     return g.read_denied || g.state == PermissionState::unreadable;
 }
 
-/// An HKLM value may override a profile's entry ONLY when it was SUCCESSFULLY read and decoded
-/// to a real state -- an absent, unreadable or refused HKLM value says nothing about policy and
-/// must never displace what the profile really holds.
-[[nodiscard]] inline bool hklm_value_authoritative(const RawGrant& g) noexcept {
-    if (grant_failed(g)) return false;
-    return g.state == PermissionState::allowed || g.state == PermissionState::denied ||
-           g.state == PermissionState::prompt_undetermined;
+/// PRECEDENCE -- Microsoft's documented Settings model for the ConsentStore, confirmed on the-rig
+/// (a non-MDM host carries HKLM `<capability>` `Value Allow` on every capability): the
+/// machine-wide HKLM `Value` is the DEVICE toggle ("allow access on this device"). An HKLM `Deny`
+/// blocks every user whatever their own value; an HKLM `Allow` blocks nothing and defers to each
+/// user's own choice. So only a SUCCESSFULLY read and decoded HKLM `Deny` overrides a profile:
+/// most restrictive wins, key by key -- the capability toggle (`-`) against the user's
+/// capability toggle, the NonPackaged toggle against the user's NonPackaged toggle, an app
+/// against the same app. An HKLM `Allow` or unmodelled value never overrides a user's Deny or
+/// prompt (nor fills a key the user lacks -- that would invent a per-user grant); an absent,
+/// unreadable or refused HKLM value says nothing. Rows below a toggle are reported as stored:
+/// the toggle rows are what govern them, and the plugin does not compute an effective state.
+[[nodiscard]] inline bool hklm_overrides_profile(const RawGrant& g) noexcept {
+    return !grant_failed(g) && g.state == PermissionState::denied;
 }
 
-/// The profile's own grants with every AUTHORITATIVE HKLM grant applied: HKLM wins a matching
-/// (app_id, category) over a successfully-read profile entry (an MDM/GPO-locked policy over the
-/// user's own choice) and fills in a key the profile lacks. A FAILED profile entry is never
-/// overwritten -- its failure row is kept and the HKLM value is added beside it, so a read
-/// failure is never hidden behind a policy value. Non-authoritative HKLM grants are NOT merged
-/// (the caller reports those once, as HKLM's own rows). Output sorted by (app_id, category).
+/// Whether an HKLM entry is emitted ONCE as HKLM's own unqualified row. An overriding `Deny` is
+/// applied into each reachable profile's merge instead, so it is its own row only when no
+/// profile was reachable to carry it. Everything else HKLM holds is its own row -- except a
+/// capability-level `absent` coverage entry, which says nothing and is left to
+/// fill_uncovered_categories.
+[[nodiscard]] inline bool hklm_emitted_once(const RawGrant& g, bool any_profile_reachable) noexcept {
+    if (hklm_overrides_profile(g)) return !any_profile_reachable;
+    return grant_failed(g) || g.app_id != "-" || g.state != PermissionState::absent;
+}
+
+/// The profile's own grants with every overriding HKLM `Deny` applied (hklm_overrides_profile):
+/// it replaces a successfully-read profile entry for the same (app_id, category) and fills a key
+/// the profile lacks. A FAILED profile entry is never overwritten -- its failure row is kept and
+/// the HKLM value is added beside it, so a read failure is never hidden behind a policy value.
+/// Every other HKLM entry is skipped here (the caller reports those once, hklm_emitted_once).
+/// Output sorted by (app_id, category).
 [[nodiscard]] inline std::vector<RawGrant> merge_with_hklm(std::span<const RawGrant> profile,
                                                            std::span<const RawGrant> hklm) {
     std::map<std::pair<std::string, std::string_view>, RawGrant> merged;
     std::vector<RawGrant> extra; // HKLM values applied beside a failed profile entry
     for (const auto& g : profile) merged[{g.app_id, g.category}] = g;
     for (const auto& h : hklm) {
-        if (!hklm_value_authoritative(h)) continue;
+        if (!hklm_overrides_profile(h)) continue;
         const auto it = merged.find({h.app_id, h.category});
         if (it != merged.end() && grant_failed(it->second))
             extra.push_back(h);

@@ -487,6 +487,35 @@ TEST_CASE("browser_inventory (real fragment): Forensics single-target rule — 1
     }
 }
 
+// Wave 8 PR8.5 — pins the REAL privacy_permissions fragment (not the hand-built
+// kForensicsFixture above) through the same Forensics single-target rule: its one row is
+// ReadOnly/AdminOrApproval under the Forensics securable (execution_artifacts' boundary), so
+// it must be targeted exactly as execution_artifacts is.
+TEST_CASE("privacy_permissions.permissions (real fragment): Forensics single-target rule — 1 "
+          "agent Targeted, 2 agents RefuseUntargeted",
+          "[server][dispatch][security][capability]") {
+    namespace capdecls = yuzu::server::capdecls;
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_privacy_permissions()};
+    auto classified = registry.classify("privacy_permissions", "permissions");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+
+    const auto refused = evaluate_destructive_targeting(classified,
+                                                         /*valid_nonempty_agent_ids=*/true,
+                                                         /*scope_key_present=*/false,
+                                                         /*agent_id_count=*/2);
+    CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+    CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+    CHECK(refused.refusal_message == kForensicUntargetedMessage);
+}
+
 TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
           "Forensics pair",
           "[server][dispatch][security]") {

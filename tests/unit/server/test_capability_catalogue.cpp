@@ -389,3 +389,29 @@ TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact
         CHECK_FALSE(it->system_reserved);
     }
 }
+
+/// Exact-row pin for `privacy_permissions` (Wave 8 PR8.5, Forensics-class): the same
+/// field-for-field copy of execution_artifacts' Forensics/AdminOrApproval boundary as the
+/// browser_inventory pin above, checked on the fragment AND as the composed registry
+/// classifies it, so neither a fragment edit nor a composition change can drift it silently.
+TEST_CASE("capability catalogue: privacy_permissions.permissions pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_privacy_permissions();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "privacy_permissions");
+        CHECK(r.action == "permissions");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("privacy_permissions", "permissions");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
+}

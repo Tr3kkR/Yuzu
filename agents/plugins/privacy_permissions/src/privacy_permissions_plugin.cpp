@@ -70,8 +70,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore via its "
       "loaded HKU\\<SID> hive or an offline NTUSER.DAT mount (RegLoadKeyW, SeBackup/SeRestore), "
       "plus the same HKLM ConsentStore path",
-      "LocalSystem's own HKCU is not read; an HKLM value overrides a profile's only when "
-      "successfully read; the HKLM mirror's shape is unconfirmed on real hardware"}},
+      "measured on the-rig (Windows 11, LocalSystem) 2026-09-23; LocalSystem's own HKCU is not "
+      "read; only a successfully read HKLM Deny (the device toggle) overrides a profile"}},
 };
 
 } // namespace

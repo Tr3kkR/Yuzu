@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
@@ -62,6 +63,7 @@ inline constexpr std::array<TccService, 3> kTccServices{{
 inline constexpr int kSqlitePerm = 3;
 inline constexpr int kSqliteCantOpen = 14;
 inline constexpr int kSqliteAuth = 23;
+inline constexpr int kSqliteCantOpenSymlink = kSqliteCantOpen | (6 << 8); // extended code
 
 enum class SourceOutcome { absent, denied, unreadable };
 
@@ -93,16 +95,62 @@ classify_tcc_presence(int lstat_errno, bool is_regular_file, bool missing_is_abs
 }
 
 /// A sqlite3_open_v2 / sqlite3_prepare_v2 failure on a file the lstat pre-check already saw
-/// as present: SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM is the SIP/TCC refusal shape (the
-/// charter's expected outcome for a process without Full Disk Access) -> denied; any other code
+/// as present. SQLITE_AUTH/SQLITE_PERM are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY
+/// when the VFS's own failed syscall (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES --
+/// the SIP/TCC refusal shape, the charter's expected outcome without Full Disk Access; a
+/// CANTOPEN for any other reason (ENOENT after a race, EMFILE, ...) is unreadable. Any other code
 /// (SQLITE_NOMEM, SQLITE_IOERR, SQLITE_NOTADB, a schema error) is a real fault that gaining FDA
-/// would not fix -> unreadable (C4-CODEX-004). `rc` may be an extended code; only the primary
-/// byte is compared.
-[[nodiscard]] constexpr SourceOutcome classify_tcc_sqlite_rc(int rc) noexcept {
+/// would not fix -> unreadable (C4-CODEX-004). Pass the EXTENDED code (sqlite3_extended_errcode):
+/// SQLITE_CANTOPEN_SYMLINK is SQLITE_OPEN_NOFOLLOW refusing a symbolic link somewhere in the path
+/// -- never a permission refusal, and sqlite3_system_errno is stale for it (no syscall failed),
+/// so it is unreadable whatever errno says. Otherwise only the primary byte is compared.
+[[nodiscard]] constexpr SourceOutcome classify_tcc_sqlite_rc(int rc, int sys_errno) noexcept {
+    if (rc == kSqliteCantOpenSymlink) return SourceOutcome::unreadable;
     const int primary = rc & 0xff;
-    if (primary == kSqliteCantOpen || primary == kSqliteAuth || primary == kSqlitePerm)
+    if (primary == kSqliteAuth || primary == kSqlitePerm) return SourceOutcome::denied;
+    if (primary == kSqliteCantOpen && (sys_errno == EPERM || sys_errno == EACCES))
         return SourceOutcome::denied;
     return SourceOutcome::unreadable;
+}
+
+/// Where in opening one TCC.db a SQLite call failed.
+enum class SqliteStage { open, query_only, prepare };
+
+/// The whole-source failure for a SQLite call that failed at `stage`, with cause
+/// `<stage>_failed:<sqlite3_errmsg>`. `query_only` (the PRAGMA that makes the connection
+/// read-only) never touches the file, so its failure is never a refusal -- always unreadable,
+/// and the source is never read without it.
+[[nodiscard]] inline SourceFailure classify_tcc_sqlite_failure(SqliteStage stage, int rc,
+                                                               int sys_errno,
+                                                               std::string_view errmsg) {
+    std::string_view prefix = "open_failed:";
+    if (stage == SqliteStage::query_only) prefix = "query_only_failed:";
+    if (stage == SqliteStage::prepare) prefix = "prepare_failed:";
+    const SourceOutcome outcome = stage == SqliteStage::query_only
+                                      ? SourceOutcome::unreadable
+                                      : classify_tcc_sqlite_rc(rc, sys_errno);
+    return {outcome, std::string{prefix}.append(errmsg)};
+}
+
+// ── /Users home enumeration ─────────────────────────────────────────────
+
+/// The autoruns collect_user_launchagents rule: a real home is uid 500 or above (below is a
+/// system account's directory).
+inline constexpr std::uint32_t kMinUserHomeUid = 500;
+
+/// A /Users entry name worth an fstatat at all: not empty, not a dotfile (`.`, `..`,
+/// `.localized`, ...).
+[[nodiscard]] constexpr bool home_name_eligible(std::string_view name) noexcept {
+    return !name.empty() && name.front() != '.';
+}
+
+/// Whether one /Users entry is a real per-user home: an eligible name, a directory as seen
+/// WITHOUT following a symlink (`is_directory` from an AT_SYMLINK_NOFOLLOW fstatat, so a
+/// symlink is never a home), owned by uid >= kMinUserHomeUid (`Shared` and system entries are
+/// skipped).
+[[nodiscard]] constexpr bool is_user_home_entry(std::string_view name, bool is_directory,
+                                                std::uint32_t uid) noexcept {
+    return home_name_eligible(name) && is_directory && uid >= kMinUserHomeUid;
 }
 
 /// `tcc_db` for the system database, `<user>:tcc_db` for a per-user one -- the subject every
@@ -139,18 +187,27 @@ struct TccServiceRead {
     std::string_view category;
     std::vector<TccGrant> grants;
     bool step_failed = false; // sqlite3_step returned something other than ROW/DONE
+    bool bind_failed = false; // sqlite3_bind_text failed -- the query never ran
 };
 
 /// Appends one successfully-opened source's rows: every decoded grant; an `unreadable` row
-/// (token `<source_key>:<category>:query_step_failed`) for a category whose step failed --
-/// even when some of its rows were already read, since the set is incomplete; and an `absent`
-/// row for a category the source cleanly holds nothing for. A grant whose auth_value could not
+/// (token `<source_key>:<category>:query_bind_failed` / `...:query_step_failed`) for a category
+/// whose query could not be bound or whose step failed -- even when some of its rows were
+/// already read, since the set is incomplete; and an `absent` row for a category the source
+/// cleanly holds nothing for. A grant whose auth_value could not
 /// be read is an `unreadable` row with token `<source_key>:<category>:auth_value_unreadable`.
 inline void append_tcc_source_rows(std::string_view owner, std::span<const TccServiceRead> reads,
                                    std::vector<PermissionRow>& rows,
                                    yuzu::shared::ConstraintAccumulator& acc) {
     const std::string key = tcc_source_key(owner);
     for (const auto& read : reads) {
+        if (read.bind_failed) {
+            rows.push_back(failure_row("macos", tcc_row_app_id(owner, "-"), read.category, false,
+                                       key + ":" + std::string{read.category} +
+                                           ":query_bind_failed",
+                                       acc));
+            continue;
+        }
         for (const auto& g : read.grants) {
             if (!g.auth_value) {
                 rows.push_back(failure_row("macos", tcc_row_app_id(owner, g.client), read.category,

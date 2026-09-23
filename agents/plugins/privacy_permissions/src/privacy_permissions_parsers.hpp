@@ -38,7 +38,6 @@
 #pragma once
 
 #include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,12 +79,6 @@ inline constexpr std::array<std::string_view, 6> kStateTokens{
 
 inline constexpr std::array<std::string_view, 4> kCategories{"camera", "microphone", "location",
                                                               "full_disk_access"};
-
-[[nodiscard]] constexpr bool is_known_category(std::string_view c) noexcept {
-    for (const auto k : kCategories)
-        if (k == c) return true;
-    return false;
-}
 
 // ── rows ───────────────────────────────────────────────────────────────
 
@@ -156,57 +149,27 @@ struct PermissionRow {
             denied};
 }
 
-/// One row naming a whole SOURCE's read as failed (TCC.db wouldn't open, a profile hive or the
-/// HKLM ConsentStore root refused, the portal bus call failed outright). `category` is "-"
-/// since the row stands for every category of that source.
-[[nodiscard]] inline PermissionRow whole_read_failed_row(std::string_view os, PermissionState state,
-                                                         std::string_view cause,
-                                                         yuzu::shared::ConstraintAccumulator& acc,
-                                                         bool denied) {
-    if (state == PermissionState::unreadable || denied) acc.add_failure(std::string{cause});
-    return {os, "-", "-", state, std::string{cause}, "-", "-", denied};
+/// A whole-SOURCE failure row: category "-" (it stands for every category of its source) and a
+/// failed read -- refused (`read_denied`) or `unreadable`. A whole-source `absent` row (a macOS
+/// user with no per-user TCC.db) or `unsupported` row is not a failure.
+[[nodiscard]] inline bool is_whole_source_failure(const PermissionRow& r) noexcept {
+    return r.category == "-" && (r.read_denied || r.state == PermissionState::unreadable);
 }
 
-/// Coverage backstop: appends an `absent` row for every category no row mentions -- but ONLY
-/// when nothing failed. If any read failed or was refused, the failure rows (a whole-source
-/// row covers every category of its source) already account for the gap, and an `absent` here
-/// would be exactly the failure-reads-as-absent collapse this plugin must never make.
-inline void fill_uncovered_categories(std::string_view os, std::vector<PermissionRow>& rows,
-                                      const yuzu::shared::ConstraintAccumulator& acc) {
-    if (acc.any_failure()) return;
+/// Coverage backstop: appends an `absent` row for every category no row mentions -- unless a
+/// whole-source failure row exists. That row already stands for every category of a source that
+/// could not be read, and an `absent` beside it would be exactly the failure-reads-as-absent
+/// collapse this plugin must never make. A failure that is only a TOKEN (a Windows hive that
+/// could not be unloaded, a LastUsedTime* read) carries no row and covers no category, so it
+/// never suppresses the backstop: every category still gets a row.
+inline void fill_uncovered_categories(std::string_view os, std::vector<PermissionRow>& rows) {
     for (const auto& r : rows)
-        if (r.read_denied) return;
+        if (is_whole_source_failure(r)) return;
     for (const auto cat : kCategories) {
         bool covered = false;
         for (const auto& r : rows)
             if (r.category == cat) covered = true;
         if (!covered) rows.push_back({os, "-", cat, PermissionState::absent, "-", "-", "-", false});
-    }
-}
-
-// ── Linux session-bus open (pure; errno values are portable <cerrno> constants) ──
-
-enum class BusOpenOutcome { unavailable, denied, failed };
-
-/// Classifies sd_bus_open_user's NEGATED return (pass the positive errno). No session bus to
-/// reach (no XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, no socket, nobody listening) is the
-/// honest UNAVAILABLE case; a refused socket is `denied`, never folded into "no session";
-/// anything else is a real failure.
-[[nodiscard]] constexpr BusOpenOutcome classify_session_bus_open(int err) noexcept {
-    switch (err) {
-    case ENOENT:
-    case ENOTDIR:
-    case ECONNREFUSED:
-    case ENXIO:
-#if defined(ENOMEDIUM)
-    case ENOMEDIUM: // systemd's "no XDG_RUNTIME_DIR" answer (Linux-only errno)
-#endif
-        return BusOpenOutcome::unavailable;
-    case EACCES:
-    case EPERM:
-        return BusOpenOutcome::denied;
-    default:
-        return BusOpenOutcome::failed;
     }
 }
 

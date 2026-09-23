@@ -108,26 +108,38 @@ TEST_CASE("privacy_permissions: permissions always returns at least one 8-field 
 }
 
 TEST_CASE("privacy_permissions: no category is silently omitted -- each of the four has its "
-          "own row, or a whole-source row (category '-') stands for it",
+          "own row, or a whole-source FAILURE row (category '-', denied/unreadable) stands for "
+          "it; a whole-source absent row never does",
           "[privacy_permissions][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
     const auto result = dispatcher.run(plugin->descriptor(), "permissions");
     std::vector<std::string> categories;
+    bool whole_source_failure = false;
+    bool whole_source_unavailable = false;
     for (const auto& row : rows_of(result.captured)) {
-        // field 3 (0-based) is `category`; app_id (field 2) never contains an unescaped '|'.
+        // Fields 3 and 4 (0-based) are `category` and `state`; app_id (field 2) never contains an
+        // unescaped '|'.
         std::size_t start = 0;
         for (int i = 0; i < 3; ++i) start = row.find('|', start) + 1;
-        categories.push_back(row.substr(start, row.find('|', start) - start));
+        const auto cat_end = row.find('|', start);
+        const auto category = row.substr(start, cat_end - start);
+        const auto state = row.substr(cat_end + 1, row.find('|', cat_end + 1) - cat_end - 1);
+        categories.push_back(category);
+        if (category != "-") continue;
+        if (state == "denied" || state == "unreadable") whole_source_failure = true;
+        // The one whole-MECHANISM row (Linux: no session bus / no portal backend) stands for
+        // every category only when the result says so.
+        if (state == "unsupported" && result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE)
+            whole_source_unavailable = true;
     }
     const auto has = [&](std::string_view c) {
         return std::find(categories.begin(), categories.end(), c) != categories.end();
     };
-    const bool whole_source_row = has("-");
     for (const char* cat : {"camera", "microphone", "location", "full_disk_access"}) {
         INFO(cat);
-        CHECK((has(cat) || whole_source_row));
+        CHECK((has(cat) || whole_source_failure || whole_source_unavailable));
     }
 #if defined(__APPLE__)
     CHECK(has("location")); // macOS: location is its own `unsupported` row on every collection

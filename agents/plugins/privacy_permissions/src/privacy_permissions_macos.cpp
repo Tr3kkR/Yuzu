@@ -14,8 +14,10 @@
  *     collect_user_launchagents way: directories directly under /Users, not followed through a
  *     symlink, owned by uid >= 500, the directory name as the user name (no Open Directory call).
  * A per-user db that does not exist is `absent` for that user; a refusal (EPERM/EACCES on the
- * lstat, or SQLITE_CANTOPEN/AUTH/PERM on a file that IS there) is `denied`; anything else is
- * `unreadable` with a `<source>:<cause>` token (macos_parsers.hpp decides; this file only reads).
+ * lstat, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed EPERM/EACCES on a
+ * file that IS there) is `denied`; anything else -- including a failed `PRAGMA query_only` or
+ * query bind -- is `unreadable` with a `<source>:<cause>` token (macos_parsers.hpp decides; this
+ * file only reads).
  *
  * RESIDUALS, stated rather than assumed away:
  *   - Every TCC.db (system AND per-user) is TCC-protected. An agent identity without Full Disk
@@ -23,11 +25,11 @@
  *     honestly; the production LaunchDaemon (root) is not known to hold FDA today.
  *   - A home outside /Users (a relocated or network home) is not read, and a user whose home
  *     directory is directly under /Users but owned by a uid < 500 is skipped as a system entry.
- *   - The lstat pre-check and SQLITE_OPEN_NOFOLLOW refuse a symlinked FINAL component only; the
- *     intermediate components under a user's own home are path-resolved, so a user who controls
- *     their home can make their own rows come from a different file. Attribution of per-user
- *     rows is therefore best-effort against that user; confinement of the READ is unaffected
- *     (read-only, query_only, no write).
+ *   - SQLITE_OPEN_NOFOLLOW refuses a symbolic link ANYWHERE in the path (SQLITE_CANTOPEN_SYMLINK,
+ *     reported `unreadable`, never `denied`), but it checks by path before the open, so a user
+ *     who controls their home can race it and make their own rows come from a different file.
+ *     Attribution of per-user rows is therefore best-effort against that user; confinement of
+ *     the READ is unaffected (read-only, query_only, no write).
  *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
  *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
  *     prompt_undetermined, never guessed.
@@ -49,6 +51,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -62,6 +65,7 @@
 #include <sqlite3.h>
 
 #include <posix_dir_walk.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 
 namespace yuzu::privacy_permissions {
 
@@ -70,6 +74,7 @@ namespace {
 static_assert(macos::kSqlitePerm == SQLITE_PERM);
 static_assert(macos::kSqliteCantOpen == SQLITE_CANTOPEN);
 static_assert(macos::kSqliteAuth == SQLITE_AUTH);
+static_assert(macos::kSqliteCantOpenSymlink == SQLITE_CANTOPEN_SYMLINK);
 
 constexpr std::string_view kTccDbPath = "/Library/Application Support/com.apple.TCC/TCC.db";
 constexpr std::string_view kUsersDir = "/Users";
@@ -133,15 +138,20 @@ private:
     sqlite3_stmt* stmt_{nullptr};
 };
 
-/// Opens `db_path` (default: the system TCC.db) read-only. `err_msg` is filled from
-/// sqlite3_errmsg() on failure -- the real, observed diagnostic, not a guessed one. `db_path`
-/// is a parameter so a unit test can force the exact open-failure branch deterministically
-/// against a path this process genuinely cannot open, without a non-FDA identity or the real
-/// TCC.db. `out_rc`, if non-null, receives the real sqlite3_open_v2 result code on failure
-/// (C4-CODEX-004: SQLITE_CANTOPEN/SQLITE_AUTH/SQLITE_PERM are distinct from e.g.
-/// SQLITE_NOMEM/SQLITE_IOERR, and macos::classify_tcc_sqlite_rc branches on exactly that).
-DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPath,
-                       int* out_rc = nullptr) {
+/// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle.
+std::string sqlite_errmsg(sqlite3* db) {
+    return db ? std::string{sqlite3_errmsg(db)} : std::string{"no_handle"};
+}
+
+/// Opens `db_path` (default: the system TCC.db) read-only and makes the connection query-only.
+/// On failure returns an empty handle and sets `failure` -- classified by
+/// macos::classify_tcc_sqlite_failure from the real result code, the VFS's own failed-syscall
+/// errno (sqlite3_system_errno) and sqlite3_errmsg, never a guessed diagnostic. A failed
+/// `PRAGMA query_only=1` is a failure too: the source is never read without it. `db_path` is a
+/// parameter so a unit test can force the exact open-failure branch deterministically against a
+/// path this process genuinely cannot open, without a non-FDA identity or the real TCC.db.
+DbHandle open_readonly(std::optional<macos::SourceFailure>& failure,
+                       std::string_view db_path = kTccDbPath) {
     sqlite3* raw = nullptr;
     const int rc =
         sqlite3_open_v2(std::string{db_path}.c_str(), &raw,
@@ -149,14 +159,41 @@ DbHandle open_readonly(std::string& err_msg, std::string_view db_path = kTccDbPa
     DbHandle db{raw}; // owns `raw` even on failure -- sqlite3 may allocate a handle just to
                       // carry the error message; RAII from here regardless of `rc`.
     if (rc != SQLITE_OK) {
-        if (out_rc) *out_rc = rc;
-        err_msg = db ? sqlite3_errmsg(db.get()) : "sqlite3_open_v2 failed";
+        // The EXTENDED code: sqlite3_open_v2 returns only the primary one, and the
+        // classifier must tell SQLITE_CANTOPEN_SYMLINK from a refused open.
+        failure = macos::classify_tcc_sqlite_failure(
+            macos::SqliteStage::open, db ? sqlite3_extended_errcode(db.get()) : rc,
+            db ? sqlite3_system_errno(db.get()) : 0, sqlite_errmsg(db.get()));
         return DbHandle{};
     }
     sqlite3_busy_timeout(db.get(), 2000);
-    sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    const int pragma_rc = sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    if (pragma_rc != SQLITE_OK) {
+        failure = macos::classify_tcc_sqlite_failure(macos::SqliteStage::query_only, pragma_rc,
+                                                     sqlite3_system_errno(db.get()),
+                                                     sqlite_errmsg(db.get()));
+        return DbHandle{};
+    }
     return db;
 }
+
+/// Move-only RAII owner for a POSIX DIR* (autoruns_macos.cpp's DirHandle shape): closedir()s
+/// exactly once, on every path, including an exception out of a walk callback. closedir() also
+/// closes the fd fdopendir() adopted.
+class DirHandle {
+public:
+    explicit DirHandle(DIR* d) noexcept : dir_(d) {}
+    ~DirHandle() {
+        if (dir_ != nullptr) ::closedir(dir_);
+    }
+    DirHandle(const DirHandle&) = delete;
+    DirHandle& operator=(const DirHandle&) = delete;
+    [[nodiscard]] DIR* get() const noexcept { return dir_; }
+    [[nodiscard]] bool valid() const noexcept { return dir_ != nullptr; }
+
+private:
+    DIR* dir_;
+};
 
 /// Reads ONE TCC.db source (`owner` empty = the system db) into `rows`. Every outcome lands as
 /// rows: a whole-source row when the file is missing/refused/unopenable/unpreparable, else
@@ -171,12 +208,14 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
         return;
     }
 
-    std::string err_msg;
-    int open_rc = SQLITE_OK;
-    DbHandle db = open_readonly(err_msg, path, &open_rc);
+    std::optional<macos::SourceFailure> open_failure;
+    DbHandle db = open_readonly(open_failure, path);
     if (!db) {
         rows.push_back(macos::tcc_source_failed_row(
-            owner, {macos::classify_tcc_sqlite_rc(open_rc), "open_failed:" + err_msg}, acc));
+            owner,
+            open_failure.value_or(macos::SourceFailure{macos::SourceOutcome::unreadable,
+                                                       "open_failed:unknown"}),
+            acc));
         return;
     }
 
@@ -190,18 +229,24 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
         // classified the same as an open failure, never a flat `unreadable`.
         rows.push_back(macos::tcc_source_failed_row(
             owner,
-            {macos::classify_tcc_sqlite_rc(prep_rc),
-             std::string{"prepare_failed:"} + sqlite3_errmsg(db.get())},
+            macos::classify_tcc_sqlite_failure(macos::SqliteStage::prepare,
+                                               sqlite3_extended_errcode(db.get()),
+                                               sqlite3_system_errno(db.get()),
+                                               sqlite_errmsg(db.get())),
             acc));
         return;
     }
 
     std::vector<macos::TccServiceRead> reads;
     for (const auto& svc : macos::kTccServices) {
-        macos::TccServiceRead read{svc.category, {}, false};
-        sqlite3_reset(stmt.get());
-        sqlite3_bind_text(stmt.get(), 1, svc.service.data(), static_cast<int>(svc.service.size()),
-                          SQLITE_STATIC);
+        macos::TccServiceRead read{svc.category, {}, false, false};
+        sqlite3_reset(stmt.get()); // a prior step failure is already recorded on its own read
+        if (sqlite3_bind_text(stmt.get(), 1, svc.service.data(),
+                              static_cast<int>(svc.service.size()), SQLITE_STATIC) != SQLITE_OK) {
+            read.bind_failed = true; // never run the statement with a stale or missing binding
+            reads.push_back(std::move(read));
+            continue;
+        }
         for (;;) {
             const int step_rc = sqlite3_step(stmt.get());
             if (step_rc == SQLITE_DONE) break;
@@ -221,33 +266,35 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 }
 
 /// Real per-user homes directly under `users_dir` (autoruns_macos.cpp's
-/// collect_user_launchagents rule): a directory entry, not a symlink, owned by uid >= 500,
-/// named by the directory itself. Failures that lose a whole user or the whole walk are
-/// reported as rows (never silence); the returned names are sorted for stable output.
+/// collect_user_launchagents rule, decided by macos::is_user_home_entry): a directory entry, not
+/// a symlink, owned by uid >= 500, named by the directory itself. Failures that lose a whole
+/// user or the whole walk are reported as rows (never silence); the returned names are sorted
+/// for stable output. The fd and the DIR* are RAII-owned on every path, including an exception
+/// out of the walk callback.
 std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                               yuzu::shared::ConstraintAccumulator& acc,
                                               const std::string& users_dir = std::string{kUsersDir}) {
     std::vector<std::string> names;
-    const int fd = ::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
+    yuzu::agent::ScopedFd fd{::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+    if (!fd) {
         const int err = errno;
         rows.push_back(failure_row("macos", "-", "-", err == EPERM || err == EACCES,
                                    "users:open_errno_" + std::to_string(err), acc));
         return names;
     }
-    DIR* d = ::fdopendir(fd);
-    if (d == nullptr) {
+    DirHandle dir{::fdopendir(fd.get())};
+    if (!dir.valid()) {
         const int err = errno;
-        ::close(fd);
         rows.push_back(failure_row("macos", "-", "-", false,
                                    "users:fdopendir_errno_" + std::to_string(err), acc));
-        return names;
+        return names; // `fd` still owns the descriptor and closes it
     }
-    const auto walk = yuzu::shared::walk_dir_capped(d, kMaxUserHomes, [&](const struct dirent* e) {
+    static_cast<void>(fd.release()); // the DIR* adopted the fd; closedir() closes it
+    const auto walk = yuzu::shared::walk_dir_capped(dir.get(), kMaxUserHomes, [&](const struct dirent* e) {
         const std::string name{e->d_name};
-        if (name.empty() || name.front() == '.') return true;
+        if (!macos::home_name_eligible(name)) return true;
         struct stat st{};
-        if (::fstatat(::dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (::fstatat(::dirfd(dir.get()), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int err = errno;
             if (err != ENOENT) // vanished between readdir and fstatat: nothing lost
                 rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-",
@@ -255,11 +302,11 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                            name + ":home_stat_errno_" + std::to_string(err), acc));
             return true;
         }
-        if (!S_ISDIR(st.st_mode) || st.st_uid < 500) return true; // Shared, symlinks, system
-        names.push_back(name);
+        if (macos::is_user_home_entry(name, S_ISDIR(st.st_mode),
+                                      static_cast<std::uint32_t>(st.st_uid)))
+            names.push_back(name);
         return true;
     });
-    ::closedir(d);
     if (walk.truncated) rows.push_back(failure_row("macos", "-", "-", false, "users:truncated", acc));
     if (walk.enumeration_error)
         rows.push_back(failure_row("macos", "-", "-", false, "users:readdir_error", acc));

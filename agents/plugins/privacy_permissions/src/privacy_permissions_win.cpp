@@ -15,10 +15,20 @@
  * offline RegLoadKeyW mount of <profile>\NTUSER.DAT under SeBackup/SeRestore (held for the
  * whole mount under the process-wide offline_hive_mutex()).
  *
- * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): an HKLM value overrides a
- * profile's entry for the same (CapabilityName, app_id) ONLY when that HKLM value was
- * successfully read and decoded -- an absent/unreadable/refused HKLM value never displaces a
- * profile's real grant, and a FAILED profile entry is never hidden behind an HKLM value.
+ * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
+ * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
+ * Allow` on every capability) -- the HKLM ConsentStore `Value` is the device-wide toggle. Most
+ * restrictive wins: only a successfully read and decoded HKLM `Deny` overrides a profile's entry
+ * for the same (CapabilityName, app_id); an HKLM `Allow` defers to the user's own value and is
+ * reported once as HKLM's own row; an absent/unreadable/refused HKLM value never displaces
+ * anything; a FAILED profile entry is never hidden behind an HKLM value.
+ *
+ * THREE LEVELS per capability, each its own row: the capability `Value` (app_id `-`), the
+ * NonPackaged toggle -- `<capability>\NonPackaged`'s own `Value`, "let desktop apps access"
+ * (app_id `NonPackaged`) -- and each app key. A per-app NonPackaged key carries no `Value` (only
+ * LastUsedTime*), so it reads `absent` with its timestamps: no per-app decision, governed by the
+ * NonPackaged toggle row. `NonPackaged\Executables` is a container of per-exe prompt flags, not
+ * an app, and is skipped (win::is_nonpackaged_container_key).
  * `app_id` is qualified with the owning profile's name (qualify_app_id, never the SID --
  * ADR-0024 D11); an unqualified app_id is HKLM's own row.
  *
@@ -30,12 +40,11 @@
  * UNLOAD (a token -- the read itself succeeded) and a LastUsedTime* failure (a token, and the
  * field itself reads `unreadable`; a refused one still promotes PERMISSION_DENIED).
  *
- * UNKNOWNS pending a real the-rig capture: the exact NonPackaged path-escaping scheme
- * (unescape_nonpackaged_app_id is a best-effort pass), whether the HKLM ConsentStore mirror
- * exists at all on a non-MDM host and what shape it takes when it does (there is NO Windows
- * evidence for it yet -- this leg reads it with the same walk as a profile hive and applies
- * the precedence above, nothing more), and the real `Value` literal vocabulary
- * (decode_consent_value never assumes only Allow/Deny exist).
+ * MEASURED on the-rig 2026-09-23 (Windows 11 Pro 10.0.26200, LocalSystem via a scheduled task,
+ * one interactive profile with a live HKU hive): packaged per-app Allow/Deny/Prompt decode, the
+ * NonPackaged `#` escape renders `C:#Program Files#...` as `C:\Program Files\...`, and the
+ * LastUsedTime* QWORDs decode to plausible epoch-ms. Not measured: the offline NTUSER.DAT mount
+ * arm, a host with an HKLM `Deny`, and a refused read anywhere in the walk.
  */
 #include "privacy_permissions_legs.hpp"
 #include "privacy_permissions_win_parsers.hpp"
@@ -60,6 +69,7 @@ using win::RawGrant;
 static_assert(win::kErrorSuccess == ERROR_SUCCESS);
 static_assert(win::kErrorFileNotFound == ERROR_FILE_NOT_FOUND);
 static_assert(win::kErrorAccessDenied == ERROR_ACCESS_DENIED);
+static_assert(win::kErrorNoMoreItems == ERROR_NO_MORE_ITEMS);
 static_assert(win::kRegSz == REG_SZ);
 static_assert(win::kRegQword == REG_QWORD);
 
@@ -73,40 +83,35 @@ constexpr wchar_t kConsentStorePath[] =
 // win_profiles.hpp's own kMaxEnumeratedValueNames (4096), the precedent this cap copies.
 inline constexpr DWORD kMaxEnumeratedSubkeys = 4096;
 
-/// `terminal_rc`, if non-null, receives the RegEnumKeyExW code that ended the walk --
-/// ERROR_NO_MORE_ITEMS is the only clean stop (CDX-R2-002: a previous version discarded this
-/// entirely, so a mid-enumeration ERROR_ACCESS_DENIED was silently indistinguishable from
-/// having enumerated every child). `truncated`, if non-null, is set when the walk stopped
-/// because it hit kMaxEnumeratedSubkeys AND a genuine next entry exists -- "cap reached" alone
-/// is NOT the same fact as "a record was dropped" (C4-CODEX-005/K2: a key with EXACTLY
-/// kMaxEnumeratedSubkeys real children would otherwise report a false truncation, since the
-/// cap-reached check alone can't tell "there were exactly this many" from "there were more").
-/// One extra, uncounted RegEnumKeyExW probe at the current index disambiguates -- same shape as
-/// win_profiles.hpp's own enumerate_profile_records/profile_list_actually_truncated precedent.
-std::vector<std::wstring> enumerate_subkey_names(HKEY parent, LONG* terminal_rc = nullptr,
-                                                 bool* truncated = nullptr) {
-    std::vector<std::wstring> out;
+struct SubkeyEnum {
+    std::vector<std::wstring> names;
+    win::EnumVerdict verdict;
+};
+
+/// Every child key name of `parent`, capped at kMaxEnumeratedSubkeys, plus how the walk ended
+/// (win::classify_subkey_enum decides). CDX-R2-002: the code that ended the walk is never
+/// discarded -- a mid-enumeration ERROR_ACCESS_DENIED is not "every child enumerated".
+/// C4-CODEX-005/K2: when the loop stops at the cap, one extra, uncounted RegEnumKeyExW probe at
+/// the next index tells "exactly cap children" (complete) from "more exist" (truncated) --
+/// win_profiles.hpp's enumerate_profile_records/profile_list_actually_truncated precedent.
+SubkeyEnum enumerate_subkey_names(HKEY parent) {
+    SubkeyEnum out{{}, {win::EnumOutcome::complete}};
     constexpr DWORD kNameBufLen = 512;
     wchar_t buf[kNameBufLen]{};
     DWORD idx = 0, len = kNameBufLen;
     LONG rc = ERROR_SUCCESS;
     while (idx < kMaxEnumeratedSubkeys &&
-          (rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
-              ERROR_SUCCESS) {
-        out.emplace_back(buf, len);
+           (rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
+               ERROR_SUCCESS) {
+        out.names.emplace_back(buf, len);
         len = kNameBufLen;
     }
-    if (truncated) {
-        if (idx >= kMaxEnumeratedSubkeys) {
-            wchar_t probe_buf[kNameBufLen]{};
-            DWORD probe_len = kNameBufLen;
-            *truncated = (RegEnumKeyExW(parent, idx, probe_buf, &probe_len, nullptr, nullptr,
-                                        nullptr, nullptr) == ERROR_SUCCESS);
-        } else {
-            *truncated = false;
-        }
+    LONG probe_rc = ERROR_NO_MORE_ITEMS;
+    if (rc == ERROR_SUCCESS) { // stopped by the cap alone
+        DWORD probe_len = kNameBufLen;
+        probe_rc = RegEnumKeyExW(parent, idx, buf, &probe_len, nullptr, nullptr, nullptr, nullptr);
     }
-    if (terminal_rc) *terminal_rc = rc;
+    out.verdict = win::classify_subkey_enum(rc, probe_rc);
     return out;
 }
 
@@ -233,40 +238,37 @@ ConsentWalk walk_consent_store(HKEY hive) {
                     std::move(app_id), cap.category,
                     std::string{kind} + ":" + win::win32_cause(rc), rc == ERROR_ACCESS_DENIED));
         };
-        // Enumeration completeness: ERROR_NO_MORE_ITEMS is the only clean stop.
-        const auto note_enum = [&](std::string_view kind, LONG enum_rc, bool truncated) {
-            if (truncated)
-                w.structural.push_back(structural_failure(
-                    "-", cap.category, std::string{kind} + "_enum_truncated", false));
-            else if (enum_rc != ERROR_NO_MORE_ITEMS)
-                w.structural.push_back(structural_failure(
-                    "-", cap.category, std::string{kind} + "_enum_" + std::to_string(enum_rc),
-                    enum_rc == ERROR_ACCESS_DENIED));
+        // Enumeration completeness (win::enum_failure): a complete walk -- including one of
+        // exactly the cap -- adds nothing; a truncated or failed one is a structural row.
+        const auto note_enum = [&](std::string_view kind, const win::EnumVerdict& v) {
+            if (const auto f = win::enum_failure(kind, v))
+                w.structural.push_back(structural_failure("-", cap.category, f->cause, f->denied));
         };
 
         // Packaged apps: direct children of the capability key OTHER than "NonPackaged".
-        LONG packaged_enum_rc = ERROR_SUCCESS;
-        bool packaged_truncated = false;
-        for (const auto& child :
-             enumerate_subkey_names(cap_key.get(), &packaged_enum_rc, &packaged_truncated)) {
+        const auto packaged = enumerate_subkey_names(cap_key.get());
+        for (const auto& child : packaged.names) {
             if (child == L"NonPackaged") continue;
             read_app(cap_key.get(), child, yuzu::win::from_wide(child.c_str()), "packaged_app");
         }
-        note_enum("packaged", packaged_enum_rc, packaged_truncated);
+        note_enum("packaged", packaged.verdict);
 
         // Win32 (non-packaged) apps, keyed by an escaped executable path.
         yuzu::win::RegKey nonpkg;
         const LONG nonpkg_rc =
             RegOpenKeyExW(cap_key.get(), L"NonPackaged", 0, KEY_READ, nonpkg.put());
         if (nonpkg_rc == ERROR_SUCCESS) {
-            LONG nonpkg_enum_rc = ERROR_SUCCESS;
-            bool nonpkg_truncated = false;
-            for (const auto& child :
-                 enumerate_subkey_names(nonpkg.get(), &nonpkg_enum_rc, &nonpkg_truncated))
-                read_app(nonpkg.get(), child,
-                         win::unescape_nonpackaged_app_id(yuzu::win::from_wide(child.c_str())),
+            // The "let desktop apps access" toggle: the NonPackaged key's own Value, one row.
+            w.grants.push_back(read_one_grant(
+                nonpkg.get(), std::string{win::kNonPackagedToggleAppId}, cap.category));
+            const auto nonpackaged = enumerate_subkey_names(nonpkg.get());
+            for (const auto& child : nonpackaged.names) {
+                const std::string name = yuzu::win::from_wide(child.c_str());
+                if (win::is_nonpackaged_container_key(name)) continue;
+                read_app(nonpkg.get(), child, win::unescape_nonpackaged_app_id(name),
                          "nonpackaged_app");
-            note_enum("nonpackaged", nonpkg_enum_rc, nonpkg_truncated);
+            }
+            note_enum("nonpackaged", nonpackaged.verdict);
         } else if (nonpkg_rc != ERROR_FILE_NOT_FOUND) {
             w.structural.push_back(structural_failure(
                 "-", cap.category, "nonpackaged_container:" + win::win32_cause(nonpkg_rc),
@@ -315,13 +317,14 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
 
-    // HKLM: machine-wide, collected once. Only its AUTHORITATIVE (successfully read) grants are
+    // HKLM: machine-wide, collected once. Only its successfully read `Deny` grants override a
+    // profile (win::hklm_overrides_profile -- the device toggle, most restrictive wins) and are
     // applied into each profile's merge; everything else HKLM holds is reported once below as
     // HKLM's own unqualified rows.
     const ConsentWalk hklm = walk_consent_store(HKEY_LOCAL_MACHINE);
-    std::vector<RawGrant> hklm_authoritative;
+    std::vector<RawGrant> hklm_overriding;
     for (const auto& g : hklm.grants)
-        if (win::hklm_value_authoritative(g)) hklm_authoritative.push_back(g);
+        if (win::hklm_overrides_profile(g)) hklm_overriding.push_back(g);
 
     // Real interactive users, not the agent process's own (LocalSystem) HKEY_CURRENT_USER --
     // see the file banner (CDX-R2-001).
@@ -338,11 +341,21 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
             failure_row("windows", "-", "-", false, "profiles:profile_list_unreadable", acc));
 
     // Profiles whose hive was ACTUALLY reached (COD-P1-02/K1): when none was, HKLM's
-    // authoritative grants are emitted directly (unqualified) rather than silently dropped.
+    // overriding grants are emitted directly (unqualified) rather than silently dropped.
     std::size_t reachable_profiles = 0;
     for (const auto& profile : profiles) {
         const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
         const std::string profile_row_id = qualify_app_id(pname, "-");
+
+        // The SID is appended to HKEY_USERS below (and by with_user_hive): a malformed or empty
+        // one -- or one that converts to an empty wide string -- must never open the HKU root
+        // or some other key in place of this profile's own hive.
+        const std::wstring wsid = yuzu::win::to_wide(profile.sid);
+        if (!win::is_valid_sid_string(profile.sid) || wsid.empty()) {
+            rows.push_back(
+                failure_row("windows", profile_row_id, "-", false, pname + ":invalid_sid", acc));
+            continue;
+        }
 
         // C4-CODEX-001: with_user_hive's live-hive check tests only `== ERROR_SUCCESS`, so a
         // refused LIVE HKU\<SID> root is indistinguishable from "not loaded" to its caller, and
@@ -351,8 +364,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         LONG peek_rc = ERROR_SUCCESS;
         {
             yuzu::win::RegKey peek;
-            peek_rc = RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(profile.sid).c_str(), 0,
-                                    KEY_READ, peek.put());
+            peek_rc = RegOpenKeyExW(HKEY_USERS, wsid.c_str(), 0, KEY_READ, peek.put());
         }
 
         ConsentWalk user;
@@ -394,28 +406,24 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
 
         if (user.root_rc != ERROR_SUCCESS && user.root_rc != ERROR_FILE_NOT_FOUND)
             emit_root_failure(pname, profile_row_id, user.root_rc, rows, acc);
-        for (const auto& g : win::merge_with_hklm(user.grants, hklm_authoritative))
+        for (const auto& g : win::merge_with_hklm(user.grants, hklm_overriding))
             emit_grant(pname, true, g, rows, acc);
         for (const auto& g : user.structural) emit_grant(pname, true, g, rows, acc);
     }
 
-    // HKLM's own rows, unqualified, once: its failures and app-level non-authoritative entries
-    // always; its authoritative grants only when no profile was reachable to carry them. Its
-    // capability-level `absent` coverage entries are left to fill_uncovered_categories below.
-    for (const auto& g : hklm.grants) {
-        if (win::hklm_value_authoritative(g)) {
-            if (reachable_profiles == 0) emit_grant("hklm", false, g, rows, acc);
-        } else if (win::grant_failed(g) || g.app_id != "-") {
-            emit_grant("hklm", false, g, rows, acc);
-        }
-    }
+    // HKLM's own rows, unqualified, once (win::hklm_emitted_once): its failures, its Allow and
+    // unmodelled values and its app-level entries always; its overriding Deny grants only when
+    // no profile was reachable to carry them. Its capability-level `absent` coverage entries are
+    // left to fill_uncovered_categories below.
+    for (const auto& g : hklm.grants)
+        if (win::hklm_emitted_once(g, reachable_profiles > 0)) emit_grant("hklm", false, g, rows, acc);
     for (const auto& g : hklm.structural) emit_grant("hklm", false, g, rows, acc);
     if (hklm.root_rc != ERROR_SUCCESS && hklm.root_rc != ERROR_FILE_NOT_FOUND)
         emit_root_failure("hklm", "-", hklm.root_rc, rows, acc);
 
-    // A category no row mentions is `absent` ONLY when nothing failed -- otherwise the failure
-    // rows above (each whole-source row stands for all four categories) already account for it.
-    fill_uncovered_categories("windows", rows, acc);
+    // A category no row mentions is `absent` unless a whole-source failure row above already
+    // stands for it; a token-only failure (hive_unload_failed, a LastUsedTime* read) covers none.
+    fill_uncovered_categories("windows", rows);
     return emit_rows(ctx, rows, acc, false);
 }
 

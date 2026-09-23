@@ -63,10 +63,14 @@ TEST_CASE("privacy_permissions macOS: open_readonly on a genuinely unopenable pa
           "through the same generic path a real TCC/SIP denial would, with a real "
           "sqlite3_errmsg diagnostic",
           "[privacy_permissions][macos][internals]") {
-    std::string err_msg;
-    auto db = open_readonly(err_msg, "/nonexistent/deliberately-broken/privacy_permissions_test.db");
+    std::optional<macos::SourceFailure> failure;
+    auto db = open_readonly(failure, "/nonexistent/deliberately-broken/privacy_permissions_test.db");
     CHECK_FALSE(static_cast<bool>(db));
-    CHECK_FALSE(err_msg.empty());
+    REQUIRE(failure.has_value());
+    CHECK(failure->cause.rfind("open_failed:", 0) == 0);
+    CHECK(failure->cause.size() > std::string_view{"open_failed:"}.size());
+    // A missing parent directory is SQLITE_CANTOPEN with ENOENT from the VFS -- not a refusal.
+    CHECK(failure->outcome == macos::SourceOutcome::unreadable);
 }
 
 TEST_CASE("privacy_permissions macOS: read_tcc_source on a MISSING per-user db is one absent "
@@ -97,7 +101,11 @@ TEST_CASE("privacy_permissions macOS: read_tcc_source on a PRESENT file the proc
           "PERMISSION_DENIED, never absent",
           "[privacy_permissions][macos][internals]") {
     if (::geteuid() == 0) SKIP("root ignores mode 000 -- the refusal cannot be forced here");
-    const auto path = yuzu::test::unique_temp_path("yuzu_test_pp_tcc_");
+    // Canonical: macOS's temp dir lives under the /var -> /private/var symlink, and
+    // SQLITE_OPEN_NOFOLLOW refuses a symlink anywhere in the path (SQLITE_CANTOPEN_SYMLINK) --
+    // this case must exercise the real EACCES refusal, not that one.
+    const auto raw_path = yuzu::test::unique_temp_path("yuzu_test_pp_tcc_");
+    const auto path = std::filesystem::canonical(raw_path.parent_path()) / raw_path.filename();
     { std::ofstream{path} << "x"; }
     REQUIRE(::chmod(path.c_str(), 0) == 0);
 
@@ -115,6 +123,29 @@ TEST_CASE("privacy_permissions macOS: read_tcc_source on a PRESENT file the proc
     const auto st = select_status(acc, any_denied(rows), false);
     CHECK(st.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
     CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+TEST_CASE("privacy_permissions macOS: read_tcc_source through a SYMLINKED directory is refused by "
+          "SQLITE_OPEN_NOFOLLOW as unreadable (SQLITE_CANTOPEN_SYMLINK), never a false denied",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_link_"};
+    std::filesystem::create_directories(tmp.path);
+    const auto base = std::filesystem::canonical(tmp.path); // no symlink but the one below
+    const auto real_dir = base / "real";
+    const auto link_dir = base / "link";
+    std::filesystem::create_directories(real_dir);
+    std::filesystem::create_directory_symlink(real_dir, link_dir);
+    { std::ofstream{real_dir / "TCC.db"} << "x"; }
+
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    read_tcc_source("alice", (link_dir / "TCC.db").string(), /*missing_is_absent=*/true, rows, acc);
+
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].state == PermissionState::unreadable);
+    CHECK_FALSE(rows[0].read_denied);
+    CHECK(rows[0].raw.rfind("alice:tcc_db:open_failed:", 0) == 0);
+    CHECK(select_status(acc, any_denied(rows), false).status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
 } // namespace yuzu::privacy_permissions
