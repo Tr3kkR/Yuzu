@@ -441,7 +441,12 @@ What changes on **every** deployment, including single-server:
   regenerating the built-in default certificates (for example after changing
   `--cert-san`) deleted their old inventory rows, including revoked ones, so a
   revoked default leaf was accepted again and dropped from the CRL. Revoked rows
-  are now kept.
+  are now kept. **This does not restore a revocation already lost that way:** the
+  purged serial is no longer in the inventory, so revoking it again returns
+  `404`. If you ever revoked a default server certificate (for example because
+  its key may have leaked) and the default certificates have been regenerated
+  since, re-root the internal CA (`docs/pki-architecture.md`, "Deliberate clean
+  re-root").
 
 Single-server remains the only supported topology. If you nevertheless run two
 server versions against one database during an upgrade, a publish from the

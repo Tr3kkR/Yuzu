@@ -1409,8 +1409,9 @@ groups:
           summary: "Internal-CA CRL (re)publish is failing"
           description: >-
             yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
-            attempt failed (CA key load / build / record, or a wait of more than
-            5s for the ca_store.ca_crl_versions lock held by another publisher).
+            attempt failed (e.g. CA key load, build/sign, a database read or
+            write, or a wait of more than 5s for the ca_store.ca_crl_versions lock
+            held by another publisher; see docs/user-manual/metrics.md).
             Consumers keep serving the last still-valid CRL, so this is not yet
             an outage, but a revocation made since the last successful publish
             is NOT yet in the public CRL — server-side enforcement (is_revoked())

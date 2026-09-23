@@ -173,9 +173,9 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   own) fails and consumes no number. A publisher frozen mid-transaction loses its
   session after 30 s idle (`idle_in_transaction_session_timeout`), releasing the
   lock for everyone else. Within one server process, concurrent publishes take a
-  local lock first, so at most one pool connection waits on the table lock; an
-  operator publish that cannot get the local lock within 7.5 s fails, and the
-  background freshness pass skips instead of waiting. Every trigger increments `yuzu_server_ca_crl_publish_failures_total`;
+  local lock first, so at most one pool connection waits on the table lock; any
+  other publish (operator, import or startup) that cannot get the local lock
+  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not);
   the operator-revoke paths additionally return `crl_republished:false` and write a
   `ca.crl.published` failure audit. The import-chain, boot and freshness paths
   write no `ca.crl.published` audit row, success or failure.
@@ -192,10 +192,11 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   consecutive CRL versions for N replicas — harmless.
 - **What the lock does not cover.** Restoring the database to an earlier point in
   time, losing an asynchronously replicated commit in a failover, or the
-  `default_certs` runbook clearing `ca_crl_versions` (or deleting revoked
-  `ca_issued` rows by hand, which also defeats the self-heal count), all restart numbering from
+  `default_certs` runbook clearing `ca_crl_versions`, all restart numbering from
   the surviving `MAX(version)+1`, which can reuse a crlNumber that was already
-  served. During a rolling upgrade, a publish from an older binary does not take
+  served. Separately, **never delete a revoked `ca_issued` row by hand**: it
+  un-revokes that certificate (`is_revoked()` no longer sees it, and it drops out
+  of every later CRL) and defeats the self-heal count. It does not affect numbering. During a rolling upgrade, a publish from an older binary does not take
   the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
   a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
 

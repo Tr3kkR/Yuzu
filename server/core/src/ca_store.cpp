@@ -328,10 +328,12 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
         // HA WS-6 6.1: how many revoked certs each CRL was built from, so the freshness pass
         // can tell — without comparing timestamps written by different replicas' clocks —
-        // whether a revocation is missing from the latest CRL. NULL on rows published before v3,
-        // which reads as "not covered" and triggers one republish after upgrade.
+        // whether a revocation is missing from the latest CRL. NULL on rows published before v3
+        // reads as "not covered" (normally superseded at once by the startup publish).
         // The ALTER needs ACCESS EXCLUSIVE on a table publishers lock; bound the wait so boot
         // fails loudly (and retries on restart) rather than hanging behind a stalled holder.
+        // 30 s rather than the pool's usual 10 s: long enough to outlast a legitimate publish
+        // that holds the lock (5 s lock wait + statements under a 30 s statement_timeout).
         {3, "SET LOCAL lock_timeout = '30s'; "
             "ALTER TABLE ca_crl_versions ADD COLUMN revoked_count BIGINT;"},
     };
@@ -742,8 +744,8 @@ std::expected<bool, std::string> CaStore::has_unpublished_revocations() {
     // One statement, one snapshot. The revoked set is append-only (revoke() never un-revokes and
     // delete_issued_by() keeps revoked rows), so a count that differs from the one the latest
     // CRL was built from means that CRL does not cover the current set. No CRL at all, or a
-    // pre-v3 row (NULL count), also reads as "not covered". An operator deleting revoked rows by
-    // hand (the default_certs runbook) breaks that assumption — see pki-architecture.md.
+    // pre-v3 row (NULL count), also reads as "not covered". Deleting a revoked row by hand breaks
+    // that assumption (and un-revokes the cert) — see pki-architecture.md.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT (SELECT revoked_count FROM ca_store.ca_crl_versions ORDER BY version DESC "
