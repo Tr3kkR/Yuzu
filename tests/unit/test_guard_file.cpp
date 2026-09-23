@@ -1091,13 +1091,16 @@ TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and nev
 // the verbose --success reporter (which slows the race window enough to miss it) — a
 // real, high-frequency race in shipped code, not test-environment noise.
 //
-// [.] alone does NOT exclude this from the "agent unit tests" meson entry: Catch2's
-// hidden-tag default-exclusion applies only to a truly empty command line — the moment
-// ANY pattern is passed, including this suite's own `~[tsan-heavy]`, hidden-exclusion
-// stops applying and the test runs anyway (verified empirically, not assumed). The
-// [flaky-4086] tag plus `tests/meson.build`'s explicit `~[flaky-4086]` exclusion (mirrors
-// how `[tsan-heavy]` is excluded from this same entry) is what actually keeps it out of
-// CI; [.] is kept too so a manual, zero-argument run of the exe still skips it.
+// [.] alone was NOT reliably observed to exclude this from the "agent unit tests" meson
+// entry — repeated real-hardware runs against this suite's own `~[tsan-heavy]` filter
+// were inconsistent on whether Catch2's hidden-tag default-exclusion still applies once
+// a non-empty filter is present (a governance review disputed the mechanism claimed in an
+// earlier version of this comment; re-testing then showed BOTH outcomes across repeat
+// runs, so the exact Catch2 rule here is left unresolved rather than restated with false
+// confidence). What IS reliably, repeatedly verified: the explicit [flaky-4086] tag plus
+// `tests/meson.build`'s `~[flaky-4086]` exclusion (mirroring how `[tsan-heavy]` is excluded
+// from this same entry) keeps this case out of every run tested, with no exception. [.] is
+// kept too so a manual, zero-argument run of the exe still skips it.
 //
 // Re-tag back into the normal suite once #4086 lands a real fix (mirror spark_file.cpp's
 // F2 drain-before-close pattern onto h_dir).
