@@ -28582,6 +28582,72 @@ TEST_CASE("MCP create_result_set_from_tar_query: a degraded quota pre-check fail
             PGRES_COMMAND_OK);
 }
 
+TEST_CASE("MCP create_result_set_from_tar_query: a post-dispatch DbError from create_pending "
+          "surfaces RESULT_SET_STORE_FAULT_AFTER_DISPATCH -- distinct from the pre-dispatch "
+          "quota-check-degraded RESULT_SET_STORE_UNAVAILABLE token above -- and carries "
+          "execution_id plus a null retry_after_ms (gov-4306-S4/S9)",
+          "[pg][mcp][integration][result-sets][tar][4306]") {
+    // No parent_id: same reasoning as the sibling quota-pre-check test above.
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // separate ephemeral DB,
+                                                    // unaffected by the lock below
+    yuzu::test::ResultSetStorePg rs_bundle;        // migrates the schema, gives us dsn()
+
+    // Short lock_timeout_ms (established technique, mirrors the REST twin in
+    // test_rest_result_sets_async.cpp) so the lock taken INSIDE the dispatch
+    // closure below faults create_pending's INSERT deterministically and
+    // fast, rather than waiting out the default 10s lock_timeout. The quota
+    // pre-check runs BEFORE dispatch, strictly before the lock is taken, so
+    // it completes on the still-unlocked table -- dispatch genuinely fires.
+    pg::PgPool short_lock_pool{{.conninfo = rs_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    yuzu::server::ResultSetStore short_lock_store{short_lock_pool};
+    REQUIRE(short_lock_store.is_open());
+
+    pg::PgConn locker{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    // Take the table lock INSIDE the fake dispatch closure, mirroring the
+    // REST twin's on_dispatch technique exactly.
+    auto dispatch =
+        [&locker](const std::string&, const std::string&, const std::vector<std::string>&,
+                  const std::string&, const std::unordered_map<std::string, std::string>&,
+                  const std::string&,
+                  const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE result_set_store.result_sets IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        return {.sent = 1, .command_id = "c1"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = &short_lock_store;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1","name":"postdispatch"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    const std::string msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.starts_with("RESULT_SET_STORE_FAULT_AFTER_DISPATCH:"));
+    CHECK(msg.find("do not re-send") != std::string::npos);
+    CHECK(msg.find("execution_id=") != std::string::npos);
+    // DELIBERATELY non-retryable: a real dispatch already succeeded, so a
+    // positive retry hint would tell an agentic caller to re-send a command
+    // that already reached the fleet (matches the REST twin's regression
+    // lock).
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
 TEST_CASE("MCP create_result_set_from_inventory_query: a degraded members-table read on the "
           "parent-narrowing loop refuses rather than materialising an unnarrowed result set "
           "(#4306 finding 3)",

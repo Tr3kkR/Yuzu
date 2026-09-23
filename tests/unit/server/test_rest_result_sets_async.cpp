@@ -3079,6 +3079,15 @@ TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful disp
     CHECK(j["error"]["message"].get<std::string>().find(
               "result-set store unavailable after dispatch already succeeded") !=
           std::string::npos);
+    // gov-4306-S4/S9: distinct token from the pre-dispatch quota-check-
+    // degraded 503 (RESULT_SET_STORE_UNAVAILABLE). An agentic caller
+    // pattern-matching the message text alone must not conflate "safe to
+    // retry" with "already dispatched, never re-send". Also carries
+    // execution_id, matching MCP's identical branch.
+    CHECK(j["error"]["message"].get<std::string>().starts_with(
+        "RESULT_SET_STORE_FAULT_AFTER_DISPATCH:"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "execution_id=" + h.calls[0].execution_id) != std::string::npos);
     // #4306/#4307 adversarial review: this branch is DELIBERATELY left
     // non-retryable (unlike the five 503 pre-dispatch branches above/below) -
     // a real dispatch already succeeded here, so a positive retry hint would

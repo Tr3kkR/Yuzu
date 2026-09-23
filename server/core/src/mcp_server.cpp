@@ -1041,9 +1041,12 @@ static const ToolDef kTools[] = {
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
      "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
-     "instead. Exception: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
-     "degraded before anything was sent) says so explicitly and carries a positive "
-     "retry_after_ms - that one IS safe to retry.",
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1061,9 +1064,12 @@ static const ToolDef kTools[] = {
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
-     "instead. Exception: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
-     "degraded before anything was sent) says so explicitly and carries a positive "
-     "retry_after_ms - that one IS safe to retry.",
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1086,10 +1092,12 @@ static const ToolDef kTools[] = {
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
-     "re-dispatches a real command to the fleet. Exception: a pre-dispatch "
-     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
-     "says so explicitly and carries a positive retry_after_ms - that one IS safe to "
-     "retry.",
+     "re-dispatches a real command to the fleet. Two distinct fault tokens distinguish "
+     "when retry is safe: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
+     "degraded before anything was sent) carries a positive retry_after_ms and IS safe "
+     "to retry; a post-dispatch RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store "
+     "faulted after a real command already reached the fleet) carries no retry_after_ms "
+     "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -11552,18 +11560,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         // compliance fix).
                         res.set_content(
                             a4_error(kInternalError,
-                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable "
-                                     "after dispatch already succeeded - do not re-send; poll "
-                                     "executions for the dispatched command's outcome"),
+                                     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH: result-set store "
+                                     "unavailable after dispatch already succeeded - do not "
+                                     "re-send; poll executions for the dispatched command's "
+                                     "outcome execution_id=" + exec_id),
                             "application/json");
                         return;
                     }
                     // retry-hint-exempt: business-rule outcome (quota), not a
-                    // transient fault.
+                    // transient fault. Same "do not re-send" situation as the
+                    // DbError branch above -- a real dispatch already succeeded
+                    // (sent > 0, set_agents_targeted already called); only the
+                    // bookkeeping row lost the authoritative in-txn quota
+                    // recheck (#4306 gov-4306-S5).
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        std::string(to_string(created.error())) +
-                                           " execution_id=" + exec_id),
+                                           " - a command was already dispatched to the fleet; do "
+                                           "not re-send, poll executions for its outcome "
+                                           "execution_id=" + exec_id),
                         "application/json");
                     return;
                 }

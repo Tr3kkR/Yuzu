@@ -10032,15 +10032,25 @@ void RestApiV1::register_routes(
                     // dispatch already succeeded (sent > 0, set_agents_targeted
                     // already called above) — not a client error, so 400 was
                     // wrong. 500, matching MCP rs_run_async's identical
-                    // post-dispatch DbError branch for parity.
+                    // post-dispatch DbError branch for parity. Distinct token
+                    // (gov-4306-S4/S9) from the pre-dispatch quota-check-degraded
+                    // 503 above: an agentic caller pattern-matching the message
+                    // text alone (not retry_after_ms) must not conflate "safe to
+                    // retry" with "already dispatched, never re-send".
                     rs_err(res, 500,
-                           "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable after "
-                           "dispatch already succeeded - do not re-send; poll executions for "
-                           "the dispatched command's outcome execution_id=" + exec_id);
+                           "RESULT_SET_STORE_FAULT_AFTER_DISPATCH: result-set store unavailable "
+                           "after dispatch already succeeded - do not re-send; poll executions "
+                           "for the dispatched command's outcome execution_id=" + exec_id);
                     return;
                 }
+                // Same "do not re-send" situation as the DbError branch
+                // above: a real dispatch already succeeded (sent > 0,
+                // set_agents_targeted already called); only the authoritative
+                // in-txn quota recheck lost the race (#4306 gov-4306-S5).
                 rs_err(res, 429,
-                       std::string(to_string(created.error())) + " execution_id=" + exec_id);
+                       std::string(to_string(created.error())) +
+                           " - a command was already dispatched to the fleet; do not re-send, "
+                           "poll executions for its outcome execution_id=" + exec_id);
                 return;
             }
             if (metrics_registry)
