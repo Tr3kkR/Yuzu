@@ -276,14 +276,26 @@ struct SudoersEntry {
 
 namespace detail {
 
+/// Splits a sudoers list at unescaped commas. A comma inside a Runas_Spec -- a `(`
+/// that OPENS an item, up to its `)` -- is part of the spec, not a separator:
+/// `(root, %wheel) NOPASSWD: /bin/ls` is one item (sudoers(5) Runas_List). Only an
+/// item-leading `(` opens a spec, so parentheses inside a command's arguments never
+/// suppress splitting.
 inline std::vector<std::string> split_unescaped_commas(std::string_view s) {
     std::vector<std::string> out;
     std::string cur;
+    bool in_runas = false;
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (s[i] == '\\' && i + 1 < s.size()) {
             cur += s[i];
             cur += s[++i];
-        } else if (s[i] == ',') {
+        } else if (s[i] == '(' && !in_runas && trim_ws(cur).empty()) {
+            in_runas = true;
+            cur += s[i];
+        } else if (s[i] == ')' && in_runas) {
+            in_runas = false;
+            cur += s[i];
+        } else if (s[i] == ',' && !in_runas) {
             out.push_back(std::string{trim_ws(cur)});
             cur.clear();
         } else {
@@ -818,7 +830,8 @@ struct PwPolicyItem {
     std::vector<std::pair<std::string, std::string>> params; // policyParameters scalars, key-sorted
     /// What the plist bridge could NOT read in the documented shape, each named once:
     /// `malformed_category` (the category's value is not an array), `malformed_policy`
-    /// (an array element is not a dictionary), `malformed_parameters` (policyParameters
+    /// (an array element is not a dictionary), `malformed_identifier` / `malformed_content` /
+    /// `malformed_parameter_value` (a modelled field is not a scalar), `malformed_parameters` (policyParameters
     /// is not a dictionary), `non_string_key` (a dictionary key that is not a string was
     /// skipped; at the plist root the item's category is empty), `unconvertible_key` (a
     /// string key with no UTF-8 rendering was skipped). pwpolicy_rows adds `missing_content`

@@ -294,13 +294,16 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
             const auto fields = detail::cf_dict_entries(static_cast<CFDictionaryRef>(el));
             detail::add_key_defects(it, fields);
             for (const auto& [k, v] : fields.entries) {
-                // "unmodelled" only on a genuine conversion failure (nullopt) -- a real
-                // empty string from CF still comes back as an empty std::string, not
-                // nullopt, so this never mislabels a genuinely-empty value.
+                // A modelled field whose value is not a scalar CF can render (nullopt: a
+                // nested dictionary/array, a date, data) is a shape defect, recorded on the
+                // item -- never replaced by an ordinary-looking value. A real empty string
+                // from CF comes back as an empty std::string, not nullopt.
                 if (k == "policyIdentifier") {
-                    it.identifier = detail::cf_scalar_text(v).value_or("unmodelled");
+                    if (auto t = detail::cf_scalar_text(v)) it.identifier = std::move(*t);
+                    else detail::add_defect(it, "malformed_identifier");
                 } else if (k == "policyContent") {
-                    it.content = detail::cf_scalar_text(v).value_or("unmodelled");
+                    if (auto t = detail::cf_scalar_text(v)) it.content = std::move(*t);
+                    else detail::add_defect(it, "malformed_content");
                 } else if (k == "policyParameters") {
                     if (CFGetTypeID(v) != CFDictionaryGetTypeID()) {
                         detail::add_defect(it, "malformed_parameters");
@@ -308,8 +311,10 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
                     }
                     const auto params = detail::cf_dict_entries(static_cast<CFDictionaryRef>(v));
                     detail::add_key_defects(it, params);
-                    for (const auto& [pk, pv] : params.entries)
-                        it.params.emplace_back(pk, detail::cf_scalar_text(pv).value_or("unmodelled"));
+                    for (const auto& [pk, pv] : params.entries) {
+                        if (auto t = detail::cf_scalar_text(pv)) it.params.emplace_back(pk, std::move(*t));
+                        else detail::add_defect(it, "malformed_parameter_value");
+                    }
                 }
             }
             items.push_back(std::move(it));
