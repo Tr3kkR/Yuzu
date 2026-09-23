@@ -90,7 +90,7 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 23 securables × 7
+`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 38 securables × 7
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
