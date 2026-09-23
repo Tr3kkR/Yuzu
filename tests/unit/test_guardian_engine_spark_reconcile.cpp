@@ -1919,6 +1919,10 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     const auto kv_path = unique_kv_path();
     yuzu::test::TempDbFile db{kv_path};
 
+    // Test boot ordering within the service admission quota (3). Above-quota
+    // synchronous refusals are allowed at boot and need a later server reapply;
+    // this test has no server and must not rely on worker completion racing the walk.
+    constexpr int kBootRuleCount = 3;
     // Phase 1: an engine that persists cached rules AND a durable journal, then goes away.
     {
         auto opened = KvStore::open(kv_path);
@@ -1935,10 +1939,10 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
                                  [](const OutboxEntry&) { return SendResult::Retain; });
         gpb::GuaranteedStatePush p;
         p.set_full_sync(true);
-        // Distinct service names: the "Spooler" default collapses all five rules
-        // onto ONE spark key, and phase 2 needs to prove five DISTINCT re-watches
+        // Distinct service names: the "Spooler" default collapses all the rules
+        // onto ONE spark key, and phase 2 needs to prove DISTINCT re-watches
         // survived the restart, not merely that some watch reappeared (#2298 F13).
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < kBootRuleCount; ++i)
             *p.add_rules() = make_service_rule("r" + std::to_string(i), true,
                                                "Svc" + std::to_string(i));
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
@@ -1946,14 +1950,14 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
         // rung 9c PR-2 Unit 6: the arms are Accepted, not yet resolved, when dispatch
         // returns - settle (each tick also retries any pending journal persist, so
         // this doubles as "force the pending records durable" once armed). Generous
-        // bound: 5 rules each dispatch to a detached worker thread, and under the FULL
+        // bound: each rule dispatches to a detached worker thread, and under the FULL
         // agent suite's accumulated thread/scheduling load (thousands of prior test
         // cases) the default 5s spin_until bound was observed to be too tight for this
         // one - not a logic race (isolated and [spark][guardian]-only runs never miss).
         REQUIRE(yuzu::test::spin_until(
             [&] {
                 engine.journal_maintenance_tick();
-                return engine.spark_armed_rule_count() == 5; // armed via spark BEFORE the restart
+                return engine.spark_armed_rule_count() == kBootRuleCount;
             },
             std::chrono::seconds(30)));
         engine.stop();
@@ -2012,7 +2016,7 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     // The re-arm must not have been starved by the boot maintenance scan. The KvStore busy
     // timeout is 5 s, so anything approaching it means the two are serialising badly.
     CHECK(elapsed < std::chrono::seconds(2));
-    CHECK(engine.rule_count() == 5); // every cached rule came back
+    CHECK(engine.rule_count() == kBootRuleCount); // every cached rule came back
 
     // And the journal side still did its work rather than being crowded out.
     auto* journal = engine.lifecycle_journal_for_test();
@@ -2023,20 +2027,21 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     CHECK(journal->pages() >= 1);
 
     // The core F13 gap: rule_count() only proves the rules were RE-DISCOVERED. Prove
-    // they RE-ARMED VIA SPARK - mutual exclusion held, and each of the five distinct
+    // they RE-ARMED VIA SPARK - mutual exclusion held, and each of the distinct
     // services is actually re-watched by the (new, phase-2) mechanism.
     //
     // rung 9c PR-2 Unit 6: start_local()'s boot re-arm is Accepted, not yet resolved,
     // when it returns - settle (generous bound, see the Phase 1 seeding block's own
     // comment on this same class of full-agent-suite load sensitivity).
-    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; },
-                                   std::chrono::seconds(30)));
-    CHECK(engine.spark_armed_rule_count() == 5);
+    REQUIRE(
+        yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == kBootRuleCount; },
+                               std::chrono::seconds(30)));
+    CHECK(engine.spark_armed_rule_count() == kBootRuleCount);
     CHECK(engine.armed_guard_count() == 0);
     CHECK(engine.unsupported_counts_by_type().empty());
     const auto watched = mechanism2->watched_snapshot();
-    CHECK(mechanism2->watching_count() == 5);
-    for (int i = 0; i < 5; ++i) {
+    CHECK(mechanism2->watching_count() == kBootRuleCount);
+    for (int i = 0; i < kBootRuleCount; ++i) {
         const std::string svc = "Svc" + std::to_string(i);
         CHECK(std::any_of(watched.begin(), watched.end(),
                           [&](const std::string& key) { return key.find(svc) != std::string::npos; }));
@@ -3442,15 +3447,25 @@ TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an
     CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1); // still K1
     CHECK(f.mechanism->watching_count() == 1);                         // K1's real watch untouched
 
-    // R2's own hung, wedged claim still recovers normally once released - nobody
-    // ever adopted it (no live follower was ever queued behind it for K2, and R's
-    // own refused retarget never queued one either), so it self-disarms the
-    // ordinary way, the ONLY disarm this whole scenario ever produces.
+    // PR-5d adopts a late success for the still-wanted original rule even without
+    // a follower. R2 was never withdrawn, so it must recover on K2 while R's
+    // preserved watch stays on K1. Wait for publication, not the pre-callback
+    // watching_count()==1 that could make the old self-disarm assertion pass early.
     f.mechanism->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 1; },
-                                   std::chrono::seconds(10)));
-    CHECK(f.engine->spark_armed_rule_count() == 1); // still just R, on K1, throughout
-    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return f.engine->spark_armed_rule_count() == 2 && f.engine->active_io_workers() == 0;
+        },
+        std::chrono::seconds(10)));
+    CHECK(f.mechanism->watching_count() == 2);
+    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 2);
+    CHECK(f.engine->spark_runtime_for_test()->rule_active_for_test("R") == true);
+    CHECK(f.engine->spark_runtime_for_test()->rule_active_for_test("R2") == true);
+    const auto watched = f.mechanism->watched_snapshot();
+    for (const std::string_view service : {"Spooler", "Notepad"})
+        CHECK(std::any_of(watched.begin(), watched.end(), [&](const std::string& key) {
+            return key.find(service) != std::string::npos;
+        }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

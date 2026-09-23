@@ -7322,6 +7322,9 @@ TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while 
         if (!yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
                                     std::chrono::seconds(30)))
             ::_exit(92);
+        // _exit bypasses destructors; join the completed caller so TSan does not
+        // report a leaked joinable thread instead of the fault under test.
+        a_thread.join();
         if (!yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                     std::chrono::seconds(10)))
             ::_exit(93); // the direct-disarm-and-fall-through recovery never ran
@@ -7423,6 +7426,7 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
         if (!yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
                                     std::chrono::seconds(30)))
             ::_exit(92);
+        a_thread.join(); // _exit below must not leave a joinable caller for TSan.
         // Gate 8 re-review (quality-engineer, PR #4318): this file's own "withdrawn"
         // wakeup path (see the "#2233 item 3 (C5/k3)" test case earlier in this file,
         // where detach_rule_locked's Case 0 notifies the waiting attach_rule()
