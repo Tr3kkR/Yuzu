@@ -880,8 +880,10 @@ struct DisabledGuardFixture {
 // short refresh cadence configured, it must keep re-asserting on its own with no filesystem
 // activity at all, since the legacy sink drops events on disconnect with no retry.
 void run_parent_unhealthy_refresh_cadence() {
-    DisabledGuardFixture fx(250); // 250ms refresh
-    REQUIRE(fx.col->wait_health_count(3, 5s)); // edge + >=2 refresh ticks, no fs activity at all
+    DisabledGuardFixture fx(500); // 500ms refresh
+    // edge + >=2 refresh ticks needs ~1s; 30s matches this file's own timeout convention
+    // (a thin margin here risks CI flake on a loaded/shared runner — CLAUDE.md #1871).
+    REQUIRE(fx.col->wait_health_count(3, 30s));
 }
 
 // The mirror case: refresh_ms == 0 must NOT arm a timer — the health count must stay at the
@@ -915,6 +917,7 @@ void run_health_report_sink_throw_is_best_effort() {
 // drift->compliant transition afterward must re-arm the gate and fire exactly one more.
 void run_compliant_edge_gated_by_health_no_redundant_refire() {
     DisabledGuardFixture fx(0);
+    const auto drift_before_remove = fx.col->drift_count(); // whatever the fixture's own setup
 
     write_file(fx.target, "content"); // presence flips true: edge into compliant, but gated
     REQUIRE(fx.col->wait_health_count(2, 30s));
@@ -929,8 +932,13 @@ void run_compliant_edge_gated_by_health_no_redundant_refire() {
 
     REQUIRE(fs::remove(fx.target)); // presence flips false: a genuine drift (report(), never
         // gated) resets last_compliant
-    REQUIRE(fx.col->wait_drift_count(4, 30s)); // fixture's own setup already produced 3 (initial
-        // absent + 2 ancestor-chain rebuilds); this is the 4th
+    // A hardcoded absolute count here would be a false-green risk: the F-level create_directory
+    // inside DisabledGuardFixture's own setup trips the abandon limit AND separately evaluates
+    // eval_exists() in the same reconcile (mirrors the sibling abandon-chain test, which reaches
+    // drift #4 at the equivalent step) — asserting a specific absolute count could already be
+    // satisfied by the fixture's setup alone, passing even if this remove() produced no drift at
+    // all. Assert relative to a captured baseline instead.
+    REQUIRE(fx.col->wait_drift_count(drift_before_remove + 1, 30s));
 
     write_file(fx.target, "content"); // presence flips true again: a NEW edge into compliant,
         // still disabled — the gate must re-fire
@@ -1058,26 +1066,26 @@ TEST_CASE("FileGuard rename: an ancestor-triggered rebuild chain reaches the aba
 
 TEST_CASE("FileGuard rename: the disabled-parent-watch unhealthy report keeps re-asserting on "
           "a configured refresh cadence with no filesystem activity at all",
-          "[guardian][guard][file][rename]") {
+          "[guardian][guard][file][rename][health]") {
     run_parent_unhealthy_refresh_cadence();
 }
 
 TEST_CASE("FileGuard rename: a zero refresh cadence never arms the backstop timer — the "
           "unhealthy report stays edge-only",
-          "[guardian][guard][file][rename]") {
+          "[guardian][guard][file][rename][health]") {
     run_parent_unhealthy_refresh_disabled_when_zero();
 }
 
 TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and never ends the "
           "watch thread",
-          "[guardian][guard][file][rename]") {
+          "[guardian][guard][file][rename][health]") {
     run_health_report_sink_throw_is_best_effort();
 }
 
 TEST_CASE("FileGuard rename: the compliant edge cache is shared with the gated health "
           "substitution — no redundant report on a same-state re-notify, but a genuine "
           "drift-then-recompliant cycle re-arms the gate",
-          "[guardian][guard][file][rename]") {
+          "[guardian][guard][file][rename][health][compliant]") {
     run_compliant_edge_gated_by_health_no_redundant_refire();
 }
 
