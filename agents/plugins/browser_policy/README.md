@@ -47,7 +47,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder (the registry probe below is evidence, not a measurement of this plugin) | n/a - the placeholder reports `UNAVAILABLE` with `windows:planned` and reads nothing |
 | macOS | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder | n/a - the placeholder reports `UNAVAILABLE` with `macos:planned` and reads nothing |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them | Measured 2026-09-22 in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as a non-root user, not by a service-account run on a real host | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, one `status` row repeats the outcome, and the result never reads as "no policy configured" |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them | Measured 2026-09-23 in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as a non-root user, not by a service-account run on a real host | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, one `status` row repeats the outcome, and the result never reads as "no policy configured" |
 
 No external binaries, no subprocesses, no shell-out and no network use: the Linux leg is an in-process, bounded read of local files.
 
@@ -113,7 +113,7 @@ status|-|-|-|policies|-|unavailable|-|macos:planned
 [result_status] UNAVAILABLE / PARTIAL / macos:planned
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 (container seeded with two synthetic Chrome policy files for this capture; see the note under the samples) · leg-hash 3349c5d2765b
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 (container seeded with two synthetic Chrome policy files for this capture; see the note under the samples) · leg-hash 3349c5d2765b
 
 ```
 == action=policies
