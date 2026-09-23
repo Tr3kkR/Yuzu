@@ -3503,7 +3503,7 @@ Create a new policy fragment from YAML.
 
 Delete a policy fragment.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3658,7 +3658,7 @@ Get policy detail including compliance summary.
 
 Delete a policy and all associated compliance data.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3680,7 +3680,7 @@ Enable a previously disabled policy.
 
 ```json
 {
-  "status": "enabled"
+  "status": "ok"
 }
 ```
 
@@ -3700,7 +3700,7 @@ Disable a policy, pausing compliance checks.
 
 ```json
 {
-  "status": "disabled"
+  "status": "ok"
 }
 ```
 
@@ -3714,13 +3714,13 @@ included in the body.
 
 Invalidate agent-side compliance cache for a specific policy. Resets all agent statuses to `pending`, forcing re-evaluation.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "agents_invalidated": 42
 }
 ```
@@ -3734,13 +3734,13 @@ retry, internal error string never included in the body.
 
 Invalidate compliance cache for all policies across all agents.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "total_invalidated": 210
 }
 ```
