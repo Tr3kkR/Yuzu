@@ -768,10 +768,9 @@ TEST_CASE("browser_policy linux: a non-regular object at a policy-file path is c
                           [&] { rows = lnx::linux_policy_rows_at(dir.path, reason); });
     if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
         // Release a blocked open() so the worker (and this process) can exit.
-        const int rel = ::open((managed / "fifo.json").c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        posix::Fd release{
+            ::open((managed / "fifo.json").c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC)};
         fut.wait();
-        if (rel >= 0)
-            ::close(rel);
         FAIL("linux_policy_rows_at blocked in open() on a writer-less FIFO");
     }
     // The regular sibling still reads; both non-regular objects collapse to ONE
@@ -810,14 +809,14 @@ TEST_CASE("browser_policy linux: a policy file whose NAME is not valid UTF-8 is 
     yuzu::test::TempDir dir{"yuzu_test_browser_policy_utf8name_"};
     const fs::path managed = dir.path / "etc/opt/chrome/policies/managed";
     fs::create_directories(managed);
-    const int fd = ::open((managed / "corp_\xFF.json").c_str(), O_CREAT | O_WRONLY | O_CLOEXEC,
-                          0644);
-    if (fd < 0) {
+    posix::Fd file{::open((managed / "corp_\xFF.json").c_str(), O_CREAT | O_WRONLY | O_CLOEXEC,
+                          0644)};
+    if (!file.valid()) {
         SKIP("this filesystem refuses a file name that is not valid UTF-8");
     }
     const std::string body = R"({"ShowHomeButton": true})";
-    REQUIRE(::write(fd, body.data(), body.size()) == static_cast<ssize_t>(body.size()));
-    ::close(fd);
+    REQUIRE(::write(file.get(), body.data(), body.size()) == static_cast<ssize_t>(body.size()));
+    file.reset(); // close before the walk reads it
 
     std::string reason;
     const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
