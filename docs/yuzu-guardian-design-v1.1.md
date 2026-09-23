@@ -2597,6 +2597,23 @@ Guardian ladder must check these.
   (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
   rule never armed via legacy still relaunders on full_sync/restart exactly as
   before this fix.
+- **A guard whose own detection has permanently degraded must never publish
+  itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
+  (rename-detection) watch permanently disables after repeated teardown
+  failures (`kParentIoAbandonLimit`, `guard_file.cpp`); `report_compliant()`
+  gates on that state and substitutes a `guard.unhealthy` health report
+  (`GuardDrift::Health`, `guard.hpp`) for any would-be compliant publication,
+  re-sent on a `parent_unhealthy_refresh_ms` cadence (default 5 minutes) as a
+  lost-edge backstop, for as long as the rule stays disabled — ordinary drift
+  reporting for the guard's own detection is unaffected. `GuardianEngine::
+  emit_guard_event`'s health arm runs BEFORE `apply_drift_to_event` and
+  ignores every compliance field on the report unconditionally, so a future
+  producer that sets both `health` and a compliance field cannot leak a false
+  compliant/drift verdict through it. A future `Health` enumerator or a new
+  degraded-detection state on ANY guard type (Registry, Service) must route
+  through this same gate-and-substitute shape — never append a second,
+  parallel "also emit compliant" event alongside a health report, which
+  reopens the exact false-green window this PR closed.
 
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 

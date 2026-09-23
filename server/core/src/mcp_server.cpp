@@ -31,7 +31,6 @@
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
-#include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
@@ -13072,16 +13071,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status.
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                // #4037: guardian_status_rollup (guardian_model.hpp) is the SAME function
-                // REST's GET /guaranteed-state/status calls — cannot drift on
+                // #4037/ADR-0031 WS-A4 (ninth family): GuardianApi::status wraps the
+                // SAME guardian_status_rollup function REST's
+                // GET /guaranteed-state/status calls — cannot drift on
                 // total_rules/errored_rules derivation by construction.
-                auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
+                auto rollup = guardian_api_->status(gate.scope);
                 if (!rollup) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13123,13 +13123,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guaranteed_state_store->list_rules();
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_rules.
+                auto rows = guardian_api_->list_rules();
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13178,7 +13179,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13244,7 +13245,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "dex.device.view", "success",
                     fleet ? "GuaranteedState" : "Agent", q.agent_id,
                     "Guaranteed State events via MCP list_guardian_events");
-                auto rows = guaranteed_state_store->query_events(q);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
+                // plain-vector, empty-on-degrade contract (ADR-0038 "deferred
+                // widening", #2659; see guardian_api.hpp).
+                auto rows = guardian_api_->list_events(q);
                 JArr arr;
                 for (const auto& e : rows) {
                     arr.add(JObj()
@@ -13292,7 +13296,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13306,8 +13310,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely
                 // absent / degraded — a degrade must error, never collapse
-                // into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // into "not found". ADR-0031 WS-A4 (ninth family):
+                // GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13331,7 +13336,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
+                auto rows = guardian_api_->rule_status(rule_id);
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13390,13 +13395,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guardian_device_all_guards(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
+                auto rows = guardian_api_->device_guards(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/agents/{agent_id}/rules and the
                 // dashboard Guardian device lens. MCP set-and-proceed
@@ -13570,7 +13576,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13578,7 +13584,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely absent /
                 // degraded — a degrade must error, never collapse into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13963,13 +13970,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::agent_status.
+                auto rollup = guardian_api_->agent_status(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/status/{agent_id}. MCP set-and-proceed posture
                 // (audit_persisted:false on a dropped row, never fail closed — MCP
@@ -14050,7 +14058,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store || !baseline_store_) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -14062,11 +14070,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // fires below - the prior inline version audited "success" right
                 // after the first read, so a degrade in any of the other three
                 // still surfaced a 500 the audit had already called successful.
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance
+                // wraps guardian_device_compliance_rollup verbatim.
                 bool store_degraded = false;
                 bool pii_access_began = false;
-                auto rollup = guardian_device_compliance_rollup(
-                    *baseline_store_, *guaranteed_state_store, baseline_name, agent_id,
-                    &store_degraded, &pii_access_began);
+                auto rollup = guardian_api_->device_compliance(baseline_name, agent_id,
+                                                                &store_degraded, &pii_access_began);
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
