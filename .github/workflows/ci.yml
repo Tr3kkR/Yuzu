@@ -2081,10 +2081,17 @@ jobs:
       # ImageOS is required because setup-beam cannot auto-detect a self-hosted
       # runner's OS; macos26 matches the BigMags Mac Minis (macOS 26, arm64).
       # Step-scoped so the rest of the job does not see it.
+      # RUNNER_TOOL_CACHE is re-pointed for this step only. Both BigMags agents
+      # share /opt/ci/tool_cache, and setup-beam deletes + re-copies its OTP tree
+      # there, so a concurrent debug/release pair on one box could wipe each
+      # other's OTP mid-job: scope it per agent. A trusted-fork run must not write
+      # a persistent erl into a cache later normal jobs execute (the "Do not read
+      # or write runner.tool_cache" rule above), so it gets a per-run temp dir.
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: macos26
+          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
         with:
           otp-version: '28'
           rebar3-version: '3.24'
