@@ -2,8 +2,10 @@
      @-import — loaded every session, same authority as CLAUDE.md itself. This
      file holds the platform/product/data/observability concerns; auth,
      access-control and request-admission live in the sibling
-     `routed-concerns-access-control.md`, and the read-only security-posture
-     plugin rows in `routed-concerns-security-posture.md`. Row discipline: catastrophic-if-violated
+     `routed-concerns-access-control.md`, the read-only security-posture
+     plugin rows in `routed-concerns-security-posture.md`, and Forensics /
+     per-user-software-data concerns in `routed-concerns-software-estate.md`
+     (CLAUDE.md's own table names each). Row discipline: catastrophic-if-violated
      invariants + doc pointers ONLY — detail goes in the routed doc. -->
 
 | Concern | Doc | Loaded by |
