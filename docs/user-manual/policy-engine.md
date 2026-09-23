@@ -356,8 +356,11 @@ result.signature_age < duration('24h')
 
 ## REST API Endpoints
 
-All policy engine endpoints are under `/api/` (legacy prefix). They require
-the `Policy:Read` or `Policy:Write` RBAC permission.
+All policy engine endpoints are under `/api/` (legacy prefix). They require a
+**route-specific** `Policy:*` RBAC permission — `Read`, `Write`, `Delete` and
+`Execute` are granted independently, so the per-row `Permission:` annotations
+below are the authority, not a blanket Read/Write pair. The REST reference
+(`rest-api.md`) carries the same values.
 
 ### Policy Fragments
 
@@ -365,7 +368,7 @@ the `Policy:Read` or `Policy:Write` RBAC permission.
 |---|---|---|
 | `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. |
 | `POST` | `/api/policy-fragments` | Create a fragment from YAML. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. |
-| `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. |
+| `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. Permission: `Policy:Delete`. |
 
 #### Worked example — `POST /api/policy-fragments`
 
@@ -414,13 +417,13 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 | `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. |
 | `POST` | `/api/policies` | Create a policy from YAML. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
 | `GET` | `/api/policies/{id}` | Get policy detail including compliance summary and `remediation_available` (true when the bound fragment defines a `fix` instruction). |
-| `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. |
+| `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. Permission: `Policy:Delete`. |
 | `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. |
 | `POST` | `/api/policies/{id}/disable` | Disable an active policy. |
 | `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents. |
 | `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. |
-| `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. |
-| `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). |
+| `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. Permission: `Policy:Execute`. |
+| `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). Permission: `Policy:Execute`. |
 
 ### Compliance
 
