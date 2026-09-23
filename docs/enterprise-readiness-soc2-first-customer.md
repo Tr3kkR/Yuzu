@@ -519,8 +519,12 @@ unaffected and did run.
 #4800 closes it: the check now runs the suites (52 cases on the Linux and Windows legs),
 and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
 and the release workflow's EUnit step were brought under the same rule. A hermetic
-self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. macOS CI
-does not run the gateway checks at all (#4841).
+self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. The same
+change closes a second, older gap (#4841): the macOS CI leg never had Erlang, so Meson
+silently skipped the gateway there and the leg passed without building or testing it. The
+macOS leg now installs Erlang/OTP 28, and every PR-validated CI leg configures with
+`-Drequire_gateway=true`, so a runner missing the gateway toolchain fails at configure
+instead of passing without the gateway.
 
 ---
 

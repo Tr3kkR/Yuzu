@@ -1113,6 +1113,11 @@ NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
 no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (unsigned —
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
+The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
+(`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
+eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
+skipped the gateway. Every PR-validated leg now configures with `-Drequire_gateway=true`, so
+a missing `rebar3` fails configure rather than skipping.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected

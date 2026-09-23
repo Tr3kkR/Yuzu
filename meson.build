@@ -675,6 +675,13 @@ if _rebar3.found()
   )
   message('Erlang gateway: enabled (rebar3 found)')
 else
+  if get_option('require_gateway')
+    # A skipped gateway is invisible: the build and every test leg stay green
+    # with no gateway compiled and no gateway test registered. macOS CI ran
+    # that way from the start (#4841). CI turns this on so the skip cannot hide.
+    error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
+          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: erlef/setup-beam).')
+  endif
   message('Erlang gateway: skipped (rebar3 not found)')
 endif
 
