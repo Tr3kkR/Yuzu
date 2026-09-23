@@ -17,7 +17,9 @@ Hermetic: parses sources, runs nothing.
 """
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -103,6 +105,54 @@ class RequireTestsExecuted(unittest.TestCase):
     def test_nonzero_rc_passes_through_unchanged(self):
         self.assertEqual(gts.require_tests_executed('Failed 6 tests. Passed 44 tests.', 'ct', 1), 1)
         self.assertEqual(gts.require_tests_executed('', 'ct', -1), -1)
+
+
+class CancelTolerantVerdict(unittest.TestCase):
+    # The verdict /test's eunit-gate.sh and the release workflow's EUnit step
+    # both take from scripts/gateway_test_summary.py (#1005 tolerance +
+    # #4800 zero-executed rule).
+
+    def test_matrix(self):
+        cases = [
+            # (log, rc, expected exit, why)
+            ('  All 300 tests passed.', 0, 0, 'green'),
+            ('  2 tests passed.', 0, 0, 'two tests'),
+            ('  Test passed.', 0, 0, 'one test'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.\nOne or more tests were cancelled.', 1, 0,
+             'some sets cancelled (#1005)'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 0.\nOne or more tests were cancelled.', 1, 1,
+             'ALL cancelled (#4800 C-1)'),
+            ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
+            ('  There were no tests to run.', 0, 1, 'nothing discovered'),
+            ('===> Compilation failed', 1, 1, 'rebar3 failed before tests'),
+            ('*** log: All 5 tests passed. (noise)\n', 0, 1, 'embedded noise only'),
+            ('  All 300 tests passed.', 1, 1, 'rc!=0 without a Failed: line'),
+        ]
+        for log, rc, want, why in cases:
+            with self.subTest(why=why):
+                self.assertEqual(gts.cancel_tolerant_verdict(log, rc)[0], want)
+
+    def test_cli(self):
+        script = os.path.join(ROOT, 'scripts', 'gateway_test_summary.py')
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            log = os.path.join(d, 'eunit.log')
+            for text, rc, want in [('  All 3 tests passed.\n', '0', 0),
+                                   ('  Failed: 0.  Skipped: 0.  Passed: 0.\n', '1', 1)]:
+                with open(log, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                p = subprocess.run([sys.executable, script, 'cancel-tolerant', rc, log, '--github'],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, want, p.stdout + p.stderr)
+            p = subprocess.run([sys.executable, script], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2)
+
+    def test_shell_gates_use_this_parser(self):
+        # A hand-written regex copy in either gate is how the CH-1 anchoring
+        # fix reached only one of three gates; keep them on the shared parser.
+        for path in (os.path.join(ROOT, 'scripts', 'test', 'eunit-gate.sh'),
+                     os.path.join(ROOT, '.github', 'workflows', 'release.yml')):
+            with self.subTest(path=path):
+                self.assertRegex(_read(path), r'gateway_test_summary\.py"?\s+cancel-tolerant')
 
 
 class WrapperWiring(unittest.TestCase):

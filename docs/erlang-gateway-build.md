@@ -32,7 +32,7 @@ source scripts/ensure-erlang.sh 28.4.2    # exact pin
 command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 ```
 
-The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
+OTP 28 is the only supported toolchain for the gateway test gates: `scripts/test_gateway.py` no longer carries the old OTP-25 CT teardown-race override (removed in #4800 because it could pass a run with an auto-skipped suite), so an OTP 25 run that hits that race now fails closed. The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
 
 ## Standing Erlang pitfalls
 

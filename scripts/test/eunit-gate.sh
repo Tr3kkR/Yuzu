@@ -77,51 +77,14 @@ REBAR_BASE_DIR="${REBAR_BASE_DIR:-$PWD/_build_eunit}" \
     rebar3 eunit "$@" 2>&1 | tee "$capture"
 rebar3_rc=${PIPESTATUS[0]}
 
-# Parse the EUnit summary. It is one of:
-#   `  All N tests passed.`                      (rc 0)
-#   `  2 tests passed.` / `  Test passed.`       (rc 0, exactly two / one)
-#   `  Failed: N.  Skipped: N.  Passed: N.`      (failures and/or cancellations)
-#   `  There were no tests to run.`
-# Neither rc 0 nor Failed: 0 proves anything ran, so both paths also require
-# a nonzero executed (failed + passed) count (#4800).
-out=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$capture")
-executed=""
-if line=$(grep -E "All [0-9]+ tests? passed\." <<<"$out" | tail -1) && [[ -n "$line" ]]; then
-    executed=$(sed -E 's/.*All ([0-9]+) tests? passed\..*/\1/' <<<"$line")
-elif grep -qE "^[[:space:]]*2 tests passed\.[[:space:]]*$" <<<"$out"; then
-    executed=2   # eunit's wording for exactly two tests
-elif grep -qE "^[[:space:]]*Test passed\.[[:space:]]*$" <<<"$out"; then
-    executed=1
+# The verdict comes from the SAME parser the Meson wrapper uses
+# (scripts/gateway_test_summary.py, pinned by tests/test_gateway_test_summary.py),
+# so the gates cannot drift apart: whole-line summary matching, the LAST
+# summary wins, >= 1 test must have EXECUTED (#4800), and a non-zero rebar3
+# exit is tolerated only for eunit's "Failed: 0" line with tests passed
+# (cancelled sets, #1005).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "eunit-gate: python3 not on PATH (needed for the summary parser)" >&2
+    exit 2
 fi
-summary=$(grep -E "^[[:space:]]*Failed:[[:space:]]+[0-9]+" <<<"$out" | tail -1)
-if [[ -n "$summary" ]]; then
-    failed_count=$(sed -E 's/.*Failed:[[:space:]]+([0-9]+).*/\1/' <<<"$summary")
-    passed_count=$(sed -E 's/.*Passed:[[:space:]]+([0-9]+).*/\1/' <<<"$summary")
-    executed=$(( failed_count + passed_count ))
-fi
-
-if [[ -z "$executed" ]]; then
-    echo "eunit-gate: rebar3 exited $rebar3_rc and no EUnit summary line found — treating as real failure" >&2
-    exit 1
-fi
-if [[ "$executed" -eq 0 ]]; then
-    echo "eunit-gate: EUnit executed ZERO tests (every set cancelled, or nothing discovered) — treating as real failure (#4800)" >&2
-    exit 1
-fi
-
-if [[ $rebar3_rc -eq 0 ]]; then
-    exit 0
-fi
-
-if [[ -z "$summary" ]]; then
-    echo "eunit-gate: rebar3 exited $rebar3_rc with no Failed/Passed summary — treating as real failure" >&2
-    exit 1
-fi
-if [[ "$failed_count" == "0" ]]; then
-    echo "eunit-gate: rebar3 exited $rebar3_rc but EUnit summary shows Failed: 0 — treating as PASS." \
-         "Cancellations are expected and not a regression (#1005)." >&2
-    exit 0
-fi
-
-echo "eunit-gate: EUnit reports Failed: $failed_count — real failure" >&2
-exit 1
+python3 "$REPO_ROOT/scripts/gateway_test_summary.py" cancel-tolerant "$rebar3_rc" "$capture"

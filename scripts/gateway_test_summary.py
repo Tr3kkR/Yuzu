@@ -46,8 +46,12 @@ _SUMMARY_RE = re.compile(
 )
 
 
-def executed_count(text):
-    """Executed (passed + failed) count from the last summary, or None."""
+def last_summary(text):
+    """(executed, failed, eunit_failed_line) from the LAST summary, or None.
+
+    eunit_failed_line is True only for eunit's "Failed: F.  Skipped: S.
+    Passed: P." shape, the one shape #1005's cancellation tolerance applies to.
+    """
     last = None
     for m in _SUMMARY_RE.finditer(_ANSI_RE.sub("", text)):
         last = m
@@ -55,16 +59,24 @@ def executed_count(text):
         return None
     g = last.group
     if g("all") is not None:
-        return int(g("all"))
+        return int(g("all")), 0, False
     if g("one") is not None:
-        return 1
+        return 1, 0, False
     if g("two") is not None:
-        return 2
+        return 2, 0, False
     if g("none") is not None:
-        return 0
+        return 0, 0, False
     if g("cp") is not None:
-        return int(g("cf") or 0) + int(g("cp"))
-    return int(g("ef")) + int(g("ep"))
+        failed = int(g("cf") or 0)
+        return failed + int(g("cp")), failed, False
+    failed = int(g("ef"))
+    return failed + int(g("ep")), failed, True
+
+
+def executed_count(text):
+    """Executed (passed + failed) count from the last summary, or None."""
+    s = last_summary(text)
+    return None if s is None else s[0]
 
 
 def require_tests_executed(text, label, returncode):
@@ -86,3 +98,68 @@ def require_tests_executed(text, label, returncode):
         return 1
     print(f"\n[test_gateway.py] {label}: {executed} tests executed.")
     return 0
+
+
+def cancel_tolerant_verdict(text, returncode):
+    """Verdict for the EUnit gates that tolerate cancelled sets (#1005).
+
+    Used by scripts/test/eunit-gate.sh (/test) and the release workflow's
+    EUnit step, so all three gateway test gates share ONE parser. Returns
+    (exit_code, level, message); level is None, "warning" or "error".
+
+      - no recognisable summary        -> 1 (rebar3 failed before tests ran,
+                                            or the capture was truncated)
+      - zero tests executed            -> 1 (every set cancelled, or nothing
+                                            discovered: the #4800 class)
+      - rc 0 with >= 1 executed        -> 0
+      - rc != 0, eunit "Failed: 0" line
+        with >= 1 passed               -> 0 with a warning (cancellations,
+                                            #1005)
+      - anything else                  -> 1
+    """
+    s = last_summary(text)
+    if s is None:
+        return 1, "error", (
+            f"EUnit printed no recognisable test summary (rebar3 rc={returncode}) "
+            "-- rebar3 failed before any test ran, or the output was cut short. "
+            "If rebar3 changed its summary wording, update "
+            "scripts/gateway_test_summary.py.")
+    executed, failed, eunit_failed_line = s
+    if executed == 0:
+        return 1, "error", (
+            "EUnit executed zero tests (every set cancelled, or nothing was "
+            "discovered) -- nothing was tested (#4800).")
+    if returncode == 0:
+        return 0, None, None
+    if eunit_failed_line and failed == 0:
+        return 0, "warning", (
+            f"EUnit exited {returncode} but 0 tests failed and {executed} ran "
+            "-- cancelled sets are tolerated (#1005).")
+    return 1, "error", (
+        f"EUnit exited {returncode} with {failed} failed of {executed} executed.")
+
+
+def _main(argv):
+    """CLI: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]"""
+    if len(argv) < 3 or argv[0] != "cancel-tolerant":
+        print("usage: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]",
+              file=sys.stderr)
+        return 2
+    try:
+        rc = int(argv[1])
+        with open(argv[2], encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except (ValueError, OSError) as exc:
+        print(f"gateway_test_summary: {exc}", file=sys.stderr)
+        return 2
+    code, level, message = cancel_tolerant_verdict(text, rc)
+    if message:
+        if "--github" in argv[3:]:
+            print(f"::{level}::{message}")
+        else:
+            print(f"eunit-gate: {level}: {message}", file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))
