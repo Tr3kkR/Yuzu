@@ -3041,7 +3041,10 @@ TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful disp
           "client error (#4306 fold-in B)",
           "[pg][result_set][async][tar][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    // Short lock_timeout_ms (established technique) so the deliberately-held
+    // lock below fails the blocked query deterministically and fast, rather
+    // than waiting out the default 10s lock_timeout.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
 
@@ -3091,7 +3094,7 @@ TEST_CASE("from-inventory-query: a degraded members-table read on the parent-nar
           "refuses rather than materialising an unnarrowed result set (#4306 finding 3)",
           "[pg][result_set][async][inventory][security][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     InventoryStore inventory{pool};
     REQUIRE(inventory.is_open());
@@ -3138,7 +3141,7 @@ TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 w
           "finding 2)",
           "[pg][result_set][security][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     h.seed_materialized("has-one", {"a"});
@@ -3169,7 +3172,7 @@ TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read r
           "(503), never a 200 with an empty array (#4306 finding 3 / #4307 finding 2)",
           "[pg][result_set][security][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     auto id = h.seed_materialized("has-members", {"a", "b"});
@@ -3211,7 +3214,7 @@ TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read ref
           "finding 2)",
           "[pg][result_set][security][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     auto id = h.seed_materialized("has-lineage", {"a"});
