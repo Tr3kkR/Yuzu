@@ -6,8 +6,8 @@
  *                     UNSUPPORTED; Windows: SecureBoot\State registry (rung 1)
  *   code_integrity -- Linux: securityfs lsm + lockdown (rung 1); macOS: spctl
  *                     --status + csrutil status via run_bounded_subprocess
- *                     (rung 2 argv leaves); Windows: CI\Policy + DeviceGuard
- *                     registry (rung 1)
+ *                     (rung 2 argv leaves); Windows: CI\Policy, DeviceGuard and
+ *                     Lsa\LsaCfgFlags registry (rung 1)
  *
  * WHY (state plainly, do not inflate): there is no documented business driver.
  * No capability-map requirement, enterprise-parity, SOC 2 or roadmap entry
@@ -47,7 +47,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "(errno-classified absent/unreadable)", nullptr},
      {YUZU_SUPPORT_SUPPORTED, 2, "spctl --status + csrutil status via run_bounded_subprocess", nullptr},
      {YUZU_SUPPORT_SUPPORTED, 1,
-      "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy and Control\\DeviceGuard registry values", nullptr}},
+      "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy, Control\\DeviceGuard and "
+      "Control\\Lsa\\LsaCfgFlags registry values", nullptr}},
 };
 
 } // namespace

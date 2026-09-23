@@ -107,6 +107,14 @@ ps::ValueOutcome read_value(HKEY key, const ps::KeySpec& spec, const std::string
             return failed(o, ps::classify_win32_failure(rk, static_cast<std::uint32_t>(rc)));
         if (type != probed_type)
             return failed(o, ps::unreadable_failure(rk, "type_changed"));
+        // PR #4792 review (fjarvis, 5289352195): if the value shrinks below 4
+        // bytes between the probe and this fill (a narrow TOCTOU on an
+        // admin-writable key), RegQueryValueExW still returns ERROR_SUCCESS
+        // with `sz` set to the actual (smaller) size and `v`'s un-written
+        // trailing bytes left at their zero-init -- silently fabricating a
+        // zero-extended dword instead of reporting the shrink.
+        if (sz != sizeof(v))
+            return failed(o, ps::unreadable_failure(rk, "size_" + std::to_string(sz)));
         o.value.kind = ps::ValueKind::dword;
         o.value.dword = static_cast<std::uint32_t>(v);
         return o;

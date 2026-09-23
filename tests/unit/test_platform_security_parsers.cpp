@@ -158,6 +158,38 @@ TEST_CASE("platform_security: the real Docker capture (no UEFI vars, no Lockdown
     CHECK(select_status(acc, false).status == YUZU_RESULT_STATUS_OK);
 }
 
+// PR #4792 review (fjarvis, 5289352195, HIGH): a leaf ENOENT must mean "the OS definitively says
+// this value is not there", never "the whole collection surface (efivarfs/securityfs) isn't
+// mounted in this namespace" -- the two are indistinguishable from open()'s errno alone. The real
+// fix lives in platform_security_linux.cpp's read_file, which is real-syscall code this pure-layer
+// suite cannot exercise directly (per the file's own injected-reader design) -- what IS testable,
+// and what the fixed read_file now depends on, is that the pure layer correctly tells a genuine
+// "not there" (ENOENT) apart from a "surface unavailable" signal (any other errno, here ENODEV)
+// reaching it through the SAME reader seam. This locks that contract in independently of the real
+// mount-detection code, exactly mirroring the existing EACCES regression above.
+TEST_CASE("platform_security: a collection-surface-unavailable errno is unreadable, never absent",
+          "[platform_security][parsers][fixtures]") {
+    ConstraintAccumulator acc;
+    const auto rows = secure_boot_rows_linux(
+        reader_over({{kSecureBootPath, {ENODEV, {}}}, {kSetupModePath, {ENODEV, {}}}}), acc);
+    CHECK(formatted(rows) == Rows{"secure_boot|linux|secure_boot|-|unreadable",
+                                  "secure_boot|linux|setup_mode|-|unreadable"});
+    // ENODEV's numeric value isn't POSIX-mandated (this test file also builds on macOS/Windows) --
+    // match the source's own "<key>:errno_<n>" construction rather than hardcode a platform value.
+    const std::string tok = "errno_" + std::to_string(ENODEV);
+    CHECK(acc.reason() == "secure_boot:" + tok + ",setup_mode:" + tok);
+    CHECK_FALSE(any_denied(rows)); // unreadable, but not a permission denial
+    CHECK(select_status(acc, false).status == YUZU_RESULT_STATUS_CONSTRAINED);
+
+    ConstraintAccumulator ci_acc;
+    const auto ci_rows = code_integrity_rows_linux(
+        reader_over({{"/sys/kernel/security/lsm", {ENODEV, {}}},
+                     {"/sys/kernel/security/lockdown", {ENODEV, {}}}}),
+        ci_acc);
+    CHECK(formatted(ci_rows) == Rows{"code_integrity|linux|lsm|-|unreadable",
+                                     "code_integrity|linux|lockdown|-|unreadable"});
+}
+
 // Fails if the decision order changes: absence alone stays OK/FULL, a token beats OK, a denial
 // outranks another failure (both tokens stay in provenance).
 TEST_CASE("platform_security: select_status is the one decision every leg shares",

@@ -10,6 +10,14 @@
  * efivarfs must be read from offset 0 into a buffer holding the whole
  * variable, so the reader loops read() into one bounded buffer; a file that
  * fills it is EFBIG (unreadable, never truncated into a value).
+ *
+ * A leaf ENOENT is only trusted as genuine absence when the PARENT pseudo-
+ * filesystem (efivarfs / securityfs) is confirmed mounted via statfs's magic
+ * number first (PR #4792 review, fjarvis) -- otherwise it's remapped to
+ * ENODEV (`unreadable` + `:errno_19`) before it ever reaches the pure layer,
+ * so a container running with neither mounted (a real, shipped deployment
+ * path) never reports a clean absent/OK for a posture that was never
+ * actually probed.
  */
 #include "platform_security_legs.hpp"
 
@@ -18,11 +26,14 @@
 #include <yuzu/agent/scoped_fd.hpp>
 
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::platform_security {
 
@@ -30,13 +41,63 @@ namespace {
 
 constexpr std::size_t kMaxFileBytes = 4096;
 
+// linux/magic.h's ABI-stable pseudo-filesystem magic numbers, not included
+// directly to avoid a kernel-header build dependency this TU otherwise has no
+// need for.
+constexpr decltype(std::declval<struct statfs>().f_type) kEfivarfsMagic = 0xde5e81e4;
+constexpr decltype(std::declval<struct statfs>().f_type) kSecurityfsMagic = 0x73636673;
+
+// True iff `dir` is currently mounted as the pseudo-filesystem carrying
+// `expected_magic`. False on ANY statfs failure -- including the directory
+// not existing at all -- never guessed true.
+bool mount_matches(const char* dir, decltype(std::declval<struct statfs>().f_type) expected_magic) {
+    struct statfs buf {};
+    if (::statfs(dir, &buf) != 0) return false;
+    return buf.f_type == expected_magic;
+}
+
+bool dir_exists(const char* dir) {
+    struct stat st {};
+    return ::stat(dir, &st) == 0;
+}
+
+// True iff a leaf ENOENT under `path` should be remapped to "surface
+// unavailable" (ENODEV) rather than trusted as genuine absence.
+//
+// securityfs: one check suffices -- securityfs is kernel infrastructure with
+// no hardware precondition, so `/sys/kernel/security` either IS securityfs
+// (mounted) or it isn't; an unprivileged container leaves the directory
+// present but backed by the outer sysfs mount (confirmed empirically:
+// `stat -f` reports `Type: sysfs`, not `securityfs`, there), which
+// `mount_matches` alone correctly catches.
+//
+// efivarfs needs a SECOND, prior check: `/sys/firmware/efi` not existing at
+// all means genuinely non-UEFI firmware (a real, legitimate absence -- e.g.
+// a BIOS/CSM-booted VM, the documented case this plugin's own fixture
+// captures) and must NOT be reclassified. Only when `/sys/firmware/efi`
+// exists (real UEFI firmware) but `/sys/firmware/efi/efivars` is not itself
+// mounted as efivarfs is the surface unavailable, not absent -- exactly the
+// container scenario PR #4792's own review (fjarvis, 5289352195, HIGH)
+// found: this plugin's real Linux sample capture reported all four rows
+// absent/OK/FULL on a host whose actual posture was never probed.
+bool surface_unavailable(std::string_view path) {
+    if (path.starts_with("/sys/firmware/efi/efivars/"))
+        return dir_exists("/sys/firmware/efi") &&
+               !mount_matches("/sys/firmware/efi/efivars", kEfivarfsMagic);
+    return !mount_matches("/sys/kernel/security", kSecurityfsMagic);
+}
+
 ReadOutcome read_file(std::string_view path) {
     const std::string p{path};
     int raw;
     do {
         raw = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
     } while (raw < 0 && errno == EINTR);
-    if (raw < 0) return {errno, {}};
+    if (raw < 0) {
+        const int open_errno = errno; // capture before the mount probes' own syscalls touch errno
+        if (open_errno == ENOENT && surface_unavailable(path)) return {ENODEV, {}};
+        return {open_errno, {}};
+    }
     yuzu::agent::ScopedFd fd(raw);
 
     std::string data;
