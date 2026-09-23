@@ -80,19 +80,19 @@ spec:
       - name: row_kind
         type: string
         values: [policy, status]
-        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (at most one, written first and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-".'
+        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-".'
         example: policy
         platforms: [windows, linux, darwin]
       - name: browser
         type: string
         values: [chrome, chromium, edge]
-        description: 'Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge).'
+        description: 'Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge); "-" on a status row.'
         example: chrome
         platforms: [linux]
       - name: level
         type: string
         values: [mandatory, recommended]
-        description: 'Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change).'
+        description: 'Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change); "-" on a status row.'
         example: mandatory
         platforms: [linux]
       - name: scope
@@ -108,7 +108,7 @@ spec:
       - name: value_type
         type: string
         values: [bool, int, real, string, list, dict, "null", unmodelled]
-        description: 'Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail).'
+        description: 'Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail); "-" on a status row.'
         example: string
         platforms: [linux]
       - name: value
@@ -123,11 +123,12 @@ spec:
         platforms: [linux]
       - name: detail
         type: string
-        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.'
+        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD; truncated marks a field longer than 64 KiB, cut. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.'
         example: "-"
         platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
+        - row_kind
         - browser
         - level
       operations:

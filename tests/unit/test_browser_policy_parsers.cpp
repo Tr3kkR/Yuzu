@@ -39,11 +39,16 @@
  *   - NUL: drop the NUL replacement in format_policy_row -> the row is
  *     truncated at the C-string boundary and the `nul_replaced` tail is lost;
  *   - read-to-EOF (Linux only, /proc reports st_size 0): read exactly st_size
- *     -> the /proc read returns empty.
- *   - in-band outcome row: drop the write from mark_result_read (or write it on an OK
- *     read) -> the pairing check inside run_leg fails on every constrained run;
- *   - depth guard: end the line comment at LF only in max_nesting_depth, or shift its
- *     comparison -> the CR/NUL-comment and exact-boundary cases fail;
+ *     -> the /proc read returns empty;
+ *   - in-band outcome row: drop the write from mark_result_read, write it on an OK read, or
+ *     write it AFTER the rows -> the pairing / first-line check inside run_leg fails on every
+ *     constrained (or OK) run that reaches it;
+ *   - depth and container guards (max_nesting_depth / scan_json_shape): end the line comment
+ *     at LF only, keep the LAST opener instead of the deepest, drop the backslash skip inside a
+ *     string, or shift a comparison -> the comment, escape, sibling-order and exact-boundary
+ *     cases fail; an undercount against nlohmann's own SAX depth fails the differential case;
+ *   - field cap: drop the kMaxFieldBytes cut (or cut after escaping) -> the oversized-field
+ *     cases fail;
  *   - UTF-8 (protobuf transport): drop repair_utf8 from wire_field -> the invalid-byte
  *     cases keep the raw bytes and the CommandResponse round trip fails (Linux also has the
  *     real raw-byte-file-name case; no other OS can create such a name);
@@ -62,9 +67,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <string_view>
@@ -448,6 +455,75 @@ TEST_CASE("browser_policy: repair_utf8 agrees with an independent reference on e
     CHECK(valid_seen > 0); // the sweep does cover well-formed input, not only garbage
 }
 
+TEST_CASE("browser_policy: a field longer than the cap is cut on a character boundary and flagged",
+          "[browser_policy][parsers]") {
+    // One policy value can otherwise make a row larger than the server's per-chunk ingest cap
+    // (which drops the row's source and detail fields while the agent reports a complete read).
+    // The cut is on the repaired text BEFORE escaping, so it can never strand half an escape in
+    // front of the field separator. MUTATION: drop the cut, or cut after escaping.
+    PolicyRow r;
+    r.name = "N";
+    r.scope = "machine";
+    r.source = "/x";
+    const auto fields_of = [&r](std::string value) {
+        r.value = PolicyValue{PolicyType::String, std::move(value), {}};
+        return format_policy_row(r);
+    };
+    // Exactly the cap: untouched. One over: cut, flagged.
+    const auto at_cap = fields_of(std::string(kMaxFieldBytes, 'a'));
+    CHECK(split_fields(at_cap)[8] == "-");
+    CHECK(split_fields(at_cap)[6].size() == kMaxFieldBytes);
+    const auto over = fields_of(std::string(kMaxFieldBytes + 1, 'a'));
+    CHECK(split_fields(over)[8] == "truncated");
+    CHECK(split_fields(over)[6] == std::string(kMaxFieldBytes, 'a'));
+    CHECK(split_fields(over).size() == 9);
+
+    // A three-byte character that straddles the cap is dropped whole, never split.
+    const auto straddle = fields_of(std::string(kMaxFieldBytes - 1, 'a') + "\xE2\x82\xAC");
+    CHECK(split_fields(straddle)[6] == std::string(kMaxFieldBytes - 1, 'a'));
+    CHECK(split_fields(straddle)[8] == "truncated");
+    CHECK(survives_transport(straddle));
+
+    // Pipes are escaped AFTER the cut: a value of all pipes keeps nine fields and stays far
+    // under the ingest cap even at twice the cap.
+    const auto pipes = fields_of(std::string(kMaxFieldBytes * 2, '|'));
+    CHECK(split_fields(pipes).size() == 9);
+    CHECK(split_fields(pipes)[8] == "truncated");
+    CHECK(pipes.size() < 2 * kMaxFieldBytes + 1024);
+
+    // Every free-text field is capped, and the flags combine in a fixed order.
+    r.name = std::string(kMaxFieldBytes + 5, 'n') + '\xFF';
+    r.value = PolicyValue{PolicyType::String, std::string("v\0", 2), {}};
+    const auto combined = format_policy_row(r);
+    CHECK(split_fields(combined)[8] == "nul_replaced,utf8_replaced,truncated");
+    CHECK(split_fields(combined)[4].size() == kMaxFieldBytes);
+    CHECK(survives_transport(combined));
+}
+
+TEST_CASE("browser_policy: a file with more than the container cap is json_too_complex, exactly at "
+          "the cap is not",
+          "[browser_policy][parsers]") {
+    // Root object + one array + (cap - 2) empty objects = exactly kMaxJsonContainers containers.
+    // A parsed container costs ~30x its bytes, so the count (not the file size) bounds the
+    // document. MUTATION: shift the comparison by one, or drop the check.
+    const auto text_with = [](std::size_t containers) {
+        std::string t = R"({"a":[)";
+        for (std::size_t i = 0; i + 2 < containers; ++i)
+            t += (i ? ",{}" : "{}");
+        t += "]}";
+        return t;
+    };
+    const auto parse_text = [](const std::string& t) {
+        return rows_from_json_policy_text(t, Browser::chrome, Level::mandatory, "machine", "/x");
+    };
+    CHECK_FALSE(parse_text(text_with(kMaxJsonContainers)).failure.has_value());
+    CHECK(parse_text(text_with(kMaxJsonContainers + 1)).failure == kTokenJsonTooComplex);
+    CHECK(detail::scan_json_shape(text_with(kMaxJsonContainers)).containers == kMaxJsonContainers);
+    // Too deep is reported in preference to too complex.
+    CHECK(parse_text(std::string(kMaxNestingDepth + 1, '[') + std::string(kMaxNestingDepth + 1, ']'))
+              .failure == kTokenJsonTooDeep);
+}
+
 TEST_CASE("browser_policy: the status row is nine fields, escapes its reason, and never holds a NUL",
           "[browser_policy][parsers]") {
     const auto planned = format_status_row(kStateUnavailable, "macos:planned");
@@ -486,6 +562,102 @@ TEST_CASE("browser_policy: max_nesting_depth counts brackets outside strings and
     CHECK(max_nesting_depth(std::string_view{"{// x\0[[[[", 10}) == 5);
     CHECK(max_nesting_depth("{/* unterminated [[[[") == 1);        // ends the scan; the parse fails
     CHECK(max_nesting_depth("]]]]{") == 1);                        // closers never go negative
+    // The DEEPEST nesting, not the last: a deep container before a shallow sibling. MUTATION:
+    // keep the last opener's depth instead of the maximum -> this reads 2.
+    CHECK(max_nesting_depth(R"({"a":[[[1]]],"b":[]})") == 4);
+    // An escaped quote does not end the string, so the brackets after it are still inside it.
+    // MUTATION: drop the backslash skip -> the string ends early and the `[[[[` counts.
+    CHECK(max_nesting_depth(R"({"a":"x\"[[[["})") == 1);
+    // Parse level, same two shapes: 33 nested arrays after a shallow key, and after an escaped
+    // quote, are still json_too_deep (the guard must see them wherever they sit).
+    const auto parse_text = [](const std::string& text) {
+        return rows_from_json_policy_text(text, Browser::chrome, Level::mandatory, "machine", "/x");
+    };
+    const std::string deep = std::string(kMaxNestingDepth, '[') + std::string(kMaxNestingDepth, ']');
+    CHECK(parse_text(R"({"a":)" + deep + R"(,"b":[]})").failure == kTokenJsonTooDeep);
+    CHECK(parse_text(R"({"a":"\"","b":)" + deep + "}").failure == kTokenJsonTooDeep);
+}
+
+namespace {
+
+/// nlohmann's own view of the nesting: the peak depth its SAX events reach, including the events
+/// delivered before a parse error stops it.
+struct PeakDepthSax {
+    std::size_t depth = 0;
+    std::size_t peak = 0;
+    bool start_object(std::size_t) { return open(); }
+    bool end_object() { return close(); }
+    bool start_array(std::size_t) { return open(); }
+    bool end_array() { return close(); }
+    bool null() { return true; }
+    bool boolean(bool) { return true; }
+    bool number_integer(nlohmann::json::number_integer_t) { return true; }
+    bool number_unsigned(nlohmann::json::number_unsigned_t) { return true; }
+    bool number_float(nlohmann::json::number_float_t, const std::string&) { return true; }
+    bool string(std::string&) { return true; }
+    bool binary(nlohmann::json::binary_t&) { return true; }
+    bool key(std::string&) { return true; }
+    bool parse_error(std::size_t, const std::string&, const nlohmann::json::exception&) {
+        return false;
+    }
+
+private:
+    bool open() {
+        peak = std::max(peak, ++depth);
+        return true;
+    }
+    bool close() {
+        --depth;
+        return true;
+    }
+};
+
+} // namespace
+
+TEST_CASE("browser_policy: the container scan never counts less nesting than nlohmann builds",
+          "[browser_policy][parsers]") {
+    // The depth guard hand-mirrors nlohmann's lexer (comment and string rules). An UNDERCOUNT
+    // would let a deep document reach the recursive dump(), so this compares the scan with the
+    // parser's own peak depth on a fixed pseudo-random corpus: bracket-heavy random bytes and
+    // random token sequences that include every comment form, escapes and NUL. A vcpkg bump of
+    // nlohmann that changes a lexer rule fails here. MUTATION: any of the scan's rules changed
+    // so it counts less (LF-only comment end, no NUL end, no backslash skip, no comments).
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    const auto next = [&state]() {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<std::uint32_t>(state >> 33);
+    };
+    static const char kChars[] = {'{', '}', '[', ']', '"', '\\', '/', '*', ':', ',', 'a', '1',
+                                  ' ', '\n', '\r', '\0'};
+    static const std::array<std::string_view, 16> kTokens = {
+        "{", "}", "[", "]", "\"a\"", "\"\\\"[[\"", ":", ",", "1", "// x\n", "// x\r", "/* [ */",
+        std::string_view{"\0", 1}, "\"", "/", "*"};
+    std::size_t undercounts = 0;
+    std::size_t accepted = 0;
+    const auto compare = [&](const std::string& text) {
+        PeakDepthSax sax;
+        const bool ok = nlohmann::json::sax_parse(text.begin(), text.end(), &sax,
+                                                  nlohmann::json::input_format_t::json,
+                                                  /*strict=*/false, /*ignore_comments=*/true);
+        if (detail::max_nesting_depth(text) < sax.peak)
+            ++undercounts;
+        if (ok)
+            ++accepted;
+    };
+    for (int i = 0; i < 20000; ++i) {
+        std::string bytes;
+        const auto n = 1 + next() % 40;
+        for (std::uint32_t k = 0; k < n; ++k)
+            bytes += kChars[next() % sizeof(kChars)];
+        compare(bytes);
+        std::string tokens;
+        const auto m = 1 + next() % 30;
+        for (std::uint32_t k = 0; k < m; ++k)
+            tokens += kTokens[next() % kTokens.size()];
+        compare(tokens);
+    }
+    CHECK(undercounts == 0);
+    CHECK(accepted > 0); // the corpus reaches accepted documents, not only errors
 }
 
 TEST_CASE("browser_policy: the depth cap has an exact boundary for arrays AND objects, and holds "
@@ -519,15 +691,17 @@ TEST_CASE("browser_policy: the depth cap has an exact boundary for arrays AND ob
     CHECK(parse(sneaky).failure == kTokenJsonTooDeep);
 }
 
-TEST_CASE("browser_policy: a megabyte of sibling containers parses in linear time and is bounded "
-          "by max_rows",
+TEST_CASE("browser_policy: a wide file of sibling containers parses in linear time, a wider one "
+          "is json_too_complex, and rows stop at max_rows",
           "[browser_policy][parsers]") {
-    // The shape nlohmann's callback parser handled QUADRATICALLY (over two minutes for 1 MiB):
-    // one key holding a huge list of small objects. The depth guard is now a linear pre-scan and
-    // the parse has no callback, so this returns at once; a regression back to the callback
-    // parser shows up as a suite that does not finish, not as a timing assertion.
+    // The shape nlohmann's callback parser handled QUADRATICALLY (minutes for 1 MiB): one key
+    // holding a huge list of small objects. The depth guard is now a linear pre-scan and the
+    // parse has no callback, so the widest file the container cap admits returns at once; a
+    // regression back to the callback parser shows up as a suite that does not finish, not as
+    // a timing assertion. A megabyte of the same shape exceeds the container cap and is
+    // refused by the pre-scan without being parsed.
     std::string text = R"({"a":[)";
-    while (text.size() < 1024 * 1024)
+    while (text.size() < 65000 * 8)
         text += R"({"x":1},)";
     text += R"({"x":1}]})";
     const auto p = rows_from_json_policy_text(text, Browser::chrome, Level::mandatory, "machine",
@@ -535,6 +709,13 @@ TEST_CASE("browser_policy: a megabyte of sibling containers parses in linear tim
     REQUIRE_FALSE(p.failure.has_value());
     REQUIRE(p.rows.size() == 1);
     CHECK(p.rows[0].value.type == PolicyType::List);
+
+    std::string huge = R"({"a":[)";
+    while (huge.size() < 1024 * 1024)
+        huge += R"({"x":1},)";
+    huge += R"({"x":1}]})";
+    CHECK(rows_from_json_policy_text(huge, Browser::chrome, Level::mandatory, "machine", "/x")
+              .failure == kTokenJsonTooComplex);
 
     // And a file with many keys stops building rows at the budget it is given.
     std::string keys = "{";
@@ -730,20 +911,28 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
     out.completeness = result.result_completeness;
     out.provenance = result.result_provenance;
     std::istringstream lines(result.captured);
+    bool first_line = true;
+    bool status_row_first = false;
     for (std::string line; std::getline(lines, line);) {
         if (line.empty())
             continue;
         if (line.rfind("status|", 0) == 0) {
-            CHECK(out.status_row.empty()); // at most ONE outcome row per run
+            CHECK(out.status_row.empty()); // one outcome row per leg run in this file
             out.status_row = line;
+            status_row_first = first_line;
         } else {
             out.rows.push_back(line);
         }
+        first_line = false;
     }
     // The pairing invariant, checked on EVERY leg run in this file: a CONSTRAINED read carries
-    // exactly one `constrained` status row naming the same tokens as the typed provenance; a
-    // completed read (OK/FULL, populated or empty) carries none. MUTATION: drop the row write
-    // from mark_result_read, or write it on an OK read -> every case that runs a leg fails here.
+    // exactly one `constrained` status row, FIRST in the output, naming the same tokens as the
+    // typed provenance; a completed read (OK/FULL, populated or empty) carries none. MUTATION:
+    // drop the row write from mark_result_read, write it on an OK read, or move it after
+    // write_rows -> the runs that reach the changed branch fail here.
+    if (!out.status_row.empty()) {
+        CHECK(status_row_first);
+    }
     if (out.status == YUZU_RESULT_STATUS_CONSTRAINED) {
         CHECK(out.status_row == "status|-|-|-|policies|-|constrained|-|" + out.provenance);
     } else {
@@ -994,22 +1183,38 @@ TEST_CASE("browser_policy linux: a non-regular object at a policy-file path is c
     fs::create_directories(managed / "dir.json"); // a DIRECTORY named like a policy file
     write_file(dir.path, "etc/opt/chrome/policies/managed/ok.json", R"({"ShowHomeButton": true})");
 
+    // The walk under the deadlock guard: a hang becomes a named failure, and the blocked open()
+    // is released so the worker (and this process) can exit.
+    const auto walk_guarded = [](const fs::path& root, const fs::path& fifo, std::string& reason) {
+        std::vector<std::string> rows;
+        auto fut = std::async(std::launch::async,
+                              [&] { rows = lnx::linux_policy_rows_at(root, reason); });
+        if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+            posix::Fd release{::open(fifo.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC)};
+            fut.wait();
+            FAIL("linux_policy_rows_at blocked in open() on a writer-less FIFO");
+        }
+        return rows;
+    };
+
     std::string reason;
-    std::vector<std::string> rows;
-    auto fut = std::async(std::launch::async,
-                          [&] { rows = lnx::linux_policy_rows_at(dir.path, reason); });
-    if (fut.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
-        // Release a blocked open() so the worker (and this process) can exit.
-        posix::Fd release{
-            ::open((managed / "fifo.json").c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC)};
-        fut.wait();
-        FAIL("linux_policy_rows_at blocked in open() on a writer-less FIFO");
-    }
+    const auto rows = walk_guarded(dir.path, managed / "fifo.json", reason);
     // The regular sibling still reads; both non-regular objects collapse to ONE
     // token (the accumulator dedupes exact strings).
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].find("|ShowHomeButton|bool|true|") != std::string::npos);
     CHECK(reason == "linux:not_regular");
+
+    // A FIFO where a DIRECTORY hop belongs: O_DIRECTORY refuses it at once (ENOTDIR). MUTATION:
+    // drop O_DIRECTORY from open_dir_at -> the open blocks on the writer-less FIFO, the guard
+    // above fires, and the case fails by name instead of wedging the suite.
+    yuzu::test::TempDir hop{"yuzu_test_browser_policy_fifohop_"};
+    fs::create_directories(hop.path / "etc/opt");
+    REQUIRE(::mkfifo((hop.path / "etc/opt/chrome").c_str(), 0644) == 0);
+    std::string hop_reason;
+    const auto hop_rows = walk_guarded(hop.path, hop.path / "etc/opt/chrome", hop_reason);
+    CHECK(hop_rows.empty());
+    CHECK(hop_reason == "linux:not_a_directory");
 }
 
 TEST_CASE("browser_policy linux: a regular file where a policy directory is expected is constrained",
@@ -1248,6 +1453,19 @@ TEST_CASE("browser_policy linux leg: a cap stops the walk, so a later sibling ad
     CHECK(run.provenance == "linux:row_cap");
 }
 
+TEST_CASE("browser_policy linux leg: an unlimited row budget builds every row, not none",
+          "[browser_policy][linux][cap]") {
+    // The parser is handed the budget that is left plus one; a max_rows of SIZE_MAX must
+    // saturate, not wrap to "build no rows" (which would read as an empty, complete OK).
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_unlimited_"};
+    write_file(dir.path, "etc/opt/chrome/policies/managed/a.json", R"({"A": 1, "B": 2})");
+    WalkLimits limits;
+    limits.max_rows = std::numeric_limits<std::size_t>::max();
+    const auto run = run_leg(dir.path, limits);
+    CHECK(run.rows.size() == 2);
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+}
+
 TEST_CASE("browser_policy linux leg: rows come out in sorted file order, whatever readdir returns",
           "[browser_policy][linux][tree]") {
     // MUTATION: drop the std::sort in list_names -> readdir order (newest-first on tmpfs, hash
@@ -1339,14 +1557,14 @@ TEST_CASE("browser_policy linux leg: the walk leaks no file descriptor on the ha
           "failure path",
           "[browser_policy][linux][tree]") {
     // LeakSanitizer sees heap only, so an unclosed fd is invisible to the sanitizer legs: count
-    // the process's descriptors around the walk. MUTATION: drop closedir in ~Dir, or a close in
-    // the fd owner or in dir_from_fd's failure path -> the count grows.
+    // the process's descriptors around the walk. MUTATION: drop closedir in ~Dir, or the close in
+    // the fd owner -> the count grows. (No FIFO here: a lost O_NONBLOCK would hang this case
+    // instead of failing it; the FIFO case above carries the deadlock guard.)
     yuzu::test::TempDir ok{"yuzu_test_browser_policy_leg_fdleak_"};
     for (char c = 'a'; c <= 'e'; ++c)
         write_file(ok.path, std::string{"etc/opt/chrome/policies/managed/"} + c + ".json", R"({"K": 1})");
     write_file(ok.path, "etc/opt/edge/policies/recommended/x.json", "{ nope");             // unparseable
     write_file(ok.path, "etc/chromium/policies/managed/big.json", std::string(2048, 'a'));  // oversized below
-    REQUIRE(::mkfifo((ok.path / "etc/opt/chrome/policies/managed/f.json").c_str(), 0644) == 0);
     fs::create_symlink("nowhere", ok.path / "etc/opt/chrome/policies/managed/l.json");      // symlink leaf
     WalkLimits limits;
     limits.max_file_bytes = 1024;

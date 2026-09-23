@@ -24,8 +24,9 @@
  *            injected test root
  *   detail   "-" normally; `json_type` for an `unmodelled` value (the only
  *            unmodelled qualifier emitted today), and `nul_replaced` /
- *            `utf8_replaced` (appended, comma-joined) when any free-text field
- *            held an embedded NUL / a byte that is not valid UTF-8
+ *            `utf8_replaced` / `truncated` (appended, comma-joined) when any
+ *            free-text field held an embedded NUL, a byte that is not valid
+ *            UTF-8, or more than kMaxFieldBytes
  *
  * Every free-text field goes through yuzu::util::safe_output_field
  * (sdk/include/yuzu/string_utils.hpp): a value ending in a backslash or
@@ -42,7 +43,11 @@
  * UTF-8. JSON keys and values are validated by the parser, but a Linux file
  * name is arbitrary bytes and lands in `source`, so every free-text field is
  * repaired (repair_utf8: each offending byte becomes U+FFFD, flagged in
- * `detail`) before it is written.
+ * `detail`) before it is written. Every free-text field is also capped at
+ * kMaxFieldBytes (cut on a UTF-8 boundary, BEFORE escaping so a cut can never
+ * strand an escape, flagged `truncated`): one policy value can otherwise make a
+ * row larger than the server's per-chunk ingest cap, which drops the row's
+ * `source` and `detail` fields while the agent still reports a complete read.
  *
  * OUTCOME, IN BAND. A host with no managed policy (browser not installed, no
  * policy files) reports ZERO rows and a clean OK status — an absent policy set
@@ -52,7 +57,9 @@
  * that could not be completed is `constrained` with the failure tokens, a
  * PLANNED leg or a leg that threw is `unavailable`. The row exists because the
  * server's response queries (REST, MCP, the dashboard) do not return the typed
- * status today, so without it a host that was not inspected, or a read that
+ * status today (tracked as #4865; that issue also decides whether these
+ * in-band rows are then retired or kept, since the typed status carries no
+ * reason tokens), so without it a host that was not inspected, or a read that
  * failed, is indistinguishable from "no policy configured". The outcomes are
  * never conflated: zero rows and no `status` row means the read completed.
  *
@@ -94,14 +101,28 @@ namespace yuzu::browser_policy {
 inline constexpr std::size_t kMaxPolicyFileBytes = 1024 * 1024;
 /// Total rows one leg emits per run; beyond it the leg records `row_cap`.
 inline constexpr std::size_t kMaxPolicyRows = 8192;
-/// Total bytes of policy-file content one leg reads per run; beyond it the leg
+/// Total bytes of policy-file content one leg PARSES per run; beyond it the leg
 /// records `byte_cap`. The per-file, per-directory and row caps are independent
 /// and their product is far too large to be a real bound (thousands of files at
-/// the per-file cap), so this is the one that bounds the run's file I/O and the
-/// input to the parser. It is an INPUT bound: retained row text can be roughly
-/// twice it (pipe escaping doubles a worst-case value), and the parser's
-/// document tree for one file is a small multiple of that file's size.
+/// the per-file cap), so this is the one that bounds the run's parser input.
+/// The file that crosses it has been read (at most one extra file cap) but is
+/// not parsed. It is an INPUT bound, not a memory bound: one file's parsed
+/// document costs tens of times its text (measured: 16 files, each a 1 MiB array
+/// of empty strings, peak about 46 MiB resident; a 1 MiB array of `{}` would
+/// cost more, which is what kMaxJsonContainers prevents), and the retained row
+/// text is at most about twice the parsed input, because every field is capped
+/// (kMaxFieldBytes) and pipe escaping at most doubles what is left.
 inline constexpr std::size_t kMaxPolicyTotalBytes = 16 * 1024 * 1024;
+/// Containers (`[` or `{`) one policy file may hold. A parsed container costs
+/// roughly thirty times the three bytes of `{}` that describe it, so the file
+/// cap alone allows a ~30 MiB document per megabyte of `{}`, on top of what its
+/// scalars cost; real policy files hold a few hundred containers. Beyond it the
+/// file is `json_too_complex`.
+inline constexpr std::size_t kMaxJsonContainers = 65536;
+/// Bytes of any one free-text field (name, value, source, detail) before it is
+/// cut and flagged `truncated`; with escaping a row is at most nine times twice
+/// this, far below the server's 2 MiB per-chunk ingest cap.
+inline constexpr std::size_t kMaxFieldBytes = 64 * 1024;
 /// Directory entries examined per directory (walk_dir_capped cap).
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
 /// Container nesting the mapper will descend; deeper is a constraint
@@ -125,6 +146,7 @@ struct WalkLimits {
 inline constexpr std::string_view kTokenJsonUnparseable = "linux:json_unparseable";
 inline constexpr std::string_view kTokenJsonNotObject = "linux:json_not_object";
 inline constexpr std::string_view kTokenJsonTooDeep = "linux:json_too_deep";
+inline constexpr std::string_view kTokenJsonTooComplex = "linux:json_too_complex";
 
 // ── fixed vocabularies ───────────────────────────────────────────────────
 
@@ -237,12 +259,44 @@ namespace detail {
     return out;
 }
 
-/// safe_output_field plus the two transport repairs: every byte that is not
-/// valid UTF-8 becomes U+FFFD and sets `utf8_seen`; every embedded NUL becomes
-/// U+FFFD and sets `nul_seen` (see the header notes on the transport).
-[[nodiscard]] inline std::string wire_field(std::string_view value, bool& nul_seen,
-                                            bool& utf8_seen) {
-    const std::string repaired = repair_utf8(value, utf8_seen);
+/// What `wire_field` had to change in a field; each becomes a `detail` token.
+struct WireFlags {
+    bool nul = false;       // an embedded NUL was replaced by U+FFFD
+    bool utf8 = false;      // a byte that is not valid UTF-8 was replaced by U+FFFD
+    bool truncated = false; // the field held more than kMaxFieldBytes and was cut
+};
+
+/// Appends the `detail` tokens for `f` to `det`, comma-joined, in a fixed order.
+inline void append_wire_flag_tokens(std::string& det, const WireFlags& f) {
+    const auto add = [&det](std::string_view token) {
+        if (!det.empty())
+            det += ',';
+        det += token;
+    };
+    if (f.nul)
+        add("nul_replaced");
+    if (f.utf8)
+        add("utf8_replaced");
+    if (f.truncated)
+        add("truncated");
+}
+
+/// safe_output_field plus the transport repairs, in this order: every byte that
+/// is not valid UTF-8 becomes U+FFFD; a field longer than kMaxFieldBytes is cut
+/// on a UTF-8 boundary BEFORE escaping (so a cut can never strand a backslash
+/// or half an escape sequence in front of the field separator); the escaper
+/// runs; every embedded NUL becomes U+FFFD (see the header notes).
+[[nodiscard]] inline std::string wire_field(std::string_view value, WireFlags& flags) {
+    std::string repaired = repair_utf8(value, flags.utf8);
+    if (repaired.size() > kMaxFieldBytes) {
+        std::size_t cut = kMaxFieldBytes;
+        // repaired[cut] is the first byte dropped; if it continues a sequence, back up to that
+        // sequence's lead byte so the field never ends in half a character.
+        while (cut > 0 && (static_cast<unsigned char>(repaired[cut]) & 0xC0) == 0x80)
+            --cut;
+        repaired.resize(cut);
+        flags.truncated = true;
+    }
     std::string escaped = yuzu::util::safe_output_field(repaired);
     if (escaped.find('\0') == std::string::npos)
         return escaped;
@@ -251,7 +305,7 @@ namespace detail {
     for (char c : escaped) {
         if (c == '\0') {
             out += "\xEF\xBF\xBD";
-            nul_seen = true;
+            flags.nul = true;
         } else {
             out += c;
         }
@@ -263,29 +317,25 @@ namespace detail {
 /// Formats one row (no trailing newline: append_output() adds the separator).
 /// The result never contains a NUL byte.
 [[nodiscard]] inline std::string format_policy_row(const PolicyRow& r) {
-    bool nul = false;
-    bool utf8 = false;
+    detail::WireFlags flags;
     std::string out = "policy|";
     out += browser_token(r.browser);
     out += '|';
     out += level_token(r.level);
     out += '|';
-    out += detail::wire_field(r.scope, nul, utf8);
+    out += detail::wire_field(r.scope, flags);
     out += '|';
-    out += detail::wire_field(r.name, nul, utf8);
+    out += detail::wire_field(r.name, flags);
     out += '|';
     out += type_token(r.value.type);
     out += '|';
-    out += detail::wire_field(r.value.value, nul, utf8);
+    out += detail::wire_field(r.value.value, flags);
     out += '|';
-    out += detail::wire_field(r.source, nul, utf8);
+    out += detail::wire_field(r.source, flags);
     out += '|';
     std::string det =
-        r.value.detail.empty() ? std::string{} : detail::wire_field(r.value.detail, nul, utf8);
-    if (nul)
-        det += det.empty() ? "nul_replaced" : ",nul_replaced";
-    if (utf8)
-        det += det.empty() ? "utf8_replaced" : ",utf8_replaced";
+        r.value.detail.empty() ? std::string{} : detail::wire_field(r.value.detail, flags);
+    detail::append_wire_flag_tokens(det, flags);
     out += det.empty() ? std::string_view{"-"} : std::string_view{det};
     return out;
 }
@@ -312,15 +362,14 @@ inline constexpr std::string_view kStateUnavailable = "unavailable";
 /// the header note). The result never contains a NUL byte.
 [[nodiscard]] inline std::string format_status_row(std::string_view state,
                                                    std::string_view reason) {
-    bool nul = false;
-    bool utf8 = false;
+    detail::WireFlags flags;
     std::string out{kStatusRowTag};
     out += "|-|-|-|";
     out += kActionName;
     out += "|-|";
-    out += detail::wire_field(state, nul, utf8);
+    out += detail::wire_field(state, flags);
     out += "|-|";
-    out += detail::wire_field(reason, nul, utf8);
+    out += detail::wire_field(reason, flags);
     return out;
 }
 
@@ -333,16 +382,25 @@ namespace detail {
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
-/// The deepest container nesting in `text`, counted over `[`/`{` outside string
-/// literals and outside the `//` and `/* */` comments the parse tolerates. ONE
-/// linear pass with no allocation: it replaces nlohmann's parser callback as the
-/// depth guard, because the callback parser is QUADRATIC on a wide container of
-/// child containers (a 1 MiB `{"a":[{},{},...]}` takes minutes), which is exactly
-/// the shape a hostile policy file would use. An unterminated string or comment
-/// simply ends the scan; the parse that follows reports it as unparseable.
-[[nodiscard]] inline std::size_t max_nesting_depth(std::string_view text) noexcept {
+/// What one linear pass over a policy file's text finds out about its shape.
+struct JsonShape {
+    std::size_t depth = 0;      // deepest container nesting
+    std::size_t containers = 0; // total `[` and `{`
+};
+
+/// The deepest container nesting and the container count in `text`, counted over
+/// `[`/`{` outside string literals and outside the `//` and `/* */` comments the
+/// parse tolerates. ONE linear pass with no allocation: it replaces nlohmann's
+/// parser callback as the depth guard, because the callback parser is QUADRATIC
+/// on a wide container of child containers (a 1 MiB `{"a":[{},{},...]}` takes
+/// minutes), which is exactly the shape a hostile policy file would use. It must
+/// never count LESS nesting than the parser builds (an undercount would let a deep
+/// document reach the recursive dump()); the unit suite pins it against nlohmann's
+/// own SAX depth. An unterminated string or comment simply ends the scan; the
+/// parse that follows reports it as unparseable.
+[[nodiscard]] inline JsonShape scan_json_shape(std::string_view text) noexcept {
+    JsonShape shape;
     std::size_t depth = 0;
-    std::size_t deepest = 0;
     for (std::size_t i = 0; i < text.size(); ++i) {
         const char c = text[i];
         if (c == '"') {
@@ -362,12 +420,18 @@ namespace detail {
                 break;
             i = end + 1;
         } else if (c == '[' || c == '{') {
-            deepest = std::max(deepest, ++depth);
+            ++shape.containers;
+            shape.depth = std::max(shape.depth, ++depth);
         } else if ((c == ']' || c == '}') && depth > 0) {
             --depth;
         }
     }
-    return deepest;
+    return shape;
+}
+
+/// The deepest container nesting in `text` (see scan_json_shape).
+[[nodiscard]] inline std::size_t max_nesting_depth(std::string_view text) noexcept {
+    return scan_json_shape(text).depth;
 }
 } // namespace detail
 
@@ -404,9 +468,9 @@ struct JsonPolicyParse {
 /// Parses one policy JSON file's text into rows, one per top-level key,
 /// sorted by name (nlohmann objects are key-ordered). `//` and block
 /// comments are tolerated (Chromium's file policy loader accepts them).
-/// Top-level must be an object; nesting deeper than kMaxNestingDepth is a
-/// constraint, decided by a linear pre-scan BEFORE the parse so a deep value is
-/// never materialised. At most `max_rows` rows are built (the leg passes the row
+/// Top-level must be an object; nesting deeper than kMaxNestingDepth, or more
+/// than kMaxJsonContainers containers, is a constraint, decided by a linear
+/// pre-scan BEFORE the parse so a deep or sprawling value is never materialised. At most `max_rows` rows are built (the leg passes the row
 /// budget it has left plus one, so a file that would overrun the cap is noticed
 /// without first turning every one of its keys into a row).
 [[nodiscard]] inline JsonPolicyParse
@@ -414,8 +478,13 @@ rows_from_json_policy_text(std::string_view text, Browser browser, Level level,
                            std::string_view scope, std::string_view source,
                            std::size_t max_rows = std::numeric_limits<std::size_t>::max()) {
     JsonPolicyParse out;
-    if (detail::max_nesting_depth(text) > static_cast<std::size_t>(kMaxNestingDepth)) {
+    const detail::JsonShape shape = detail::scan_json_shape(text);
+    if (shape.depth > static_cast<std::size_t>(kMaxNestingDepth)) {
         out.failure = kTokenJsonTooDeep;
+        return out;
+    }
+    if (shape.containers > kMaxJsonContainers) {
+        out.failure = kTokenJsonTooComplex;
         return out;
     }
     nlohmann::json doc;

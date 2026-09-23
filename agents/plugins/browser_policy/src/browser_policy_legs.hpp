@@ -14,6 +14,16 @@
  * DEFINITION is self-gated (each leg .cpp wraps its body in
  * `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin TU calls only
  * the host leg — a single-OS build never links the other two.
+ *
+ * WHEN A LEG LANDS (Windows registry, macOS plist): replace its `mark_result_planned`
+ * body with a real read that reports through `mark_result_read` BEFORE writing rows, then
+ * touch every place that still describes the leg as planned: the descriptor legs in
+ * browser_policy_plugin.cpp (support level, mechanism, notes; the leg-hash changes, so
+ * run `plugin_doc_gen.py --stamp` for both samples), the yaml `platforms` of the columns
+ * the leg fills and the `scope`/`source` wording, the README (Privileges, Result status,
+ * Sample, Caveats 3), the planned blocks in test_browser_policy_local_dispatcher.cpp, the
+ * capability matrix row and counts, the capability-map cell, the catalogue header comment,
+ * the agent_registry description, and the changelog fragment.
  */
 #pragma once
 
@@ -56,14 +66,22 @@ template <typename Leg>
     try {
         return leg(ctx);
     } catch (...) {
-        // The in-band row first, in its own guard: building or writing it can itself throw
-        // (allocation), and that must never stop the typed status below from being set.
+        // Each report is its own guard: building or writing the row, and the typed status
+        // itself (the SDK copies the provenance into a std::string), can each throw on an
+        // allocation failure, and none may let a second exception cross the plugin ABI. If the
+        // typed status cannot be set, the rc of 1 below still makes the host report a failure.
+        // A leg that throws AFTER it has already reported (an allocation failure inside
+        // write_output) therefore leaves an `unavailable` row behind its own output: "written
+        // first, at most one" holds for every outcome except that one.
         try {
             ctx.write_output(format_status_row(kStateUnavailable, kExceptionToken));
         } catch (...) {
         }
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              kExceptionToken);
+        try {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, kExceptionToken);
+        } catch (...) {
+        }
         return 1;
     }
 }

@@ -55,6 +55,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -259,6 +260,8 @@ template <typename Keep>
     if (walk.enumeration_error)
         acc.add_failure(std::string{prefix} + ":readdir_error");
     std::sort(names.begin(), names.end());
+    // A directory rewritten while it is listed can return an entry twice; one file is one file.
+    names.erase(std::unique(names.begin(), names.end()), names.end());
     return names;
 }
 
@@ -372,10 +375,10 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                     acc.add_failure(linux_token(file.detail));
                     continue;
                 }
-                // The run's file I/O, parser input and retained row text scale with this
-                // budget, not with the per-file and per-directory caps (whose product is
-                // enormous). The file that crosses it is not parsed and the walk stops:
-                // rows already read stand, the result is a lower bound.
+                // The run's parser input (and, through it, the retained row text) scales with
+                // this budget, not with the per-file and per-directory caps (whose product is
+                // enormous). The file that crosses it has been read but is not parsed, and the
+                // walk stops: rows already read stand, the result is a lower bound.
                 total_bytes += file.bytes.size();
                 if (total_bytes > limits.max_total_bytes) {
                     acc.add_failure("linux:byte_cap");
@@ -384,9 +387,12 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
                 const std::string source = base + lvl.dir + "/" + fname;
                 // Build at most one row past the budget that is left: enough to notice an
                 // overrun below, without turning every key of a huge file into a row first.
+                // (Saturating: a max_rows of SIZE_MAX must not wrap to "build no rows".)
+                const std::size_t rows_left = limits.max_rows - rows.size();
+                const std::size_t rows_to_build =
+                    rows_left < std::numeric_limits<std::size_t>::max() ? rows_left + 1 : rows_left;
                 auto parsed = rows_from_json_policy_text(file.bytes, vendor.browser, lvl.level,
-                                                         machine_scope(), source,
-                                                         limits.max_rows - rows.size() + 1);
+                                                         machine_scope(), source, rows_to_build);
                 if (parsed.failure) {
                     acc.add_failure(*parsed.failure);
                     continue;

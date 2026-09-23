@@ -16,7 +16,7 @@
 /// `policies` is ReadOnly/None. The Linux leg reads root-owned JSON policy
 /// files under /etc/opt/{chrome,edge} and /etc/chromium with
 /// O_NOFOLLOW/O_NONBLOCK and never writes; the Windows and macOS legs are
-/// planned placeholders that return zero rows and touch nothing.
+/// planned placeholders that read nothing and return one in-band `status` row.
 ///
 /// Grouped under the existing `Inventory` securable (Inventory:Read), the same
 /// read-only-fact-collection precedent `peripherals.*` and `printing.*` use.

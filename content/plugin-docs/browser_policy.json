@@ -32,7 +32,7 @@
     "**No default-off kill switch, by design.** `browser_policy` reads operator/IT-authored config, not personal data, so it seeds no default-off gate and the action is an ordinary `Inventory` read (`Inventory:Read`, no execute gate), unlike plugins that read per-user data. The operator-settable per-plugin kill switch applies to it like any other plugin.",
     "**Windows and macOS legs planned.** Each follows as its own PR; until then `policies` on those hosts returns one `status` row (`unavailable`) with result status `UNAVAILABLE` and provenance `windows:planned` or `macos:planned`, so a host that was not inspected never reads as having no policy.",
     "**Linux reads machine-level JSON policy files in three vendor directories only.** Only the `managed` and `recommended` `*.json` files under `/etc/opt/chrome`, `/etc/chromium` and `/etc/opt/edge` are read; per-user policy, snap and flatpak Chromium paths, other Chromium-based browsers and Firefox `policies.json` are not, and every row reports scope `machine`. `OK`/`FULL` therefore means those directories were read completely, not that no browser on the host has a policy.",
-    "**Values are reported, not validated.** A policy name is emitted as written and is not checked against the browser's policy schema, so a misspelt or unsupported policy still appears as a row; lists and dicts are emitted as compact JSON text, and an embedded backslash in a value is folded to `/` by the escaper. `value_type` describes how the value is stored in its source, not the browser's schema: a future Windows registry DWORD holding a boolean policy will report `int` where the Linux JSON file reports `bool`."
+    "**Values are reported, not validated.** A policy name is emitted as written and is not checked against the browser's policy schema, so a misspelt or unsupported policy still appears as a row; lists and dicts are emitted as compact JSON text, and an embedded backslash in a value is folded to `/` by the escaper, and a name, value or source longer than 64 KiB is cut and flagged `truncated`. `value_type` describes how the value is stored in its source, not the browser's schema: a future Windows registry DWORD holding a boolean policy will report `int` where the Linux JSON file reports `bool`."
   ],
   "definitions": [
     {
@@ -58,7 +58,7 @@
     }
   ],
   "description": "Enterprise-managed Chrome, Chromium and Edge browser policy inventory",
-  "how_it_works": "`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. One `policy` row is written per configured policy: the browser (Chrome, Chromium or Edge), whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under `/etc/opt/chrome/policies`, `/etc/chromium/policies` and `/etc/opt/edge/policies`, in their `managed` and `recommended` subdirectories. Every directory below the root is opened without following symlinks, every file is read with a 1 MiB cap (16 MiB in total per run), and the parse is done with the vendored `nlohmann` JSON library. The plugin reads local configuration and nothing else: no subprocess, no network, no write. It enforces nothing and judges nothing; a policy is a row, not a verdict. When a read cannot be completed, or on a host whose leg is still a placeholder, one `status` row leads the output and repeats the typed result status, so the outcome is visible wherever rows are (see Result status). The Windows and macOS legs are placeholders (see Caveats).\n\nThe plugin carries no default-off kill switch, on purpose: it reads operator/IT-authored config, not personal data, and carries neither gate.",
+  "how_it_works": "`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. One `policy` row is written per configured policy: the browser (Chrome, Chromium or Edge), whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under `/etc/opt/chrome/policies`, `/etc/chromium/policies` and `/etc/opt/edge/policies`, in their `managed` and `recommended` subdirectories. Every directory below the root is opened without following symlinks, every file is read with a 1 MiB cap (16 MiB parsed in total per run), and the parse is done with the vendored `nlohmann` JSON library. The plugin reads local configuration and nothing else: no subprocess, no network, no write. It enforces nothing and judges nothing; a policy is a row, not a verdict. When a read cannot be completed, or on a host whose leg is still a placeholder, one `status` row leads the output and repeats the typed result status, so the outcome is visible wherever rows are (see Result status). The Windows and macOS legs are placeholders (see Caveats).\n\nThe plugin seeds no default-off kill switch, on purpose: it reads operator/IT-authored config, not personal data, so it carries neither the default-off switch nor an execute gate (the operator-settable per-plugin kill switch still applies to it).",
   "inputs": [],
   "kind": {
     "collector": true,
@@ -72,7 +72,7 @@
     {
       "columns": [
         {
-          "description": "Row shape discriminator (field 0): policy (one per configured policy) or status (at most one, written first and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are \"-\".",
+          "description": "Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are \"-\".",
           "example": "policy",
           "name": "row_kind",
           "platforms": [
@@ -87,7 +87,7 @@
           ]
         },
         {
-          "description": "Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge).",
+          "description": "Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge); \"-\" on a status row.",
           "example": "chrome",
           "name": "browser",
           "platforms": [
@@ -101,7 +101,7 @@
           ]
         },
         {
-          "description": "Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change).",
+          "description": "Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change); \"-\" on a status row.",
           "example": "mandatory",
           "name": "level",
           "platforms": [
@@ -136,7 +136,7 @@
           "values": null
         },
         {
-          "description": "Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail).",
+          "description": "Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail); \"-\" on a status row.",
           "example": "string",
           "name": "value_type",
           "platforms": [
@@ -177,7 +177,7 @@
           "values": null
         },
         {
-          "description": "A short qualifier, or \"-\" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.",
+          "description": "A short qualifier, or \"-\" when there is none. json_type marks an unmodelled value; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD; truncated marks a field longer than 64 KiB, cut. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.",
           "example": "-",
           "name": "detail",
           "platforms": [
@@ -192,7 +192,7 @@
       "definition_id": "crossplatform.browser_policy.policies"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited and has nine fields; field 0 is `policy` for a policy row, or `status` for the one outcome row described under Result status. A host with no managed policy returns zero rows. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design), a field with an embedded NUL byte, or with a byte that is not valid UTF-8 (only a Linux file name can carry one, in `source`), has it replaced by U+FFFD and is flagged in `detail` (`nul_replaced`, `utf8_replaced`), and a value that cannot be represented is typed `unmodelled` (`detail` `json_type`) instead of being dropped. `browser_policy` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`.",
+  "outputs_note": "Every row is pipe-delimited and has nine fields; field 0 is `policy` for a policy row, or `status` for the one outcome row described under Result status. A host with no managed policy returns zero rows. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design), a field with an embedded NUL byte, or with a byte that is not valid UTF-8 (only a Linux file name can carry one, in `source`), has it replaced by U+FFFD and is flagged in `detail` (`nul_replaced`, `utf8_replaced`), a field longer than 64 KiB is cut and flagged `truncated`, and a value that cannot be represented is typed `unmodelled` (`detail` `json_type`) instead of being dropped. `browser_policy` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`.",
   "platforms": {
     "linux": "supported",
     "macos": "planned",
@@ -231,9 +231,9 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:byte_cap` (more than 16 MiB of policy files read in one run), `linux:json_unparseable`, `linux:json_not_object` and `linux:json_too_deep` (several tokens are comma-joined)",
+      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:byte_cap` (more than 16 MiB of policy files read in one run), `linux:json_unparseable`, `linux:json_not_object`, `linux:json_too_deep` and `linux:json_too_complex` (more than 65536 containers in one file) (several tokens are comma-joined)",
       "status": "`CONSTRAINED`",
-      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, 16 MiB total read cap, nesting depth) was hit; one `constrained` `status` row"
+      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, 16 MiB total parse cap, nesting depth, container count) was hit; one `constrained` `status` row"
     },
     {
       "completeness": "`PARTIAL`",
@@ -351,9 +351,9 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `policies` is also a gathered definition (`crossplatform.browser_policy.policies`, 300s TTL).",
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `policies` is also a gathered definition (`crossplatform.browser_policy.policies`, `gather.ttlSeconds` 300: informational, nothing re-dispatches on it).",
     "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
-    "**Sensitivity.** Rows are operator/IT-authored configuration: policy names and values such as homepage URLs, allowed or blocked extension ids and proxy settings can disclose part of an organisation's browser-management posture and internal hostnames. They carry no browsing history, bookmarks, cookies or per-user data, and no row names a user account on the Linux leg. Values are reported verbatim and are not screened: a value an administrator wrote can itself hold a credential-bearing URL or an enrollment token (for example a proxy address with embedded credentials), and the files are world-readable so the browser can load them, so treat the rows as sensitive.",
+    "**Sensitivity.** Rows are operator/IT-authored configuration: policy names and values such as homepage URLs, allowed or blocked extension ids and proxy settings can disclose part of an organisation's browser-management posture and internal hostnames. They carry no browsing history, bookmarks, cookies or per-user data, and the `scope` column never names a user. Values are reported verbatim and are not screened: a value an administrator wrote can itself hold a credential-bearing URL or an enrollment token (for example a proxy address with embedded credentials), and the files are world-readable so the browser can load them, so treat the rows as sensitive. Stored responses are kept for the ResponseStore's retention period (90 days by default, `docs/user-manual/response-store.md`); with RBAC off, the default, any authenticated session can dispatch the action and read the result, and with RBAC on it takes `Inventory:Read` to dispatch and `Response:Read` to read.",
     "**Sibling:** `installed_apps` (which browsers are installed, not how they are managed)."
   ]
 }

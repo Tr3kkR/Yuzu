@@ -30,9 +30,10 @@
  * When the Windows or macOS leg ships, its own cases replace the matching planned block
  * below.
  *
- * The one committed source file read at run time is content/definitions/browser_policy.yaml
- * (located from YUZU_TEST_FIXTURE_DIR / MESON_SOURCE_ROOT), so a rename of the action, or a
- * drift of the row_kind-first column list, is caught here. On Linux the status case also
+ * Two committed source files are read at run time (located from YUZU_TEST_FIXTURE_DIR /
+ * MESON_SOURCE_ROOT): content/definitions/browser_policy.yaml, so a rename of the action, or a
+ * drift of the row_kind-first column list, is caught here; and browser_policy_linux.cpp, for the
+ * run_linux tripwire below. On Linux the status case also
  * looks, read-only, for a `*.json` under the vendor policy directories to decide whether its
  * populated-read tier applies (a host with a policy file must yield a row or a CONSTRAINED
  * status; a host with none gets a WARN), and the shipped leg's whole result is compared with
@@ -189,6 +190,10 @@ std::vector<std::string> check_outcome_rows(const yuzu::agent::LocalDispatcher::
     std::vector<std::string> policy_rows;
     for (const auto& row : captured_rows(result.captured)) {
         (is_status_row(row) ? status_rows : policy_rows).push_back(row);
+    }
+    const auto all_rows = captured_rows(result.captured);
+    if (!all_rows.empty() && !status_rows.empty()) {
+        CHECK(is_status_row(all_rows.front())); // the outcome leads the stream
     }
     if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
         REQUIRE(status_rows.size() == 1);
@@ -468,8 +473,8 @@ bool host_has_policy_file() {
 /// reports an unconditional non-OK status, adds or drops a row, or returns nonzero -- on any Linux
 /// host. It does NOT catch a wrong root or an unconditional empty OK on a host with no policy
 /// file: all three read the same empty tree. Those two are covered by the populated-read tier on
-/// a host that has a policy file, by the source tripwire below on every host, and by the container
-/// evidence recorded in the review notes.
+/// a host that has a policy file (the seeded capture in docs/samples/linux.txt) and by the source
+/// tripwire below on every host.
 int production_root_execute(YuzuCommandContext* raw, const char* /*action*/,
                             const YuzuParam* /*params*/, std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
@@ -628,8 +633,9 @@ TEST_CASE("browser_policy plugin: policies returns rc 0 and only rows that fit t
 
 // MUTATION (Windows / macOS): revert the placeholder to a CONSTRAINED status (or to
 // mark_result_read), drop the mark_result_planned call (status stays UNDECLARED), change the
-// `<os>:planned` token, emit a placeholder row, return nonzero, or delete the host's dispatch
-// branch in execute() -> the matching check in check_planned_placeholder fails.
+// `<os>:planned` token, drop the in-band status row (or write a second row), return nonzero, or
+// delete the host's dispatch branch in execute() -> the matching check in
+// check_planned_placeholder fails.
 // MUTATION (Linux): drop the mark_result_read call in run_linux_at (UNDECLARED), report the
 // planned outcome (UNAVAILABLE) or a wrong-OS token from the Linux leg -> the OK-or-CONSTRAINED
 // and `linux:` token checks fail. A wrong production root or an unconditional empty OK -> the
@@ -677,9 +683,9 @@ TEST_CASE("browser_policy plugin: the host's own leg reports the planned placeho
     // binding ("/") must surface it: policy rows, or a CONSTRAINED status if the file exists but
     // cannot be decoded. On a host with none (most CI runners) the tier does not apply and says
     // so. MUTATION: run_linux passing any root but "/", or reporting an unconditional empty
-    // OK/FULL, yields zero rows + OK on a host that has a policy file -> fails here (recorded
-    // for this leg in the seeded-container runs; on a policy-less host only the source tripwire
-    // below catches those two).
+    // OK/FULL, yields zero rows + OK on a host that has a policy file -> fails here (checked
+    // against the seeded sample in docs/samples/linux.txt; on a policy-less host only the source
+    // tripwire below catches those two).
     if (host_has_policy_file()) {
         CHECK((!policy_rows.empty() || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
     } else {
