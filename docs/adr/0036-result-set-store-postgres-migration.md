@@ -265,3 +265,39 @@ owns — is untouched; it is not backfill machinery despite living in the same m
 block. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
 `result_sets`/`result_set_members` instead — silent unless real rows are found, never
 blocks boot.
+
+## Update (2026-09-23) — `count_for_owner`/`members`/`list_by_owner`/`lineage` widened (#4306)
+
+The "Follow-ups and accepted risks" section above (and the Posture bullet at line 81)
+claimed these four reads "still return plain `std::optional`/containers with no error
+channel" and that their failure modes were "deny-or-benign... none
+grants/targets/enforces/skips/inverts." That was true when written but is now FALSIFIED
+for two of the four: `count_for_owner` backs the PRE-DISPATCH per-owner quota check on the
+three async result-set producers, and `members` backs the from-inventory-query
+parent-narrowing loop, which MATERIALISES its (previously silently-truncated) result into a
+durable result set future dispatches target — both are genuinely
+authorization/targeting-relevant, not merely cosmetic (#4306 findings 1 and 3, #4307
+finding 2; full analysis and fix: `changelog.d/`, PR history for #4306).
+
+`count_for_owner_checked`/`members_checked`/`list_by_owner_checked`/`lineage_checked` were
+added (`std::expected<T, ResultSetError>`, `DbError` on a runtime failure, never
+empty/zero/truncated) and adopted at every call site where a degraded read could
+grant/target/dispatch/materialise: the REST/MCP async-producer quota pre-checks, the
+from-inventory-query parent-narrowing loop and its MCP twin, and the REST/MCP
+list/members/lineage read routes. The plain `list_by_owner`/`members`/`lineage`/
+`count_for_owner` wrappers remain for the one deliberately-still-plain consumer class — the
+render-only dashboard fragments in `result_set_routes.cpp` (no decision downstream of a
+dashboard render; `docs/postgres-store-playbook.md` rule 4's render-only carve-out).
+
+**Correction to the "short lineage breadcrumb" characterisation (line 83):** the pre-#4306
+plain `lineage()` did not just return an empty breadcrumb on a DB fault — it returned
+whatever PARTIAL chain had been accumulated before a mid-walk query failure, which reads
+indistinguishably from a genuinely short (but complete) lineage. The new `lineage_checked`
+treats a mid-walk failure as `DbError` for the whole call; the plain `lineage()` wrapper
+built on top of it now returns EMPTY on that same fault instead of the old partial chain —
+more honest (no silently-incomplete breadcrumb), but a real behavior change for any
+still-plain caller (today, only the dashboard fragments).
+
+`count_pinned_for_owner`, `counts`, and `list_pending` remain unwidened — no caller of
+these three routes a degraded read into an authorization/targeting/dispatch decision today;
+widening them stays a legitimate mechanical follow-up, not a security gap.
