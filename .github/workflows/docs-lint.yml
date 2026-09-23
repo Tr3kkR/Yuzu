@@ -104,6 +104,17 @@ jobs:
       - name: Governance-ledger linter self-test
         run: python3 tests/test_governance_ledger_check_selftest.py
 
+      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
+      # (system roles, securable types, operations, the authorization-topology
+      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
+      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
+      # by the time PR #4776 audited them the doc was 15 securable types, one
+      # role and five floor entries behind — each drift arriving through a
+      # reviewed PR. Set-equality, so a failure names the entry rather than the
+      # count. Stdlib only, parses source text, needs no build.
+      - name: RBAC doc/seed parity
+        run: python3 tests/test_rbac_doc_counts.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The
