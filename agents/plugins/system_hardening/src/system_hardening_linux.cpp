@@ -4,13 +4,18 @@
  * SHAPE, NOT A COPY, of vuln_scan's config_checks.hpp:73-80 read_proc_value
  * (single path). That helper returns {} for ENOENT, EACCES and every other
  * failure alike; a posture plugin must not, so this reader uses
- * ::open(O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW) + ::fstat + ::read and hands
+ * ::open(O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW|O_NOCTTY) + ::fstat + ::read and hands
  * the captured errno back to the pure collect loop (system_hardening_parsers.hpp),
  * which classifies it. Only a successful read of a REGULAR file yields a value:
  * O_NONBLOCK makes a FIFO or device mounted at an allowlisted path return from
  * open() at once, and opened_leaf_error() refuses to read anything fstat() does
- * not report as a regular file (`<key>:not_regular`), so no such file can pin an
- * agent worker or put device bytes in a row. No shell, no sysctl binary, no
+ * not report as a regular file (`<key>:not_regular`), so a FIFO or device cannot
+ * pin an agent worker or put device bytes in a row (O_NOCTTY keeps a tty from
+ * becoming the agent's controlling terminal). A filesystem that never answers
+ * (an unresponsive FUSE daemon, a stale hard NFS mount) mounted at or below
+ * /proc/sys can still block open/statfs/read: that needs root or CAP_SYS_ADMIN in
+ * the agent's mount namespace, and no in-plugin bound can cancel a hung syscall --
+ * it is a platform-level per-command deadline concern. No shell, no sysctl binary, no
  * directory walk: the key -> path table is kLinuxAllowlist.
  *
  * A leaf ENOENT is only trusted as genuine absence when the nearest existing directory
@@ -65,7 +70,7 @@ ReadOutcome read_proc_sys(std::string_view path) {
     const std::string p{path};
     int raw;
     do {
-        raw = ::open(p.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+        raw = ::open(p.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW | O_NOCTTY);
     } while (raw < 0 && errno == EINTR);
     if (raw < 0) {
         const int open_errno = errno; // captured before the statfs probe can touch errno

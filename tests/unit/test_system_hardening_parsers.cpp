@@ -488,9 +488,10 @@ TEST_CASE("system_hardening: surface_is_procfs trusts the nearest existing direc
     }
 }
 
-// Fails under: reading a leaf fstat() does not report as a regular file (a FIFO with no writer
-// pins the worker forever; a device puts NULs and non-UTF-8 in the row), or mistaking the
-// not-regular outcome for an absence, a denial or an errno.
+// Fails under: opened_leaf_error() admitting a non-regular st_mode, or its outcome being
+// mistaken for an absence, a denial or an errno. It does NOT observe the leg's open flags or
+// that the leg calls this before read(): the FIFO/device non-hang is evidenced by the
+// privileged-container probe recorded in the PR body, not by this unit test.
 TEST_CASE("system_hardening: only a regular file is read; anything else is unreadable not_regular",
           "[system_hardening][classify]") {
     CHECK(opened_leaf_error(0100644) == 0);           // S_IFREG | 0644: a /proc/sys leaf

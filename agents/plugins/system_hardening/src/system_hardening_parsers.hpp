@@ -251,7 +251,8 @@ inline constexpr std::uint32_t kModeRegular = 0100000;
 /// opens with O_NONBLOCK so a FIFO or device mounted at an allowlisted path returns from open()
 /// at once, and never read()s a non-regular file -- a FIFO with no writer or a blocking device
 /// would otherwise pin an agent worker indefinitely, and a device's bytes (NULs, non-UTF-8)
-/// would reach the row.
+/// would reach the row. (A hung filesystem is a different case this cannot bound; see the
+/// Linux leg's banner.)
 [[nodiscard]] constexpr int opened_leaf_error(std::uint32_t st_mode) noexcept {
     return (st_mode & kModeTypeMask) == kModeRegular ? 0 : kErrNotRegular;
 }
