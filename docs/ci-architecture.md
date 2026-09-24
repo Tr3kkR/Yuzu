@@ -215,41 +215,32 @@ arm names is `both`, so an unknown path runs everything.
 `agents/core` headers (the heartbeat tag-key tables), so nothing narrower than the directory
 is proven. The same reasoning keeps every `meson.build` `both`.
 
-**The run-time-read rule.** A test can read a file that is in no build graph (the
-`docs/capability-registries/*.tsv` tables, `docs/user-manual/metrics.md`). So a path that
-would leave a family unaffected still affects it when a test source of that family names the
-path verbatim: server tests are `tests/unit/server/` plus the helper headers directly under
-`tests/unit/`, agent tests are the rest of `tests/unit/`, and `tests/meson.build` counts for
-both. The scan is over-broad on purpose (an error string that mentions a path counts) because
-a false run costs minutes and a false skip costs a red dev. **Blind spots:** a path assembled
-at run time from parts (keep a run-time read to one literal path), the relative names
-`tests/meson.build` uses (`unit/x`), and production code under `server/` or `agents/` that
-names a path (only tests are scanned).
+**The run-time-read rule.** A test can read a file in no build graph (the
+`docs/capability-registries/*.tsv` tables, `docs/user-manual/metrics.md`), so a path still
+affects a family when a test source of that family names it verbatim: server tests are
+`tests/unit/server/` plus the helper headers directly under `tests/unit/`, agent tests the rest
+of `tests/unit/`, and `tests/meson.build` counts for both. Over-broad on purpose (a mention in an
+error string counts). **Blind spots:** a path assembled at run time from parts (keep a run-time
+read to one literal path), the relative names `tests/meson.build` uses (`unit/x`), and paths
+named by production code rather than tests.
 
-**Fail-closed.** Every uncertainty runs everything: a changed-path list that cannot be bound to
-the run's merge commit (HEAD is not the run's commit, not a two-parent merge, or its second
-parent is not the PR head), an empty list, a path that cannot be read back exactly, a missing
-tests tree or `tests/meson.build`, a symlink in the tests tree, a scan or temp-directory
-failure, or a classifier error. Each fail-closed branch raises a `::warning`. A `none`-class PR
-still builds and still runs `docs`, `proto` and `gateway`.
+**Fail-closed.** Every uncertainty runs everything, with a `::warning`: a list that cannot be
+bound to the run's merge commit, an empty list, a path that cannot be read back exactly, a
+missing tests tree or `tests/meson.build`, a symlink in the tests tree, a scan, temp-directory or
+classifier failure. A `none`-class PR still builds and runs `docs`, `proto` and `gateway`.
 
 **Soundness against the real build.** `scripts/ci/check-suite-input-closure.py` runs after
-Build on the Linux `(pg A)` legs and on macOS (the Windows legs share the source tree and are
-not checked). It reads ninja's own dependency log, classifies every compile-time input of
-each test family with the SAME table (`affected-suites.sh --classify-many`), and fails when an
-agent-family object depends on a `server` or `none` path, or a server-family object on an
-`agent` or `none` path. So the table is proven per build, and a table edit that breaks the
-proof fails there instead of skipping a suite silently. It finds the test binaries through
-`meson introspect --tests` (any suite label starting `server`, or `agent`/`tar`, puts a binary
-in that family, so a new binary or label is picked up without editing the script), and it
-fails rather than passing vacuously on an unbuilt dir or on dependency paths that resolve to
-nothing under the repo root. **Limits:** it sees only the preprocessor branches this build
-takes (a Windows-only `#ifdef` include is invisible), only compiler-visible inputs (a
-`custom_target` that reads `content/` into an object shows as a build-dir path), not the
-objects of fixture plugins and helper programs under `tests/`, and not run-time reads, which
-the run-time-read rule above covers. If it fails, either remove the dependency or reclassify
-the path in `classify_path` in the same change. Two merged changes can trip it together (one
-adds an include, another moves the file), so it can fail on a PR that touched neither.
+Build on the Linux `(pg A)` legs and on macOS. It reads ninja's dependency log, classifies every
+compile-time input of each test family with the SAME table (`--classify-many`), and fails when an
+agent-family object depends on a `server` or `none` path, or a server-family object on an `agent`
+or `none` path, so a table edit that breaks the proof fails there instead of skipping silently.
+Test binaries join a family by suite-label prefix (`server*`, `agent*`, `tar*`, from `meson
+introspect --tests`), and an unbuilt dir or dependency paths that resolve to nothing under the
+repo root fail rather than pass. **Limits:** only the preprocessor branches this build takes (a
+Windows-only `#ifdef` include is invisible), only compiler-visible inputs, not the objects of
+helper programs under `tests/`, and not run-time reads. On a failure, remove the dependency or
+reclassify the path in `classify_path`; two merged changes can trip it together (one adds an
+include, another moves the file), so it can fail on a PR that touched neither.
 
 **Wiring.** No skip branch can run in the PR that introduces it (a PR touching `.github/` or
 `scripts/` is class `both`), so `tests/shell/test_suite_selection_wiring.sh` runs the real step
@@ -264,10 +255,8 @@ production environment is the hosted preflight runner.
 see what a branch would skip: `git diff --no-renames --name-only origin/dev...HEAD | bash
 scripts/ci/affected-suites.sh` (GNU grep; BSD grep is quadratic in the number of paths).
 
-**Measured** on the 391 code PRs merged to dev in the window ending 2026-09-24: 79% run both
-families, 13% skip agent and tar (server-side changes), 5% skip both (docs, skills, ledger,
-gateway or deploy only, which today still run every suite because a changelog fragment or a
-ledger row is code-side to the docs-only gate), 2% skip server (agent-test-only).
+**Measured** on the 391 code PRs merged to dev up to 2026-09-24: 79% run both families, 13%
+skip agent and tar, 5% skip both (docs, skills, ledger, gateway or deploy only), 2% skip server.
 
 **What catches a wrong skip.** The next PR that reaches the skipped family runs it on a merge
 commit that carries the break, so that PR's required checks go red: caught within a PR or two,

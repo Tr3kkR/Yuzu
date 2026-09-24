@@ -13,12 +13,9 @@ Proves: every registered test() entry is either matched by one of the
 given `--suite` flags, or carries one of the given `--exclude-suite`
 labels (deliberately out of scope for this invocation, e.g. server-pg /
 server-pg-smoke, which run in a separate, gated step), or carries one of
-the given `--skipped-suite` labels (a PR whose changed paths cannot reach
-that suite, decided by scripts/ci/affected-suites.sh and named here so the
-skip is REPORTED, not just absent) — no entry is silently in none of the
-three buckets. A `--skipped-suite` is the same as an `--exclude-suite`
-for the proof; the separate flag exists so the OK line says how many
-entries this PR skipped as unaffected, which an exclusion never does.
+the given `--skipped-suite` labels (skipped as unaffected by this PR, per
+scripts/ci/affected-suites.sh; the same as an exclusion for the proof, but
+counted and named in the OK line) — no entry is silently in none of them.
 
 `meson introspect --tests` suite strings are project-namespaced
 ("yuzu:server-nonpg", not "server-nonpg") — comparisons here strip the
@@ -71,13 +68,8 @@ def compute_coverage(tests, selected_suites, excluded_suites,
     (unprefixed) suite name sets this invocation selects/excludes/skips as
     unaffected, return (ok: bool, failures: list[str], stats: dict). No I/O,
     no sys.exit — the same real-build-vs-synthetic-fixture split
-    check-pg-shard-partition.py uses.
-
-    `skipped_suites` are out of scope for the proof exactly like
-    `excluded_suites`; they are counted separately (stats["skipped"]: entries
-    carrying a skipped label and no excluded one) so the caller can report
-    them. An entry that carries BOTH an excluded and a skipped label counts as
-    excluded, never twice.
+    check-pg-shard-partition.py uses. stats["skipped"] counts entries with a
+    skipped label and no excluded one (an entry with both counts as excluded).
     """
     failures = []
     if not tests:

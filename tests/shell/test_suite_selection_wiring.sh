@@ -126,8 +126,7 @@ for sv in "" true; do for ag in "" true; do
 python scripts/ci/flake-retry.py --builddir build-windows-debug -- --print-errorlogs --num-processes 4 $suites"
   d="windows non-pg skip_server='${sv:-}' skip_agent='${ag:-}'"
   check "$d: the exact argv of the guard and the run" "$want" "$(calls)"
-  # structural, independent of the string above: ONE suites array feeds both, and every suite the
-  # build registers is in exactly one bucket, so the proof the guard runs is about the run that follows
+  # structural: ONE suites array feeds both, and every suite is in exactly one bucket
   guard_suites="$(sed -n 1p "$LOG" | tr ' ' '\n' | awk '$0=="--suite"{getline; print}' | sort | tr '\n' ' ')"
   run_suites="$(sed -n 2p "$LOG" | tr ' ' '\n' | awk '$0=="--suite"{getline; print}' | sort | tr '\n' ' ')"
   check "$d: the guard and the run select the same suites" "$guard_suites" "$run_suites"
@@ -161,9 +160,8 @@ gate "preflight cancelled -> red"                  1 cancelled true success
 gate "no code_changed verdict -> red"              1 success ""    skipped
 
 # ── preflight chain on a real merge commit ───────────────────────────────────
-# A scratch repository holding the three real scripts and a miniature tests tree. Each case makes a
-# PR branch off `base` and merges it with --no-ff into a branch off `base`, the shape of GitHub's
-# test merge commit (first parent the base tip, second parent the PR head); the bodies run there.
+# The three real scripts in a scratch repository; each case merges a PR branch into `base` with
+# --no-ff, the shape of GitHub's test merge commit (first parent base, second the PR head).
 REPO="$TMP/repo"; RT="$TMP/rt"; mkdir -p "$REPO" "$RT"
 fgit() { env -i PATH="$(dirname "$GIT_BIN"):/usr/bin:/bin" HOME="$TMP" GIT_CONFIG_NOSYSTEM=1 \
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t \
