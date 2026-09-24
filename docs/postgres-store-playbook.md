@@ -290,30 +290,30 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise
   has changed. (Historical note: the original mandatory-backfill mechanism this bullet used to
   describe — a one-time, idempotent `migrate_from_sqlite()` running at startup, before serving,
-  failing closed on any error — is what every already-migrated store built UNTIL ADR-0009's
+  failing closed on any error — is what every store that built one built UNTIL ADR-0009's
   hard-cutover Update (2026-09-04, #3623) withdrew it fleet-wide, including AuditStore's
   previously-permanent exception. No store on this ladder has a `migrate_from_sqlite()` today —
   see the ADR-0040-round-3 discussion further below for the retirement history. See ADR-0009's
-  amendment for the rationale.)
+  2026-09-04 hard-cutover Update, not the earlier 2026-08-25 amendment, for the rationale.)
 - **Secret columns transform, never copy** (ADR-0010): applies only if you DO build a backfill
   under the documented-exception case above — a backfill that touches secret material
   encrypts/hashes on the way in, a plain column copy of a secret is forbidden. For the
   skip-by-default case, this bullet doesn't apply (there's no column copy to transform); see the
   detect-and-warn requirement above instead for that case's own obligation on secret-bearing
   legacy files.
-- **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.
-  Backfill opens it read-only; a wired subject/device erasure path must delete that identity
-  from the rollback copy so rollback cannot resurrect erased data. **Historical, no live target
-  today**: the upgrade-test (`scripts/test/test-upgrade-stack.sh` — the assertions live in the
+- **Rollback window** — applies only if you DO build a backfill under the documented-exception
+  case above; **historical, no live target today** (see below): retain the legacy `<name>.db`
+  for exactly one release, then remove it. Backfill opens it read-only; a wired subject/device
+  erasure path must delete that identity from the rollback copy so rollback cannot resurrect
+  erased data. The upgrade-test (`scripts/test/test-upgrade-stack.sh` — the assertions live in the
   script, not in `docker-compose.upgrade-test.yml`) used to assert config/reference/audit data
-  survives previous-release-SQLite → new-release-Postgres **for a store that DID build a
-  backfill** (the documented-exception case, or an already-migrated store). ADR-0009's
-  hard-cutover Update (2026-09-04, #3623) retired every remaining backfill on this ladder,
-  AuditStore's included, so there is currently no store this requirement applies to — the last
-  stale assertion of this shape was removed from the harness in #3997. **Superseded for the
-  skip-by-default case** (ADR-0009's 2026-08-25 amendment) for the same reason: there is no
-  transition to assert when nothing is copied across. If a future store's own per-store ADR
-  reintroduces a documented-exception backfill, its upgrade-test assertion belongs here again.
+  survives previous-release-SQLite → new-release-Postgres. ADR-0009's hard-cutover Update
+  (2026-09-04, #3623) retired every remaining backfill on this ladder, AuditStore's included, so
+  there is currently no store this requirement applies to — the last stale assertion of this
+  shape was removed from the harness in #3997. This was already superseded for the skip-by-default
+  case (ADR-0009's earlier 2026-08-25 amendment) for the same reason: there is no transition to
+  assert when nothing is copied across. If a future store's own per-store ADR reintroduces a
+  documented-exception backfill, its upgrade-test assertion belongs here again.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
 - **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
