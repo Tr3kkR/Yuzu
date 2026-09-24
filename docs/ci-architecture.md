@@ -1188,10 +1188,14 @@ Resolution order inside the script:
    Wee Tam server-suite timeouts). Until a box is provisioned with the
    extra clusters the script falls back to the shared pre-set DSN with a
    `::warning` — no flag day. Runners without a `-<n>` suffix use the DSN
-   as-is. **The DSN must not set `options=`, and `PGOPTIONS` must be unset
-   in the job environment** (checked unconditionally, before path
-   selection) — either silently disables PgPool's `statement_timeout`/
-   `lock_timeout` safety-bound GUCs (`pg_pool.cpp`'s `conninfo_has_options_`
+   as-is. **The DSN must not set `options=`, and `PGOPTIONS` must not carry
+   a non-empty value (matched case-insensitively — deliberate for
+   MSYS2/Windows psql.exe's case-insensitive `getenv`; on POSIX, where
+   `getenv` is case-sensitive, a non-canonical-case match is a harmless,
+   merely conservative false trigger) in the job environment** (checked
+   unconditionally, before path selection) — either silently disables
+   PgPool's `statement_timeout`/`lock_timeout` safety-bound GUCs
+   (`pg_pool.cpp`'s `conninfo_has_options_`
    gate), caught by the `[pg][hardening]` test "PgPool injects
    statement_timeout and lock_timeout GUCs". Put durability tuning in
    `postgresql.conf` via `ALTER SYSTEM` instead (#2167).
@@ -1210,12 +1214,13 @@ Resolution order inside the script:
    toolchain-manifest-vouched `psql` (`YUZU_CI_PSQL`, see below), with a
    **plain URI DSN** (`pg_dsn_target_provable` — no query string, and its
    RFC 3986 authority, the substring between `://` and the first following
-   `/`, contains exactly one `@` and a bare `host:port`; a keyword-form,
-   IPv6, multi-host, or userinfo-in-the-*path* DSN — e.g. a Unix-socket
-   path that happens to contain a literal `@` before the real host — is
-   report-only, since the per-agent derivation regex reads the first two
-   as an unparsed `?` host anyway and this function's own authority-only
-   parse refuses the third), and with none of
+   `/`, contains AT MOST one `@` (zero when the DSN carries no userinfo)
+   and a bare `host:port`; a keyword-form, IPv6, multi-host, or
+   userinfo-in-the-*path* DSN — e.g. a Unix-socket path that happens to
+   contain a literal `@` before the real host — is report-only, since the
+   per-agent derivation (`pg_dsn_rebuild_port`) and `pg_dsn_host_port`
+   read the first two as an unparsed `?` host anyway and this function's
+   own authority-only parse refuses the third), and with none of
    `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` set in the job/runner
    environment (`PGHOSTADDR`, or a `PGSERVICE` entry carrying `hostaddr`,
    redirect even a plain URI DSN — via libpq's `hostaddr`, which a URI
@@ -1237,10 +1242,14 @@ Resolution order inside the script:
    edit, e.g. `pg_hba.conf`, still goes live through the same reload). An
    APPLY-PHASE row (a postmaster-context change staged without a restart,
    or an invalid value) does NOT abort a reload — Postgres applies every
-   other change instead — so it does NOT refuse the heal; under a
-   non-English `lc_messages` these two literal English error strings will
-   not match, so the guard refuses even an apply-phase row there
-   (fail-closed). Only past both does it run `ALTER
+   other change instead — so it does NOT refuse the heal; **only one of the
+   two exclusion strings is language-dependent** (verified against all 15
+   PostgreSQL 18.6 message catalogs): `setting could not be applied` is an
+   untranslated literal in all 15 and always matches, but `cannot be
+   changed without restarting the server` is translated in all 15 — so
+   under a non-English `lc_messages` only the restart-pending apply-phase
+   class stops matching, and the guard refuses that one class too there
+   (fail-closed, not a silent gap). Only past both guards does it run `ALTER
    SYSTEM SET … = off` ×3 + `pg_reload_conf()`, then a bounded (5 × 1s)
    re-read, since a reload's SIGHUP handling is asynchronous. Everywhere
    else (a developer's pre-set DSN, a bespoke remote DB, any other
@@ -1351,7 +1360,11 @@ credential failure when `psql` is available (path 4), and nothing found
 (path 5) — **plus, since the #2167 follow-up, on ANY path-1 invocation
 (any pre-set `YUZU_TEST_POSTGRES_DSN`, on any OS, not only Wee Tam's
 Windows jobs): a manifest-vouched `SELECT 1` failure after retries
-(agent 0/the base cluster as well as any further agent), a durability
+(agent 0/the base cluster as well as any further agent), a pre-set DSN a
+multi-agent (`-<n>`) runner's manifest-vouched `psql` cannot safely
+derive its own per-agent port from (the DSN isn't a plain URI the
+derivation can parse, and falling back to the shared DSN would silently
+defeat the #2094 per-agent isolation with no way to verify it), a durability
 read that is unreadable/unparseable, a heal whose `ALTER SYSTEM`/
 `pg_reload_conf()` fails outright (including either in-session
 loopback/target-identity or config-parse check failing closed), a
@@ -1407,8 +1420,9 @@ compare `SELECT count(*) FROM pg_stat_activity` against
 | `durability read failed on <host:port>: ...` | The first `pg_settings` read itself failed to connect/authenticate. | Run the query above against the DSN by hand; check the service is up and the credential is right. |
 | `durability settings unreadable on <host:port> (...): ...` | psql connected (rc 0) but the output wasn't 3 clean `name\|setting\|source` rows — this is the READ arm, so the raw text is withheld under Actions even though psql itself succeeded. | Run the query above by hand on the runner; any role can read these three settings. |
 | `... NOT healing (cannot prove the target)` | The DSN has a query string, more than one `@` in its authority, an `@` that is actually inside the DSN's path rather than its authority, or is keyword-form/IPv6/multi-host, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
+| `cannot derive a per-agent DSN for <runner> ...` | The machine-level pre-set DSN on a multi-agent (`-<n>`) runner isn't a plain `postgresql://user@host:port/db` URI, so its per-agent port can't be derived safely, and this job's `psql` is manifest-vouched — falling back to the shared DSN would silently defeat the #2094 per-agent isolation. | Set the machine-level pre-set DSN to a plain URI form. |
 | `... NOT healing (heal runs only under GitHub Actions ...)` | Host isn't loopback, or the psql isn't manifest-vouched (`YUZU_CI_PSQL`), or you're outside Actions. | Expected for a developer shell / bespoke remote DB — tune durability by hand if you want it off. |
-| `heal failed on ... (psql rc=N; this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity — including a NULL server address/port, e.g. a Unix-socket session — or a `pg_file_settings` reload-aborting error) raised first. | The printed `ERROR:` line names which — a `yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard` line names the guard; anything else is a genuine `ALTER SYSTEM` failure (grant/permission). |
+| `heal failed on ... (psql rc=N; this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity — including a NULL server address/port, e.g. a Unix-socket session — or a `pg_file_settings` reload-aborting error) raised first — or `psql` itself never ran (`rc=124` timed out, `rc=126`/`127` failed to execute; see the rc legend above). | The printed `ERROR:` line names which guard fired (`yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard`); a `psql rc=124/126/127` is the timeout/exec-failure case above, not a database fault; any OTHER rc with no guard-marker line is a genuine `ALTER SYSTEM` failure (grant/permission). |
 | `could not re-read after heal on ... (psql rc=N): ...` | The heal itself succeeded, but the bounded re-read afterward couldn't even connect. | Check the service is still up; rc 124/126/127 are timeout/exec-failure, not a settings problem. |
 | `still not durability-off 5s after heal` | The re-read connected and returned rows, but a setting is still not `off`. | Check `pg_file_settings` and the server log first (a reload-aborting error means the reload applied nothing); then remove the override — an `ImagePath -c` flag, or `ALTER ROLE`/`ALTER DATABASE ... RESET`. |
 | `durability settings unreadable ... after heal (...)` | The post-heal re-read connected (rc 0) but its own output wasn't 3 clean rows. | Same as the read-arm row above, run the query above by hand once the heal has settled. |

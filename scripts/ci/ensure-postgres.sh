@@ -25,7 +25,7 @@
 #      cluster (see pg_durability_decide in pg-durability.sh) and, only
 #      under GitHub Actions against a loopback host PROVABLE from a plain
 #      URI DSN (pg_dsn_target_provable — no query string, and its authority
-#      alone contains exactly one '@' and a bare host:port), with no
+#      alone contains at most one '@' and a bare host:port), with no
 #      PGHOST/PGHOSTADDR/PGSERVICE/PGPORT override in the job/
 #      runner environment, and with a toolchain-manifest-vouched psql
 #      (YUZU_CI_PSQL, exported by deploy/windows/Assert-Toolchain.ps1
@@ -43,8 +43,11 @@
 #      malformed DSN's password verbatim) is withheld under GitHub Actions
 #      rather than republished in a public ::error::/::warning:: annotation
 #      — see p1_diag; a POST-read failure (heal, post-heal re-read) prints
-#      only the server's own ERROR/FATAL/WARNING/DETAIL/HINT lines instead,
-#      since that DSN already proved it parses — see p1_server_diag.
+#      only the server's own ERROR/FATAL/WARNING/DETAIL/HINT lines, plus a
+#      line carrying this guard's own "yuzu-heal-" marker or a connection-
+#      phase "connection to server ... failed:" line (neither can newly
+#      carry a credential on a DSN already proven to parse) — see
+#      p1_server_diag.
 #      Test seam: YUZU_CI_PG_SLEEP_SCALE scales the guard's bounded sleeps
 #      (defaults to 1; the docs-suite selftest sets 0 so every scenario
 #      runs in milliseconds).
@@ -158,15 +161,21 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
 # lower-case copy invisible to bash's own ${VAR:-} test is still visible
 # to psql.exe's case-insensitive Windows getenv. Pure bash/builtins
 # only (compgen -e, nocasematch) — no external tr/grep pipeline, which the
-# stripped-PATH docs-suite selftest harness cannot supply.
+# stripped-PATH docs-suite selftest harness cannot supply. On a match, sets
+# P1_ENV_MATCH to the variable's ACTUAL (case-preserved) name, so a caller
+# that also cares about the value can read it via `${!P1_ENV_MATCH}` — the
+# PGOPTIONS gate below is the one caller that does; a caller that (like the
+# PGHOST-family gate) treats "set" as fatal regardless of value ignores it.
 p1_env_is_set() {
   local name='' nocase_was_on=1
   shopt -q nocasematch || nocase_was_on=0
   shopt -s nocasematch
   local found=1
+  P1_ENV_MATCH=''
   while IFS= read -r name; do
     if [[ "$name" =~ ^($1)$ ]]; then
       found=0
+      P1_ENV_MATCH="$name"
       break
     fi
   done < <(compgen -e)
@@ -223,11 +232,14 @@ p1_probe_manifest() {
 # Bounds psql itself, not just the connect: PGCONNECT_TIMEOUT (below) only
 # covers the initial connection, and a hung/wedged backend after that would
 # otherwise block the step indefinitely. /usr/bin/timeout by ABSOLUTE
-# PATH is load-bearing on Wee Tam — MSYS2 bash's PATH puts
-# C:\Windows\system32 first, so a bare `timeout` resolves to Windows'
-# timeout.exe (sweep-test-databases.sh:53-58 documents the same trap), which
-# takes different arguments and would silently no-op or error. macOS has no
-# /usr/bin/timeout and stays unbounded there (dev shells only, never CI).
+# PATH is load-bearing on Wee Tam — Start-PinnedRunner.ps1 prepends MSYS2's
+# usr/bin ahead of C:\Windows\system32 in today's runner PATH, but the
+# absolute path is what guards a runner started WITHOUT that PATH order
+# (sweep-test-databases.sh:53-58 makes the same pre-existing, now-stale
+# "system32 is first" claim) — there, a bare `timeout` would resolve to
+# Windows' timeout.exe instead, which takes different arguments and would
+# silently no-op or error. macOS has no /usr/bin/timeout and stays
+# unbounded there (dev shells only, never CI).
 # 30s per call, not 60s: PGCONNECT_TIMEOUT=10 already bounds the connect,
 # and every query this guard issues (a pg_settings SELECT, three ALTER
 # SYSTEMs, a reload) completes in milliseconds on a loopback cluster — 30s
@@ -257,6 +269,23 @@ p1_psql() {
   local dsn="$1"
   shift
   PGCONNECT_TIMEOUT=10 MSYS2_ARG_CONV_EXCL='*' "${P1_TIMEOUT[@]+"${P1_TIMEOUT[@]}"}" "$P1_PSQL" -X -w --dbname="$dsn" "$@"
+}
+
+# p1_hp_disp <dsn> — pg_dsn_host_port's "?" is the correct MACHINE value
+# for a DSN this guard cannot parse (keyword-form, IPv6, multi-host, a
+# query string, or any other shape pg_dsn_parse_authority's grammar
+# excludes), but a bare "?" reads as a broken interpolation in an
+# operator-facing message ("... not off on ?"). Every message arm in
+# p1_conform, and the agent-0/base-cluster probe-failure message below,
+# prints this instead.
+p1_hp_disp() {
+  local hp
+  hp="$(pg_dsn_host_port "$1")"
+  if [[ "$hp" == "?" ]]; then
+    echo "host unparsed (keyword-form, IPv6, multi-host, or query-string DSNs are report-only)"
+  else
+    echo "$hp"
+  fi
 }
 
 # p1_flatten <text> — CRLF-strip then newline-and-tab-flatten psql/error
@@ -310,12 +339,16 @@ p1_diag() {
 # (e.g. `ERROR:  permission denied to set parameter "fsync"`, or the
 # in-session loopback/config-parse guards in the heal call's DO blocks
 # firing), which is exactly what an operator needs to diagnose a failed
-# heal, and withholding it serves no credential purpose. Prints only
-# the lines that start with one of psql's own server-message prefixes —
-# ERROR/FATAL/WARNING/DETAIL/HINT — flattened and space-joined; anything
-# else (a stray sentinel, connection-banner noise, or simply no output at
-# all) prints a fixed "no ERROR/FATAL/WARNING/DETAIL/HINT line in psql
-# output" instead of echoing raw text. This takes only the text, never an
+# heal, and withholding it serves no credential purpose. Prints only the
+# lines that start with one of psql's own server-message prefixes —
+# ERROR/FATAL/WARNING/DETAIL/HINT — OR carry this guard's own "yuzu-heal-"
+# RAISE marker (so a non-English lc_messages, which translates the plain
+# prefixes, still surfaces the guard's own English marker text) OR a
+# connection-phase "connection to server ... failed:" line (safe here for
+# the same already-proven-to-parse reason) — flattened and space-joined;
+# anything else (a stray sentinel, connection-banner noise, or simply no
+# output at all) prints a fixed "no ERROR/FATAL/WARNING/DETAIL/HINT line in
+# psql output" instead of echoing raw text. This takes only the text, never an
 # <rc> — every caller already prefixes its own message with
 # "(psql rc=${rc})", so passing rc through here used to double it up as
 # "(psql rc=2): psql rc=2" when there was no server line to print.
@@ -368,28 +401,30 @@ p1_server_diag() {
 p1_conform() {
   local dsn="$1" hp='' dsn_redacted='' rows='' rc=0 decision='' allow=0 attempt=0
   local q="SELECT name, setting, source FROM pg_catalog.pg_settings WHERE name IN ('fsync','synchronous_commit','full_page_writes') ORDER BY name"
-  local heal_refusal_reason='' final_decision=''
+  local heal_refusal_reason='' final_decision='' hp_disp=''
   hp="$(pg_dsn_host_port "$dsn")"
+  hp_disp="$hp"
+  [[ "$hp_disp" == "?" ]] && hp_disp="host unparsed (keyword-form, IPv6, multi-host, or query-string DSNs are report-only)"
   dsn_redacted="$(pg_dsn_redact "$dsn")"
 
   if [[ "$P1_PSQL_SRC" == "none" ]]; then
-    echo "::warning::ensure-postgres: durability conformance UNVERIFIED on ${hp} — no psql (pass -ExportCiEnv to deploy/windows/Assert-Toolchain.ps1, which exports YUZU_CI_PSQL from the manifest — never set it by hand, it authorises the heal — or put psql on PATH for a report-only check). See docs/ci-architecture.md 'Postgres for server tests'." >&2
+    echo "::warning::ensure-postgres: durability conformance UNVERIFIED on ${hp_disp} — no psql (pass -ExportCiEnv to deploy/windows/Assert-Toolchain.ps1, which exports YUZU_CI_PSQL from the manifest — never set it by hand, it authorises the heal — or put psql on PATH for a report-only check). See docs/ci-architecture.md 'Postgres for server tests'." >&2
     return 0
   fi
 
   rc=0
   rows="$(p1_psql "$dsn" -tA -c "$q" 2>&1)" || rc=$?
   if [[ "$rc" != "0" ]]; then
-    # No DSN-derived string beyond ${hp} in the Actions arm — the two
+    # No DSN-derived string beyond ${hp_disp} in the Actions arm — the two
     # redaction gaps in pg_dsn_redact (a backslash-escaped space, a
     # percent-encoded keyword) both reproduce against a real libpq DSN, and
     # the root fix is not printing a redacted DSN in a public annotation at
     # all, not chasing more regex gaps. A developer shell (no Actions) still
     # gets it — useful, and not a public leak.
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-      echo "::error::ensure-postgres: durability read failed on ${hp}: $(p1_diag "$rc" "$rows")" >&2
+      echo "::error::ensure-postgres: durability read failed on ${hp_disp}: $(p1_diag "$rc" "$rows")" >&2
     else
-      echo "::error::ensure-postgres: durability read failed on ${hp} (${dsn_redacted}): $(p1_diag "$rc" "$rows")" >&2
+      echo "::error::ensure-postgres: durability read failed on ${hp_disp} (${dsn_redacted}): $(p1_diag "$rc" "$rows")" >&2
     fi
     return 1
   fi
@@ -417,18 +452,17 @@ p1_conform() {
 
   case "$decision" in
     ok)
-      echo "ensure-postgres: durability conformance ok on ${hp} ($(p1_flatten "$rows"))" >&2
+      echo "ensure-postgres: durability conformance ok on ${hp_disp} ($(p1_flatten "$rows"))" >&2
       return 0
       ;;
     drift*)
-      # The per-agent derivation regex (and pg_dsn_host_port)
+      # The per-agent derivation (pg_dsn_rebuild_port) and pg_dsn_host_port
       # only ever yield a real host:port for a URI-form DSN with a literal
-      # loopback host — a keyword-form, IPv6, or multi-host DSN reads as
-      # "?" and is drift-only by construction (pg_heal_allowed can never
-      # see a loopback host for one). Say so plainly rather than printing
-      # the confusing literal "on ?".
-      local hp_disp="$hp"
-      [[ "$hp_disp" == "?" ]] && hp_disp="host unparsed (keyword-form, IPv6, or multi-host DSNs are report-only)"
+      # loopback host — a keyword-form, IPv6, multi-host, or query-string
+      # DSN reads as "?" (hp_disp, computed above) and is drift-only by
+      # construction (pg_heal_allowed can never see a loopback host for
+      # one). Say so plainly rather than printing the confusing literal
+      # "on ?".
       if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         if [[ -n "$heal_refusal_reason" ]]; then
           echo "::warning::ensure-postgres: ${decision#drift } not off on ${hp_disp} — NOT healing (${heal_refusal_reason})." >&2
@@ -441,40 +475,28 @@ p1_conform() {
       return 0
       ;;
     heal*)
-      echo "::warning::ensure-postgres: ${hp} had ${decision#heal } not off ($(p1_flatten "$rows")) — healing with ALTER SYSTEM SET ... = off + pg_reload_conf(). This persists in postgresql.auto.conf; if it recurs, the printed pg_settings.source will name the cause." >&2
+      echo "::warning::ensure-postgres: ${hp_disp} had ${decision#heal } not off ($(p1_flatten "$rows")) — healing with ALTER SYSTEM SET ... = off + pg_reload_conf(). This persists in postgresql.auto.conf; if it recurs, the printed pg_settings.source will name the cause." >&2
       rc=0
       # The heal session's first two statements are in-session DO-block
-      # guards, run BEFORE any ALTER SYSTEM, under ON_ERROR_STOP=1 so either
-      # one failing aborts the whole call with no ALTER issued:
-      #   1. identity guard — the DSN-string checks above (provable + no env
-      #      override) only bound what we ATTEMPT; this is the authoritative
-      #      bound on what the heal actually MUTATES: RAISE unless the
-      #      server this session is actually connected to is loopback on the
-      #      exact port ${hp} claims. inet_server_addr()/inet_server_port()
-      #      are BOTH NULL on a Unix-socket session, and `NOT (NULL AND ...)`
-      #      is itself NULL — PL/pgSQL's `IF NULL` takes the ELSE branch (no
-      #      RAISE), so a socket connection previously healed unguarded. The
-      #      explicit IS NULL disjuncts below close that: either function
-      #      reading NULL now RAISEs directly, never reaching the three-
-      #      valued-logic predicate at all.
-      #   2. config-parse guard — pg_reload_conf() is a cluster-wide SIGHUP.
-      #      RAISE only on a RELOAD-ABORTING error class (an unrecognized
-      #      parameter, a syntax error, a missing include — these make the
-      #      reload apply NOTHING, so any already-staged, unrelated edit,
-      #      e.g. a pending pg_hba.conf restriction, would go live via the
-      #      same SIGHUP with no durability change to show for it). An
-      #      APPLY-PHASE row (a postmaster-context change staged without a
-      #      restart, or an invalid value) does NOT abort the reload —
-      #      Postgres applies every OTHER change and logs "unaffected
-      #      changes were applied" — so refusing on those would fail every
-      #      job on that agent until someone restarted the service.
-      #      Excluding exactly those two observed classes is
-      #      fail-open only for them; any other class still RAISEs
-      #      (fail-closed). Under a non-English lc_messages these two
-      #      literal English strings will not match, so the guard refuses
-      #      even an apply-phase row there — fail-closed, and worth
-      #      knowing about rather than a silent gap.
+      # guards, run BEFORE any ALTER SYSTEM under ON_ERROR_STOP=1 (either
+      # RAISEing aborts the whole call with no ALTER issued): (1) an
+      # identity guard binding what the heal actually MUTATES to loopback
+      # on this DSN's exact port ${hp} — explicit IS NULL disjuncts so a
+      # Unix-socket session's NULL inet_server_addr()/port() RAISEs
+      # directly rather than falling through PL/pgSQL's three-valued `IF
+      # NULL`; (2) a config-parse guard that refuses a RELOAD-ABORTING
+      # pg_file_settings error (which would make pg_reload_conf() apply
+      # NOTHING) but is fail-open on an APPLY-PHASE row (Postgres applies
+      # every other change on those regardless). Full rationale, including
+      # the non-English lc_messages caveat, is in docs/ci-architecture.md
+      # "Postgres for server tests".
+      # The session's FIRST statement pins search_path so a planted
+      # public.string_agg/inet-operator function (the yuzu role is
+      # SUPERUSER) can never intercept this session's unqualified calls —
+      # belt alongside the explicit pg_catalog. qualifications below, which
+      # stay for readability. -q suppresses the SET's own status line.
       rows="$(p1_psql "$dsn" -q -v ON_ERROR_STOP=1 -tA \
+        -c 'SET search_path = pg_catalog, pg_temp' \
         -c "DO \$\$ BEGIN IF pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = ${hp##*:}) THEN RAISE EXCEPTION 'yuzu-heal-identity-guard: connected server % port % is not loopback:${hp##*:}', pg_catalog.inet_server_addr(), pg_catalog.inet_server_port(); END IF; END \$\$" \
         -c "DO \$\$ DECLARE bad_errors text; BEGIN SELECT string_agg(DISTINCT error, '; ') INTO bad_errors FROM pg_catalog.pg_file_settings WHERE error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION 'yuzu-heal-config-parse-guard: pg_file_settings has reload-aborting error(s) - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log: %', bad_errors; END IF; END \$\$" \
         -c 'ALTER SYSTEM SET fsync = off' \
@@ -482,7 +504,7 @@ p1_conform() {
         -c 'ALTER SYSTEM SET full_page_writes = off' \
         -c 'SELECT pg_catalog.pg_reload_conf()' 2>&1)" || rc=$?
       if [[ "$rc" != "0" ]]; then
-        echo "::error::ensure-postgres: heal failed on ${hp} (psql rc=${rc}$(p1_rc_hint "$rc"); this includes the in-session loopback/target identity guard and the config-parse guard, either of which fails closed here): $(p1_server_diag "$rows")" >&2
+        echo "::error::ensure-postgres: heal failed on ${hp_disp} (psql rc=${rc}$(p1_rc_hint "$rc"); this includes the in-session loopback/target identity guard and the config-parse guard, either of which fails closed here): $(p1_server_diag "$rows")" >&2
         return 1
       fi
       # pg_reload_conf() only signals the postmaster; SIGHUP handling (and,
@@ -492,7 +514,7 @@ p1_conform() {
         rc=0
         rows="$(p1_psql "$dsn" -tA -c "$q" 2>&1)" || rc=$?
         if [[ "$rc" == "0" ]] && [[ "$(pg_durability_decide 0 "$rows")" == "ok" ]]; then
-          echo "ensure-postgres: durability healed on ${hp} (attempt ${attempt})" >&2
+          echo "ensure-postgres: durability healed on ${hp_disp} (attempt ${attempt})" >&2
           return 0
         fi
         sleep $((1 * P1_SLEEP_SCALE))
@@ -500,17 +522,17 @@ p1_conform() {
       # Branch on the ACTUAL last outcome rather than always
       # citing pg_settings.source, which only explains the "not off" case.
       if [[ "$rc" != "0" ]]; then
-        echo "::error::ensure-postgres: could not re-read after heal on ${hp} (psql rc=${rc}$(p1_rc_hint "$rc")): $(p1_server_diag "$rows")" >&2
+        echo "::error::ensure-postgres: could not re-read after heal on ${hp_disp} (psql rc=${rc}$(p1_rc_hint "$rc")): $(p1_server_diag "$rows")" >&2
         return 1
       fi
       final_decision="$(pg_durability_decide 0 "$rows" || true)"
       case "$final_decision" in
         fail*)
-          echo "::error::ensure-postgres: durability settings unreadable on ${hp} after heal (${final_decision#fail }): $(p1_diag "$rc" "$rows" 1)" >&2
+          echo "::error::ensure-postgres: durability settings unreadable on ${hp_disp} after heal (${final_decision#fail }): $(p1_diag "$rc" "$rows" 1)" >&2
           return 1
           ;;
         *)
-          echo "::error::ensure-postgres: ${hp} still not durability-off 5s after heal (${final_decision#drift } $(p1_flatten "$rows")) — check pg_file_settings and the server log first (a postgresql.conf parse error means the reload applied nothing), then remove the override (ImagePath -c, or ALTER ROLE/DATABASE ... RESET) — a per-role/per-database override or a command-line -c beats ALTER SYSTEM." >&2
+          echo "::error::ensure-postgres: ${hp_disp} still not durability-off 5s after heal (${final_decision#drift } $(p1_flatten "$rows")) — check pg_file_settings and the server log first (a postgresql.conf parse error means the reload applied nothing), then remove the override (ImagePath -c, or ALTER ROLE/DATABASE ... RESET) — a per-role/per-database override or a command-line -c beats ALTER SYSTEM." >&2
           return 1
           ;;
       esac
@@ -522,11 +544,11 @@ p1_conform() {
       # Actions-gated withholding p1_diag applies to a genuine psql failure,
       # rather than trusting rc==0 to mean "safe to print raw". This is the
       # READ arm: unchanged, still withheld under Actions.
-      echo "::error::ensure-postgres: durability settings unreadable on ${hp} (${decision#fail }): $(p1_diag "$rc" "$rows" 1)" >&2
+      echo "::error::ensure-postgres: durability settings unreadable on ${hp_disp} (${decision#fail }): $(p1_diag "$rc" "$rows" 1)" >&2
       return 1
       ;;
     *)
-      echo "::error::ensure-postgres: durability decision unrecognised on ${hp}: ${decision}" >&2
+      echo "::error::ensure-postgres: durability decision unrecognised on ${hp_disp}: ${decision}" >&2
       return 1
       ;;
   esac
@@ -535,12 +557,20 @@ p1_conform() {
 # PGOPTIONS is process-environment-level, not DSN content: pg_pool.cpp's
 # conninfo_has_options_ gate checks getenv("PGOPTIONS") unconditionally,
 # regardless of which of the 4 paths below built the connection string.
-# A set PGOPTIONS would silently disable PgPool's statement_timeout/
-# lock_timeout safety bounds even on the docker/brew/native paths, which
-# never see a caller-supplied DSN - so this runs unconditionally, before
-# path selection, not only inside the pre-set-DSN branch (path 1 below).
-if p1_env_is_set 'PGOPTIONS'; then
-  echo "::error::ensure-postgres: PGOPTIONS must not be set in the job or runner machine environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
+# A set, NON-EMPTY PGOPTIONS would silently disable PgPool's
+# statement_timeout/lock_timeout safety bounds even on the docker/brew/
+# native paths, which never see a caller-supplied DSN - so this runs
+# unconditionally, before path selection, not only inside the pre-set-DSN
+# branch (path 1 below). Matched case-insensitively via p1_env_is_set (see
+# its doc comment) — deliberate for MSYS2/Windows psql.exe's
+# case-insensitive getenv; real POSIX getenv is case-sensitive, so a
+# non-canonical-case match there is a harmless, merely conservative false
+# trigger, never a false negative. An EMPTY value is exempt either way:
+# pg_pool.cpp/leader_elector.cpp only read PGOPTIONS when it is non-empty
+# (`env_options[0] != '\0'`), so a set-but-empty PGOPTIONS disables
+# nothing and must not be fatal.
+if p1_env_is_set 'PGOPTIONS' && [[ -n "${!P1_ENV_MATCH}" ]]; then
+  echo "::error::ensure-postgres: PGOPTIONS must not be set to a non-empty value in the job or runner machine environment (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
   exit "$SOFT_EXIT"
 fi
 
@@ -645,17 +675,22 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # cross-job contention and contaminates the timing determination this
   # guard exists to make).
   #
-  # The derived DSN is trusted only when pg_dsn_target_provable accepts
-  # the pre-set DSN, and it is REBUILT from the parsed parts
-  # (pg_dsn_rebuild_port), never regex-substituted over the whole string
-  # (which could rewrite a numeral inside the password field as the port).
-  # A DSN this cannot derive from is the same no-fallback contract as a
+  # The derived DSN is trusted only when pg_dsn_parse_authority accepts
+  # the pre-set DSN (called DIRECTLY here, not via its pg_dsn_target_provable
+  # alias, since this call site needs the PG_DSN_HOST/PG_DSN_PORT fields the
+  # parse sets as its documented side channel — pg_dsn_target_provable's own
+  # doc comment is silent on that channel), then rebuilt via
+  # pg_dsn_rebuild_port — see that function's own doc comment for why. A
+  # DSN this cannot derive from is the same no-fallback contract as a
   # failed probe below: fatal with a manifest-vouched psql, a loud warning
   # otherwise — never a silent export of the shared DSN.
   if [[ -n "$AGENT_IDX" && "$AGENT_IDX" != "0" ]]; then
-    if pg_dsn_target_provable "$YUZU_TEST_POSTGRES_DSN"; then
+    if pg_dsn_parse_authority "$YUZU_TEST_POSTGRES_DSN"; then
       PA_HOST="$PG_DSN_HOST"
-      PA_PORT=$((PG_DSN_PORT + AGENT_IDX))
+      # 10# forces base-10: a leading-zero port (e.g. "08") would otherwise
+      # read as invalid octal under `set -e` and abort path 1 (the same
+      # trap documented at :99 for YUZU_CI_PG_SLEEP_SCALE).
+      PA_PORT=$((10#$PG_DSN_PORT + AGENT_IDX))
       PA_DSN="$(pg_dsn_rebuild_port "$YUZU_TEST_POSTGRES_DSN" "$PA_PORT")"
       PA_HOW=""
       if [[ -n "$P1_PSQL" ]]; then
@@ -695,7 +730,7 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
   # loud, specific wording instead of surfacing only as a generic read
   # failure inside p1_conform.
   if [[ "$P1_PSQL_SRC" == "manifest" ]] && ! p1_probe_manifest "$P1_DSN"; then
-    echo "::error::ensure-postgres: Postgres on $(pg_dsn_host_port "$P1_DSN") (agent 0 / base cluster for ${RUNNER_NAME:-this runner}) failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved it earlier in this same job) — refusing to proceed. Check the service/orphaned backends; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+    echo "::error::ensure-postgres: Postgres on $(p1_hp_disp "$P1_DSN") (agent 0 / base cluster for ${RUNNER_NAME:-this runner}) failed 'psql SELECT 1' (psql rc=${P1_PROBE_RC}$(p1_rc_hint "$P1_PROBE_RC")) although the toolchain manifest declares it (Assert-Toolchain proved it earlier in this same job) — refusing to proceed. Check the service/orphaned backends; see docs/ci-architecture.md 'Postgres for server tests'." >&2
     exit "$SOFT_EXIT"
   fi
   p1_conform "$P1_DSN" || exit "$SOFT_EXIT"

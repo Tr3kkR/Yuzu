@@ -263,8 +263,9 @@ if(-not $hasClusterContract){
     # and release.yml invoke this script without it, so a throw here would
     # only ever hit the ci.yml Windows PR/push job, never a release build.
     # The elseif ORDER (not an -and short-circuit) is what keeps $Matches
-    # fresh: the -match at the previous elseif fills it whenever that arm
-    # returns false, and TryParse below only runs once that arm was false.
+    # fresh: the -notmatch at the previous elseif fills it whenever that
+    # arm returns false, and TryParse below only runs once that arm was
+    # false.
     $idx = 0
     if(-not $env:GITHUB_ENV){
       Write-Host "  [warn] -ExportCiEnv but GITHUB_ENV is unset — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
@@ -274,12 +275,12 @@ if(-not $hasClusterContract){
       Write-Host "  [warn] RUNNER_NAME '$($env:RUNNER_NAME)' suffix '-$($Matches[1])' is out of the 0-9 pool-agent-index range — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
     } else {
       $own = @($m.postgres_clusters) | Where-Object { [int]$_.agent -eq $idx } | Select-Object -First 1
-      # All three of these MUST hold, not just a truthy $own.psql:
-      # a JSON array's first element alone is truthy and its
-      # OWN Test-Path check would return a truthy `True,False` array whose
-      # string interpolation carries a literal LF into Add-Content below —
-      # a crafted manifest could then append a second, attacker-chosen
-      # GITHUB_ENV line.
+      # All four of these MUST hold, not just a truthy $own.psql: a JSON
+      # array value for $own.psql (rather than the expected single string)
+      # is also truthy, and its OWN Test-Path check would return a truthy
+      # `True,False` array whose string interpolation carries a literal LF
+      # into Add-Content below — a crafted manifest could then append a
+      # second, attacker-chosen GITHUB_ENV line.
       if($own -and $own.psql -is [string] -and $own.psql -notmatch '[\r\n]' -and (Test-Path -LiteralPath $own.psql -PathType Leaf)){
         Add-Content -LiteralPath $env:GITHUB_ENV -Value "YUZU_CI_PSQL=$($own.psql)"
         Write-Host ("  [OK]   exported YUZU_CI_PSQL for agent {0} ({1})" -f $idx, $own.psql) -ForegroundColor Green

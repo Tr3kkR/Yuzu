@@ -189,13 +189,17 @@ pg_dsn_parse_authority() {
   PG_DSN_SCHEME="${BASH_REMATCH[1]}"
   local authority="${BASH_REMATCH[3]}"
   PG_DSN_REST="${BASH_REMATCH[4]:-}"
-  case "$PG_DSN_REST" in *'@'*) return 1 ;; esac
+  # Every later failure return re-clears PG_DSN_SCHEME/PG_DSN_REST (already
+  # assigned above) so the doc comment's "all five cleared to \"\" on
+  # failure" is true at EVERY return 1, not only the two before any field
+  # is set.
+  case "$PG_DSN_REST" in *'@'*) PG_DSN_SCHEME='' PG_DSN_REST=''; return 1 ;; esac
   local at_count=0 rest="$authority"
   while [[ "$rest" == *"@"* ]]; do
     at_count=$((at_count + 1))
     rest="${rest#*@}"
   done
-  [[ "$at_count" -le 1 ]] || return 1
+  [[ "$at_count" -le 1 ]] || { PG_DSN_SCHEME='' PG_DSN_REST=''; return 1; }
   local hostport="$authority"
   if [[ "$at_count" -eq 1 ]]; then
     PG_DSN_USERINFO="${authority%%@*}@"
@@ -206,7 +210,7 @@ pg_dsn_parse_authority() {
   # '[^' to avoid closing the class early — `[^]:/?,@[]` (not
   # `[^:/?,@\[\]]`, which silently matches NOTHING: the stray `\]` closes
   # the class one character early).
-  [[ "$hostport" =~ ^([^]:/?,@[]+):([0-9]+)$ ]] || { PG_DSN_USERINFO=''; return 1; }
+  [[ "$hostport" =~ ^([^]:/?,@[]+):([0-9]+)$ ]] || { PG_DSN_SCHEME='' PG_DSN_USERINFO='' PG_DSN_REST=''; return 1; }
   PG_DSN_HOST="${BASH_REMATCH[1]}"
   PG_DSN_PORT="${BASH_REMATCH[2]}"
   return 0
@@ -255,9 +259,15 @@ pg_dsn_redact() {
 # actually connects and is safe input to pg_heal_allowed's loopback check.
 # A DSN this refuses (keyword-form, IPv6, multi-host, a query string, or
 # any shape pg_dsn_parse_authority's grammar excludes) is report-only —
-# see that function's doc comment for the full grammar and rationale.
+# see that function's doc comment for the full grammar, the PG_DSN_* side
+# channel it sets on success, and its rationale. A pure boolean alias — it
+# prints nothing itself (pg_dsn_parse_authority doesn't either), so a
+# caller that also needs the parsed PG_DSN_HOST/PG_DSN_PORT fields (the
+# per-agent derivation in ensure-postgres.sh) calls pg_dsn_parse_authority
+# directly instead of through this alias, to keep that dependency visible
+# at the call site rather than hidden behind a boolean-looking predicate.
 pg_dsn_target_provable() {
-  pg_dsn_parse_authority "$1" >/dev/null
+  pg_dsn_parse_authority "$1"
 }
 
 # pg_psql_path_from_env <value> — backslash -> forward-slash (Windows-form
@@ -389,8 +399,14 @@ pg_durability_selftest() {
   pg_durability_check "dsn_target_provable non-postgres scheme not provable" "1" "$rc"
   rc=0; pg_dsn_target_provable 'postgresql://yuzu@127.0.0.1,127.0.0.1:5433/db' || rc=$?
   pg_durability_check "dsn_target_provable comma multi-host not provable" "1" "$rc"
+  # A userinfo-FREE plain URI (at_count=0) is accepted too — the grammar is
+  # "AT MOST one '@'", not "exactly one"; this is the fixture the `-le 1` ->
+  # `-eq 1` mutation (CR5-5a) survived both suites without.
+  rc=0; pg_dsn_target_provable 'postgresql://127.0.0.1:5433/yuzu_test' || rc=$?
+  pg_durability_check "dsn_target_provable userinfo-free uri provable" "0" "$rc"
 
   out="$(pg_dsn_host_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port uri" "127.0.0.1:5433" "$out"
+  out="$(pg_dsn_host_port 'postgresql://127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port userinfo-free uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu')"; pg_durability_check "dsn_host_port keyword-form" "?" "$out"
   out="$(pg_dsn_host_port 'postgresql://yuzu@[::1]:5433/db')"; pg_durability_check "dsn_host_port ipv6" "?" "$out"
   # A greedy whole-string regex reads the password fragment "vault:2024"
@@ -403,6 +419,13 @@ pg_durability_selftest() {
 
   out="$(pg_dsn_rebuild_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test' 5434)"
   pg_durability_check "dsn_rebuild_port shifts only the port" "postgresql://yuzu:yuzu@127.0.0.1:5434/yuzu_test" "$out"
+  out="$(pg_dsn_rebuild_port 'postgresql://127.0.0.1:5433/yuzu_test' 5434)"
+  pg_durability_check "dsn_rebuild_port userinfo-free uri shifts only the port" "postgresql://127.0.0.1:5434/yuzu_test" "$out"
+  # A numeral INSIDE the password field must never be mistaken for the port
+  # by anything that rewrites the string in place — this is rebuilt from
+  # the parsed authority parts, never regex-substituted.
+  out="$(pg_dsn_rebuild_port 'postgresql://yuzu:p5433x@127.0.0.1:5433/db' 5434)"
+  pg_durability_check "dsn_rebuild_port shifts only the port, not a numeral in the password" "postgresql://yuzu:p5433x@127.0.0.1:5434/db" "$out"
   rc=0; out="$(pg_dsn_rebuild_port 'host=127.0.0.1 port=5433 user=yuzu' 5434)" || rc=$?
   pg_durability_check "dsn_rebuild_port refuses a non-provable DSN" "1" "$rc"
   pg_durability_check "dsn_rebuild_port refuses a non-provable DSN (empty output)" "" "$out"

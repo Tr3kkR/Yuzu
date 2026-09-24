@@ -194,11 +194,13 @@ FAKE_FAIL_OUT=$'ERROR:  permission denied to set parameter "fsync"\nDETAIL:  fak
 # that the filter is selective, not "print everything after the first
 # match" (case 6b below asserts CONTEXT: is withheld).
 FAKE_GUARD_FAIL_OUT=$'ERROR:  yuzu-heal-identity-guard: connected server 127.0.0.1 port 5433 is not loopback:5434\nCONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE\nfake-psql-sentinel-should-not-appear'
-# Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24): an invalid
-# postgresql.conf line makes the config-parse guard RAISE before any ALTER
-# SYSTEM. Verified live: postgresql.auto.conf stays byte-identical and the
-# durability settings are unchanged when this fires.
-FAKE_CONFIG_GUARD_FAIL_OUT=$'ERROR:  yuzu-heal-config-parse-guard: 1 row(s) in pg_file_settings have a parse error - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log\nfake-psql-sentinel-should-not-appear'
+# Real PostgreSQL 18.6 capture (orchestrator probe, 2026-09-24, re-captured
+# against the LANDED config-parse guard's exact RAISE text — the prior
+# fixture here was stale pre-change wording): an unrecognized-parameter
+# line appended to a running cluster's postgresql.auto.conf (so it reaches
+# pg_file_settings without aborting startup) makes the guard RAISE, CONTEXT
+# line included, before any ALTER SYSTEM.
+FAKE_CONFIG_GUARD_FAIL_OUT=$'ERROR:  yuzu-heal-config-parse-guard: pg_file_settings has reload-aborting error(s) - pg_reload_conf() would apply nothing and may leave an unrelated staged change (e.g. pg_hba.conf) live; check pg_file_settings and the server log: unrecognized configuration parameter\nCONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE\nfake-psql-sentinel-should-not-appear'
 
 # ── per-case state + invocation ─────────────────────────────────────────────
 # new_state <rows_rc> <rows_out> <heal_rc> <post_rows_rc> <post_rows_out>
@@ -466,19 +468,19 @@ N=$((N + 1))
 state="$(new_state 0 "$CAP_DEFAULT" '' '' '' '' '' '' 1 "$FAKE_CONFIG_GUARD_FAIL_OUT")"
 invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
 err="$(cat "$state/stderr")"
-calls="$(cat "$state/calls.log")"
 expect "heal-config-guard-fails" "rc" "1" "$RC"
 expect_contains "heal-config-guard-fails" "stderr" "heal failed on" "$err"
 expect_contains "heal-config-guard-fails" "stderr" "config-parse guard" "$err"
 expect_contains "heal-config-guard-fails" "stderr" "yuzu-heal-config-parse-guard" "$err"
 expect_not_contains "heal-config-guard-fails" "stderr" "fake-psql-sentinel-should-not-appear" "$err"
+expect_not_contains "heal-config-guard-fails" "stderr" "CONTEXT" "$err"
 # (No "no ALTER lands" check here: the fake psql never writes "ALTER
 # SYSTEM issued" once guard_rc/config_guard_rc fires, so such a check would
 # test the fake, not ensure-postgres.sh. Cases 2 and 18 pin the guard SQL
 # in the heal argv instead.)
 
 # ── 6b. the heal's own in-session identity guard fires (simulated: the
-#        fake exits 3 on the heal call without ever writing "ALTER SYSTEM
+#        fake exits 1 on the heal call without ever writing "ALTER SYSTEM
 #        issued") — the heal-failed arm names the guard, no ALTER lands,
 #        and the real capture's CONTEXT: line is WITHHELD (p1_server_diag's
 #        allowlist is ERROR/FATAL/WARNING/DETAIL/HINT only). ──────────────
@@ -487,7 +489,6 @@ N=$((N + 1))
 state="$(new_state 0 "$CAP_DEFAULT" '' '' '' "$FAKE_GUARD_FAIL_OUT" '' 1)"
 invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
 err="$(cat "$state/stderr")"
-calls="$(cat "$state/calls.log")"
 expect "heal-guard-fails" "rc" "1" "$RC"
 expect_contains "heal-guard-fails" "stderr" "heal failed on" "$err"
 expect_contains "heal-guard-fails" "stderr" "identity guard" "$err"
@@ -874,6 +875,63 @@ expect_contains "sleep-scale-leading-zero" "stdout" "YUZU_TEST_POSTGRES_DSN=${DS
 N=$((N + 1))
 expect "p1-timeout-static-pin" "exactly one absolute /usr/bin/timeout wrapper" "1" \
   "$(grep -c '^\[\[ -x /usr/bin/timeout \]\] && P1_TIMEOUT=(/usr/bin/timeout 30)$' "$ENSURE")"
+
+# ── 23. a keyword-form DSN is never provable, so pg_dsn_host_port reads
+#          "?" — every operator-facing message must show a readable "host
+#          unparsed" note instead of the confusing literal "on ?" (this
+#          covers the "ok" arm too, which raw ${hp} interpolation missed
+#          before hp_disp was hoisted to the top of p1_conform). ──────────
+N=$((N + 1))
+DSN_KW='host=127.0.0.1 port=5433 user=yuzu dbname=yuzu_test'
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN_KW" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+expect "keyword-form-host-unparsed" "rc" "0" "$RC"
+expect_contains "keyword-form-host-unparsed" "stderr" "host unparsed" "$err"
+expect_not_contains "keyword-form-host-unparsed" "stderr" " on ?" "$err"
+
+# ── 24/25. CR5-2: PGOPTIONS is fatal only on a non-empty value, matched
+#          case-insensitively (a set-but-empty PGOPTIONS disables nothing
+#          in pg_pool.cpp/leader_elector.cpp). ─────────────────────────────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGOPTIONS=
+err="$(cat "$state/stderr")"
+expect "pgoptions-empty-not-fatal" "rc" "0" "$RC"
+expect_not_contains "pgoptions-empty-not-fatal" "stderr" "PGOPTIONS must not be set" "$err"
+expect_contains "pgoptions-empty-not-fatal" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN0}" "$OUT"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_OFF" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 pgoptions=-cx
+err="$(cat "$state/stderr")"
+expect "pgoptions-lowercase-nonempty-fatal" "rc" "1" "$RC"
+expect_contains "pgoptions-lowercase-nonempty-fatal" "stderr" "PGOPTIONS must not be set" "$err"
+expect_not_contains "pgoptions-lowercase-nonempty-fatal" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
+
+# ── 26. a lower-case pghostaddr=::1 still refuses the heal (set-or-empty,
+#          case-insensitive) — unaffected by the PGOPTIONS non-empty fix
+#          above, since the two gates use p1_env_is_set differently. ──────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 pghostaddr=::1
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "pghostaddr-lowercase-refused" "rc" "0" "$RC"
+expect_contains "pghostaddr-lowercase-refused" "stderr" "cannot prove the target" "$err"
+expect_not_contains "pghostaddr-lowercase-refused" "calls.log" "ALTER SYSTEM issued" "$calls"
+
+# ── 27. static pin: the durability read query and the heal's config-parse
+#          guard both resolve pg_settings/pg_file_settings/string_agg via
+#          pg_catalog, never bare (CR5-6: search_path is untrusted since
+#          the yuzu role is SUPERUSER). ────────────────────────────────────
+N=$((N + 1))
+expect "pg-catalog-static-pin" "read query qualifies pg_settings via pg_catalog" "1" \
+  "$(grep -c 'FROM pg_catalog\.pg_settings' "$ENSURE")"
+expect "pg-catalog-static-pin" "config-parse guard qualifies pg_file_settings via pg_catalog" "1" \
+  "$(grep -c 'FROM pg_catalog\.pg_file_settings' "$ENSURE")"
+expect "pg-catalog-static-pin" "config-parse guard uses pg_catalog-qualified string_agg" "1" \
+  "$(grep -c 'string_agg(DISTINCT error' "$ENSURE")"
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ensure-postgres-p1-selftest: all $N cases ok"
