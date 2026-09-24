@@ -1047,3 +1047,111 @@ TEST_CASE("GuardianEngine::arm_stats(): default prefer_spark_=false stays "
     // comment for why) and reads a plain 0 either way.
     CHECK(f.engine->io_ceiling_rejections() == 0);
 }
+
+// ---------------------------------------------------------------------------
+// guard.hpp's GuardDrift::Health / emit_guard_event's health arm (PR #4748 blocking fix):
+// a health report must go out as "guard.unhealthy" via the health branch, never through
+// apply_drift_to_event's default-arm 4-way event_type cascade, and every compliance field
+// on the same report must be ignored outright — a health report never mints drift.detected
+// or guard.compliant, even when the caller (a bug in some future producer) also sets them.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GuardianEngine: a health report emits guard.unhealthy with its detail, never "
+          "through the drift/compliance cascade",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    gpb::GuaranteedStateEvent captured;
+    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health";
+    d.rule_name = "rule-health-name";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "parent-directory watch permanently disabled";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    CHECK(captured.event_type() == "guard.unhealthy");
+    CHECK(captured.guard_type() == "file");
+    CHECK(captured.rule_name() == "rule-health-name");
+    CHECK(captured.detail_json() == R"({"detail":"parent-directory watch permanently disabled"})");
+    // event_id/rule_id/guard_category/timestamp/platform are stamped outside the
+    // health/drift branch — unaffected by which arm ran.
+    CHECK(captured.rule_id() == "rule-health");
+    CHECK(captured.guard_category() == "event");
+    CHECK_FALSE(captured.event_id().empty());
+}
+
+TEST_CASE("GuardianEngine: a health report with an empty detail omits detail_json",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    gpb::GuaranteedStateEvent captured;
+    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-empty";
+    d.rule_name = "rule-health-empty";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    // health_detail left empty.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    CHECK(captured.event_type() == "guard.unhealthy");
+    CHECK(captured.detail_json().empty());
+}
+
+TEST_CASE("GuardianEngine: a health report with non-UTF-8 detail bytes still serializes "
+          "(U+FFFD replacement, matches the spark health stream's convention)",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    gpb::GuaranteedStateEvent captured;
+    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-badutf8";
+    d.rule_name = "rule-health-badutf8";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "bad-byte-\xFF-here";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    CHECK(captured.event_type() == "guard.unhealthy");
+    CHECK_FALSE(captured.detail_json().empty()); // must serialize, never throw/drop the event
+    CHECK(captured.detail_json().find("bad-byte-") != std::string::npos);
+}
+
+TEST_CASE("GuardianEngine: a health report with contradictory compliance fields set still "
+          "emits guard.unhealthy and ignores every compliance field",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    gpb::GuaranteedStateEvent captured;
+    f.engine->set_event_sink([&captured](const gpb::GuaranteedStateEvent& ev) { captured = ev; });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-contradictory";
+    d.rule_name = "rule-health-contradictory";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "contradictory-fields-test";
+    // Deliberately contradictory: a real producer never sets these alongside health, but
+    // the health arm must ignore them unconditionally regardless of caller behavior.
+    d.compliant = true;
+    d.detected_value = "should-be-ignored";
+    d.expected_value = "should-be-ignored";
+    d.remediation_attempted = true;
+    d.remediation_success = true;
+    d.remediation_action = "should-be-ignored";
+    d.collapsed_count = 3;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    CHECK(captured.event_type() == "guard.unhealthy");
+    CHECK(captured.remediation_action().empty());
+    CHECK_FALSE(captured.remediation_success());
+    CHECK(captured.detected_value().empty());
+    CHECK(captured.expected_value().empty());
+    CHECK(captured.drift_rate() == 0);
+}

@@ -21,6 +21,14 @@
  * translation unit (windows.h's ERROR / min / max macros vs protobuf headers).
  * On non-Windows the class is a no-op (start() returns false) so the engine and
  * tests build everywhere; real enforcement is Windows-only for the MVP.
+ *
+ * KNOWN RESIDUAL: unlike FileGuard (guard_file.cpp), this guard has no watch on the
+ * target key's own PARENT — RegNotifyChangeKeyValue is armed on the target/ancestor
+ * handle itself, which (by the same class of gap FileGuard's parent-watch exists to
+ * close) reports the handle's own subkeys/values changing, not the key itself being
+ * renamed/moved by its parent. A rename of the watched key is not detected until an
+ * unrelated wake re-resolves it. Not yet fixed here; tracked alongside this branch's
+ * disclosure decision for FileGuard's own fix.
  */
 
 #include <yuzu/agent/guard_registry.hpp>
