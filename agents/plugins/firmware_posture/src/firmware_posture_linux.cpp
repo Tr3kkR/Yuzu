@@ -21,12 +21,13 @@
  * unexpected D-Bus error) is recorded through FirmwareReport::fail /
  * note_failure as a `<source>:<cause>` token; a refused read (EACCES/EPERM,
  * AccessDenied) also sets the denial flag. Every classification
- * (classify_errno, classify_fwupd_error), every outcome-to-row/token mapping
- * (apply_fwupd_failure, record_dmi_read_error) and every row mapping
- * (parse_dmi_sysfs/dmi_rows, fwupd_device_rows) is a pure function in the
- * parsers header; this TU only performs the calls and formats errno names,
- * builds a FirmwareReport and hands it to finish_report -- the one writer of
- * rows and result status.
+ * (classify_errno, classify_fwupd_error), the failed-read outcome-to-row/token
+ * mappings (apply_fwupd_failure, apply_upgrades_failure, record_dmi_read_error)
+ * and every row mapping (parse_dmi_sysfs/dmi_rows, fwupd_device_rows) are pure
+ * functions in the parsers header; this TU performs the calls, formats errno
+ * names, builds a FirmwareReport and hands it to finish_report -- the one
+ * writer of rows and result status. (The `dmi:<file>:oversized`, `dmi:bios_release`,
+ * `fwupd:shape`, `fwupd:row_cap` and `fwupd:budget` tokens are recorded inline.)
  *
  * A build without libsystemd (-Dsystemd_guard=auto|disabled) is a
  * reduced-coverage BUILD, not an OS statement: it reports update_pending
@@ -362,18 +363,10 @@ void query_upgrades(sd_bus* bus, FwupdBudget& budget, FirmwareReport& report, Fw
     const int rc = sd_bus_call_method(bus, kFwupdDest, kFwupdPath, kFwupdIface, "GetUpgrades",
                                       &uerr.err, &ureply.m, "s", device_id.c_str());
     if (rc < 0) {
-        switch (classify_fwupd_error(dbus_error_name(uerr.err), -rc)) {
-        case FwupdOutcome::no_devices: // NothingToDo: no upgrade offered
+        // NothingToDo (no upgrade offered) -> HasUpgrades=false; anything else records a token.
+        if (apply_upgrades_failure(report, classify_fwupd_error(dbus_error_name(uerr.err), -rc),
+                                   errno_token(-rc)))
             dev["HasUpgrades"] = "false";
-            break;
-        case FwupdOutcome::denied:
-            report.note_failure("fwupd:get_upgrades:permission_denied", true);
-            break;
-        case FwupdOutcome::unavailable:
-        case FwupdOutcome::failed:
-            report.note_failure("fwupd:get_upgrades:" + errno_token(-rc));
-            break;
-        }
         return;
     }
     // Table row 3: reply body is exactly one 'aa{sv}'.

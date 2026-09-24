@@ -30,10 +30,12 @@
  * WBEM access denied) and any other failure go through FirmwareReport::fail
  * as an `unreadable` row plus a `<source>:<cause>` token (the refusal also
  * sets the denial flag).
- * Every classification (classify_win32_error / classify_hresult) and row
- * mapping (wmi_bios_rows / parse_smbios_type0 / smbios_rows) is a pure
- * function in the parsers header; this TU only performs the calls, builds a
- * FirmwareReport and hands it to finish_report.
+ * Every classification (classify_win32_error / classify_hresult /
+ * classify_wmi_error_token), the failed-call mappings (apply_wmi_error_token /
+ * apply_smbios_call_failed) and row mapping (wmi_bios_rows /
+ * parse_smbios_type0 / smbios_rows) is a pure function in the parsers header;
+ * this TU only performs the calls, builds a FirmwareReport and hands it to
+ * finish_report.
  *
  * ── Probe record (run-context: symbol + service-identity in the banner) ──
  * the-rig, Windows 11 Pro 10.0.26200 x64, 2026-09-21, run as NT AUTHORITY\SYSTEM (scheduled task,
@@ -65,11 +67,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 // The pure classifiers carry these numbers as bare integers (they must stay
@@ -87,6 +87,16 @@ static_assert(static_cast<std::uint32_t>(WBEM_E_INVALID_CLASS) == 0x80041010u,
               "classify_hresult: WBEM_E_INVALID_CLASS");
 static_assert(static_cast<std::uint32_t>(WBEM_E_NOT_FOUND) == 0x80041002u,
               "classify_hresult: WBEM_E_NOT_FOUND");
+// classify_wmi_error_token spells wmi_bounded's stage prefixes as literals (it must stay
+// OS-header-free); pin them so a renamed prefix fails the Windows build instead of silently
+// misclassifying a stage.
+static_assert(std::string_view{yuzu::shared::wmi::error_tokens::kWmiConnectFailedPrefix} ==
+                      "wmi_connect_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiQueryFailedPrefix} ==
+                      "wmi_query_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiNextFailedPrefix} ==
+                      "wmi_next_failed_",
+              "classify_wmi_error_token's stage prefixes must match wmi_bounded.hpp's error_tokens");
 
 namespace yuzu::firmware_posture {
 
@@ -113,14 +123,10 @@ void collect_wmi(FirmwareReport& report) {
         L"root\\CIMV2", L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS");
 
     if (query.error.has_value()) {
-        // Stage-aware: only a connect- or query-stage token may read `absent`; the same HRESULT
-        // from enumeration (wmi_next_failed_*) is a runtime fault after the class was proven there.
-        const ReadOutcome o = classify_wmi_error_token(*query.error);
-        if (o == ReadOutcome::absent) {
-            report.add_all(wmi_bios_rows({})); // namespace/class not there: a definitive absent row
-            return;
-        }
-        report.fail("vendor", kSrcWmi, "wmi:" + *query.error, o == ReadOutcome::denied);
+        // Stage-aware, in the pure layer (apply_wmi_error_token): a missing namespace or class
+        // (connect/query stage, or INVALID_CLASS delivered at the first Next) is an explicit absent
+        // row; any other fault is an unreadable row plus a token; a refusal is denied.
+        apply_wmi_error_token(report, *query.error);
         return;
     }
     if (query.truncated)
@@ -138,13 +144,7 @@ void collect_wmi(FirmwareReport& report) {
 
 /// A GetSystemFirmwareTable call that returned 0: classify GetLastError().
 void smbios_call_failed(FirmwareReport& report, DWORD err) {
-    const ReadOutcome o = classify_win32_error(static_cast<std::uint32_t>(err));
-    if (o == ReadOutcome::absent) {
-        report.add_all(smbios_rows(Smbios0{})); // no RSMB provider: a definitive absent row
-        return;
-    }
-    report.fail("vendor", kSrcSmbios, "smbios:win32_" + std::to_string(err),
-                o == ReadOutcome::denied);
+    apply_smbios_call_failed(report, static_cast<std::uint32_t>(err)); // pure mapping
 }
 
 void collect_smbios(FirmwareReport& report) {

@@ -3,7 +3,11 @@
 (`firmware|field|value|source`, tested in tests/unit/test_firmware_posture_parsers.cpp
 against a hard-coded column list) to the definition YAML that actually ships it, so a
 reordered or renamed result column fails here rather than only in a dashboard.
+
+Runnable standalone: `python3 tests/test_firmware_posture_definition.py` (how meson runs it; a
+bare pytest-style file with no runner would execute zero assertions and always exit 0).
 """
+import unittest
 from pathlib import Path
 
 import yaml
@@ -21,9 +25,13 @@ def _result_columns() -> list[str]:
     return [c["name"] for c in doc["spec"]["result"]["columns"]]
 
 
-def test_row_kind_is_the_first_declared_column():
-    assert _result_columns()[0] == "row_kind"
+class FirmwarePostureDefinitionColumns(unittest.TestCase):
+    def test_row_kind_is_the_first_declared_column(self):
+        self.assertEqual(_result_columns()[0], "row_kind")
+
+    def test_result_columns_match_the_wire_row_the_plugin_emits(self):
+        self.assertEqual(_result_columns(), EXPECTED_COLUMNS)
 
 
-def test_result_columns_match_the_wire_row_the_plugin_emits():
-    assert _result_columns() == EXPECTED_COLUMNS
+if __name__ == "__main__":
+    unittest.main()

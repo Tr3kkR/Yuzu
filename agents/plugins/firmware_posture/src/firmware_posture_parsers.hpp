@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -122,19 +123,27 @@ enum class ReadOutcome { ok, absent, denied, failed };
     return hr;
 }
 
-/// Classifies a wmi_bounded error token, STAGE-AWARE. Only a CONNECT- or QUERY-stage token whose
-/// HRESULT names a missing namespace, class or object may read `absent` (the namespace or class
-/// itself is not there: a definitive answer). Any later stage (the proxy blanket, or enumeration:
-/// `wmi_next_failed_*`) runs AFTER the class was proven present by a successful connect and query,
-/// so the same HRESULT there is a runtime fault (a damaged repository or provider), never absence:
-/// `denied` for a refusal HRESULT, else `failed`. A token with no HRESULT is `failed`.
+/// Classifies a wmi_bounded error token, STAGE-AWARE: which stages may legitimately say "not
+/// there"? A refusal HRESULT is `denied` at every stage; a token with no HRESULT is `failed`.
+/// An absence HRESULT (0x8004100E / 0x80041010 / 0x80041002) reads `absent` only where WMI can
+/// really be answering "the namespace or class does not exist":
+///   - `wmi_connect_failed_*` / `wmi_query_failed_*`: the connect or the query itself said so;
+///   - `wmi_next_failed_*` with WBEM_E_INVALID_CLASS (0x80041010) ONLY. The query runs
+///     semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY), so ExecQuery succeeds without
+///     resolving the class and a missing CLASS is delivered at the first Next() (verified live on
+///     the rig, commit 89074810a). NOT_FOUND (0x80041002) or INVALID_NAMESPACE (0x8004100E) at
+///     enumeration cannot be a "class is missing" answer: they are a runtime fault (a damaged
+///     repository or provider) and read `failed`.
+/// The proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
+/// schema answer, so it never reads `absent` either.
 [[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token) noexcept {
     const auto hr = hresult_from_token(token);
     const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
-    const bool absence_stage = token.starts_with("wmi_connect_failed_") ||
-                               token.starts_with("wmi_query_failed_");
-    if (o == ReadOutcome::absent && !absence_stage) return ReadOutcome::failed;
-    return o == ReadOutcome::ok ? ReadOutcome::failed : o;
+    if (o != ReadOutcome::absent) return o == ReadOutcome::ok ? ReadOutcome::failed : o;
+    if (token.starts_with("wmi_connect_failed_") || token.starts_with("wmi_query_failed_"))
+        return ReadOutcome::absent;
+    if (token.starts_with("wmi_next_failed_") && *hr == 0x80041010u) return ReadOutcome::absent;
+    return ReadOutcome::failed;
 }
 
 /// Everything a leg gathered: rows to write plus the failure accounting.
@@ -613,6 +622,53 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
     unreadable_keys.emplace_back(file);
     report.note_failure("dmi:" + std::string{file} + ":" + std::string{errno_tok},
                         outcome == ReadOutcome::denied);
+}
+
+/// The pure half of the Linux leg's failed GetUpgrades handling (one call per updatable device).
+/// Returns true when the daemon answered NothingToDo (no upgrade offered): the caller records
+/// HasUpgrades=false. Every other outcome records a token (no row: the device row comes from the
+/// mapper) and returns false; `unavailable` and `failed` are the same mid-run failure here.
+[[nodiscard]] inline bool apply_upgrades_failure(FirmwareReport& report, FwupdOutcome outcome,
+                                                 std::string_view errno_tok) {
+    switch (outcome) {
+    case FwupdOutcome::no_devices:
+        return true;
+    case FwupdOutcome::denied:
+        report.note_failure("fwupd:get_upgrades:permission_denied", true);
+        return false;
+    case FwupdOutcome::unavailable:
+    case FwupdOutcome::failed:
+        report.note_failure("fwupd:get_upgrades:" + std::string{errno_tok});
+        return false;
+    }
+    return false;
+}
+
+/// The pure half of the Windows leg's failed WMI query: classifies the wmi_bounded error token
+/// (classify_wmi_error_token) and maps it onto the report. `absent` writes the explicit absent
+/// rows with NO token (a definitive absence is a row, never silence); a refusal or any other
+/// failure writes an `unreadable` vendor row plus `wmi:<token>`, and a refusal sets the denial
+/// flag.
+inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token) {
+    const ReadOutcome o = classify_wmi_error_token(token);
+    if (o == ReadOutcome::absent) {
+        report.add_all(wmi_bios_rows({}));
+        return;
+    }
+    report.fail("vendor", kSrcWmi, "wmi:" + std::string{token}, o == ReadOutcome::denied);
+}
+
+/// The pure half of the Windows leg's failed GetSystemFirmwareTable call: classifies the Win32
+/// error. `absent` (no RSMB provider) writes the explicit absent rows with NO token; a refusal or
+/// any other failure writes an `unreadable` vendor row plus `smbios:win32_<n>`.
+inline void apply_smbios_call_failed(FirmwareReport& report, std::uint32_t err) {
+    const ReadOutcome o = classify_win32_error(err);
+    if (o == ReadOutcome::absent) {
+        report.add_all(smbios_rows(Smbios0{}));
+        return;
+    }
+    report.fail("vendor", kSrcSmbios, "smbios:win32_" + std::to_string(err),
+                o == ReadOutcome::denied);
 }
 
 struct DtNode {
