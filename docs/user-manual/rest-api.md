@@ -6045,7 +6045,9 @@ re-eval, unchanged.
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
+| 500 | `RESULT_SET_STORE_FAULT_AFTER_DISPATCH` — a real command already dispatched to agents, but the store fault persisting the pending result-set row afterward (#4306; previously `400`, corrected — this is a server fault, not a client error, once a command has already been sent). Do **not** re-send; poll `GET /api/v1/executions/{id}` for the dispatched command's outcome instead |
 | 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
+| 503 | `RESULT_SET_STORE_UNAVAILABLE` (pre-dispatch) — the per-owner quota could not be verified before dispatch (Postgres degraded, #4306). Nothing was dispatched; safe to retry (`Retry-After` header present) |
 | 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
 
 #### `GET /api/v1/inventory/{agent_id}/{plugin}`
@@ -6292,8 +6294,9 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
+| 503 | `RESULT_SET_STORE_UNAVAILABLE` — a store-level read failure while listing |
 
-A store-level read failure is not surfaced as an error on this route — `ResultSetStore::list_by_owner` deliberately returns a plain (possibly empty) container rather than `std::expected` (ADR-0036 "not yet widened" class), so a degraded store answers `200` with an empty `result_sets` array, not a `503`.
+A store-level read failure now answers `503 RESULT_SET_STORE_UNAVAILABLE` (fail-closed, #4306) rather than a silent empty `200` array.
 
 #### `POST /api/v1/result-sets`
 

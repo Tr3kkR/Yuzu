@@ -23,6 +23,7 @@
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
+#include "mcp_retry.hpp" // mcp::kMcpStoreFaultRetryMs - shared retry_after_ms floor (#4306 gov-4306-N4)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
@@ -1487,17 +1488,17 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke a device token", "tags": ["Device Tokens"], "description": "Only available when DeviceTokenStore is wired — the server does not construct it today (capability 18.8 deliberately shelved, ADR-0052); documented for when a future change re-wires it. Requires DeviceToken:Delete.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{revoked: true}"}, "404": {"description": "No token with this id — \"token not found\""}, "503": {"description": "A genuine database write failure (Retry-After: 2)"}}}
     },
     "/result-sets": {
-      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}}},
+      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
       "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS)"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
     },
     "/result-sets/from-inventory-query": {
-      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set)"}}}
+      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
     },
     "/result-sets/from-tar-query": {
-      "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), or dispatch unavailable/failed"}}}
+      "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
+      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
     },
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
@@ -1509,7 +1510,7 @@ const std::string& openapi_spec() {
         // #3992 F2 split just below.
         R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's source_kind is unsupported for re-eval (RESULT_SET_REEVAL_UNSUPPORTED) - checked ahead of the parent-gone guard below (#4306 follow-up) so a crafted scope_input_id on an unsupported source_kind can never be misreported as parent_gone; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), or a re-run field exceeds its bound (#4373)"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original's source_kind is unsupported for re-eval (RESULT_SET_REEVAL_UNSUPPORTED) - checked ahead of the parent-gone guard below (#4306 follow-up) so a crafted scope_input_id on an unsupported source_kind can never be misreported as parent_gone; otherwise, the original's live parent_id is gone (ON DELETE SET NULL, the parent set was deleted) AND the stored source_payload shows it was narrowed at creation time (scope_input_id) - refused (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than re-resolved against a possibly-rebound alias or silently broadcast to __all__ (#4306); a genuinely parentless original (no scope_input_id was ever recorded) still broadcasts, unchanged; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), or a re-run field exceeds its bound (#4373)"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, the instruction store is unavailable, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -9724,14 +9725,20 @@ void RestApiV1::register_routes(
         // tools' shape cannot drift (api-twin-recipe.md Rule 1).
         auto rs_to_json = [](const ResultSet& r) { return result_set_json(r).dump(); };
 
-        // Emit an A4 error with a fresh correlation id.
-        auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
+        // Emit an A4 error with a fresh correlation id. `opts` defaults to {}
+        // (no retry hint) - a call site that fails BEFORE anything was
+        // dispatched passes {.retry_after_ms = 5000} to match the MCP
+        // twins' kMcpStoreFaultRetryMs (#4306/#4307 adversarial review: REST's
+        // fail-closed 503 branches were dropping the retry hint MCP carries
+        // for the identical fault).
+        auto rs_err = [](httplib::Response& res, int status, std::string_view msg,
+                          const detail::A4ErrorOpts& opts = {}) {
             res.status = status;
             // Route through a4_error so the X-Correlation-Id RESPONSE HEADER is set
             // (via ensure_correlation_id) — error_json_a4 alone builds only the body,
             // leaving the header absent on all 26 result-set error paths (S1,
             // adversarial review). a4_error derives the body `code` from res.status.
-            res.set_content(detail::a4_error(res, msg), "application/json");
+            res.set_content(detail::a4_error(res, msg, opts), "application/json");
         };
 
         // Load a row and enforce the owner check. Returns nullopt and writes a
@@ -9939,7 +9946,42 @@ void RestApiV1::register_routes(
             // command we can't record. create_pending re-checks atomically
             // below, but rejecting here means the common at-quota case fails
             // BEFORE any agent executes (review finding B5).
-            if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
+            //
+            // #4306 finding 1: the plain count_for_owner() returned 0 on a
+            // degraded read, indistinguishable from a genuinely-empty owner —
+            // an over-quota owner's dispatch would fire for real before
+            // create_pending's atomic in-txn recheck (which runs AFTER
+            // dispatch, below) ever got a chance to refuse it. Fail CLOSED
+            // instead: nothing has been dispatched yet at this point, so
+            // refusing here is free.
+            auto quota = result_set_store->count_for_owner_checked(owner);
+            if (!quota.has_value()) {
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                }
+                // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
+                // Deliberately minimal, not the full
+                // <store>_read_degrade_total{reason} convention other stores
+                // use, which would require wiring ResultSetStore itself with
+                // a MetricsRegistry member, out of scope for this fix round;
+                // a future PR can decide whether to upgrade it.
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_check_degraded_total")
+                        .increment();
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                        "reason=quota_check_degraded source_kind=" +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 503,
+                       "RESULT_SET_STORE_UNAVAILABLE: could not verify the per-owner "
+                       "result-set quota; nothing was dispatched execution_id=" + exec_id,
+                       {.retry_after_ms = mcp::kMcpStoreFaultRetryMs});
+                return;
+            }
+            if (*quota >= ResultSetStore::kMaxPerOwner) {
                 if (metrics_registry)
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
@@ -10029,9 +10071,30 @@ void RestApiV1::register_routes(
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
                 }
-                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
-                rs_err(res, status,
-                       std::string(to_string(created.error())) + " execution_id=" + exec_id);
+                if (created.error() == ResultSetError::DbError) {
+                    // #4306 fold-in B: this is a SERVER fault after a real
+                    // dispatch already succeeded (sent > 0, set_agents_targeted
+                    // already called above) — not a client error, so 400 was
+                    // wrong. 500, matching MCP rs_run_async's identical
+                    // post-dispatch DbError branch for parity. Distinct token
+                    // (gov-4306-S4/S9) from the pre-dispatch quota-check-degraded
+                    // 503 above: an agentic caller pattern-matching the message
+                    // text alone (not retry_after_ms) must not conflate "safe to
+                    // retry" with "already dispatched, never re-send".
+                    rs_err(res, 500,
+                           "RESULT_SET_STORE_FAULT_AFTER_DISPATCH: result-set store unavailable "
+                           "after dispatch already succeeded - do not re-send; poll executions "
+                           "for the dispatched command's outcome execution_id=" + exec_id);
+                    return;
+                }
+                // Same "do not re-send" situation as the DbError branch
+                // above: a real dispatch already succeeded (sent > 0,
+                // set_agents_targeted already called); only the authoritative
+                // in-txn quota recheck lost the race (#4306 gov-4306-S5).
+                rs_err(res, 429,
+                       std::string(to_string(created.error())) +
+                           " - a command was already dispatched to the fleet; do not re-send, "
+                           "poll executions for its outcome execution_id=" + exec_id);
                 return;
             }
             if (metrics_registry)
@@ -10050,7 +10113,7 @@ void RestApiV1::register_routes(
         };
 
         // GET /api/v1/result-sets — owner-scoped list.
-        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json,
+        sink.Get("/api/v1/result-sets", [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
                                          deny_fleet_wide_service_scoped](
                                             const httplib::Request& req, httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding: owner-scoped via
@@ -10081,13 +10144,34 @@ void RestApiV1::register_routes(
                 if (v > 0 && v <= 500)
                     limit = v;
             }
-            std::string next;
-            auto sets = result_set_store->list_by_owner(session->username, cursor, limit, next);
+            // #4306/#4307 finding 2: a degraded page must never silently
+            // read as "empty fleet" — refuse rather than answer 200 with an
+            // empty array indistinguishable from a genuine no-result-sets
+            // owner.
+            auto page = result_set_store->list_by_owner_checked(session->username, cursor, limit);
+            if (!page) {
+                // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                // degraded-read branch. This route previously never captured
+                // audit_fn at all, so the new 503 degraded-read refusal never
+                // attempted to audit. Scoped narrowly to this branch only; the
+                // existing 200 success path stays unaudited (a separate,
+                // out-of-scope question).
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.list", "failure", "ResultSet", "",
+                                        "reason=store_degraded");
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 503,
+                       "RESULT_SET_STORE_UNAVAILABLE: could not list result sets",
+                       {.retry_after_ms = 5000});
+                return;
+            }
             JArr arr;
-            for (const auto& s : sets)
+            for (const auto& s : page->sets)
                 arr.add_raw(rs_to_json(s));
             auto data =
-                JObj().raw("result_sets", arr.str()).add("next_cursor", next).str();
+                JObj().raw("result_sets", arr.str()).add("next_cursor", page->next_cursor).str();
             res.set_content(ok_json(data), "application/json");
         });
 
@@ -10414,12 +10498,30 @@ void RestApiV1::register_routes(
                               // out-cursor first, so aliasing one variable as
                               // both rereads page 1 forever once the parent
                               // exceeds the page size (review finding B3).
-                              std::string next;
-                              auto page = result_set_store->members(pid, cur, 5000, next);
-                              ms.insert(page.begin(), page.end());
-                              if (next.empty())
+                              auto page_result = result_set_store->members_checked(pid, cur, 5000);
+                              // #4306 finding 3: the plain members() silently
+                              // truncated the loop on a degraded page,
+                              // indistinguishable from a genuine last page —
+                              // this route MATERIALISES the narrowed match set
+                              // into a durable result set, so a truncated read
+                              // here silently narrows who future dispatches
+                              // against it reach. Fail CLOSED: refuse the
+                              // whole operation rather than materialise a
+                              // partial parent_members set.
+                              if (!page_result) {
+                                  audit_failure("store_degraded");
+                                  rs_err(res, 503,
+                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                         "parent set's members; refusing to materialise a "
+                                         "partial result set",
+                                         {.retry_after_ms = 5000});
+                                  return;
+                              }
+                              ms.insert(page_result->device_ids.begin(),
+                                       page_result->device_ids.end());
+                              if (page_result->next_cursor.empty())
                                   break;
-                              cur = std::move(next);
+                              cur = std::move(page_result->next_cursor);
                           }
                           parent_members = std::move(ms);
                       }
@@ -11121,7 +11223,7 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, result_set_store, load_owned,
+                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11149,19 +11251,38 @@ void RestApiV1::register_routes(
                          if (v > 0 && v <= 10000)
                              limit = v;
                      }
-                     std::string next;
-                     auto devs = result_set_store->members(id, cursor, limit, next);
+                     // #4306 finding 3 / #4307 finding 2: never a 200 with an
+                     // empty array on a degraded read — indistinguishable
+                     // from a genuine last/empty page.
+                     auto page = result_set_store->members_checked(id, cursor, limit);
+                     if (!page) {
+                         // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                         // degraded-read branch, scoped to this branch only.
+                         bool audit_ok = true;
+                         if (audit_fn)
+                             audit_ok = audit_fn(req, "result_set.members", "failure", "ResultSet",
+                                                 id, "reason=store_degraded");
+                         if (!audit_ok)
+                             res.set_header("Sec-Audit-Failed", "true");
+                         rs_err(res, 503,
+                                "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
+                                "members",
+                                {.retry_after_ms = 5000});
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& d : devs)
+                     for (const auto& d : page->device_ids)
                          arr.add(d);
-                     auto data =
-                         JObj().raw("device_ids", arr.str()).add("next_cursor", next).str();
+                     auto data = JObj()
+                                     .raw("device_ids", arr.str())
+                                     .add("next_cursor", page->next_cursor)
+                                     .str();
                      res.set_content(ok_json(data), "application/json");
                  });
 
         // GET /api/v1/result-sets/{id}/lineage
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
-                 [auth_fn, result_set_store, load_owned,
+                 [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
                   deny_fleet_wide_service_scoped](const httplib::Request& req,
                                                   httplib::Response& res) {
                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
@@ -11179,9 +11300,26 @@ void RestApiV1::register_routes(
                      auto row = load_owned(req, id, session->username, res);
                      if (!row)
                          return;
-                     auto chain = result_set_store->lineage(id, session->username);
+                     // #4306 finding 3 / #4307 finding 2: never a 200 with an
+                     // empty/truncated chain on a degraded read.
+                     auto chain_result = result_set_store->lineage_checked(id, session->username);
+                     if (!chain_result) {
+                         // #4306 gov-4306-S8: audit parity with MCP's equivalent
+                         // degraded-read branch, scoped to this branch only.
+                         bool audit_ok = true;
+                         if (audit_fn)
+                             audit_ok = audit_fn(req, "result_set.lineage", "failure", "ResultSet",
+                                                 id, "reason=store_degraded");
+                         if (!audit_ok)
+                             res.set_header("Sec-Audit-Failed", "true");
+                         rs_err(res, 503,
+                                "RESULT_SET_STORE_UNAVAILABLE: could not read result-set "
+                                "lineage",
+                                {.retry_after_ms = 5000});
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& n : chain)
+                     for (const auto& n : *chain_result)
                          arr.add(JObj()
                                      .add("id", n.id)
                                      .add("name", n.name)
