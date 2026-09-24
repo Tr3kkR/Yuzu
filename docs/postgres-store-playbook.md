@@ -533,8 +533,12 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   (`server/core/src/pg_reachability_probe.hpp`) on its own dedicated connection. Per-store
   runtime degradation (a revoked grant, a dropped table) is deliberately out of scope for
   `/readyz`: every replica shares the database, so evicting one fixes nothing — it surfaces
-  as the store's own request-path 503s and its `*_read_degrade_total` metrics instead. A new
-  store still adds its `/readyz` (and `/health`) row, for boot-state parity.
+  as the store's own request-path 503s (or, for a store that fails open, its degraded answers)
+  and, where the store emits one, its `*_read_degrade_total` counter; several existing stores
+  (e.g. `deployment_store`, `result_set_store`, `session_store`, `notification_store`) have no
+  such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
+  `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
+  decision holds for it.
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match

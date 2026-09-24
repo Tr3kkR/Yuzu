@@ -143,8 +143,11 @@ production-grade. You **must**:
   still a standby — and reports not ready until it reaches the new primary; recovery is one
   successful probe (about 2 s). A load balancer health-checking `/readyz` stops routing during
   that window; one that fails open when all backends are down keeps forwarding and gets `503`s.
-  The probe drops its connection whenever it lands on a standby, so it never stays pinned to a
-  demoted node, even behind a proxy that does not kill sessions on failover.
+  The probe drops its connection whenever it lands on a server that refuses writes, so a proxy,
+  DNS name or read-any port that sends a *new* connection to a standby cannot pin it there. With a
+  multi-host DSN (`host=n1,n2,n3`) it tries each host under its own deadline, so a frozen first host
+  costs one deadline, not every probe (list hosts explicitly — one name resolving to several
+  addresses is walked inside libpq, which does not move past a silent address on its own).
 
 ## Backup and disaster recovery
 

@@ -1570,11 +1570,14 @@ gaps closed:
   at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
   `/readyz` used to stay green through an outage. A dedicated-connection probe
   (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
-  two failed probes, immediately on reaching a standby (`pg_is_in_recovery()` — core is the sole
-  writer, so a standby-pointed replica cannot serve), or after 15 s without a success. Every libpq call
-  runs under a client-side deadline (non-blocking API) because a blocking query against a frozen
-  backend was measured at 101 s; a standby answer drops the connection so the probe re-resolves
-  through the proxy rather than pinning a demoted node. Consequence, accepted: a Postgres failover
+  two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
+  `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq wait runs under a
+  client-side deadline (non-blocking API) because a blocking query against a frozen backend was
+  measured at 101 s; a multi-host DSN is split so each host gets its own deadline (libpq's
+  non-blocking connect never advances past a silent first host); and a read-only answer drops the
+  connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
+  or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
   Leadership is deliberately not a readiness condition.
 - **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`

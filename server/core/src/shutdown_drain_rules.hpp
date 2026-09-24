@@ -18,18 +18,25 @@
 ///   2. In-flight executions — the pre-existing wait, capped at
 ///      `kExecutionDrainCap` from drain start.
 ///
-/// Total wait is therefore max(N, time for executions to finish), and never more
-/// than max(N, kExecutionDrainCap).
+/// Total wait is therefore max(N, time for executions to finish), normally at
+/// most max(N, kExecutionDrainCap). stop() skips the executions query while the
+/// reachability probe reports Postgres unreachable; one query already in flight
+/// when a primary freezes can still overrun (it runs on a pooled connection with
+/// no client-side deadline).
 ///
-/// `kMaxShutdownDrainSeconds` is 60, not more, because the shipped stop budgets
-/// (compose `stop_grace_period: 210s`, systemd `TimeoutStopSec=210`) must still
-/// cover the whole stacked shutdown. docs/user-manual/upgrading.md documents a
-/// ~115s stacked worst case whose FIRST stage is this 30s execution drain; the
-/// grace replaces that stage with max(N, 30), so the worst case becomes
-/// max(N, 30) + 85s — 145s at N = 60, and ~205s on the rare thread-exhaustion
-/// fallback path server-admin.md documents (~175s today), only 5s inside 210s.
-/// Raising this cap means raising those budgets (and both docs) in the same
-/// change; the unit test pins both sums.
+/// WHAT THIS DOES TO THE STOP BUDGET — and what it does not claim. The grace ADDS
+/// up to N seconds to the front of a stacked shutdown whose other stages (the
+/// gRPC drain, the web-thread wait, the delivery-queue quiesce, and the app-perf
+/// + catalogue roll-up joins the shipped 210s `stop_grace_period` /
+/// `TimeoutStopSec` was sized for) are unchanged. There is no fixed total this
+/// header can promise, so the operator rule is the plain one: raise the
+/// orchestrator's stop timeout by N when setting N (docs/user-manual/
+/// server-admin.md, "Load balancers and shutdown drain"). To keep the grace from
+/// ENLARGING those later stages, stop() stops both roll-ups from starting new
+/// work when draining begins — an hourly recompute can no longer begin inside
+/// the grace and then run its full statement budget after it.
+/// `kMaxShutdownDrainSeconds` (60) bounds how much an operator can add in one
+/// setting; it is not derived from the 210s budget.
 
 #include <chrono>
 

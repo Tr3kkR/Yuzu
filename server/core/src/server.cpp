@@ -1849,8 +1849,12 @@ public:
                           "Seconds since this replica's Postgres reachability probe last succeeded",
                           "gauge");
         metrics_.describe("yuzu_server_pg_reachability_probe_failures_total",
-                          "Total Postgres reachability probes that failed or reached a standby",
+                          "Total Postgres reachability probes that failed or reached a server "
+                          "that refuses writes",
                           "counter");
+        // Pre-seeded so the series reads 0, not absent, before the first failure
+        // (docs/observability-conventions.md — keeps a future rate()/absent() rule honest).
+        (void)metrics_.counter("yuzu_server_pg_reachability_probe_failures_total");
         metrics_.describe("yuzu_pg_acquire_timeout_total",
                           "Total PostgreSQL pool acquires that timed out before a connection was "
                           "available",
@@ -9211,6 +9215,13 @@ public:
         // shutdown_drain_rules.hpp.
         {
             using namespace std::chrono;
+            // No NEW heavy maintenance from here on (RD-1): the catalogue roll-up is
+            // told to stop without a join (an in-flight recompute finishes and is
+            // joined later, as before); the app-perf loop watches draining_ itself.
+            // Otherwise a recompute starting inside the grace would add its full
+            // statement budget AFTER the grace, past the orchestrator's stop timeout.
+            if (software_catalog_rollup_)
+                software_catalog_rollup_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
                                                shutdown_drain::kMaxShutdownDrainSeconds)};
             if (min_grace.count() > 0) {
@@ -9219,15 +9230,32 @@ public:
                              min_grace.count());
             }
             const auto drain_start = steady_clock::now();
+            auto last_log = drain_start;
             for (;;) {
                 const auto elapsed = steady_clock::now() - drain_start;
                 std::size_t running = 0;
-                if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
+                // Skip the running-executions query while this replica's probe says
+                // Postgres is unreachable: the query runs on a pooled connection with
+                // no client-side deadline, and against a frozen primary it can block
+                // ~100s, past the cap (Gate 3 SAFE-2). An unreachable database has no
+                // execution that can complete anyway.
+                const bool pg_ok = !pg_reachability_probe_ ||
+                                   pg_reachability_probe_->verdict() ==
+                                       pg_reachability::Verdict::Ready;
+                if (execution_tracker_ && pg_ok && elapsed < shutdown_drain::kExecutionDrainCap)
                     running = execution_tracker_->query_executions({.status = "running"}).size();
                 if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
                     break;
-                if (running > 0)
+                if (running > 0) {
                     spdlog::info("Draining: {} executions in flight, waiting...", running);
+                } else if (steady_clock::now() - last_log >= seconds(10)) {
+                    // A countdown, so a long grace does not read as a hang and invite
+                    // the second signal that hard-exits (UP-11).
+                    spdlog::info("Draining: {}s of the {}s grace left",
+                                 duration_cast<seconds>(min_grace - elapsed).count(),
+                                 min_grace.count());
+                    last_log = steady_clock::now();
+                }
                 std::this_thread::sleep_for(seconds(1));
             }
         }
@@ -9306,8 +9334,10 @@ public:
         // HA WS-8: stop the Postgres reachability probe's loop thread. Its OBJECT
         // is deliberately NOT reset here — /readyz handlers already admitted may
         // still be running until listen() returns (bounded by the web-thread wait
-        // below), and they read the probe's atomics. The join is bounded by one
-        // poll slice (~200ms): every libpq wait in the probe observes stop().
+        // below), and they read the probe's snapshot. The join is normally one
+        // poll slice (~200ms): every libpq wait in the probe observes stop(). Not
+        // bounded by us: a host-name lookup (system resolver timeouts) or a GSSAPI
+        // exchange inside libpq that is in progress when stop() arrives.
         if (pg_reachability_probe_)
             pg_reachability_probe_->stop();
 
@@ -15344,13 +15374,20 @@ private:
             app_perf_rollup_thread_ = std::thread([this]() {
                 spdlog::info("App-perf roll-up thread started (cadence=1h, B2 retention=180d)");
                 bool first = true;
-                while (!stop_requested_.load(std::memory_order_acquire)) {
+                // HA WS-8: `draining_` also ends the loop. It is set at the START of
+                // stop()'s drain grace, `stop_requested_` only after it — without
+                // this, an hourly roll-up could begin inside the grace and its
+                // 120s statement budget would then stack after it in the shutdown.
+                const auto halt = [this] {
+                    return stop_requested_.load(std::memory_order_acquire) ||
+                           draining_.load(std::memory_order_acquire);
+                };
+                while (!halt()) {
                     if (!first) {
                         // ~1h in 5s steps so shutdown stays responsive.
-                        for (int i = 0;
-                             i < 720 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        for (int i = 0; i < 720 && !halt(); ++i)
                             std::this_thread::sleep_for(std::chrono::seconds{5});
-                        if (stop_requested_.load(std::memory_order_acquire))
+                        if (halt())
                             break;
                     }
                     first = false;
@@ -15372,8 +15409,7 @@ private:
                         YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
                         const std::int64_t retention_win =
                             static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400;
-                        for (int drain = 0;
-                             drain < 12 && !stop_requested_.load(std::memory_order_acquire); ++drain) {
+                        for (int drain = 0; drain < 12 && !halt(); ++drain) {
                             const int pruned = app_perf_fleet_store_->run_retention_prune(retention_win);
                             if (pruned != static_cast<int>(AppPerfFleetStore::kPruneCapPerPass))
                                 break;

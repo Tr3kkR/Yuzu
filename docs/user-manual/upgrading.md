@@ -193,9 +193,15 @@ What you may observe after upgrading:
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
   `SIGTERM` the server keeps serving for at least that long after `/readyz` turns `503 draining`, so a load
   balancer stops routing to it before the listener closes. The default 0 keeps today's shutdown timing;
-  set it for any deployment behind a load balancer (guidance in `docs/user-manual/server-admin.md`, "Load
-  balancers and shutdown drain"). The execution-drain wait it sits alongside is now timed in wall-clock
-  seconds (at most 30 s) rather than counted as 30 polls.
+  set it for any deployment behind a load balancer, **and raise your orchestrator's stop timeout by the
+  same amount** (guidance in `docs/user-manual/server-admin.md`, "Load balancers and shutdown drain"). The
+  execution-drain wait it sits alongside is now timed in wall-clock seconds (at most 30 s) rather than
+  counted as 30 polls, and is skipped while Postgres is unreachable.
+- **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
+  managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
+- **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
+  readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
+  retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
 
 **What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
 `max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
@@ -1643,9 +1649,8 @@ a rollback is genuinely needed.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
   graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
-  draining in-flight executions (or `--shutdown-drain-seconds`, if that is longer — at most 60 s, HA
-  WS-8; every worst case below then grows by the difference: ~145 s, and ~205 s on the rare
-  thread-exhaustion path `docs/user-manual/server-admin.md` describes), up to 5 s on the gRPC shutdown deadline
+  draining in-flight executions (plus any `--shutdown-drain-seconds` grace, HA WS-8, which runs
+  before everything listed here and adds to it — raise your stop timeout by the same amount), up to 5 s on the gRPC shutdown deadline
   (moved up by #3495 to run earlier in the sequence, ahead of the four
   joins below and several other quick housekeeping joins not separately
   listed here, though still after the execution drain — see below),

@@ -20,8 +20,8 @@
 /// planes, leader_elector.hpp), so a follower is fully ready. That is the
 /// recorded #4014 decision — the elector stays out of `/readyz`.
 ///
-/// EVERY LIBPQ CALL HAS A CLIENT-SIDE DEADLINE. The probe uses libpq's
-/// non-blocking API (`PQconnectStart`/`PQconnectPoll`, `PQsendQuery` +
+/// EVERY LIBPQ WAIT HAS A CLIENT-SIDE DEADLINE. The probe uses libpq's
+/// non-blocking API (`PQconnectStartParams`/`PQconnectPoll`, `PQsendQuery` +
 /// `poll()`/`PQconsumeInput`/`PQisBusy`) under `kConnectDeadline` /
 /// `kQueryDeadline`, sliced so `stop()` is observed within ~200ms. This is
 /// load-bearing: against a FROZEN backend (a `docker pause`d or black-holed
@@ -29,18 +29,35 @@
 /// tree (see `make_containment_gate` in server.cpp) — `statement_timeout` is
 /// enforced server-side and `tcp_user_timeout`/keepalives never fire while the
 /// peer ACKs. A blocking probe would make `stop()`'s join unbounded.
-/// Residual: `PQconnectStart` resolves a host NAME synchronously
-/// (getaddrinfo), bounded by the system resolver's timeouts, not ours.
+/// Residuals — synchronous work inside libpq that no slice can interrupt,
+/// bounded by the system, not by us: the host-NAME lookup (getaddrinfo, so the
+/// system resolver's timeouts), and on a libpq built with GSSAPI (or a server
+/// choosing a huge SCRAM iteration count) the authentication exchange.
 ///
-/// Any failure, AND reaching a server in recovery, CLOSES the connection so the
-/// next tick reconnects. The recovery case matters: without it a probe pinned
-/// to a demoted primary (behind a proxy that does not kill sessions on
-/// failover) would report read-only forever while a healthy new primary exists
-/// — every replica stuck red (pre-implementation review, finding 2).
+/// A MULTI-HOST DSN IS SPLIT, ONE DEADLINE PER HOST. libpq's non-blocking
+/// connect never advances past a host that accepts TCP and then goes silent;
+/// only its blocking path applies `connect_timeout` per host. So the probe
+/// parses the DSN (`PQconninfoParse`) and tries each host in turn — a frozen
+/// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
+/// UP-1, reproduced). Residual: one host NAME resolving to several addresses is
+/// iterated inside libpq and keeps the no-advance behaviour.
 ///
-/// PUBLICATION IS LOCK-FREE. `/readyz` and `/metrics` read three atomics and
-/// never touch the probe's connection or thread, so a stalled probe can never
-/// stall a health check (the #4013 lesson).
+/// Any failure, AND reaching a server that does not accept writes, CLOSES the
+/// connection so the next tick reconnects. The probe query checks both
+/// `pg_is_in_recovery()` (a standby) and `transaction_read_only` (a primary
+/// refusing writes via `default_transaction_read_only` — managed Postgres does
+/// this on a full disk). Dropping the connection matters for the standby case:
+/// a proxy, DNS name or read-any port can route a NEW connection to a standby,
+/// and without the drop the probe would stay pinned there while a writable
+/// primary exists — every replica stuck red (pre-implementation review,
+/// finding 2).
+///
+/// PUBLICATION. `/readyz` and `/metrics` read a three-field snapshot under a
+/// LEAF mutex held only to copy the fields — never across I/O, never while
+/// logging — so a stalled probe can never stall a health check (the #4013
+/// lesson), and a reader never sees a torn mix of two publications (Gate 4
+/// UP-7: separate atomics let one read pair a new failure count with an old
+/// failure kind).
 ///
 /// LIFETIME (ServerImpl). The first probe runs SYNCHRONOUSLY in `run()` before
 /// the HTTP listener binds (no `not_yet_probed` window after bind); `start()`
@@ -86,8 +103,10 @@ public:
     };
 
     /// The probe query. Must return exactly one boolean: `true` means "the
-    /// connected server is in recovery (a standby)".
-    static constexpr const char* kProbeSql = "SELECT pg_is_in_recovery()";
+    /// connected server does not accept writes" — a standby, or a primary with
+    /// `default_transaction_read_only` on.
+    static constexpr const char* kProbeSql =
+        "SELECT pg_is_in_recovery() OR current_setting('transaction_read_only')::boolean";
 
     /// Production: a real libpq probe against `dsn` (already augmented by
     /// `build_coord_dsn`). Does not connect until `probe_once()`. `probe_sql`
@@ -113,10 +132,11 @@ public:
     /// Spawn the probe loop. Idempotent; a no-op after `stop()`.
     void start();
 
-    /// Signal and join the loop. Idempotent. Sticky: no restart after stop.
+    /// Signal and join the loop. Idempotent and sticky (no restart after stop),
+    /// but not safe to call from two threads at once.
     void stop();
 
-    /// Lock-free read of the published state.
+    /// The published state, copied under a leaf mutex (never held across I/O).
     pg_reachability::Snapshot snapshot() const noexcept;
 
     /// `classify(snapshot(), now_ns)`.
@@ -134,13 +154,11 @@ private:
     Observer obs_;
     std::chrono::milliseconds interval_;
 
-    std::atomic<std::int64_t> last_success_ns_{pg_reachability::kNever};
-    std::atomic<int> consecutive_failures_{0};
-    std::atomic<std::uint8_t> last_failure_{
-        static_cast<std::uint8_t>(pg_reachability::FailureKind::None)};
+    mutable std::mutex snap_mu_; ///< leaf lock: guards snap_ only, never held across I/O
+    pg_reachability::Snapshot snap_{};
 
     std::atomic<bool> stop_{false};
-    std::mutex mu_; ///< guards cv_ waits and thread_ start/join only
+    std::mutex mu_; ///< guards the cv_ wait and thread_ start; the join is done outside it
     std::condition_variable cv_;
     std::thread thread_;
     bool started_{false};

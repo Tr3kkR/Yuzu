@@ -26,7 +26,7 @@
 /// `docker pause`d / black-holed primary whose kernel still ACKs, so no
 /// socket-level timeout fires) is normally caught before that by the probe's
 /// own client-side deadlines — the query times out (2s), the reconnect times
-/// out (5s), two failures ⇒ Unreachable, measured ~10s end to end
+/// out (5s), two failures ⇒ Unreachable, measured ~11s end to end
 /// (scripts/ha/ha-readyz-scenarios.sh, scenario A). `kStaleAfter` is the
 /// backstop that holds even if a tick wedges outside those deadlines.
 
@@ -56,18 +56,19 @@ inline constexpr int kFailThreshold = 2;
 inline constexpr std::chrono::milliseconds kStaleAfter{15000};
 
 /// Sentinel for "no probe has ever succeeded".
-inline constexpr std::int64_t kNever = std::numeric_limits<std::int64_t>::min();
+// Parenthesised so a windows.h min() macro can never expand it (#4722 class).
+inline constexpr std::int64_t kNever = (std::numeric_limits<std::int64_t>::min)();
 
 /// What the most recent failed probe saw.
 enum class FailureKind : std::uint8_t {
     None,        ///< the most recent probe succeeded
     Unreachable, ///< connect/query failed or timed out
-    ReadOnly,    ///< reached a server in recovery (a standby) — cannot write
+    ReadOnly,    ///< reached a server that refuses writes (a standby, or read-only)
 };
 
-/// The probe's published state, read lock-free by `/readyz` and `/metrics`.
-/// The three fields are loaded individually, not as one atomic set; a one-tick
-/// skew between them is benign because the rule below is monotone in each.
+/// The probe's published state, as `/readyz` and `/metrics` read it (copied
+/// whole under the probe's leaf mutex, so the three fields are always from the
+/// same publication).
 struct Snapshot {
     std::int64_t last_success_ns{kNever}; ///< steady_clock ns of the last success
     int consecutive_failures{0};
@@ -78,15 +79,16 @@ enum class Verdict : std::uint8_t {
     Ready,
     NotYetProbed, ///< no probe has completed yet
     Unreachable,  ///< kFailThreshold consecutive connect/query failures
-    ReadOnly,     ///< the most recent probe reached a standby
+    ReadOnly,     ///< the most recent probe reached a server that refuses writes
     Stale,        ///< no success within kStaleAfter (probe blocked or wedged)
 };
 
 /// The readiness rule. `now_ns` is steady_clock ns since its epoch.
 ///
 /// Order matters:
-///   1. ReadOnly is IMMEDIATE (one observation). A replica pointed at a standby
-///      cannot serve writes this instant, and core is the sole `yuzu` writer
+///   1. ReadOnly is IMMEDIATE (one observation). A replica pointed at a standby (or
+///      at a primary with `default_transaction_read_only` on) cannot serve
+///      writes this instant, and core is the sole `yuzu` writer
 ///      — there is no read-only degraded mode (durable sessions write through
 ///      on validate; audit-on-read fails closed).
 ///   2. Never succeeded: not-ready either way, but name the reason honestly.

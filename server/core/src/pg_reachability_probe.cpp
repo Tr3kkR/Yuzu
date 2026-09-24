@@ -1,4 +1,13 @@
 #ifdef _WIN32
+// windows.h defines function-like min()/max() macros that break
+// std::numeric_limits<...>::min() (pg_reachability_rules.hpp) — the same guard
+// server.cpp and key_provider.cpp carry. Must come before the first Windows header.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 // clang-format off
 #include <winsock2.h>  // must precede windows.h to avoid redefinition
 #include <windows.h>
@@ -17,8 +26,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <memory>
 #include <optional>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -29,6 +41,10 @@ namespace pr = pg_reachability;
 
 /// Longest single poll() slice, so `stop` is noticed promptly mid-wait.
 constexpr std::chrono::milliseconds kPollSlice{200};
+
+/// Set on the probe's connection unless the DSN names one, so the probe's
+/// backend is identifiable in pg_stat_activity.
+constexpr const char* kProbeApplicationName = "yuzu-readyz-probe";
 
 enum class Want { Read, Write };
 
@@ -50,7 +66,7 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
 #ifdef _WIN32
         WSAPOLLFD pfd{};
         pfd.fd = static_cast<SOCKET>(sock);
-        pfd.events = want == Want::Read ? POLLRDNORM : POLLWRNORM;
+        pfd.events = static_cast<SHORT>(want == Want::Read ? POLLRDNORM : POLLWRNORM);
         const int rc = WSAPoll(&pfd, 1, timeout_ms);
         if (rc > 0)
             return true;
@@ -77,44 +93,169 @@ std::string pq_error(PGconn* c, const char* fallback) {
     return s;
 }
 
+std::vector<std::string> split_commas(std::string_view v) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t comma = v.find(',', start);
+        out.emplace_back(v.substr(start, comma == std::string_view::npos ? v.npos : comma - start));
+        if (comma == std::string_view::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+using ConnOptions = std::vector<std::pair<std::string, std::string>>;
+
+struct ConnTarget {
+    ConnOptions opts;
+    bool expand_dbname{false}; ///< true only for the unparseable-DSN fallback
+};
+
+/// One connection attempt per host (UP-1). libpq's NON-blocking connect
+/// (`PQconnectStart`/`PQconnectPoll`) never moves past a host that accepts the
+/// TCP handshake and then goes silent — only the BLOCKING path applies
+/// `connect_timeout` per host and advances. A multi-host DSN
+/// (`host=n1,n2,n3 target_session_attrs=read-write`, the pattern
+/// docs/user-manual/ha-postgres.md documents) would otherwise wait out the
+/// whole deadline on a frozen n1 every tick while the pool serves from n2.
+/// So the probe splits the host list itself and gives each host its own
+/// deadline. Residual, documented: a single host NAME that resolves to several
+/// addresses is iterated inside libpq and keeps the no-advance behaviour.
+/// On a parse failure or a list shape libpq itself would reject, returns ONE
+/// target carrying the original values, so libpq reports the error.
+std::vector<ConnTarget> build_targets(const std::string& dsn) {
+    ConnOptions base;
+    std::vector<std::string> hosts, addrs, ports;
+    bool has_app_name = false;
+    char* errmsg = nullptr;
+    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
+        PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
+    if (errmsg)
+        PQfreemem(errmsg);
+    if (!opts) // unparseable: hand libpq the raw DSN so it reports the error
+        return {ConnTarget{ConnOptions{{"dbname", dsn}}, true}};
+    for (const PQconninfoOption* o = opts.get(); o->keyword != nullptr; ++o) {
+        if (o->val == nullptr)
+            continue;
+        const std::string_view k{o->keyword};
+        if (k == "host")
+            hosts = split_commas(o->val);
+        else if (k == "hostaddr")
+            addrs = split_commas(o->val);
+        else if (k == "port")
+            ports = split_commas(o->val);
+        else {
+            if (k == "application_name")
+                has_app_name = true;
+            base.emplace_back(o->keyword, o->val);
+        }
+    }
+    if (!has_app_name)
+        base.emplace_back("application_name", kProbeApplicationName);
+
+    const std::size_t n = std::max<std::size_t>({hosts.size(), addrs.size(), 1});
+    const bool shape_ok = (hosts.empty() || hosts.size() == n) &&
+                          (addrs.empty() || addrs.size() == n) &&
+                          (ports.size() <= 1 || ports.size() == n);
+    auto join = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (std::size_t i = 0; i < v.size(); ++i)
+            s += (i ? "," : "") + v[i];
+        return s;
+    };
+    std::vector<ConnTarget> targets;
+    if (n == 1 || !shape_ok) {
+        ConnOptions t = base;
+        if (!hosts.empty())
+            t.emplace_back("host", join(hosts));
+        if (!addrs.empty())
+            t.emplace_back("hostaddr", join(addrs));
+        if (!ports.empty())
+            t.emplace_back("port", join(ports));
+        targets.push_back(ConnTarget{std::move(t)});
+        return targets;
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        ConnOptions t = base;
+        if (!hosts.empty())
+            t.emplace_back("host", hosts[i]);
+        if (!addrs.empty())
+            t.emplace_back("hostaddr", addrs[i]);
+        if (!ports.empty())
+            t.emplace_back("port", ports.size() == 1 ? ports[0] : ports[i]);
+        targets.push_back(ConnTarget{std::move(t)});
+    }
+    return targets;
+}
+
 /// The production ping: owns the dedicated connection between ticks.
 class LibpqPinger {
 public:
-    LibpqPinger(std::string dsn, std::string sql) : dsn_(std::move(dsn)), sql_(std::move(sql)) {}
+    LibpqPinger(const std::string& dsn, std::string sql)
+        : targets_(build_targets(dsn)), sql_(std::move(sql)) {}
 
     PgReachabilityProbe::PingResult ping(const std::atomic<bool>& stop) {
         using R = PgReachabilityProbe::PingResult;
         if (!conn_ || PQstatus(conn_.get()) != CONNECTION_OK) {
             conn_.reset();
-            if (auto err = connect(stop)) {
+            if (auto err = connect_any(stop)) {
                 conn_.reset();
                 return R{R::Kind::Failed, std::move(*err)};
             }
         }
-        std::optional<bool> in_recovery;
-        if (auto err = query(stop, in_recovery)) {
+        std::optional<bool> read_only;
+        if (auto err = query(stop, read_only)) {
             conn_.reset(); // reconnect next tick
             return R{R::Kind::Failed, std::move(*err)};
         }
-        if (*in_recovery) {
-            // A standby: drop the session so the next tick re-resolves through
-            // the proxy to whichever node is primary now (header, finding 2).
+        if (*read_only) {
+            // A standby, or a primary refusing writes (default_transaction_read_only,
+            // e.g. managed Postgres on a full disk). Drop the session so the next tick
+            // re-resolves through the host list / proxy (header, finding 2).
             conn_.reset();
-            return R{R::Kind::ReadOnly, "connected server is in recovery (standby)"};
+            return R{R::Kind::ReadOnly, "connected server does not accept writes (in recovery, or "
+                                        "transaction_read_only is on)"};
         }
         return R{R::Kind::Ok, {}};
     }
 
 private:
-    /// Returns an error string on failure, nullopt on success.
-    std::optional<std::string> connect(const std::atomic<bool>& stop) {
-        if (dsn_.empty())
-            return std::string("no DSN configured");
+    /// Try each target in order, each under its own kConnectDeadline. Returns
+    /// the last error on total failure, nullopt on success.
+    std::optional<std::string> connect_any(const std::atomic<bool>& stop) {
+        std::string last = "no connection target";
+        for (const auto& t : targets_) {
+            if (stop.load(std::memory_order_acquire))
+                return std::string("stopped");
+            auto err = connect_one(t, stop);
+            if (!err)
+                return std::nullopt;
+            conn_.reset();
+            last = std::move(*err);
+        }
+        return last;
+    }
+
+    std::optional<std::string> connect_one(const ConnTarget& target,
+                                           const std::atomic<bool>& stop) {
+        std::vector<const char*> keys, vals;
+        keys.reserve(target.opts.size() + 1);
+        vals.reserve(target.opts.size() + 1);
+        for (const auto& [k, v] : target.opts) {
+            keys.push_back(k.c_str());
+            vals.push_back(v.c_str());
+        }
+        keys.push_back(nullptr);
+        vals.push_back(nullptr);
+
         const auto deadline = Clock::now() + pr::kConnectDeadline;
-        conn_ = pg::PgConn{PQconnectStart(dsn_.c_str())};
+        conn_ = pg::PgConn{
+            PQconnectStartParams(keys.data(), vals.data(), target.expand_dbname ? 1 : 0)};
         PGconn* c = conn_.get();
         if (c == nullptr)
-            return std::string("PQconnectStart returned null (out of memory)");
+            return std::string("PQconnectStartParams returned null (out of memory)");
         if (PQstatus(c) == CONNECTION_BAD)
             return pq_error(c, "connection failed");
         // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
@@ -125,7 +266,7 @@ private:
                 break;
             if (st == PGRES_POLLING_FAILED)
                 return pq_error(c, "connection failed");
-            const int sock = PQsocket(c); // may change between hosts — re-read
+            const int sock = PQsocket(c); // may change between addresses — re-read
             if (sock < 0)
                 return std::string("connection has no socket");
             if (!wait_socket(sock, st == PGRES_POLLING_READING ? Want::Read : Want::Write, deadline,
@@ -139,10 +280,10 @@ private:
         return std::nullopt;
     }
 
-    /// The probe query (`kProbeSql` in production) under kQueryDeadline. Sets `in_recovery`
-    /// on success; returns an error string on any failure.
+    /// The probe query (`kProbeSql` in production) under kQueryDeadline. Sets
+    /// `read_only` on success; returns an error string on any failure.
     std::optional<std::string> query(const std::atomic<bool>& stop,
-                                     std::optional<bool>& in_recovery) {
+                                     std::optional<bool>& read_only) {
         PGconn* c = conn_.get();
         const auto deadline = Clock::now() + pr::kQueryDeadline;
         const auto timed_out = [&]() {
@@ -175,7 +316,7 @@ private:
                 if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
                     PQnfields(r.get()) == 1 && !PQgetisnull(r.get(), 0, 0)) {
                     const char* v = PQgetvalue(r.get(), 0, 0);
-                    in_recovery = v != nullptr && v[0] == 't';
+                    read_only = v != nullptr && v[0] == 't';
                 } else if (!result_error) {
                     const char* m = PQresultErrorMessage(r.get());
                     result_error = (m && *m) ? std::string(m) : std::string("unexpected result");
@@ -183,17 +324,21 @@ private:
             }
             if (done)
                 break;
+            // Read-readiness only: the reply to this one-statement query is a few
+            // hundred bytes, so a TLS record OpenSSL buffered ahead of poll() is not
+            // a practical concern — at worst one tick fails at the deadline, which is
+            // below kFailThreshold.
             if (!wait_socket(PQsocket(c), Want::Read, deadline, stop))
                 return timed_out();
         }
         if (result_error)
             return result_error;
-        if (!in_recovery)
+        if (!read_only)
             return std::string("probe query returned no row");
         return std::nullopt;
     }
 
-    std::string dsn_;
+    std::vector<ConnTarget> targets_;
     std::string sql_;
     pg::PgConn conn_;
 };
@@ -202,7 +347,7 @@ private:
 
 std::unique_ptr<PgReachabilityProbe> PgReachabilityProbe::make_libpq(std::string dsn, Observer obs,
                                                                      std::string probe_sql) {
-    auto pinger = std::make_shared<LibpqPinger>(std::move(dsn), std::move(probe_sql));
+    auto pinger = std::make_shared<LibpqPinger>(dsn, std::move(probe_sql));
     return std::make_unique<PgReachabilityProbe>(
         [pinger](const std::atomic<bool>& stop) { return pinger->ping(stop); }, std::move(obs));
 }
@@ -221,12 +366,11 @@ std::int64_t PgReachabilityProbe::now_ns() noexcept {
 }
 
 pg_reachability::Snapshot PgReachabilityProbe::snapshot() const noexcept {
-    pg_reachability::Snapshot s;
-    s.last_success_ns = last_success_ns_.load(std::memory_order_acquire);
-    s.consecutive_failures = consecutive_failures_.load(std::memory_order_acquire);
-    s.last_failure =
-        static_cast<pg_reachability::FailureKind>(last_failure_.load(std::memory_order_acquire));
-    return s;
+    // Leaf lock: held only to copy three fields, never across I/O — so a
+    // stalled probe cannot stall a reader (the #4013 lesson), and a reader
+    // never sees a torn mix of two publications.
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    return snap_;
 }
 
 pg_reachability::Verdict PgReachabilityProbe::verdict_at(std::int64_t now) const noexcept {
@@ -239,42 +383,47 @@ pg_reachability::Verdict PgReachabilityProbe::verdict() const noexcept {
 
 void PgReachabilityProbe::publish(const PingResult& r) {
     using K = PingResult::Kind;
-    if (r.kind == K::Ok) {
-        // Order: clear the failure state BEFORE stamping success, so a reader
-        // racing this never sees a fresh success paired with a stale ReadOnly.
-        last_failure_.store(static_cast<std::uint8_t>(pr::FailureKind::None),
-                            std::memory_order_release);
-        consecutive_failures_.store(0, std::memory_order_release);
-        last_success_ns_.store(now_ns(), std::memory_order_release);
-    } else {
-        last_failure_.store(static_cast<std::uint8_t>(r.kind == K::ReadOnly
-                                                          ? pr::FailureKind::ReadOnly
-                                                          : pr::FailureKind::Unreachable),
-                            std::memory_order_release);
-        consecutive_failures_.fetch_add(1, std::memory_order_acq_rel);
-        if (obs_.on_failure)
-            obs_.on_failure();
-    }
-
-    // Transition-only logging, plus a periodic reminder while not ready, so a
-    // long outage is neither silent nor one log line per tick.
-    constexpr std::int64_t kReminderNs = std::chrono::nanoseconds(std::chrono::seconds(60)).count();
     const auto now = now_ns();
-    const auto v = pr::classify(snapshot(), now);
+    pr::Snapshot after;
+    {
+        std::lock_guard<std::mutex> lk(snap_mu_);
+        if (r.kind == K::Ok) {
+            snap_.last_failure = pr::FailureKind::None;
+            snap_.consecutive_failures = 0;
+            snap_.last_success_ns = now;
+        } else {
+            snap_.last_failure =
+                r.kind == K::ReadOnly ? pr::FailureKind::ReadOnly : pr::FailureKind::Unreachable;
+            ++snap_.consecutive_failures;
+        }
+        after = snap_;
+    }
+    if (r.kind != K::Ok && obs_.on_failure)
+        obs_.on_failure();
+
+    // Logged when a COMPLETED probe changes the verdict, plus a reminder every
+    // 60s while not ready. (A probe stuck outside its deadlines — see the
+    // resolver residual in the header — reads Stale without completing, so the
+    // next log line comes when it does.)
+    constexpr std::int64_t kReminderNs = std::chrono::nanoseconds(std::chrono::seconds(60)).count();
+    const auto v = pr::classify(after, now);
+    const std::string detail = r.detail.empty() ? std::string("-") : r.detail;
     if (v != logged_verdict_) {
         if (v == pr::Verdict::Ready) {
-            spdlog::info("[readyz] Postgres reachable again — pg_reachable ok");
+            spdlog::info(logged_verdict_ == pr::Verdict::NotYetProbed
+                             ? "[readyz] Postgres reachable — pg_reachable ok"
+                             : "[readyz] Postgres reachable again — pg_reachable ok");
         } else {
             spdlog::warn("[readyz] Postgres not reachable from this replica — pg_reachable={} "
                          "(/readyz reports not ready): {}",
-                         pr::reason(v), r.detail.empty() ? std::string("-") : r.detail);
+                         pr::reason(v), detail);
             last_red_log_ns_ = now;
         }
         logged_verdict_ = v;
     } else if (v != pr::Verdict::Ready && now - last_red_log_ns_ >= kReminderNs) {
-        spdlog::warn(
-            "[readyz] Postgres still not reachable from this replica — pg_reachable={}: {}",
-            pr::reason(v), r.detail.empty() ? std::string("-") : r.detail);
+        spdlog::warn("[readyz] Postgres not reachable from this replica (still) — "
+                     "pg_reachable={}: {}",
+                     pr::reason(v), detail);
         last_red_log_ns_ = now;
     }
 }
@@ -308,7 +457,9 @@ void PgReachabilityProbe::stop() {
         stop_.store(true, std::memory_order_release);
     }
     cv_.notify_all();
-    // Join outside mu_: the loop takes mu_ for its interval wait.
+    // Join outside mu_: the loop takes mu_ for its interval wait. Not safe to
+    // call from two threads at once (both could see joinable()); ServerImpl's
+    // callers are serialised by lifecycle_mu_, and the destructor runs after.
     if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id())
         thread_.join();
 }

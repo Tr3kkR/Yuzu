@@ -292,8 +292,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // if migration/open fails) but was absent from both /healthz and
         // /readyz, the same readyz-vs-healthz drift class the rows above
         // document. Startup fail-closed limits the immediate blast radius,
-        // but if is_open() ever flips false post-startup, /api/v1/upload-
-        // grants* would 503 while both probes still reported healthy.
+        // and a store that failed to open would leave /api/v1/upload-grants*
+        // 503ing while both probes reported healthy. (is_open() is latched at
+        // boot, #3061 — this row reports that boot state.)
         bool upload_grant_ok = deps.upload_grant_store && deps.upload_grant_store->is_open();
         // TagStore (ADR-0050) — born-on-PG (as of this migration), wired
         // into both /readyz and /healthz from the start (the
@@ -658,14 +659,15 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // the pool answered.
             {"offline_endpoint_store",
              deps.offline_endpoint_store && deps.offline_endpoint_store->is_open()},
-            // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
-            // state post-boot makes ReportInventory silently ack with no
-            // ingest and no readiness signal — surface it (gov Pattern E).
+            // ADR-0016 born-on-Pg store. Fail-closed at boot; a store that
+            // failed to open would make ReportInventory silently ack with no
+            // ingest — surface that boot state (gov Pattern E; latched, #3061).
             {"software_inventory_store",
              deps.software_inventory_store && deps.software_inventory_store->is_open()},
-            // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
-            // not-open post-boot state means the PR-4 matching engine would
-            // silently no-op findings persistence — surface it (Pattern E).
+            // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a store
+            // that failed to open would silently no-op the PR-4 matching
+            // engine's findings persistence — surface that boot state
+            // (Pattern E; latched, #3061).
             {"vuln_finding_store", deps.vuln_finding_store && deps.vuln_finding_store->is_open()},
             // Periodic Access Reviews (SOC 2 CC6.2) born-on-PG store. AUTHORITATIVE
             // per ADR-0012 §1 — the /api/v1/access-reviews campaign lifecycle
@@ -684,19 +686,18 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"device_inventory_store",
              deps.device_inventory_store && deps.device_inventory_store->is_open()},
             // ADR-0024 SLE born-on-Pg stores (roadmap G-10, HC-1 Pattern E). Same
-            // rationale as the inventory stores: fail-closed at boot, but a not-open
-            // state post-boot makes ReportInventory silently ack the licensing blob
-            // with no ingest (software_licensing_store) and the /api/v1/sle/* reads
-            // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
+            // rationale as the inventory stores: fail-closed at boot; a store that
+            // failed to open would make ReportInventory silently ack the licensing
+            // blob with no ingest (software_licensing_store) and the /api/v1/sle/*
+            // reads degrade to 503 (both) — surface that boot state (latched, #3061).
             {"software_licensing_store",
              deps.software_licensing_store && deps.software_licensing_store->is_open()},
             // Wave 7 PR7.2 born-on-Pg store (ADR-0016 §5, gov Gate 3 sre HIGH
             // finding). Same rationale as software_licensing_store above:
-            // fail-closed at boot, but a not-open state post-boot makes
+            // fail-closed at boot; a store that failed to open would make
             // ReportInventory/ProxyInventory silently ack the app_usage blob
             // with no ingest and the Forensics REST/MCP reads degrade to
-            // 503/kInternalError — surface it so an LB/operator sees the
-            // half-state instead of only discovering it per-request.
+            // 503/kInternalError — surface that boot state (latched, #3061).
             {"app_usage_store", deps.app_usage_store && deps.app_usage_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
@@ -776,16 +777,15 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // latched, #3061), matching discovery_store's equivalent row.
             {"quarantine_store", deps.quarantine_store && deps.quarantine_store->is_open()},
             // ADR-0046 born-on-PG (as of this migration) store — same
-            // rationale as the other rows above: fail-closed at boot, but
-            // a not-open post-boot state would leave the notification
-            // feed silently dead while /readyz reported "ready" (gov
-            // Pattern E).
+            // rationale as the other rows above: fail-closed at boot; this
+            // row reports that boot state (latched, #3061), so a failed open
+            // cannot leave the notification feed dead behind a "ready"
+            // /readyz (gov Pattern E).
             {"notification_store", deps.notification_store && deps.notification_store->is_open()},
             // ADR-3004 (PR1.6a) — review finding (#3135): same
             // readyz-vs-healthz drift class as the rows above.
-            // Fail-closed at boot, but a not-open post-boot state would
-            // leave /api/v1/upload-grants* silently 503ing while
-            // /readyz still reported "ready".
+            // Fail-closed at boot; this row reports that boot state
+            // (latched, #3061).
             {"upload_grant_store",
              deps.upload_grant_store && deps.upload_grant_store->is_open()},
             // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
@@ -795,9 +795,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"patch_manager", deps.patch_manager && deps.patch_manager->is_open()},
             // Wave 7b PR7b.1 execution_artifacts — PluginConfigStore backs the
             // plugin kill switch; action_allowed() fails closed when the store
-            // is not open, so a not-open post-boot state silently denies every
-            // kill-switched action with no readiness signal. Same
-            // readyz-vs-healthz drift class the rows above document.
+            // is not open, so a store that failed to open would silently deny
+            // every kill-switched action. Same readyz-vs-healthz drift class
+            // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
         };
 
@@ -883,7 +883,11 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool guaranteed_state_ok =
             deps.guaranteed_state_store && deps.guaranteed_state_store->is_open();
         bool baseline_ok = deps.baseline_store && deps.baseline_store->is_open();
-        bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+        // HA WS-8: the one RUNTIME signal — the store rows above are boot state.
+        bool pg_reachable_ok =
+            deps.pg_reachability_probe &&
+            deps.pg_reachability_probe->verdict() == yuzu::server::pg_reachability::Verdict::Ready;
+        bool all_ok = pg_reachable_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
                       guaranteed_state_ok && baseline_ok;
 
         // Execution stats
@@ -951,6 +955,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
 
         if (!all_ok) {
             html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
+            if (!pg_reachable_ok)
+                html += "postgres ";
             if (!response_ok)
                 html += "responses ";
             if (!audit_ok)
