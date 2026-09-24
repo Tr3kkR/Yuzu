@@ -298,8 +298,18 @@ class TestRunBuild(_TempDirCase):
         self.assertEqual(rc, 7)
 
     def test_relay_start_failure_kills_child(self):
-        with mock.patch.object(build_gateway.Relay, "start",
-                               side_effect=RuntimeError("can't start new thread")):
+        def fail_once_tree_exists(relay):
+            # Wait for "started" (printed only after the grandchild is
+            # spawned) before failing. Failing straight after Popen races
+            # the grandchild's creation against taskkill /T's non-atomic
+            # tree walk on Windows: a grandchild born mid-walk is orphaned
+            # and the test flakes, without the start-failure path being
+            # wrong.
+            self.assertIn(b"started", relay._src.readline())
+            raise RuntimeError("can't start new thread")
+
+        with mock.patch.object(build_gateway.Relay, "start", autospec=True,
+                               side_effect=fail_once_tree_exists):
             with self.assertRaises(RuntimeError):
                 self.run_build(self.sleeper())
         self.assert_killed()
