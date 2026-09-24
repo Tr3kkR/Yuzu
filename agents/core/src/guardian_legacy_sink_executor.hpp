@@ -6,14 +6,18 @@
  * `.claude/plans/4783-legacy-guard-sink-blocking-PLAN-v2.md` §3.1).
  *
  * WHY: FileGuard/RegistryGuard/ServiceGuard/SystemdServiceGuard each call
- * GuardianEngine::emit_guard_event() -> the injected EventSink -> (today)
- * emit_guardian_event()'s synchronous gRPC Write() on the SAME thread that runs
- * the guard's own detection loop. A stalled-but-not-dead stream (no deadline on
- * subscribe_ctx_) wedges that thread indefinitely: the guard stops detecting, and
- * if the wedge happens to land inside GuardianEngine::stop()'s mtx_-held guard
- * join, teardown itself wedges. This class decouples the producer from the send,
- * mirroring guardian_outbox_send_executor.hpp / guardian_io_executor.hpp's
- * detached-worker shape (spawn_detached, the armed-under-lock AliveTicket idiom,
+ * GuardianEngine::emit_guard_event(). BEFORE this class existed, emit_guard_event()
+ * called the injected EventSink directly, which meant emit_guardian_event()'s
+ * synchronous gRPC Write() ran on the SAME thread that runs the guard's own
+ * detection loop. A stalled-but-not-dead stream (no deadline on subscribe_ctx_)
+ * wedged that thread indefinitely: the guard stopped detecting, and if the wedge
+ * happened to land inside GuardianEngine::stop()'s mtx_-held guard join, teardown
+ * itself wedged. This class decouples the producer from the send: emit_guard_event()
+ * (guardian_engine.cpp) now enqueues onto this executor via offer() instead of
+ * calling the sink synchronously, and is unconditionally live in production
+ * (constructed in GuardianEngine's ctor, independent of prefer_spark_) - mirroring
+ * guardian_outbox_send_executor.hpp / guardian_io_executor.hpp's detached-worker
+ * shape (spawn_detached, the armed-under-lock AliveTicket idiom,
  * GuardianDetachedWorkerRole, firewalled stall/recovery logging) - but is NOT
  * single-flight like those two: producers commit their decider state (last_compliant
  * etc.) BEFORE calling the sink and GuardSink returns void, so a refused/dropped
@@ -146,13 +150,16 @@
  *
  * ORPHAN-EXIT CONTRACT: identical to the sibling executors - a worker wedged in
  * a blocking Write() cannot be joined or force-cancelled. active_worker_count()
- * MUST be summed into GuardianEngine::active_io_workers() (a later commit's job;
- * this class is not wired into GuardianEngine yet) so a detached send survives
- * teardown observably, not silently.
+ * IS summed into GuardianEngine::active_io_workers() (guardian_engine.cpp) as
+ * the fourth term, after spark_reader_'s state-read executor, spark_runtime_'s
+ * arm/disarm executor, and spark_drain_worker_'s outbox-send executor, so a
+ * detached send survives teardown observably, not silently.
  *
- * NOT WIRED YET: this file is deliberately self-contained and unused in
- * production as of this commit - GuardianEngine/agent.cpp integration is a
- * separate follow-up commit per the delivery plan's sequencing.
+ * WIRED: this class is constructed unconditionally in GuardianEngine's
+ * constructor and is the live legacy IGuard sink path in production, independent
+ * of prefer_spark_ - see guardian_engine.cpp's emit_guard_event() (enqueues via
+ * offer()) and legacy_sink_kick() (drives kick() and gap repair from the agent
+ * heartbeat, agent.cpp).
  */
 
 #include "guardian_detached_worker_role.hpp" // GuardianDetachedWorkerRole
@@ -390,8 +397,8 @@ public:
     /// (correctness property 4) - every exception anywhere in this function maps
     /// to RefusedAdmission. `is_gap_repair` marks this offer as a synthesized
     /// repair report for an existing gap (see the class doc comment); it is the
-    /// caller's (GuardianEngine::legacy_sink_kick(), a later commit) job to build
-    /// that event, not this class's.
+    /// caller's (GuardianEngine::legacy_sink_kick(), guardian_engine.cpp) job to
+    /// build that event, not this class's.
     [[nodiscard]] OfferOutcome offer(Event ev, SendFn send, bool is_gap_repair = false) noexcept {
         // Declared here (not inside the try) so the catch block below can still
         // use whatever was successfully computed before an exception hit -
@@ -539,10 +546,11 @@ public:
 
     /// Re-evaluate launch eligibility and observe an in-flight stall, entirely
     /// independent of offer() (correctness properties 3 and 6). Production wires
-    /// this to the agent heartbeat tick (GuardianEngine::legacy_sink_kick(), a
-    /// later commit), so a stranded queue or a quiet-but-stalled send is noticed
-    /// within one heartbeat interval even with zero new guard activity. Never
-    /// throws; a failure here is best-effort and simply retried on the next call.
+    /// this to the agent heartbeat tick via GuardianEngine::legacy_sink_kick()
+    /// (agent.cpp), independent of prefer_spark_, so a stranded queue or a
+    /// quiet-but-stalled send is noticed within one heartbeat interval even with
+    /// zero new guard activity. Never throws; a failure here is best-effort and
+    /// simply retried on the next call.
     void kick() noexcept {
         std::shared_ptr<AliveTicket> ticket;
         bool need_spawn = false;
@@ -600,8 +608,8 @@ public:
     }
 
     /// PHYSICAL alive worker count (payload not yet destroyed) - 0 at rest, no
-    /// claimed transient ceiling (correctness property 8). For
-    /// GuardianEngine::active_io_workers()'s orphan-exit sum (a later commit).
+    /// claimed transient ceiling (correctness property 8). Summed into
+    /// GuardianEngine::active_io_workers()'s orphan-exit sum (guardian_engine.cpp).
     [[nodiscard]] std::size_t active_worker_count() const {
         std::lock_guard<std::mutex> lk{state_->mu};
         return static_cast<std::size_t>(state_->worker_count);

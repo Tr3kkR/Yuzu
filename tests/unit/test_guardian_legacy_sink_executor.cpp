@@ -1,7 +1,9 @@
 // test_guardian_legacy_sink_executor.cpp - direct, isolated coverage of
 // GuardianLegacySinkExecutor (#4783 commit 2), independent of GuardianEngine's own
-// call graph (not wired in yet - a later commit's job). Fast and deterministic:
-// every "stall"/"block" here is a test-controlled condition_variable, never a real
+// call graph (GuardianEngine IS wired to this class in production as of #4783 commit
+// 3/4 - see test_guardian_engine_legacy_sink.cpp for that engine-level coverage; this
+// file exercises the executor standalone). Fast and deterministic: every
+// "stall"/"block" here is a test-controlled condition_variable, never a real
 // network wait.
 
 #include "guardian_legacy_sink_executor.hpp"
