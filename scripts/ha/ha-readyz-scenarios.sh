@@ -36,6 +36,8 @@
 #   G. read-only second host  `host=A,B` with NO target_session_attrs, B read-only:
 #                       stop A (red), start A -> /readyz 200 again, not pinned to B
 #                       (Gate 8 round 2 UH-R2-1).
+#   H. read-only FIRST host  same DSN, A turns read-only at runtime, B writable: /readyz
+#                       stays red — the pool's writes land on A (Gate 8 round 3).
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -57,7 +59,7 @@ PG_IMAGE="${YUZU_HA_READYZ_PG_IMAGE:-postgres:18.4-bookworm@sha256:efef99e1558f8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,45p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,47p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -284,6 +286,22 @@ if t=$(wait_for /readyz 200 30); then pass "/readyz 200 again ${t}s after the pr
 else fail "/readyz still not ready 30s after the primary came back: $(body /readyz)"; fi
 stop_server 210
 psql_in "$PG2" "ALTER SYSTEM RESET default_transaction_read_only" && psql_in "$PG2" "SELECT pg_reload_conf()"
+
+echo "== H: multi-host DSN without target_session_attrs, the FIRST host turns read-only"
+# Gate 8 round 3 (CA-R3-1 / G8R3-CPP-1): the pool takes the first host that accepts a
+# connection, read-only or not, so with A read-only its writes fail. A probe that went
+# looking for a writable host (B) reported ready while every pool write failed. The
+# probe walks hosts in the DSN's order, like the pool, so /readyz must STAY red.
+boot "$GDSN" || exit 1
+psql_in "$PG" "ALTER SYSTEM SET default_transaction_read_only = on" && psql_in "$PG" "SELECT pg_reload_conf()"
+if t=$(wait_for /readyz 503 15 '"pg":"read_only"'); then pass "/readyz 503 read_only ${t}s after the first host turned read-only"
+else fail "/readyz not read_only within 15s: $(body /readyz)"; fi
+green=0
+for _ in $(seq 1 30); do [[ "$(code /readyz)" == 200 ]] && green=$((green + 1)); sleep 0.5; done
+if (( green == 0 )); then pass "/readyz stayed red for 15s — it does not report a writable host the pool never uses"
+else fail "/readyz went green ${green}x in 15s while the pool's first host is read-only"; fi
+stop_server 210
+psql_in "$PG" "ALTER SYSTEM RESET default_transaction_read_only" && psql_in "$PG" "SELECT pg_reload_conf()"
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

@@ -22,9 +22,10 @@
 ///
 /// Timing budget (why `kStaleAfter` is 15s): the normal gap between two
 /// successes is at most interval + connect deadline + query deadline =
-/// 2 + 5 + 2 = 9s, so 15s never reds a healthy replica. A reconnect starts from
-/// the host that last worked, so a multi-host DSN adds nothing in steady state;
-/// only a move to another host pays one connect deadline per host tried. A FROZEN backend (a
+/// 2 + 5 + 2 = 9s, so 15s never reds a healthy replica with a single host. With a
+/// multi-host DSN a reconnect walks the hosts in the DSN's order (as the pool's
+/// fresh connections do), paying one connect deadline per silent host ahead of
+/// the one that answers; the probe holds its connection in steady state. A FROZEN backend (a
 /// `docker pause`d / black-holed primary whose kernel still ACKs, so no
 /// socket-level timeout fires) is normally caught before that by the probe's
 /// own client-side deadlines — the query times out (2s), the reconnect times
@@ -33,7 +34,6 @@
 /// backstop that holds even if a tick wedges outside those deadlines.
 
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -111,18 +111,6 @@ constexpr Verdict classify(const Snapshot& s, std::int64_t now_ns) noexcept {
     if (now_ns > s.last_success_ns && now_ns - s.last_success_ns > stale_ns)
         return Verdict::Stale;
     return Verdict::Ready;
-}
-
-/// Which host a reconnect should try first, after the host at index `i` (of
-/// `n`) answered that it refuses writes. The probe normally starts from the
-/// host that last CONNECTED — but a read-only server keeps accepting
-/// connections, so starting there again would pin the probe to it forever
-/// while another listed host is the writable primary (Gate 8 round 2, UH-R2-1,
-/// reproduced: `/readyz` stuck `read_only` for 90s+ after a brief blip on the
-/// primary, the pool long since back on it). So a read-only answer moves the
-/// starting point on, rotating through the list until a writable host answers.
-constexpr std::size_t next_host_after_read_only(std::size_t i, std::size_t n) noexcept {
-    return n == 0 ? 0 : (i + 1) % n;
 }
 
 /// Stable, low-cardinality token for the `/readyz` body and logs. Carries no

@@ -167,18 +167,6 @@ TEST_CASE("pg_reachability rule: the timing budget never reds a healthy replica"
     STATIC_REQUIRE(pr::kFailThreshold >= 2);
 }
 
-TEST_CASE("pg_reachability rule: a read-only answer moves the starting host on",
-          "[server][readyz][pg_reachability]") {
-    // Gate 8 round 2 UH-R2-1: starting a reconnect from the last host that
-    // CONNECTED pinned the probe to a read-only server (it keeps accepting
-    // connections). The rule rotates instead, so every host is tried in turn.
-    STATIC_REQUIRE(pr::next_host_after_read_only(0, 1) == 0);
-    STATIC_REQUIRE(pr::next_host_after_read_only(0, 2) == 1);
-    STATIC_REQUIRE(pr::next_host_after_read_only(1, 2) == 0);
-    STATIC_REQUIRE(pr::next_host_after_read_only(2, 3) == 0);
-    STATIC_REQUIRE(pr::next_host_after_read_only(0, 0) == 0);
-}
-
 TEST_CASE("pg_reachability rule: reason tokens are stable and carry no detail",
           "[server][readyz][pg_reachability]") {
     CHECK(std::string(pr::reason(pr::Verdict::Ready)) == "ok");
@@ -597,9 +585,10 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     CHECK(probe->verdict() == pr::Verdict::Ready);
     CHECK(std::chrono::steady_clock::now() - t2 < 1s);
 
-    // A RECONNECT starts from the host that last worked (Gate 8): kill the probe's
-    // backend; the next tick fails on the dead session, the one after reconnects
-    // straight to the second host — no second payment of the frozen host's deadline.
+    // A RECONNECT walks the hosts in the DSN's order, as a fresh pool connection
+    // does: kill the probe's backend; the next tick fails on the dead session, the
+    // one after pays the frozen host's deadline again, then reaches the second
+    // host (Gate 8 round 3: the probe mirrors the pool's host choice).
     REQUIRE(admin_scalar(db.dsn(),
                          "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
                          "WHERE application_name = $1 AND datname = current_database()",
@@ -608,8 +597,8 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     REQUIRE(wait_for_backends(db.dsn(), "yuzu-readyz-probe", 0) == 0);
     probe->probe_once(); // dead session → one failure
     const auto t3 = std::chrono::steady_clock::now();
-    probe->probe_once(); // reconnect
+    probe->probe_once(); // reconnect: frozen host first, then the second host
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(std::chrono::steady_clock::now() - t3 < pr::kConnectDeadline - 1s);
+    CHECK(std::chrono::steady_clock::now() - t3 >= pr::kConnectDeadline - 100ms);
 }
 #endif

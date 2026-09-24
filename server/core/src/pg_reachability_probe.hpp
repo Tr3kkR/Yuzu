@@ -39,7 +39,9 @@
 /// only its blocking path applies `connect_timeout` per host. So the probe
 /// parses the DSN (`PQconninfoParse`) and tries each host in turn — a frozen
 /// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
-/// UP-1, reproduced) — and a reconnect starts from the host that last worked.
+/// UP-1, reproduced). Hosts are always tried in the DSN's order — the order the
+/// pool's own connections use — so the probe measures the host the pool reaches
+/// (Gate 8 round 3: any smarter preference diverged from the pool).
 /// Residuals, all keeping libpq's no-advance behaviour: one host NAME resolving
 /// to several addresses (libpq iterates those itself), and a host list that
 /// comes from `service=` or `PGHOST` (PQconninfoParse does not expand either).

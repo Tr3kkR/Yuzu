@@ -215,12 +215,10 @@ public:
         }
         if (*read_only) {
             // A standby, or a primary refusing writes (default_transaction_read_only,
-            // e.g. managed Postgres on a full disk). Drop the session AND move the
-            // starting host on, so the next tick re-resolves through the host list /
-            // proxy instead of reconnecting to this same read-only server (header,
-            // finding 2; next_host_after_read_only for the multi-host pin).
+            // e.g. managed Postgres on a full disk). Drop the session so the next tick
+            // re-resolves from the top of the host list / through the proxy (header,
+            // finding 2) — the same choice a fresh pool connection would make.
             conn_.reset();
-            preferred_ = pr::next_host_after_read_only(preferred_, targets_.size());
             return R{R::Kind::ReadOnly, "connected server does not accept writes (in recovery, or "
                                         "transaction_read_only is on)"};
         }
@@ -228,24 +226,25 @@ public:
     }
 
 private:
-    /// Try each target, each under its own kConnectDeadline, STARTING FROM THE
-    /// LAST ONE THAT WORKED. Without that, a reconnect behind two or more silent
-    /// hosts listed ahead of the primary would pay every one of their deadlines
-    /// on every reconnect and read Stale while healthy (Gate 8, consistency +
-    /// unhappy-path). Only a genuine move — the last good host itself gone —
-    /// walks the list. Returns every host's error on total failure.
+    /// Try each target IN THE DSN'S ORDER, each under its own kConnectDeadline —
+    /// the same order libpq, and so the server's pool, uses for a fresh
+    /// connection. The probe must measure the host the pool would reach, not be
+    /// cleverer than it: two governance rounds tried a "start from the last host
+    /// that worked" preference, and it either pinned the probe to a read-only
+    /// host after the primary came back or — rotated — found a writable host the
+    /// pool never uses and reported ready while every pool write failed (Gate 8
+    /// rounds 2 and 3, both reproduced). Cost, accepted: silent hosts listed
+    /// ahead of the primary are walked on every reconnect, exactly as a new pool
+    /// connection walks them. Returns every host's error on total failure.
     std::optional<std::string> connect_any(const std::atomic<bool>& stop) {
         std::string errors;
         const std::size_t n = targets_.size();
-        for (std::size_t k = 0; k < n; ++k) {
+        for (std::size_t i = 0; i < n; ++i) {
             if (stop.load(std::memory_order_acquire))
                 return std::string("stopped");
-            const std::size_t i = (preferred_ + k) % n;
             auto err = connect_one(targets_[i], stop);
-            if (!err) {
-                preferred_ = i;
+            if (!err)
                 return std::nullopt;
-            }
             conn_.reset();
             if (n > 1)
                 errors += (errors.empty() ? "" : "; ") + ("host " + std::to_string(i + 1) + ": ");
@@ -358,7 +357,6 @@ private:
     }
 
     std::vector<ConnTarget> targets_;
-    std::size_t preferred_{0}; ///< index of the last target that connected
     std::string sql_;
     pg::PgConn conn_;
 };
