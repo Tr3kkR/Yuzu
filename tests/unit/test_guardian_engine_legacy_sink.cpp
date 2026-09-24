@@ -1121,3 +1121,183 @@ TEST_CASE("CH-2 Windows: a full_sync push dropping a rule whose legacy-sink send
 }
 
 #endif // _WIN32
+
+// ── #4783 Gate 4 UP-3/UP-4: the restart-durable loss ledger (KV wiring) ─────
+//
+// Cross-platform: exercises GuardianEngine::start_local()/legacy_sink_kick()/
+// stop() directly via guardian_emit_drift_for_test() + admission-fault
+// injection (no real guard, no BlockingSink/thread orchestration needed - see
+// test_guardian_legacy_sink_executor.cpp's own restore() cases for the same
+// deterministic-loss technique). A simulated restart is a fresh KvStore +
+// GuardianEngine pair opened against the SAME db path AFTER the first pair
+// has been fully destroyed - mirroring how LegacySinkFixture's own db_ member
+// is a TempDbFile (deletes the file on ITS destruction), these cases own an
+// explicit TempDbFile so the path survives across both "processes".
+
+TEST_CASE("#4783 Gate 4 UP-3: an open gap persisted by kick() survives a simulated "
+          "agent restart - the new engine's start_local() restores it without a "
+          "fresh loss",
+          "[guardian][engine][legacy_sink]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+
+    // "Process 1".
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-restart-test", false);
+        REQUIRE(engine.start_local().has_value());
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = "gapped-rule";
+        d.rule_name = "gapped-rule";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+
+        // Unwire the sink BEFORE kick(): kick()'s own repair-dispatch loop would
+        // otherwise synthesize a guard.unhealthy report for "gapped-rule" and,
+        // with a real (always-Sent) sink still installed, successfully deliver
+        // and CLEAR the very gap this test is about to verify survived the
+        // persist - emit_guard_event() bails at "no sink wired" before ever
+        // reaching offer() when the sink is null, so this isolates "kick()
+        // persists the CURRENT ledger" from "a repair happened to race ahead
+        // and cleared it first".
+        engine.set_event_sink(nullptr);
+        engine.legacy_sink_kick(); // the write under test
+        REQUIRE(engine.legacy_sink_gap_rules() == 1); // still open - no repair could send
+        // "Process 1" ends here - engine/kv destruct (simulating an agent exit).
+    }
+
+    // "Process 2": a fresh KvStore + GuardianEngine at the SAME path.
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-restart-test", false);
+        REQUIRE(engine.start_local().has_value());
+
+        CHECK(engine.legacy_sink_gap_rules() == 1);
+        CHECK(engine.legacy_sink_events_lost() >= 1);
+        const auto gaps = engine.legacy_sink_executor_for_test().all_gaps_for_test();
+        REQUIRE(gaps.size() == 1);
+        CHECK(gaps[0].first == "gapped-rule");
+        // Fresh in-process sequencing (restore()'s own contract) - immediately
+        // eligible for repair, no fresh loss occurred in this second process.
+        CHECK(gaps[0].second.repair_seq == 0);
+        CHECK(gaps[0].second.last_attempt_kick == 0);
+
+        engine.stop();
+    }
+}
+
+TEST_CASE("#4783 Gate 4 UP-3: an absent, malformed, or schema-mismatched legacy-sink "
+          "loss-ledger record self-heals at boot - no restore, no crash",
+          "[guardian][engine][legacy_sink]") {
+    // Absent: nothing written yet - a completely fresh KvStore.
+    {
+        yuzu::test::TempDbFile db{unique_kv_path()};
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-ledger-absent-test", false);
+        REQUIRE(engine.start_local().has_value()); // must not fail or crash
+        CHECK(engine.legacy_sink_gap_rules() == 0);
+        CHECK(engine.legacy_sink_events_lost() == 0);
+        engine.stop();
+    }
+
+    // Malformed: garbage bytes under the exact key a real engine writes to.
+    {
+        yuzu::test::TempDbFile db{unique_kv_path()};
+        {
+            auto opened = KvStore::open(db.path);
+            REQUIRE(opened.has_value());
+            KvStore kv(std::move(*opened));
+            REQUIRE(kv.set(GuardianEngine::kv_namespace(),
+                           GuardianEngine::legacy_sink_loss_ledger_key_for_test(), "not json"));
+        }
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-ledger-malformed-test", false);
+        REQUIRE(engine.start_local().has_value()); // self-heals: logs, skips, boots
+        CHECK(engine.legacy_sink_gap_rules() == 0);
+        CHECK(engine.legacy_sink_events_lost() == 0);
+        engine.stop();
+    }
+
+    // Schema-mismatched: well-formed JSON, wrong schema version - a distinct
+    // Malformed cause from bad JSON (mirrors read_baseline_record's own
+    // schema-drift-is-a-separate-case posture).
+    {
+        yuzu::test::TempDbFile db{unique_kv_path()};
+        {
+            auto opened = KvStore::open(db.path);
+            REQUIRE(opened.has_value());
+            KvStore kv(std::move(*opened));
+            REQUIRE(kv.set(GuardianEngine::kv_namespace(),
+                           GuardianEngine::legacy_sink_loss_ledger_key_for_test(),
+                           R"({"schema":99,"counters":{},"gaps":[]})"));
+        }
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-ledger-schema-test", false);
+        REQUIRE(engine.start_local().has_value());
+        CHECK(engine.legacy_sink_gap_rules() == 0);
+        CHECK(engine.legacy_sink_events_lost() == 0);
+        engine.stop();
+    }
+}
+
+TEST_CASE("#4783 Gate 4 UP-3: stop() persists a final snapshot even with no prior "
+          "kick() having run - an open gap survives an immediate shutdown",
+          "[guardian][engine][legacy_sink]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-stop-flush-test", false);
+        REQUIRE(engine.start_local().has_value());
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d;
+        d.guard_type = "file";
+        d.rule_id = "gapped-rule-stop";
+        d.rule_name = "gapped-rule-stop";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+
+        // Deliberately NO legacy_sink_kick() call anywhere in this scope -
+        // stop() must flush the ledger unconditionally on its own. Verified
+        // below via a second engine restored from whatever this stop() wrote.
+        engine.stop();
+    }
+
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-stop-flush-test", false);
+        REQUIRE(engine.start_local().has_value());
+        CHECK(engine.legacy_sink_gap_rules() == 1);
+        const auto gaps = engine.legacy_sink_executor_for_test().all_gaps_for_test();
+        REQUIRE(gaps.size() == 1);
+        CHECK(gaps[0].first == "gapped-rule-stop");
+        engine.stop();
+    }
+}

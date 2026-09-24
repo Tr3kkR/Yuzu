@@ -186,10 +186,72 @@ namespace yuzu::agent {
 /// Outcome of one delivery attempt, reported by the injected send function.
 enum class LegacySendOutcome : std::uint8_t { Sent, LinkDown, WriteFailed };
 
+/**
+ * Known limitations (accepted, #4783 D1d / Gate 4 UP-3+UP-4). Two are a
+ * confirmed, deliberately-NOT-fixed trade-off; read them together with
+ * snapshot()/restore() below, which close a DIFFERENT gap (process-restart
+ * survival of the loss/gap BOOKKEEPING itself, never of any lost event's own
+ * payload - this class stays a loss-visibility marker, not a durable spool):
+ *
+ *  - UP-4 (accepted trade-off). An interior compliance transition (e.g.
+ *    `drift.detected`) can be silently and permanently lost if it is refused
+ *    at capacity while the rule's BRACKETING events (the state before and
+ *    the state after) both succeed - the gap self-clears on the later
+ *    successful event (SEQ-GUARDED CLEARING above) with no repair ever
+ *    firing, so the server's audit HISTORY shows continuous compliance
+ *    through a window that was, for a time, a real violation - even though
+ *    CURRENT state is accurate. The loss is never SILENT, though: it is
+ *    counted (`events_lost`, restart-durable via snapshot()/restore()),
+ *    attributed in the agent log by rule_id at the moment of loss (see
+ *    LossLogHook / the per-loss spdlog::warn/info call in offer()/
+ *    account_outcome_locked), and fleet-visible
+ *    (`yuzu_fleet_guardian_legacy_sink_events_lost`). Fully closing this
+ *    needs a durable spool of the lost event's own content, which D1d
+ *    explicitly declined as out of scope - tracked as a separate follow-up
+ *    issue, #TBD (not yet filed as of this comment).
+ *
+ *  - UP-3 (fixed here, restart semantics). snapshot()/restore() make the gap
+ *    ledger and loss counters survive an agent restart mid-outage - without
+ *    this, a restarted agent's fresh-boot state (everything zeroed) fed the
+ *    next heartbeat's fleet-gauge sweep identically to a genuine repair, so
+ *    an operator could not tell "fixed" from "agent bounced, evidence lost"
+ *    by reading `yuzu_fleet_guardian_legacy_sink_gap_rules` alone. Two
+ *    restart outcomes: if the link comes back up before the rule's next real
+ *    transition, that transition's own arm-time verdict clears the restored
+ *    gap LEGITIMATELY via the ordinary SEQ-GUARDED CLEARING path - restore()
+ *    resets a restored gap's `lost_seq` to 0, so ANY subsequent delivery for
+ *    that rule (seq >= 1) clears it; if the link is still down, the gap
+ *    stays open and legacy_sink_kick()'s repair loop resumes once reachable,
+ *    stamping the repair with the gap's ORIGINAL pre-restart `last_lost`
+ *    (preserved byte-for-byte by restore(), never reset to the restart
+ *    time).
+ *
+ *  - A narrower residual (accepted, not worth its own follow-up). stop()'s
+ *    final snapshot()+persist (GuardianEngine::stop()) runs immediately
+ *    after legacy_sink_executor_->stop() returns, but correctness property 7
+ *    above still lets an already-in-flight send complete AFTER stop()
+ *    returns. If that send comes back WriteFailed, the gap it opens exists
+ *    in memory but postdates the final persisted snapshot, so it is not
+ *    itself restart-durable - the same orphan-exit window
+ *    active_worker_count()/GuardianEngine::active_io_workers() already cover
+ *    for shutdown-OBSERVABILITY purposes, just not separately covered here.
+ */
 class YUZU_EXPORT GuardianLegacySinkExecutor {
 public:
     using Event = ::yuzu::guardian::v1::GuaranteedStateEvent;
     using SendFn = std::function<LegacySendOutcome(const Event&)>;
+
+    /// TEST-ONLY observation seam for the per-loss attribution log (#4783 Gate 4
+    /// UP-4 de-escalation, part 1) - see log_loss()'s call sites in offer()/
+    /// account_outcome_locked and set_loss_log_hook_for_test() below.
+    /// spdlog::level::off is never delivered here (log_loss() returns before
+    /// invoking the hook in that case) - the hook only ever fires alongside a
+    /// real spdlog::warn/info call. `kind` is always a static string literal
+    /// ("RefusedCapacity"/"RefusedAdmission"/"WriteFailed"/"SendException"), so
+    /// the `const char*` outlives every call.
+    using LossLogHook = std::function<void(const std::string& rule_id, const char* kind,
+                                           const std::string& event_type,
+                                           spdlog::level::level_enum level)>;
 
     struct Config {
         std::size_t max_events{4096};
@@ -234,6 +296,25 @@ public:
         std::uint64_t last_attempt_kick{0};
     };
 
+    /// A restart-durable projection of one GapRecord (#4783 Gate 4 UP-3) - see
+    /// snapshot()/restore() below. Deliberately narrower than GapRecord: no
+    /// `lost_seq`/`repair_seq`/`last_attempt_kick` - those are IN-PROCESS
+    /// sequencing tied to this executor's own `next_seq`/`kick_epoch` counters,
+    /// which restart at 0 in a fresh process, so restore() always seeds them
+    /// fresh (0) rather than replaying stale sequence state from a prior
+    /// process (see restore()'s own doc comment for why that makes a restored
+    /// gap immediately eligible for repair). Timestamps are epoch-milliseconds
+    /// (not `time_point`, which is not a stable on-disk representation across
+    /// a process/library-version boundary).
+    struct GapSnapshotEntry {
+        std::string rule_id;
+        std::string guard_type;
+        std::string rule_name;
+        std::uint64_t lost{0};
+        std::int64_t first_lost_ms{0};
+        std::int64_t last_lost_ms{0};
+    };
+
     struct Stats {
         std::uint64_t events_lost{0};
         std::uint64_t backpressure_drops{0};
@@ -253,6 +334,27 @@ public:
         /// as a loss (the gap they would have repaired was either already closed
         /// by something newer, or has since advanced past them).
         std::uint64_t repairs_suppressed{0};
+    };
+
+    /// A restart-durable snapshot of this executor's loss counters + open-gap
+    /// ledger (#4783 Gate 4 UP-3/UP-4) - see snapshot()/restore() below and
+    /// GuardianEngine's own KV-persistence wiring (guardian_engine.cpp's
+    /// legacy_sink_kick()/start_local()/stop()). Deliberately does NOT capture
+    /// any queued Item/Event payload, in-flight send state, or in-process
+    /// sequencing (next_seq/kick_epoch) - see this class's own "Known
+    /// limitations" doc comment above: this is a loss-VISIBILITY marker, never
+    /// a durable spool.
+    struct Snapshot {
+        Stats counters;
+        std::vector<GapSnapshotEntry> gaps;
+        /// The executor-internal change generation this snapshot was taken at
+        /// (State::change_gen) - a caller compares this against the generation
+        /// it last successfully persisted to decide whether a fresh write is
+        /// worth doing at all (see legacy_sink_kick()'s own gate). Not itself
+        /// meaningful across a restart (a fresh process's executor starts back
+        /// at 0) - purely a same-process "has anything changed since I last
+        /// wrote" token.
+        std::uint64_t change_gen{0};
     };
 
     /// Test-only fault injection for the admission path (offer()). `ThrowOnTicket`
@@ -297,6 +399,24 @@ public:
         std::string rule_id;
         std::string guard_type;
         std::string rule_name;
+        // #4783 Gate 4 UP-4: extracted early alongside rule_id/guard_type/
+        // rule_name (not read off `ev` later) for the SAME reason those three
+        // are - by the time either loss site below could want it, `ev` may
+        // already have been moved-from (the success branch moves it into the
+        // queued Item; protobuf's move leaves the source cleared, not merely
+        // unspecified), and the catch(...) branch may run after a throw whose
+        // exact point relative to that move is not fixed.
+        std::string event_type;
+        // #4783 Gate 4 UP-4: the per-loss log decision + the test-hook copy for
+        // it, computed under the SAME lock acquisition as the loss itself
+        // (record_gap_locked/State::loss_log_hook_for_test) so this costs no
+        // extra lock beyond what offer() already takes - the actual spdlog
+        // call happens AFTER the lock releases, at the very end of this
+        // function, matching the existing log_send_stall/log_send_recovery
+        // pattern (logging must never happen while state_->mu is held).
+        auto loss_log_level = spdlog::level::off;
+        const char* loss_log_kind = nullptr;
+        LossLogHook loss_log_hook;
         try {
             // (1) Compute the byte size and copy the identifying fields BEFORE
             // the lock - these allocate, and the strong-guarantee rollback below
@@ -305,6 +425,7 @@ public:
             rule_id = ev.rule_id();
             guard_type = ev.guard_type();
             rule_name = ev.rule_name();
+            event_type = ev.event_type();
 
             // (2) The unarmed ticket, BEFORE the lock (allocates; #3966 idiom -
             // see guardian_outbox_send_executor.hpp's AliveTicket doc comment).
@@ -335,9 +456,20 @@ public:
                     outcome = OfferOutcome::RefusedStopping;
                 } else if (state_->queue.size() >= state_->max_events ||
                            state_->bytes + bytes > state_->max_bytes) {
+                    // #4783 Gate 4 UP-4: copy the test hook FIRST, before any
+                    // counters/ledger mutation below - a std::function copy can
+                    // allocate and throw, and this branch has no throwing-step-
+                    // is-last discipline of its own the way the success branch's
+                    // ThrowOnNode does; if it threw AFTER the increments/
+                    // record_gap_locked below, the outer catch(...) would record
+                    // a SECOND, spurious RefusedAdmission loss for the same
+                    // event on top of this branch's already-recorded
+                    // RefusedCapacity one.
+                    loss_log_hook = state_->loss_log_hook_for_test;
                     ++state_->counters.backpressure_drops;
                     ++state_->counters.events_lost;
-                    record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
+                    loss_log_level = record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
+                    loss_log_kind = "RefusedCapacity";
                     outcome = OfferOutcome::RefusedCapacity;
                 } else {
                     // (3) The list-node allocation - the LAST throwing step; on
@@ -378,8 +510,12 @@ public:
             // (5) Unlock, then spawn outside the lock.
             if (need_spawn)
                 attempt_launch(std::move(ticket));
+            // (6) Log OUTSIDE the lock, same as (5)'s spawn - #4783 Gate 4 UP-4.
+            // A no-op unless the capacity-refusal branch above actually ran.
+            log_loss(rule_id, loss_log_kind, event_type, loss_log_level, loss_log_hook);
             return outcome;
         } catch (...) {
+            auto catch_loss_log_level = spdlog::level::off;
             try {
                 std::lock_guard<std::mutex> lk{state_->mu};
                 // This path never reached the locked block above (the throw hit
@@ -390,9 +526,13 @@ public:
                 const std::uint64_t seq = ++state_->next_seq;
                 ++state_->counters.admission_failures;
                 ++state_->counters.events_lost;
-                record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
+                catch_loss_log_level = record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
+                loss_log_hook = state_->loss_log_hook_for_test;
             } catch (...) {
             }
+            // #4783 Gate 4 UP-4: logged OUTSIDE the lock_guard above, same
+            // rationale as the main path's own (6).
+            log_loss(rule_id, "RefusedAdmission", event_type, catch_loss_log_level, loss_log_hook);
             return OfferOutcome::RefusedAdmission;
         }
     }
@@ -529,6 +669,98 @@ public:
         return out;
     }
 
+    /// A restart-durable snapshot of the current counters + open-gap ledger
+    /// (#4783 Gate 4 UP-3/UP-4) - see the class's own "Known limitations" doc
+    /// comment and GuardianEngine::legacy_sink_kick()/stop() for how a caller
+    /// persists this to KvStore. Read-only: takes state_->mu, copies, releases -
+    /// does not mutate anything (in particular does NOT reset change_gen; that
+    /// only ever moves forward via a loss/clear, see record_gap_locked and
+    /// account_outcome_locked's Sent-clears-gap branch).
+    [[nodiscard]] Snapshot snapshot() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        Snapshot snap;
+        snap.counters = state_->counters;
+        snap.counters.gap_rules = state_->gaps.size(); // same read-time denormalization as stats()
+        snap.gaps.reserve(state_->gaps.size());
+        for (const auto& [rule_id, g] : state_->gaps) {
+            GapSnapshotEntry e;
+            e.rule_id = rule_id;
+            e.guard_type = g.guard_type;
+            e.rule_name = g.rule_name;
+            e.lost = g.lost;
+            e.first_lost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  g.first_lost.time_since_epoch())
+                                  .count();
+            e.last_lost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 g.last_lost.time_since_epoch())
+                                 .count();
+            snap.gaps.push_back(std::move(e));
+        }
+        snap.change_gen = state_->change_gen;
+        return snap;
+    }
+
+    /// Seed this executor's counters + open-gap ledger from a PRIOR process's
+    /// snapshot() (#4783 Gate 4 UP-3) - the restart-durability half of the
+    /// fix; see the class's own "Known limitations" doc comment for the full
+    /// restart-semantics contract this establishes.
+    ///
+    /// PRECONDITION (caller's responsibility, not enforced here): MUST be
+    /// called before this executor's first offer()/kick() - i.e. on the
+    /// single-threaded agent boot path, before any guard thread or the
+    /// heartbeat thread can reach this executor. GuardianEngine::start_local()
+    /// satisfies this by calling restore() (under its own mtx_, itself only
+    /// ever called before guards are (re-)armed) strictly before the rule
+    /// re-arm loop that could otherwise let a freshly-armed guard's detection
+    /// thread call offer() concurrently with this seeding. Calling this after
+    /// concurrent activity has begun is a data race on state_->gaps/counters
+    /// (this function does not itself take any lock ordering precaution beyond
+    /// its own state_->mu acquisition, which does not help if a concurrent
+    /// offer()/kick() interleaves a partially-seeded ledger into its own
+    /// decisions).
+    ///
+    /// `seed_counters` seeds state_->counters directly - this is what makes
+    /// `events_lost` (and every other counter) MONOTONIC across a restart: the
+    /// new process's counters start from the persisted value, not 0, and
+    /// increment from there. `gaps` reconstructs one GapRecord per entry, with
+    /// FRESH in-process sequencing (`lost_seq`/`repair_seq`/`last_attempt_kick`
+    /// all reset to 0 - these are NEW post-restart sequence numbers tied to
+    /// this process's own next_seq/kick_epoch counters, which also both start
+    /// at 0) but the ORIGINAL `first_lost`/`last_lost` timestamps preserved -
+    /// a restored gap is therefore immediately ELIGIBLE for repair
+    /// (repair_seq==0) and clears on the very next delivery for that rule
+    /// (lost_seq==0 is strictly less than any real seq, which starts at 1).
+    /// Never throws (fully firewalled) - a restore that fails partway through
+    /// leaves whatever was already seeded in place rather than crashing agent
+    /// boot; the caller degrades to "start with an empty ledger" on any read
+    /// failure BEFORE ever calling this, so a throw here would only be a
+    /// secondary allocation failure on an already-parsed, well-formed record.
+    void restore(Stats seed_counters, std::vector<GapSnapshotEntry> gaps) noexcept {
+        try {
+            std::lock_guard<std::mutex> lk{state_->mu};
+            state_->counters = seed_counters;
+            // gap_rules is a read-time denormalization (see stats()/snapshot()),
+            // never stored authoritatively in state_->counters - zero it back
+            // out so a stale seeded value is never mistaken for one.
+            state_->counters.gap_rules = 0;
+            for (auto& e : gaps) {
+                GapRecord g;
+                g.guard_type = e.guard_type;
+                g.rule_name = e.rule_name;
+                g.lost = e.lost;
+                g.first_lost =
+                    std::chrono::system_clock::time_point{std::chrono::milliseconds{e.first_lost_ms}};
+                g.last_lost =
+                    std::chrono::system_clock::time_point{std::chrono::milliseconds{e.last_lost_ms}};
+                g.lost_seq = 0;
+                g.repair_seq = 0;
+                g.last_attempt_kick = 0;
+                state_->gaps.emplace(std::move(e.rule_id), std::move(g));
+            }
+        } catch (...) {
+        }
+    }
+
     // ---- test seams -------------------------------------------------------
 
     /// EVERY current gap, unfiltered by eligibility and unsorted - unlike
@@ -593,6 +825,20 @@ public:
         state_->admission_fault_for_test.store(f, std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY (#4783 Gate 4 UP-4 de-escalation): observe the per-loss
+    /// attribution log without depending on spdlog's own default-logger state,
+    /// which is unreliable across a shared-library boundary (see
+    /// test_log_capture.hpp's own doc comment and test_guardian_arm_ack.cpp's
+    /// LogCapture removal - this class is compiled into libyuzu_agent_core AND
+    /// directly into any test TU that includes this header, so which image's
+    /// spdlog state a given call observes is not guaranteed). Guarded by
+    /// state_->mu like every other State field - set this BEFORE any
+    /// offer()/kick() that could race a concurrent read of it.
+    void set_loss_log_hook_for_test(LossLogHook hook) {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        state_->loss_log_hook_for_test = std::move(hook);
+    }
+
 private:
     struct Item {
         Event ev;
@@ -635,6 +881,30 @@ private:
         /// rule, so gapped_rules_needing_repair()'s rotation sort can tell which
         /// gaps were attempted longest ago.
         std::uint64_t kick_epoch{0};
+        /// #4783 Gate 4 UP-3: bumped by record_gap_locked() (every loss) and by
+        /// account_outcome_locked()'s Sent-clears-gap branch (every gap erase) -
+        /// see snapshot()'s own doc comment. A caller (GuardianEngine) compares
+        /// this against the generation it last persisted to decide whether a
+        /// fresh restart-durable write is worth doing. Deliberately NOT bumped
+        /// by every Stats field (e.g. `stalls`/`worker_faults`/
+        /// `repairs_suppressed`) - only loss/clear events, which is what
+        /// `events_lost`/the open-gap ledger (the UP-3/UP-4 restart-durability
+        /// target) actually depend on.
+        std::uint64_t change_gen{0};
+        /// #4783 Gate 4 UP-4: process-lifetime, per-rule loss count for the
+        /// per-loss attribution log's rate limit - see log_loss()'s call sites.
+        /// Deliberately SEPARATE from GapRecord::lost: GapRecord (and its
+        /// `lost` field) is ERASED when a gap clears (SEQ-GUARDED CLEARING), but
+        /// the rate limit must never reset just because a rule's gap happened
+        /// to close in between two losses - a chronically-flapping rule must
+        /// still only warn once per process, not once per open-gap episode.
+        /// Never erased; bounded in practice by the number of distinct rule_ids
+        /// this agent has ever had rules for (the same unbounded-by-rule_id
+        /// growth shape `gaps` itself has while open).
+        std::unordered_map<std::string, std::uint64_t> loss_log_counts;
+        /// TEST-ONLY (see set_loss_log_hook_for_test) - guarded by mu like every
+        /// other State field; empty = no-op.
+        LossLogHook loss_log_hook_for_test;
     };
 
     /// RAII orphan-exit marker (#3966 idiom - see
@@ -678,6 +948,10 @@ private:
         return pred();
     }
 
+    /// #4783 Gate 4 UP-4: the per-loss attribution log's rate limit - see
+    /// State::loss_log_counts' own doc comment and record_gap_locked below.
+    static constexpr std::uint64_t kLossLogRateLimit = 100;
+
     /// Called with state_->mu HELD, from EITHER offer() (an admission refusal)
     /// or the worker (post-send accounting) - a single chokepoint so
     /// AdmissionFaultForTest::ThrowOnGapLedger exercises the same degrade path
@@ -686,9 +960,27 @@ private:
     /// rather than escaping into either caller's own noexcept contract. `seq` is
     /// the LOST event's own admission-time seq - folded into `lost_seq` as
     /// `max(existing, seq)` (#4783 follow-up: SEQ-GUARDED CLEARING).
-    static void record_gap_locked(State& st, const std::string& rule_id,
-                                  const std::string& guard_type, const std::string& rule_name,
-                                  std::uint64_t seq) {
+    ///
+    /// Returns the per-loss attribution log DECISION for the caller to act on
+    /// AFTER releasing state_->mu (#4783 Gate 4 UP-4 - see log_loss() and this
+    /// function's own two call sites in offer()/account_outcome_locked):
+    /// spdlog::level::off means "do not log", ::warn means "first loss this
+    /// process has recorded for this rule_id", ::info means "the
+    /// kLossLogRateLimit-th loss since then".
+    static spdlog::level::level_enum record_gap_locked(State& st, const std::string& rule_id,
+                                                       const std::string& guard_type,
+                                                       const std::string& rule_name,
+                                                       std::uint64_t seq) {
+        // #4783 Gate 4 UP-3: bumped FIRST, unconditionally - a plain ++ on a
+        // uint64_t cannot throw, so this still advances even if the gap-ledger
+        // mutation below degrades (AdmissionFaultForTest::ThrowOnGapLedger).
+        // The caller (GuardianEngine::legacy_sink_kick()) compares this against
+        // the generation it last persisted to decide whether events_lost (which
+        // the caller already bumped, just before calling this) is worth a
+        // fresh restart-durable write - that counter changed regardless of
+        // whether the gap ledger itself could be updated.
+        ++st.change_gen;
+        auto log_level = spdlog::level::off;
         try {
             if (st.admission_fault_for_test.load(std::memory_order_relaxed) ==
                 AdmissionFaultForTest::ThrowOnGapLedger)
@@ -709,10 +1001,22 @@ private:
                 it->second.last_lost = now;
                 it->second.lost_seq = std::max(it->second.lost_seq, seq);
             }
+            // #4783 Gate 4 UP-4: a process-lifetime, per-rule loss count - see
+            // State::loss_log_counts' own doc comment for why this is separate
+            // from GapRecord::lost (which resets on every gap clear). warn on
+            // this rule_id's very first loss this process has ever recorded,
+            // then info every kLossLogRateLimit-th loss thereafter, so a
+            // chronically-lossy rule cannot flood the log but is never silent.
+            const std::uint64_t total = ++st.loss_log_counts[rule_id];
+            if (total == 1)
+                log_level = spdlog::level::warn;
+            else if (total % kLossLogRateLimit == 0)
+                log_level = spdlog::level::info;
         } catch (...) {
             st.gap_ledger_degraded = true;
             ++st.counters.gap_ledger_faults;
         }
+        return log_level;
     }
 
     /// Called with state_->mu HELD, on the worker thread, after one send
@@ -723,17 +1027,22 @@ private:
     /// recorded loss's `lost_seq` and to decide (Sent case) whether this specific
     /// delivery is allowed to clear an existing gap (#4783 follow-up:
     /// SEQ-GUARDED CLEARING - see the class doc comment).
-    static void account_outcome_locked(State& st, const Item& it, LegacySendOutcome r,
-                                       bool threw) {
+    ///
+    /// Returns the per-loss attribution log decision (#4783 Gate 4 UP-4), same
+    /// contract as record_gap_locked's own return - spdlog::level::off for
+    /// every non-loss outcome (Sent, LinkDown) below.
+    static spdlog::level::level_enum account_outcome_locked(State& st, const Item& it,
+                                                             LegacySendOutcome r, bool threw) {
         if (threw) {
             ++st.counters.send_exceptions;
             ++st.counters.events_lost;
-            record_gap_locked(st, it.rule_id, it.ev.guard_type(), it.ev.rule_name(), it.seq);
+            const auto level =
+                record_gap_locked(st, it.rule_id, it.ev.guard_type(), it.ev.rule_name(), it.seq);
             if (it.gap_repair) {
                 if (auto gi = st.gaps.find(it.rule_id); gi != st.gaps.end())
                     gi->second.repair_seq = 0;
             }
-            return;
+            return level;
         }
         switch (r) {
         case LegacySendOutcome::Sent:
@@ -750,20 +1059,27 @@ private:
             if (auto gi = st.gaps.find(it.rule_id); gi != st.gaps.end()) {
                 if (it.seq > gi->second.lost_seq) {
                     st.gaps.erase(gi); // confirmed delivered, strictly newer than any known loss
+                    // #4783 Gate 4 UP-3: a gap CLEAR is the other half of
+                    // change_gen's contract (record_gap_locked bumps it on every
+                    // LOSS) - a caller comparing generations must see this too,
+                    // or a resolved gap would never get persisted away.
+                    ++st.change_gen;
                 } else if (it.gap_repair) {
                     gi->second.repair_seq = 0;
                 }
             }
             break;
-        case LegacySendOutcome::WriteFailed:
+        case LegacySendOutcome::WriteFailed: {
             ++st.counters.send_failures;
             ++st.counters.events_lost;
-            record_gap_locked(st, it.rule_id, it.ev.guard_type(), it.ev.rule_name(), it.seq);
+            const auto level =
+                record_gap_locked(st, it.rule_id, it.ev.guard_type(), it.ev.rule_name(), it.seq);
             if (it.gap_repair) {
                 if (auto gi = st.gaps.find(it.rule_id); gi != st.gaps.end())
                     gi->second.repair_seq = 0; // retry on the next kick
             }
-            break;
+            return level;
+        }
         case LegacySendOutcome::LinkDown:
             ++st.counters.dropped_link_down; // NOT a gap - D4b, today's documented
                                              // pre-network/A3 drop semantics
@@ -773,6 +1089,7 @@ private:
             }
             break;
         }
+        return spdlog::level::off;
     }
 
     static void log_send_stall(const std::string& rule_id) {
@@ -790,6 +1107,44 @@ private:
                          "having stalled past its threshold.",
                          rule_id);
         } catch (...) {
+        }
+    }
+
+    /// #4783 Gate 4 UP-4 de-escalation, part 1 (per-loss attribution log). MUST
+    /// be called with state_->mu NOT held, same posture as log_send_stall/
+    /// log_send_recovery above - every call site computes `level` (and, if a
+    /// test hook is armed, `hook`) under the lock via record_gap_locked/
+    /// account_outcome_locked's return value, then calls this AFTER releasing
+    /// it. A no-op (does not log, does not invoke `hook`) when
+    /// `level == spdlog::level::off` - the common case, every offer()/send
+    /// outcome that was not itself a loss. `kind` is always one of the four
+    /// static string literals named at this class's loss sites
+    /// ("RefusedCapacity"/"RefusedAdmission"/"WriteFailed"/"SendException").
+    static void log_loss(const std::string& rule_id, const char* kind,
+                         const std::string& event_type, spdlog::level::level_enum level,
+                         const LossLogHook& hook) {
+        if (level == spdlog::level::off)
+            return;
+        try {
+            if (level == spdlog::level::warn) {
+                spdlog::warn("Guardian legacy sink lost an event (rule_id {}, loss_kind {}, "
+                             "event_type {}) - first loss recorded for this rule this "
+                             "process; see legacy_sink_events_lost/legacy_sink_gap_rules for "
+                             "the running totals.",
+                             rule_id, kind, event_type);
+            } else {
+                spdlog::info("Guardian legacy sink lost another event (rule_id {}, loss_kind "
+                            "{}, event_type {}) - rate-limited: logged every {}th loss "
+                            "recorded for this rule this process.",
+                            rule_id, kind, event_type, kLossLogRateLimit);
+            }
+        } catch (...) {
+        }
+        if (hook) {
+            try {
+                hook(rule_id, kind, event_type, level);
+            } catch (...) {
+            }
         }
     }
 
@@ -870,7 +1225,14 @@ private:
                     st->stall_logged = true;
                 }
                 const bool recovered = st->stall_logged;
-                account_outcome_locked(*st, it, r, threw);
+                const auto loss_level = account_outcome_locked(*st, it, r, threw);
+                // #4783 Gate 4 UP-4: the test-hook copy, same "under the SAME
+                // lock this call already holds, no extra acquisition" posture
+                // as offer()'s own two loss sites - only bothers copying it
+                // when there is actually something to log.
+                LossLogHook loss_hook;
+                if (loss_level != spdlog::level::off)
+                    loss_hook = st->loss_log_hook_for_test;
                 st->in_flight = false;
                 lk.unlock();
 
@@ -878,6 +1240,14 @@ private:
                     log_send_stall(it.rule_id);
                 if (recovered)
                     log_send_recovery(it.rule_id);
+                // #4783 Gate 4 UP-4: logged OUTSIDE the lock, same as the stall/
+                // recovery logs above. `threw` (SendException) and WriteFailed
+                // are the only two outcomes account_outcome_locked returns a
+                // non-off level for (Sent/LinkDown never lose an event).
+                if (loss_level != spdlog::level::off) {
+                    const char* kind = threw ? "SendException" : "WriteFailed";
+                    log_loss(it.rule_id, kind, it.ev.event_type(), loss_level, loss_hook);
+                }
                 // `it` (and its SendFn copy) destructs here, before `ticket`.
             } catch (...) {
                 try {

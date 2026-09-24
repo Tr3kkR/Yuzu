@@ -441,6 +441,133 @@ std::string make_rule_key(std::string_view rule_id) {
     return k;
 }
 
+// #4783 Gate 4 UP-3/UP-4: the legacy-sink loss ledger's persistence shape - a
+// SINGLE fixed key (not per-rule, unlike kBaselinePrefix - the whole ledger is
+// one small JSON blob), read at boot (start_local(), BEFORE the rule re-arm
+// loop) and written from legacy_sink_kick() (gated on change_gen - see that
+// method's own doc comment) and stop()'s unconditional final flush. Mirrors
+// guardian_persist_baseline/read_baseline_record's shape (schema field, plain
+// KvStore::set/get_entry, Ok/Absent/ReadError/Malformed collapsing) rather
+// than inventing a new one - see this row's citation in the #4783 Gate 4
+// completion report for exactly which lines this was copied from.
+constexpr std::string_view kLegacySinkLossKey = "legacy_sink_loss_ledger";
+constexpr int kLegacySinkLossSchemaVersion = 1;
+
+nlohmann::json legacy_sink_snapshot_to_json(const GuardianLegacySinkExecutor::Snapshot& snap) {
+    nlohmann::json j;
+    j["schema"] = kLegacySinkLossSchemaVersion;
+    auto& c = j["counters"];
+    c["events_lost"] = snap.counters.events_lost;
+    c["backpressure_drops"] = snap.counters.backpressure_drops;
+    c["admission_failures"] = snap.counters.admission_failures;
+    c["send_failures"] = snap.counters.send_failures;
+    c["send_exceptions"] = snap.counters.send_exceptions;
+    c["worker_faults"] = snap.counters.worker_faults;
+    c["dropped_link_down"] = snap.counters.dropped_link_down;
+    c["discarded_at_stop"] = snap.counters.discarded_at_stop;
+    c["stalls"] = snap.counters.stalls;
+    c["launch_failures"] = snap.counters.launch_failures;
+    c["gap_ledger_faults"] = snap.counters.gap_ledger_faults;
+    c["repairs_suppressed"] = snap.counters.repairs_suppressed;
+    // gap_rules is a read-time denormalization (Stats::gap_rules, set by
+    // GuardianLegacySinkExecutor::stats()/snapshot() from gaps.size()) -
+    // deliberately NOT persisted; restore() recomputes it the same way once
+    // the gaps array below is restored.
+    auto& gaps = j["gaps"] = nlohmann::json::array();
+    for (const auto& g : snap.gaps) {
+        nlohmann::json ge;
+        ge["rule_id"] = g.rule_id;
+        ge["guard_type"] = g.guard_type;
+        ge["rule_name"] = g.rule_name;
+        ge["lost"] = g.lost;
+        ge["first_lost_ms"] = g.first_lost_ms;
+        ge["last_lost_ms"] = g.last_lost_ms;
+        gaps.push_back(std::move(ge));
+    }
+    return j;
+}
+
+/// Same Ok/Absent/ReadError/Malformed collapsing as BaselineReadOutcome above -
+/// see that enum's own doc comment for the rationale (both the boot-read caller
+/// and any future re-check caller can switch on one shape without duplicating
+/// the KV-read/JSON-parse plumbing).
+enum class LegacySinkLossReadOutcome { Ok, Absent, ReadError, Malformed };
+
+LegacySinkLossReadOutcome
+read_legacy_sink_loss_record(KvStore& kv, GuardianLegacySinkExecutor::Stats& counters_out,
+                             std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry>& gaps_out) {
+    auto raw = kv.get_entry(kKvNamespace, kLegacySinkLossKey);
+    if (!raw)
+        return LegacySinkLossReadOutcome::ReadError;
+    if (!raw->has_value())
+        return LegacySinkLossReadOutcome::Absent;
+    try {
+        auto j = nlohmann::json::parse(**raw);
+        // Schema-version drift is a DISTINCT failure from "malformed" only in
+        // spirit here (unlike the baseline record, this ledger has no
+        // fingerprint-vs-retarget distinction to protect) - still gated
+        // separately from the generic parse/shape checks below so a future
+        // schema bump reads as an explicit, intentional case rather than
+        // falling through whatever the shape checks happen to do with an
+        // old-shaped record.
+        if (j.value("schema", -1) != kLegacySinkLossSchemaVersion)
+            return LegacySinkLossReadOutcome::Malformed;
+        if (!j.contains("counters") || !j["counters"].is_object() || !j.contains("gaps") ||
+            !j["gaps"].is_array())
+            return LegacySinkLossReadOutcome::Malformed;
+        const auto& c = j["counters"];
+        GuardianLegacySinkExecutor::Stats counters{};
+        counters.events_lost = c.value("events_lost", std::uint64_t{0});
+        counters.backpressure_drops = c.value("backpressure_drops", std::uint64_t{0});
+        counters.admission_failures = c.value("admission_failures", std::uint64_t{0});
+        counters.send_failures = c.value("send_failures", std::uint64_t{0});
+        counters.send_exceptions = c.value("send_exceptions", std::uint64_t{0});
+        counters.worker_faults = c.value("worker_faults", std::uint64_t{0});
+        counters.dropped_link_down = c.value("dropped_link_down", std::uint64_t{0});
+        counters.discarded_at_stop = c.value("discarded_at_stop", std::uint64_t{0});
+        counters.stalls = c.value("stalls", std::uint64_t{0});
+        counters.launch_failures = c.value("launch_failures", std::uint64_t{0});
+        counters.gap_ledger_faults = c.value("gap_ledger_faults", std::uint64_t{0});
+        counters.repairs_suppressed = c.value("repairs_suppressed", std::uint64_t{0});
+        std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry> gaps;
+        gaps.reserve(j["gaps"].size());
+        for (const auto& ge : j["gaps"]) {
+            if (!ge.is_object())
+                return LegacySinkLossReadOutcome::Malformed;
+            GuardianLegacySinkExecutor::GapSnapshotEntry g;
+            g.rule_id = ge.value("rule_id", std::string{});
+            g.guard_type = ge.value("guard_type", std::string{});
+            g.rule_name = ge.value("rule_name", std::string{});
+            g.lost = ge.value("lost", std::uint64_t{0});
+            g.first_lost_ms = ge.value("first_lost_ms", std::int64_t{0});
+            g.last_lost_ms = ge.value("last_lost_ms", std::int64_t{0});
+            if (g.rule_id.empty()) // every real entry always has one - guard against a hand-crafted/corrupt record
+                return LegacySinkLossReadOutcome::Malformed;
+            gaps.push_back(std::move(g));
+        }
+        counters_out = counters;
+        gaps_out = std::move(gaps);
+        return LegacySinkLossReadOutcome::Ok;
+    } catch (const nlohmann::json::exception&) {
+        return LegacySinkLossReadOutcome::Malformed;
+    }
+}
+
+/// Persist `snap` to the fixed legacy-sink loss ledger key. Takes `KvStore*` by
+/// raw pointer (not `GuardianEngine&`/`this`) for the SAME reason
+/// guardian_persist_baseline does - safe to call from legacy_sink_kick(), which
+/// deliberately runs off mtx_ (see that method's own doc comment), and `kv_`
+/// outlives every caller by construction (agent.cpp declares kv_store_ before
+/// guardian_). Returns kv_->set()'s own success bool (false if `kv` is null) -
+/// every caller logs on false and does NOT advance its own "last persisted
+/// generation" tracking, so a failed write is retried on the next opportunity
+/// rather than silently believed to have happened.
+bool persist_legacy_sink_loss_ledger(KvStore* kv, const GuardianLegacySinkExecutor::Snapshot& snap) {
+    if (!kv)
+        return false;
+    return kv->set(kKvNamespace, kLegacySinkLossKey, legacy_sink_snapshot_to_json(snap).dump());
+}
+
 } // namespace
 
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
@@ -474,6 +601,10 @@ GuardianEngine::~GuardianEngine() {
 
 std::string_view GuardianEngine::kv_namespace() {
     return kKvNamespace;
+}
+
+std::string_view GuardianEngine::legacy_sink_loss_ledger_key_for_test() {
+    return kLegacySinkLossKey;
 }
 
 std::expected<void, std::string> GuardianEngine::start_local() {
@@ -533,6 +664,42 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
     } catch (...) {
         spdlog::warn("Guardian: failed to begin boot ack application: unknown exception");
+    }
+
+    // #4783 Gate 4 UP-3/UP-4: restore the legacy-sink loss ledger (counters +
+    // open gaps) from a prior process, BEFORE the boot re-arm loop below -
+    // reconcile_rule_locked() (called from that loop) can start a REAL guard
+    // thread (e.g. a Windows FileGuard's watch thread) that reaches
+    // emit_guard_event() -> legacy_sink_executor_->offer() asynchronously,
+    // before this function returns. restore() itself is safe to call here
+    // specifically because start_local() holds mtx_ for its entire body and
+    // this call precedes every re-arm in that same locked call, so no
+    // offer()/kick() against legacy_sink_executor_ can be in flight yet - see
+    // GuardianLegacySinkExecutor::restore()'s own precondition doc comment.
+    if (kv_) {
+        GuardianLegacySinkExecutor::Stats seed_counters{};
+        std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry> seed_gaps;
+        switch (read_legacy_sink_loss_record(*kv_, seed_counters, seed_gaps)) {
+        case LegacySinkLossReadOutcome::Ok: {
+            const std::size_t gap_count = seed_gaps.size(); // read BEFORE the move below
+            legacy_sink_executor_->restore(seed_counters, std::move(seed_gaps));
+            spdlog::info("Guardian: restored the legacy-sink loss ledger from a prior "
+                        "process (events_lost={}, open gap_rules={})",
+                        seed_counters.events_lost, gap_count);
+            break;
+        }
+        case LegacySinkLossReadOutcome::Absent:
+            break; // nothing persisted yet - fresh state, nothing to restore
+        case LegacySinkLossReadOutcome::ReadError:
+            spdlog::warn("Guardian: legacy-sink loss ledger lookup failed (KV read error) - "
+                        "starting with an empty loss ledger");
+            break;
+        case LegacySinkLossReadOutcome::Malformed:
+            spdlog::warn("Guardian: legacy-sink loss ledger record is malformed (bad JSON, "
+                        "schema mismatch, or bad shape) - discarding and starting with an "
+                        "empty loss ledger");
+            break;
+        }
     }
 
     // A2 (restart re-arm). A restarted agent must keep enforcing without waiting
@@ -692,6 +859,31 @@ void GuardianEngine::stop() {
     // guardian_legacy_sink_executor.hpp's own stop() doc comment for the full
     // contract; never blocks.
     legacy_sink_executor_->stop();
+    // #4783 Gate 4 UP-3/UP-4: one final, unconditional (not change_gen-gated,
+    // unlike legacy_sink_kick()'s own persist) restart-durable write of the
+    // loss ledger - same reasoning as the lifecycle-journal final flush right
+    // below: a bounded, synchronous KV write that catches whatever changed
+    // since the last successful kick()-driven persist, including a rule that
+    // never got a single heartbeat before the agent shut down (an open gap
+    // with zero prior kicks still needs to survive the restart it is about to
+    // undergo). FIREWALLED for the same reason as the journal flush below -
+    // stop() is reached from the (implicitly noexcept) ~GuardianEngine
+    // destructor. kv_ read without mtx_ is safe - see legacy_sink_kick()'s own
+    // comment on that; mtx_ IS held here (stop()'s whole body), but that does
+    // not change kv_'s own never-reassigned-after-construction contract.
+    if (kv_) {
+        try {
+            const auto snap = legacy_sink_executor_->snapshot();
+            if (persist_legacy_sink_loss_ledger(kv_, snap))
+                legacy_sink_last_persisted_gen_.store(snap.change_gen, std::memory_order_relaxed);
+            else
+                spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger during "
+                            "shutdown (change_gen={}) - a restart may see stale (though never "
+                            "corrupt) loss/gap state",
+                            snap.change_gen);
+        } catch (...) {
+        }
+    }
     // F7: stop() is terminal - nothing reconciles again afterward, so there is no
     // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
     // precisely instead). Blanket-clearing here just keeps a heartbeat composed
@@ -1675,6 +1867,31 @@ void GuardianEngine::legacy_sink_kick() noexcept {
         // Firewalled: runs on the bare heartbeat thread (agent.cpp) - same posture
         // as journal_maintenance_tick()'s own try/catch (review B4a). A throw here
         // must never escalate to std::terminate.
+    }
+
+    // #4783 Gate 4 UP-3/UP-4: persist the loss ledger if it changed since the
+    // last write - own try/catch, deliberately AFTER (and independent of) the
+    // repair-dispatch loop above, so a KV write failure here can never prevent
+    // (or be masked by) the gap-repair work. kv_ is a raw pointer set once at
+    // construction and never reassigned (same rationale
+    // guardian_persist_baseline's own doc comment gives for reading it off
+    // mtx_ from a non-engine thread) - safe to read here without mtx_, which
+    // this method deliberately never takes (see its own doc comment).
+    if (kv_) {
+        try {
+            const auto snap = legacy_sink_executor_->snapshot();
+            if (snap.change_gen != legacy_sink_last_persisted_gen_.load(std::memory_order_relaxed)) {
+                if (persist_legacy_sink_loss_ledger(kv_, snap)) {
+                    legacy_sink_last_persisted_gen_.store(snap.change_gen, std::memory_order_relaxed);
+                } else {
+                    spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger "
+                                "(change_gen={}) - will retry on the next heartbeat kick",
+                                snap.change_gen);
+                }
+            }
+        } catch (...) {
+            // Same firewall posture as the repair-dispatch try/catch above.
+        }
     }
 }
 

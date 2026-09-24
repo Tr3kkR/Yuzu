@@ -164,6 +164,15 @@ public:
 
     /// Phase 1 startup (pre-network). Loads cached rules from KvStore
     /// into the in-memory count cache so get_status() is cheap.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: also restores legacy_sink_executor_'s loss
+    /// ledger (counters + open-gap snapshots) from a prior process, if one was
+    /// persisted (see legacy_sink_kick()/stop()) - STRICTLY BEFORE the rule
+    /// re-arm loop below, so a restored gap is already visible before the
+    /// first guard thread (or the first post-boot legacy_sink_kick()) can
+    /// reach the executor. An absent/malformed/schema-mismatched record
+    /// self-heals (logged, skipped, boot proceeds) - same posture as a
+    /// corrupt/absent #4021 baseline record.
     std::expected<void, std::string> start_local();
 
     /// Phase 2 startup (post-Register). No-op in PR 2 — PR 4 uses this
@@ -211,6 +220,19 @@ public:
     /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:
     /// runs on the bare heartbeat thread (agent.cpp), same posture as
     /// journal_maintenance_tick()'s own firewalling.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: AFTER the repair-dispatch loop above (own
+    /// try/catch), also persists legacy_sink_executor_'s loss ledger
+    /// (counters + open-gap snapshots - GuardianLegacySinkExecutor::Snapshot)
+    /// to KvStore whenever its change_gen has moved since the last successful
+    /// write (legacy_sink_last_persisted_gen_) — a small, restart-durable
+    /// marker, NOT a durable spool of the lost events themselves (see
+    /// guardian_legacy_sink_executor.hpp's "Known limitations" doc comment).
+    /// This is what keeps `yuzu_fleet_guardian_legacy_sink_gap_rules` from
+    /// reading as "resolved" after a mid-outage agent restart the same way a
+    /// genuine repair would (UP-3), and keeps `events_lost` monotonic across
+    /// one (UP-4's restart-durability half - see start_local()/stop() below
+    /// for the read/final-write sides of this same mechanism).
     void legacy_sink_kick() noexcept;
 
     /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
@@ -324,6 +346,15 @@ public:
 
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: also takes one final, UNCONDITIONAL (not
+    /// change_gen-gated, unlike legacy_sink_kick()'s own persist) snapshot of
+    /// legacy_sink_executor_'s loss ledger and writes it to KvStore - a
+    /// bounded, synchronous write, same reasoning as the pre-existing
+    /// lifecycle-journal final flush right after it in the .cpp. Covers the
+    /// case where the agent shuts down before its next heartbeat ever runs
+    /// (an open gap with zero prior legacy_sink_kick() calls still needs to
+    /// survive the restart it is about to undergo).
     void stop();
 
     /// Sink for outbound Guardian events (drift, etc.). Wired by agent.cpp once
@@ -402,6 +433,16 @@ public:
     /// KV namespace used for all Guardian persistent state. Exposed for
     /// tests — do not read from this namespace in production code.
     static std::string_view kv_namespace();
+
+    /// #4783 Gate 4 UP-3/UP-4: the single fixed KvStore key (under
+    /// kv_namespace()) the legacy-sink loss ledger (counters + open-gap
+    /// snapshots) persists under — see legacy_sink_kick()/start_local()/
+    /// stop() in guardian_engine.cpp. Exposed for tests — same "do not read
+    /// from this namespace in production code" rule as kv_namespace() above;
+    /// lets a test write a deliberately malformed/absent record directly
+    /// (the self-heal / boot-degrade regression) without needing a second
+    /// GuardianEngine instance to have produced one first.
+    static std::string_view legacy_sink_loss_ledger_key_for_test();
 
     /// Wire the spark detection path, once, before start_local() (agent.cpp,
     /// rung 7.7): builds the reader, the SparkEngine backend adapter, the
@@ -851,6 +892,22 @@ private:
     /// wired" is distinguishable from "wired and delivered". No production consumer
     /// yet (that is commit 4's heartbeat-tag wiring); read directly in tests.
     std::atomic<std::uint64_t> legacy_sink_dropped_unwired_{0};
+    /// #4783 Gate 4 UP-3/UP-4: the change_gen (GuardianLegacySinkExecutor::
+    /// Snapshot::change_gen) of the loss ledger this engine last successfully
+    /// persisted to KvStore - see legacy_sink_kick()'s own doc comment for the
+    /// gate this guards. ATOMIC (not a plain uint64_t) because it is written
+    /// from TWO threads that can genuinely run concurrently with no shared
+    /// lock between them: legacy_sink_kick() runs off mtx_ on the agent's
+    /// heartbeat thread (by design - see that method's own doc comment), while
+    /// stop() holds mtx_ but that guards nothing here, and agent.cpp's own
+    /// shutdown ScopeExit calls guardian_->stop() BEFORE joining the heartbeat
+    /// thread (quiesce_run_workers() - a late in-flight heartbeat tick can
+    /// still call legacy_sink_kick() while stop() is already running). Default
+    /// 0 matches a freshly-constructed (or freshly-restore()'d - restore()
+    /// never touches change_gen) executor's own change_gen default, so the
+    /// first post-boot kick()/stop() does not treat "nothing changed since
+    /// restore()" as something worth a redundant write.
+    std::atomic<std::uint64_t> legacy_sink_last_persisted_gen_{0};
     /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
     /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums

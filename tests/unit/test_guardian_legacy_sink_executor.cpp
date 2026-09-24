@@ -40,6 +40,8 @@ using Event = GuardianLegacySinkExecutor::Event;
 using OfferOutcome = GuardianLegacySinkExecutor::OfferOutcome;
 using LaunchFaultForTest = GuardianLegacySinkExecutor::LaunchFaultForTest;
 using AdmissionFaultForTest = GuardianLegacySinkExecutor::AdmissionFaultForTest;
+using GapSnapshotEntry = GuardianLegacySinkExecutor::GapSnapshotEntry;
+using Snapshot = GuardianLegacySinkExecutor::Snapshot;
 
 Event make_event(const std::string& rule_id, const std::string& event_type,
                  const std::string& guard_type = "file", const std::string& rule_name = "rn") {
@@ -1171,4 +1173,157 @@ TEST_CASE("wait_idle_for_test can read true while a retiring worker is still "
     REQUIRE(exec.wait_idle_for_test(5s));
     REQUIRE(exec.wait_workers_retired_for_test(5s));
     CHECK(exec.active_worker_count() == 0);
+}
+
+// ── #4783 Gate 4 UP-3/UP-4: snapshot()/restore() + the per-loss log ─────────
+
+TEST_CASE("snapshot(): change_gen stays flat across repeated no-op kick() calls when "
+          "nothing has been lost or cleared (#4783 Gate 4 UP-3)",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+    const Snapshot initial = exec.snapshot();
+    CHECK(initial.change_gen == 0);
+    CHECK(initial.counters.events_lost == 0);
+    CHECK(initial.gaps.empty());
+
+    for (int i = 0; i < 5; ++i)
+        exec.kick(); // empty queue, nothing in flight, nothing gapped - a pure no-op
+
+    const Snapshot after = exec.snapshot();
+    CHECK(after.change_gen == initial.change_gen);
+    CHECK(after.counters.events_lost == 0);
+    CHECK(after.gaps.empty());
+}
+
+TEST_CASE("restore(): seeds Stats so a subsequent loss continues counting from the "
+          "restored value, never from 0 (#4783 Gate 4 UP-3)",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+    GuardianLegacySinkExecutor::Stats seed{};
+    seed.events_lost = 41;
+    seed.backpressure_drops = 7;
+    exec.restore(seed, {});
+    CHECK(exec.stats().events_lost == 41);
+    CHECK(exec.stats().backpressure_drops == 7);
+
+    // A deterministic fresh loss via admission-fault injection - no threading
+    // needed (mirrors this file's other AdmissionFaultForTest cases).
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::ThrowOnNode);
+    CHECK(exec.offer(make_event("r1", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::Sent; }) ==
+         OfferOutcome::RefusedAdmission);
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::None);
+
+    CHECK(exec.stats().events_lost == 42); // continues from the restored 41, not from 0
+    CHECK(exec.stats().admission_failures == 1); // this counter, unlike events_lost, was never seeded
+}
+
+TEST_CASE("restore(): restored gaps are immediately eligible for repair (repair_seq==0, "
+          "fresh last_attempt_kick==0) and preserve the original first_lost/last_lost "
+          "(#4783 Gate 4 UP-3)",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+    GapSnapshotEntry g;
+    g.rule_id = "r-restored";
+    g.guard_type = "file";
+    g.rule_name = "rn";
+    g.lost = 5;
+    g.first_lost_ms = 1000;
+    g.last_lost_ms = 9000;
+    exec.restore(GuardianLegacySinkExecutor::Stats{}, {g});
+
+    const auto gaps = exec.all_gaps_for_test();
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == "r-restored");
+    CHECK(gaps[0].second.guard_type == "file");
+    CHECK(gaps[0].second.rule_name == "rn");
+    CHECK(gaps[0].second.lost == 5);
+    CHECK(gaps[0].second.repair_seq == 0);
+    CHECK(gaps[0].second.last_attempt_kick == 0);
+    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(
+              gaps[0].second.first_lost.time_since_epoch())
+              .count() == 1000);
+    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(
+              gaps[0].second.last_lost.time_since_epoch())
+              .count() == 9000);
+
+    // Eligible for repair immediately - not excluded as "already mid-repair".
+    const auto eligible = exec.gapped_rules_needing_repair(10);
+    REQUIRE(eligible.size() == 1);
+    CHECK(eligible[0].first == "r-restored");
+}
+
+TEST_CASE("restore(): a restored gap clears on the first subsequent Sent delivery for "
+          "that rule - the same seq-guard mechanism as any other gap (#4783 Gate 4 UP-3)",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+    GapSnapshotEntry g;
+    g.rule_id = "r-restored";
+    g.guard_type = "file";
+    g.rule_name = "rn";
+    g.lost = 1;
+    g.first_lost_ms = 1000;
+    g.last_lost_ms = 1000;
+    exec.restore(GuardianLegacySinkExecutor::Stats{}, {g});
+    REQUIRE(exec.all_gaps_for_test().size() == 1);
+
+    RecordingSend send;
+    CHECK(exec.offer(make_event("r-restored", "guard.compliant"), std::ref(send)) ==
+         OfferOutcome::Queued);
+    REQUIRE(exec.wait_idle_for_test(5s));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    CHECK(exec.all_gaps_for_test().empty()); // cleared - lost_seq==0 is < any real seq (>=1)
+    CHECK(send.count() == 1);
+}
+
+TEST_CASE("Per-loss attribution log: fires exactly once (warn) on a rule_id's first loss "
+          "this process, then again (info) only on its 100th loss - never LogCapture, "
+          "cross-image hazard (test_guardian_arm_ack.cpp) (#4783 Gate 4 UP-4)",
+          "[guardian][legacy_sink]") {
+    GuardianLegacySinkExecutor exec;
+    struct Observed {
+        std::string rule_id;
+        std::string kind;
+        std::string event_type;
+        spdlog::level::level_enum level;
+    };
+    std::mutex mu;
+    std::vector<Observed> observed;
+    exec.set_loss_log_hook_for_test([&](const std::string& rule_id, const char* kind,
+                                        const std::string& event_type,
+                                        spdlog::level::level_enum level) {
+        std::lock_guard<std::mutex> lk{mu};
+        observed.push_back(Observed{rule_id, kind, event_type, level});
+    });
+
+    // 150 deterministic losses for the SAME rule_id via admission-fault
+    // injection (never queues, so the capacity branch never trips - every
+    // single offer() takes the RefusedAdmission path).
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::ThrowOnNode);
+    for (int i = 0; i < 150; ++i) {
+        CHECK(exec.offer(make_event("r-loss", "drift.detected"),
+                         [](const Event&) { return LegacySendOutcome::Sent; }) ==
+             OfferOutcome::RefusedAdmission);
+    }
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::None);
+
+    std::lock_guard<std::mutex> lk{mu};
+    std::vector<Observed> warns;
+    std::vector<Observed> infos;
+    for (const auto& o : observed) {
+        if (o.level == spdlog::level::warn)
+            warns.push_back(o);
+        else if (o.level == spdlog::level::info)
+            infos.push_back(o);
+    }
+    // Loss #1 -> warn; loss #100 -> info; losses #2-99 and #101-150 -> nothing.
+    REQUIRE(warns.size() == 1);
+    CHECK(warns[0].rule_id == "r-loss");
+    CHECK(warns[0].kind == "RefusedAdmission");
+    CHECK(warns[0].event_type == "drift.detected");
+    REQUIRE(infos.size() == 1);
+    CHECK(infos[0].rule_id == "r-loss");
+    CHECK(infos[0].kind == "RefusedAdmission");
+    CHECK(observed.size() == 2); // nothing else fired across all 150 losses
 }
