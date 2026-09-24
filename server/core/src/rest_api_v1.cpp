@@ -9875,17 +9875,36 @@ void RestApiV1::register_routes(
             }
             // #4734: the shape check above only excludes non-string/empty --
             // a well-formed but oversized parent_id fell straight through to
-            // resolve_owned_parent (almost certainly a 404, since nothing
-            // this long can match a real id/alias) and, on the tar-query/
-            // instruction-result producers, an oversized value was also
-            // copied verbatim into the persisted source_payload's
-            // scope_input_id with no bound at all. Same cap MCP's own
-            // create_result_set_from_tar_query/_instruction_result handlers
-            // already enforce (kResultSetParentIdMaxLen) -- REST never had
-            // the matching check.
+            // resolve_owned_parent, where it COULD have resolved: a real
+            // per-operator alias (a result-set `name`) is valid up to 256
+            // bytes (kResultSetNameMaxLen), so a 65-256 byte value here was
+            // NOT "almost certainly a 404" -- it could be a genuine,
+            // previously-working alias reference. This cap intentionally
+            // forecloses that case for parity with MCP's own
+            // create_result_set_from_tar_query/_instruction_result handlers,
+            // which already enforce the same 64-byte kResultSetParentIdMaxLen
+            // bound before alias resolution (#4353) -- REST never had the
+            // matching check. This IS a real, documented behaviour change for
+            // any caller using a >64-byte alias here -- see changelog.d's
+            // Breaking fragment and docs/scope-walking-design.md section 6.
+            // On the tar-query/instruction-result producers, an oversized
+            // value was also copied verbatim into the persisted
+            // source_payload's scope_input_id with no bound at all before
+            // this fix.
             if (body.contains("parent_id") &&
                 body["parent_id"].get_ref<const std::string&>().size() >
                     yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                // Audited on the same action/outcome as the shape-check guard
+                // immediately above (governance #4307/#4734 round -- the two
+                // guards previously diverged: shape-check audited, length-
+                // check didn't, on the same route/action/branch).
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        "reason=parent_id_too_long source_kind=" +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 rs_err(res, 400,
                        std::format("parent_id must be at most {} bytes",
                                    yuzu::server::mcp::kResultSetParentIdMaxLen));
@@ -10278,6 +10297,10 @@ void RestApiV1::register_routes(
                 // oversized value was copied verbatim into the persisted
                 // source_payload's scope_input_id with no cap.
                 if (pid.size() > yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                    // Audited on the same action/outcome as the shape-check
+                    // guard above (governance #4307/#4734 round).
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=parent_id_too_long");
                     rs_err(res, 400,
                            std::format("parent_id must be at most {} bytes",
                                        yuzu::server::mcp::kResultSetParentIdMaxLen));
@@ -10470,6 +10493,16 @@ void RestApiV1::register_routes(
                       if (body.contains("parent_id") && body["parent_id"].is_string() &&
                           body["parent_id"].get_ref<const std::string&>().size() >
                               yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                          // Audited on the same action/outcome as the shape-
+                          // check guard above (governance #4307/#4734 round).
+                          bool audit_ok = true;
+                          if (audit_fn)
+                              audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
+                                                  "",
+                                                  "reason=parent_id_too_long "
+                                                  "source_kind=inventory_query");
+                          if (!audit_ok)
+                              res.set_header("Sec-Audit-Failed", "true");
                           rs_err(res, 400,
                                  std::format("parent_id must be at most {} bytes",
                                              yuzu::server::mcp::kResultSetParentIdMaxLen));

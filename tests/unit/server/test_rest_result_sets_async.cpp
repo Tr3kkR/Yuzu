@@ -19,6 +19,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "mcp_input_bounds.hpp" // kResultSetParentIdMaxLen / kResultSetNameMaxLen
 #include "mcp_retry.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -668,13 +669,14 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
 // otherwise proceeded through resolve_owned_parent/dispatch. Both producers
 // funnel through the same run_async closure, so one fix covers both -
 // exercised here on both routes to pin that.
-TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on both async "
-          "producers",
+TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on all three "
+          "affected routes",
           "[pg][result_set][async][security][4734]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     const std::string big(65, 'p');
+    const std::string exact(yuzu::server::mcp::kResultSetParentIdMaxLen, 'p');
 
     SECTION("from-tar-query") {
         AsyncHarness h(pool);
@@ -688,6 +690,20 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on both 
                   "parent_id must be at most 64 bytes") != std::string::npos);
         REQUIRE(h.calls.empty());
     }
+    SECTION("from-tar-query -- exactly 64 bytes clears the length cap (boundary, "
+            "404s on ownership since it's a random unowned id, but never the "
+            "length-cap 400)") {
+        AsyncHarness h(pool);
+        int status = 0;
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
     SECTION("from-instruction-result") {
         AsyncHarness h(pool);
         auto iid = make_instruction(*h.instr);
@@ -699,6 +715,20 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on both 
         REQUIRE(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find(
                   "parent_id must be at most 64 bytes") != std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-instruction-result -- exactly 64 bytes clears the length cap "
+            "(boundary)") {
+        AsyncHarness h(pool);
+        auto iid = make_instruction(*h.instr);
+        int status = 0;
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
         REQUIRE(h.calls.empty());
     }
     SECTION("from-inventory-query -- a fifth site the #4307 brief didn't name, found "
@@ -721,6 +751,53 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on both 
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
+    SECTION("from-inventory-query -- exactly 64 bytes clears the length cap "
+            "(boundary, 404s on ownership)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = nlohmann::json::array(
+            {{{"plugin", "os_info"}, {"field", "platform"}, {"op", "=="}, {"value", "linux"}}});
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+}
+
+// #4734 alias-length regression: `parent_id` accepts either a canonical
+// `rs_...` id or a per-operator alias (the set's own `name`, valid up to
+// kResultSetNameMaxLen == 256 bytes). The new 64-byte kResultSetParentIdMaxLen
+// bound is checked BEFORE alias resolution is attempted, so a real,
+// previously-working alias between 65 and 256 bytes is now refused rather
+// than resolved. This is the actual behaviour-changing case the fix
+// introduces (see changelog.d and docs/user-manual/server-admin.md's vNEXT
+// entry) -- it had zero test coverage until now.
+TEST_CASE("from-tar-query: a real alias longer than 64 bytes is refused before "
+          "resolution is attempted (the #4734 alias-length regression)",
+          "[pg][result_set][async][tar][alias][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string long_alias(100, 'n');
+    h.seed_materialized(long_alias, {"a1"});
+
+    int status = 0;
+    nlohmann::json body;
+    body["sql"] = "SELECT 1";
+    body["parent_id"] = long_alias;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("parent_id must be at most 64 bytes") !=
+          std::string::npos);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
@@ -2854,17 +2931,34 @@ TEST_CASE("POST /api/v1/result-sets: an oversized parent_id is refused with 400"
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
-    AsyncHarness h(pool);
-    nlohmann::json body;
-    body["name"] = "x";
-    body["parent_id"] = std::string(65, 'p');
-    int status = 0;
-    auto j = h.post("/api/v1/result-sets", body.dump(), status);
-    CHECK(status == 400);
-    CHECK(j["error"]["message"].get<std::string>().find("parent_id must be at most 64 bytes") !=
-          std::string::npos);
-    std::string next;
-    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+
+    SECTION("65 bytes is refused") {
+        AsyncHarness h(pool);
+        nlohmann::json body;
+        body["name"] = "x";
+        body["parent_id"] = std::string(65, 'p');
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("exactly 64 bytes clears the length cap (boundary, 404s on ownership "
+            "since it's a random unowned id, but never the length-cap 400)") {
+        AsyncHarness h(pool);
+        nlohmann::json body;
+        body["name"] = "x";
+        body["parent_id"] = std::string(yuzu::server::mcp::kResultSetParentIdMaxLen, 'p');
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        CHECK(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
 }
 
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
