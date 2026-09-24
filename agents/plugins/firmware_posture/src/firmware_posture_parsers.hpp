@@ -123,26 +123,31 @@ enum class ReadOutcome { ok, absent, denied, failed };
     return hr;
 }
 
-/// Classifies a wmi_bounded error token, STAGE-AWARE: which stages may legitimately say "not
-/// there"? A refusal HRESULT is `denied` at every stage; a token with no HRESULT is `failed`.
-/// An absence HRESULT (0x8004100E / 0x80041010 / 0x80041002) reads `absent` only where WMI can
-/// really be answering "the namespace or class does not exist":
-///   - `wmi_connect_failed_*` / `wmi_query_failed_*`: the connect or the query itself said so;
-///   - `wmi_next_failed_*` with WBEM_E_INVALID_CLASS (0x80041010) ONLY. The query runs
-///     semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY), so ExecQuery succeeds without
-///     resolving the class and a missing CLASS is delivered at the first Next() (verified live on
-///     the rig, commit 89074810a). NOT_FOUND (0x80041002) or INVALID_NAMESPACE (0x8004100E) at
-///     enumeration cannot be a "class is missing" answer: they are a runtime fault (a damaged
-///     repository or provider) and read `failed`.
-/// The proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
-/// schema answer, so it never reads `absent` either.
+/// Classifies a wmi_bounded error token, STAGE-AWARE. A refusal HRESULT is `denied` at every
+/// stage; a token with no HRESULT is `failed`. `absent` is exactly the two answers WMI gives when
+/// the thing really is missing, and nothing else:
+///   - WBEM_E_INVALID_NAMESPACE (0x8004100E) from `wmi_connect_failed_*`: the namespace is not
+///     there (a namespace is resolved at ConnectServer);
+///   - WBEM_E_INVALID_CLASS (0x80041010) from `wmi_query_failed_*` or `wmi_next_failed_*`: the
+///     class is not there. The query runs semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY),
+///     so ExecQuery can succeed without resolving the class and the answer then arrives at the
+///     first Next(); tests/unit/test_wmi_bounded.cpp records that WQL validation is deferred to
+///     Next(), and a probe on the rig saw a non-existent class fail at Next with InvalidClass
+///     (issue #4900 tracks a committed real-WMI test).
+/// Every other absence-looking HRESULT is a FAULT and reads `failed`: WBEM_E_NOT_FOUND
+/// (0x80041002) anywhere (Microsoft lists it at connect as a repository-corruption symptom), and
+/// INVALID_NAMESPACE / INVALID_CLASS at a stage that cannot legitimately produce them. The
+/// proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
+/// schema answer, so it never reads `absent`. A damaged repository that presents AS one of the two
+/// answers is indistinguishable from a real absence (README caveat 4; decision in #4900).
 [[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token) noexcept {
     const auto hr = hresult_from_token(token);
     const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
     if (o != ReadOutcome::absent) return o == ReadOutcome::ok ? ReadOutcome::failed : o;
-    if (token.starts_with("wmi_connect_failed_") || token.starts_with("wmi_query_failed_"))
+    if (token.starts_with("wmi_connect_failed_") && *hr == 0x8004100Eu) return ReadOutcome::absent;
+    if ((token.starts_with("wmi_query_failed_") || token.starts_with("wmi_next_failed_")) &&
+        *hr == 0x80041010u)
         return ReadOutcome::absent;
-    if (token.starts_with("wmi_next_failed_") && *hr == 0x80041010u) return ReadOutcome::absent;
     return ReadOutcome::failed;
 }
 

@@ -34,8 +34,9 @@
  * classify_wmi_error_token), the failed-call mappings (apply_wmi_error_token /
  * apply_smbios_call_failed) and row mapping (wmi_bios_rows /
  * parse_smbios_type0 / smbios_rows) is a pure function in the parsers header;
- * this TU only performs the calls, builds a FirmwareReport and hands it to
- * finish_report.
+ * this TU performs the calls, records the truncation and size tokens
+ * (wmi:row_cap, smbios:oversized, smbios:size_race) and the empty-rowset absent
+ * row inline, builds a FirmwareReport and hands it to finish_report.
  *
  * ── Probe record (run-context: symbol + service-identity in the banner) ──
  * the-rig, Windows 11 Pro 10.0.26200 x64, 2026-09-21, run as NT AUTHORITY\SYSTEM (scheduled task,

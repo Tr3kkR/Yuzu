@@ -26,8 +26,10 @@
  * and every row mapping (parse_dmi_sysfs/dmi_rows, fwupd_device_rows) are pure
  * functions in the parsers header; this TU performs the calls, formats errno
  * names, builds a FirmwareReport and hands it to finish_report -- the one
- * writer of rows and result status. (The `dmi:<file>:oversized`, `dmi:bios_release`,
- * `fwupd:shape`, `fwupd:row_cap` and `fwupd:budget` tokens are recorded inline.)
+ * writer of rows and result status. (Recorded inline here: `dmi:<file>:oversized`,
+ * `dmi:bios_release`, `fwupd:budget`, `fwupd:not_built` and the `fwupd:shape` of a
+ * mismatched reply; `fwupd:row_cap` and the per-device `fwupd:shape` come from the
+ * pure fwupd_device_rows.)
  *
  * A build without libsystemd (-Dsystemd_guard=auto|disabled) is a
  * reduced-coverage BUILD, not an OS statement: it reports update_pending

@@ -409,7 +409,8 @@ TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware
     CHECK(classify_win32_error(122) == ReadOutcome::failed); // ERROR_INSUFFICIENT_BUFFER
     CHECK(classify_win32_error(267) == ReadOutcome::failed); // ERROR_DIRECTORY: the ENOTDIR analogue, never absence
     CHECK(classify_win32_error(0) == ReadOutcome::ok);
-    CHECK(classify_hresult(0) == ReadOutcome::ok);    CHECK(classify_hresult(0x80041003u) == ReadOutcome::denied);  // WBEM_E_ACCESS_DENIED
+    CHECK(classify_hresult(0) == ReadOutcome::ok);
+    CHECK(classify_hresult(0x80041003u) == ReadOutcome::denied);  // WBEM_E_ACCESS_DENIED
     CHECK(classify_hresult(0x80070005u) == ReadOutcome::denied);  // E_ACCESSDENIED
     CHECK(classify_hresult(0x8004100Eu) == ReadOutcome::absent);  // WBEM_E_INVALID_NAMESPACE
     CHECK(classify_hresult(0x80041010u) == ReadOutcome::absent);  // WBEM_E_INVALID_CLASS
@@ -546,24 +547,26 @@ TEST_CASE("hresult_from_token: extracts only a trailing 0x<8 hex digits>", "[fir
     CHECK_FALSE(hresult_from_token("").has_value());
 }
 
-// The stage-aware WMI error classification. Fails under: an enumeration-stage NOT_FOUND
-// (wmi_next_failed_0x80041002, a runtime fault) reading as a definitive `absent` with no token;
+// The stage-aware WMI error classification. Fails under: any absence-looking HRESULT reading as a
+// definitive `absent` with no token where WMI is not actually answering "missing" (NOT_FOUND
+// anywhere, an enumeration-stage NOT_FOUND / INVALID_NAMESPACE, a connect-stage INVALID_CLASS);
 // and, in the other direction, under losing the `absent` the earlier governance contract
-// (FV-CODEX-01) requires for a MISSING namespace or class: the query is semisynchronous, so a
-// missing CLASS is delivered at the first Next() as WBEM_E_INVALID_CLASS (verified live on the
-// rig, commit 89074810a) and must still read `absent`.
-TEST_CASE("classify_wmi_error_token: only a stage that can really say 'not there' may read absent",
+// (FV-CODEX-01) requires for a MISSING namespace (INVALID_NAMESPACE at connect) or class
+// (INVALID_CLASS at query, or at the first Next(): the query is semisynchronous, see
+// tests/unit/test_wmi_bounded.cpp, so a missing class can arrive there).
+TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives when something is missing",
           "[firmware_posture]") {
-    // connect / query: the namespace or class itself is reported missing
+    // exactly three cells read absent
     CHECK(classify_wmi_error_token("wmi_connect_failed_0x8004100e") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041002") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e") == ReadOutcome::absent);
     CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002") == ReadOutcome::absent);
-    // enumeration: ONLY INVALID_CLASS is a "class is missing" answer (deferred to the first Next)
     CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010") == ReadOutcome::absent);
+    // NOT_FOUND is never a "missing" answer here: Microsoft lists it as a repository-corruption symptom
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041002") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002") == ReadOutcome::failed);
     CHECK(classify_wmi_error_token("wmi_next_failed_0x80041002") == ReadOutcome::failed);
+    // a namespace answer at a stage that cannot produce it, and a class answer at connect
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e") == ReadOutcome::failed);
     CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e") == ReadOutcome::failed);
     // the proxy blanket runs before the query and carries no WBEM schema answer
     CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002") == ReadOutcome::failed);
@@ -584,10 +587,10 @@ TEST_CASE("classify_wmi_error_token: only a stage that can really say 'not there
     CHECK(classify_wmi_error_token("wmi_connect_failed_0x00000000") == ReadOutcome::failed);
 }
 
-// The Windows failed-WMI mapping the leg applies. Fails under: a runtime enumeration fault
-// (NOT_FOUND at Next) writing the explicit absent rows with no token (the false absence an
-// external review's governance found), a missing class no longer writing them (FV-CODEX-01), or a
-// refusal not setting the denial flag.
+// The Windows failed-WMI mapping the leg applies. Fails under: a runtime fault (NOT_FOUND at any
+// stage) writing the explicit absent rows with no token (the false absence the governance review
+// found), a missing namespace or class no longer writing them (FV-CODEX-01), or a refusal not
+// setting the denial flag.
 TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or class; else unreadable plus a token",
           "[firmware_posture]") {
     {   // a missing CLASS arrives at the first Next() as INVALID_CLASS: explicit absent rows, OK
@@ -596,13 +599,22 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
         REQUIRE(rep.rows.size() == 3);
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|absent|wmi");
         CHECK_FALSE(rep.constraints.any_failure());
+        CHECK_FALSE(rep.denied);
         CHECK(select_verdict(rep.constraints, rep.denied).status == YUZU_RESULT_STATUS_OK);
     }
     {   // a missing namespace at connect: explicit absent rows, OK
         FirmwareReport rep;
         apply_wmi_error_token(rep, "wmi_connect_failed_0x8004100e");
-        CHECK(rep.rows.size() == 3);
+        REQUIRE(rep.rows.size() == 3);
         CHECK_FALSE(rep.constraints.any_failure());
+        CHECK_FALSE(rep.denied);
+    }
+    {   // NOT_FOUND at connect (a repository-corruption symptom): one unreadable row and a token
+        FirmwareReport rep;
+        apply_wmi_error_token(rep, "wmi_connect_failed_0x80041002");
+        REQUIRE(rep.rows.size() == 1);
+        CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "wmi:wmi_connect_failed_0x80041002");
     }
     {   // a runtime fault at enumeration: one unreadable row and a token, never absent
         FirmwareReport rep;
@@ -614,11 +626,13 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
         CHECK(v.reason == "wmi:wmi_next_failed_0x80041002");
         CHECK(v.rc == 1);
     }
-    {   // a refusal at any stage sets the denial flag
+    {   // a refusal at any stage sets the denial flag and keeps its token
         FirmwareReport rep;
         apply_wmi_error_token(rep, "wmi_next_failed_0x80041003");
         CHECK(rep.denied);
-        CHECK(select_verdict(rep.constraints, rep.denied).status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        const auto v = select_verdict(rep.constraints, rep.denied);
+        CHECK(v.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        CHECK(v.reason == "wmi:wmi_next_failed_0x80041003");
     }
     {   // a deadline overrun carries no HRESULT: failed
         FirmwareReport rep;
@@ -633,9 +647,10 @@ TEST_CASE("apply_smbios_call_failed: no RSMB provider is an explicit absent row;
     {   // ERROR_FILE_NOT_FOUND (2): no provider, explicit absent rows, no token
         FirmwareReport rep;
         apply_smbios_call_failed(rep, 2);
-        CHECK(rep.rows.size() == 3);
+        REQUIRE(rep.rows.size() == 3);
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|absent|smbios");
         CHECK_FALSE(rep.constraints.any_failure());
+        CHECK_FALSE(rep.denied);
     }
     {   // ERROR_ACCESS_DENIED (5): refusal
         FirmwareReport rep;
@@ -651,24 +666,40 @@ TEST_CASE("apply_smbios_call_failed: no RSMB provider is an explicit absent row;
             apply_smbios_call_failed(rep, e);
             REQUIRE(rep.rows.size() == 1);
             CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|smbios");
-            CHECK(select_verdict(rep.constraints, rep.denied).status == YUZU_RESULT_STATUS_CONSTRAINED);
+            const auto v = select_verdict(rep.constraints, rep.denied);
+            CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(v.reason == "smbios:win32_" + std::to_string(e));
         }
     }
 }
 
 // The failed GetUpgrades mapping (one call per updatable device). Fails under: `denied` losing its
 // flag, NothingToDo recording a token, or a failure recording none.
+// A refusal recorded earlier must survive a later non-refusal failure: the verdict stays
+// PERMISSION_DENIED and keeps both tokens. Fails under: `denied` being overwritten instead of OR-ed.
+TEST_CASE("FirmwareReport: a refusal stays sticky across a later non-refusal failure", "[firmware_posture]") {
+    FirmwareReport rep;
+    rep.fail("vendor", kSrcSmbios, "smbios:win32_5", true);
+    apply_wmi_error_token(rep, "wmi_next_failed_0x80041002"); // a non-refusal fault afterwards
+    CHECK(rep.denied);
+    const auto v = select_verdict(rep.constraints, rep.denied);
+    CHECK(v.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(v.reason == "smbios:win32_5,wmi:wmi_next_failed_0x80041002");
+}
+
 TEST_CASE("apply_upgrades_failure: NothingToDo continues; denied and failed record a token",
           "[firmware_posture]") {
     {
         FirmwareReport rep;
         CHECK(apply_upgrades_failure(rep, classify_fwupd_error("org.freedesktop.fwupd.NothingToDo", 0), "errno_0"));
         CHECK_FALSE(rep.constraints.any_failure());
+        CHECK(rep.rows.empty());
     }
     {
         FirmwareReport rep;
         CHECK_FALSE(apply_upgrades_failure(rep, classify_fwupd_error("org.freedesktop.DBus.Error.AccessDenied", 0), "errno_0"));
         CHECK(rep.denied);
+        CHECK(rep.rows.empty());
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_upgrades:permission_denied");
     }
     for (const auto o : {FwupdOutcome::failed, FwupdOutcome::unavailable}) {
