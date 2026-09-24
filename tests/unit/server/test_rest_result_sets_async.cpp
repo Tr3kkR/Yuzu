@@ -2800,6 +2800,52 @@ TEST_CASE("POST /api/v1/result-sets: an oversized source_kind is refused with 40
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
+// #4307 item 6: the generic create route's parent_id shape check used to be
+// `contains && is_string && !empty`, so a malformed/empty parent_id fell
+// through to the untargeted "no parent" arm and was silently accepted --
+// unlike the async producers above, this route never dispatches, so the
+// consequence is a lineage/UX defect (the caller believes the set is
+// parented and it silently isn't), not a dispatch-safety one -- no
+// yuzu_server_dispatch_target_rejected_total counter (that metric family is
+// reserved for the targeting-argument routes named in #2500).
+TEST_CASE("POST /api/v1/result-sets: a malformed or empty parent_id is refused with 400, "
+          "not silently treated as parentless",
+          "[pg][result_set][security][4307]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("numeric parent_id") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x","parent_id":123})", status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("empty-string parent_id") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x","parent_id":""})", status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("omitting parent_id still creates a parentless set (regression)") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x"})", status);
+        CHECK(status == 201);
+        CHECK(j.contains("data"));
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1);
+    }
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

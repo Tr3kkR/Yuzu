@@ -26927,6 +26927,42 @@ TEST_CASE("MCP create_result_set_from_inventory_query: an oversized parent_id is
     CHECK(body["error"]["code"] == kInvalidParams);
 }
 
+// #4307 item 6: the generic create_result_set tool's parent_id shape check
+// used to be `contains && is_string && !empty`, so a malformed/empty
+// parent_id fell through to the untargeted "no parent" arm and was silently
+// accepted -- mirrors REST's identical fix on the generic
+// POST /api/v1/result-sets route. This tool never dispatches, so the
+// consequence is a lineage/UX defect, not a dispatch-safety one -- checked
+// ahead of the store-availability gate, so this is a client error even with
+// no ResultSetStore wired.
+TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with "
+          "kInvalidParams, not silently treated as parentless",
+          "[mcp][result-sets][security][4307]") {
+    McpTestServer ts;
+    ts.start();
+
+    SECTION("numeric parent_id") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"x","parent_id":123}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+    SECTION("empty-string parent_id") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set","arguments":{"name":"x","parent_id":""}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+}
+
 // Gate 4 unhappy-path finding (#4364 re-review): create_result_set has no
 // source_kind allowlist and only bounds source_kind's own length, so a row
 // can be minted directly (bypassing the create-time params checks

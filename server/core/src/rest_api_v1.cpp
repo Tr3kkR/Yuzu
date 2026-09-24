@@ -10245,6 +10245,29 @@ void RestApiV1::register_routes(
             nlohmann::json payload = body.contains("source_payload")
                                           ? body["source_payload"]
                                           : nlohmann::json::object();
+            // #4307 item 6: a malformed/empty parent_id (e.g. `{"parent_id":
+            // 123}` or `{"parent_id":""}`) previously fell straight through
+            // the is_string()+!empty() guard below and was silently treated
+            // as "no parent_id" -- the caller believed the new set was
+            // parented onto an existing one and it silently wasn't. Unlike
+            // the async producers' identically-shaped guard (#2500), parent_id
+            // here is NOT a dispatch-targeting argument -- this route is
+            // synchronous and never dispatches -- so this is a caller-
+            // UX/lineage-correctness fix, not a dispatch-safety one: no
+            // yuzu_server_dispatch_target_rejected_total counter (that metric
+            // family is reserved for the targeting-argument routes).
+            if (body.contains("parent_id") &&
+                (!body["parent_id"].is_string() ||
+                 body["parent_id"].get_ref<const std::string&>().empty())) {
+                const std::string_view reason =
+                    body["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
+                audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                         std::string("reason=") + std::string(reason));
+                rs_err(res, 400,
+                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent "
+                       "set; omit it entirely to leave the set parentless");
+                return;
+            }
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
                 !body["parent_id"].get<std::string>().empty()) {
                 auto pid = body["parent_id"].get<std::string>();
