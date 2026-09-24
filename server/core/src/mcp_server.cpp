@@ -1414,12 +1414,15 @@ static const ToolDef kTools[] = {
     // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
     // below, not the global perm gate.
     {"get_dex_device_score",
-     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
-     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "Per-device DEX read model: the 0-100 experience score (-1 when no store is "
+     "configured) plus this device's OWN signal summary "
      "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
      "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
      "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
-     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "lens. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / "
+     "query error) returns a retryable error instead of a score — never conflate the -1 "
+     "'no store' case above with a degraded read, which is an ERROR response, not a -1 "
+     "score. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
      "management-group-scoped to this device.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
@@ -1543,11 +1546,14 @@ static const ToolDef kTools[] = {
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
      "devices list. The devices list names affected agent IDs (behavioral data), confined to "
      "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
+     "unscored (#4855) counts connected devices whose per-device score could not be computed "
+     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
+     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
-     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -14406,9 +14412,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
                 // persist bool is captured and surfaced as audit_persisted:false in the
                 // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                // #4855: the behavioral-PII audit row stays "success" regardless of a
+                // downstream store degrade below (the device WAS accessed on the
+                // caller's behalf; the audit records the access, not the outcome) —
+                // the separate `mcp_audit` tool-invocation record is what flips to
+                // "failure" on a degrade.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
                     "DEX per-device score + signal summary via MCP get_dex_device_score");
+                if (model.degraded) {
+                    // #4855: never serialize a degraded model as a healthy score of
+                    // 100 with no signals -- a retryable error, matching the REST
+                    // twin's 503 and get_dex_device_app_perf's degrade branch below.
+                    mcp_audit("failure", "DEX store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", agent_id);
                 res.set_content(
                     success_response(

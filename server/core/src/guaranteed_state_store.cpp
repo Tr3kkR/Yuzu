@@ -251,28 +251,47 @@ void bump_policy_generation_on(PGconn* conn) {
 // failure), and count+sampled-log a degrade on store-not-open / pool-timeout
 // / query-error via yuzu_server_guardian_read_degrade_total{reason}. A successful
 // EMPTY container is NOT a degrade — only body() returning nullopt is.
+//
+// `dex_read_checked` is the TYPE-DISTINGUISHABLE twin (#4855): it returns
+// `std::nullopt` on a degrade instead of collapsing it into an empty
+// container, so a caller that NEEDS to tell "degraded" apart from "genuinely
+// no data" (the DEX device-score read — a degrade must never render as a
+// perfectly healthy score) can. It still bumps
+// `yuzu_server_guardian_read_degrade_total{reason}` via the same
+// `note_read_degrade` on every degrade path. `dex_read` itself is now a thin
+// `.value_or(Result{})` wrapper over it, so the ~26 other DEX/analytics call
+// sites (#2659's still-deferred widening) stay behaviour-identical
+// (empty-on-degrade) — this widens ONLY the device-score read, not the
+// whole family.
 template <typename Result, typename Body>
-Result dex_read(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
-                DegradeSampler& sampler, Body&& body) {
-    Result empty{};
+std::optional<Result> dex_read_checked(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics,
+                                       const char* method, DegradeSampler& sampler, Body&& body) {
     if (!open) {
         if (const auto d = note_read_degrade(metrics, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: store not open", method);
-        return empty;
+        return std::nullopt;
     }
     auto lease = pool.try_acquire_for(kDexReadTimeout);
     if (!lease) {
         if (const auto d = note_read_degrade(metrics, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: pool acquire timed out", method);
-        return empty;
+        return std::nullopt;
     }
     auto result = body(lease.get());
     if (!result) {
         if (const auto d = note_read_degrade(metrics, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: query failed", method);
-        return empty;
+        return std::nullopt;
     }
     return std::move(*result);
+}
+
+template <typename Result, typename Body>
+Result dex_read(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
+                DegradeSampler& sampler, Body&& body) {
+    return dex_read_checked<Result>(open, pool, metrics, method, sampler,
+                                    std::forward<Body>(body))
+        .value_or(Result{});
 }
 
 // ── Postgres schema (ADR-0038): the FINAL column set of all 8 SQLite
@@ -1361,11 +1380,17 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::st
         });
 }
 
-std::vector<DexSignalCount>
-GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
-                                                const std::string& since) const {
+std::optional<std::vector<DexSignalCount>>
+GuaranteedStateStore::dex_device_signal_summary_checked(const std::string& agent_id,
+                                                        const std::string& since) const {
+    // #4855: the ONE DEX/analytics read the device-score surfaces (dashboard
+    // lens, REST GET /api/v1/dex/devices/{id}, MCP get_dex_device_score) need
+    // to tell "degraded" apart from "no signals" — a degrade here previously
+    // rendered as a perfectly healthy score of 100. See dex_read_checked's
+    // doc comment: this is a NAMED, deliberate widening of this one read,
+    // not the #2659 fleet-wide widening.
     static DegradeSampler sampler;
-    return dex_read<std::vector<DexSignalCount>>(
+    return dex_read_checked<std::vector<DexSignalCount>>(
         open_, pool_, metrics_, "dex_device_signal_summary", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<DexSignalCount>> {
             pg::PgResult res = pg::exec_params(
@@ -1390,6 +1415,13 @@ GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
             }
             return out;
         });
+}
+
+std::vector<DexSignalCount>
+GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
+                                                const std::string& since) const {
+    return dex_device_signal_summary_checked(agent_id, since)
+        .value_or(std::vector<DexSignalCount>{});
 }
 
 std::vector<DexSubjectCount>

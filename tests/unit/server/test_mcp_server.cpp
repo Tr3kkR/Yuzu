@@ -7575,6 +7575,51 @@ TEST_CASE("MCP DEX: get_dex_device_score returns the shape, confined to THIS dev
     CHECK(ts.audit_log.back() == "mcp.get_dex_device_score|success");
 }
 
+// #4855: a degraded signal-summary read must return a retryable ERROR, never
+// serialize a fabricated healthy score of 100 with no signals. DROP TABLE on
+// a second connection forces a genuine query-level failure while the store
+// stays open (same technique the REST/lens degrade tests use). The
+// behavioral-PII dex.device.view audit row stays "success" (the device WAS
+// accessed on the caller's behalf); the SEPARATE tool-invocation mcp_audit
+// record is what flips to "failure".
+TEST_CASE("MCP DEX: get_dex_device_score on a degraded signal-summary read returns a retryable "
+          "error, never a fabricated healthy score",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":951,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    CHECK(res->body.find("\"result\"") == std::string::npos); // no success payload
+    CHECK(res->body.find("DEX store read degraded") != std::string::npos);
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    bool saw_view_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.view|success")
+            saw_view_success = true;
+    CHECK(saw_view_success); // behavioral-PII audit still records the access
+    CHECK(ts.audit_log.back() == "mcp.get_dex_device_score|failure");
+}
+
 TEST_CASE("MCP DEX: get_dex_device_score scope gate unwired -> fail closed, never global",
           "[mcp][integration][dex]") {
     McpTestServer ts; // scoped_perm_fn_for_test left empty
