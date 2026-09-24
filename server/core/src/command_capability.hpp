@@ -152,12 +152,14 @@ public:
     /// does not silently overflow it. Exceeding it is a construction-time
     /// programmer error — fail loud via an exception, never silently drop a
     /// fragment (a dropped fragment would make every one of its rows
-    /// `Unclassified`, indistinguishable from an honest miss). Raised
-    /// 16 -> 20 (Wave 8 PR8.1-a1, platform_security): the seventeenth
-    /// fragment exactly exhausted the prior ceiling; the bump restores
-    /// headroom for the fragments still landing in this cohort rather than
-    /// re-exhausting it on the very next one.
-    static constexpr std::size_t kMaxSources = 20;
+    /// `Unclassified`, indistinguishable from an honest miss).
+    /// Raised 16 to 24 (#4729 merge, two sibling plugins — browser_inventory
+    /// and app_control — each shipping its own fragment file landed the live
+    /// source count at 17, past the old ceiling): the prior value was already
+    /// at capacity with zero headroom, contrary to its own "generous, not a
+    /// tight fit" contract. 24 gives room for several more
+    /// individually-fragmented plugins before this needs raising again.
+    static constexpr std::size_t kMaxSources = 24;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {

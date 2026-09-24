@@ -51,6 +51,7 @@
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -453,6 +454,39 @@ TEST_CASE("app_usage.summary (real fragment): Forensics single-target rule — 1
     CHECK(refused.refusal_reason == kReasonForensicUntargeted);
 }
 
+// Wave 10 P2a-3 — pins the REAL browser_inventory fragment (not the
+// hand-built kForensicsFixture above) through the same Forensics
+// single-target rule: browser_inventory's two rows are ReadOnly/
+// AdminOrApproval under the Forensics securable (field-for-field copy of
+// execution_artifacts'), so they must be targeted exactly as
+// execution_artifacts is.
+TEST_CASE("browser_inventory (real fragment): Forensics single-target rule — 1 agent Targeted, "
+          "2 agents RefuseUntargeted for both actions",
+          "[server][dispatch][security]") {
+    namespace capdecls = yuzu::server::capdecls;
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_browser_inventory()};
+
+    for (const char* action : {"browsers", "profiles"}) {
+        auto classified = registry.classify("browser_inventory", action);
+        REQUIRE(classified.has_value());
+        CHECK(classified->securable == kForensicsSecurable);
+        CHECK(requires_explicit_targets(*classified));
+
+        const auto targeted = evaluate_destructive_targeting(classified,
+                                                              /*valid_nonempty_agent_ids=*/true,
+                                                              /*scope_key_present=*/false,
+                                                              /*agent_id_count=*/1);
+        CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                             /*valid_nonempty_agent_ids=*/true,
+                                                             /*scope_key_present=*/false,
+                                                             /*agent_id_count=*/2);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+    }
+}
+
 TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
           "Forensics pair",
           "[server][dispatch][security]") {
@@ -542,7 +576,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 17> sources{{
+    const std::array<std::span<const CommandCapability>, 18> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -559,6 +593,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_platform_security(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -615,6 +650,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_platform_security(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");
