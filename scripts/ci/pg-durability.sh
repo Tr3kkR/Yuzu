@@ -190,6 +190,18 @@ pg_dsn_redact() {
 #   - the whole string matches a scheme + "://" + authority (+ optional
 #     "/rest") shape, with the authority captured as everything up to the
 #     first '/' after "://" — never past it;
+#   - the REST (the optional "/rest" tail, i.e. everything from that first
+#     '/' onward) contains no '@' at all. Without this, an authority that
+#     is itself well-formed but whose PATH also contains a second
+#     '@host:port/'-shaped substring — e.g.
+#     `postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433
+#     /rest` — would pass every authority-shape check below although
+#     pg_dsn_host_port's greedy regex anchors on the LAST '@' in the whole
+#     string and so reads the PATH's host:port (127.0.0.1:5433, loopback)
+#     instead of the authority's own (notloopback.example:1234, not
+#     loopback) — vouching for a target this function never actually
+#     inspected. Checked up front, before the authority's own '@'-count,
+#     so this shape fails for this specific, readable reason;
 #   - the authority contains no '?': a URI-form DSN's query string is
 #     itself a bag of libpq keyword=value parameters (RFC 3986-style
 #     `key=value[&...]`) — `postgresql://yuzu@127.0.0.1:56551/postgres
@@ -204,13 +216,23 @@ pg_dsn_redact() {
 #     <host>:<port>` with no '/' or '@' inside the host (userinfo MAY
 #     contain ':', e.g. `user:password@host:port`) — a userinfo-free
 #     authority, a second '@' inside it, or a non-numeric/missing port all
-#     mean this function cannot derive a trustworthy host:port from it.
+#     mean this function cannot derive a trustworthy host:port from it;
+#   - AGREEMENT INVARIANT with pg_dsn_host_port, kept as a root-cause
+#     backstop independent of the two checks above: pg_heal_allowed is
+#     always called with the host pg_dsn_host_port derives from this same
+#     DSN, never with this function's own parse of it — so "provable" only
+#     means what it claims to mean if pg_dsn_host_port's read of this DSN
+#     is EXACTLY the host:port this function just derived from the
+#     authority. This holds by construction today given the checks above,
+#     but is asserted explicitly so a future change to either regex cannot
+#     silently reopen the gap the previous check closed only by accident.
 # Returns 1 (not provable) on any of the above; 0 only when all hold.
 pg_dsn_target_provable() {
   local dsn="$1"
   case "$dsn" in *'?'*) return 1 ;; esac
   [[ "$dsn" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^/]*)(/.*)?$ ]] || return 1
   local authority="${BASH_REMATCH[1]}"
+  case "${BASH_REMATCH[2]:-}" in *'@'*) return 1 ;; esac
   local at_count=0 rest="$authority"
   while [[ "$rest" == *"@"* ]]; do
     at_count=$((at_count + 1))
@@ -218,6 +240,7 @@ pg_dsn_target_provable() {
   done
   [[ "$at_count" -eq 1 ]] || return 1
   [[ "$authority" =~ ^[^@]+@[^:/@]+:[0-9]+$ ]] || return 1
+  [[ "$(pg_dsn_host_port "$dsn")" == "${authority#*@}" ]] || return 1
   return 0
 }
 
@@ -331,6 +354,16 @@ pg_durability_selftest() {
   pg_durability_check "dsn_target_provable path-embedded host@port not provable" "1" "$rc"
   rc=0; pg_dsn_target_provable 'postgresql://foo/x@127.0.0.1:5433/db' || rc=$?
   pg_durability_check "dsn_target_provable no-userinfo path '@' not provable" "1" "$rc"
+  # A WELL-FORMED single-@ authority (yuzu@notloopback.example:1234)
+  # whose PATH also contains an '@host:port/'-shaped substring. Without the
+  # path-'@' check and the pg_dsn_host_port agreement invariant, the
+  # authority-shape checks alone would call this provable while
+  # pg_dsn_host_port's greedy regex reads the PATH's host:port
+  # (127.0.0.1:5433, loopback) instead of the authority's own
+  # (notloopback.example:1234, not loopback) — vouching for a host this
+  # function never actually inspected.
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433/rest' || rc=$?
+  pg_durability_check "dsn_target_provable path-embedded @host:port past a well-formed authority not provable" "1" "$rc"
 
   out="$(pg_dsn_host_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu')"; pg_durability_check "dsn_host_port keyword-form" "?" "$out"

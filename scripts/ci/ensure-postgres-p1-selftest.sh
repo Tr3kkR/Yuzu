@@ -46,7 +46,7 @@ N=0
 # the real one) only ever needs dirname/sed/sleep/cat as EXTERNAL tools —
 # everything else it touches (regex matching, /dev/tcp, string ops) is a
 # bash builtin. Symlinking the host's real copies keeps this portable across
-# macOS /bin/bash and MSYS2 bash without hard-coding either one's coreutils
+# macOS /bin/bash and Linux bash without hard-coding either one's coreutils
 # layout.
 BASEBIN="$TMP/basebin"
 mkdir -p "$BASEBIN"
@@ -219,14 +219,6 @@ new_state() {
   [[ -n "${9:-}" ]] && printf '%s' "$9" > "$dir/config_guard_rc"
   [[ -n "${10:-}" ]] && printf '%s' "${10}" > "$dir/config_guard_fail_out"
   printf '%s' "$dir"
-}
-
-# set_port_fixture <dir> <port> <name> <value> — an ADDITIONAL, port-keyed
-# fixture layered on top of a new_state() call, for a case that needs port
-# A and port B to behave differently within the SAME invocation.
-set_port_fixture() {
-  local dir="$1" port="$2" name="$3" value="$4"
-  printf '%s' "$value" > "$dir/$name.$port"
 }
 
 # invoke <state_dir> <runner_name> <github_actions> <dsn> <ci_psql> <path_has_psql 0|1> [extra_env...]
@@ -573,8 +565,9 @@ expect_contains "path-psql-fallback" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN0}" "
 # ── 10. no psql at all — fallback + UNVERIFIED (also covers the TCP-only
 #        per-agent branch: the per-agent port has nothing listening) ───────
 # Needs base+1 (the derived per-agent port, agent index 1) to be genuinely
-# CLOSED so the real /dev/tcp probe fails — a fixed base of 5433 false-fails
-# on the Wee Tam Windows pool, where :5434 is agent 1's own live cluster.
+# CLOSED so the real /dev/tcp probe fails — a fixed base false-fails
+# wherever :5434 is live, for example a native cluster on a Linux host, or
+# Wee Tam's agent 1 before the MSYS2 skip above.
 # Search a short candidate list for a base whose neighbour port is
 # verifiably closed right now (same idiom as ensure-postgres.sh's tcp_probe).
 N=$((N + 1))
@@ -629,8 +622,8 @@ expect_not_contains "unreadable-settings" "calls.log" "ALTER SYSTEM issued" "$ca
 expect_contains "unreadable-settings" "stderr" "diagnostic withheld under Actions" "$err"
 expect_not_contains "unreadable-settings" "stderr" "permission denied" "$err"
 
-# ── 13. per-agent HAPPY path — SELECT 1 ok, only the per-agent DSN healed
-#         (nothing here) / conforms, and it alone is exported ─────────────
+# ── 13. per-agent HAPPY path — SELECT 1 ok; cluster conforms; only the
+#         per-agent DSN exported ───────────────────────────────────────────
 N=$((N + 1))
 DSN1='postgresql://yuzu:yuzu@127.0.0.1:5434/yuzu_test'
 state="$(new_state 0 "$CAP_OFF" '' '' '')"
@@ -676,6 +669,27 @@ expect_contains "path-at-not-provable" "stderr" "NOT healing" "$err"
 expect_contains "path-at-not-provable" "stderr" "cannot prove the target" "$err"
 expect_contains "path-at-not-provable" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN_PATHAT}" "$OUT"
 expect_not_contains "path-at-not-provable" "calls.log" "ALTER SYSTEM issued" "$calls"
+
+# ── 14c. A WELL-FORMED single-@ authority (yuzu@notloopback.example:1234)
+#          whose PATH also contains a second '@host:port/'-shaped substring
+#          is never provable either — drift-only, no ALTER — even though
+#          the authority alone parses cleanly and pg_dsn_host_port's own
+#          greedy regex anchors on the PATH's '@' instead, misreading the
+#          host:port as the loopback 127.0.0.1:5433 the path names rather
+#          than the authority's own non-loopback notloopback.example:1234.
+#          (An authority-only '@'-count alone misses this shape, since the
+#          authority by itself has exactly one '@'.) ────
+N=$((N + 1))
+DSN_PATHAT2='postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433/rest'
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN_PATHAT2" "$FAKEBIN/psql" 0
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "path-at-well-formed-authority-not-provable" "rc" "0" "$RC"
+expect_contains "path-at-well-formed-authority-not-provable" "stderr" "NOT healing" "$err"
+expect_contains "path-at-well-formed-authority-not-provable" "stderr" "cannot prove the target" "$err"
+expect_contains "path-at-well-formed-authority-not-provable" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN_PATHAT2}" "$OUT"
+expect_not_contains "path-at-well-formed-authority-not-provable" "calls.log" "ALTER SYSTEM issued" "$calls"
 
 # ── 15. A PGHOST-family env var in the job/runner environment refuses the
 #           heal even for an otherwise-perfect manifest/loopback DSN — the
@@ -783,11 +797,11 @@ expect_contains "sleep-scale-leading-zero" "stderr" "durability conformance ok" 
 expect_contains "sleep-scale-leading-zero" "stdout" "YUZU_TEST_POSTGRES_DSN=${DSN0}" "$OUT"
 
 # ── 22. static pin: exactly one absolute /usr/bin/timeout wrapper
-#          definition, at the CR3-M6-reconciled value — a bare `timeout`
-#          would resolve to Windows' timeout.exe under MSYS2's PATH order
-#          (a different, incompatible CLI), and a step-timeout/per-call-
-#          timeout mismatch reintroduces the 671s-vs-5min bound this fix
-#          reconciled. ──────────────────────────────────────────────────
+#          definition, at the value the step timeout is sized for — a bare
+#          `timeout` would resolve to Windows' timeout.exe under MSYS2's
+#          PATH order (a different, incompatible CLI), and a larger per-call
+#          timeout would let the script's worst case outlive the step's
+#          timeout-minutes. ──────────────────────────────────────────────────
 N=$((N + 1))
 expect "p1-timeout-static-pin" "exactly one absolute /usr/bin/timeout wrapper" "1" \
   "$(grep -c '^\[\[ -x /usr/bin/timeout \]\] && P1_TIMEOUT=(/usr/bin/timeout 30)$' "$ENSURE")"

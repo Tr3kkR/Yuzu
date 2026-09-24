@@ -22,9 +22,11 @@
   additionally exports YUZU_CI_PSQL to $env:GITHUB_ENV for THIS runner's own
   agent, read from the same manifest this script just validated — the
   contract scripts/ci/ensure-postgres.sh's durability conformance guard
-  relies on to resolve a proven psql.exe instead of an unauthenticated TCP
-  probe. The sibling scripts Provision-Windows-Runner.ps1 deploys alongside
-  this one (Update-ToolchainManifest.ps1, Test-ToolchainContract.ps1) also
+  relies on to resolve a proven psql.exe, which enables the heal and the
+  no-fallback rule, rather than a PATH psql (which only reports drift) or
+  none (conformance UNVERIFIED; per-agent selection by a bare TCP probe).
+  nightly.yml and release.yml's Windows Assert steps, and the contract
+  test's child pwsh run of this script (Test-ToolchainContract.ps1), also
   run under Actions with GITHUB_ENV set, so this must stay opt-in — never
   write the job env unless asked.
 

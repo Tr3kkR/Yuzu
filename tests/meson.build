@@ -2457,9 +2457,9 @@ if _bash_test.found()
   # The glue around pg-durability.sh's pure functions — ensure-postgres.sh's
   # psql resolution ladder, per-agent probe-and-fallback, no-fallback rule
   # and fail arms — driven through a FAKE psql (canned rows/exit codes, no
-  # database, no external network — the only socket use is one loopback
-  # connect to a verified-closed port, about 2s) rather than the decide
-  # function in isolation above.
+  # database, no external network — the only socket use is loopback
+  # connects to verified-closed ports) rather than the decide function in
+  # isolation above.
   test('pg durability p1 glue selftest',
     _bash_test,
     args: [files('../scripts/ci/ensure-postgres-p1-selftest.sh')],

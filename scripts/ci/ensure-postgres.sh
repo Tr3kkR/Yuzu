@@ -207,7 +207,7 @@ p1_probe_manifest() {
 # SYSTEMs, a reload) completes in milliseconds on a loopback cluster — 30s
 # is still generous headroom for a loaded runner. This value and the
 # step's own `timeout-minutes` (ci.yml) are reconciled against the script's
-# own worst case (CR3-M6): 4 attempts + 3 retry sleeps of the per-agent
+# own worst case: 4 attempts + 3 retry sleeps of the per-agent
 # probe, the read, the heal, and 5 re-read attempts of 1s each, all capped
 # at 30s per call, bound the script under 6 minutes — comfortably inside
 # the step's 8-minute timeout, so a hung psql is killed by THIS wrapper and
@@ -273,7 +273,7 @@ p1_diag() {
   fi
 }
 
-# p1_server_diag <rc> <text> — like p1_diag, but for POST-READ arms only: a
+# p1_server_diag <text> — like p1_diag, but for POST-READ arms only: a
 # psql call made after the top-of-p1_conform read has already proven the
 # SAME DSN parses and connects in this same process (the heal call and the
 # post-heal re-read). A client-side, credential-echoing parse error — the
@@ -287,12 +287,12 @@ p1_diag() {
 # ERROR/FATAL/WARNING/DETAIL/HINT — flattened and space-joined; anything
 # else (a stray sentinel, connection-banner noise, or simply no output at
 # all) prints a fixed "no ERROR/FATAL/WARNING/DETAIL/HINT line in psql
-# output" instead of echoing raw text. This function never repeats <rc> —
-# every caller already prefixes its own message with "(psql rc=${rc})", so
-# this used to double it up as "(psql rc=2): psql rc=2" when there was no
-# server line to print.
+# output" instead of echoing raw text. This takes only the text, never an
+# <rc> — every caller already prefixes its own message with
+# "(psql rc=${rc})", so passing rc through here used to double it up as
+# "(psql rc=2): psql rc=2" when there was no server line to print.
 p1_server_diag() {
-  local rc="${1:-}" text="${2//$'\r'/}"
+  local text="${1//$'\r'/}"
   local line='' out=''
   while IFS= read -r line; do
     case "$line" in
@@ -361,19 +361,19 @@ p1_conform() {
   allow=0
   heal_refusal_reason=''
   if [[ -n "${PGHOST:-}" || -n "${PGHOSTADDR:-}" || -n "${PGSERVICE:-}" || -n "${PGPORT:-}" ]]; then
-    # PGHOSTADDR and PGSERVICE actually redirect a plain URI DSN (probed
-    # live against psql 18.6: PGHOSTADDR overrides the URI's own host, and
-    # a matching pg_service.conf section applies its stored parameters on
-    # top). PGHOST and PGPORT are only DEFAULTS libpq applies when the DSN
+    # PGHOSTADDR, and a PGSERVICE section carrying hostaddr=, fill libpq's
+    # hostaddr, which a URI DSN never sets. libpq then dials hostaddr
+    # instead of resolving the URI's host (probed live against psql 18.6).
+    # PGHOST and PGPORT are only DEFAULTS libpq applies when the DSN
     # itself sets no host/port — a URI DSN always sets both, so in practice
     # they do NOT redirect it — but refusing on their mere presence too is
     # cheap and keeps this gate from depending on proving libpq's exact
     # precedence rules for every DSN shape this script might ever emit.
     # Non-fatal either way: drift is still reported below, the job still
     # proceeds — same posture as the PGOPTIONS gate above.
-    heal_refusal_reason="cannot prove the target (PGHOST/PGHOSTADDR/PGSERVICE/PGPORT set in the job/runner environment can redirect, or in PGHOST/PGPORT's case coincide with without truly proving, where libpq actually connects)"
+    heal_refusal_reason="cannot prove the target (PGHOST/PGHOSTADDR/PGSERVICE/PGPORT is set in the job/runner environment; PGHOSTADDR, or a PGSERVICE entry carrying hostaddr, redirects even a plain URI DSN, and PGHOST/PGPORT are refused conservatively)"
   elif ! pg_dsn_target_provable "$dsn"; then
-    heal_refusal_reason="cannot prove the target (the DSN is not a plain URI — it has a query string and/or more than one '@', either of which can shift where libpq actually connects)"
+    heal_refusal_reason="cannot prove the target (the DSN is not a plain postgresql://user@host:port/db URI — a query string, an '@' outside the authority, or a keyword-form, IPv6 or multi-host DSN can shift or hide where libpq actually connects)"
   elif pg_heal_allowed "${GITHUB_ACTIONS:-}" "${hp%%:*}" "$P1_PSQL_SRC" "1"; then
     allow=1
   fi
@@ -435,7 +435,7 @@ p1_conform() {
         -c 'ALTER SYSTEM SET full_page_writes = off' \
         -c 'SELECT pg_reload_conf()' 2>&1)" || rc=$?
       if [[ "$rc" != "0" ]]; then
-        echo "::error::ensure-postgres: heal failed on ${hp} (psql rc=${rc}; this includes the in-session loopback/target identity guard and the config-parse guard, either of which fails closed here): $(p1_server_diag "$rc" "$rows")" >&2
+        echo "::error::ensure-postgres: heal failed on ${hp} (psql rc=${rc}; this includes the in-session loopback/target identity guard and the config-parse guard, either of which fails closed here): $(p1_server_diag "$rows")" >&2
         return 1
       fi
       # pg_reload_conf() only signals the postmaster; SIGHUP handling (and,
@@ -453,7 +453,7 @@ p1_conform() {
       # Branch on the ACTUAL last outcome rather than always
       # citing pg_settings.source, which only explains the "not off" case.
       if [[ "$rc" != "0" ]]; then
-        echo "::error::ensure-postgres: could not re-read after heal on ${hp} (psql rc=${rc}): $(p1_server_diag "$rc" "$rows")" >&2
+        echo "::error::ensure-postgres: could not re-read after heal on ${hp} (psql rc=${rc}): $(p1_server_diag "$rows")" >&2
         return 1
       fi
       final_decision="$(pg_durability_decide 0 "$rows" || true)"

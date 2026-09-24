@@ -1217,8 +1217,9 @@ Resolution order inside the script:
    as an unparsed `?` host anyway and this function's own authority-only
    parse refuses the third), and with none of
    `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` set in the job/runner
-   environment (`PGHOSTADDR`/`PGSERVICE` actually redirect a plain URI DSN
-   — probed live against psql 18.6; `PGHOST`/`PGPORT` are only defaults
+   environment (`PGHOSTADDR`, or a `PGSERVICE` entry carrying `hostaddr`,
+   redirect even a plain URI DSN — via libpq's `hostaddr`, which a URI
+   never sets, probed live against psql 18.6; `PGHOST`/`PGPORT` are only defaults
    libpq applies when the DSN sets neither, so a URI DSN's own host/port
    normally win regardless — refused too, conservatively, rather than
    relied on to redirect) does the guard even ATTEMPT to **heal**. The DSN-string checks above only bound
@@ -1278,6 +1279,10 @@ Resolution order inside the script:
    off both the heal and the manifest per-agent no-fallback rule — path 1
    then demotes to a PATH `psql` (still reads and reports drift, never
    heals) or, with no `psql` at all, reports conformance **UNVERIFIED**.
+   This guard makes durability drift visible, or rules it out, as a cause
+   of a Windows `[pg]`-shard timeout; per-test connection and `CREATE
+   DATABASE` churn (#2354, "PG coverage by platform" below) is the other
+   known Windows `[pg]`-timeout driver.
    (Test seam:
    `YUZU_CI_PG_SLEEP_SCALE` scales the guard's bounded sleeps — 1 in
    production, 0 in the docs-suite selftest.)
@@ -1388,7 +1393,7 @@ compare `SELECT count(*) FROM pg_stat_activity` against
 |---|---|---|
 | `durability read failed on <host:port>: ...` | The first `pg_settings` read itself failed to connect/authenticate. | Run the query above against the DSN by hand; check the service is up and the credential is right. |
 | `durability settings unreadable on <host:port> (...): ...` | psql connected (rc 0) but the output wasn't 3 clean `name\|setting\|source` rows (e.g. a permission error) — this is the READ arm, so the raw text is withheld under Actions even though psql itself succeeded. | Check the role has `pg_read_all_settings` (or is superuser); run the query above by hand to see the real text. |
-| `... NOT healing (cannot prove the target)` | The DSN has a query string, more than one `@` in its authority, an `@` that is actually inside the DSN's path rather than its authority, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
+| `... NOT healing (cannot prove the target)` | The DSN has a query string, more than one `@` in its authority, an `@` that is actually inside the DSN's path rather than its authority, or is keyword-form/IPv6/multi-host, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
 | `... NOT healing (heal runs only under GitHub Actions ...)` | Host isn't loopback, or the psql isn't manifest-vouched (`YUZU_CI_PSQL`), or you're outside Actions. | Expected for a developer shell / bespoke remote DB — tune durability by hand if you want it off. |
 | `heal failed on ... (psql rc=N; this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity — including a NULL server address/port, e.g. a Unix-socket session — or a `pg_file_settings` parse error) raised first. | The printed `ERROR:` line names which — a `yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard` line names the guard; anything else is a genuine `ALTER SYSTEM` failure (grant/permission). |
 | `could not re-read after heal on ... (psql rc=N): ...` | The heal itself succeeded, but the bounded re-read afterward couldn't even connect. | Check the service is still up; rc 124/126/127 are timeout/exec-failure, not a settings problem. |
