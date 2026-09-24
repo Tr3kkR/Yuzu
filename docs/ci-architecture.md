@@ -182,12 +182,11 @@ unit test alone is ~197 s on Windows, ~170 s on macOS and ~87 s on Linux, and th
 shards are 5-9 minutes. A PR into `main` (a release or a hotfix) never skips.
 
 **Where it is decided.** Preflight lists the paths the PR changes from the merge commit the run
-builds (`scripts/ci/pr-changed-paths.sh`: the commit's diff against its first parent, the base
-tip; the checkout fetches depth 2 for it). That list is bound to the commit every build job
-checks out, needs no API call, has no file-count cap, and names both sides of a rename. The
-`affected` step runs `scripts/ci/affected-suites.sh` over it and publishes `skip_server_suites`
-and `skip_agent_suites`, and also records the verdict, the forcing path and the classifier's
-version as a `::notice` annotation, which outlives the job log. The build jobs read them:
+builds (`scripts/ci/pr-changed-paths.sh`: its diff against its first parent), so the list is bound
+to the commit every build job checks out, has no file-count cap, and names both sides of a
+rename. The `affected` step runs `scripts/ci/affected-suites.sh` over it, publishes
+`skip_server_suites` and `skip_agent_suites`, and records the verdict, the forcing path and the
+classifier's version as a `::notice` annotation, which outlives the job log. The legs read them:
 
 | Leg | When a family is skipped |
 |---|---|
@@ -253,41 +252,32 @@ the path in `classify_path` in the same change. Two merged changes can trip it t
 adds an include, another moves the file), so it can fail on a PR that touched neither.
 
 **Wiring.** No skip branch can run in the PR that introduces it (a PR touching `.github/` or
-`scripts/` is class `both`), so `tests/shell/test_suite_selection_wiring.sh` extracts the real
-step bodies from `ci.yml` and runs them: the preflight chain on a real merge commit in a
-scratch repository (every binding failure included), each leg's test step against stubs for
-every skip combination, and the `linux-pr-gate` step for every result combination; plus
-lexical pins for the `if:` gates, the env mapping, the matrix axis and excludes, the check
-names, the leg-only step guards, the closure-guard steps and its own registration. It runs in
-preflight on every PR, like `tests/shell/test_affected_suites.sh`, which pins the classifier
-itself; neither is a `docs` meson suite, because they spawn processes per case (the Windows leg
-would run them too) and the classifier's production environment is the hosted preflight
-runner.
+`scripts/` is class `both`), so `tests/shell/test_suite_selection_wiring.sh` runs the real step
+bodies from `ci.yml`: the preflight chain on a real merge commit (binding failures included),
+each leg's test step for every skip combination, and `linux-pr-gate` for every result, plus
+lexical pins for what a step body cannot show. It and `tests/shell/test_affected_suites.sh` run in
+preflight on every PR, not in a meson suite: they spawn processes per case, and the classifier's
+production environment is the hosted preflight runner.
 
 **Changing the table.** Edit `classify_path` and add the case to
-`tests/shell/test_affected_suites.sh`. Nothing else states the table: the guard reads it
-through `--classify-many`, and this section defers to the code. To see what a branch would
-skip: `git diff --no-renames --name-only origin/dev...HEAD | bash scripts/ci/affected-suites.sh`
-(GNU grep; BSD grep is quadratic in the number of changed paths, so the classifier test's
-real-tree cases take about 45 s on macOS and under a second in preflight).
+`tests/shell/test_affected_suites.sh`; the guard reads the table through `--classify-many`. To
+see what a branch would skip: `git diff --no-renames --name-only origin/dev...HEAD | bash
+scripts/ci/affected-suites.sh` (GNU grep; BSD grep is quadratic in the number of paths).
 
 **Measured** on the 391 code PRs merged to dev in the window ending 2026-09-24: 79% run both
 families, 13% skip agent and tar (server-side changes), 5% skip both (docs, skills, ledger,
 gateway or deploy only, which today still run every suite because a changelog fragment or a
 ledger row is code-side to the docs-only gate), 2% skip server (agent-test-only).
 
-**What catches a wrong skip.** A push to dev runs every suite, and the next PR that reaches the
-skipped family runs it on the merge commit, which carries the break, so that PR's required
-checks go red: the break is caught within a PR or two, but in someone else's PR. The push run is
-a weak alarm on its own today: 84 of the last 100 dev push runs (2026-09-14 to 2026-09-24)
-failed, and nothing reports a red push run, so a new failure there is easy to miss (#4902
-tracks the alert). Pushes to dev also keep only one pending run, so a burst of merges can leave
+**What catches a wrong skip.** The next PR that reaches the skipped family runs it on a merge
+commit that carries the break, so that PR's required checks go red: caught within a PR or two,
+but in someone else's PR. The dev push run is a weak alarm on its own: 84 of the last 100 failed
+(2026-09-14 to 09-24) and nothing reports a red push run (#4902), and a burst of merges can leave
 an intermediate merge without a push run of its own.
 
-**Turning it off.** Revert the change that introduced it, as an ordinary PR; that PR is class
-`both`, so its own CI runs everything, and no ruleset step is involved. Re-run only the latest
-run of a PR: re-running a superseded run joins the PR's concurrency group and cancels the
-current one.
+**Turning it off.** Revert the change as an ordinary PR (class `both`, so its CI runs
+everything; no ruleset step). Re-run only the latest run of a PR: re-running a superseded run
+joins the PR's concurrency group and cancels the current one.
 
 ### Linux Postgres split across two legs
 
@@ -309,14 +299,12 @@ the labels `server-pg-a` and `server-pg-b`; `scripts/ci/check-pg-shard-partition
 on an empty half, and ci.yml's pg step fails on a selector that selects nothing (meson would
 exit 0 for it).
 
-**The required check.** The dev and main rulesets require `Linux gcc-15 debug`, and on a PR
-that context is the `linux-pr-gate` job, not a leg: it waits for every Linux leg (`needs`,
-`if: always()`), and passes only when preflight succeeded and either every leg succeeded or
-preflight found a docs-only PR (no leg runs). A failed, cancelled or skipped leg fails it. So
-the split needs no ruleset change and adds no required context. It runs on every pull request,
-because a job skipped by its own `if:` counts as passed for a required check; on any other event
-it is skipped under a different name, so a push commit never carries a skipped check named
-`Linux gcc-15 debug`.
+**The required check.** The dev and main rulesets require `Linux gcc-15 debug`; on a PR that is
+the `linux-pr-gate` job, not a leg. It waits for every Linux leg (`needs`, `if: always()`) and
+passes only when preflight succeeded and every leg did, or preflight found a docs-only PR; a
+failed, cancelled or skipped leg fails it. So the split needs no ruleset change. It runs on every
+PR, because a job skipped by its own `if:` counts as passed for a required check; on any other
+event it is skipped under a different name.
 
 **Balance.** The `(pg A)` leg also carries work the second does not (the non-pg suites, the
 gateway and capability-matrix gates), so the split is about 1:5 by shard time, not 1:1. Median
@@ -330,13 +318,11 @@ first correction to try. To rebalance, re-measure from recent green PR runs (`gh
 --job <id> --log | grep 'server pg unit tests shard'`), move a shard by editing its `suite:`
 label, and keep the legs' totals close. This is the only place the figures are kept.
 
-**Cost.** A PR now holds two of Big Tam's four runner agents, and each leg holds one of the
-three heavy test slots (`with-test-slot.sh 3`), so a busy box queues more PRs than before. A
-replay of 300 PR runs and 82 dev pushes estimates that a PR leg waiting over 60 s for a runner
-rises from about 10% to about 19%, and total Big Tam runner time per PR rises by about 70 s,
-roughly offset by the suites skipped. Windows remains the slowest leg (it finished last in 160 of
-189 PR runs; 10-14 min), so this shortens the Linux check, not the time to a green PR, for most
-PRs. Re-measure after about 20 PRs.
+**Cost.** A PR now holds two of Big Tam's four runner agents and two of the three heavy test
+slots. A replay of 300 PR runs and 82 dev pushes estimates PR legs waiting over 60 s for a runner
+rising from about 10% to 19%, and Big Tam time per PR rising by about 70 s, roughly offset by the
+suites skipped. Windows stays the slowest leg (last in 160 of 189 PR runs; 10-14 min), so this
+shortens the Linux check, not the time to a green PR. Re-measure after about 20 PRs.
 
 ## Gates outside the tier ladder
 

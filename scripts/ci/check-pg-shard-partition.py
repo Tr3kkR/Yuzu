@@ -7,14 +7,10 @@ genuine, bounded, correctly-flagged subset of ``[pg]`` — one entry, the
 expected name, the expected exact case count, tagged ``--allow-running-
 no-tests``, and every matched case also carries ``[pg]``.
 
-PR-time halves: on a pull request ci.yml runs the Linux pg shards on two jobs,
-selected by ``--suite server-pg-a`` / ``--suite server-pg-b`` (a dev/main push
-still runs the whole ``server-pg`` on one leg). check_pg_halves() proves every
-``server-pg`` entry carries exactly one of the two labels, neither half is
-empty, and no other entry carries either — so the halves are an exact partition
-of the entries, and therefore (with the case partition above) of every [pg]
-case: a shard added or split without a half label fails HERE, not by silently
-never running on a PR.
+PR-time halves: a pull request runs the Linux pg shards on two legs, by ``--suite
+server-pg-a`` / ``server-pg-b``. check_pg_halves() proves the halves an exact partition of
+the ``server-pg`` entries (each in exactly one, neither empty, no half label elsewhere), so a
+shard added without a half label fails HERE instead of never running on a PR.
 
 Windows CI test-phase restructuring (#3443, 2026-08-28): the same check_partition()
 set-math also proves the ``server-nonpg``-suite entries partition ``~[pg]`` —

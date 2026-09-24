@@ -2,48 +2,26 @@
 """check-suite-input-closure.py — prove, against the real build, the class table that
 scripts/ci/affected-suites.sh uses to let a pull request skip test suites.
 
-affected-suites.sh skips the SERVER suites when no changed path can reach them, and the AGENT
-suites likewise. That is sound only while its class table matches the build. This reads the
-compiler's own dependency records (`ninja -t deps`: every header and source each object was
-compiled from), classifies every in-repo input with the SAME table (`affected-suites.sh
---classify-many`, so the table has one home) and fails when
+It reads the compiler's own dependency records (`ninja -t deps`), classifies every in-repo input
+with the SAME table (`affected-suites.sh --classify-many`, so the table has one home) and fails when
+an AGENT-family object depends on a path classed `server` or `none`, or a SERVER-family object on a
+path classed `agent` or `none` (`both` is fine for either). Such a path could change that family's
+result while the classifier lets a PR skip it: remove the dependency, or reclassify the path.
 
-  - an object built for the AGENT family depends on a path classed `server` or `none`, or
-  - an object built for the SERVER family depends on a path classed `agent` or `none`.
+Families: objects under `agents/` and of the agent/tar test binaries are agent; objects under
+`server/` and of the server test binaries are server. A built test binary's family comes from
+`meson introspect --tests`: any suite label starting `server`, or `agent`/`tar`, so a new binary or
+label is picked up without editing this file. Other objects (sdk/, proto/, tools/, ...) are shared
+or irrelevant and not checked. A family with no dependency records, or whose records resolve to no
+input under --repo-root, is a FAILURE: it proves nothing and must not look like a clean result.
 
-`both` is fine for either family; `server` for a server object and `agent` for an agent object are
-its own inputs. A failure means a pull request touching that path could change a family's result
-while the classifier says the family cannot be reached, so its suites would be skipped. Either
-remove the dependency, or reclassify the path in affected-suites.sh (making PRs that touch it run
-both families) in the same change. The class table is therefore proven per build, and a table edit
-that breaks the proof fails here rather than skipping a suite silently.
+Limits (docs/ci-architecture.md, "Soundness against the real build"): run-time reads (the
+classifier's mention scan owns those); preprocessor branches this build did not take, so it runs
+on the Linux and macOS legs only and a Windows-only include is invisible; inputs that are not
+compiler-visible; and objects of helper programs under tests/ outside the test binaries.
 
-Object families: everything under `agents/` and the objects of the agent/tar test binaries are the
-agent family; everything under `server/` and the objects of the server test binaries are the server
-family. Which binaries are which is read from `meson introspect --tests`: a built test binary with
-any suite label starting `server` is in the server family, one starting `agent` or `tar` in the
-agent family, so a new test binary or a new label such as `server-e2e` is picked up without editing
-this file. Objects under sdk/, proto/, tools/ and anything else are shared or irrelevant and are not
-checked.
-
-A family with no dependency records at all is a FAILURE, not a pass: an unbuilt or wiped build dir
-would otherwise prove nothing and look identical to a clean result. So is a family whose records
-resolve to no in-repo input (every dependency path fell outside --repo-root): that too proves nothing.
-
-What this does NOT cover (each is also affected-suites.sh's documented limit):
-  - a file a test reads at RUN time: affected-suites.sh's mention-scan owns that;
-  - the preprocessor branches this build did not take (`#ifdef _WIN32` includes) — it runs on the
-    Linux and macOS legs only, because MSVC's dependency records are Windows-shaped, so a Windows-only
-    include of a server file from agent code is invisible here;
-  - inputs that are not compiler-visible: a custom_target that reads content/ into an object shows
-    up as a build-dir path, and an agent test compiled into a helper library under tests/ has an
-    object directory this script does not classify.
-
-Pure logic (`parse_ninja_deps`, `test_binary_prefixes`, `object_family`, `family_inputs`,
-`find_violations`, `parse_classify_output`) is separated from I/O (`main`) the same way
-check-pg-shard-partition.py is, and works on POSIX-shaped path strings on EVERY platform (it uses
-posixpath deliberately): its self-test is registered in the `docs` suite, which the Windows leg
-runs. test_check_suite_input_closure.py exercises it with synthetic dependency text and no build.
+The pure functions work on POSIX-shaped path strings on every platform (posixpath), and their
+self-test (test_check_suite_input_closure.py) is in the `docs` suite, which the Windows leg runs.
 
 Run:  python3 scripts/ci/check-suite-input-closure.py --builddir build-linux-gcc-15-debug
 """

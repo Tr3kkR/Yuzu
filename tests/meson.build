@@ -1577,19 +1577,12 @@ if build_server
   #     than silently dropping coverage — verify with meson test --list
   #     against each ci.yml invocation before trusting a change to either side.
   #   - PR-time halves: every server-pg entry ALSO carries exactly one of
-  #     'server-pg-a' / 'server-pg-b'. On a pull request ci.yml splits the
-  #     Linux pg shards across two jobs (`--suite server-pg-a` on the job that
-  #     also runs every non-pg suite, `--suite server-pg-b` on the second job,
-  #     each against its own per-runner Postgres); a dev/main push still runs
-  #     the whole `server-pg` on one leg. A new or split shard needs one of the
-  #     two labels -- check-pg-shard-partition.py fails without it, since an
-  #     unlabeled shard would never run on a PR -- and ci.yml's selectors must
-  #     keep matching them (its pg step fails on a selector that selects
-  #     nothing). Balance by MEASURED Big Tam wall time, not case count, and
-  #     weight the halves ~1:5, not 1:1: the `a` job also carries the non-pg
-  #     suites. The measured figures and the re-measure procedure live in ONE
-  #     place, docs/ci-architecture.md "PR-time test selection" (Balance), so
-  #     they cannot drift from a second copy here.
+  #     'server-pg-a' / 'server-pg-b'; a pull request runs the halves on two
+  #     Linux legs, a dev/main push the whole server-pg on one. A new or split
+  #     shard needs one of the two labels (check-pg-shard-partition.py fails
+  #     without it). Balance by measured wall time, weighted ~1:5 because the
+  #     pg-a leg also carries the non-pg suites; the figures and the re-measure
+  #     procedure live only in docs/ci-architecture.md "PR-time test selection".
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.

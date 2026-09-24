@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # pr-changed-paths.sh — the paths a pull request changes, read from the commit CI builds.
 #
-# On a pull_request run every job checks out GitHub's test merge commit M: the PR head merged into
-# the base tip (first parent the base tip, second parent the PR head). What the PR changes, as
-# built, is diff(M^1, M). That list is bound to the commit the jobs test, has no file-count cap and
-# needs no API call, and `--no-renames` lists a rename as the deletion of the old path plus the
-# addition of the new one, so the source of a rename out of a heavy directory is always seen.
-# ci.yml's preflight feeds it to the docs-only gate (detect-code-change.sh) and to the suite
-# classifier (affected-suites.sh).
+# On a pull_request run every job checks out GitHub's test merge commit M (first parent the base
+# tip, second the PR head). What the PR changes, as built, is diff(M^1, M): bound to the commit the
+# jobs test, no file-count cap, no API call, and `--no-renames` lists both sides of a rename. ci.yml
+# feeds it to the docs-only gate and to scripts/ci/affected-suites.sh.
 #
-# Output (stdout): one path per line, as git prints it with core.quotePath=false. A path git still
-# C-quotes (a quote, backslash or control character in it) starts with `"`, and both classifiers
-# fail closed on that.
-# Exits non-zero, having printed nothing, unless HEAD is that merge commit: HEAD equals $GITHUB_SHA
-# (when set), HEAD has exactly two parents, and the second is PR_HEAD_SHA. The checkout must include
-# the parents (actions/checkout `fetch-depth: 2`).
+# Output: one path per line, as git prints it with core.quotePath=false (a path git still C-quotes
+# starts with `"`, and both classifiers fail closed on it). Exits non-zero, printing nothing, unless
+# HEAD is that merge commit: HEAD equals $GITHUB_SHA (when set), has exactly two parents, and the
+# second is PR_HEAD_SHA. The checkout must include the parents (`fetch-depth: 2`).
 #
 # Usage: pr-changed-paths.sh PR_HEAD_SHA > paths
 # Tests: tests/shell/test_suite_selection_wiring.sh (a real merge commit in a scratch repository).

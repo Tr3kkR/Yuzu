@@ -3,10 +3,9 @@
 `meson introspect --tests` entries and a table-driven stand-in for the classifier, no real build.
 Same pure/IO split precedent as test_check_pg_shard_partition.py and test_assert_suite_cover.py.
 
-A guard that can pass vacuously is worse than none, so the cases below spend as much effort on
-"a real violation IS reported" and "an empty build dir is NOT a pass" as on the clean case. This
-file runs in the `docs` meson suite, which the Windows leg runs too, so it must not depend on the
-host's path flavour: test_host_path_flavour_is_irrelevant pins that.
+A guard that can pass vacuously is worse than none, so "a violation IS reported" and "a hollow
+run is NOT a pass" get as many cases as the clean one. It runs in the `docs` suite on Windows too,
+so it must not depend on the host's path flavour (test_host_path_flavour_is_irrelevant).
 
 Run: python3 scripts/ci/test_check_suite_input_closure.py   (exit 0 = pass)
 """

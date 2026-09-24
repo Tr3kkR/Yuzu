@@ -2,33 +2,14 @@
 # test_suite_selection_wiring.sh — contract net for the ci.yml step bodies that DECIDE and APPLY
 # PR-time test selection (docs/ci-architecture.md, "PR-time test selection").
 #
-# WHY THIS EXISTS. The classifier has its own fixture tests, but the wiring decides which suites a
-# leg ACTUALLY runs, and no skip branch can run in the pull request that introduces it: a PR that
-# touches .github/ or scripts/ is class `both`, so its own CI never skips anything. A swapped flag
-# (the server verdict wired to the agent suites) would first run on a LATER PR and silently skip the
-# wrong family. So this extracts the REAL step bodies from ci.yml (tests/shell/extract_run_block.py,
-# the idiom test_trusted_inputs_validate.sh uses, so it cannot assert a copy of the logic) and runs
-# them. Pinned:
-#
-#   preflight chain        on a REAL merge commit in a scratch repository: the changed-path list,
-#                          the docs-only gate (which also defers to the classifier) and the
-#                          `affected` verdict; every binding failure (not a merge commit, wrong PR
-#                          head, wrong run commit) and every classifier failure fails closed
-#   Linux non-pg suites    agent/tar dropped only when the agent family is skipped; the by-name
-#                          server call only when the server family is not
-#   Linux pg shards        server-pg-a / server-pg-b on a PR, the whole server-pg on a push, and a
-#                          selector that matches nothing is an error (meson would exit 0)
-#   Windows non-pg suites  the cover guard and the real run share ONE suites array, and every suite
-#                          is in exactly one of selected / skipped / excluded
-#   macOS test             --no-suite for exactly the skipped family
-#   linux-pr-gate          the required Linux context is green only when every Linux leg is (or on a
-#                          docs-only PR), and never when preflight failed
-#
-# plus lexical pins for what a step body cannot show: the `if:` gates, the env mapping between the
-# preflight outputs and the consumers, the matrix axis and its excludes, the check names, the
-# leg-only step guards, the closure-guard steps and the registration of these tests. Stub
-# `python3`/`python`/`meson` record their argv and never run anything, so this needs no build and
-# no network.
+# No skip branch can run in the PR that introduces it (a PR touching .github/ or scripts/ is class
+# `both`), so a swapped flag would first act on a LATER PR. This extracts the REAL step bodies from
+# ci.yml (tests/shell/extract_run_block.py, as test_trusted_inputs_validate.sh does) and runs them:
+# the preflight chain (changed-path list, docs-only gate, `affected`) on a real merge commit in a
+# scratch repository, every leg's test step for every skip combination against stubs that record
+# argv, and the linux-pr-gate step for every result combination. Lexical pins cover what a body
+# cannot show: `if:` gates, env mappings, the matrix axis and excludes, check names, the leg-only
+# step guards, the closure-guard steps and this test's own registration. No build, no network.
 #
 # Where it runs: ci.yml's preflight "Shell gate tests" step, on every PR (Windows never runs it).
 # Run:  bash tests/shell/test_suite_selection_wiring.sh

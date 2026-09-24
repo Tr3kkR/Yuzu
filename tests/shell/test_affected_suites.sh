@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 # test_affected_suites.sh — fixture tests for scripts/ci/affected-suites.sh
 #
-# The classifier decides which heavy test suites a pull request may skip (docs/ci-architecture.md,
-# "PR-time test selection"). Its two failure directions cost very different amounts: a false RUN
-# costs minutes, a false SKIP lets a break reach dev. So this pins, hermetically (no network, no
-# build, a throwaway tests tree):
-#   - the class table, including the case-arm ordering traps (`*` in a case pattern matches `/`)
-#   - the run-time-read rule: a path that a test source names verbatim affects that test's family
-#   - every fail-closed input: empty list, unreadable path, missing tests tree or meson file, a
-#     symlink in the tests tree, an unreadable tests directory, no temporary directory
-#   - renames: the SOURCE of a rename out of a heavy directory still counts (it arrives as its own
-#     line, the way scripts/ci/pr-changed-paths.sh lists a rename)
-# and finally runs the classifier over the real repository as a smoke test.
+# A false RUN costs minutes, a false SKIP lets a break reach dev. So this pins, hermetically (a
+# throwaway tests tree, no network, no build): the class table and its arm-order traps; the
+# run-time-read rule in both directions; every fail-closed input; renames (the source path arrives
+# as its own line); and finally the classifier over the real repository. The real-tree cases are
+# deliberate tripwires: they fail if the tests stop naming the docs they read. They take about 45 s
+# on macOS (BSD grep) and under a second in preflight (GNU grep).
 #
-# Where it runs: ci.yml's preflight "Shell gate tests" step, on every PR, like
-# tests/shell/test_detect_code_change.sh. It is deliberately NOT a meson `docs` suite entry: it spawns
-# a process per case and chmods a directory, so it belongs on the integration surface rather than in
-# the suites every OS leg runs (and the chmod case means nothing on Windows).
+# Where it runs: ci.yml's preflight "Shell gate tests" step on every PR, like
+# tests/shell/test_detect_code_change.sh; not a meson `docs` suite entry, because it spawns a process
+# per case and chmods a directory.
 #
 # Run:  bash tests/shell/test_affected_suites.sh
 set -euo pipefail

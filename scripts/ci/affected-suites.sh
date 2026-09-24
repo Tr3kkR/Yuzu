@@ -1,67 +1,34 @@
 #!/usr/bin/env bash
 # affected-suites.sh — fail-closed classifier: which heavy meson test suites can a PR reach?
 #
-# Without it, ci.yml's PR fast-path would run every suite on every leg. The two heavy families are
+# The two heavy families are server (suites server-nonpg, server-pg, server-pg-smoke,
+# server-checks) and agent (suites agent, tar); docs, proto and gateway always run. A PR whose
+# changed paths cannot reach a family's build or run-time inputs cannot change its results, and
+# every dev/main push still runs the full matrix, so the PR run skips that family. The classes, the
+# run-time-read rule and their limits are explained in docs/ci-architecture.md, "PR-time test
+# selection"; the class TABLE itself lives only in classify_path below (first matching arm wins; a
+# path no arm names is `both`, so an unknown path runs everything).
 #
-#   server  suites server-nonpg, server-pg, server-pg-smoke (yuzu_server_tests: 12 Postgres shards,
-#           the slowest step on Windows and Linux) and server-checks
-#   agent   suites agent, tar (the agent and tar test binaries: the single longest test entry on
-#           macOS and Windows)
-#
-# A PR whose changed paths cannot reach a family's build inputs or run-time inputs cannot change
-# that family's results, and every push to dev/main still runs the full matrix, so the PR run skips
-# the family. The docs, proto and gateway suites always run.
-#
-# Input (stdin): one changed path per line, as scripts/ci/pr-changed-paths.sh prints it from the
-#   merge commit CI builds (a rename is two lines, the old path and the new, so the source of a
-#   rename out of a heavy directory is classified too).
-# Output (stdout): exactly two lines
-#     skip_server=true|false
-#     skip_agent=true|false
-# Diagnostics go to stderr. Every uncertainty prints false/false (run everything): an empty list; a
-# path that cannot be read back exactly (C-quoted by git, a TAB or backslash in it, absolute, or a
-# `..` component); a missing or unreadable tests tree or tests/meson.build, or a symlink inside the
-# tests tree; a scan or temp-directory failure.
-#
-# THE CLASS TABLE lives in classify_path below and nowhere else: this comment,
-# docs/ci-architecture.md and `--classify PATH` all defer to it. What the classes mean (the first
-# matching arm wins; a path no arm names is `both`, so an unknown path runs everything):
-#   both    can affect either family: the build graph and CI infrastructure, the code both
-#           binaries are built from (agents/ is `both` because the server test binary includes 15
-#           agents/core headers), the test-tree files they share, docs/capability-registries/,
-#           any .gitattributes (it changes line endings on checkout), and anything unrecognised
-#   server  reaches only the server family (server/, content/, tests/unit/server/)
-#   agent   reaches only the agent family (the agent/tar test translation units)
-#   none    text no compiled test reads at build time: docs, changelog and ledger fragments,
-#           agent-config directories, gateway, deploy, site, the non-C++ test drivers, the runner
-#           inventory, and an explicit allowlist of inert root files
-#
-# The one derived rule (RUN-TIME READS). A test can read a file that is in no build graph — the
-# tables under docs/capability-registries/, docs/user-manual/metrics.md. So a path that would leave
-# a family unaffected still affects it when a test source of that family names the path verbatim:
-# the server tests are tests/unit/server/ plus the shared helper headers directly under
-# tests/unit/, the agent tests are the rest of tests/unit/, and tests/meson.build counts for both.
-# The scan is deliberately over-broad — an error string that merely mentions a path counts —
-# because a false run costs minutes and a false skip costs a red dev. Its blind spots: a path
-# assembled at run time from parts (`base + "user-manual/x.md"`), so keep a run-time read to one
-# literal path; tests/meson.build names files relative to tests/ (`unit/x`, `prometheus/y`), which
-# never equal a repo-relative path; and production code under server/ or agents/ that names a path
-# is not scanned, only tests are.
-#
-# The class table is proven against the real build by scripts/ci/check-suite-input-closure.py,
-# which classifies every compile-time input of both families through --classify-many (no
-# agent-family object may depend on a `server` or `none` path, no server-family object on an
-# `agent` or `none` path). This file's own cases are tests/shell/test_affected_suites.sh; the
-# ci.yml step bodies that apply the verdict are tests/shell/test_suite_selection_wiring.sh.
+# Input (stdin): one changed path per line, as scripts/ci/pr-changed-paths.sh prints it (a rename
+#   is two lines, so the source of a rename out of a heavy directory is classified too).
+# Output (stdout): exactly two lines, skip_server=true|false and skip_agent=true|false; diagnostics
+#   go to stderr. Every uncertainty prints false/false (run everything): an empty list; a path that
+#   cannot be read back exactly (C-quoted by git, a TAB or backslash in it, absolute, or a `..`
+#   component); a missing or unreadable tests tree or tests/meson.build, or a symlink inside the
+#   tests tree; a scan or temp-directory failure.
+# Run-time reads: a path that would leave a family unaffected still affects it when a test source
+#   of that family (server: tests/unit/server/ plus the helper headers directly under tests/unit/;
+#   agent: the rest of tests/unit/; both: tests/meson.build) names the path verbatim.
 #
 # Usage:
 #   affected-suites.sh [--tests-root DIR] < changed-paths
 #   affected-suites.sh --classify PATH             print one path's class (both|server|agent|none)
 #   affected-suites.sh --classify-many < paths     one `path<TAB>class` line per input path
+#     (scripts/ci/check-suite-input-closure.py proves the table against the real build with it)
 # Locally, for a branch (GNU grep expected; BSD grep is quadratic in the number of changed paths):
 #   git diff --no-renames --name-only origin/dev...HEAD | bash scripts/ci/affected-suites.sh
-#
-# Run tests:  bash tests/shell/test_affected_suites.sh
+# Tests: tests/shell/test_affected_suites.sh (the classifier) and
+#   tests/shell/test_suite_selection_wiring.sh (the ci.yml steps that apply its verdict).
 set -euo pipefail
 
 tests_root="tests/unit"
