@@ -792,8 +792,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
     {"get_management_group",
-     "Get one management group's metadata plus its current member list. #1762 "
-     "(governance round-2): a DEGRADED read of EITHER the group row itself or its "
+     "Get one management group's metadata plus its current member list. #1762: "
+     "a DEGRADED read of EITHER the group row itself or its "
      "member list (store closed / pool-acquire timeout / query error) returns a "
      "retryable error, never a fabricated healthy result — do not conflate that with "
      "the not-found case (a genuinely nonexistent group_id, no retry hint). Mirrors GET "

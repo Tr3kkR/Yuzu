@@ -536,10 +536,12 @@ Get a single group's details including its current members.
 }
 ```
 
-Member resolution reads `ManagementGroupStore::get_members_checked` (#1762) — a
-store-not-open / pool-acquire-timeout / query-error degrade returns `503` (A4
-envelope, `retry_after_ms: 2000`) rather than an authoritative empty
-`members: []`. The MCP twin `get_management_group` fails the same way.
+The group row is read through `ManagementGroupStore::get_group_checked` and its
+members through `get_members_checked` (#1762). A store-not-open /
+pool-acquire-timeout / query-error degrade on EITHER read returns `503` (A4
+envelope, `retry_after_ms: 2000`) rather than a `404` or an authoritative empty
+`members: []`; `404` now always means the group does not exist. The MCP twin
+`get_management_group` fails the same way.
 
 ---
 

@@ -42,10 +42,12 @@ using namespace yuzu::server;
 namespace {
 
 struct GroupDetailHarness {
+    // Declared FIRST: mgmt_bundle's store borrows it via set_metrics(), so
+    // it must outlive the store (destroyed last).
+    yuzu::MetricsRegistry metrics;
     yuzu::test::ManagementGroupStorePg mgmt_bundle; // SKIPs without a PG DSN
     yuzu::test::RbacStorePg rbac_bundle;
     RbacStore& rbac = *rbac_bundle;
-    yuzu::MetricsRegistry metrics;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
 

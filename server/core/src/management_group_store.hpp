@@ -107,12 +107,18 @@ public:
     /// The `GET /api/v1/management-groups/{id}` REST route and its MCP twin
     /// `get_management_group` have both moved to `get_group_checked` (fail
     /// closed with a retryable 503/error on a degrade, a flat 404 only on a
-    /// genuine not-found); other callers (parent-id validation in
-    /// `create_group`/`update_group`) stay on this fail-soft form
-    /// unchanged — a degraded parent lookup there already refuses the
-    /// mutation via a DIFFERENT check (the "parent group not found" /
-    /// ancestor-walk `nullopt` guards). Prefer `get_group_checked` for any
-    /// NEW code that needs to tell the two apart (#1762 shape).
+    /// genuine not-found). Remaining fail-soft callers: the parent-id check
+    /// in `create_group`/`update_group`, the REST `PUT
+    /// /api/v1/management-groups/{id}` route, MCP `update_management_group`,
+    /// and the root-group bootstrap in ServerImpl. On a degrade each of them
+    /// refuses rather than writes (the mutation paths answer 404/400
+    /// "group not found" / "parent group not found" — the SAME `nullopt`, so
+    /// the operator sees the wrong cause, not an unsafe write; tracked with
+    /// the other fail-soft residuals in #4907). Because this wrapper now goes
+    /// through `get_group_checked`, every such degrade IS counted on
+    /// `yuzu_server_mgmt_group_read_degrade_total` (previously silent).
+    /// Prefer `get_group_checked` for any NEW code that needs to tell the two
+    /// apart (#1762 shape).
     std::optional<ManagementGroup> get_group(const std::string& id) const;
     /// Degrade-distinguishable twin of `get_group()` (#1762): `nullopt` on a
     /// genuine not-found, `unexpected` on store-not-open / pool-acquire-
