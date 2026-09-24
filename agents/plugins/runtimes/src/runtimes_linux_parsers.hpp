@@ -68,10 +68,12 @@
  * tens of megabytes); a candidate root that is on, under or contains a network
  * mount (yuzu::shared::is_network_fstype) is skipped BEFORE any syscall touches it
  * and records `network_fs_skipped`. A healthy network-mounted JDK is skipped too,
- * and a network-typed `/` skips every candidate. Residuals a plugin cannot close:
- * a mount that appears after the snapshot, a STACKED filesystem (an overlay,
- * ecryptfs or loop device over a dead network mount reports its own local type), a
- * network type the deny-list does not name, and a hang on a local block device.
+ * and a network-typed `/` skips every candidate. When the table cannot be read in
+ * full the walk runs guarded only by the mounts read (`mountinfo_unreadable`).
+ * Residuals a plugin cannot close: a mount that appears after the snapshot, a
+ * STACKED filesystem (an overlay, ecryptfs or loop device over a dead network mount
+ * reports its own local type), a network or FUSE type the deny-list does not name
+ * (bare `fuse` among them), and a hang on a local block device.
  */
 #pragma once
 
@@ -135,8 +137,9 @@ inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
 /// table runs to tens of megabytes (16k mounts measured at 24.7 MB), so a whole-file cap fails the
 /// guard OPEN on exactly the busiest hosts and a larger one multiplies memory by the command pool.
 /// Bounds: kMountinfoChunk bytes per read; an unfinished line longer than kMaxMountinfoLine (a real
-/// line is a few KiB, an overlay with hundreds of layers reaches ~100 KiB) is dropped, not kept, and
-/// scanning resumes at its newline; and a runaway bound on the whole read.
+/// line is a few KiB, an overlay with hundreds of layers ~100 KiB) is dropped, not kept, and
+/// scanning resumes at its newline (a line over 2 x the chunk is always dropped); and a runaway
+/// bound on the whole read.
 inline constexpr std::size_t kMountinfoChunk = 64 * 1024;
 inline constexpr std::size_t kMaxMountinfoLine = 64 * 1024;
 inline constexpr std::size_t kMaxMountinfoBytes = 256 * 1024 * 1024;
@@ -159,7 +162,8 @@ struct WalkLimits {
 
 /// Everything a walk needs besides the root: its bounds and the absolute mount points of the
 /// network filesystems to keep away from (empty: no guard, the unit-suite default).
-/// `mountinfo_unreadable`: the mount table could not be read in full (the walk still runs, guarded by what was read).
+/// `mountinfo_unreadable`: the mount table could not be read in full (the walk still runs, guarded
+/// by the mounts read).
 struct WalkConfig {
     WalkLimits limits{};
     std::vector<std::string> network_mounts{};
@@ -667,10 +671,10 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
 
 /// True iff <home>/bin/java or <home>/jre/bin/java is a regular file or a symlink (never followed):
 /// the footprint of a JVM home whose installer wrote no `release` file (some distro OpenJDK 8
-/// packages; Rocky's has only jre/bin/java). Each hop is opened O_NOFOLLOW. A failed open of `bin`/`jre`
-/// or a failed stat of `java` (other than ENOENT) is recorded, never read as "no java"; a symlinked
-/// `bin`/`jre` is refused visibly (`symlink_refused`) when no binary was found through the other
-/// route; a directory or other special file named `java` is not a JVM.
+/// packages; Rocky's has only jre/bin/java). Each hop is opened O_NOFOLLOW. A failed open of
+/// `bin`/`jre` or a failed stat of `java` (other than ENOENT) is recorded, never read as "no
+/// java"; a symlinked `bin`/`jre` is refused visibly (`symlink_refused`) when no binary was found
+/// through the other route; a directory or other special file named `java` is not a JVM.
 inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
     bool alias_seen = false;
     const auto open_hop = [&](DIR* dir, const char* name) {
@@ -865,9 +869,10 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 }
 
 /// Production's WalkConfig: the default bounds plus the network mount points read from
-/// /proc/self/mountinfo (`mountinfo_unreadable` when it cannot be read). The path is a parameter
-/// so the unit suite can point it at a fixture.
-[[nodiscard]] inline WalkConfig production_config(const char* mountinfo_path = "/proc/self/mountinfo") {
+/// /proc/self/mountinfo (`mountinfo_unreadable` when it cannot be read in full). The path is a
+/// parameter so the unit suite can point it at a fixture.
+[[nodiscard]] inline WalkConfig production_config(
+    const char* mountinfo_path = "/proc/self/mountinfo") {
     auto scan = walk::scan_mounts(mountinfo_path);
     WalkConfig cfg;
     cfg.network_mounts = std::move(scan.network_mounts);

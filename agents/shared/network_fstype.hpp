@@ -12,10 +12,11 @@
 // This is a DENY-list by name and is inherently incomplete -- the durable fix is a known-local
 // allowlist, which needs its own review. It covers the network, cluster and paravirtualised types
 // whose backing store is remote: nfs, nfs3, nfs4, cifs, smb3, smbfs, afs, ceph, glusterfs, 9p,
-// virtiofs, lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, vmhgfs, prl_fs, autofs (a direct-map trigger point
-// blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does NOT see a
-// STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own local
-// type): that needs a bounded-call seam in agent core, not a longer list. TAR's
+// virtiofs, lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, vmhgfs, prl_fs, autofs (a direct-map
+// trigger point blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does
+// NOT see a STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own
+// local type) or a bare `fuse` mount (many are local): that needs a bounded-call seam in agent
+// core, not a longer list. TAR's
 // tar_mapdrive_collector.cpp keeps a deliberately different, map-drive-specific set.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
@@ -30,7 +31,8 @@ namespace yuzu::shared {
     constexpr std::string_view kExact[] = {"nfs",   "nfs3",      "nfs4",   "cifs",   "smb3",
                                            "smbfs", "afs",       "ceph",   "glusterfs", "9p",
                                            "virtiofs", "lustre", "beegfs", "gfs2",   "ocfs2",
-                                           "gpfs",  "panfs",     "vboxsf", "vmhgfs", "prl_fs", "autofs"};
+                                           "gpfs",  "panfs",     "vboxsf", "vmhgfs", "prl_fs",
+                                           "autofs"};
     for (const auto s : kExact) {
         if (fstype == s) return true;
     }

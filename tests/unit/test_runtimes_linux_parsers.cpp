@@ -31,8 +31,9 @@
  * jvm roots, the network-mount guard, the mount-table stream and the FIFO/fd cases carry their
  * mutation in their own comment. The guard-before-any-syscall orderings change which directories
  * are OPENED, not the rows or tokens, so on Linux the "never opened" case watches IN_OPEN with
- * inotify; the `exhausted` check inside dotnet_rows_at's per-framework loop is equivalent the same
- * way and is not pinned. push_row's sticky flag is pinned by the cross-root byte-budget case.
+ * inotify. The `exhausted` checks in dotnet_rows_at and list_entries' aggregate flag show only in
+ * the token of a LATER unreadable entry and are not pinned; push_row's sticky flag is pinned by the
+ * cross-root byte-budget case.
  * The chmod cases SKIP at euid 0;
  * the constrained path stays covered there by the symlink, cap and oversize
  * cases and by the forced-constraint CommandContext case, none of which needs
@@ -457,16 +458,17 @@ int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*
     yuzu::CommandContext ctx{raw};
     const auto a = rt::parse_action(action);
     if (!a) return 1;
-    return lnx::run_linux_at(ctx, *a, *g_leg_root, g_leg_cfg ? *g_leg_cfg : lnx::WalkConfig{});
+    return lnx::run_linux_at(ctx, *a, *g_leg_root, *g_leg_cfg);
 }
 
-LegRun run_leg(rt::Action action, const fs::path& root) {
+LegRun run_leg(rt::Action action, const fs::path& root, const lnx::WalkConfig& cfg = {}) {
     g_leg_root = &root;
+    g_leg_cfg = &cfg;
+    yuzu::test::ScopeExit reset{[] { g_leg_root = nullptr, g_leg_cfg = nullptr; }}; // even if the run throws
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &leg_execute;
     yuzu::agent::LocalDispatcher dispatcher;
     const auto result = dispatcher.run(&descriptor, rt::action_name(action));
-    g_leg_root = nullptr;
 
     LegRun out;
     out.rc = result.rc;
@@ -1245,14 +1247,12 @@ TEST_CASE("runtimes linux: run_linux_at hands the guard to both walks (SYNTHETIC
     write_text(dir.path / "usr/lib/dotnet", "a file where a mount would be");
     lnx::WalkConfig cfg;
     cfg.network_mounts = {"/opt/java", "/usr/lib/dotnet"};
-    g_leg_cfg = &cfg;
     for (const auto a : {rt::Action::jvm, rt::Action::dotnet}) {
-        const auto run = run_leg(a, dir.path);
+        const auto run = run_leg(a, dir.path, cfg);
         CHECK(run.rows == std::vector<std::string>{"status|" + std::string{rt::action_name(a)} +
                                                     "|constrained|linux:runtimes:network_fs_skipped"});
         CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     }
-    g_leg_cfg = nullptr;
 }
 
 #if defined(__linux__)
@@ -1321,9 +1321,7 @@ TEST_CASE("runtimes linux: the mount table is scanned, an unreadable one is repo
     REQUIRE(materialize_manifest(dir.path, err));
     lnx::WalkConfig cfg;
     cfg.mountinfo_unreadable = true;
-    g_leg_cfg = &cfg;
-    const auto run = run_leg(rt::Action::jvm, dir.path);
-    g_leg_cfg = nullptr;
+    const auto run = run_leg(rt::Action::jvm, dir.path, cfg);
     CHECK(run.rows == std::vector<std::string>{
               "status|jvm|constrained|linux:runtimes:mountinfo_unreadable", kDebianRow, kTemurinRow});
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
@@ -1354,13 +1352,24 @@ TEST_CASE("runtimes linux: the mount table is streamed: a line split across read
     const auto scan = lnx::walk::scan_mounts((dir.path / "mountinfo").c_str());
     CHECK(scan.ok);
     CHECK(scan.network_mounts == std::vector<std::string>{"/mnt/straddle", "/mnt/last"});
-    // A line too long to keep is skipped, not fatal: a mount that starts exactly at a read boundary
-    // after it is still armed, and `ok` is false. MUTATION: never leaving the skip drops that line.
-    write_text(dir.path / "longline", std::string(3 * lnx::kMountinfoChunk, 'x') + "\n" +
-                                          std::string(lnx::kMountinfoChunk - 2, 'y') + "\n" + nfs);
+    // A line too long to keep is skipped, not fatal: mounts before it are kept, mounts after it are
+    // armed (one in its newline's read, one at the next read boundary), `ok` is false and
+    // production_config keeps them all. MUTATION: a wrong resume, an uncleared head or a discarded
+    // partial result loses one of the three.
+    const std::size_t chunk = lnx::kMountinfoChunk;
+    const std::string before = "20 1 0:20 / /mnt/before rw - nfs4 h:/z rw\n";
+    const std::string head = "23 1 0:23 / /mnt/long rw - overlay overlay rw,lowerdir=";
+    const std::string after = "24 1 0:24 / /mnt/after rw - nfs4 h:/y rw\n";
+    write_text(dir.path / "longline",
+               before + head + std::string(3 * chunk - before.size() - head.size(), 'x') + "\n" +
+                   after + std::string(chunk - 2 - after.size(), 'y') + "\n" + nfs);
     const auto longscan = lnx::walk::scan_mounts((dir.path / "longline").c_str());
+    const std::vector<std::string> armed{"/mnt/before", "/mnt/after", "/mnt/straddle"};
     CHECK_FALSE(longscan.ok);
-    CHECK(longscan.network_mounts == std::vector<std::string>{"/mnt/straddle"});
+    CHECK(longscan.network_mounts == armed);
+    const auto cfg = lnx::production_config((dir.path / "longline").c_str());
+    CHECK(cfg.mountinfo_unreadable);
+    CHECK(cfg.network_mounts == armed);
     const auto size = fs::file_size(dir.path / "mountinfo");
     CHECK(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size).ok);
     CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size - 1).ok);

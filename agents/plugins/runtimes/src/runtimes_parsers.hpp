@@ -359,8 +359,8 @@ struct StatusOutcome {
 }
 
 /// jvm row for a home whose installer laid down no `release` file (some distro OpenJDK 8
-/// packages): the home is real but its version and vendor are unknown, so both read `-`. The leg records
-/// `release_missing` next to it; such a home is never left out.
+/// packages): the home is real but its version and vendor are unknown, so both read `-`. The leg
+/// records `release_missing` next to it; such a home is never left out.
 [[nodiscard]] inline std::string jvm_row_release_missing(std::string_view install_path) {
     return format_runtime_row("jvm", flavour_token(JvmFlavour::unmodelled), "", install_path, "");
 }
