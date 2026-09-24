@@ -1407,10 +1407,13 @@ FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, n
 every branch this PR's own scope covers, not that one.
 
 ### 8. PKI / CA high availability (Q8)
-Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
-- **CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
-  to **KEK availability**.
-- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence — but numbering alone
+Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
+"collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
+below)*:
+- ~~**CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
+  to **KEK availability**.~~ *Superseded 2026-09-23: the key stays behind `KeyProvider`.*
+- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence *(superseded
+  2026-09-23: a table lock, not a sequence)* — but numbering alone
   is insufficient: **CRL publication becomes an explicit durable state machine** (allocate → sign →
   store → make-current) with a fencing rule, since a sequence prevents collisions yet can leave gaps
   and does not make publication atomic (`ca_store.cpp:605`).
@@ -1420,6 +1423,41 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
   includes KEK **version rollout, rollback, and node-admission** semantics (an instance without the
   current version must not silently produce unverifiable material). KMS/HSM via the existing seam is
   optional (SaaS / high-security).
+
+**Update (2026-09-23, WS-6 planning + slice 6.1).** Three points above are resolved as follows:
+- **The CA root key does NOT become a `SecretCodec` blob in Postgres.** The first bullet conflicted
+  with ADR-0010 Decision 6 (the CA root key stays behind `KeyProvider`; "no future store migration
+  may" move it) and ADR-0053 §Secrets. ADR-0010 governs. Putting the key under the secrets KEK would
+  make database + KEK sufficient to hold the CA, while saving little operationally, because the KEK
+  files must be distributed to every replica anyway. WS-6 instead uses **shared key custody**: the
+  CA key and KEK files are provisioned to every replica, and a replica must prove it can resolve
+  every required key before it is admitted (slice 6.3, with `/readyz`).
+- **`CaStore` → Postgres** was already done by ADR-0053 before WS-6 began.
+- **CRL publication (slice 6.1, closes #4126)** is one Postgres transaction:
+  `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE` → read `MAX(version)+1` → read
+  the revoked set → sign → `INSERT` → `COMMIT` (`CaStore::publish_next_crl`). Allocate, store and
+  make-current happen together at the commit ("current" is the highest committed version), a
+  rollback consumes no number, so there are no gaps and no sequence is needed. The table lock is
+  the fencing rule — in a different sense from §3's fencing token: there is no leadership to lose,
+  because the lock and the CRL write are one transaction, so a paused publisher cannot hold a
+  silently transferred right. It serialises every publisher on every replica, is released by the
+  commit, and is deliberately not a leader epoch, because the operator revoke path publishes
+  synchronously (the two-dispatch-planes rule). A table lock rather than the codebase's usual
+  `pg_advisory_xact_lock` because it also blocks writers that do not opt in (any other INSERT into
+  `ca_crl_versions`, including an older binary's during a rolling upgrade) — do not "harmonise" it
+  to an advisory lock. The lock wait is bounded per transaction (`set_config('lock_timeout', …)`),
+  and a process-local mutex keeps each replica to one pool connection waiting on it. Reading the
+  revoked set after acquiring the lock makes each CRL a superset of the one before it; re-reading
+  `ca_root`'s fingerprint under the lock stops a publish that raced a subordinate import from
+  landing a CRL under the superseded issuer. The CA key is loaded before the lock is taken; only
+  signing runs under it. A publish that fails (e.g. lock timeout) is healed by the leader's
+  freshness pass, which republishes whenever the latest CRL's recorded `revoked_count` differs from
+  the current revoked count — a count comparison, never cross-replica timestamps, which holds
+  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows, and a migration-v4
+  row trigger rejects deleting or updating a revoked `ca_issued` row). A publisher
+  frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
+- **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
+  `pending-agents.cfg` once at first boot rather than starting fresh.
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
@@ -1569,8 +1607,8 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 4. **Gateway routing + multi-cluster topology** — fenced agent→cluster directory **and net-new
    distributed intra-cluster agent→node routing** (§7).
 5. **Shared agent presence / health / scope population** (§7a).
-6. **PKI/CA HA** — CA key to `SecretCodec`, CRL publication state machine, KEK versioning/rollout,
-   enrollment to PG (§8).
+6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
+   2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
    default)** + operator-plane LB (§11).
 8. **Health contract + BYO-LB doc** (§12).

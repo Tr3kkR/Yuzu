@@ -1060,7 +1060,10 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
   error on a genuine database error**, instead of a silently-empty or
   silently-false result.
 - Every other CA behavior — revocation semantics, CRL numbering, the single
-  `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
+  `sign_agent_csr` chokepoint — was unchanged by that migration. CRL numbering and
+  publication were later reworked for multiple server replicas (HA WS-6 slice 6.1):
+  see `docs/user-manual/server-admin.md` "vNEXT — CRL publishing is serialised in
+  Postgres". Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
 - **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
   same unconditional rollback-refusal applies to this store (its own dropped marker table).

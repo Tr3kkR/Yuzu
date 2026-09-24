@@ -24,6 +24,8 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
+#include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -1039,8 +1041,14 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
-     "dispatches a real command to the fleet; poll instead.",
+     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1057,7 +1065,13 @@ static const ToolDef kTools[] = {
      "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
-     "error — it dispatches a real command to the fleet; poll instead.",
+     "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1079,7 +1093,13 @@ static const ToolDef kTools[] = {
      "to every visible device (#4306) — create a new set from the intended parent instead. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
-     "NEVER re-send this call on a timeout or error.",
+     "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
+     "re-dispatches a real command to the fleet. Two distinct fault tokens distinguish "
+     "when retry is safe: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
+     "degraded before anything was sent) carries a positive retry_after_ms and IS safe "
+     "to retry; a post-dispatch RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store "
+     "faulted after a real command already reached the fleet) carries no retry_after_ms "
+     "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -5260,7 +5280,7 @@ McpServer::HandlerFn McpServer::build_handler(
     DexPerfFn dex_perf_fn, std::shared_ptr<const NetworkApi> network_api,
     ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store,
-    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
+    yuzu::MetricsRegistry* metrics,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
@@ -11429,8 +11449,40 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                if (result_set_store_->count_for_owner(session->username) >=
-                    ResultSetStore::kMaxPerOwner) {
+                // #4306 finding 1: the plain count_for_owner() returned 0 on
+                // a degraded read, indistinguishable from a genuinely-empty
+                // owner — an over-quota owner's dispatch would fire for real
+                // before create_pending's atomic in-txn recheck (which runs
+                // AFTER dispatch, below) ever got a chance to refuse it. Fail
+                // CLOSED instead: nothing has been dispatched yet here, so
+                // refusing is free. Mirrors REST's run_async fix exactly.
+                auto quota = result_set_store_->count_for_owner_checked(session->username);
+                if (!quota.has_value()) {
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
+                    // Deliberately minimal, not the full
+                    // <store>_read_degrade_total{reason} convention other
+                    // stores use, which would require wiring ResultSetStore
+                    // itself with a MetricsRegistry member, out of scope for
+                    // this fix round; a future PR can decide whether to
+                    // upgrade it.
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_check_degraded_total").increment();
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "failure", "ResultSet", "",
+                        "reason=quota_check_degraded source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: could not verify the "
+                                 "per-owner result-set quota; nothing was dispatched "
+                                 "execution_id=" + exec_id,
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (*quota >= ResultSetStore::kMaxPerOwner) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
@@ -11519,18 +11571,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         // compliance fix).
                         res.set_content(
                             a4_error(kInternalError,
-                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable "
-                                     "after dispatch already succeeded - do not re-send; poll "
-                                     "executions for the dispatched command's outcome"),
+                                     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH: result-set store "
+                                     "unavailable after dispatch already succeeded - do not "
+                                     "re-send; poll executions for the dispatched command's "
+                                     "outcome execution_id=" + exec_id),
                             "application/json");
                         return;
                     }
                     // retry-hint-exempt: business-rule outcome (quota), not a
-                    // transient fault.
+                    // transient fault. Same "do not re-send" situation as the
+                    // DbError branch above -- a real dispatch already succeeded
+                    // (sent > 0, set_agents_targeted already called); only the
+                    // bookkeeping row lost the authoritative in-txn quota
+                    // recheck (#4306 gov-4306-S5).
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        std::string(to_string(created.error())) +
-                                           " execution_id=" + exec_id),
+                                           " - a command was already dispatched to the fleet; do "
+                                           "not re-send, poll executions for its outcome "
+                                           "execution_id=" + exec_id),
                         "application/json");
                     return;
                 }
@@ -11577,13 +11636,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 500)
                     limit = 500;
-                std::string next;
-                auto sets = result_set_store_->list_by_owner(session->username, cursor,
-                                                              static_cast<int>(limit), next);
+                // #4306/#4307 finding 2: never a success response with an
+                // empty array on a degraded read — indistinguishable from a
+                // genuine no-result-sets owner.
+                auto page = result_set_store_->list_by_owner_checked(
+                    session->username, cursor, static_cast<int>(limit));
+                if (!page) {
+                    const bool audit_ok = mcp_audit("failure");
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not list "
+                                                  "result sets",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : sets)
+                for (const auto& s : page->sets)
                     arr.push_back(result_set_json(s));
-                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -11899,12 +11970,35 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::unordered_set<std::string> ms;
                     std::string cur;
                     while (true) {
-                        std::string next;
-                        auto page = result_set_store_->members(pid, cur, 5000, next);
-                        ms.insert(page.begin(), page.end());
-                        if (next.empty())
+                        // #4306 finding 3: the plain members() silently
+                        // truncated the loop on a degraded page,
+                        // indistinguishable from a genuine last page — this
+                        // tool MATERIALISES the narrowed match set into a
+                        // durable result set, so a truncated read here
+                        // silently narrows who future dispatches against it
+                        // reach. Fail CLOSED: refuse the whole operation
+                        // rather than materialise a partial parent_members
+                        // set. Mirrors REST's identical fix.
+                        auto page_result = result_set_store_->members_checked(pid, cur, 5000);
+                        if (!page_result) {
+                            const bool audit_ok = audit_fn(
+                                req, "result_set.create", "failure", "ResultSet", "",
+                                "reason=store_degraded source_kind=inventory_query");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                         "parent set's members; refusing to materialise a "
+                                         "partial result set",
+                                         "retry once the server reports ready",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                         audit_ok),
+                                "application/json");
+                            return;
+                        }
+                        ms.insert(page_result->device_ids.begin(), page_result->device_ids.end());
+                        if (page_result->next_cursor.empty())
                             break;
-                        cur = std::move(next);
+                        cur = std::move(page_result->next_cursor);
                     }
                     parent_members = std::move(ms);
                 }
@@ -12609,13 +12703,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 10000)
                     limit = 10000;
-                std::string next;
-                auto devs =
-                    result_set_store_->members(rs_id, cursor, static_cast<int>(limit), next);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty result on a degraded read.
+                auto page =
+                    result_set_store_->members_checked(rs_id, cursor, static_cast<int>(limit));
+                if (!page) {
+                    const bool audit_ok = mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set members",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : devs)
+                for (const auto& d : page->device_ids)
                     arr.push_back(d);
-                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success", rs_id);
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -12640,9 +12745,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                auto chain = result_set_store_->lineage(rs_id, session->username);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty/truncated chain on a degraded read.
+                auto chain_result = result_set_store_->lineage_checked(rs_id, session->username);
+                if (!chain_result) {
+                    const bool audit_ok = mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set lineage",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& n : chain)
+                for (const auto& n : *chain_result)
                     arr.push_back({{"id", n.id},
                                    {"name", n.name},
                                    {"source_kind", n.source_kind},
@@ -14445,8 +14562,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Behavioral-PII access audit BEFORE the read (provider-null already
-                // checked, matching the REST twin's ordering) — same verb/target as
-                // the REST twin and the dashboard's app-perf-over-time drill.
+                // checked, matching the REST twin's ordering) — same audit verb/target
+                // as the REST twin and the dashboard's app-perf-over-time drill (the
+                // dashboard's own ordering differs — it audits BEFORE its null-seam
+                // check, over-auditing on an unwired provider — see dex_routes.cpp's
+                // "#4626 Concern A" comment; only the verb/target match here, not the
+                // ordering).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.app_perf.view", "success", "Agent", agent_id,
                     "device app-perf-over-time drill (B1 retained) via MCP "
@@ -15350,7 +15471,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (member resolution then B1 aggregate), membership via
                     // TagStore::agents_with_tag instead of
                     // ManagementGroupStore::get_members — see
-                    // AppPerfTagCohortFn's doc comment (dex_app_perf_model.hpp)
+                    // DexPerfApi::tag_trend's doc comment (dex_perf_api.hpp)
                     // for why the SAME kDexCohortFloor suppression applies. No
                     // interim deny_fleet_wide_service_scoped() call is needed
                     // here for the reason the sibling branch's own comment
@@ -24345,7 +24466,6 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24383,7 +24503,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
                     guaranteed_state_store, std::move(dex_perf_fn), std::move(network_api),
                     std::move(response_scope_fn), software_inventory_store, metrics,
-                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
                     mcp_streamed_post_enabled, std::move(allowed_origins),
                     software_licensing_store, engine_principal_store,
@@ -24414,7 +24534,6 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24463,7 +24582,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(publish_crl_fn), guaranteed_state_store,
                             std::move(dex_perf_fn), std::move(network_api),
                             std::move(response_scope_fn), software_inventory_store, metrics,
-                            std::move(app_perf_providers), quarantine_store,
+                            quarantine_store,
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                             sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                             std::move(allowed_origins),

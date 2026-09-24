@@ -527,6 +527,12 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
+    'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
+    'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
+    'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
+    'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
+    'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -540,9 +546,11 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -598,6 +606,8 @@ agent_test_exe = executable(
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
              # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
              # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
+             # Wave 8 PR8.1-a1: test_platform_security_{parsers,win_parsers}.cpp read
+             # Docker/this-Mac/the-rig REAL CAPTURE fixtures via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -692,9 +702,11 @@ agent_test_exe = executable(
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
                 app_control_plugin_lib,  # Wave 8 PR8.6
+                platform_security_plugin_lib,  # Wave 8 PR8.1-a1
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
+                browser_inventory_plugin_lib,  # Wave 10 P2a
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 ],
 )
@@ -2261,6 +2273,20 @@ test('proto gen_proto version check',
   args: [files('test_gen_proto_version.py')],
   suite: 'proto',
   timeout: 30,
+)
+
+# ── Gateway build wrapper ──────────────────────────────────────────────────
+# scripts/build_gateway.py (+ the shared erlang_toolchain.py) driven with a
+# fake Python child — no Erlang needed, so it runs on every leg, including the
+# Windows one whose stdio/timeout/Ctrl-C behaviour it mostly pins. ~51s
+# measured (Windows and Linux); several cases deliberately wait out a
+# grandchild to prove the whole tree was killed, so the timeout leaves room
+# for a loaded shared runner box.
+test('gateway build wrapper',
+  _python3_test,
+  args: [files('test_build_gateway.py')],
+  suite: 'docs',
+  timeout: 180,
 )
 
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
