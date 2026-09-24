@@ -1275,6 +1275,108 @@ TEST_CASE("#4783 Gate 4 UP-3: an open gap persisted by kick() survives a simulat
     }
 }
 
+// ── #4783 governance follow-up: dropped_unwired is NOT restart-durable, ────
+// unlike its two persisted siblings above ──────────────────────────────────
+
+TEST_CASE("#4783 governance follow-up: legacy_sink_dropped_unwired() does NOT survive a "
+          "simulated agent restart, unlike its two persisted siblings events_lost()/"
+          "gap_rules() above - it lives on GuardianEngine directly and is never part of "
+          "the restart-durable Snapshot/Stats record",
+          "[guardian][engine][legacy_sink]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+
+    // "Process 1": produce BOTH loss kinds in the same pass - a real gap (the same
+    // admission-fault-injection seam the UP-3 restart case above uses) AND an
+    // unwired-sink drop (the same seam the "0 until a sink is wired" case above
+    // uses: guardian_emit_drift_for_test() with no sink installed, which bails
+    // inside emit_guard_event() before ever reaching offer()) - then kick() to
+    // persist.
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-restart-asymmetry-test", false);
+        REQUIRE(engine.start_local().has_value());
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+
+        // (a) a real gap: force a RefusedCapacity-shaped admission failure so
+        // events_lost()/gap_rules() become nonzero (same seam as the UP-3 restart
+        // case above).
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift gap_drift;
+        gap_drift.guard_type = "file";
+        gap_drift.rule_id = "gapped-rule-asymmetry";
+        gap_drift.rule_name = "gapped-rule-asymmetry";
+        yuzu::agent::guardian_emit_drift_for_test(engine, gap_drift);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+
+        // Unwire the sink BEFORE the unwired-drop event and BEFORE kick() - same
+        // rationale as the UP-3 restart case above: with a real (always-Sent) sink
+        // still installed, kick()'s own repair-dispatch loop would successfully
+        // deliver and clear the very gap this test is about to verify survives the
+        // persist.
+        engine.set_event_sink(nullptr);
+
+        // (b) an unwired-sink drop: emit_guard_event() bails at "no sink wired"
+        // before ever reaching offer() (see the "0 until a sink is wired" case
+        // above) - this is the seam that increments legacy_sink_dropped_unwired_.
+        yuzu::agent::GuardDrift unwired_drift;
+        unwired_drift.guard_type = "file";
+        unwired_drift.rule_id = "dropped-unwired-rule-asymmetry";
+        unwired_drift.rule_name = "dropped-unwired-rule-asymmetry";
+        yuzu::agent::guardian_emit_drift_for_test(engine, unwired_drift);
+        REQUIRE(engine.legacy_sink_dropped_unwired() == 1);
+
+        engine.legacy_sink_kick(); // the write under test - persists events_lost/
+                                   // gap_rules (via the executor's Snapshot/Stats)
+                                   // only; dropped_unwired_ is not part of that type.
+                                   // kick()'s OWN repair-dispatch loop also calls
+                                   // emit_guard_event() for "gapped-rule-asymmetry"
+                                   // (gap.repair_seq == 0, so it is due a repair
+                                   // attempt) - with the sink still unwired that
+                                   // call bails the same "no sink wired" way, so
+                                   // dropped_unwired_ goes 1 -> 2 here too. Real
+                                   // production behaviour, not a test artifact.
+
+        // All three counters nonzero before the simulated restart.
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+        REQUIRE(engine.legacy_sink_events_lost() >= 1);
+        REQUIRE(engine.legacy_sink_dropped_unwired() == 2);
+        // "Process 1" ends here - engine/kv destruct (simulating an agent exit).
+    }
+
+    // "Process 2": a fresh KvStore + GuardianEngine at the SAME path.
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-restart-asymmetry-test", false);
+        REQUIRE(engine.start_local().has_value());
+
+        // The two persisted siblings restore, matching the UP-3 restart case above.
+        CHECK(engine.legacy_sink_gap_rules() == 1);
+        CHECK(engine.legacy_sink_events_lost() >= 1);
+
+        // NEW assertion this test adds: legacy_sink_dropped_unwired_ is a bare
+        // GuardianEngine member, never folded into
+        // GuardianLegacySinkExecutor::Snapshot/Stats and never touched by
+        // restore() (see persist_legacy_sink_loss_ledger()/
+        // legacy_sink_snapshot_to_json() in guardian_engine.cpp, and
+        // legacy_sink_dropped_unwired_'s own doc comment in guardian_engine.hpp) -
+        // so, unlike its two siblings above, it does NOT survive the restart. A
+        // future refactor that accidentally folded this counter into the
+        // persisted record would read nonzero here instead of 0, failing this
+        // CHECK.
+        CHECK(engine.legacy_sink_dropped_unwired() == 0);
+
+        engine.stop();
+    }
+}
+
 TEST_CASE("#4783 Gate 4 UP-3: an absent, malformed, or schema-mismatched legacy-sink "
           "loss-ledger record self-heals at boot - no restore, no crash",
           "[guardian][engine][legacy_sink]") {
