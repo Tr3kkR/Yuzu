@@ -35,9 +35,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "the fwupd leg needs libsystemd at build time (a system dependency, never vcpkg); "
          "without it update_pending reads unreadable with the fwupd:not_built token and the sysfs "
          "rows remain. Hosts without "
-         "DMI (containers, some VMs) report the DMI fields absent and hosts without the fwupd "
-         "daemon report update_pending unavailable: neither is a failure. The populated-DMI "
-         "shape is not captured from a physical Linux host"},
+         "DMI (containers, some VMs) report the DMI fields absent and a reachable system bus "
+         "with no fwupd daemon reports update_pending unavailable: neither is a failure. A "
+         "system bus that cannot be opened (a container without the bus socket) reads "
+         "update_pending unreadable with fwupd:bus_open:<errno> and the action CONSTRAINED. The "
+         "populated-DMI shape is not captured from a physical Linux host"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, "

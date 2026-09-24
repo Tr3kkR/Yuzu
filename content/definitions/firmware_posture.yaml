@@ -12,8 +12,8 @@
 ## Wire rows lead with a fixed tag: `firmware|<field>|<value>|<source>` (the
 ## data rows) or, only when the action's one exception handler fires,
 ## `constrained|internal_error`. A fact the OS definitively reports as not
-## present is `absent` (or `unavailable` for a missing fwupd daemon) and is
-## not a failure; `unreadable` is a failed read and always comes with a
+## present is `absent` (or `unavailable` when the system bus reports fwupd not
+## installed) and is not a failure; `unreadable` is a failed read and always comes with a
 ## non-OK result status.
 
 ---
@@ -29,8 +29,9 @@ metadata:
     and BIOS/embedded-controller release (Windows raw SMBIOS, Linux DMI
     release), the fwupd update-pending verdict and one row per fwupd device
     (Linux), and the device-tree version source and hardware model (macOS).
-    A fact the OS reports as not present reads `absent`; a missing fwupd
-    daemon reads `update_pending|unavailable`; a failed read reads
+    A fact the OS reports as not present reads `absent`; a system bus that
+    reports fwupd not installed reads `update_pending|unavailable`; a failed
+    read (including a bus that cannot be opened) reads
     `unreadable` and downgrades the result to CONSTRAINED or
     PERMISSION_DENIED with a `<source>:<cause>` reason.
   tags: [firmware_posture, security, posture, firmware, inventory]
@@ -69,7 +70,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The value. vendor, version, release_date: the text read, else `absent` (the OS reports nothing) or `unreadable` (the read failed). release_date is `YYYY-MM-DD` when the source used a recognised date shape, otherwise the source text unchanged. update_pending: `yes`, `no` or `unknown` (aggregate over updatable fwupd devices), `unavailable` (no fwupd daemon on this host: a state, not a failure) or `unreadable` (the fwupd read failed, or this build has no libsystemd and reports the fwupd:not_built reason). fwupd_device: `id=<id>;name=<name>;version=<version>;updatable=<yes|no>;needs_reboot=<yes|no>;update_pending=<yes|no|unknown>;unmodelled=<yes|no>`, where unmodelled=yes means a device flag bit above those the plugin names was set. Other fields: a decimal number, an `<major>.<minor>` release, a device-tree `<node>#<key>` reference or the hardware model. Empty on a `constrained` row.'
+        description: 'The value. vendor, version, release_date: the text read, else `absent` (the OS reports nothing) or `unreadable` (the read failed). release_date is `YYYY-MM-DD` when the source used a recognised date shape, otherwise the source text unchanged. update_pending: `yes`, `no` or `unknown` (aggregate over updatable fwupd devices), `unavailable` (the system bus answered and fwupd is not on it: a state, not a failure) or `unreadable` (the fwupd read failed, or this build has no libsystemd and reports the fwupd:not_built reason). fwupd_device: `id=<id>;name=<name>;version=<version>;updatable=<yes|no>;needs_reboot=<yes|no>;update_pending=<yes|no|unknown>;unmodelled=<yes|no>`, where unmodelled=yes means a device flag bit above those the plugin names was set. Other fields: a decimal number, an `<major>.<minor>` release, a device-tree `<node>#<key>` reference or the hardware model. Empty on a `constrained` row.'
         example: A1.2.3
         platforms: [windows, linux, darwin]
       - name: source
