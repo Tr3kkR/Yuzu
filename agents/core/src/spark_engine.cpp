@@ -2161,8 +2161,13 @@ SparkEngine::subscription_establishment(SubscriptionId id) const {
     auto ait = armed_.find(sit->second);
     if (ait == armed_.end())
         return std::nullopt;
-    return SubscriptionEstablishment{ait->second.armed_at, ait->second.established_at,
-                                     ait->second.coverage};
+    SubscriptionEstablishment out{ait->second.armed_at, ait->second.established_at,
+                                  ait->second.coverage};
+    // An inert mechanism may have dropped a coverage transition; do not trust the cache.
+    if (auto mit = mechanisms_.find(ait->second.spec.type);
+        mit != mechanisms_.end() && mit->second->stats().inert)
+        out.coverage = SparkCoverage::None;
+    return out;
 }
 
 std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {

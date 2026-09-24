@@ -67,6 +67,7 @@ All Yuzu metrics follow a consistent naming scheme.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
+| `yuzu_server_ca_crl_publish_failures_total` | counter | Failed CRL (re)publish attempts, whatever the cause — e.g. the CA root read or CA key load failed, CRL build/sign failed, no database connection within 2.5 s, a wait of more than 5 s for the `ca_store.ca_crl_versions` table lock, a statement or idle-in-transaction timeout, a degraded revoked-set or number read, an insert or COMMIT failure, the CA root changing twice mid-publish, or another publish in the same process still running after 7.5 s. Every failed publish counts; the one exception is the background freshness pass finding another publish already running in the same process, which it skips (a skip is not a failure) instead of waiting. A failure of the freshness pass's unpublished-revocation *check* (not a publish) is logged at warn and not counted (#4830). Server-side revocation enforcement is unaffected; the public CRL is stale until the next successful publish, which the leader's freshness pass retries automatically. Fires `YuzuCaCrlPublishFailing` (`docs/prometheus/yuzu-alerts.yml`). |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
 ## Executions event-outbox metrics (HA WS-2a)
@@ -110,6 +111,24 @@ Until a dedicated alert ships (tracked for WS-11), monitor this family
 manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
+
+### Agent presence metrics (HA WS-5 slice 1)
+
+`OfflineEndpointStore` (schema `endpoint_state`) is the cross-replica agent
+presence source `AgentRegistry::all_ids()`/`evaluate_scope()` merge into
+scope-evaluation visibility (ADR-2002 §7a). See
+`docs/postgres-migration-ladder.md`'s `OfflineEndpointStore` row for the v3
+migration and `docs/observability-conventions.md` for the fail-soft posture
+this counter covers.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_agent_presence_store_failed_total` | counter | A presence-store operation that degraded instead of succeeding, labeled `op` (`upsert`\|`query_live_ids`\|`remove_if_session`) and `reason` (`store_unavailable`\|`db_error`). All three operations are fail-soft by design (a degraded `upsert` just means this heartbeat's identity/liveness refresh didn't land, self-healing on the next heartbeat; a degraded read leaves `evaluate_scope`/`all_ids()` local-only for the cache window; a degraded delete leaves a departed agent's row to expire via the ordinary TTL filter instead of an immediate delete) — this counter exists so fail-soft does not also mean fail-invisible. A legitimate session-mismatch result from `remove_if_session` (zero rows matched `RETURNING`) is NOT counted here, only a genuine store-unavailable/query-error path. |
+
+There is deliberately no success/rate counter and no dedicated alert rule yet
+— same posture as `yuzu_server_gateway_route_desync_total` below: a
+background rate worth paging on needs real fleet data once a multi-replica
+deployment exists to generate any.
 
 ### Gateway routing directory metrics (HA WS-4 4.1)
 
