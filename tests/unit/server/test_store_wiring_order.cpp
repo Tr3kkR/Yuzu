@@ -37,7 +37,9 @@
  * at the time of writing that server.cpp's match counts are IDENTICAL with
  * and without stripping (no setter or construction call is presently
  * mentioned only inside a comment), so this costs nothing today and guards
- * against a future false match/miss inside commented-out code.
+ * against a future false match/miss inside commented-out code. The HA
+ * ConfinedDispatchSink check further down is the exception: it needs the strip
+ * (see the last bullet below).
  *
  * EXCLUDED BY THE REGEX, NOT BY AN ALLOWLIST: by-reference setter forms
  * (`set_health_store(&health_store_)`, `set_blast_radius_detector(&blast_
@@ -59,6 +61,15 @@
  * Nothing here needs updating when a setter or construction call is added
  * in the correct order; a failure means an ordering regression was
  * introduced, not that this file is stale.
+ *
+ * COST ON WINDOWS. server.cpp is loaded and comment-stripped once, by
+ * cached_server_cpp_text() below: take the text from it rather than reading the
+ * file in a new case. A whole-text std::regex over the ~0.76 MB stripped file can
+ * be very slow on MSVC debug depending on the pattern's shape -- one with an
+ * optional capture group at its head took 231 s there (about 1.5 s on libc++),
+ * while the plain patterns in this file cost a few seconds per pass. For a new
+ * scan prefer std::string_view::find plus a small matcher (see
+ * confined_sink_scan.hpp), and time it on a Windows debug build.
  *
  * WHAT THIS SCAN DOES NOT CATCH (governance Gate 3 architect + quality-
  * engineer, both SHOULD, recorded here per docs-writer-owns-wording /
@@ -89,20 +100,29 @@
  *     slash-star-shaped substring, losing ~2000 real lines including 5 live
  *     setters from the scan. A correct fix needs a string-literal-aware
  *     stripper, which this file does not attempt.
- *   - The ConfinedDispatchSink scan (confined_sink_scan.hpp) recognises one
+ *   - The HA WS-5 ConfinedDispatchSink scan is a separate, regex-free scan (the
+ *     hand-written matcher in confined_sink_scan.hpp). It recognises one
  *     spelling, `[yuzu::server::]ConfinedDispatchSink [identifier] {`. A
  *     construction written with parentheses, `= {`, a type alias, or a block
- *     comment between the type and its brace is invisible to it, and the
+ *     comment between the type and its brace is invisible to it, and so is one in
+ *     any file other than server.cpp and dispatch_scope_ladder.hpp; the
  *     site-count pin cannot flag what the scan cannot see. It is purely lexical
- *     and runs on text with `//` comments stripped: a brace-shaped mention inside
- *     a block comment or a string literal is counted as a site, which fails the
- *     count pin loudly. Its two field markers are searched in the next
- *     kFieldWindow (1200) bytes: one further away reads as missing and fails
- *     loudly, but one that belongs to whatever follows a site, if it falls inside
- *     the window, is credited to the site and passes silently (no real site is
- *     followed by one today). The check is presence-only: `prepare_route_fallback`
- *     and `presence_widens` share a type (`dispatch_confined_arms.hpp`), so a site
- *     with the two positional lambdas swapped still passes.
+ *     and runs on text with `//` comments stripped, which the ladder site needs
+ *     (raw, its `has_remote_presence` lies 1533 bytes from the site's start, past
+ *     the window, because 760 bytes of `//` comments sit inside its initialiser;
+ *     stripped, it is 773 bytes in). The stripper also cuts a line at a `//`
+ *     inside a string literal. A brace-shaped mention inside a block comment or a
+ *     string literal is counted as a site, which fails the count pin loudly
+ *     (unless a real site is lost in the same edit). Its two field markers,
+ *     `has_remote_presence` and `->prepare(`, are
+ *     searched as plain text in the next kFieldWindow (1200) bytes: one further
+ *     away reads as missing and fails loudly, but one that belongs to whatever
+ *     follows a site, or that sits inside a block comment or a string literal
+ *     within the window, is credited to the site and passes silently (no real
+ *     site is followed by one today). The check is presence-only:
+ *     `prepare_route_fallback` and `presence_widens` share a type
+ *     (`dispatch_confined_arms.hpp`), so a site with the two positional lambdas
+ *     swapped still passes.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -125,6 +145,7 @@
 #endif
 
 using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
+using yuzu::test::wiring_scan::kFieldWindow;
 using yuzu::test::wiring_scan::kTypeName;
 
 namespace {
@@ -142,6 +163,7 @@ struct SetterCall {
 int g_server_cpp_loads = 0;
 
 std::string read_text_file(const fs::path& path) {
+    INFO("reading " << path.string());
     REQUIRE(fs::is_regular_file(path));
     std::ifstream in(path, std::ios::binary);
     REQUIRE(in.is_open());
@@ -195,22 +217,25 @@ std::string strip_line_comments(const std::string& text) {
 
 /// server.cpp, comment-stripped, loaded once per process and shared by every
 /// real-source TEST_CASE: take the text from this accessor rather than reading the
-/// file again. Function-local static: read-only input, and Catch2 runs the cases
-/// serially in one process.
+/// file again (the strip alone is a whole-text regex pass, about 0.5 s on MSVC debug,
+/// and each case used to repeat it). Function-local static: read-only input, and
+/// Catch2 runs the cases serially in one process.
 const std::string& cached_server_cpp_text() {
     static const std::string text = [] {
-        ++g_server_cpp_loads;
-        return strip_line_comments(
-            read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp"));
+        std::string stripped =
+            strip_line_comments(read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp"));
+        ++g_server_cpp_loads; // a failed read throws first, and the next call retries
+        return stripped;
     }();
     return text;
 }
 
 } // namespace
 
-// The other cases pass whether or not the cache strips, so pin the content: no
-// `//` survives (the naive stripper removes them even inside string literals),
-// and it is still server.cpp.
+// Only the #1712 case's `== 4` count depends on the strip (unstripped, a `//` mention
+// makes it 5); the other cases pass either way. So pin the content directly: no `//`
+// survives (the naive stripper removes them even inside string literals), and it is
+// still server.cpp.
 TEST_CASE("cached_server_cpp_text is server.cpp with every // comment stripped",
           "[wiring_order]") {
     const std::string& text = cached_server_cpp_text();
@@ -430,6 +455,8 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
             ++total_sites;
             INFO(label << ":" << line_of(text, site.start)
                        << " — ConfinedDispatchSink construction");
+            INFO("has_remote_presence and ->prepare( are searched in the next " << kFieldWindow
+                 << " bytes (see this file's header)");
             CHECK(site.has_remote_presence);
             CHECK(site.has_prepare_route_fallback);
         }
@@ -439,24 +466,27 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
 
     // Sanity floor+ceiling (not just ">= 1"): exactly 3 production sites as
     // of this slice (make_confined_dispatch_sink, forward_legacy_command,
-    // wire_and_dispatch_confined). A 4th site added later without updating
-    // this count is flagged for review, not silently passed; a site removed
-    // is caught the same way.
+    // wire_and_dispatch_confined). A 4th site in the recognised spelling (see this
+    // file's header) added later without updating this count is flagged for review,
+    // not silently passed; a site removed is caught the same way.
     CHECK(total_sites == 3);
 }
 
 // The matcher must not use the C++ regular-expression library: scanning server.cpp
 // with it takes minutes on MSVC debug, and nothing else here notices a merely slow
 // scan. Reading the header rather than timing the scan keeps this independent of
-// the machine.
+// the machine. It guards that one header only: it cannot see the regexes this file
+// still uses, another header, a macro, or a slow scan that does not use one.
 TEST_CASE("confined_sink_scan.hpp does not use the regular-expression library",
           "[wiring_order]") {
     // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
     std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
                                       "tests" / "unit" / "server" / "confined_sink_scan.hpp");
+    // Not vacuous: an empty read must not pass.
+    REQUIRE(text.find("find_confined_dispatch_sink_sites") != std::string::npos);
     std::transform(text.begin(), text.end(), text.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    INFO("the matcher header must not use the regular-expression library");
+    INFO("the matcher header must not contain \"regex\" in any case, comments included");
     CHECK(text.find("regex") == std::string::npos);
 }
 
@@ -518,6 +548,7 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
              {"ConfinedDispatchSink " + std::string(200, 'a') + fields,
               "ConfinedDispatchSink" + std::string(161, ' ') + "sink" + fields,
               "ConfinedDispatchSink" + std::string(600, ' ') + fields}) {
+            INFO("text length " << text.size());
             const auto sites = find_confined_dispatch_sink_sites(text);
             REQUIRE(sites.size() == 1);
             CHECK(sites[0].start == 0);
@@ -534,6 +565,10 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         CHECK(find_confined_dispatch_sink_sites("-> ConfinedDispatchSink ConfinedDispatchSink" +
                                                 fields)
                   .empty());
+        // The search resumes one past the brace, so a name right behind it is a second site.
+        CHECK(find_confined_dispatch_sink_sites("ConfinedDispatchSink{ConfinedDispatchSink" +
+                                                fields)
+                  .size() == 2);
     }
 
     SECTION("every whitespace kind separates tokens; only word characters form the identifier") {
@@ -549,6 +584,32 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
                   .empty());
     }
 
+    SECTION("the whitespace and identifier classes are exactly the original `\\s` and `\\w`, "
+            "byte by byte") {
+        std::string arrow_wrong, suffix_wrong; // decimal codes of the bytes that disagree
+        for (int b = 0; b < 256; ++b) {
+            const char c = static_cast<char>(b);
+            const bool space = b == ' ' || (b >= '\t' && b <= '\r');
+            const bool word = (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') ||
+                              (b >= 'a' && b <= 'z') || b == '_';
+            // Only whitespace keeps a `->` attached to the type name.
+            const auto arrowed = find_confined_dispatch_sink_sites(
+                "->" + std::string(1, c) + "ConfinedDispatchSink" + fields);
+            if (arrowed.empty() != space)
+                arrow_wrong += " " + std::to_string(b);
+            // Between the type name and the brace: whitespace, a word byte, or the brace itself.
+            const auto suffixed = find_confined_dispatch_sink_sites(
+                "ConfinedDispatchSink " + std::string(1, c) + fields);
+            if ((suffixed.size() == 1) != (space || word || c == '{'))
+                suffix_wrong += " " + std::to_string(b);
+        }
+        INFO("bytes classified differently from the original grammar, before `->`:" << arrow_wrong);
+        CHECK(arrow_wrong.empty());
+        INFO("bytes classified differently from the original grammar, before the brace:"
+             << suffix_wrong);
+        CHECK(suffix_wrong.empty());
+    }
+
     SECTION("a type-name mention that fails to match hides nothing after it") {
         // The first type name's identifier run swallows the second and then meets
         // `foo`, not a brace; the second is a real site.
@@ -562,6 +623,7 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         for (const std::string& prefix :
              {std::string("yuzu::server:X"), std::string("Xuzu::server::"),
               std::string("yuzu::server:: ")}) {
+            INFO("prefix \"" << prefix << "\"");
             const auto sites =
                 find_confined_dispatch_sink_sites(prefix + "ConfinedDispatchSink" + fields);
             REQUIRE(sites.size() == 1);
@@ -615,6 +677,12 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         // Measured from the start of the qualified spelling, not from the type
         // name: this marker ends 14 bytes past the window's edge.
         CHECK_FALSE(presence_seen_at("yuzu::server::", 1195));
+        // And only forward: markers before the site's start are not part of its window.
+        const auto before = find_confined_dispatch_sink_sites(
+            "has_remote_presence ->prepare( ConfinedDispatchSink s{ };");
+        REQUIRE(before.size() == 1);
+        CHECK_FALSE(before[0].has_remote_presence);
+        CHECK_FALSE(before[0].has_prepare_route_fallback);
     }
 
     SECTION("identifier, whitespace, arrow and window edges match the original grammar exactly") {
@@ -628,6 +696,8 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         }
         CHECK(find_confined_dispatch_sink_sites("x > ConfinedDispatchSink s" + fields).size() == 1);
         CHECK(find_confined_dispatch_sink_sites("x - ConfinedDispatchSink s" + fields).size() == 1);
+        CHECK(find_confined_dispatch_sink_sites("-sConfinedDispatchSink" + fields).size() == 1);
+        CHECK(find_confined_dispatch_sink_sites("- > ConfinedDispatchSink" + fields).size() == 1);
         const auto seen_at = [](const std::string& q, const std::string& other,
                                 const std::string& marker, std::size_t offset) {
             std::string text = q + "ConfinedDispatchSink sink{ " + other;
@@ -645,5 +715,26 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         CHECK_FALSE(seen_at("", presence + ",", prepare, 1191));
         CHECK_FALSE(seen_at("", presence + ",", prepare, 5000));
         CHECK_FALSE(seen_at("yuzu::server::", presence + ",", prepare, 1191));
+        CHECK(seen_at("yuzu::server::", prepare, presence, 1181)); // qualified: the same edges
+        CHECK_FALSE(seen_at("yuzu::server::", prepare, presence, 1182));
+        CHECK(seen_at("yuzu::server::", presence + ",", prepare, 1190));
+    }
+
+    SECTION("input that ends inside the suffix is a mention, and nothing is read past a view's "
+            "end") {
+        for (const char* text : {"", "ConfinedDispatchSink", "ConfinedDispatchSink ",
+                                 "ConfinedDispatchSink x", "-> "}) {
+            INFO("text \"" << text << "\"");
+            CHECK(find_confined_dispatch_sink_sites(text).empty());
+        }
+        // Views into a longer buffer whose NEXT byte is the brace (not part of the view).
+        const std::string a = "ConfinedDispatchSink{ x";
+        const std::string b = "ConfinedDispatchSink   {";
+        const std::string c = "ConfinedDispatchSink foo{";
+        const std::string d = "ConfinedDispatchSink foo   {";
+        CHECK(find_confined_dispatch_sink_sites(std::string_view(a).substr(0, 20)).empty());
+        CHECK(find_confined_dispatch_sink_sites(std::string_view(b).substr(0, 23)).empty());
+        CHECK(find_confined_dispatch_sink_sites(std::string_view(c).substr(0, 24)).empty());
+        CHECK(find_confined_dispatch_sink_sites(std::string_view(d).substr(0, 27)).empty());
     }
 }

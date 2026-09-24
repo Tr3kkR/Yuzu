@@ -6,7 +6,7 @@
 // understood).
 //
 // Keep the C++ regular-expression library out of this file: scanning server.cpp
-// with it takes minutes on MSVC debug (milliseconds on libstdc++ and libc++), and
+// with it takes minutes on MSVC debug (seconds at most on libstdc++ and libc++), and
 // test_store_wiring_order.cpp fails if it appears here.
 
 #include <cstddef>
