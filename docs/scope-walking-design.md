@@ -212,6 +212,23 @@ point, and only one of them wants everything. Refusals are counted as
 `yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
 `result_set.create|denied`.
 
+**The generic `POST /api/v1/result-sets` route and MCP `create_result_set` apply the same
+malformed/empty-`parent_id` refusal (#4307) but are NOT dispatch surfaces** — unlike the three
+async producers above, they never call `command_dispatch_fn`, so their `RESULT_SET_BAD_PARENT`
+refusals are audited as `result_set.create|denied` but deliberately do **not** increment
+`yuzu_server_dispatch_target_rejected_total`; that metric family is reserved for the
+dispatch-targeting routes. Do not mistake the absent counter on these two call sites for a
+regression of the alerting coverage the metric otherwise provides.
+
+**`parent_id` is additionally length-capped at 64 bytes (#4734, `kResultSetParentIdMaxLen`)**
+on all five create surfaces (the generic route, all three async producers, and
+`from-inventory-query`) before the value can reach the persisted `scope_input_id` lineage
+marker. Because `parent_id` also accepts a per-operator alias (a result-set `name`, valid up to
+256 bytes) on the three async producers, a real alias longer than 64 bytes that previously
+resolved successfully is now refused before resolution is attempted — reference the set by its
+canonical `rs_...` id instead. See the `vNEXT` breaking-change note in
+`docs/user-manual/server-admin.md` for the full operator-facing account.
+
 **`{id}/re-eval` is refused, never broadcast, when the original's recorded parent no longer
 exists (#4306).** `re-eval` synthesises the sibling's dispatch scope from the LIVE, nullable
 `parent_id` FK column on the original — `parent_id TEXT REFERENCES result_sets(id) ON DELETE SET

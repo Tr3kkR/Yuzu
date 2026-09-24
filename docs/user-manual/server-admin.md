@@ -270,6 +270,21 @@ reason=parent_gone` case: create a fresh result set from the intended parent ins
 re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
 at creation) still broadcasts on re-eval, unchanged.
 
+### vNEXT — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-tar-query`/`from-instruction-result` (#4734, breaking)
+
+**What changed.** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias
+(the set's own `name`, valid up to 256 bytes). `POST /api/v1/result-sets/from-tar-query` and
+`/from-instruction-result` (and their MCP twins) now bound `parent_id` to 64 bytes
+(`kResultSetParentIdMaxLen`) before attempting alias resolution, closing a gap where an
+oversized value was copied unbounded into the persisted `scope_input_id` lineage marker. MCP's
+equivalent producer tools already enforced this bound; REST did not.
+
+**Who this affects.** Any caller referencing a result set by a `name`-based alias longer than 64
+bytes as `parent_id` on these two REST routes. Previously such a call resolved the alias and
+dispatched normally; it now returns `400` ("parent_id must be at most 64 bytes") before
+resolution is attempted. Use the set's canonical `rs_...` id instead (`GET
+/api/v1/result-sets` lists both `id` and `name` for every set you own).
+
 ### vNEXT — `GET /api/v1/result-sets` can now answer `503`; the async result-set producers' post-dispatch fault code changes from `400` to `500` on REST (#4306, breaking)
 
 **What changed.** `GET /api/v1/result-sets` previously always answered `200`, even when the
