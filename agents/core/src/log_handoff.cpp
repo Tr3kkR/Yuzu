@@ -339,6 +339,15 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         // This is the authoritative "the worker is actually done" signal
         // wait_for_worker_exit() waits on, independent of which thread's shared_ptr
         // reset happens to trigger ~thread_pool()'s destructor call.
+        //
+        // HARDENING NOTE (third-round adversarial review, Fable): WorkerExitSignal is a
+        // ONE-SHOT latch, correct only because `1` below is hard-coded to exactly one
+        // worker thread -- on_thread_stop fires once per worker, so wait_for_worker_exit()
+        // would observe the FIRST exit, not "every worker has exited", if this pool ever
+        // grew to N>1 threads. If a future change raises the thread count, replace the
+        // one-shot bool with a countdown (or an atomic counter reaching zero) at the same
+        // time -- do not carry this literal `1` and WorkerExitSignal's one-shot shape out
+        // of sync with each other.
         auto pool = std::make_shared<spdlog::details::thread_pool>(
             queue_capacity, 1, [] {},
             [worker_exit] {
