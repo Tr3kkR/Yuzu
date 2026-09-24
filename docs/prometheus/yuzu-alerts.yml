@@ -2159,6 +2159,57 @@ groups:
             that the clock moved. Nothing has been deleted by these passes - the guard
             declines rather than deletes on this trigger.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-reap-anchor-not-surviving"
+      # #4856: yuzu_server_guardian_read_degrade_total{reason,source} shipped
+      # with no alert referencing it, so a sustained read degrade silently
+      # turned device compliance scores "healthy" (the DEX-score fail-open
+      # this counter's guardian_state source also covers) and paged nobody.
+      # Two sources on the SAME counter, both keyed by reason
+      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # is the DEX/observation family (dex_read<>/dex_observation) - these
+      # fail SOFT, serving an empty/degraded result rather than an error, so
+      # this is the ONLY external signal that anything went wrong; "guardian_rules"
+      # is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
+      # agent_rule_statuses*/rule_names*/errored_rule_count) - these fail HARD
+      # (a typed error the caller must act on), but a sustained rate here still
+      # means the Guardian push/reconcile/status surface is failing, not
+      # merely serving stale data. `by (reason, source)` keeps both dimensions
+      # on the fired alert so an operator can tell which family and which
+      # substrate condition without cross-referencing /metrics by hand.
+      - alert: YuzuGuardianReadDegraded
+        expr: |
+          sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason, source) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian reads degrading ({{ $labels.source }}/{{ $labels.reason }})"
+          description: >-
+            yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
+            source="{{ $labels.source }}"} is non-zero. source="guardian_state"
+            means a DEX/observation read (crash summary, top apps, device
+            score inputs, ...) is degrading and fails SOFT - callers keep
+            serving an empty/partial result, so this counter and the sampled
+            warn log are the only external tell; do not read a "healthy"
+            device compliance score as authoritative while this fires (#4855).
+            source="guardian_rules" means an AUTHORITATIVE rule/status read
+            (get_rule/list_rules/agent_rule_statuses/rule_names/
+            errored_rule_count) is degrading: the read itself returns a typed
+            error, not a silent empty/stale result — but "returns a typed
+            error" does not mean every caller aborts. Most callers DO fail
+            closed (abort push/reconcile/status on the typed error), but this
+            is not universal: several guardian_routes.cpp dashboard renders
+            call list_rules().value_or({}) and fall back to an empty rule
+            list on a degrade, and guardian_ingest.cpp's event-severity
+            enrichment folds a degraded get_rule into the same "unknown"
+            severity default it already uses for a genuinely-deleted rule.
+            Treat those specific views/fields as unknown, not "confirmed
+            absent", while this alert fires. Either way,
+            pool_acquire_timeout/query_error correlate with yuzu_pg_*
+            saturation or outage; store_not_open means the store failed to
+            open at boot (should not be reachable post-boot given fail-closed
+            construction - investigate as a possible regression if seen).
+            See #2659 for the deferred-widening posture behind this metric.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
@@ -2992,13 +3043,29 @@ groups:
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
-        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
-        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
-        # closed to DenyAll. This is the confinement substrate itself faulting,
-        # not the fleet shrinking: a fired alert means SCOPED operators see
-        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
-        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
-        # pure pool saturation, so only the store-specific counter moves.
+        # A CONFINEMENT-feeding management-group read (ancestors / descendants /
+        # agent-groups / row/member resolution, ADR-0042 + #1762) degraded.
+        # Three shapes share this one counter, by caller: (1) the confinement
+        # hierarchy reads fail closed to DenyAll; (2) a checked row/member read
+        # (get_group_checked and/or get_members_checked — the DEX app-perf
+        # group trend, /auto VERIFY compare, and GET
+        # /api/v1/management-groups/{id} + its MCP twin get_management_group,
+        # the latter two on BOTH checked twins since governance round-2)
+        # surfaces the degrade as a 503/retryable result to its own caller;
+        # (3) the LEGACY get_group()/get_members() wrappers still render the
+        # SAME degrade as a flat not-found / empty member list to their
+        # remaining callers — a genuinely render-only dashboard fragment, but
+        # ALSO several dispatch-targeting reads (group dispatch resolution,
+        # dispatch-scope-ladder's group-members closure, Guardian rule-push
+        # group resolution, policy-check target resolution, and the `/auto`
+        # Pre-flight group-cohort resolver) whose empty result fails safe by
+        # under-reaching rather than being a benign display gap — tracked as
+        # KNOWN, DISCLOSED residuals at #4907. This is deliberate fail-soft
+        # behaviour there, not a bug, but it is why a fired alert must not be
+        # read as "groups were deleted" or "the fleet shrank". Same
+        # dashboard-invisibility as YuzuInventoryReadDegraded — /readyz stays
+        # green under pure pool saturation, so only the store-specific counter
+        # moves.
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
           sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
@@ -3009,14 +3076,32 @@ groups:
           summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
           description: >-
             yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
-            is non-zero: a confinement-feeding hierarchy read degraded and the
-            caller failed closed to DenyAll. This is a confinement-substrate
-            degrade — scoped operators now see REDUCED or EMPTY lists, it does
-            NOT mean management groups shrank or devices left the fleet.
-            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
-            or outage; store_not_open means the store failed to open at boot. Do
-            not read a scoped operator's short/empty list as authoritative while
-            this fires.
+            is non-zero: a confinement-feeding management-group read degraded.
+            Depending on the caller this means the caller failed closed to
+            DenyAll, returned a degraded/503-or-retryable result to its own
+            caller (e.g. the DEX app-perf group trend, /auto VERIFY compare,
+            or GET /api/v1/management-groups/{id} and its MCP twin — both now
+            on get_group_checked for the group row as well as
+            get_members_checked for the member list), or — for the legacy
+            get_group()/get_members() wrappers' remaining callers (#4907) —
+            received a flat not-found / an empty member list rather than the
+            real row/membership, which for the dashboard scope picker is a
+            benign display gap but for a dispatch-targeting caller (group
+            dispatch, dispatch-scope ladder, Guardian rule push, policy-check
+            target resolution) means the current dispatch under-reaches
+            rather than the group being genuinely empty. A `/auto` Pre-flight
+            run STARTED during the degrade resolves its group cohort through
+            the same legacy path: it answers "No visible devices in that
+            scope." and creates no run at all, rather than a run with a
+            frozen-empty cohort — re-run Pre-flight after the degrade clears,
+            it will not self-heal an existing run. This is a
+            confinement-substrate degrade, it does NOT mean management groups
+            shrank or devices left the fleet. pool_acquire_timeout/query_error
+            correlate with yuzu_pg_* saturation or outage; store_not_open
+            means the store failed to open at boot. Do not read a scoped
+            operator's short/empty list, an empty app-perf/VERIFY cohort, a
+            zero-reach dispatch, or a Pre-flight "no visible devices" refusal,
+            as authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuAnalyticsStoreNotOpen
         # AnalyticsEventStore (ADR-0049) failed to open at boot and is

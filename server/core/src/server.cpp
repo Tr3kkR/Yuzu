@@ -1947,9 +1947,10 @@ public:
         metrics_.describe("yuzu_server_mgmt_group_read_degrade_total",
                           "Management-group confinement reads (get_agent_groups / "
                           "get_ancestor_ids / get_descendant_ids / get_member_agents_in_subtrees "
-                          "/ get_assignments_for_principal / get_visible_agents) that returned a "
-                          "degrade (nullopt/DenyAll) rather than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "/ get_assignments_for_principal / get_visible_agents / "
+                          "get_members_checked, incl. the legacy get_members() wrapper - "
+                          "#1762) that returned a degrade (nullopt/DenyAll) rather than a "
+                          "result, by reason (store_not_open/pool_acquire_timeout/query_error)",
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
@@ -3381,12 +3382,30 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
+        // #4856: two sources share this counter, both by reason
+        // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
+        // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
+        // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
+        // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
+        // agent_rule_statuses*/rule_names*/errored_rule_count, fail-hard: the
+        // caller gets a std::expected error and aborts the push/reconcile
+        // rather than fan out empty/stale data). Pre-seeded below (same closed
+        // {reason x source} cross-product pre-seed pattern as
+        // yuzu_server_kek_operations_total above) so absent()/rate() alerting
+        // is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
-                          "read) rather than a genuine result, by reason and source. A sampled "
-                          "warn accompanies each new degrade episode; the catastrophic reads "
-                          "(rules/status) abort the push/reconcile rather than fan out empty.",
+                          "read) rather than a genuine result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(guardian_state = DEX/observation reads, fail-soft, empty result "
+                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "push/reconcile aborts rather than fans out empty). A sampled warn "
+                          "accompanies each new degrade episode.",
                           "counter");
+        for (const auto source : {"guardian_state", "guardian_rules"})
+            for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                                 {{"reason", reason}, {"source", source}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -16390,19 +16409,11 @@ private:
         // device/group/tag_cohort/version_devices) internally, and is the SOLE
         // consumer every surface (REST, MCP, dashboard) reads.
         //
-        // GAP-1 (#4857): `.tag_values` has NO home in `DexPerfApi` (no public
-        // fleet-wide "distinct tag values" resource exists yet — see
-        // `DexRoutes::TagValuesFn`'s own doc comment) — kept here, standalone,
-        // as a disclosed presentation-side data dependency outside the seam.
-        DexRoutes::TagValuesFn dex_tag_values_fn =
-            [this](const std::string& tag_key) -> std::optional<std::vector<std::string>> {
-            if (!tag_store_)
-                return std::nullopt;
-            auto values = tag_store_->get_distinct_values(tag_key);
-            if (!values)
-                return std::nullopt;
-            return *values;
-        };
+        // GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's
+        // device-model scope-selector values no longer need a standalone
+        // TagStore-reading lambda here — `DexRoutes` now derives them
+        // in-seam from `dex_perf_api`'s own `fleet_snapshot` (see
+        // `DexPerfApi`'s own doc comment).
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -16547,10 +16558,7 @@ private:
             // The devices-by-version drill's sole gate (ADR-0017) — the SAME
             // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
             // surfaces resolve visibility identically.
-            fleet_read_fn,
-            // GAP-1 (#4857): the device-model scope selector's distinct-tag-
-            // values reader (see TagValuesFn's own doc comment).
-            dex_tag_values_fn);
+            fleet_read_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).

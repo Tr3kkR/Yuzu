@@ -2211,6 +2211,37 @@ TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device'
     CHECK(audited);
 }
 
+// #4855: a degraded signal-summary read must 503, never render a fabricated
+// healthy score of 100 with no signals. DROP TABLE on a second connection
+// forces a genuine query-level failure while the store stays open (same
+// technique the guard/baseline degrade tests in test_guardian_routes.cpp
+// use). The audit fires BEFORE the read (unchanged fail-closed ordering), so
+// it still records "success" here.
+TEST_CASE("REST dex/devices/{id}: a degraded signal-summary read → 503, never a fabricated "
+          "healthy score",
+          "[pg][rest][dex][device][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"score\"") == std::string::npos); // never a score at all
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
 TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
           "[pg][rest][dex][device][a2]") {
     RestGsHarness h;
