@@ -515,6 +515,101 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
 }
 
 // ---------------------------------------------------------------------------
+// BLOCKER (round 2) regression (#4666 PR-1 second adversarial review round, Fable):
+// the drain-reader lease above only protects drain_log_bounded() specifically.
+// spdlog::async_logger::sink_it_()/flush_() both do
+// `if (auto pool_ptr = thread_pool_.lock()) pool_ptr->post_log(...)` (or post_flush),
+// so ANY thread calling ordinary logger()->info()/flush() -- not just
+// drain_log_bounded() -- transiently holds its own strong shared_ptr<thread_pool>,
+// completely outside the lease's visibility. Before the worker-exit-signal fix,
+// teardown_body()'s pool_.reset() could be a non-destructive ref-decrement whenever an
+// ordinary PRODUCER thread held that transient reference, letting the
+// ShutdownDeadlineGuard cancel on a normal return while the sink was still genuinely
+// wedged -- reproduced empirically (150/150 under 4-thread producer saturation against
+// a wedged sink). This is the falsifier: RED on pre-worker-exit-signal code (the wait
+// below times out because the action never fires, or fires only by scheduling luck --
+// unreliably, not on the schedule the watchdog promises), GREEN after
+// wait_for_worker_exit() anchors teardown() to the pool's worker thread's own genuine
+// exit, independent of which thread's shared_ptr reset happens to trigger
+// ~thread_pool(). Cleanup (stop producers, release the sink, join everything) runs
+// UNCONDITIONALLY before the outcome is asserted, so a RED run never leaves an
+// abandoned joinable thread behind.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("BLOCKER round-2 regression: teardown()'s deadline watchdog still fires while "
+          "ordinary producer threads (not drain_log_bounded()) are concurrently logging "
+          "against a wedged sink, and no thread is left on an unwatched join",
+          "[log_handoff]") {
+    Harness h; // initially paused
+    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
+
+    auto logger = h.handoff->logger();
+    logger->info("park");
+    REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
+
+    // Producer saturation: 4 threads in a tight loop, each transiently holding its own
+    // strong pool reference on every logger()->info() call (matches the reproducer's
+    // own parameters -- this is what makes the race reliably reproducible rather than
+    // a rare 1-in-200 occurrence).
+    constexpr int kProducers = 4;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> producers;
+    producers.reserve(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&, p] {
+            int i = 0;
+            while (!stop.load(std::memory_order_relaxed))
+                logger->info("p{}-{}", p, i++);
+        });
+    }
+
+    // Give the producers a moment to actually start hammering before teardown begins.
+    std::this_thread::sleep_for(100ms * yuzu::test::kSpinScale);
+
+    std::mutex fired_mu;
+    std::condition_variable fired_cv;
+    bool fired = false;
+    std::chrono::steady_clock::time_point fired_at;
+    const auto teardown_start = std::chrono::steady_clock::now();
+    const auto grace = 300ms;
+
+    std::thread teardown_thread([&] {
+        h.handoff->teardown_with_action_for_test(grace, [&] {
+            {
+                std::lock_guard<std::mutex> lk(fired_mu);
+                fired = true;
+                fired_at = std::chrono::steady_clock::now();
+            }
+            fired_cv.notify_all();
+        });
+    });
+
+    bool ok = false;
+    {
+        std::unique_lock<std::mutex> lk(fired_mu);
+        ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
+                               [&] { return fired; });
+    }
+    const auto fired_after = fired ? (fired_at - teardown_start) : std::chrono::steady_clock::duration::zero();
+
+    // Cleanup runs UNCONDITIONALLY, before any assertion on `ok` -- see this
+    // TEST_CASE's own header comment for why: a RED run must never leave an abandoned
+    // joinable thread behind (round 1's manual RED verification hit exactly that
+    // hazard, which is why this round's test is written to avoid it from the start).
+    stop.store(true, std::memory_order_relaxed);
+    h.sink->release();
+    for (auto& t : producers)
+        t.join();
+    teardown_thread.join();
+
+    REQUIRE(ok);
+    CHECK(fired_after >= grace / 2);
+    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
+    SUCCEED("teardown()'s watchdog covered the concurrent producer traffic; every "
+            "thread joined cleanly");
+}
+
+// ---------------------------------------------------------------------------
 // U6: TSan - concurrent producers plus a repeatedly toggled gate
 // ---------------------------------------------------------------------------
 

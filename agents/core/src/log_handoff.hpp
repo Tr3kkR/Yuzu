@@ -141,40 +141,78 @@
 /// internal snapshot object, so a CONCURRENT teardown() can never leave this function
 /// dereferencing a freed pool.
 ///
-/// DRAIN-READER LEASE (fixes a real, reproduced defect -- an earlier draft of this
-/// primitive claimed a residual race here was harmless; it was not, see below):
-/// drain_log_bounded() holds a `DrainLease` (log_handoff.cpp) for its ENTIRE
-/// pool-touching span, which increments LogHandoff's own `drain_gate_->active_readers`
-/// for that span and decrements it again strictly AFTER every local strong
-/// `shared_ptr<thread_pool>` this function ever creates has already been dropped
-/// (guaranteed by C++ reverse-declaration-order destruction -- the lease is declared
-/// BEFORE any local pool/sink shared_ptr, so it destructs AFTER them). teardown()'s T0
-/// closes admission of new leases (LogHandoff::close_drain_admission()) BEFORE doing
-/// any teardown work, then -- still INSIDE its own already-armed ShutdownDeadlineGuard
-/// scope, not after it -- calls LogHandoff::wait_for_drain_quiescence(), which blocks
-/// until active_readers reaches zero. Only once that returns does teardown_body() run
-/// its own pool_.reset(). This guarantees teardown_body()'s pool_.reset() is ALWAYS the
-/// call that observes the last reference (if any drain_log_bounded() call was ever
-/// concurrently in flight, it has, by construction, already dropped its own copy before
-/// active_readers can reach zero) -- so the actual blocking ~thread_pool() join can
-/// ONLY ever happen on teardown()'s own thread, inside its own watchdog's scope, never
-/// on a drain_log_bounded() caller's thread. A drain_log_bounded() call itself is
-/// therefore bounded by its own `wait` parameter as documented, with no exception: it
-/// never becomes responsible for the pool's blocking destructor.
+/// WORKER-EXIT SIGNAL (the PRIMARY cross-thread guarantee -- fixes a real, reproduced
+/// defect the drain-reader lease below does NOT cover, found in a second round of
+/// adversarial review after the lease shipped): `spdlog::async_logger::sink_it_()`/
+/// `flush_()` (async_logger-inl.h) both do `if (auto pool_ptr = thread_pool_.lock())
+/// pool_ptr->post_log(...)` (or `post_flush`) -- meaning ANY thread calling ordinary
+/// `logger()->info()`/`logger()->flush()`, not just drain_log_bounded(), transiently
+/// holds its OWN strong `shared_ptr<thread_pool>` for the duration of that one call,
+/// completely outside the drain-reader lease's visibility (that lease only wraps
+/// drain_log_bounded()'s own calls). If teardown_body()'s pool_.reset() happened to run
+/// while some OTHER thread was inside that window, the reset became non-destructive,
+/// teardown_body() returned, and the caller's watchdog cancelled on that NORMAL scope
+/// exit -- while THAT producer thread's own local `pool_ptr` could later trigger
+/// ~thread_pool()'s blocking worker join, on the producer thread, with nothing watching
+/// it. Reproduced empirically before this fix landed (150/150 under producer
+/// saturation against a wedged sink; ~1/200 under light logging) -- rare in normal
+/// operation, but this primitive's whole reason to exist is the wedged-sink-during-a-
+/// backlog case, exactly when a producer is most likely to be caught mid-call. TSan
+/// does NOT catch this: pool_ is a correctly refcounted shared_ptr, so there is no data
+/// race, only an ownership-order race on WHICH thread ends up running the destructor.
 ///
-/// THE DEFECT THIS REPLACES (kept here as a historical note, not a live property):
-/// a prior revision let drain_log_bounded() hold a bare strong pool_ reference with no
-/// lease/admission-close protocol. If teardown() ran concurrently, its own
-/// pool_.reset() became a non-destructive ref-decrement (the drainer still held a live
-/// copy), so teardown_body() returned quickly and the ShutdownDeadlineGuard local to
-/// teardown() was destroyed and cancelled on that NORMAL scope exit -- before the real
-/// blocking work (the pool's actual destruction) had happened. The drainer's own later
-/// release of its reference could then be the one that dropped the last owner, running
-/// ~thread_pool()'s blocking join on the drain thread with NO watchdog covering it at
-/// all -- silently violating the "process-wide safety property" this file claimed.
-/// Reproduced independently by two reviewers with standalone repros before this fix
-/// landed; see the routed Spark row's clause (4) and
-/// docs/resource-ledgers/4666-log-handoff.md for the corrected proof this fix provides.
+/// Fix: don't try to track every possible external strong-ref holder (unwinnable
+/// whack-a-mole against spdlog's own internals) -- anchor the wait to the WORKER
+/// THREAD'S OWN lifecycle instead, which is authoritative regardless of which external
+/// thread's shared_ptr reset happens to trigger the C++ destructor call. The pool is
+/// built via spdlog's 4-arg thread_pool constructor
+/// (q_max_items, threads_n, on_thread_start, on_thread_stop) -- verified directly in
+/// thread_pool-inl.h: the worker's lambda is `{ on_thread_start(); worker_loop_();
+/// on_thread_stop(); }`, so on_thread_stop() fires ON THE WORKER THREAD ITSELF,
+/// strictly after worker_loop_() has genuinely returned (i.e. after the worker has
+/// actually processed the terminate message and exited its loop) -- which can only
+/// happen once SOME thread's shared_ptr drop has triggered ~thread_pool() (posting the
+/// terminate message) AND the worker is not wedged. LogHandoff's on_thread_stop
+/// callback sets `worker_exit_->exited = true` and notifies; teardown_body() calls
+/// LogHandoff::wait_for_worker_exit() immediately after pool_.reset(), still INSIDE
+/// teardown()'s/teardown_with_action_for_test()'s already-armed ShutdownDeadlineGuard
+/// scope. Whichever thread ends up actually running ~thread_pool()'s destructor --
+/// teardown()'s own thread, or a stray producer thread that happened to hold the last
+/// ref -- teardown() now waits for the WORKER to have genuinely exited before
+/// proceeding to T2/T3, so a wedged sink means the watchdog fires hard_exit()/the test
+/// action after grace exactly as intended, and a healthy sink means the wait returns
+/// essentially immediately.
+///
+/// DRAIN-READER LEASE (kept -- an ADDITION to the worker-exit signal above, not a
+/// replacement; still correct and still necessary, but for a narrower reason than the
+/// prior banner here claimed): drain_log_bounded() holds a `DrainLease`
+/// (log_handoff.cpp) for its ENTIRE pool-touching span, which increments LogHandoff's
+/// own `drain_gate_->active_readers` for that span and decrements it again strictly
+/// AFTER every local strong `shared_ptr<thread_pool>` this function ever creates has
+/// already been dropped (guaranteed by C++ reverse-declaration-order destruction).
+/// teardown()'s T0 closes admission of new leases (LogHandoff::close_drain_admission())
+/// BEFORE any teardown work, then -- still inside the watchdog's scope -- calls
+/// LogHandoff::wait_for_drain_quiescence(). WITHOUT this lease, the worker-exit signal
+/// above still correctly bounds teardown() itself (it would simply wait out
+/// drain_log_bounded()'s own `wait` parameter before the object's last reference could
+/// possibly drop) -- but drain_log_bounded() itself could become the accidental LAST
+/// owner right as its own spin loop ends, inheriting the blocking join on ITS OWN
+/// thread and exceeding ITS OWN documented `wait` bound, which is exactly BLOCKER-1's
+/// original mechanism recurring on drain_log_bounded()'s side even with the worker-exit
+/// fix in place. The lease exists to keep THAT bound honest, nothing more; it is not,
+/// and was never claimed to be here as of this correction, sufficient on its own to
+/// protect teardown() from an ordinary producer thread.
+///
+/// THE DEFECTS THIS REPLACES (kept here as a historical note, not a live property):
+/// round 1 (the drain-reader lease alone) fixed drain_log_bounded()'s own racing
+/// against teardown() but left the wider door above open -- ANY producer thread's
+/// ordinary logger()->info()/flush() call could still transiently hold the pool. That
+/// gap was reproduced independently by two reviewers with standalone repros in round 1,
+/// but its own scope (drain_log_bounded() specifically) was too narrow; round 2 (this
+/// paragraph) closed the actual general case via the worker-exit signal above, found
+/// and reproduced with a standalone repro before this fix landed. See the routed Spark
+/// row's clause (4) and docs/resource-ledgers/4666-log-handoff.md for the corrected
+/// proof this fix provides.
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
@@ -270,31 +308,52 @@ private:
 
 /// Opaque control block backing drain_log_bounded()'s reader lease (log_handoff.cpp);
 /// forward-declared only -- see the file banner's DRAIN-READER LEASE paragraph. No
-/// caller outside log_handoff.cpp ever names this type.
-class DrainGate;
+/// caller outside log_handoff.cpp ever names this type. Tag kept consistent (`struct`)
+/// with the definition in log_handoff.cpp -- a class/struct tag mismatch between a
+/// forward declaration and its definition trips -Wmismatched-tags on Clang / C4099 on
+/// MSVC (harmless here since this repo does not build -Werror, but free to avoid).
+struct DrainGate;
+
+/// Opaque control block for LogHandoff::wait_for_worker_exit() -- see the file banner's
+/// WORKER-EXIT SIGNAL paragraph. No caller outside log_handoff.cpp ever names this
+/// type. Same struct-tag-consistency note as DrainGate above.
+struct WorkerExitSignal;
 
 /// Owns the private single-thread pool, the async logger, and the wrapper sinks (plan
 /// 1.2/1.4). Non-copyable, non-movable -- there is exactly one owner, matching
 /// ShutdownDeadlineGuard's own precedent for a shutdown-path primitive with a single,
 /// stack/member-local owner. See the file banner above for the full contract.
 ///
-/// THREAD-SAFETY CONTRACT (should-fix from the #4666 PR-1 adversarial review):
-/// teardown()/teardown_with_action_for_test() are documented callable "from any
-/// thread" and ARE internally synchronized against a CONCURRENT drain_log_bounded()
-/// call (the DRAIN-READER LEASE above) and against each other/the destructor (the
-/// torn_down_ exchange). They are NOT synchronized against a concurrent call to the
-/// plain accessors below (overrun_total()/queue_depth()/in_write()/stalled_for()/
-/// log_errors_total()/last_log_error_for_test()) or against install()/logger() --
-/// those read pool_/logger_/wrapped_sinks_/error_state_ directly, with no lock, while
-/// teardown_body() resets them. This is UNREACHABLE in PR-1 (nothing calls these
-/// accessors from a second thread yet) but is a REAL CONSTRAINT for PR-3's planned
-/// heartbeat poller, which by construction runs on a different thread than whatever
-/// calls teardown(). Matching ShutdownDeadlineGuard's own precedent ("safe to call
-/// from the constructing thread only", shutdown_deadline_guard.hpp), the rule for a
-/// caller introducing a second thread here is: EITHER serialize every accessor/
-/// install()/logger() call against teardown() with the caller's own lock, OR (if a
-/// wait-free poller is required) snapshot pool_/logger_/wrapped_sinks_ the same
-/// weak-ptr way drain_log_bounded() already does, before PR-3 wires a poller against
+/// THREAD-SAFETY CONTRACT (should-fix from the #4666 PR-1 adversarial review, wording
+/// corrected in the second review round -- the first draft overclaimed what
+/// torn_down_ synchronizes): teardown()/teardown_with_action_for_test() are documented
+/// callable "from any thread" and ARE internally synchronized against a CONCURRENT
+/// drain_log_bounded() call (the DRAIN-READER LEASE) and against an ordinary producer
+/// thread's logger()->info()/flush() call (the WORKER-EXIT SIGNAL, both above). They
+/// are NOT fully synchronized against EACH OTHER: the `torn_down_` atomic exchange
+/// makes a SECOND concurrent teardown()/teardown_with_action_for_test()/destructor
+/// call return immediately (idempotency, preventing a double-run of the body), but it
+/// does NOT make that second caller WAIT for the first call to actually finish -- so
+/// two threads calling teardown() (or one calling it while another drops the last
+/// `unique_ptr<LogHandoff>`, triggering the destructor) concurrently can still race
+/// each other: the second caller's own call returns as soon as it loses the exchange,
+/// which can be well before the first caller's teardown_body() has actually completed.
+/// A caller needing "teardown is genuinely done" from a second thread must still
+/// synchronize that externally (e.g. join the thread that called teardown(), as every
+/// test in this file already does). Separately, they are NOT synchronized against a
+/// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
+/// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
+/// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
+/// directly, with no lock, while teardown_body() resets them. This is UNREACHABLE in
+/// PR-1 (nothing calls these accessors from a second thread yet) but is a REAL
+/// CONSTRAINT for PR-3's planned heartbeat poller, which by construction runs on a
+/// different thread than whatever calls teardown(). Matching ShutdownDeadlineGuard's
+/// own precedent ("safe to call from the constructing thread only",
+/// shutdown_deadline_guard.hpp), the rule for a caller introducing a second thread
+/// here is: EITHER serialize every accessor/install()/logger() call against
+/// teardown() with the caller's own lock, OR (if a wait-free poller is required)
+/// snapshot pool_/logger_/wrapped_sinks_ the same weak-ptr way drain_log_bounded()
+/// already does, before PR-3 wires a poller against
 /// this class. Do not assume the accessors are already safe for that use just because
 /// nothing today calls them concurrently.
 class YUZU_EXPORT LogHandoff {
@@ -444,6 +503,16 @@ private:
     /// unwatched wait. Null-safe, same as close_drain_admission().
     void wait_for_drain_quiescence();
 
+    /// The WORKER-EXIT SIGNAL fix (see the file banner's own paragraph): blocks until
+    /// the pool's single worker thread has actually run its on_thread_stop callback
+    /// (i.e. genuinely exited worker_loop_()), independent of which thread's
+    /// shared_ptr<thread_pool> reset happens to trigger ~thread_pool()'s destructor.
+    /// Called by teardown_body() immediately after pool_.reset(), which keeps it
+    /// INSIDE the same ShutdownDeadlineGuard scope teardown()/
+    /// teardown_with_action_for_test() already construct. Null-safe, same reasoning as
+    /// close_drain_admission()/wait_for_drain_quiescence().
+    void wait_for_worker_exit();
+
     static void register_global_drain_handle(LogHandoff* self);
     static void clear_global_drain_handle(const LogHandoff* self);
 
@@ -452,6 +521,7 @@ private:
     std::vector<std::shared_ptr<StallObservableSink>> wrapped_sinks_;
     std::shared_ptr<ErrorState> error_state_;
     std::shared_ptr<DrainGate> drain_gate_; // see close_drain_admission()/wait_for_drain_quiescence()
+    std::shared_ptr<WorkerExitSignal> worker_exit_; // see wait_for_worker_exit()
     std::atomic<bool> torn_down_{false};
     bool log_file_fallback_{false};
     std::string log_file_fallback_reason_;

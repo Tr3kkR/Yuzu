@@ -76,6 +76,23 @@ struct DrainGate {
 };
 
 // ---------------------------------------------------------------------------
+// Worker-exit signal (fixes the general producer-thread race the drain-reader lease
+// above does not cover -- second-round #4666 PR-1 adversarial review). See the
+// header's WORKER-EXIT SIGNAL paragraph for the full mechanism. A one-shot latch: the
+// pool's single worker thread sets `exited` and notifies from spdlog's own
+// on_thread_stop callback, which fires ON THE WORKER THREAD ITSELF, strictly after
+// worker_loop_() has genuinely returned (verified against thread_pool-inl.h's ctor).
+// Defined at namespace scope (not anonymous), matching DrainGate, because
+// WorkerExitSignal is forward-declared in the header as yuzu::agent::WorkerExitSignal.
+// ---------------------------------------------------------------------------
+
+struct WorkerExitSignal {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool exited{false};
+};
+
+// ---------------------------------------------------------------------------
 // Global drain-lookup slot for drain_log_bounded() (plan 1.8). File-local: no header
 // exposure needed, only LogHandoff's own private static members and the
 // drain_log_bounded() free function below ever touch this.
@@ -179,6 +196,14 @@ void LogHandoff::wait_for_drain_quiescence() {
         return;
     std::unique_lock<std::mutex> lk(drain_gate_->mu);
     drain_gate_->cv.wait(lk, [&] { return drain_gate_->active_readers == 0; });
+}
+
+void LogHandoff::wait_for_worker_exit() {
+    if (!worker_exit_)
+        return; // construction never reached the point of assigning this -- same
+                // reasoning as close_drain_admission()'s null guard
+    std::unique_lock<std::mutex> lk(worker_exit_->mu);
+    worker_exit_->cv.wait(lk, [&] { return worker_exit_->exited; });
 }
 
 bool drain_log_bounded(std::chrono::milliseconds wait) {
@@ -302,7 +327,27 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         for (auto& s : sinks)
             wrapped.push_back(std::make_shared<StallObservableSink>(std::move(s)));
 
-        auto pool = std::make_shared<spdlog::details::thread_pool>(queue_capacity, 1);
+        // Worker-exit signal (see the header's WORKER-EXIT SIGNAL paragraph) -- built
+        // BEFORE the pool so it can be captured into the pool's own on_thread_stop
+        // callback below.
+        auto worker_exit = std::make_shared<WorkerExitSignal>();
+
+        // 4-arg constructor (q_max_items, threads_n, on_thread_start, on_thread_stop):
+        // on_thread_stop fires ON THE WORKER THREAD ITSELF, after worker_loop_() has
+        // genuinely returned (verified against thread_pool-inl.h's ctor -- the worker's
+        // lambda is exactly `{ on_thread_start(); worker_loop_(); on_thread_stop(); }`).
+        // This is the authoritative "the worker is actually done" signal
+        // wait_for_worker_exit() waits on, independent of which thread's shared_ptr
+        // reset happens to trigger ~thread_pool()'s destructor call.
+        auto pool = std::make_shared<spdlog::details::thread_pool>(
+            queue_capacity, 1, [] {},
+            [worker_exit] {
+                {
+                    std::lock_guard<std::mutex> lk(worker_exit->mu);
+                    worker_exit->exited = true;
+                }
+                worker_exit->cv.notify_all();
+            });
 
         std::vector<spdlog::sink_ptr> as_sink_ptrs(wrapped.begin(), wrapped.end());
         auto logger = std::make_shared<spdlog::async_logger>(
@@ -342,6 +387,7 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         handoff->wrapped_sinks_ = std::move(wrapped);
         handoff->error_state_ = std::move(error_state);
         handoff->drain_gate_ = std::move(drain_gate);
+        handoff->worker_exit_ = std::move(worker_exit);
         register_global_drain_handle(handoff.get());
         return handoff;
     } catch (const std::exception& e) {
@@ -412,9 +458,20 @@ void LogHandoff::teardown_body() {
     // sink: this simply does not return -- the ShutdownDeadlineGuard constructed
     // around teardown_body() (see teardown()/teardown_with_action_for_test() below)
     // is what bounds the wait, not this call itself.
+    //
+    // pool_.reset() here is NOT necessarily the call that actually destroys the pool
+    // (WORKER-EXIT SIGNAL, header banner): an ordinary producer thread concurrently
+    // inside logger_->info()/flush() can transiently hold its own strong
+    // shared_ptr<thread_pool> (spdlog's async_logger::sink_it_()/flush_() do exactly
+    // this), so this reset() can be a non-destructive ref-decrement. wait_for_worker_exit()
+    // immediately below is what makes that harmless: it blocks until the pool's worker
+    // thread has ACTUALLY exited, regardless of which thread's reset ends up triggering
+    // ~thread_pool(), so a wedged sink is still caught by the watchdog armed around this
+    // whole function (teardown()/teardown_with_action_for_test()).
     if (logger_)
         logger_->flush();
     pool_.reset();
+    wait_for_worker_exit();
 
     // T2: every image's registry drops its reference to our logger by overwriting the
     // "" default-logger slot with a NULL-sink logger, rather than
@@ -452,9 +509,13 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
         // Still INSIDE the watchdog's scope, not after it: if a drain_log_bounded()
         // lease admitted just before close_drain_admission() above never releases (a
         // genuinely wedged sink), this wait is what the watchdog is covering -- not an
-        // unwatched drain thread discovered later. Only once every admitted lease has
-        // released does teardown_body()'s pool_.reset() run, which is what guarantees
-        // teardown_body() always observes the last reference itself.
+        // unwatched drain thread discovered later. This keeps drain_log_bounded()'s OWN
+        // `wait` bound honest (it can no longer become the accidental last owner of the
+        // pool right as its spin loop ends) -- it does NOT by itself guarantee
+        // teardown_body()'s pool_.reset() observes the last reference in general (an
+        // ordinary producer thread can still hold one transiently); wait_for_worker_exit()
+        // inside teardown_body(), right after pool_.reset(), is what closes that wider
+        // case (see the header's WORKER-EXIT SIGNAL paragraph).
         wait_for_drain_quiescence();
         teardown_body();
     } catch (...) {
