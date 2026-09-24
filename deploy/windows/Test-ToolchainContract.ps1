@@ -814,36 +814,44 @@ Check 'the standalone assertion models runner-local MSYS2 PATH without leaking i
 Check 'the authenticated PostgreSQL probe uses the bounded process primitive' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $psqlAt = $assertText.IndexOf('if($c.psql')
+  if($psqlAt -lt 0){ return $false }
   $boundedAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $psqlAt)
   $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $boundedAt)
-  $psqlAt -ge 0 -and $boundedAt -gt $psqlAt -and $timeoutAt -gt $boundedAt
+  $boundedAt -gt $psqlAt -and $timeoutAt -gt $boundedAt
 }
 Check 'the settings fingerprint probe uses the bounded process primitive' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $psqlAt = $assertText.IndexOf('if($c.psql')
+  if($psqlAt -lt 0){ return $false }
   $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $psqlAt)
   $probeAt = $assertText.IndexOf('$fp = (Invoke-YuzuContractProbe', $psqlAt)
+  if($probeAt -lt 0){ return $false }
   $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $probeAt)
+  if($fingerprintAt -lt 0){ return $false }
   $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $fingerprintAt)
-  $psqlAt -ge 0 -and $probeAt -gt $psqlAt -and $fingerprintAt -gt $probeAt -and
+  $probeAt -gt $psqlAt -and $fingerprintAt -gt $probeAt -and
     $timeoutAt -gt $fingerprintAt -and $timeoutAt -lt $clusterOkAt
 }
 Check 'the settings fingerprint never fails the assertion' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $psqlAt = $assertText.IndexOf('if($c.psql')
+  if($psqlAt -lt 0){ return $false }
   $probeAt = $assertText.IndexOf('$fp = (Invoke-YuzuContractProbe', $psqlAt)
+  if($probeAt -lt 0){ return $false }
   $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $probeAt)
+  if($clusterOkAt -le $probeAt){ return $false }
   $span = $assertText.Substring($probeAt, $clusterOkAt - $probeAt)
-  $probeAt -ge 0 -and $clusterOkAt -gt $probeAt -and $span -notmatch '\$fail\+\+'
+  $span -notmatch '\$fail\+\+'
 }
 Check 'the CI psql export is opt-in and agent-guarded' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $exportIfAt = $assertText.IndexOf('if($ExportCiEnv)')
+  if($exportIfAt -lt 0){ return $false }
   $matchAt = $assertText.IndexOf('-match ''-(\d+)$''', $exportIfAt)
+  if($matchAt -lt 0){ return $false }
   $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $matchAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
-  $exportIfAt -ge 0 -and $matchAt -gt $exportIfAt -and $writeAt -gt $matchAt -and
-    $occurrences -eq 1 -and $assertText -match '\[switch\]\$ExportCiEnv'
+  $writeAt -gt $matchAt -and $occurrences -eq 1 -and $assertText -match '\[switch\]\$ExportCiEnv'
 }
 Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion' {
   $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw
