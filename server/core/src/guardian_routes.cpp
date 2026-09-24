@@ -299,12 +299,16 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 //    exclusion, used by all 3 synthetic-notimpl fold sites in this file ──────
 
 // Composite key for one (agent, rule) pair. A real struct + hash functor, NOT a
-// delimiter-joined string: neither agent_id nor rule_id has a charset restriction
-// that would make a separator byte unambiguous. agent_id is client-supplied at
-// Register (length-checked only, agent_service_impl.cpp) and rule_id is
-// operator free text on the REST create path (no shape validation,
-// rest_api_v1.cpp) — governance Gate 2/3/6 independently confirmed a crafted
-// "\x1f"-containing agent_id or rule_id collided the prior delimited-string key
+// delimiter-joined string — and its correctness never leans on either field's
+// charset, which is why it stays correct even though only one of the two now
+// carries a guarantee: agent_id is client-supplied at Register (length-checked
+// only, agent_service_impl.cpp), still charset-unrestricted; rule_id created
+// via REST/MCP now IS charset-restricted (is_valid_rule_id, #4665), but a
+// rule_id predating that check, or one reaching this struct via any other,
+// non-charset-checked path, is not guaranteed charset-safe either — a
+// delimiter would still be ambiguous for either field. Governance Gate 2/3/6
+// independently confirmed a crafted "\x1f"-containing agent_id or rule_id
+// collided the prior delimited-string key
 // (`agentA\x1fextra` + `ruleX` == `agentA` + `extra\x1fruleX`), silently
 // dropping a real status row from every fold. A struct key has no delimiter to
 // collide on, for any byte content, by construction — this is the fix, not a
