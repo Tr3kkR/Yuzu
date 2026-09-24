@@ -54,10 +54,18 @@ constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
-// "source" so a future second Guardian-adjacent read-degrade emitter
-// (there is only one surface today) stays distinguishable on the same
-// dashboards without a metric rename.
+// "source" so a future second Guardian-adjacent read-degrade emitter stays
+// distinguishable on the same dashboards without a metric rename. Two
+// sources exist today (#4856): "guardian_state" for the DEX/observation
+// family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
+// is returned to the caller) and "guardian_rules" for the AUTHORITATIVE
+// rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
+// errored_rule_count, fail-hard — a std::expected error is returned and the
+// caller decides how to fail). Both bump the SAME counter,
+// yuzu_server_guardian_read_degrade_total{reason,source}, so an alert can
+// aggregate `by (reason, source)` without missing either family.
 constexpr const char* kDegradeSource = "guardian_state";
+constexpr const char* kDegradeSourceRules = "guardian_rules";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
 // Mirrors InventoryStore's constants.
@@ -215,11 +223,11 @@ struct DegradeLog {
 };
 
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
-                             DegradeSampler& s) {
+                             const char* source, DegradeSampler& s) {
     if (metrics)
         metrics
             ->counter("yuzu_server_guardian_read_degrade_total",
-                      {{"reason", reason}, {"source", kDegradeSource}})
+                      {{"reason", reason}, {"source", source}})
             .increment();
     const std::int64_t now = now_epoch();
     const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
@@ -256,19 +264,19 @@ Result dex_read(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, con
                 DegradeSampler& sampler, Body&& body) {
     Result empty{};
     if (!open) {
-        if (const auto d = note_read_degrade(metrics, kReasonStoreNotOpen, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics, kReasonStoreNotOpen, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: store not open", method);
         return empty;
     }
     auto lease = pool.try_acquire_for(kDexReadTimeout);
     if (!lease) {
-        if (const auto d = note_read_degrade(metrics, kReasonPoolTimeout, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics, kReasonPoolTimeout, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: pool acquire timed out", method);
         return empty;
     }
     auto result = body(lease.get());
     if (!result) {
-        if (const auto d = note_read_degrade(metrics, kReasonQueryError, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics, kReasonQueryError, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: query failed", method);
         return empty;
     }
@@ -595,17 +603,34 @@ GuaranteedStateRuleRow read_rule_row(PGresult* res, int i) {
 
 std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError>
 GuaranteedStateStore::get_rule(const std::string& rule_id) const {
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::get_rule: store not open");
         return std::unexpected(GuaranteedStateReadError::kDegraded);
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::get_rule: pool acquire timed out");
         return std::unexpected(GuaranteedStateReadError::kDegraded);
+    }
     const std::string sql = std::string("SELECT ") + kRuleCols +
                             " FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id "
                             "= $1";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{rule_id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::get_rule: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected(GuaranteedStateReadError::kDegraded);
+    }
     if (PQntuples(res.get()) == 0)
         return std::optional<GuaranteedStateRuleRow>{std::nullopt};
     return std::optional<GuaranteedStateRuleRow>{read_rule_row(res.get(), 0)};
@@ -613,16 +638,33 @@ GuaranteedStateStore::get_rule(const std::string& rule_id) const {
 
 std::expected<std::vector<GuaranteedStateRuleRow>, std::string>
 GuaranteedStateStore::list_rules() const {
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::list_rules: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::list_rules: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     const std::string sql = std::string("SELECT ") + kRuleCols +
                             " FROM guaranteed_state_store.guaranteed_state_rules ORDER BY name";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::list_rules: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     std::vector<GuaranteedStateRuleRow> rows;
     const int n = PQntuples(res.get());
     rows.reserve(static_cast<std::size_t>(n));
@@ -1827,13 +1869,13 @@ GuaranteedStateStore::dex_observation(const std::string& event_id) const {
     // is visible on /metrics — matching the ADR-0038 "deferred widening"
     // posture for every non-catastrophic read.
     if (!open_) {
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::dex_observation: store not open");
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kDexReadTimeout);
     if (!lease) {
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::dex_observation: pool acquire timed out");
         return std::nullopt;
     }
@@ -1844,7 +1886,7 @@ GuaranteedStateStore::dex_observation(const std::string& event_id) const {
         "WHERE event_id = $1 LIMIT 1",
         std::vector<std::string>{event_id});
     if (res.status() != PGRES_TUPLES_OK) {
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSource, sampler); d.should_log)
             spdlog::warn("GuaranteedStateStore::dex_observation: query failed: {}",
                          PQresultErrorMessage(res.get()));
         return std::nullopt;
@@ -1927,11 +1969,22 @@ GuaranteedStateStore::daily_remediations(const std::string& since) const {
 
 std::expected<std::vector<GuardianAgentRuleStatus>, std::string>
 GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     std::string sql =
         "SELECT agent_id, rule_id, state, updated_at FROM "
         "guaranteed_state_store.guardian_agent_rule_status";
@@ -1941,8 +1994,14 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
         params.push_back(rule_id);
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     std::vector<GuardianAgentRuleStatus> out;
     const int n = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(n));
@@ -1959,19 +2018,36 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
 
 std::expected<std::vector<GuardianAgentRuleStatus>, std::string>
 GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id) const {
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses_for_agent: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses_for_agent: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     // Rides the (agent_id, rule_id) PK auto-index (agent_id leading).
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT agent_id, rule_id, state, updated_at FROM "
         "guaranteed_state_store.guardian_agent_rule_status WHERE agent_id = $1",
         std::vector<std::string>{agent_id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_rule_statuses_for_agent: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     std::vector<GuardianAgentRuleStatus> out;
     const int n = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(n));
@@ -1988,16 +2064,33 @@ GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id)
 
 std::expected<std::unordered_map<std::string, std::string>, std::string>
 GuaranteedStateStore::rule_names() const {
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_names: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_names: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     pg::PgResult res = pg::exec_params(
         lease.get(), "SELECT rule_id, name FROM guaranteed_state_store.guaranteed_state_rules",
         std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_names: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     std::unordered_map<std::string, std::string> out;
     const int n = PQntuples(res.get());
     for (int i = 0; i < n; ++i)
@@ -2010,11 +2103,22 @@ GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) c
     std::unordered_map<std::string, std::string> out;
     if (rule_ids.empty())
         return out; // success, not degrade
-    if (!open_)
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_names_for: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_names_for: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     // CHUNKED at 500 ids per statement (mirrors the SQLite original) — a
     // Baseline whose deployed-snapshot is very large cannot make one giant
     // IN-list statement time out or exceed a param-count limit.
@@ -2032,8 +2136,14 @@ GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) c
         }
         sql += ")";
         pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
+            if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                                  sampler);
+                d.should_log)
+                spdlog::warn("GuaranteedStateStore::rule_names_for: query failed: {}",
+                             PQresultErrorMessage(res.get()));
             return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+        }
         const int rows = PQntuples(res.get());
         for (int i = 0; i < rows; ++i)
             out.emplace(text_col(res.get(), i, 0), text_col(res.get(), i, 1));
@@ -2043,16 +2153,27 @@ GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) c
 
 std::expected<std::size_t, std::string> GuaranteedStateStore::errored_rule_count(
     const std::optional<std::vector<std::string>>& agent_scope) const {
+    static DegradeSampler sampler;
     // Engaged-empty scope (ADR-0017 INV-2): zero visible agents means zero
     // rows, without issuing a query — mirrors rule_names_for's empty-input
     // posture (success, not degrade).
     if (agent_scope && agent_scope->empty())
         return static_cast<std::size_t>(0);
-    if (!open_)
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::errored_rule_count: store not open");
         return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::errored_rule_count: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
+    }
     std::string sql =
         "SELECT COUNT(DISTINCT s.rule_id) FROM "
         "guaranteed_state_store.guardian_agent_rule_status s JOIN "
@@ -2070,8 +2191,14 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::errored_rule_count
         params.push_back(pg::to_text_array(views));
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::errored_rule_count: query failed: {}",
+                         PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 

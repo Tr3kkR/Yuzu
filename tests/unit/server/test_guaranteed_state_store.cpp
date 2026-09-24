@@ -1545,6 +1545,8 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     GuaranteedStateStore bad(bad_pool);
     CHECK_FALSE(bad.is_open());
+    yuzu::MetricsRegistry metrics;
+    bad.set_metrics(&metrics);
 
     CHECK_FALSE(bad.create_rule(make_rule("x", "x")));
     CHECK_FALSE(bad.update_rule(make_rule("x", "x")));
@@ -1580,6 +1582,39 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     auto empty_scope = bad.errored_rule_count(std::vector<std::string>{});
     REQUIRE(empty_scope.has_value());
     CHECK(*empty_scope == 0);
+
+    // #4856: the AUTHORITATIVE rule/status reads must ALSO bump the shared
+    // yuzu_server_guardian_read_degrade_total counter, distinguished by
+    // source="guardian_rules" from the DEX/observation family's
+    // source="guardian_state" (query_events above) — previously these seven
+    // reads surfaced a typed error WITHOUT bumping anything, so a sustained
+    // read degrade on the catastrophic-read set was invisible on /metrics.
+    CHECK_FALSE(bad.agent_rule_statuses("").has_value());
+    CHECK_FALSE(bad.agent_rule_statuses_for_agent("agent-a").has_value());
+    CHECK_FALSE(bad.rule_names().has_value());
+    CHECK_FALSE(bad.rule_names_for(std::vector<std::string>{"r1"}).has_value());
+    // rule_names_for's own empty-input short-circuit (success, not degrade —
+    // mirrored by errored_rule_count's empty-scope case above) must NOT
+    // increment either.
+    auto empty_names = bad.rule_names_for(std::vector<std::string>{});
+    REQUIRE(empty_names.has_value());
+    CHECK(empty_names->empty());
+    // 8 authoritative-read degrades total: get_rule, list_rules,
+    // agent_rule_statuses, agent_rule_statuses_for_agent, rule_names,
+    // rule_names_for, and errored_rule_count's two non-empty-scope calls
+    // above — the metric label itself, not just the typed-error return, is
+    // what a regression here would silently drop.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_rules"}})
+              .value() == 8.0);
+    // The DEX/observation family's own store_not_open degrade (query_events
+    // above) stays on the ORIGINAL source — proof the two families are
+    // counted separately rather than merged into one undifferentiated total.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_state"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
