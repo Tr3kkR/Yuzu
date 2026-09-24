@@ -20,6 +20,7 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp> // #4665: shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
 
 #include <algorithm>
 #include <array>
@@ -2514,9 +2515,25 @@ TEST_CASE("#4606 criterion-10: format_arm_committed_line keeps the #3990 driver'
     // reading.
     // A plain id renders byte-for-byte as it did before the id was neutralised: the #3990 driver's
     // T2_RE (docs/spark-rebuild-baselines/fullsync_blackout_diag.py) parses exactly this shape.
-    CHECK(format_arm_committed_line("blackout-reg-01", 3, 101, "file", "inline-shared", 7) ==
-          "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=101, "
-          "type=file, via=inline-shared, attach_to_commit_ms=7)");
+    // #4665: fixture-driven (tests/unit/fixtures/spark/arm_committed_line.json) so this assertion
+    // and the driver-side lockstep test (tests/test_spark_evidence_format_lockstep.py) share one
+    // golden shape instead of two independently hand-spelled literals.
+    {
+        const std::filesystem::path fixture_path =
+            std::filesystem::path{YUZU_TEST_FIXTURE_DIR} / "spark" / "arm_committed_line.json";
+        REQUIRE(std::filesystem::exists(fixture_path));
+        std::ifstream fixture_file(fixture_path, std::ios::binary);
+        const auto fixture = nlohmann::json::parse(fixture_file);
+        const auto& in = fixture.at("input");
+        const std::string rule_id = in.at("rule_id").get<std::string>();
+        const std::string type = in.at("type").get<std::string>();
+        const std::string via = in.at("via").get<std::string>();
+        CHECK(format_arm_committed_line(rule_id, in.at("epoch").get<std::uint64_t>(),
+                                         in.at("incarnation").get<std::uint64_t>(), type.c_str(),
+                                         via.c_str(),
+                                         in.at("attach_to_commit_ms").get<std::int64_t>()) ==
+              fixture.at("expected_line").get<std::string>());
+    }
 
     // The rule id is operator-authored and unvalidated. A newline would forge a whole physical
     // line (here a fake benchmark T_detect line) and a space, '=' or ',' would forge tokens.
