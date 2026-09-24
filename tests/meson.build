@@ -1583,13 +1583,13 @@ if build_server
   #     each against its own per-runner Postgres); a dev/main push still runs
   #     the whole `server-pg` on one leg. A new or split shard needs one of the
   #     two labels -- check-pg-shard-partition.py fails without it, since an
-  #     unlabeled shard would never run on a PR. Balance by MEASURED Big Tam
-  #     wall time, not case count: median of six PR runs (2026-09-24, 2 procs)
-  #     b = C 114.8s, F 59.9, A 53.8, B 50.2, H 46.4, J 37.0, E 33.8, D 33.0
-  #     (429s); a = G 29.4, K 24.8, I 19.3, L 13.2 (87s). That is ~1:5, not 1:1,
-  #     because the a job also carries ~170s of non-pg work the b job does not.
-  #     Re-measure before moving a shard (docs/ci-architecture.md, "PR-time
-  #     Linux pg split").
+  #     unlabeled shard would never run on a PR -- and ci.yml's selectors must
+  #     keep matching them (its pg step fails on a selector that selects
+  #     nothing). Balance by MEASURED Big Tam wall time, not case count, and
+  #     weight the halves ~1:5, not 1:1: the `a` job also carries the non-pg
+  #     suites. The measured figures and the re-measure procedure live in ONE
+  #     place, docs/ci-architecture.md "PR-time test selection" (Balance), so
+  #     they cannot drift from a second copy here.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.

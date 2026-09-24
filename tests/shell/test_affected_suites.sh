@@ -2,7 +2,7 @@
 # test_affected_suites.sh — fixture tests for scripts/ci/affected-suites.sh
 #
 # The classifier decides which heavy test suites a pull request may skip (docs/ci-architecture.md,
-# "PR-time suite selection"). Its two failure directions cost very different amounts: a false RUN
+# "PR-time test selection"). Its two failure directions cost very different amounts: a false RUN
 # costs minutes, a false SKIP lets a break reach dev. So this pins, hermetically (no network, no
 # build, a throwaway tests tree):
 #   - the class table, including the case-arm ordering traps (`*` in a case pattern matches `/`)
@@ -10,6 +10,11 @@
 #   - every fail-closed input: empty list, count mismatch, unreadable path, missing tests tree
 #   - renames: the SOURCE of a rename out of a heavy directory still counts
 # and finally runs the classifier over the real repository as a smoke test.
+#
+# Where it runs: ci.yml's preflight "Shell gate tests" step, on every PR, like
+# tests/shell/test_detect_code_change.sh. It is deliberately NOT a meson `docs` suite entry: it spawns
+# a process per case and chmods a directory, so it belongs on the integration surface rather than in
+# the suites every OS leg runs (and the chmod case means nothing on Windows).
 #
 # Run:  bash tests/shell/test_affected_suites.sh
 set -euo pipefail
@@ -35,6 +40,12 @@ EOF
 cat > "$T/tests/unit/agent/test_b.cpp" <<'EOF'
 // reads .claude/read-by-agent.md
 EOF
+# a helper header directly under tests/unit/ is compiled into the server binary too
+cat > "$T/tests/unit/test_helpers.hpp" <<'EOF'
+// a shared helper that reads docs/read-by-helper.md
+EOF
+# a source grep would call binary (NULs); GNU grep >= 3.5 prints nothing for one without -a
+printf 'docs/read-by-binary.md\000\001\002 blob\n' > "$T/tests/unit/server/blob.bin"
 TR="$T/tests/unit"
 
 pass=0 fail=0
@@ -64,7 +75,8 @@ expect_class() {   # expect_class <want> <path>
 # both: the build graph and CI infrastructure
 for p in meson.build meson.options vcpkg.json vcpkg-configuration.json triplets/x64-linux.cmake \
          meson/native/linux-gcc15.ini requirements-ci.txt subdir/meson.build tests/meson.build \
-         .github/workflows/ci.yml scripts/ci/flake-retry.py tools/capmatrix-gen/x.cpp; do
+         .github/workflows/ci.yml scripts/ci/flake-retry.py tools/capmatrix-gen/x.cpp \
+         enterprise/x.cpp .clusterfuzzlite/Dockerfile; do
   expect_class both "$p"
 done
 # both: code both binaries are built from, and shared test-tree files
@@ -122,6 +134,8 @@ expect "false false" "tests/meson.build naming a path runs both"          'docs/
 expect "true true"   "a doc no test names skips both"                     'docs/user-manual/unread.md\t\n'
 expect "false false" "capability registries always run both"              'docs/capability-registries/x.tsv\t\n'
 expect "true true"   "a changed path that merely extends a named path is not named" 'docs/user-manual/metrics.md.bak\t\n'
+expect "false false" "a path a shared helper header names runs both families" 'docs/read-by-helper.md\t\n'
+expect "false true"  "a path named only inside a binary-looking server source is still found" 'docs/read-by-binary.md\t\n'
 
 # --- renames: the source path counts -------------------------------------------------------------
 expect "false true"  "rename server code -> docs still runs the server family" 'docs/x.md\tserver/core/src/x.cpp\n'
@@ -134,6 +148,10 @@ expect "false false" "only blank lines"                    '\n\n'
 expect "false false" "list shorter than --total"           'docs/z.md\t\n'               --total 2
 expect "false false" "list longer than --total"            'docs/z.md\t\ndocs/y.md\t\n'  --total 1
 expect "false false" "non-numeric --total"                 'docs/z.md\t\n'               --total many
+expect "false false" "--total given but empty is not 'no guard'" 'docs/z.md\t\n'            --total ""
+expect "false false" "a record with no filename"           '\t\n'
+expect "false false" "a record with no filename, with --total" '\t\n'                        --total 1
+expect "false false" "a record with only a previous name"  '\tdocs/old.md\n'
 expect "true true"   "matching --total keeps the result"   'docs/z.md\t\n'               --total 1
 expect "false false" "backslash from @tsv escaping"        'docs/a\\\\tb.md\t\n'
 expect "false false" "C-quoted path"                       '"docs/a b.md"\t\n'
@@ -162,13 +180,30 @@ rc=0; bash "$SCRIPT" --bogus >/dev/null 2>&1 </dev/null || rc=$?
 rc=0; bash "$SCRIPT" --total >/dev/null 2>&1 </dev/null || rc=$?
 [ "$rc" = 2 ] && report 0 "flag without a value exits 2" || report 1 "flag without a value exits 2" "rc=$rc"
 
+# --classify-many is what scripts/ci/check-suite-input-closure.py calls, so its shape is a contract.
+got="$(printf 'server/x\nagents/y\ndocs/z.md\ndocs/capability-registries/t.tsv\nunknown-file\n' | bash "$SCRIPT" --classify-many)"
+want="$(printf 'server/x\tserver\nagents/y\tboth\ndocs/z.md\tnone\ndocs/capability-registries/t.tsv\tboth\nunknown-file\tboth')"
+if [ "$got" = "$want" ]; then report 0 "--classify-many prints one path<TAB>class line per input"
+else report 1 "--classify-many prints one path<TAB>class line per input" "got: $got"; fi
+
 # --- the real repository -------------------------------------------------------------------------
-# Not a result to assert (it moves with the tree) but a robustness check: the run-time-read scan must
-# finish over the real tests tree with every tracked path as input, and emit exactly two lines.
+# Robustness on the real tests tree. The input must be inert-only: `git ls-files` as a whole is decided
+# by its first `both` path, so the run-time-read scan (pass 2) would never run. docs/ minus the
+# capability registries is all class `none`, so every path goes through the scan, against the real
+# tests/unit, with a real-sized pattern set; the scan having run is asserted through its diagnostic.
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  real="$(git -C "$ROOT" ls-files | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null))" || real=""
-  lines="$(printf '%s\n' "$real" | grep -c '^skip_\(server\|agent\)=\(true\|false\)$' || true)"
-  [ "$lines" = 2 ] && report 0 "real tree: two well-formed result lines" || report 1 "real tree: two well-formed result lines" "got: $real"
+  inert="$(git -C "$ROOT" ls-files docs | grep -v '^docs/capability-registries/' || true)"
+  if [ -z "$inert" ]; then
+    report 1 "real tree: there are tracked docs paths to scan" "git ls-files docs was empty"
+  else
+    rc=0
+    printf '%s\n' "$inert" | (cd "$ROOT" && bash "$SCRIPT" >"$T/real.out" 2>"$T/real.err") || rc=$?
+    lines="$(grep -c '^skip_\(server\|agent\)=\(true\|false\)$' "$T/real.out" || true)"
+    if [ "$rc" = 0 ] && [ "$lines" = 2 ]; then report 0 "real tree: the scan finishes over every tracked docs path"
+    else report 1 "real tree: the scan finishes over every tracked docs path" "rc=$rc lines=$lines"; fi
+    if grep -q "named by" "$T/real.err"; then report 0 "real tree: the run-time-read scan ran and found real readers"
+    else report 1 "real tree: the run-time-read scan ran and found real readers" "$(head -c 300 "$T/real.err")"; fi
+  fi
   # Every doc a real test reads must classify as affecting; the two known readers are the pin.
   got="$(printf 'docs/user-manual/metrics.md\t\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
   case "$got" in
@@ -177,8 +212,8 @@ if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   esac
   got="$(printf 'docs/capability-registries/dex_obs_platforms.tsv\t\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
   case "$got" in
-    *skip_server=false*skip_agent=false*) report 0 "real tree: a capability registry table runs both" ;;
-    *) report 1 "real tree: a capability registry table runs both" "got: $got" ;;
+    *skip_server=false*skip_agent=false*) report 0 "real tree: a capability registry table runs both (class row)" ;;
+    *) report 1 "real tree: a capability registry table runs both (class row)" "got: $got" ;;
   esac
 fi
 

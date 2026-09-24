@@ -20,40 +20,47 @@
 # Output (stdout): exactly two lines
 #     skip_server=true|false
 #     skip_agent=true|false
-# Diagnostics go to stderr. Every uncertainty prints false/false (run everything): an empty list, a
-# list shorter or longer than --total (the API caps a PR's file list at 3000), a path that cannot be
-# read back exactly (a backslash from jq's @tsv escaping, a C-quoted path), an unreadable tests root.
+# Diagnostics go to stderr. Every uncertainty prints false/false (run everything): an empty list or
+# a record with no path, a list shorter or longer than --total (the API caps a PR's file list at
+# 3000; a --total that is given but empty is an error, not "no guard"), a path that cannot be read
+# back exactly (a backslash from jq's @tsv escaping, a C-quoted path), an unreadable tests root.
 #
-# Classes (first match wins; a path in none of them is `both`, so an unknown path runs everything):
-#   both    build graph and CI infrastructure (any meson.build, meson.options, vcpkg*, triplets,
-#           .github, scripts, tools), everything in agents/ common/ sdk/ proto/ (server tests include
-#           15 agents/core headers; nothing narrower than the directory is proven), and the test-tree
-#           files both binaries share (tests/meson.build, tests/unit/*.hpp, test_runner_main.cpp,
-#           fixtures)
-#   server  server/, content/ (embedded into the server binary), tests/unit/server/
-#   agent   tests/unit/*.cpp and tests/unit/agent/* — the agent/tar test translation units
-#   none    text no compiled test reads: docs/, changelog.d/, governance.d/, .claude/, .codex/,
-#           gateway/, deploy/, site/, tests/{shell,prometheus,puppeteer}/, top-level tests/* files,
-#           root *.md, LICENSE, NOTICE and the inert dotfiles (.gitignore, .dockerignore,
-#           .editorconfig, .pre-commit-config.yaml); any other root file is `both`
+# THE CLASS TABLE lives in classify_path below and nowhere else: this comment,
+# docs/ci-architecture.md and `--classify PATH` all defer to it. What the classes mean (the first
+# matching arm wins; a path no arm names is `both`, so an unknown path runs everything):
+#   both    can affect either family: the build graph and CI infrastructure, the code both
+#           binaries are built from (agents/ is `both` because the server test binary includes 15
+#           agents/core headers), the test-tree files they share, docs/capability-registries/,
+#           and anything unrecognised
+#   server  reaches only the server family (server/, content/, tests/unit/server/)
+#   agent   reaches only the agent family (the agent/tar test translation units)
+#   none    text no compiled test reads at build time: docs, changelog and ledger fragments,
+#           agent-config directories, gateway, deploy, site, the non-C++ test drivers, and an
+#           explicit allowlist of inert root files
 #
 # The one derived rule (RUN-TIME READS). A test can read a file that is in no build graph — the
 # tables under docs/capability-registries/, docs/user-manual/metrics.md. So a path that would leave
 # a family unaffected still affects it when a test source of that family names the path verbatim:
-# the server tests are tests/unit/server/, the agent tests are the rest of tests/unit/, and
-# tests/meson.build counts for both. The scan is deliberately over-broad — an error string that
-# merely mentions a path counts — because a false run costs minutes and a false skip costs a red
-# dev. Its blind spot is a path assembled at run time from parts (`base + "user-manual/x.md"`): keep
-# a run-time read to one literal path, or the reader is invisible to this script.
+# the server tests are tests/unit/server/ plus the shared helper headers directly under
+# tests/unit/, the agent tests are the rest of tests/unit/, and tests/meson.build counts for both.
+# The scan is deliberately over-broad — an error string that merely mentions a path counts —
+# because a false run costs minutes and a false skip costs a red dev. Its blind spots: a path
+# assembled at run time from parts (`base + "user-manual/x.md"`), so keep a run-time read to one
+# literal path; tests/meson.build names files relative to tests/ (`unit/x`, `prometheus/y`), which
+# never equal a repo-relative path; and production code under server/ or agents/ that names a path
+# is not scanned, only tests are.
 #
-# Soundness of the class table is checked against the real build by
-# scripts/ci/check-suite-input-closure.py (no agent-side object includes a server-side file, no
-# server-side object compiles an agent test); this file's own cases are tests/shell/test_affected_suites.sh.
+# The class table is proven against the real build by scripts/ci/check-suite-input-closure.py,
+# which classifies every compile-time input of both families through --classify-many (no
+# agent-family object may depend on a `server` or `none` path, no server-family object on an
+# `agent` or `none` path). This file's own cases are tests/shell/test_affected_suites.sh; the
+# ci.yml step bodies that apply the verdict are tests/shell/test_suite_selection_wiring.sh.
 #
 # Usage:
 #   affected-suites.sh [--total N] [--tests-root DIR] < changed-files
 #   affected-suites.sh --classify PATH             print one path's class (both|server|agent|none)
-# Locally, for a branch:
+#   affected-suites.sh --classify-many < paths     one `path<TAB>class` line per input path
+# Locally, for a branch (GNU grep expected; BSD grep is quadratic in the number of changed paths):
 #   git diff --no-renames --name-only origin/dev...HEAD | bash scripts/ci/affected-suites.sh
 #
 # Run tests:  bash tests/shell/test_affected_suites.sh
@@ -61,23 +68,27 @@ set -euo pipefail
 
 tests_root="tests/unit"
 expected_total=""
+total_given=false
 classify_only=""
+classify_many=false
 
 usage() {
   cat >&2 <<'EOF'
 usage:
   affected-suites.sh [--total N] [--tests-root DIR] < changed-files
   affected-suites.sh --classify PATH [--tests-root DIR]
+  affected-suites.sh --classify-many < paths
 EOF
   exit 2
 }
 
 while (( $# )); do
   case "$1" in
-    --total)       (( $# >= 2 )) || usage; expected_total="$2"; shift 2 ;;
-    --tests-root)  (( $# >= 2 )) || usage; tests_root="$2"; shift 2 ;;
-    --classify)    (( $# >= 2 )) || usage; classify_only="$2"; shift 2 ;;
-    *)             usage ;;
+    --total)         (( $# >= 2 )) || usage; expected_total="$2"; total_given=true; shift 2 ;;
+    --tests-root)    (( $# >= 2 )) || usage; tests_root="$2"; shift 2 ;;
+    --classify)      (( $# >= 2 )) || usage; classify_only="$2"; shift 2 ;;
+    --classify-many) classify_many=true; shift ;;
+    *)               usage ;;
   esac
 done
 
@@ -123,6 +134,14 @@ if [[ -n "$classify_only" ]]; then
   exit 0
 fi
 
+if [[ "$classify_many" == true ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    printf '%s\t%s\n' "$line" "$(classify_path "$line")"
+  done
+  exit 0
+fi
+
 # --- read the list -------------------------------------------------------------------------------
 paths=()
 n_files=0
@@ -132,6 +151,13 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   new_path="${line%%$'\t'*}"
   old_path=""
   [[ "$line" == *$'\t'* ]] && old_path="${line#*$'\t'}"
+  # A changed file always has a name. A record without one is malformed input, and it must not
+  # count as a file that contributes no path: that would let a list of such records read as
+  # "nothing reaches either family".
+  if [[ -z "$new_path" ]]; then
+    echo "affected-suites: record with no filename -> running everything (fail-closed)" >&2
+    emit_all_run
+  fi
   for p in "$new_path" "$old_path"; do
     [[ -z "$p" ]] && continue
     # Not readable back exactly: jq's @tsv turns tab/newline/backslash into a backslash escape and
@@ -144,11 +170,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   done
 done
 
-if (( n_files == 0 )); then
+if (( n_files == 0 || ${#paths[@]} == 0 )); then
   echo "affected-suites: empty file list -> running everything (fail-closed)" >&2
   emit_all_run
 fi
-if [[ -n "$expected_total" ]]; then
+if [[ "$total_given" == true ]]; then
   if [[ ! "$expected_total" =~ ^[0-9]+$ ]]; then
     echo "affected-suites: invalid --total '$expected_total' -> running everything (fail-closed)" >&2
     emit_all_run
@@ -194,13 +220,15 @@ if [[ ( -z "$server_why" || -z "$agent_why" ) && ${#candidates[@]} -gt 0 ]]; the
   printf '%s\n' "${candidates[@]}" > "$work/patterns"
 
   # scan_to <out-file> <grep path args...>: the candidate paths a set of sources names verbatim.
+  # -a: a source grep would call binary (a NUL, or invalid UTF-8 under a UTF-8 locale) is still
+  # searched; GNU grep >= 3.5 otherwise prints nothing for it, which would read as "not named".
   # grep exits 1 for "no match", which is the normal case; anything above 1 is an error, and an
-  # error must not read as "no reader found". Called in the main shell, never inside $(...), so the
-  # fail-closed exit really ends the script.
+  # error must not read as "no reader found". Called in the main shell, never inside $(...), so
+  # the fail-closed exit really ends the script.
   scan_to() {
     local out="$1" rc=0
     shift
-    grep -rhoF -f "$work/patterns" "$@" > "$out" 2>/dev/null || rc=$?
+    grep -rahoF -f "$work/patterns" "$@" > "$out" 2>/dev/null || rc=$?
     if (( rc > 1 )); then
       echo "affected-suites: scan of '$*' failed (grep exit $rc) -> running everything (fail-closed)" >&2
       emit_all_run
@@ -210,16 +238,22 @@ if [[ ( -z "$server_why" || -z "$agent_why" ) && ${#candidates[@]} -gt 0 ]]; the
   : > "$work/meson"
   meson_file="$(dirname "$tests_root")/meson.build"
   if [[ -f "$meson_file" ]]; then scan_to "$work/meson" "$meson_file"; fi
-  scan_to "$work/server" "$tests_root/server"
+  # The server binary compiles tests/unit/server/ AND the helper headers directly under tests/unit/
+  # (test_helpers.hpp, ...), so a read placed in a shared helper belongs to the server family too.
+  server_sources=("$tests_root/server")
+  for helper in "$tests_root"/*.hpp; do
+    if [[ -f "$helper" ]]; then server_sources+=("$helper"); fi
+  done
+  scan_to "$work/server" "${server_sources[@]}"
   scan_to "$work/agent" --exclude-dir=server "$tests_root"
 
   if [[ -z "$server_why" ]]; then
     hit="$(cat "$work/server" "$work/meson" | sed -n 1p)"
-    [[ -z "$hit" ]] || server_why="$hit (named by a server test or tests/meson.build)"
+    [[ -z "$hit" ]] || server_why="$hit (named by a server test, a shared test helper or tests/meson.build)"
   fi
   if [[ -z "$agent_why" ]]; then
     hit="$(cat "$work/agent" "$work/meson" | sed -n 1p)"
-    [[ -z "$hit" ]] || agent_why="$hit (named by an agent test or tests/meson.build)"
+    [[ -z "$hit" ]] || agent_why="$hit (named by an agent test, a shared test helper or tests/meson.build)"
   fi
 fi
 

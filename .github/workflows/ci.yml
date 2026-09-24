@@ -318,10 +318,11 @@ jobs:
       # PR skips them instead of blocking forever on absent required checks.
       # Always true for non-PR events (push / workflow_dispatch build always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
-      # PR-time suite selection (docs/ci-architecture.md): 'true' iff no path this PR changes can
-      # reach that test family, so the build jobs skip its suites. Set ONLY by the `affected` step
-      # below; anything else (a non-PR event, a docs-only PR, a classifier or API failure) leaves
-      # the output empty, and every consumer compares `== 'true'`, so the default is to run.
+      # PR-time test selection (docs/ci-architecture.md): 'true' iff no
+      # path this PR changes can reach that test family, so the build jobs skip its suites. Written
+      # ONLY by the `affected` step below, which runs on a pull request with code changes: a non-PR
+      # event or a docs-only PR skips the step and leaves the output empty, and a classifier or API
+      # failure writes 'false'. Every consumer compares `== 'true'` / `!= 'true'`, so both mean run.
       skip_server_suites: ${{ steps.affected.outputs.skip_server_suites }}
       skip_agent_suites: ${{ steps.affected.outputs.skip_agent_suites }}
       checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
@@ -383,7 +384,7 @@ jobs:
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
 
-      # ── Affected suites (PR-time suite selection) ──────────────────────
+      # ── Affected suites (PR-time test selection) ───────────────────────
       # Which heavy test families can this PR reach? The classification (path classes, the run-time
       # read rule, every fail-closed input) lives in scripts/ci/affected-suites.sh and is covered by
       # tests/shell/test_affected_suites.sh; the class table's soundness against the real build is
@@ -408,9 +409,9 @@ jobs:
                 --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$work/files.tsv"; then
             if result=$(bash scripts/ci/affected-suites.sh --total "$CHANGED_FILES" \
                   < "$work/files.tsv" 2> "$work/why.txt"); then
-              s=$(printf '%s\n' "$result" | sed -n 's/^skip_server=\(true\|false\)$/\1/p')
-              a=$(printf '%s\n' "$result" | sed -n 's/^skip_agent=\(true\|false\)$/\1/p')
-              if [[ -n "$s" && -n "$a" ]]; then
+              s=$(printf '%s\n' "$result" | sed -n 's/^skip_server=//p')
+              a=$(printf '%s\n' "$result" | sed -n 's/^skip_agent=//p')
+              if [[ ( "$s" == true || "$s" == false ) && ( "$a" == true || "$a" == false ) ]]; then
                 skip_server="$s"
                 skip_agent="$a"
               else
@@ -501,6 +502,7 @@ jobs:
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
           bash tests/shell/test_affected_suites.sh      # which heavy suites a PR may skip
+          bash tests/shell/test_suite_selection_wiring.sh  # the step bodies that APPLY that verdict
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
@@ -627,7 +629,7 @@ jobs:
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
     # The second PR-time Postgres leg is "Linux gcc-15 debug (pg B)"; every other leg (all four on
-    # a push, the primary leg on a PR) keeps the exact name the branch-protection contexts use.
+    # a push, the pg-a leg on a PR) keeps the exact name the branch-protection contexts use.
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ matrix.pg_part == 'pg-b' && ' (pg B)' || '' }}"
     needs: [preflight]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
@@ -650,7 +652,7 @@ jobs:
       # process fan-out inside that boundary; affinity alone still leaves
       # Ninja seeing the host-wide 64 logical CPUs.
       YUZU_BUILD_JOBS: "16"
-      # This leg's label for telemetry rows, step summaries and artifact names; equals `name:` above.
+      # This leg's label for telemetry rows and step summaries; equals `name:` above.
       YUZU_LEG_NAME: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ matrix.pg_part == 'pg-b' && ' (pg B)' || '' }}"
       # Big Tam runs 4 runners on one host. A gateway eunit test that boots the
       # app can transiently bring up Erlang distribution and trip the #659
@@ -665,14 +667,17 @@ jobs:
       # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
       # agents on one box. A `dev`/`main` push runs the full 2x2 matrix below
       # and would otherwise claim all 4 simultaneously, starving a
-      # concurrently-queued PR's single Linux leg at the RUNNER-ACQUISITION
+      # concurrently-queued PR's Linux legs at the RUNNER-ACQUISITION
       # level — below with-test-slot.sh, which only gates contention *inside*
       # a job that already has a runner (docs/ci-architecture.md "Cross-job";
       # a PR job was directly observed waiting 35 minutes for a free runner
       # during exactly this window). Capping at 3 leaves at least one Big Tam
       # runner unclaimed BY THIS MATRIX. No-op on `pull_request` events: the
-      # exclude below already trims that matrix to a single gcc-15/debug leg,
-      # so max-parallel never binds there. Trade-off: a `dev` push's 4th leg
+      # excludes below already trim that matrix to the two gcc-15/debug legs
+      # (pg-a and pg-b), so max-parallel never binds there. A PR now needs TWO
+      # runners since the pg split, and the one runner a push leaves free may
+      # not be enough for both: that residual is accepted (docs/ci-architecture.md
+      # "PR-time test selection", Cost). Trade-off: a `dev` push's 4th leg
       # waits for a slot to free (two waves instead of one) — acceptable,
       # since push-triggered runs aren't PR-fast-path latency sensitive.
       # NOT a guarantee the freed runner reaches the intended PR job: this
@@ -689,19 +694,19 @@ jobs:
       matrix:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
-        # pg_part: which slice of the work a leg owns. `primary` is the leg that has always existed.
-        # On a PULL REQUEST a second leg, `pg-b`, runs the second half of the Postgres shards on
-        # another runner and its own per-runner Postgres (`--suite server-pg-b`), while `primary`
-        # runs every non-pg suite plus the first half (`--suite server-pg-a`) — roughly 8 min down
-        # to 5. On a PUSH (or dispatch/call) the exclude below removes `pg-b` and `primary` runs the
-        # whole `server-pg` on one leg exactly as before, so dev and main still get every shard.
-        # The halves are labels in tests/meson.build, proven an exact partition by
-        # scripts/ci/check-pg-shard-partition.py. `pg-b` is a real matrix axis rather than an
-        # include: entry because an include: key that matches an existing combination is merged
-        # into it instead of creating a new one (the same reason pg_mode, below, is NOT an axis).
-        # Its check context, "Linux gcc-15 debug (pg B)", must be registered as a required status
-        # check by a repo admin, and is listed in docs-required-checks below.
-        pg_part: [primary, pg-b]
+        # pg_part: which half of the Postgres shards a leg owns; the value names the meson suite
+        # (`server-pg-a` / `server-pg-b`). `pg-a` is the leg that has always existed, name and check
+        # context unchanged. On a PULL REQUEST it runs every non-pg suite plus the first half, and a
+        # second leg, `pg-b`, runs the second half on another runner and its own per-runner Postgres
+        # — roughly 8 min down to 5. On a PUSH (or dispatch/call) the last exclude below removes
+        # `pg-b` and `pg-a` runs the whole `server-pg` on one leg exactly as before, so dev and main
+        # still get every shard. The halves are labels in tests/meson.build, proven an exact
+        # partition by scripts/ci/check-pg-shard-partition.py. `pg_part` is a real matrix axis rather
+        # than an include: entry because an include: key that matches an existing combination is
+        # merged into it instead of creating a new one (the same reason pg_mode, below, is NOT an
+        # axis). Its check context, "Linux gcc-15 debug (pg B)", must be registered as a required
+        # status check by a repo admin, and is listed in docs-required-checks below.
+        pg_part: [pg-a, pg-b]
         exclude:
           # PRs: only gcc-15 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
@@ -711,7 +716,9 @@ jobs:
         # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
         # third axis (2x matrix, breaks max-parallel:3's 4-runner arithmetic) and
         # never in `name:` (job names are the ruleset's required-check contexts,
-        # docs-required-checks below must stay in lockstep). A key-only include
+        # docs-required-checks below must stay in lockstep). pg_part above IS an
+        # axis, but its exclude collapses it to one value on every non-PR event, so
+        # a push stays four legs and that arithmetic holds. A key-only include
         # entry attaches to every combination surviving exclude:; a later include
         # that ALSO matches a given combination can overwrite a value an earlier
         # include added (never an original axis value) — this is GitHub's
@@ -720,10 +727,10 @@ jobs:
         # gcc-15/debug resolves to full and fails the job loudly if it doesn't
         # (adversarial-review hardening; this comment no longer describes an
         # unchecked assumption). So: default smoke first,
-        # then the gcc-15/debug override to full. On a PR the exclude above has
-        # already trimmed the matrix to the single gcc-15/debug leg, so both
-        # include entries match that one leg and the net result is pg_mode=full
-        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
+        # then the gcc-15/debug override to full. On a PR the excludes above have
+        # already trimmed the matrix to the two gcc-15/debug legs (pg-a and pg-b), so
+        # both include entries match each of them and the net result is pg_mode=full
+        # on both — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
         # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
         # stay smoke. Item 4 of the original plan (a periodic full clang-release
         # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
@@ -973,11 +980,12 @@ jobs:
           bash scripts/ci/check-plugin-capture-os-guard.sh \
             "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
 
-      # Suite-selection soundness (scripts/ci/affected-suites.sh): prove against THIS build that no
-      # agent-side object depends on server/, content/ or tests/unit/server/, and no server-side
-      # object compiles an agent test. Those two claims are what let a PR skip a test family, so
-      # they are checked on every build, not only on the PRs that skip. Reads ninja's dependency
-      # log, so it needs the objects Build just produced.
+      # Suite-selection soundness (scripts/ci/affected-suites.sh): prove against THIS build that
+      # every compile-time input of each test family is classed consistently by the table that
+      # decides what a PR may skip (no server-class or inert path in an agent object, no
+      # agent-class or inert path in a server object). That is what lets a PR skip a family, so it
+      # is checked on every build, not only on the PRs that skip. Reads ninja's dependency log, so
+      # it needs the objects Build just produced.
       - name: Verify test-family separation (affected-suites class table)
         if: matrix.pg_part != 'pg-b'
         run: python3 scripts/ci/check-suite-input-closure.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
@@ -1101,7 +1109,7 @@ jobs:
           # pg_part: the second pg leg exists only on a pull request, and only where the pg shards
           # run in full. A pg-b leg anywhere else would run a half of the shards nobody selected.
           case "$PG_PART" in
-            primary) ;;
+            pg-a) ;;
             pg-b)
               if [[ "$GITHUB_EVENT_NAME" != "pull_request" || "$PG_MODE" != "full" ]]; then
                 echo "::error::pg_part=pg-b on a $GITHUB_EVENT_NAME run with pg_mode=$PG_MODE — the matrix exclude: mapping is broken; the second pg leg belongs to gcc-15/debug pull requests only"
@@ -1109,7 +1117,7 @@ jobs:
               fi
               ;;
             *)
-              echo "::error::pg_part is '$PG_PART', expected 'primary' or 'pg-b' — matrix axis may be misconfigured"
+              echo "::error::pg_part is '$PG_PART', expected 'pg-a' or 'pg-b' — matrix axis may be misconfigured"
               exit 1
               ;;
           esac
@@ -1127,7 +1135,7 @@ jobs:
       - name: Test (non-pg suites)
         if: matrix.pg_part != 'pg-b'
         env:
-          # PR-time suite selection (preflight): 'true' means no changed path can reach that family.
+          # PR-time test selection (preflight): 'true' means no changed path can reach that family.
           SKIP_SERVER_SUITES: ${{ needs.preflight.outputs.skip_server_suites }}
           SKIP_AGENT_SUITES: ${{ needs.preflight.outputs.skip_agent_suites }}
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
@@ -1212,9 +1220,9 @@ jobs:
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full' && needs.preflight.outputs.skip_server_suites != 'true'
-        # PR-time halves: on a pull request this step runs `--suite server-pg-a` (primary leg) or
+        # PR-time halves: on a pull request this step runs `--suite server-pg-a` (the pg-a leg) or
         # `--suite server-pg-b` (the pg-b leg); on a push it runs the whole `server-pg`. See the
-        # pg_part matrix axis and docs/ci-architecture.md "PR-time Linux pg split". Each leg holds
+        # pg_part matrix axis and docs/ci-architecture.md "PR-time test selection". Each leg holds
         # its own with-test-slot.sh slot, so a PR takes two of the box's three heavy slots.
         # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
         # resolved to 'full' (today: gcc-15/debug, every PR and its matching
@@ -1466,14 +1474,20 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             case "$PG_PART" in
-              primary) pg_suite=server-pg-a ;;
-              pg-b)    pg_suite=server-pg-b ;;
+              pg-a|pg-b) pg_suite="server-$PG_PART" ;;
               *) echo "::error::pg_part is '$PG_PART' on a pull request"; exit 1 ;;
             esac
           else
             pg_suite=server-pg
           fi
           echo "Postgres shards: --suite $pg_suite"
+          # A selector that matches nothing makes meson (and flake-retry) exit 0 with "No suitable
+          # tests defined.", so a label renamed in tests/meson.build but not here would leave this
+          # step green having run no shard. `--list` exits non-zero for an empty selection.
+          if ! meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --list --no-rebuild --suite "$pg_suite" > /dev/null; then
+            echo "::error::--suite $pg_suite selects no tests — the label in ci.yml and in tests/meson.build have drifted apart"
+            exit 1
+          fi
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite "$pg_suite"
 
@@ -1939,7 +1953,7 @@ jobs:
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-          # PR-time suite selection (preflight): 'true' means no changed path can reach that family.
+          # PR-time test selection (preflight): 'true' means no changed path can reach that family.
           SKIP_SERVER_SUITES: ${{ needs.preflight.outputs.skip_server_suites }}
           SKIP_AGENT_SUITES: ${{ needs.preflight.outputs.skip_agent_suites }}
         run: |
@@ -1973,15 +1987,20 @@ jobs:
           else
             suites+=(--suite agent --suite tar)
           fi
+          # The pg suites run in their own step. When the server family is skipped that step is
+          # skipped too, so the guard is told they were SKIPPED (counted in its OK line), not that
+          # they ran elsewhere.
+          excluded=(--exclude-suite server-pg --exclude-suite server-pg-smoke)
           if [[ "$SKIP_SERVER_SUITES" == "true" ]]; then
             skipped+=(--skipped-suite server-nonpg --skipped-suite server-checks)
+            skipped+=(--skipped-suite server-pg --skipped-suite server-pg-smoke)
+            excluded=()
             echo "::notice title=Server suites skipped::no path this PR changes can reach the server tests (scripts/ci/affected-suites.sh); a push to dev runs them"
           else
             suites+=(--suite server-nonpg --suite server-checks)
           fi
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
-            "${suites[@]}" "${skipped[@]}" \
-            --exclude-suite server-pg --exclude-suite server-pg-smoke
+            "${suites[@]}" "${skipped[@]}" "${excluded[@]}"
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
               "${suites[@]}"
@@ -2309,7 +2328,8 @@ jobs:
           bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
 
       # Suite-selection soundness (scripts/ci/affected-suites.sh): see the Linux job's step of the
-      # same name. The Windows legs do not run it (MSVC dependency records); they share the tree.
+      # same name. The Windows legs do not run it (MSVC dependency records, and its branches are
+      # the ones this build takes); they share the source tree.
       - name: Verify test-family separation (affected-suites class table)
         run: python3 scripts/ci/check-suite-input-closure.py --builddir build-macos
 
@@ -2351,7 +2371,7 @@ jobs:
 
       - name: Test
         env:
-          # PR-time suite selection (preflight): 'true' means no changed path can reach that family.
+          # PR-time test selection (preflight): 'true' means no changed path can reach that family.
           SKIP_SERVER_SUITES: ${{ needs.preflight.outputs.skip_server_suites }}
           SKIP_AGENT_SUITES: ${{ needs.preflight.outputs.skip_agent_suites }}
         # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
@@ -2435,7 +2455,9 @@ jobs:
 
   # ── Docs-only required-check stubs (issue #1978) ──────────────────────
   # The linux/windows/macos required contexts are MATRIX-expanded names
-  # ("Linux gcc-15 debug", "Windows MSVC debug", "macOS debug"). A matrix job
+  # ("Linux gcc-15 debug", "Linux gcc-15 debug (pg B)", "Windows MSVC debug",
+  # "macOS debug"; the pg B one is registered by a repo admin after the pg
+  # split merges, and its stub is emitted ahead of that). A matrix job
   # skipped at the job level is skipped BEFORE the matrix expands, so it emits
   # none of its inner check-run names (actions/runner#952). Gating the real
   # jobs on code_changed therefore leaves those required contexts "Expected —
@@ -2451,7 +2473,7 @@ jobs:
   # proto-compat is a NON-matrix job: its skipped run reports "Proto
   # backward-compat: skipped", which already satisfies the required check, so
   # it needs no stub. preflight always runs; "CHANGELOG order" (docs-lint.yml)
-  # runs on every PR. Together that satisfies all six required contexts on a
+  # runs on every PR. Together that satisfies every required context on a
   # docs-only PR without a build.
   docs-required-checks:
     name: ${{ matrix.check }}
