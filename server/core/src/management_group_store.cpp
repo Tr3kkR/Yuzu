@@ -462,19 +462,37 @@ std::expected<void, std::string> ManagementGroupStore::remove_member(const std::
 
 std::vector<ManagementGroupMember>
 ManagementGroupStore::get_members(const std::string& group_id) const {
-    std::vector<ManagementGroupMember> result;
-    if (!open_)
-        return result;
+    return get_members_checked(group_id).value_or(std::vector<ManagementGroupMember>{});
+}
+
+std::optional<std::vector<ManagementGroupMember>>
+ManagementGroupStore::get_members_checked(const std::string& group_id) const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_members_checked: store not open — DENY");
+        return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return result;
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("ManagementGroupStore::get_members_checked: pool acquire timed out — DENY");
+        return std::nullopt;
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT group_id, agent_id, source, added_at "
         "FROM management_group_store.management_group_members WHERE group_id = $1 ORDER BY agent_id",
         std::vector<std::string>{group_id});
-    if (r.status() != PGRES_TUPLES_OK)
-        return result;
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_members_checked: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::vector<ManagementGroupMember> result;
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         ManagementGroupMember m;
         m.group_id = text_col(r.get(), i, 0);

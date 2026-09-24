@@ -175,16 +175,14 @@ public:
     /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (a named group is a
     /// set of specific devices, so a small-N aggregate is de-facto individual
     /// behaviour — works-council). `nullopt` = the aggregate read failed OR the
-    /// B1 `group_reader_` is unwired OR the group/tag store is unwired. A
-    /// DEGRADED member-resolution read is a known pre-existing gap, NOT
-    /// covered by `nullopt` today:
-    /// `ManagementGroupStore::get_members` returns an empty vector rather than
-    /// a distinguishable error on a store degrade, so `LocalDexPerfApi` cannot
-    /// tell "genuinely zero members" from "the read failed" and renders the
-    /// former (an empty trend, "no member reported…") in both cases — tracked as
-    /// #1762. `tag_trend` below does NOT share this gap: `TagStore`
-    /// returns `std::optional` and a degraded tag read fails closed to
-    /// `nullopt`.
+    /// B1 `group_reader_` is unwired OR the group/tag store is unwired OR the
+    /// member-resolution read degraded (`ManagementGroupStore::get_members_checked`
+    /// returned `nullopt` — store-not-open / pool-acquire-timeout / query-error,
+    /// #1762, fixed). `LocalDexPerfApi` resolves members via the checked twin,
+    /// not the fail-soft `get_members()`, so a degraded member read now fails
+    /// closed to `nullopt` instead of rendering as an empty trend — the SAME
+    /// contract `tag_trend` below already has via `TagStore`, which returns
+    /// `std::optional` and fails closed on a degraded tag read.
     [[nodiscard]] virtual std::optional<std::vector<AppPerfTrendPoint>>
     group_trend(const std::string& group_id, const std::string& app,
                const std::string& version) const = 0;
