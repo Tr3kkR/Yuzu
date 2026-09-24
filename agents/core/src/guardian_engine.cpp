@@ -557,6 +557,14 @@ read_legacy_sink_loss_record(KvStore& kv, GuardianLegacySinkExecutor::Stats& cou
             // catch - this narrows ONLY the single-bad-entry case.
             if (g.rule_id.empty()) {
                 ++skipped_empty_rule_id;
+                // #4783 Gate 6 sre finding, 2026-09-24: fold into the SAME
+                // durable counter record_gap_locked()'s own allocation-degrade
+                // path already uses (see that field's doc comment, amended in
+                // the same change) rather than leaving this a log-only,
+                // easily-missed signal - a restart is exactly the moment an
+                // operator is least likely to be watching logs for a one-line
+                // warn that's also wrapped in its own try/catch below.
+                ++counters.gap_ledger_faults;
                 continue;
             }
             gaps.push_back(std::move(g));

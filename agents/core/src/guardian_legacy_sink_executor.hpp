@@ -367,6 +367,15 @@ public:
         std::uint64_t discarded_at_stop{0};
         std::uint64_t stalls{0};
         std::uint64_t launch_failures{0};
+        /// record_gap_locked()'s own allocation-failure degrade path (see the
+        /// class doc comment). #4783 Gate 6 sre finding, 2026-09-24: also
+        /// bumped by read_legacy_sink_loss_record() (guardian_engine.cpp) for
+        /// each empty-rule_id entry it skips on restore - a second, rarer
+        /// source of the same "the gap ledger's own bookkeeping degraded"
+        /// signal, folded into this field rather than a new one so it stays
+        /// fleet-durable across the field's existing JSON persistence, not
+        /// just a one-line log an operator has to be watching for at the
+        /// exact restart moment.
         std::uint64_t gap_ledger_faults{0};
         std::size_t gap_rules{0};
         /// #4783 follow-up: queued repairs skipped at dequeue time because they

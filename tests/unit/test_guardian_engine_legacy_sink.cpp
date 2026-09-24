@@ -1472,6 +1472,11 @@ TEST_CASE("#4783 Gate 4 unhappy-path finding, 2026-09-24: a single empty-rule_id
     // was NOT treated as Malformed (which would have discarded both).
     CHECK(engine.legacy_sink_gap_rules() == 1); // "" was skipped, "real-rule" kept
     CHECK(engine.legacy_sink_events_lost() == 2); // counters restored normally
+    // #4783 Gate 6 sre finding, 2026-09-24: the skip is folded into
+    // gap_ledger_faults (a durable, persisted counter) rather than being a
+    // log-only signal an operator has to be watching for at the exact
+    // restart moment - see that field's own doc comment.
+    CHECK(engine.legacy_sink_executor_for_test().stats().gap_ledger_faults == 1);
     engine.stop();
 }
 
