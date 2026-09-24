@@ -12,8 +12,13 @@ run it as the FIRST line of that step, before the actual test invocation.
 Proves: every registered test() entry is either matched by one of the
 given `--suite` flags, or carries one of the given `--exclude-suite`
 labels (deliberately out of scope for this invocation, e.g. server-pg /
-server-pg-smoke, which run in a separate, gated step) — no entry is
-silently in neither bucket.
+server-pg-smoke, which run in a separate, gated step), or carries one of
+the given `--skipped-suite` labels (a PR whose changed paths cannot reach
+that suite, decided by scripts/ci/affected-suites.sh and named here so the
+skip is REPORTED, not just absent) — no entry is silently in none of the
+three buckets. A `--skipped-suite` is the same as an `--exclude-suite`
+for the proof; the separate flag exists so the OK line says how many
+entries this PR skipped as unaffected, which an exclusion never does.
 
 `meson introspect --tests` suite strings are project-namespaced
 ("yuzu:server-nonpg", not "server-nonpg") — comparisons here strip the
@@ -60,41 +65,53 @@ def _bare_suites(entry_suites):
     return out
 
 
-def compute_coverage(tests, selected_suites, excluded_suites):
+def compute_coverage(tests, selected_suites, excluded_suites,
+                     skipped_suites=frozenset()):
     """Pure: given `tests` (as `meson introspect --tests` emits) and the bare
-    (unprefixed) suite name sets this invocation selects/excludes, return
-    (ok: bool, failures: list[str], stats: dict). No I/O, no sys.exit — the
-    same real-build-vs-synthetic-fixture split check-pg-shard-partition.py
-    uses.
+    (unprefixed) suite name sets this invocation selects/excludes/skips as
+    unaffected, return (ok: bool, failures: list[str], stats: dict). No I/O,
+    no sys.exit — the same real-build-vs-synthetic-fixture split
+    check-pg-shard-partition.py uses.
+
+    `skipped_suites` are out of scope for the proof exactly like
+    `excluded_suites`; they are counted separately (stats["skipped"]: entries
+    carrying a skipped label and no excluded one) so the caller can report
+    them. An entry that carries BOTH an excluded and a skipped label counts as
+    excluded, never twice.
     """
     failures = []
     if not tests:
         return False, ["meson introspect returned zero test entries — "
                         "empty or broken builddir"], {}
 
-    conflict = selected_suites & excluded_suites
+    conflict = selected_suites & (excluded_suites | skipped_suites)
     if conflict:
-        return False, [f"--suite and --exclude-suite name the same suite(s) "
-                        f"{sorted(conflict)!r} — a suite cannot be both "
-                        f"covered by this invocation and deliberately out of "
-                        f"scope for it"], {}
+        return False, [f"--suite and --exclude-suite/--skipped-suite name the "
+                        f"same suite(s) {sorted(conflict)!r} — a suite cannot "
+                        f"be both covered by this invocation and deliberately "
+                        f"out of scope for it"], {}
 
+    out_of_scope = excluded_suites | skipped_suites
     selected_names = set()
     excluded_names = set()
+    skipped_names = set()
     both_names = set()
     per_suite_hits = {s: 0 for s in selected_suites}
     for t in tests:
         bare = _bare_suites(t.get("suite", []))
         is_selected = bool(bare & selected_suites)
-        is_excluded = bool(bare & excluded_suites)
-        if is_selected and is_excluded:
+        is_out = bool(bare & out_of_scope)
+        if is_selected and is_out:
             both_names.add(t["name"])
         elif is_selected:
             selected_names.add(t["name"])
             for s in bare & selected_suites:
                 per_suite_hits[s] += 1
-        elif is_excluded:
-            excluded_names.add(t["name"])
+        elif is_out:
+            if bare & excluded_suites:
+                excluded_names.add(t["name"])
+            else:
+                skipped_names.add(t["name"])
 
     if both_names:
         failures.append(f"{len(both_names)} entr(y/ies) carry BOTH a "
@@ -108,17 +125,18 @@ def compute_coverage(tests, selected_suites, excluded_suites):
                          f"typo looks exactly like this (meson's own "
                          f"`--suite <bad>` silently matches nothing)")
 
-    expected = {t["name"] for t in tests} - excluded_names
+    expected = {t["name"] for t in tests} - excluded_names - skipped_names
     missing = expected - selected_names - both_names
     if missing:
         sample = sorted(missing)[:5]
-        failures.append(f"{len(missing)} entr(y/ies) covered by neither "
-                         f"--suite {sorted(selected_suites)!r} nor "
-                         f"--exclude-suite {sorted(excluded_suites)!r}: "
+        failures.append(f"{len(missing)} entr(y/ies) covered by none of "
+                         f"--suite {sorted(selected_suites)!r}, "
+                         f"--exclude-suite {sorted(excluded_suites)!r} or "
+                         f"--skipped-suite {sorted(skipped_suites)!r}: "
                          f"{sample!r}" + (" ..." if len(missing) > 5 else ""))
 
     stats = {"selected": len(selected_names), "excluded": len(excluded_names),
-              "total": len(tests)}
+              "skipped": len(skipped_names), "total": len(tests)}
     return not failures, failures, stats
 
 
@@ -130,18 +148,28 @@ def main(argv=None):
     ap.add_argument("--exclude-suite", action="append", default=[],
                      help="a suite deliberately out of scope for this "
                           "invocation, e.g. server-pg (repeatable)")
+    ap.add_argument("--skipped-suite", action="append", default=[],
+                     help="a suite this PR skips because no changed path can "
+                          "reach it (scripts/ci/affected-suites.sh); same "
+                          "proof as --exclude-suite, but counted and named in "
+                          "the OK line (repeatable)")
     args = ap.parse_args(argv)
 
     tests = introspect_tests(args.builddir)
     ok, failures, stats = compute_coverage(
-        tests, set(args.suite), set(args.exclude_suite))
+        tests, set(args.suite), set(args.exclude_suite),
+        set(args.skipped_suite))
     if not ok:
         for f in failures:
             gh("error", f"assert-suite-cover: {f}")
         return 1
 
+    skipped = ""
+    if args.skipped_suite:
+        skipped = (f", {stats['skipped']} skipped as unaffected by this PR's "
+                   f"changed paths ({', '.join(sorted(set(args.skipped_suite)))})")
     print(f"assert-suite-cover: OK — {stats['selected']} entr(y/ies) covered "
-          f"by --suite, {stats['excluded']} deliberately excluded, "
+          f"by --suite, {stats['excluded']} deliberately excluded{skipped}, "
           f"{stats['total']} total")
     return 0
 

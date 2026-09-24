@@ -407,6 +407,78 @@ def test_check_smoke_exe_mismatch(failures):
           "smoke exe mismatch: failure message names the mismatched binary", failures)
 
 
+def _half_entry(name, halves, pg=True):
+    """An entry as `meson introspect --tests` reports it: project-prefixed
+    suite labels, server-pg plus the given half labels (bare a/b)."""
+    suites = ["yuzu:server"] + (["yuzu:server-pg"] if pg else [])
+    suites += [f"yuzu:server-pg-{h}" for h in halves]
+    return {"name": name, "cmd": ["/fake/exe", "[pg][x]"], "suite": suites}
+
+
+def test_check_pg_halves_clean(failures):
+    tests = [_half_entry("shard A", "b"), _half_entry("shard K", "a"),
+             {"name": "docs test", "cmd": ["x"], "suite": ["yuzu:docs"]}]
+    ok, msgs, stats = _mod.check_pg_halves(tests)
+    check(ok and msgs == [], "halves clean: ok, no messages", failures)
+    check(stats == {"server-pg-a": 1, "server-pg-b": 1},
+          "halves clean: per-half entry counts", failures)
+
+
+def test_check_pg_halves_shard_without_a_half(failures):
+    # The failure this exists for: a new or split shard forgets its half label.
+    # It would still run on a push (--suite server-pg) but NEVER on a PR.
+    tests = [_half_entry("shard A", "b"), _half_entry("shard K", "a"),
+             _half_entry("shard NEW", "")]
+    ok, msgs, _ = _mod.check_pg_halves(tests)
+    check(not ok, "unlabeled shard: reports not-ok", failures)
+    check(any("shard NEW" in m and "neither" in m for m in msgs),
+          "unlabeled shard: names it and says it never runs on a PR", failures)
+
+
+def test_check_pg_halves_shard_in_both(failures):
+    tests = [_half_entry("shard A", "b"), _half_entry("shard K", "a"),
+             _half_entry("shard TWICE", "ab")]
+    ok, msgs, _ = _mod.check_pg_halves(tests)
+    check(not ok, "double-labeled shard: reports not-ok", failures)
+    check(any("shard TWICE" in m and "BOTH" in m for m in msgs),
+          "double-labeled shard: names it and says it runs twice", failures)
+
+
+def test_check_pg_halves_label_on_non_pg_entry(failures):
+    tests = [_half_entry("shard A", "b"), _half_entry("shard K", "a"),
+             _half_entry("non-pg shard", "a", pg=False)]
+    ok, msgs, _ = _mod.check_pg_halves(tests)
+    check(not ok, "half label on a non-pg entry: reports not-ok", failures)
+    check(any("non-pg shard" in m and "without" in m for m in msgs),
+          "half label on a non-pg entry: names it", failures)
+
+
+def test_check_pg_halves_empty_half(failures):
+    # Every shard on one side leaves the other PR job with nothing to run —
+    # and `meson test --suite server-pg-a` matching zero entries exits 0.
+    tests = [_half_entry("shard A", "b"), _half_entry("shard B", "b")]
+    ok, msgs, stats = _mod.check_pg_halves(tests)
+    check(not ok, "empty half: reports not-ok", failures)
+    check(any("server-pg-a" in m and "no entries" in m for m in msgs),
+          "empty half: names the empty half", failures)
+    check(stats == {"server-pg-a": 0, "server-pg-b": 2},
+          "empty half: counts still reported", failures)
+
+
+def test_check_pg_halves_collects_every_violation(failures):
+    tests = [_half_entry("shard A", "b"), _half_entry("shard NEW", ""),
+             _half_entry("shard TWICE", "ab"), _half_entry("stray", "a", pg=False)]
+    ok, msgs, _ = _mod.check_pg_halves(tests)
+    check(not ok and sum(1 for m in msgs
+                         if any(n in m for n in ("shard NEW", "shard TWICE", "stray"))) == 3,
+          "all violations: each is reported, not just the first", failures)
+
+
+def test_check_pg_halves_no_tests(failures):
+    ok, msgs, _ = _mod.check_pg_halves([])
+    check(not ok, "no entries at all: reports not-ok (both halves hollow)", failures)
+
+
 def main():
     failures = []
     test_parse_shard_entries_happy_path(failures)
@@ -434,6 +506,13 @@ def main():
     test_check_smoke_count_one_above(failures)
     test_check_smoke_not_subset_of_pg(failures)
     test_check_smoke_exe_mismatch(failures)
+    test_check_pg_halves_clean(failures)
+    test_check_pg_halves_shard_without_a_half(failures)
+    test_check_pg_halves_shard_in_both(failures)
+    test_check_pg_halves_label_on_non_pg_entry(failures)
+    test_check_pg_halves_empty_half(failures)
+    test_check_pg_halves_collects_every_violation(failures)
+    test_check_pg_halves_no_tests(failures)
 
     if failures:
         print(f"\ncheck-pg-shard-partition selftest: {len(failures)} FAILED")

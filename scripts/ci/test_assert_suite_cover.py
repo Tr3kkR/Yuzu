@@ -41,7 +41,7 @@ def test_clean_coverage(failures):
         tests, {"agent", "tar"}, {"server-pg"})
     check(ok, "clean: reports OK", failures)
     check(fail_msgs == [], "clean: no failure messages", failures)
-    check(stats == {"selected": 2, "excluded": 1, "total": 3},
+    check(stats == {"selected": 2, "excluded": 1, "skipped": 0, "total": 3},
           "clean: stats correct", failures)
 
 
@@ -109,6 +109,74 @@ def test_entry_carries_both_selected_and_excluded_suite(failures):
           "entry conflict: failure message names the conflicting entry", failures)
 
 
+def test_skipped_suite_is_out_of_scope_and_counted(failures):
+    # A PR that cannot reach the server family skips those suites; the proof
+    # must still hold (every entry accounted for) and the count must be visible.
+    tests = [
+        _entry("agent unit tests", ["agent"]),
+        _entry("server unit tests shard A", ["server", "server-nonpg"]),
+        _entry("server pg shard partition invariant", ["server", "server-checks"]),
+        _entry("server pg unit tests shard C", ["server", "server-pg"]),
+    ]
+    ok, fail_msgs, stats = _mod.compute_coverage(
+        tests, {"agent"}, {"server-pg"},
+        skipped_suites={"server-nonpg", "server-checks"})
+    check(ok, "skipped: proof holds with skipped suites out of scope", failures)
+    check(fail_msgs == [], "skipped: no failure messages", failures)
+    check(stats == {"selected": 1, "excluded": 1, "skipped": 2, "total": 4},
+          "skipped: counted apart from excluded", failures)
+
+
+def test_skipped_suite_does_not_hide_an_uncovered_entry(failures):
+    # The point of the proof: naming a suite as skipped must not swallow an
+    # entry that is in a DIFFERENT suite nobody accounted for.
+    tests = [
+        _entry("agent unit tests", ["agent"]),
+        _entry("server unit tests shard A", ["server", "server-nonpg"]),
+        _entry("orphan test", ["docs"]),
+    ]
+    ok, fail_msgs, _ = _mod.compute_coverage(
+        tests, {"agent"}, set(), skipped_suites={"server-nonpg"})
+    check(not ok, "skipped+orphan: reports not-ok", failures)
+    check(any("orphan test" in m for m in fail_msgs),
+          "skipped+orphan: names the uncovered entry", failures)
+
+
+def test_skipped_and_selected_conflict(failures):
+    # Skipping a suite the same invocation selects is a wiring bug (the flag
+    # arrays in ci.yml disagree), not a valid state.
+    ok, fail_msgs, _ = _mod.compute_coverage(
+        [_entry("x", ["agent"])], {"agent"}, set(), skipped_suites={"agent"})
+    check(not ok, "skipped conflict: reports not-ok", failures)
+    check(any("agent" in m and "same suite" in m for m in fail_msgs),
+          "skipped conflict: names the suite", failures)
+
+
+def test_entry_in_both_excluded_and_skipped_counts_once(failures):
+    # server-pg is excluded in the non-pg step AND would be named by a
+    # careless caller as skipped too; the entry must count once, as excluded.
+    tests = [_entry("pg shard", ["server", "server-pg"]),
+             _entry("agent unit tests", ["agent"])]
+    ok, _, stats = _mod.compute_coverage(
+        tests, {"agent"}, {"server-pg"}, skipped_suites={"server-pg"})
+    # server-pg named on both sides: the same-suite check is only against
+    # --suite, so this is legal and must not double-count.
+    check(ok, "excluded+skipped overlap: reports ok", failures)
+    check(stats["excluded"] == 1 and stats["skipped"] == 0,
+          "excluded+skipped overlap: counted once, as excluded", failures)
+
+
+def test_entry_selected_and_skipped_label_is_a_conflict(failures):
+    # An entry carrying a selected label AND a skipped label is the same
+    # mislabel defect the excluded case catches.
+    tests = [_entry("mislabeled", ["agent", "server-checks"])]
+    ok, fail_msgs, _ = _mod.compute_coverage(
+        tests, {"agent"}, set(), skipped_suites={"server-checks"})
+    check(not ok, "entry selected+skipped: reports not-ok", failures)
+    check(any("mislabeled" in m and "BOTH" in m for m in fail_msgs),
+          "entry selected+skipped: names the entry", failures)
+
+
 def test_extra_suite_selected_but_unused_is_fine(failures):
     # Selecting a --suite that genuinely has no current entries (e.g. a
     # suite reserved for a future test category) is NOT the same failure
@@ -129,6 +197,11 @@ def main():
     test_selected_and_excluded_conflict(failures)
     test_entry_carries_both_selected_and_excluded_suite(failures)
     test_extra_suite_selected_but_unused_is_fine(failures)
+    test_skipped_suite_is_out_of_scope_and_counted(failures)
+    test_skipped_suite_does_not_hide_an_uncovered_entry(failures)
+    test_skipped_and_selected_conflict(failures)
+    test_entry_in_both_excluded_and_skipped_counts_once(failures)
+    test_entry_selected_and_skipped_label_is_a_conflict(failures)
 
     if failures:
         print(f"\nassert-suite-cover selftest: {len(failures)} FAILED")

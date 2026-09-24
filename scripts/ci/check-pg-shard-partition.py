@@ -7,6 +7,15 @@ genuine, bounded, correctly-flagged subset of ``[pg]`` — one entry, the
 expected name, the expected exact case count, tagged ``--allow-running-
 no-tests``, and every matched case also carries ``[pg]``.
 
+PR-time halves: on a pull request ci.yml runs the Linux pg shards on two jobs,
+selected by ``--suite server-pg-a`` / ``--suite server-pg-b`` (a dev/main push
+still runs the whole ``server-pg`` on one leg). check_pg_halves() proves every
+``server-pg`` entry carries exactly one of the two labels, neither half is
+empty, and no other entry carries either — so the halves are an exact partition
+of the entries, and therefore (with the case partition above) of every [pg]
+case: a shard added or split without a half label fails HERE, not by silently
+never running on a PR.
+
 Windows CI test-phase restructuring (#3443, 2026-08-28): the same check_partition()
 set-math also proves the ``server-nonpg``-suite entries partition ``~[pg]`` —
 the non-pg shards the Windows job's own non-pg Test step selects by suite,
@@ -74,6 +83,8 @@ import xml.etree.ElementTree as ET  # stdlib, not defusedxml: this parses our
 
 SERVER_PG_SUITE = "yuzu:server-pg"
 SERVER_PG_SMOKE_SUITE = "yuzu:server-pg-smoke"
+# The PR-time halves of SERVER_PG_SUITE (see check_pg_halves).
+SERVER_PG_HALF_SUITES = ("yuzu:server-pg-a", "yuzu:server-pg-b")
 # Windows CI test-phase restructuring (#3443, 2026-08-28): the non-pg server
 # shards (A/B/C) partition '~[pg]' the same way the pg shards partition
 # '[pg]' — same discovery-by-suite-membership property, same failure shape,
@@ -369,6 +380,48 @@ def check_smoke(smoke_entries, shard_exe, list_cases_fn):
     return True, [], {"smoke_case_count": n}
 
 
+def check_pg_halves(tests):
+    """Prove the PR-time halves are an exact partition of the server-pg
+    entries: each carries exactly one of SERVER_PG_HALF_SUITES, neither half is
+    empty, and no entry outside server-pg carries a half label.
+
+    Pure — takes `meson introspect --tests` output, no I/O. Returns
+    (ok: bool, failures: list[str], stats: dict) with per-half entry counts.
+    Collects every violation rather than stopping at the first (same
+    convention as _parse_suite_entries).
+    """
+    failures = []
+    per_half = {h: [] for h in SERVER_PG_HALF_SUITES}
+    for t in tests:
+        suites = set(t.get("suite", []))
+        name = t.get("name", "<unnamed>")
+        halves = [h for h in SERVER_PG_HALF_SUITES if h in suites]
+        in_pg = SERVER_PG_SUITE in suites
+        if in_pg and not halves:
+            failures.append(f"{name!r} is in {SERVER_PG_SUITE!r} but carries "
+                            f"neither {SERVER_PG_HALF_SUITES[0]!r} nor "
+                            f"{SERVER_PG_HALF_SUITES[1]!r} — a new or split "
+                            f"shard must be assigned to a half, or it never "
+                            f"runs on a pull request")
+        elif in_pg and len(halves) > 1:
+            failures.append(f"{name!r} carries BOTH pg halves {halves!r} — it "
+                            f"would run twice on a pull request")
+        elif halves and not in_pg:
+            failures.append(f"{name!r} carries {halves!r} without "
+                            f"{SERVER_PG_SUITE!r} — a half label on a non-pg "
+                            f"entry")
+        for h in halves:
+            if in_pg:
+                per_half[h].append(name)
+    for h, names in per_half.items():
+        if not names:
+            failures.append(f"suite {h!r} has no entries — an empty half "
+                            f"leaves that PR job with nothing to run (hollow "
+                            f"discovery or a mislabeled shard)")
+    stats = {h.split(":", 1)[-1]: len(n) for h, n in per_half.items()}
+    return not failures, failures, stats
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--builddir", required=True)
@@ -404,6 +457,12 @@ def main(argv=None):
             gh("error", f"check-pg-shard-partition: {f}")
         return 1
 
+    halves_ok, halves_failures, halves_stats = check_pg_halves(tests)
+    if not halves_ok:
+        for f in halves_failures:
+            gh("error", f"check-pg-shard-partition (pg halves): {f}")
+        return 1
+
     nonpg_ok, nonpg_failures, nonpg_stats = check_partition(
         nonpg_entries, list_cases, ref_spec=NONPG_REF_SPEC, label="server-nonpg")
     if not nonpg_ok:
@@ -418,7 +477,9 @@ def main(argv=None):
             gh("error", f"check-pg-shard-partition (smoke): {f}")
         return 1
 
-    print(f"check-pg-shard-partition: OK — {stats['shard_count']} pg shards, "
+    print(f"check-pg-shard-partition: OK — {stats['shard_count']} pg shards "
+          f"(PR halves: {halves_stats['server-pg-a']} + "
+          f"{halves_stats['server-pg-b']}), "
           f"{stats['case_count']} cases; {nonpg_stats['shard_count']} non-pg "
           f"shards, {nonpg_stats['case_count']} cases; both exact partitions "
           f"(no loss, no duplication); smoke: {smoke_stats['smoke_case_count']} "
