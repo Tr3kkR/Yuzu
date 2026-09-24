@@ -318,6 +318,7 @@ agent_test_exe = executable(
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
+    'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
@@ -526,6 +527,9 @@ agent_test_exe = executable(
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
+    'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
+    'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -539,6 +543,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
@@ -698,6 +703,7 @@ agent_test_exe = executable(
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
+                browser_inventory_plugin_lib,  # Wave 10 P2a
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 ],
 )
@@ -771,7 +777,16 @@ endif
 # [tsan-heavy] is ALWAYS excluded from this entry (previously only in a plain build) - see
 # the #2373/#4153 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
 # below, which is the only place a sanitizer build runs the sole survivor now.
-agent_test_args = ['~[tsan-heavy]']
+#
+# [flaky-4086] is excluded the same way: a single quarantined case (test_guard_file.cpp,
+# "FileGuard rename: the compliant edge cache...") with a measured 9/10 standalone failure
+# rate (issue #4086 - guard_win_handle.hpp's cancel_and_close_ doesn't drain a cancelled
+# OVERLAPPED read before reuse). Its own [.] tag was NOT reliably observed to keep it out
+# of this entry on its own - repeat real-hardware runs against this entry's `~[tsan-heavy]`
+# filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
+# unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
+# verified to work - see the header comment on the TEST_CASE for detail.
+agent_test_args = ['~[tsan-heavy]~[flaky-4086]']
 test(
   'agent unit tests',
   agent_test_exe,
@@ -1310,6 +1325,7 @@ if build_server
       'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_grpc_tls_policy.cpp', # #4722: TLS 1.2 floor + cipher allow-list over REAL handshakes against the production builders
       'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
       'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
       'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
