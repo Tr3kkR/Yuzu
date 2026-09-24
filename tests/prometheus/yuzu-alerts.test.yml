@@ -2780,3 +2780,71 @@ tests:
       - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
         eval_time: 25m
         exp_samples: []
+
+  # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────
+  #
+  # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
+  # source) > 0`, for: 5m, warning. Two sources share the counter:
+  # "guardian_state" (DEX/observation reads, fail-soft) and "guardian_rules"
+  # (authoritative rule/status reads, fail-hard) - both must page on a
+  # sustained non-zero rate, keyed by both labels.
+
+  # CASE — a sustained degrade on the DEX/observation family (guardian_state)
+  # pages, carrying both its reason and source labels.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_state degrade pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_state"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="query_error", source="guardian_state", severity="warning"}'
+            value: 1
+
+  # CASE — a sustained degrade on the AUTHORITATIVE rule/status family
+  # (guardian_rules) pages independently, on its OWN source label - proof the
+  # two families are counted (and paged) separately, not merged into one
+  # undifferentiated series.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_rules degrade pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_rules"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="store_not_open", source="guardian_rules", severity="warning"}'
+            value: 1
+
+  # CASE — the boot-time pre-seed alone (both sources x all three reasons
+  # present at zero, never incremented) must stay quiet: present-at-zero is
+  # the HEALTHY steady state, not a degrade.
+  - interval: 1m
+    name: guardian read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_rules"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
+        eval_time: 20m
+        exp_samples: []
