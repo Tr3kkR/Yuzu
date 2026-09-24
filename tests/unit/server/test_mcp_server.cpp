@@ -19235,6 +19235,52 @@ TEST_CASE("MCP get_management_group: an oversized group_id is rejected by the #4
               .value() == 1.0);
 }
 
+// Governance round-1 (sec-1/arch-1, #1762): get_management_group used to call
+// the LEGACY fail-soft ManagementGroupStore::get_members(), collapsing a
+// member-table degrade into the same empty vector a genuinely-empty group
+// returns. It now calls get_members_checked() and answers a retryable error
+// instead — same shape as get_dex_device_score's #4855 degrade test above.
+TEST_CASE("MCP get_management_group: a degraded member read fails closed with a retryable "
+          "error, never an authoritative empty member list (#1762)",
+          "[pg][mcp][management_group][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Degrade Tier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    REQUIRE(store.add_member(*created, "agent-77").has_value());
+
+    // Drop the member table (group metadata stays readable) so
+    // get_members_checked() degrades while get_group() still succeeds.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE management_group_store.management_group_members")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5002,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "management group store read degraded");
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultShortRetryMs);
+}
+
 TEST_CASE("MCP update_management_group: happy path renames a group",
           "[mcp][pg][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);

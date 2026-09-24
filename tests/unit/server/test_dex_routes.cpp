@@ -942,7 +942,11 @@ TEST_CASE("DEX overview: a degraded per-device read counts + surfaces unscored d
     DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
     auto html = render_dex_overview_fragment(&store, "", 7, fleet);
     CHECK(html.find("2 device(s) could not be scored") != std::string::npos);
-    CHECK(html.find("no devices reporting") != std::string::npos); // the median tile, honest
+    // UP-3: scored==0 && unscored>0 must NOT claim "no devices reporting" —
+    // 2 devices ARE reporting/connected, they just couldn't be scored (the
+    // note above already says so). The Overall tile says so instead.
+    CHECK(html.find("scores unavailable") != std::string::npos);
+    CHECK(html.find("no devices reporting") == std::string::npos);
 
     // The pure model (build_dex_overview_model) must count the same thing.
     const auto model = build_dex_overview_model(&store, fleet, "7d", 7, "", nullptr);
@@ -2965,7 +2969,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(r->status == 200);
         CHECK(r->body.find("Latitude 5420") != std::string::npos);
         CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
-        CHECK(r->body.find("no reporting devices this cycle") == std::string::npos);
+        CHECK(r->body.find("no reporting device carries a model tag this cycle") == std::string::npos);
     }
 
     SECTION("model selector: zero reporting devices this cycle -> lists nothing + an "
@@ -2990,7 +2994,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->body.find("name=\"model\"") == std::string::npos); // no selector
-        CHECK(r->body.find("no reporting devices this cycle") != std::string::npos);
+        CHECK(r->body.find("no reporting device carries a model tag this cycle") != std::string::npos);
         CHECK(r->body.find("degraded") == std::string::npos);
     }
 
@@ -3007,7 +3011,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(r->status == 200);
         CHECK(r->body.find("App performance data unavailable (not configured or "
                            "degraded) — retry shortly.") != std::string::npos);
-        CHECK(r->body.find("no reporting devices this cycle") == std::string::npos);
+        CHECK(r->body.find("no reporting device carries a model tag this cycle") == std::string::npos);
         CHECK(r->body.find("name=\"model\"") == std::string::npos);
     }
 }

@@ -115,11 +115,41 @@ public:
     /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
     /// store-not-open / pool-acquire-timeout / query-error degrade renders as
     /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).
-    /// Every caller here is render-only / deny-or-benign display (dashboard
-    /// fragments, dispatch-scope resolution, the deny-or-benign consumers
-    /// still counted below) that predates the degrade-distinguishable twin.
+    /// The `GET /api/v1/management-groups/{id}` REST route and its MCP twin
+    /// `get_management_group` have both moved to `get_members_checked` (fail
+    /// closed with a retryable error on a degrade); the remaining callers on
+    /// this legacy wrapper are NOT uniformly render-only — grep before
+    /// assuming otherwise:
+    ///   - `dashboard_routes.cpp` (the scope-picker fragment) is genuinely
+    ///     render-only display.
+    ///   - `PolicyEvaluator::resolve_targets` is dispatch-TARGETING: a degrade
+    ///     renders as zero members, which under-reaches (fails safe — zero
+    ///     compliance-check targets dispatched this tick, never a false
+    ///     target set) rather than mis-authorizing anyone.
+    /// Four further dispatch-TARGETING call sites remain on this fail-soft
+    /// form as KNOWN, DISCLOSED residuals (a follow-up to convert them to
+    /// `get_members_checked` is to be filed — this comment does not itself
+    /// change their behaviour):
+    ///   - `dispatch_scope_ladder.hpp`'s `group_members_fn` closure — the
+    ///     shared group-dispatch resolver several confined-dispatch call
+    ///     sites wire through — under-reaches to zero on a degrade.
+    ///   - `command_routes.cpp`'s `/api/command` group-dispatch resolution —
+    ///     a degrade reaches nobody, surfacing via the same catch-all
+    ///     zero-reach cause every other unreachable-scope case there does
+    ///     (routed-concerns.md's "Dispatch zero-reach cause discrimination"
+    ///     row), not a distinguishable "store degraded" report.
+    ///   - `server.cpp`'s `PreflightRoutes` group-cohort resolver (~line
+    ///     17353) — a degrade FREEZES the pre-flight run's cohort at an EMPTY
+    ///     set for that group (the run's targets are resolved once at
+    ///     creation, not re-resolved later), rather than surfacing the read
+    ///     failure to the operator.
+    ///   - `server.cpp`'s Guardian rule-push resolution for a `group:` scope
+    ///     (~line 18739) — a degrade targets NO device for that push; the
+    ///     periodic heartbeat reconcile pass repairs the gap on a later tick,
+    ///     so this one is bounded-staleness rather than a permanent miss.
     /// Prefer `get_members_checked` for NEW code, especially anything that
-    /// would otherwise render a degrade as "0 members" (the #1762 shape).
+    /// would otherwise render a degrade as "0 members" (the #1762 shape) in a
+    /// context where under-reach is not the safe default.
     std::vector<ManagementGroupMember> get_members(const std::string& group_id) const;
 
     /// Degrade-distinguishable twin of `get_members()` (#1762): `nullopt` on

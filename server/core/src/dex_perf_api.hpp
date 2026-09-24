@@ -101,9 +101,12 @@
 /// `dex_perf_cohorts()` helper the `GET /api/v1/dex/perf/cohorts` resource
 /// uses, so the dashboard picker and the public REST resource can never list
 /// different values. `fleet_snapshot` has no degrade channel (see its own doc
-/// comment) — an unwired `dex_perf_api_` and a genuine zero-reporting-devices
-/// cycle collapse to the same empty cohort list, rendered as one honest note
-/// ("no reporting devices this cycle"), never a claimed "degraded" state.
+/// comment), so a genuine empty cohort list is never rendered as a claimed
+/// "degraded" state — it is disclosed as "no reporting device carries a model
+/// tag this cycle" instead. An unwired `dex_perf_api_` does NOT reach this
+/// code path at all: `DexRoutes`'s route handler returns an "unavailable"
+/// placeholder from its trend fetch before ever calling `fleet_snapshot`
+/// (see `dex_routes.cpp`'s F2a fragment handler).
 /// See `dex_app_perf_builders.hpp`'s banner for why VerifyApi's `.cohort`
 /// input shape specifically is not folded into this seam (a Fable review of
 /// the plan found it dead in production and would drag VerifyApi's types

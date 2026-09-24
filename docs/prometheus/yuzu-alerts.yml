@@ -2193,9 +2193,17 @@ groups:
             device compliance score as authoritative while this fires (#4855).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
-            errored_rule_count) is degrading and fails HARD - the caller gets
-            a typed error and aborts the push/reconcile/status surface rather
-            than serving stale or empty data. Either way,
+            errored_rule_count) is degrading: the read itself returns a typed
+            error, not a silent empty/stale result — but "returns a typed
+            error" does not mean every caller aborts. Most callers DO fail
+            closed (abort push/reconcile/status on the typed error), but this
+            is not universal: several guardian_routes.cpp dashboard renders
+            call list_rules().value_or({}) and fall back to an empty rule
+            list on a degrade, and guardian_ingest.cpp's event-severity
+            enrichment folds a degraded get_rule into the same "unknown"
+            severity default it already uses for a genuinely-deleted rule.
+            Treat those specific views/fields as unknown, not "confirmed
+            absent", while this alert fires. Either way,
             pool_acquire_timeout/query_error correlate with yuzu_pg_*
             saturation or outage; store_not_open means the store failed to
             open at boot (should not be reachable post-boot given fail-closed
@@ -3039,15 +3047,21 @@ groups:
         # agent-groups / member resolution, ADR-0042 + #1762) degraded. Three
         # shapes share this one counter, by caller: (1) the confinement
         # hierarchy reads fail closed to DenyAll; (2) a checked member read
-        # (get_members_checked, e.g. the DEX app-perf group trend / /auto
-        # VERIFY compare) surfaces the degrade as a 503/degraded result to its
-        # caller; (3) the LEGACY get_members() wrapper still renders the SAME
-        # degrade as an empty member list to its render-only callers (dashboard
-        # fragments, dispatch-scope resolution) — this is deliberate fail-soft
-        # behaviour there, not a bug, but it is why a fired alert must not be
-        # read as "groups were deleted" or "the fleet shrank". Same dashboard-
-        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
-        # pure pool saturation, so only the store-specific counter moves.
+        # (get_members_checked — the DEX app-perf group trend, /auto VERIFY
+        # compare, and GET /api/v1/management-groups/{id} + its MCP twin
+        # get_management_group) surfaces the degrade as a 503/retryable result
+        # to its own caller; (3) the LEGACY get_members() wrapper still
+        # renders the SAME degrade as an empty member list to its remaining
+        # callers — a genuinely render-only dashboard fragment, but ALSO
+        # several dispatch-targeting reads (group dispatch resolution,
+        # dispatch-scope-ladder's group-members closure, Guardian rule-push
+        # group resolution, policy-check target resolution) whose empty
+        # result fails safe by under-reaching rather than being a benign
+        # display gap. This is deliberate fail-soft behaviour there, not a
+        # bug, but it is why a fired alert must not be read as "groups were
+        # deleted" or "the fleet shrank". Same dashboard-invisibility as
+        # YuzuInventoryReadDegraded — /readyz stays green under pure pool
+        # saturation, so only the store-specific counter moves.
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
           sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
@@ -3060,15 +3074,21 @@ groups:
             yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
             is non-zero: a confinement-feeding management-group read degraded.
             Depending on the caller this means the caller failed closed to
-            DenyAll, returned a degraded/503 result to its own caller (e.g. the
-            DEX app-perf group trend or /auto VERIFY compare), or — for the
-            legacy get_members() wrapper's render-only callers — received an
-            empty member list rather than the group's real membership. This is
-            a confinement-substrate degrade, it does NOT mean management groups
-            shrank or devices left the fleet. pool_acquire_timeout/query_error
-            correlate with yuzu_pg_* saturation or outage; store_not_open means
-            the store failed to open at boot. Do not read a scoped operator's
-            short/empty list, or an empty app-perf/VERIFY cohort, as
+            DenyAll, returned a degraded/503-or-retryable result to its own
+            caller (e.g. the DEX app-perf group trend, /auto VERIFY compare,
+            or GET /api/v1/management-groups/{id} and its MCP twin), or — for
+            the legacy get_members() wrapper's remaining callers — received
+            an empty member list rather than the group's real membership,
+            which for the dashboard scope picker is a benign display gap but
+            for a dispatch-targeting caller (group dispatch, dispatch-scope
+            ladder, Guardian rule push, policy-check target resolution) means
+            zero devices were reached this cycle, not that the group is
+            empty. This is a confinement-substrate degrade, it does NOT mean
+            management groups shrank or devices left the fleet.
+            pool_acquire_timeout/query_error correlate with yuzu_pg_*
+            saturation or outage; store_not_open means the store failed to
+            open at boot. Do not read a scoped operator's short/empty list, an
+            empty app-perf/VERIFY cohort, or a zero-reach dispatch, as
             authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuAnalyticsStoreNotOpen

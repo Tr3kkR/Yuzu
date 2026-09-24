@@ -1758,7 +1758,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += "<div class=\"gp-sech\">Experience</div>";
         h += "<div class=\"gp-tiles\">";
         h += stile(overall, "Overall experience",
-                   ds.empty() ? "no devices reporting"
+                   ds.empty() ? (unscored > 0 ? "scores unavailable" : "no devices reporting")
                               : "median of " + num(static_cast<int64_t>(ds.size())) + " devices");
         h += stile(dev, "Device", "stability &middot; perf &middot; hardware");
         h += stile(app, "App", "crashes &amp; hangs");
@@ -3262,15 +3262,17 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // and that resource read the identical cohort population and can
         // never drift. The untagged residual (cohort == "") is excluded: it
         // is not a selectable model value. `fleet_snapshot` has no degrade
-        // channel (dex_perf_api.hpp), so an unwired `dex_perf_api_` and a
-        // genuine zero-reporting-devices cycle collapse to the SAME empty
-        // list — never distinguished, never claimed as a "degrade".
+        // channel (dex_perf_api.hpp), so a genuine zero-cohort-population
+        // read is never claimed as a "degrade". `dex_perf_api_` is
+        // GUARANTEED non-null by this point — all three trend branches above
+        // return the "unavailable" placeholder and `return` early whenever
+        // `dex_perf_api_` is null (each assigns `trend = dex_perf_api_ ? ...
+        // : std::nullopt` then bails on `!trend`) — so an unguarded call here
+        // is safe and an unwired API never reaches this note at all.
         std::vector<std::string> model_values;
-        if (dex_perf_api_) {
-            for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
-                if (!c.cohort.empty())
-                    model_values.push_back(c.cohort);
-        }
+        for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
+            if (!c.cohort.empty())
+                model_values.push_back(c.cohort);
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version, model_values, model),
                         "text/html; charset=utf-8");

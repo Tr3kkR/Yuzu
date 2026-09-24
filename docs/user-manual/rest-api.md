@@ -536,6 +536,11 @@ Get a single group's details including its current members.
 }
 ```
 
+Member resolution reads `ManagementGroupStore::get_members_checked` (#1762) — a
+store-not-open / pool-acquire-timeout / query-error degrade returns `503` (A4
+envelope, `retry_after_ms: 2000`) rather than an authoritative empty
+`members: []`. The MCP twin `get_management_group` fails the same way.
+
 ---
 
 #### `PUT /api/v1/management-groups/{id}`

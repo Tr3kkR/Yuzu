@@ -46,29 +46,43 @@
 /// to durable storage) — it is orthogonal to the `result` STRING passed in as
 /// an audit-row field, and it is that string's meaning which varies by site:
 ///   * MOST call sites — the dashboard fragments and most fail-closed REST
-///     gates (`dex.device.view`, `dex.signal.view`) — audit BEFORE the read
-///     with a literal `result="success"`, asserting only that the request
-///     was authorised and the read was ATTEMPTED. It does **not** assert data
-///     was disclosed: a subsequent store-level degrade (see
-///     `yuzu_server_guardian_read_degrade_total`, `docs/user-manual/
+///     gates (`dex.device.view`, `dex.signal.view`), AND the MCP
+///     `get_dex_device_app_perf` tool's `dex.device.app_perf.view` row —
+///     audit BEFORE the read with a literal `result="success"`, asserting
+///     only that the request was authorised and the read was ATTEMPTED. It
+///     does **not** assert data was disclosed: a subsequent store-level
+///     degrade (see `yuzu_server_guardian_read_degrade_total`,
+///     `yuzu_server_app_perf_read_degrade_total`, `docs/user-manual/
 ///     metrics.md`) can still leave the dashboard rendering a placeholder, or
-///     the REST caller getting a 503, on top of an already recorded
-///     `success` audit row.
+///     the REST/MCP caller getting a 503/retryable error, on top of an
+///     already recorded `success` audit row.
 ///   * Some surfaces instead audit AFTER the read and set `result` by ACTUAL
-///     outcome — the Guardian REST/MCP twins (e.g. `guardian.device.view`,
-///     which passes `rows ? "success" : "failure"`) and
-///     `dex.app_perf.devices.view` record `success`/`failure` reflecting
+///     outcome — the Guardian REST/MCP twins (e.g. `guardian.device.view`
+///     on REST/MCP, which passes `rows ? "success" : "failure"`; the
+///     device-page Guardian lens fragment is a DIFFERENT posture, see below)
+///     and `dex.app_perf.devices.view` record `success`/`failure` reflecting
 ///     whether the read itself succeeded, not merely whether it was
 ///     authorised and attempted.
-///   * A third posture: the MCP DEX device-score/app-perf behavioural rows
-///     audit AFTER the read but record a CONSTANT `"success"` regardless of
-///     read outcome (the set-and-proceed convention — the tool response body
-///     carries the degrade signal instead of the audit row).
-/// These three postures are a known, accepted split across surfaces, not a
-/// bug in any one of them — an auditor reading raw rows must not assume one
-/// meaning fleet-wide. Converging them onto one posture is deferred to the
-/// WS-B2 audit-relocation step (ADR-0031); this comment documents the CURRENT
-/// state, not a target one.
+///   * A third posture: the MCP `get_dex_device_score` tool's
+///     `dex.device.view` behavioural row audits AFTER the read (`model =
+///     dex_api_->device_score(...)` runs first) but records a CONSTANT
+///     `"success"` regardless of `model.degraded` (the set-and-proceed
+///     convention — the tool response body carries the degrade signal
+///     instead of the audit row). This is NOT the same posture as
+///     `get_dex_device_app_perf` above, despite both being MCP DEX
+///     behavioural rows — do not assume the two share an ordering.
+///   * A fourth, surface-specific split on the SAME verb: `guardian.device.
+///     view` is audited post-read-by-outcome on REST and MCP (bucket two
+///     above), but the device-page Guardian lens dashboard fragment
+///     (`device_lens_routes.cpp`) audits it BEFORE the read with a constant
+///     `"success"` (bucket-one shape) — the same audit verb therefore
+///     carries a DIFFERENT ordering/outcome convention depending on which
+///     surface emitted it.
+/// These postures are a known, accepted split across surfaces, not a bug in
+/// any one of them — an auditor reading raw rows must not assume one meaning
+/// fleet-wide, and must key off (verb, surface), not verb alone. Converging
+/// them onto one posture is deferred to the WS-B2 audit-relocation step
+/// (ADR-0031); this comment documents the CURRENT state, not a target one.
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>

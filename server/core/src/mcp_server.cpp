@@ -9913,7 +9913,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
                 }
-                auto members = mgmt_store->get_members(group_id);
+                // get_members_checked (not the fail-soft get_members()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as an authoritative empty member list
+                // (#1762 shape); fail closed with a retryable error instead,
+                // matching the REST twin's 503.
+                auto members = mgmt_store->get_members_checked(group_id);
+                if (!members) {
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", group_id);
                 // Shared builder (management_group_model.hpp) - the REST twin
                 // GET /api/v1/management-groups/{id} calls the SAME function,
@@ -9921,7 +9935,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // §1 Rule 1).
                 res.set_content(
                     success_response(
-                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                        id, tool_result(management_group_detail_json(*g, *members), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -14412,11 +14426,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
                 // persist bool is captured and surfaced as audit_persisted:false in the
                 // body instead (never a failed call — see docs/api-twin-recipe.md §4).
-                // #4855: the behavioral-PII audit row stays "success" regardless of a
-                // downstream store degrade below (the device WAS accessed on the
-                // caller's behalf; the audit records the access, not the outcome) —
-                // the separate `mcp_audit` tool-invocation record is what flips to
-                // "failure" on a degrade.
+                // #4858: the read above may have degraded; this behavioural row
+                // records the access, not the outcome (#4855) — it stays "success"
+                // regardless of a `model.degraded` result below (the device WAS
+                // accessed on the caller's behalf) — the separate `mcp_audit`
+                // tool-invocation record is what flips to "failure" on a degrade.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
                     "DEX per-device score + signal summary via MCP get_dex_device_score");

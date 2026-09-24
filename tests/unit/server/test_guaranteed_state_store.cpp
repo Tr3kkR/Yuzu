@@ -1543,9 +1543,13 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     // No live rig needed for this one (deliberately NOT gated behind
     // YUZU_REQUIRE_PG_DB_TPL) — an unroutable address fails fast everywhere.
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    // metrics is declared BEFORE bad so it outlives the store: bad only holds
+    // a borrowed MetricsRegistry* (set_metrics), and C++ destroys locals in
+    // reverse declaration order — declaring metrics first means bad's
+    // destructor runs while metrics is still alive, never after.
+    yuzu::MetricsRegistry metrics;
     GuaranteedStateStore bad(bad_pool);
     CHECK_FALSE(bad.is_open());
-    yuzu::MetricsRegistry metrics;
     bad.set_metrics(&metrics);
 
     CHECK_FALSE(bad.create_rule(make_rule("x", "x")));

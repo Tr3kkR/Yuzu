@@ -68,11 +68,13 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 /// — the SAME derivation the public `GET /api/v1/dex/perf/cohorts` resource
 /// uses, #4857 D1) populates a SECOND, independent scope selector alongside
 /// the management-group one. Unlike `groups`, an empty `model_values` does NOT
-/// silently hide the selector — `fleet_snapshot` has no degrade channel, so an
-/// unwired `DexPerfApi` and a genuine zero-reporting-devices cycle are
-/// indistinguishable here, and both render the SAME honest disclosure note
-/// ("no reporting devices this cycle") rather than a selector, and never a
-/// claimed "degraded" state. `active_model` mirrors `scope_group_id`'s
+/// silently hide the selector — `fleet_snapshot` has no degrade channel, so it
+/// never renders a claimed "degraded" state. An unwired `DexPerfApi` does NOT
+/// reach this note: the caller (dex_routes.cpp's route handler) returns an
+/// "unavailable" placeholder before ever populating `model_values` in that
+/// case. The empty-list case this note actually covers is devices reporting
+/// with no `model` tag value at all, rendered as "no reporting device carries
+/// a model tag this cycle" rather than a selector. `active_model` mirrors `scope_group_id`'s
 /// convention (empty = unfiltered). The two scopes are MUTUALLY EXCLUSIVE in
 /// this slice (group takes precedence — see dex_routes.cpp's route handler);
 /// selecting one clears the other via the emitted links so a caller can never
