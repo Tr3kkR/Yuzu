@@ -274,10 +274,10 @@ at creation) still broadcasts on re-eval, unchanged.
 
 **What changed.** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias
 (the set's own `name`, valid up to 256 bytes). `POST /api/v1/result-sets/from-tar-query` and
-`/from-instruction-result` (and their MCP twins) now bound `parent_id` to 64 bytes
-(`kResultSetParentIdMaxLen`) before attempting alias resolution, closing a gap where an
-oversized value was copied unbounded into the persisted `scope_input_id` lineage marker. MCP's
-equivalent producer tools already enforced this bound; REST did not.
+`/from-instruction-result` now bound `parent_id` to 64 bytes (`kResultSetParentIdMaxLen`) before
+attempting alias resolution, closing a gap where an oversized value was copied unbounded into
+the persisted `scope_input_id` lineage marker. MCP's equivalent producer tools already enforced
+this bound; REST did not — this change brings REST to parity.
 
 **Who this affects.** Any caller referencing a result set by a `name`-based alias longer than 64
 bytes as `parent_id` on these two REST routes. Previously such a call resolved the alias and
