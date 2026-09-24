@@ -98,6 +98,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
@@ -123,27 +124,19 @@ FRAGMENT_FILES = [
 # Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
+# Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (printing.clear_queue) + 1 (firmware_posture) + 2 (browser_inventory) +
-# 2 (app_control) = 215.
-# This constant was briefly wrong at 210 on this branch: two sibling PRs
-# (printing.clear_queue and firmware_posture) each independently bumped it from
-# the same 209 baseline to 210, and merging dev into this branch kept both
-# textual edits with neither aware of the other's +1 (PR #4719 CI, all three
-# build legs) -- fixed to 211 in that cycle. Merging dev's own independent
-# app_control bump (211's dev-side counterpart landed at 212 there, +1 for
-# app_control's own 2-row add over a 210 baseline missing firmware_posture)
-# needed the same fix again: add both sides' new value on top of the
-# now-corrected 211, not pick one side's total -- 211 + 2 (app_control) = 213.
-# THIRD round, same class: dev has since independently added browser_inventory
-# (+2) on top of the same printing.clear_queue+app_control baseline (212),
-# landing at 214 there while this branch sat at 213. Shared baseline both
-# sides agree on is still 212 -- add BOTH new plugins on top of it, never
-# pick one side's total -- 212 + 1 (firmware_posture) + 2 (browser_inventory)
-# = 215.
-EXPECTED_TOTAL_ROWS = 215
+# 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
+# 2 (browser_inventory) + 1 (firmware_posture) = 217.
+# This constant has been bumped independently on both sides of a merge several times
+# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
+# always the same: find the shared baseline both sides agree on and add EVERY side's new
+# plugin on top of it, never pick one side's total. Dev is at 216 here (209 baseline +
+# printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2);
+# this branch adds firmware_posture's 1 row: 216 + 1 = 217.
+EXPECTED_TOTAL_ROWS = 217
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

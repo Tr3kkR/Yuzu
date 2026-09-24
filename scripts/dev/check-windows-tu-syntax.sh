@@ -63,6 +63,7 @@ tus=(
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
     agents/plugins/app_control/src/app_control_plugin.cpp
     agents/plugins/app_control/src/app_control_win.cpp
+    agents/plugins/platform_security/src/platform_security_win.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
