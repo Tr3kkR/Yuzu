@@ -214,15 +214,27 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   before, those two are verified fail-closed rather than added best-effort. The
   manifest self-test verifies all four private binary sets, registered service
   executables, `Running` states, and live authenticated probes, so drift fails
-  before a build starts. It also prints a read-only per-cluster durability
-  settings fingerprint for all four clusters on every run (#2167 follow-up),
-  and, when invoked with `-ExportCiEnv` (the CI job only), exports
-  `YUZU_CI_PSQL` — this runner's own agent's manifest `psql` — so
+  before a build starts. It also prints a read-only, per-cluster durability
+  settings fingerprint (fsync/synchronous_commit/full_page_writes/
+  data_directory/databases/active_backends) for every cluster that passes its
+  `SELECT 1` health probe (ordinarily all four) on every run (#2167
+  follow-up) — Cyan `[info]` when a cluster's three settings all read `off`,
+  Yellow `[warn]` (never affecting the health gate) when any does not — and,
+  when invoked with `-ExportCiEnv` (the CI job only), exports `YUZU_CI_PSQL`
+  — this runner's own agent's manifest `psql` — so
   `scripts/ci/ensure-postgres.sh`'s per-job durability conformance guard
-  resolves a proven `psql.exe` instead of an unauthenticated TCP probe. A
-  `YUZU_CI_PSQL` that is set but not executable is ignored with a
+  (every path-1 invocation, not only Wee Tam's) resolves a proven `psql.exe`
+  instead of an unauthenticated TCP probe, and its heal (behind an
+  in-session loopback/target-identity check and a config-parse check) and
+  its manifest per-agent-and-agent-0 no-fallback rule become live for this
+  job. A `YUZU_CI_PSQL` that is set but not executable is ignored with a
   `::warning`, and the guard's heal and manifest no-fallback rule are OFF
-  for that job.
+  for that job — same as omitting `-ExportCiEnv` entirely. The heal runs as
+  the DSN's own role (`yuzu`, seeded `SUPERUSER` above); the minimum grant
+  for a non-superuser role to run it is `ALTER SYSTEM` on the three
+  settings, `EXECUTE` on `pg_reload_conf()`, and read access to
+  `pg_file_settings` (see `docs/ci-architecture.md` "Postgres for server
+  tests").
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg

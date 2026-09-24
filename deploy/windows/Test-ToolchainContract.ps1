@@ -795,11 +795,16 @@ $vcpkgParseErrors = $null
 Check 'the job-scoped vcpkg assertion script remains syntactically valid' {
   $vcpkgParseErrors.Count -eq 0
 }
-$assertParseTokens = $null
-$assertParseErrorsTop = $null
-[void][System.Management.Automation.Language.Parser]::ParseFile(
-  (Resolve-Path -LiteralPath $AssertPath).Path, [ref]$assertParseTokens, [ref]$assertParseErrorsTop)
 Check 'the standalone toolchain assertion script remains syntactically valid' {
+  # QE-3: guarded by Test-Path and run INSIDE the Check body — the earlier
+  # shape ran ParseFile at top level, unconditionally, so a missing
+  # $AssertPath aborted the whole harness run instead of producing one
+  # clean FAIL + tally entry like every other Check.
+  if(-not (Test-Path -LiteralPath $AssertPath)){ return $false }
+  $assertParseTokens = $null
+  $assertParseErrorsTop = $null
+  [void][System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path -LiteralPath $AssertPath).Path, [ref]$assertParseTokens, [ref]$assertParseErrorsTop)
   $assertParseErrorsTop.Count -eq 0
 }
 $vcpkgAssertText = Get-Content -LiteralPath $AssertVcpkgPath -Raw
@@ -853,8 +858,11 @@ Check 'the settings fingerprint never fails the assertion' {
   # is a parse error the file's own parse-validity Check already catches
   # above), so this also proves the probe is still guarded, not merely
   # that $fail is untouched — deleting the try/catch around the fingerprint
-  # would otherwise still pass this Check.
-  ($span -notmatch '\$fail\+\+') -and ($span -match '\}\s*catch\s*\{')
+  # would otherwise still pass this Check. CA-5: match ANY reference to
+  # $fail (not only the increment form `$fail++`) — an `if(...) { $fail =
+  # $fail + 1 }` or similar rewrite would still touch $fail without ever
+  # spelling `$fail++`, and would slip past a narrower pattern.
+  ($span -notmatch '\$fail\b') -and ($span -match '\}\s*catch\s*\{')
 }
 Check 'the CI psql export is opt-in and agent-guarded' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
@@ -862,9 +870,16 @@ Check 'the CI psql export is opt-in and agent-guarded' {
   if($exportIfAt -lt 0){ return $false }
   $matchAt = $assertText.IndexOf('-match ''-(\d+)$''', $exportIfAt)
   if($matchAt -lt 0){ return $false }
-  $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $matchAt)
+  # CA-5: pin the literal `-le 9` bound (the AGENT_IDX>9-is-not-a-pool-index
+  # rule ensure-postgres.sh's own AGENT_IDX derivation mirrors) rather than
+  # only requiring SOME numeric comparison — a silent widening/narrowing of
+  # the bound here would desync the two derivations without failing
+  # anything else in this Check.
+  $leNineAt = $assertText.IndexOf('-le 9', $matchAt)
+  if($leNineAt -lt 0){ return $false }
+  $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $leNineAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
-  if(-not ($writeAt -gt $matchAt -and $occurrences -eq 1)){ return $false }
+  if(-not ($writeAt -gt $leNineAt -and $occurrences -eq 1)){ return $false }
   # Assert via the AST, not a file-wide text match, that [switch]$ExportCiEnv
   # is declared IN THE PARAM BLOCK (a match anywhere in the file, e.g. a
   # comment or a string, would satisfy a bare -match).

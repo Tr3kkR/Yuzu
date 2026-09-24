@@ -104,20 +104,25 @@ pg_durability_decide() {
   return 0
 }
 
-# pg_heal_allowed <github_actions> <host> <psql_src>
+# pg_heal_allowed <github_actions> <host> <psql_src> <provable 0|1>
 #
 # Returns 0 only when this job may run ALTER SYSTEM against the cluster:
 # $1 is exactly "true" (GITHUB_ACTIONS), $2 is a loopback host
 # (127.0.0.1 or localhost — IPv6 loopback is deliberately absent:
 # pg_dsn_host_port's host group [^:/@]+ can never yield "::1"/"[::1]", so an
-# IPv6 DSN always reads '?' here and is drift-only, never healed), and $3 is
+# IPv6 DSN always reads '?' here and is drift-only, never healed), $3 is
 # exactly "manifest" (the psql came from YUZU_CI_PSQL, which is only ever
 # exported by deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv from a
 # Provision-Windows-Runner.ps1 manifest — the manifest is the declaration
-# that this cluster is disposable CI infrastructure).
+# that this cluster is disposable CI infrastructure), and $4 is exactly "1"
+# (pg_dsn_target_provable said the DSN string is a reliable statement of
+# where libpq actually connects — see that function's doc comment for why a
+# query-string DSN or a caller with more than one '@' cannot be trusted:
+# B1, the orchestrator's live reproduction of `...@127.0.0.1:P1/db?port=P2`
+# passing the host:port gate while libpq dials P2).
 pg_heal_allowed() {
-  local github_actions="$1" host="$2" psql_src="$3"
-  if [[ "$github_actions" == "true" ]] && [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]] && [[ "$psql_src" == "manifest" ]]; then
+  local github_actions="$1" host="$2" psql_src="$3" provable="$4"
+  if [[ "$github_actions" == "true" ]] && [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]] && [[ "$psql_src" == "manifest" ]] && [[ "$provable" == "1" ]]; then
     return 0
   fi
   return 1
@@ -149,6 +154,40 @@ pg_dsn_host_port() {
 pg_dsn_redact() {
   local dsn="$1"
   printf '%s' "$dsn" | sed -E 's#://.*@#://***@#; s/password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)/password=***/g'
+}
+
+# pg_dsn_target_provable <dsn> — returns 0 only when a URI-form DSN's
+# authority is a RELIABLE statement of where libpq actually connects, i.e.
+# it is safe input to pg_heal_allowed's loopback check:
+#   - matches the same ^(.*@(host)):(port)(/.*)$ shape pg_dsn_host_port
+#     uses (an unmatched shape already reads host:port as "?", drift-only);
+#   - contains no '?': a URI-form DSN's query string is itself a bag of
+#     libpq keyword=value parameters (RFC 3986-style `key=value[&...]`) —
+#     `postgresql://yuzu@127.0.0.1:56551/postgres?port=56552` parses its
+#     authority as host=127.0.0.1 port=56551, but libpq's own conninfo
+#     parser applies the query string's `port=56552` on top, so the
+#     connection actually lands on 56552. Any query string could carry a
+#     hidden `host=`/`hostaddr=`/`port=` override, so its mere presence
+#     disqualifies the DSN, regardless of what it happens to contain today;
+#   - contains exactly one '@': pg_dsn_host_port's host-capture group uses
+#     a GREEDY `.*@`, i.e. it anchors on the LAST '@' in the string. A
+#     second '@' (a raw one inside a password, or one smuggled into a
+#     query string before this check's own '?' test would catch it) means
+#     the authority substring this function and pg_dsn_host_port both
+#     parsed may not be the one libpq's own (non-greedy, left-to-right)
+#     authority parser lands on.
+# Returns 1 (not provable) on any of the above; 0 only when all hold.
+pg_dsn_target_provable() {
+  local dsn="$1"
+  [[ "$dsn" =~ ^(.*@([^:/@]+)):([0-9]+)(/.*)$ ]] || return 1
+  case "$dsn" in *'?'*) return 1 ;; esac
+  local at_count=0 rest="$dsn"
+  while [[ "$rest" == *"@"* ]]; do
+    at_count=$((at_count + 1))
+    rest="${rest#*@}"
+  done
+  [[ "$at_count" -eq 1 ]] || return 1
+  return 0
 }
 
 # pg_psql_path_from_env <value> — backslash -> forward-slash (Windows-form
@@ -208,14 +247,48 @@ pg_durability_selftest() {
   rc=0; out="$(pg_durability_decide 1 "$cap_nosuper")" || rc=$?
   pg_durability_check "decide 1 permission-denied -> fail unparseable" "fail unparseable" "$out"
 
-  rc=0; pg_heal_allowed true 127.0.0.1 manifest || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 manifest" "0" "$rc"
-  rc=0; pg_heal_allowed true localhost manifest || rc=$?; pg_durability_check "heal_allowed true localhost manifest" "0" "$rc"
-  rc=0; pg_heal_allowed true 127.0.0.1 path || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 path" "1" "$rc"
-  rc=0; pg_heal_allowed true 127.0.0.1 none || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 none" "1" "$rc"
-  rc=0; pg_heal_allowed true 10.0.0.5 manifest || rc=$?; pg_durability_check "heal_allowed true 10.0.0.5 manifest" "1" "$rc"
-  rc=0; pg_heal_allowed true '?' manifest || rc=$?; pg_durability_check "heal_allowed true ? manifest" "1" "$rc"
-  rc=0; pg_heal_allowed '' 127.0.0.1 manifest || rc=$?; pg_durability_check "heal_allowed '' 127.0.0.1 manifest" "1" "$rc"
-  rc=0; pg_heal_allowed false 127.0.0.1 manifest || rc=$?; pg_durability_check "heal_allowed false 127.0.0.1 manifest" "1" "$rc"
+  # PD-07/PD-08: malformed row shapes are REJECTED (treated as no row seen
+  # for that setting), not misparsed into a false ok/heal.
+  local cap_2field=$'fsync|off\nfull_page_writes|off|configuration file\nsynchronous_commit|off|configuration file'
+  rc=0; out="$(pg_durability_decide 1 "$cap_2field")" || rc=$?
+  pg_durability_check "decide 1 2-field row rejected -> fail missing" "fail missing:fsync" "$out"
+  pg_durability_check "decide 1 2-field row rejected -> rc 1" "1" "$rc"
+  local cap_4field=$'fsync|off|configuration file|extra\nfull_page_writes|off|configuration file\nsynchronous_commit|off|configuration file'
+  rc=0; out="$(pg_durability_decide 1 "$cap_4field")" || rc=$?
+  pg_durability_check "decide 1 4-field row rejected -> fail missing" "fail missing:fsync" "$out"
+  pg_durability_check "decide 1 4-field row rejected -> rc 1" "1" "$rc"
+
+  rc=0; pg_heal_allowed true 127.0.0.1 manifest 1 || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 manifest provable" "0" "$rc"
+  rc=0; pg_heal_allowed true localhost manifest 1 || rc=$?; pg_durability_check "heal_allowed true localhost manifest provable" "0" "$rc"
+  rc=0; pg_heal_allowed true 127.0.0.1 path 1 || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 path provable" "1" "$rc"
+  rc=0; pg_heal_allowed true 127.0.0.1 none 1 || rc=$?; pg_durability_check "heal_allowed true 127.0.0.1 none provable" "1" "$rc"
+  rc=0; pg_heal_allowed true 10.0.0.5 manifest 1 || rc=$?; pg_durability_check "heal_allowed true 10.0.0.5 manifest provable" "1" "$rc"
+  rc=0; pg_heal_allowed true '?' manifest 1 || rc=$?; pg_durability_check "heal_allowed true ? manifest provable" "1" "$rc"
+  rc=0; pg_heal_allowed '' 127.0.0.1 manifest 1 || rc=$?; pg_durability_check "heal_allowed '' 127.0.0.1 manifest provable" "1" "$rc"
+  rc=0; pg_heal_allowed false 127.0.0.1 manifest 1 || rc=$?; pg_durability_check "heal_allowed false 127.0.0.1 manifest provable" "1" "$rc"
+  # B1 PD-04/PD-05 negative fixtures.
+  rc=0; pg_heal_allowed true '127.0.0.1.evil.example' manifest 1 || rc=$?
+  pg_durability_check "heal_allowed adversarial host suffix rejected" "1" "$rc"
+  rc=0; pg_heal_allowed True 127.0.0.1 manifest 1 || rc=$?
+  pg_durability_check "heal_allowed truthy-but-not-true GITHUB_ACTIONS rejected" "1" "$rc"
+  rc=0; pg_heal_allowed 1 127.0.0.1 manifest 1 || rc=$?
+  pg_durability_check "heal_allowed numeric-truthy GITHUB_ACTIONS rejected" "1" "$rc"
+  # B1: pg_heal_allowed's own provable gate — a manifest/loopback/Actions
+  # DSN that pg_dsn_target_provable refuses must still be refused here.
+  rc=0; pg_heal_allowed true 127.0.0.1 manifest 0 || rc=$?
+  pg_durability_check "heal_allowed true 127.0.0.1 manifest not-provable" "1" "$rc"
+
+  # B1: pg_dsn_target_provable — plain-URI-only bound (PD-07/PD-08 shapes).
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test' || rc=$?
+  pg_durability_check "dsn_target_provable plain uri" "0" "$rc"
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu@127.0.0.1:56551/postgres?port=56552' || rc=$?
+  pg_durability_check "dsn_target_provable query-string port override not provable" "1" "$rc"
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu@127.0.0.1:5433/db?x=1' || rc=$?
+  pg_durability_check "dsn_target_provable any query string not provable" "1" "$rc"
+  rc=0; pg_dsn_target_provable 'postgresql://a@b@127.0.0.1:5433/db' || rc=$?
+  pg_durability_check "dsn_target_provable double-@ not provable" "1" "$rc"
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu@[::1]:5433/db' || rc=$?
+  pg_durability_check "dsn_target_provable unparseable host not provable" "1" "$rc"
 
   out="$(pg_dsn_host_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu')"; pg_durability_check "dsn_host_port keyword-form" "?" "$out"

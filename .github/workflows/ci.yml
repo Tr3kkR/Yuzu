@@ -1730,7 +1730,13 @@ jobs:
       # `bash` resolves to the WSL stub, which refuses to run as the
       # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
       # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
+      #
+      # timeout-minutes (S-4): PGCONNECT_TIMEOUT only bounds the initial
+      # connect, not a psql call that connects fine and then hangs (a wedged
+      # backend, a lock wait). p1_psql's own /usr/bin/timeout wrapper bounds
+      # each individual call to 60s; this is the step-level backstop.
       - name: Ensure Postgres (server tests)
+        timeout-minutes: 5
         run: source scripts/ci/ensure-postgres.sh
 
       # Mirrors the Linux job's own step of the same name (#3443) — see that

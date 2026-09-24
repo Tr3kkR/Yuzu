@@ -209,7 +209,7 @@ if(-not $hasClusterContract){
         $probeError = $null
         try {
           $probe = (Invoke-YuzuContractProbe -Executable $c.psql `
-            -Arguments @('-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc','SELECT 1') `
+            -Arguments @('-X','-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc','SELECT 1') `
             -TimeoutSeconds ([int]$contract.probe_timeout_seconds)).Trim()
         } catch {
           $probe = ''
@@ -222,12 +222,24 @@ if(-not $hasClusterContract){
           $fail++
         } else {
           # Read-only — a failure here never affects $fail or $clusterOk;
-          # SELECT 1 above remains the health gate.
+          # SELECT 1 above remains the health gate. ER-3: Yellow [warn] (not
+          # Cyan [info]) when any of the three settings is not 'off', so a
+          # drift is visible at a glance without reading the full line —
+          # still never touches $fail/$clusterOk. Expected values: all
+          # three settings 'off'; data_directory is D:\ci\pg\agent-<n> for
+          # agents 1-3 and the EDB install's own data root for agent 0;
+          # active_backends is only meaningful from the job that owns this
+          # agent (another job's connections are foreign load, not drift).
           try {
             $fp = (Invoke-YuzuContractProbe -Executable $c.psql `
-              -Arguments @('-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc',$fingerprintSql) `
+              -Arguments @('-X','-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc',$fingerprintSql) `
               -TimeoutSeconds ([int]$contract.probe_timeout_seconds))
-            Write-Host ("  [info] agent {0} :{1} {2}" -f $c.agent, $c.port, $fp.Trim()) -ForegroundColor Cyan
+            $fpLine = $fp.Trim()
+            if($fpLine -match 'fsync=off synchronous_commit=off full_page_writes=off'){
+              Write-Host ("  [info] agent {0} :{1} {2}" -f $c.agent, $c.port, $fpLine) -ForegroundColor Cyan
+            } else {
+              Write-Host ("  [warn] agent {0} :{1} drifted: {2}" -f $c.agent, $c.port, $fpLine) -ForegroundColor Yellow
+            }
           } catch {
             Write-Host ("  [warn] agent {0}: settings fingerprint unavailable ({1})" -f $c.agent, $_.Exception.Message) -ForegroundColor Yellow
           }
@@ -243,10 +255,16 @@ if(-not $hasClusterContract){
   }
 
   if($ExportCiEnv){
+    # S-5/CA-5: TryParse rather than a direct [int] cast — a runner-name
+    # suffix of 10+ digits (an unexpected naming scheme, not a pool agent
+    # index) would otherwise throw under $ErrorActionPreference='Stop' and
+    # kill this whole Assert step, which every Windows job (incl. release
+    # builds) runs first. The -and short-circuit means TryParse only runs
+    # after the -match, so $Matches is still the match just made.
+    $idx = 0
     if(-not $env:GITHUB_ENV){
       Write-Host "  [warn] -ExportCiEnv but GITHUB_ENV is unset — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
-    } elseif($env:RUNNER_NAME -match '-(\d+)$' -and [int]$Matches[1] -le 9){
-      $idx = [int]$Matches[1]
+    } elseif($env:RUNNER_NAME -match '-(\d+)$' -and [int]::TryParse($Matches[1], [ref]$idx) -and $idx -le 9){
       $own = @($m.postgres_clusters) | Where-Object { [int]$_.agent -eq $idx } | Select-Object -First 1
       if($own -and $own.psql -and (Test-Path -LiteralPath $own.psql)){
         Add-Content -LiteralPath $env:GITHUB_ENV -Value "YUZU_CI_PSQL=$($own.psql)"

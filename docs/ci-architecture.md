@@ -1207,15 +1207,31 @@ Resolution order inside the script:
    `pg_durability_decide`) before exporting the DSN. When all three
    already read `off`, that's a one-line `ok`. Otherwise: only under
    GitHub Actions, against a loopback host, with a
-   toolchain-manifest-vouched `psql` (`YUZU_CI_PSQL`, see below) does the
-   guard **heal** — `ALTER SYSTEM SET … = off` ×3 + `pg_reload_conf()`,
-   then a bounded (5 × 1s) re-read, since a reload's SIGHUP handling is
-   asynchronous. Everywhere else (a developer's pre-set DSN, a bespoke
-   remote DB, any other self-hosted box with a machine-level loopback
-   DSN) drift is only **reported** (a `::warning` under Actions, a plain
-   informational line otherwise) — this guard never mutates a cluster it
-   cannot prove is disposable CI infrastructure. `YUZU_CI_PSQL` is
-   exported to `$GITHUB_ENV` by
+   toolchain-manifest-vouched `psql` (`YUZU_CI_PSQL`, see below), with a
+   **plain URI DSN** (`pg_dsn_target_provable` — no query string and
+   exactly one `@`; a keyword-form, IPv6, or multi-host DSN is
+   report-only, since the per-agent derivation regex reads it as an
+   unparsed `?` host anyway), and with none of
+   `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` set in the job/runner
+   environment (libpq honours those over a URI's own authority) does the
+   guard even ATTEMPT to **heal**. The DSN-string checks above only bound
+   the attempt — the heal session's own first two statements are
+   in-session `DO` blocks, under `ON_ERROR_STOP=1`, that RAISE before any
+   `ALTER SYSTEM` runs unless (a) the server this session is actually
+   talking to is loopback on the exact port the DSN claims, and (b)
+   `pg_file_settings` has no parse error (a stale/broken
+   `postgresql.conf` would otherwise make the coming `pg_reload_conf()`
+   apply nothing while any other pending edit, e.g. `pg_hba.conf`, still
+   goes live through the same reload). Only past both does it run `ALTER
+   SYSTEM SET … = off` ×3 + `pg_reload_conf()`, then a bounded (5 × 1s)
+   re-read, since a reload's SIGHUP handling is asynchronous. Everywhere
+   else (a developer's pre-set DSN, a bespoke remote DB, any other
+   self-hosted box with a machine-level loopback DSN, or a DSN this
+   guard cannot prove targets the host it says) drift is only
+   **reported** (a `::warning` under Actions, a plain informational line
+   otherwise) — this guard never mutates a cluster it cannot prove is
+   disposable CI infrastructure. `YUZU_CI_PSQL` is exported to
+   `$GITHUB_ENV` by
    `deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv` (passed only by
    `ci.yml`'s Windows job), read from the same
    `Provision-Windows-Runner.ps1` manifest Assert-Toolchain has just
@@ -1223,18 +1239,34 @@ Resolution order inside the script:
    exact cluster with `SELECT 1` earlier in this same job (vcpkg setup,
    install, configure and build all run in between — minutes, not
    seconds), so a
-   **manifest-vouched per-agent `SELECT 1` failure is retried briefly,
-   then fails the job — it never falls back to the shared agent-0
-   cluster** (that would recreate the #2094 cross-job contention and
-   contaminate the timing determination this guard exists to make
-   legible). Without any `psql` (no `YUZU_CI_PSQL`, none on `PATH`),
-   conformance is **UNVERIFIED** — a warning, not a failure. Assert-
-   Toolchain also prints a read-only, one-line settings fingerprint
-   (`fsync=… synchronous_commit=… full_page_writes=… data_directory=…
-   databases=… active_backends=…`) for **all four** Wee Tam clusters on
-   every Windows job, so a drift is visible in seconds from any job's log
-   instead of surfacing as a 700s `[pg]`-shard `TIMEOUT`. (Test seam:
-   `YUZU_CI_PG_SLEEP_SCALE` scales the guard's two bounded sleeps — 1 in
+   **manifest-vouched `SELECT 1` failure — for agent 0/the base cluster
+   exactly like any further agent — is retried briefly, then fails the
+   job — it never falls back to the shared agent-0 cluster** (that would
+   recreate the #2094 cross-job contention and contaminate the timing
+   determination this guard exists to make legible; a failure names the
+   psql exit code, calling out 126/127 as "psql failed to execute"
+   rather than a cluster fault). Without any `psql` (no `YUZU_CI_PSQL`,
+   none on `PATH`), conformance is **UNVERIFIED** — a warning, not a
+   failure. Assert-Toolchain also prints a read-only, one-line settings
+   fingerprint (`fsync=… synchronous_commit=… full_page_writes=…
+   data_directory=… databases=… active_backends=…`) for every Wee Tam
+   cluster that passes its `SELECT 1` health probe (ordinarily all four)
+   on every Windows job — Cyan `[info]` when all three settings read
+   `off`, Yellow `[warn]` (still never touching the health-gate `$fail`)
+   when any does not — so a drift is visible in seconds from any job's
+   log instead of surfacing as a 700s `[pg]`-shard `TIMEOUT`. Expected
+   values: all three settings `off`; `data_directory` is
+   `D:\ci\pg\agent-<n>` for agents 1-3 and the EDB install's own data
+   root for agent 0; `active_backends` is only meaningful from the job
+   that owns that agent (another job's connections there are foreign
+   load, not drift). The heal runs as the DSN's own role — `yuzu`, seeded
+   `SUPERUSER` by `Provision-Windows-Runner.ps1` — so the minimum grant
+   for a non-superuser role to run it is `ALTER SYSTEM` on the three
+   parameters, `EXECUTE` on `pg_reload_conf()`, and read access to
+   `pg_file_settings`; dropping `-ExportCiEnv` from the Windows job turns
+   off both the heal and the manifest per-agent no-fallback rule (path 1
+   then behaves as it did before this guard). (Test seam:
+   `YUZU_CI_PG_SLEEP_SCALE` scales the guard's bounded sleeps — 1 in
    production, 0 in the docs-suite selftest.)
 2. **Docker** (self-hosted Linux) — idempotent persistent container
    (`docker start` || `docker run --restart unless-stopped`, image pinned
@@ -1287,15 +1319,22 @@ the pg substrate suites (`[pg]`-tagged cases in the server suite)
 consume the DSN and skip cleanly when it is unset — so a runner without
 a database would silently skip that coverage. `exit "$SOFT_EXIT"`
 (= exit 1) is reached on every failure path: Docker container not ready
-in 60 s (path 2), brew cluster not ready (path 3), native-cluster
+in 120 s (path 2), brew cluster not ready (path 3), native-cluster
 credential failure when `psql` is available (path 4), and nothing found
-(path 5) — **plus, since the #2167 follow-up, a manifest-vouched path-1
-per-agent `SELECT 1` failure after retries, a path-1 durability read
-that is unreadable/unparseable, a path-1 heal whose `ALTER SYSTEM`/
-`pg_reload_conf()` fails outright, and a path-1 cluster that stays
-not-off 5s after a heal** (check `pg_settings.source` — a per-role/
-per-database override or a command-line `-c` beats `ALTER SYSTEM`). The
-non-fatal exceptions are: path 4 without `psql` (a TCP probe alone
+(path 5) — **plus, since the #2167 follow-up, on ANY path-1 invocation
+(any pre-set `YUZU_TEST_POSTGRES_DSN`, on any OS, not only Wee Tam's
+Windows jobs): a manifest-vouched `SELECT 1` failure after retries
+(agent 0/the base cluster as well as any further agent), a durability
+read that is unreadable/unparseable, a heal whose `ALTER SYSTEM`/
+`pg_reload_conf()` fails outright (including either in-session
+loopback/target-identity or config-parse check failing closed), a
+cluster that stays not-off 5s after a heal, or a post-heal re-read that
+itself fails to run** (the last two: check `pg_file_settings` and the
+server log first — a `postgresql.conf` parse error means the reload
+applied nothing — then remove the override: an `ImagePath -c`, or
+`ALTER ROLE`/`ALTER DATABASE ... RESET`; a per-role/per-database
+override or a command-line `-c` beats `ALTER SYSTEM`). The non-fatal
+exceptions are: path 4 without `psql` (a TCP probe alone
 produces a `::warning` and still exports the conventional DSN —
 credential **unverified**, wrong credentials then surface as downstream
 `[pg]` test failures; install `psql` on the runner's PATH to get the
@@ -1304,11 +1343,34 @@ authenticated gate instead); path 1 without any `psql` at all
 `YUZU_CI_PSQL` that is set but not executable, which is ignored with a
 `::warning` and the PATH/none ladder continues — with the heal and the
 manifest no-fallback rule OFF for that job; and path-1 drift outside the
-heal bound — a developer's pre-set DSN, a bespoke
-remote DB, or any other self-hosted box the guard cannot prove is
-disposable CI infrastructure — which is only **reported**, never healed
-or failed. Locally the tests still skip when `YUZU_TEST_POSTGRES_DSN` is
-unset; when it is set but unreachable they fail rather than skip.
+heal bound — a developer's pre-set DSN, a bespoke remote DB, a DSN the
+guard cannot PROVE names a loopback host (a query string or more than
+one `@`), a `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` override in the
+job/runner environment, or any other self-hosted box the guard cannot
+prove is disposable CI infrastructure — which is only **reported**,
+never healed or failed. Locally the tests still skip when
+`YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
+fail rather than skip.
+
+**Durability-guard message → meaning → next step (ER-2).** Under GitHub
+Actions the raw psql text behind most of these is deliberately withheld
+(a malformed DSN's password can otherwise echo verbatim into a public
+annotation) — re-run the printed `psql -X -w --dbname=<dsn> ...` form
+yourself on the runner (or in a dev shell against the same DSN, where the
+guard prints it in full) to see it.
+
+| Message | Meaning | Next step |
+|---|---|---|
+| `durability read failed` | The first `pg_settings` read itself failed to connect/authenticate. | Re-run the printed `psql` command on the box; check the service is up and the credential is right. |
+| `durability settings unreadable ... unparseable` | psql connected (rc 0) but the output wasn't 3 clean `name\|setting\|source` rows (e.g. a permission error). | Check the role has `pg_read_all_settings` (or is superuser); re-run the printed command to see the real text. |
+| `... NOT healing (cannot prove the target)` | The DSN has a query string / more than one `@`, or a `PGHOST`-family var is set in the job env — the string can't prove where libpq actually connects. | Use a plain `postgresql://user@host:port/db` DSN with no query string, and don't set `PGHOST`/`PGHOSTADDR`/`PGSERVICE`/`PGPORT` in the job/runner env. |
+| `... NOT healing (heal runs only under GitHub Actions ...)` | Host isn't loopback, or the psql isn't manifest-vouched (`YUZU_CI_PSQL`), or you're outside Actions. | Expected for a developer shell / bespoke remote DB — tune durability by hand if you want it off. |
+| `heal failed on ... (this includes the in-session ... guard)` | Either the `ALTER SYSTEM` sequence itself failed, or one of the two in-session `DO`-block guards (loopback/target identity, or a `pg_file_settings` parse error) raised first. | The printed `ERROR:` line names which — a `yuzu-heal-identity-guard`/`yuzu-heal-config-parse-guard` line names the guard; anything else is a genuine `ALTER SYSTEM` failure (grant/permission). |
+| `could not re-read after heal (psql rc=N)` | The heal itself succeeded, but the bounded re-read afterward couldn't even connect. | Check the service is still up; rc 124/126/127 are timeout/exec-failure, not a settings problem. |
+| `still not durability-off 5s after heal` | The re-read connected and returned rows, but a setting is still not `off`. | Check `pg_file_settings` and the server log first (a parse error means the reload applied nothing); then remove the override — an `ImagePath -c` flag, or `ALTER ROLE`/`ALTER DATABASE ... RESET`. |
+| `per-agent Postgres ... failed 'psql SELECT 1' ... (psql rc=N...)` | The manifest-vouched probe (agent 0/base or any further agent) failed after retries. `psql rc=126/127` means psql itself failed to execute (MSYS2/DLL/permissions), not a database fault. | Check the service / orphaned backends on that port; rc 126/127 points at the psql binary or its DLLs, not Postgres. |
+| `durability conformance UNVERIFIED` | No psql at all (`YUZU_CI_PSQL` unset and none on PATH). | Ensure `-ExportCiEnv` is passed to `Assert-Toolchain.ps1`, or install psql on PATH. |
+| `YUZU_CI_PSQL is set but not executable` | The exported manifest path doesn't resolve/exec. | Re-provision (`deploy/windows/Provision-Windows-Runner.ps1`) or re-run `Assert-Toolchain.ps1 -ExportCiEnv`. |
 
 On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
 pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,
