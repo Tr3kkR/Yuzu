@@ -401,9 +401,9 @@ jobs:
 
       # ── Affected suites (PR-time test selection, docs/ci-architecture.md) ─
       # Which heavy test families can this PR reach (scripts/ci/affected-suites.sh)? Any error
-      # leaves both outputs 'false', so every suite runs. Never on a PR into main, and a
-      # dev/main push never gets here: it runs the full matrix. The verdict is also a
-      # ::notice annotation, which outlives the job log.
+      # leaves both outputs 'false', so every suite runs. Never on a PR opened against main (a
+      # retarget reruns nothing: docs/ci-architecture.md), and a dev/main push runs the full
+      # matrix. The verdict is also a ::notice annotation, which outlives the job log.
       - name: Determine affected test suites (skip families this PR cannot reach)
         id: affected
         if: github.event_name == 'pull_request' && github.base_ref != 'main' && steps.codegate.outputs.code_changed == 'true'

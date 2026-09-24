@@ -179,7 +179,9 @@ The two heavy families are **server** (suites `server-nonpg`, `server-pg` and
 always run. If no path a PR changes can reach a family's build inputs or run-time inputs, its
 results cannot differ from the base's, so the PR run does not spend the minutes: the agent
 unit test alone is ~197 s on Windows, ~170 s on macOS and ~87 s on Linux, and the 12 Postgres
-shards are 5-9 minutes. A PR into `main` (a release or a hotfix) never skips.
+shards are 5-9 minutes. A PR opened against `main` never skips. GitHub does not re-run CI when
+a PR's base changes, so a PR retargeted from dev to main keeps its dev run's checks, skips and
+the docs-only verdict included, until its next push (#4906).
 
 **Where it is decided.** Preflight lists the paths the PR changes from the merge commit the run
 builds (`scripts/ci/pr-changed-paths.sh`: its diff against its first parent), so the list is bound
@@ -259,14 +261,12 @@ scripts/ci/affected-suites.sh` (GNU grep; BSD grep is quadratic in the number of
 skip agent and tar, 5% skip both (docs, skills, ledger, gateway or deploy only), 2% skip server.
 
 **What catches a wrong skip.** The next PR that reaches the skipped family runs it on a merge
-commit that carries the break, so that PR's required checks go red: caught within a PR or two,
-but in someone else's PR. The dev push run is a weak alarm on its own: 84 of the last 100 failed
-(2026-09-14 to 09-24) and nothing reports a red push run (#4902), and a burst of merges can leave
-an intermediate merge without a push run of its own.
-
-**Turning it off.** Revert the change as an ordinary PR (class `both`, so its CI runs
-everything; no ruleset step). Re-run only the latest run of a PR: re-running a superseded run
-joins the PR's concurrency group and cancels the current one.
+commit carrying the break, so that PR's required checks go red: caught within a PR or two, but in
+someone else's PR. The dev push run is a weak alarm on its own: 84 of the last 100 failed
+(2026-09-14 to 09-24), nothing reports a red push run (#4902), and a burst of merges can leave an
+intermediate merge without a push run. **Turning it off:** revert the change as an ordinary PR
+(class `both`, so its CI runs everything). Re-run only a PR's latest run: re-running a superseded
+run joins the PR's concurrency group and cancels the current one.
 
 ### Linux Postgres split across two legs
 
