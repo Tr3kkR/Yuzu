@@ -661,6 +661,68 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     }
 }
 
+// #4734: the shared run_async engine had no length bound on parent_id at
+// all -- an oversized value was copied verbatim into the persisted
+// source_payload's scope_input_id (both producer routes' own
+// payload["scope_input_id"] = ... lines) with no cap, and the request
+// otherwise proceeded through resolve_owned_parent/dispatch. Both producers
+// funnel through the same run_async closure, so one fix covers both -
+// exercised here on both routes to pin that.
+TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on both async "
+          "producers",
+          "[pg][result_set][async][security][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    const std::string big(65, 'p');
+
+    SECTION("from-tar-query") {
+        AsyncHarness h(pool);
+        int status = 0;
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-instruction-result") {
+        AsyncHarness h(pool);
+        auto iid = make_instruction(*h.instr);
+        int status = 0;
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-inventory-query -- a fifth site the #4307 brief didn't name, found "
+            "while verifying the other four: this REST route had no parent_id length "
+            "bound at all (its MCP twin already checks it), so an oversized value was "
+            "copied verbatim into the persisted body[\"scope_input_id\"]") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = nlohmann::json::array(
+            {{{"plugin", "os_info"}, {"field", "platform"}, {"op", "=="}, {"value", "linux"}}});
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+}
+
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
           "[pg][result_set][async][tar]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

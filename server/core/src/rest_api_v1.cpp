@@ -9873,6 +9873,24 @@ void RestApiV1::register_routes(
                        "omit it entirely to dispatch to all agents");
                 return;
             }
+            // #4734: the shape check above only excludes non-string/empty --
+            // a well-formed but oversized parent_id fell straight through to
+            // resolve_owned_parent (almost certainly a 404, since nothing
+            // this long can match a real id/alias) and, on the tar-query/
+            // instruction-result producers, an oversized value was also
+            // copied verbatim into the persisted source_payload's
+            // scope_input_id with no bound at all. Same cap MCP's own
+            // create_result_set_from_tar_query/_instruction_result handlers
+            // already enforce (kResultSetParentIdMaxLen) -- REST never had
+            // the matching check.
+            if (body.contains("parent_id") &&
+                body["parent_id"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                rs_err(res, 400,
+                       std::format("parent_id must be at most {} bytes",
+                                   yuzu::server::mcp::kResultSetParentIdMaxLen));
+                return;
+            }
             std::optional<std::string> parent_id;
             std::string scope_expr;
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
@@ -10230,6 +10248,18 @@ void RestApiV1::register_routes(
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
                 !body["parent_id"].get<std::string>().empty()) {
                 auto pid = body["parent_id"].get<std::string>();
+                // #4734: bound BEFORE the ownership lookup / scope_input_id
+                // copy below, mirroring MCP's create_result_set twin (which
+                // already checks this ahead of its own store gates) - this
+                // REST route had no length bound on parent_id at all, so an
+                // oversized value was copied verbatim into the persisted
+                // source_payload's scope_input_id with no cap.
+                if (pid.size() > yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                    rs_err(res, 400,
+                           std::format("parent_id must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetParentIdMaxLen));
+                    return;
+                }
                 // Owner-check the parent before persisting the lineage edge,
                 // else an operator can parent onto a victim's id and read its
                 // name/source_kind/device_count back via /lineage (review B2).
@@ -10406,6 +10436,20 @@ void RestApiV1::register_routes(
                           rs_err(res, 400,
                                  "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
                                  "parent set; omit it entirely to search all devices");
+                          return;
+                      }
+                      // #4734: bound ahead of the store gates below, mirroring
+                      // MCP's create_result_set_from_inventory_query twin
+                      // (which already checks this at the same point) - this
+                      // REST route had no length bound on parent_id at all,
+                      // so an oversized value was copied verbatim into
+                      // body["scope_input_id"] further down with no cap.
+                      if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                          body["parent_id"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetParentIdMaxLen) {
+                          rs_err(res, 400,
+                                 std::format("parent_id must be at most {} bytes",
+                                             yuzu::server::mcp::kResultSetParentIdMaxLen));
                           return;
                       }
                       if (body.contains("name")) {
