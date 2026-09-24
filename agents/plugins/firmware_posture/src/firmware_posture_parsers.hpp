@@ -9,8 +9,8 @@
  * definitively reports nothing; no failure token, status stays OK), `unreadable` (the read
  * failed; always paired with a failure token and a non-OK status), `unavailable` (the system bus
  * answered and reports the mechanism not installed, e.g. fwupd's ServiceUnknown; not a failure),
- * and `unmodelled=` on fwupd devices (flag bits
- * this mapper does not name). Failure tokens are `<source>:<detail>`.
+ * and `unmodelled=` on fwupd devices (flag bits this mapper does not name). Failure tokens are
+ * `<source>:<detail>`.
  */
 #pragma once
 

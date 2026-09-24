@@ -38,8 +38,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "DMI (containers, some VMs) report the DMI fields absent and a reachable system bus "
          "with no fwupd daemon reports update_pending unavailable: neither is a failure. A "
          "system bus that cannot be opened (a container without the bus socket) reads "
-         "update_pending unreadable with fwupd:bus_open:<errno> and the action CONSTRAINED. The "
-         "populated-DMI shape is not captured from a physical Linux host"},
+         "update_pending unreadable with fwupd:bus_open:<errno> and the action CONSTRAINED (or "
+         "PERMISSION_DENIED when the connect is refused). The populated-DMI shape is not "
+         "captured from a physical Linux host"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "IOKit IORegistryEntryFromPath IODeviceTree:/rom then IODeviceTree:/chosen, "

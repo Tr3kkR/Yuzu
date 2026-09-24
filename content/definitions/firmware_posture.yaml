@@ -13,8 +13,8 @@
 ## data rows) or, only when the action's one exception handler fires,
 ## `constrained|internal_error`. A fact the OS definitively reports as not
 ## present is `absent` (or `unavailable` when the system bus reports fwupd not
-## installed) and is not a failure; `unreadable` is a failed read and always comes with a
-## non-OK result status.
+## installed) and is not a failure; `unreadable` is a failed read and always
+## comes with a non-OK result status.
 
 ---
 apiVersion: yuzu.io/v1alpha1
