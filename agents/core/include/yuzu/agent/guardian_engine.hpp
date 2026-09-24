@@ -233,6 +233,14 @@ public:
     /// genuine repair would (UP-3), and keeps `events_lost` monotonic across
     /// one (UP-4's restart-durability half - see start_local()/stop() below
     /// for the read/final-write sides of this same mechanism).
+    ///
+    /// #4783 Gate 8 re-review: the snapshot/decide/persist/record-gen
+    /// sequence below runs under legacy_sink_persist_mu_ (own doc comment
+    /// near that member) for its ENTIRE span, not just the KV write - stop()'s
+    /// own final persist (see stop()'s doc comment) takes the same lock for
+    /// its own entire span, so the two call sites can never interleave a
+    /// stale snapshot from one against a fresher write from the other. See
+    /// that member's doc comment for the lost-update race this closes.
     void legacy_sink_kick() noexcept;
 
     /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
@@ -587,6 +595,18 @@ public:
         rearm_fault_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
+    /// see that member's own doc comment for the exact firing point and its
+    /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that
+    /// will construct/own the kicker thread, strictly before starting it, so
+    /// the write establishing the std::function is visible to the thread that
+    /// will read it (std::thread's own launch is itself a synchronizes-with
+    /// edge - no additional synchronization needed for the ARMING itself).
+    /// No production caller.
+    void set_legacy_sink_persist_race_hook_for_test(std::function<void()> hook) {
+        legacy_sink_persist_race_hook_for_test_ = std::move(hook);
+    }
+
     /// TEST-ONLY: the exact message logged for the most recent start_local() re-arm
     /// degrade (empty if none occurred this run). Recorded directly at the point of
     /// emission rather than observed via spdlog - a test binary's process-wide
@@ -892,22 +912,77 @@ private:
     /// wired" is distinguishable from "wired and delivered". No production consumer
     /// yet (that is commit 4's heartbeat-tag wiring); read directly in tests.
     std::atomic<std::uint64_t> legacy_sink_dropped_unwired_{0};
+    /// #4783 Gate 8 re-review: serializes the ENTIRE snapshot/decide/persist/
+    /// record-gen sequence in both legacy_sink_kick() and stop()'s final
+    /// persist (see each method's own doc comment) against each other. Fixes
+    /// a lost-update race: legacy_sink_kick() runs off mtx_ on the agent's
+    /// heartbeat thread (by design - it must never contend with a guard
+    /// thread's own reporting or an apply_rules reconcile), while stop() holds
+    /// mtx_ but that guards nothing here - and agent.cpp's own shutdown
+    /// ScopeExit calls guardian_->stop() BEFORE joining the heartbeat thread
+    /// (quiesce_run_workers() - a late in-flight heartbeat tick can still call
+    /// legacy_sink_kick() while stop() is already running). Before this lock
+    /// existed, a CAS on legacy_sink_last_persisted_gen_ alone was NOT
+    /// sufficient: kick() could take a snapshot at generation G1, decide to
+    /// write, then be preempted while stop() runs entirely - taking its own
+    /// later snapshot at G2, writing G2 to KV, and recording G2 - after which
+    /// kick() resumes and unconditionally writes its STALE G1 snapshot,
+    /// physically overwriting the newer KV record with older, less-complete
+    /// data (the two writes are each individually mutex-serialized inside
+    /// KvStore::set(), but nothing fenced kick()'s call to that function
+    /// against running after stop()'s on the OS scheduler's own timing).
+    /// Taking the snapshot itself under this lock (not just gating the write)
+    /// is what closes it: whichever call acquires the lock second always
+    /// takes a FRESH snapshot that already reflects everything the first call
+    /// did, so the second write can never regress the first.
+    ///
+    /// Deliberately NOT mtx_ - reusing that would block a guard thread's own
+    /// reporting or an apply_rules reconcile on a KvStore write, exactly the
+    /// hazard legacy_sink_kick() exists to stay off of (see that method's own
+    /// doc comment); this lock is taken ONLY around the orchestration
+    /// (snapshot + persist + record-gen), never around anything guard-thread-
+    /// reachable.
+    ///
+    /// Lock order: mtx_ -> legacy_sink_persist_mu_ -> {executor's own
+    /// internal `mu`, KvStore's own mutex}. stop() enters at the first level
+    /// (it holds mtx_ for its ENTIRE body, including this persist block - see
+    /// stop()'s own doc comment); legacy_sink_kick() enters at the second
+    /// level directly, never taking mtx_ at all. What keeps this acyclic:
+    /// nothing acquires legacy_sink_persist_mu_ while already holding the
+    /// executor's `mu` or KvStore's own mutex (both are taken NESTED inside
+    /// it, by snapshot()/persist_legacy_sink_loss_ledger() respectively,
+    /// never the reverse), and nothing acquires mtx_ while already holding
+    /// legacy_sink_persist_mu_.
+    std::mutex legacy_sink_persist_mu_;
     /// #4783 Gate 4 UP-3/UP-4: the change_gen (GuardianLegacySinkExecutor::
     /// Snapshot::change_gen) of the loss ledger this engine last successfully
     /// persisted to KvStore - see legacy_sink_kick()'s own doc comment for the
-    /// gate this guards. ATOMIC (not a plain uint64_t) because it is written
-    /// from TWO threads that can genuinely run concurrently with no shared
-    /// lock between them: legacy_sink_kick() runs off mtx_ on the agent's
-    /// heartbeat thread (by design - see that method's own doc comment), while
-    /// stop() holds mtx_ but that guards nothing here, and agent.cpp's own
-    /// shutdown ScopeExit calls guardian_->stop() BEFORE joining the heartbeat
-    /// thread (quiesce_run_workers() - a late in-flight heartbeat tick can
-    /// still call legacy_sink_kick() while stop() is already running). Default
-    /// 0 matches a freshly-constructed (or freshly-restore()'d - restore()
-    /// never touches change_gen) executor's own change_gen default, so the
-    /// first post-boot kick()/stop() does not treat "nothing changed since
-    /// restore()" as something worth a redundant write.
-    std::atomic<std::uint64_t> legacy_sink_last_persisted_gen_{0};
+    /// gate this guards. A PLAIN uint64_t, not atomic: every read and write of
+    /// this field happens under legacy_sink_persist_mu_ above (both call
+    /// sites), which is what actually serializes the two threads that can
+    /// touch it - the atomic this used to be only protected the field itself,
+    /// never the read-modify-decide-write sequence around it (see
+    /// legacy_sink_persist_mu_'s own doc comment for the race that left open).
+    /// Default 0 matches a freshly-constructed (or freshly-restore()'d -
+    /// restore() never touches change_gen) executor's own change_gen default,
+    /// so the first post-boot kick()/stop() does not treat "nothing changed
+    /// since restore()" as something worth a redundant write.
+    std::uint64_t legacy_sink_last_persisted_gen_{0};
+    /// TEST-ONLY (#4783 Gate 8 re-review): if set, invoked from
+    /// legacy_sink_kick()'s persist block AFTER it has taken its snapshot and
+    /// decided a write is needed, but BEFORE it actually calls
+    /// persist_legacy_sink_loss_ledger() - reproducing the exact window the
+    /// lost-update race occupied. CONTRACT: fires with legacy_sink_persist_mu_
+    /// HELD on the calling thread - observe/park only; calling back into
+    /// legacy_sink_kick() or stop() from the hook (directly, or via a
+    /// same-thread call) self-deadlocks (a genuine same-thread std::mutex
+    /// relock - same posture as set_rearm_fault_hook_for_test's CONTRACT
+    /// above). The regression test below instead runs stop() on a SECOND
+    /// thread, which the lock legitimately blocks until the hook releases -
+    /// see test_guardian_engine_legacy_sink.cpp for the full orchestration.
+    /// Set-then-use (arm before starting the kicker thread that will observe
+    /// it); null = no-op, the production default. No production caller.
+    std::function<void()> legacy_sink_persist_race_hook_for_test_;
     /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
     /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums

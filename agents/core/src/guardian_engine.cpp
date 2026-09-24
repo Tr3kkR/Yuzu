@@ -870,12 +870,27 @@ void GuardianEngine::stop() {
     // stop() is reached from the (implicitly noexcept) ~GuardianEngine
     // destructor. kv_ read without mtx_ is safe - see legacy_sink_kick()'s own
     // comment on that; mtx_ IS held here (stop()'s whole body), but that does
-    // not change kv_'s own never-reassigned-after-construction contract.
+    // not change kv_'s own never-reassigned-after-construction contract, and
+    // it is NOT what protects the sequence below (mtx_ guards nothing legacy-
+    // sink-related - see legacy_sink_persist_mu_'s own doc comment).
+    //
+    // #4783 Gate 8 re-review: snapshot + persist + record-gen run under
+    // legacy_sink_persist_mu_ for their ENTIRE span, the same lock
+    // legacy_sink_kick()'s own persist block takes for its entire span - this
+    // is what stops a late in-flight heartbeat kick() (agent.cpp calls
+    // stop() before joining the heartbeat thread - quiesce_run_workers())
+    // from clobbering the fresher write below with a stale snapshot it took
+    // before stop() ran; see legacy_sink_persist_mu_'s doc comment for the
+    // exact race this closes. The lock_guard is taken INSIDE the try, not
+    // outside it: std::mutex::lock() can throw std::system_error, and this
+    // whole path is reached from the (implicitly noexcept) destructor, so an
+    // escape here must be caught, not left to std::terminate.
     if (kv_) {
         try {
+            std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
             const auto snap = legacy_sink_executor_->snapshot();
             if (persist_legacy_sink_loss_ledger(kv_, snap))
-                legacy_sink_last_persisted_gen_.store(snap.change_gen, std::memory_order_relaxed);
+                legacy_sink_last_persisted_gen_ = snap.change_gen;
             else
                 spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger during "
                             "shutdown (change_gen={}) - a restart may see stale (though never "
@@ -1877,12 +1892,31 @@ void GuardianEngine::legacy_sink_kick() noexcept {
     // guardian_persist_baseline's own doc comment gives for reading it off
     // mtx_ from a non-engine thread) - safe to read here without mtx_, which
     // this method deliberately never takes (see its own doc comment).
+    //
+    // #4783 Gate 8 re-review: snapshot + the change_gen decision + persist +
+    // record-gen all run under legacy_sink_persist_mu_ for their ENTIRE span
+    // (lock_guard taken INSIDE the try - std::mutex::lock() can throw, and
+    // this whole method is noexcept), the same lock stop()'s own final
+    // persist takes for its entire span - so the two call sites can never
+    // interleave a stale snapshot from one against a fresher write from the
+    // other. This lock is scoped ONLY to this orchestration, never anything
+    // guard-thread-reachable, so it adds no new blocking dependency for a
+    // guard thread's own reporting or an apply_rules reconcile - see
+    // legacy_sink_persist_mu_'s own doc comment for the full race this closes
+    // and why it is deliberately not mtx_.
     if (kv_) {
         try {
+            std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
             const auto snap = legacy_sink_executor_->snapshot();
-            if (snap.change_gen != legacy_sink_last_persisted_gen_.load(std::memory_order_relaxed)) {
+            if (snap.change_gen != legacy_sink_last_persisted_gen_) {
+                // TEST-ONLY (#4783 Gate 8 re-review): fires here, with the lock
+                // above already held, after the decision to write but before
+                // the write itself - see legacy_sink_persist_race_hook_for_test_'s
+                // own doc comment for the exact race this reproduces.
+                if (legacy_sink_persist_race_hook_for_test_)
+                    legacy_sink_persist_race_hook_for_test_();
                 if (persist_legacy_sink_loss_ledger(kv_, snap)) {
-                    legacy_sink_last_persisted_gen_.store(snap.change_gen, std::memory_order_relaxed);
+                    legacy_sink_last_persisted_gen_ = snap.change_gen;
                 } else {
                     spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger "
                                 "(change_gen={}) - will retry on the next heartbeat kick",

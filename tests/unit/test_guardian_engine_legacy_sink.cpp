@@ -360,6 +360,49 @@ bool run_bounded(F&& op, std::chrono::milliseconds bound, BlockingSink& sink, co
     return yuzu::test::spin_until([&done] { return done.load(std::memory_order_acquire); }, bound);
 }
 
+/// #4783 Gate 8 re-review: a one-shot pause latch for
+/// legacy_sink_persist_race_hook_for_test_ - same entered()/release() shape as
+/// BlockingSink above, but standing in for GuardianEngine's own
+/// legacy_sink_persist_mu_ persist-race seam instead of an EventSink.
+/// wait_entered() lets the orchestrating thread block deterministically until
+/// the hook has actually fired (and, on the fixed engine, until
+/// legacy_sink_persist_mu_ is therefore actually held by the parked thread)
+/// instead of guessing with a fixed sleep.
+class PersistRaceLatch {
+public:
+    void hook() {
+        std::unique_lock lk(mu_);
+        entered_ = true;
+        cv_.notify_all();
+        cv_.wait(lk, [this] { return released_; }); // parks here, holding whatever the
+                                                     // caller held when it invoked us
+    }
+
+    bool wait_entered(std::chrono::milliseconds bound) {
+        return yuzu::test::spin_until(
+            [this] {
+                std::lock_guard lk(mu_);
+                return entered_;
+            },
+            bound);
+    }
+
+    /// One-shot: safe (and a no-op) to call more than once, same as
+    /// BlockingSink::release() above - every cleanup path below calls it
+    /// unconditionally.
+    void release() {
+        std::lock_guard lk(mu_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    bool entered_{false};
+    bool released_{false};
+};
+
 } // namespace
 
 // ── CH-1 L1 (cross-platform): the detached send stalls, never the emitter ───
@@ -1298,6 +1341,274 @@ TEST_CASE("#4783 Gate 4 UP-3: stop() persists a final snapshot even with no prio
         const auto gaps = engine.legacy_sink_executor_for_test().all_gaps_for_test();
         REQUIRE(gaps.size() == 1);
         CHECK(gaps[0].first == "gapped-rule-stop");
+        engine.stop();
+    }
+}
+
+// ── #4783 Gate 8 re-review: legacy_sink_persist_mu_ closes a lost-update ────
+// race between legacy_sink_kick() and stop()'s final persist ───────────────
+
+TEST_CASE("#4783 Gate 8: legacy_sink_kick() paused mid-persist does not clobber a "
+          "fresher write from a concurrent stop() - the lost-update race is closed",
+          "[guardian][engine][legacy_sink]") {
+    // Reproduces the exact interleaving from the Gate 8 finding: kick() takes a
+    // snapshot, decides a write is needed, and is then preempted BEFORE the
+    // actual persist call - while it is parked there, stop() runs its own
+    // final persist to completion against a NEWER executor state. Before
+    // legacy_sink_persist_mu_ existed, kick() would then resume and
+    // unconditionally overwrite the KV record with its now-stale snapshot,
+    // regressing the persisted loss ledger. legacy_sink_persist_race_hook_for_test_
+    // fires at exactly that point (own doc comment in guardian_engine.hpp),
+    // with legacy_sink_persist_mu_ already held on the fixed engine - so a
+    // real second thread (not same-thread re-entry, which would self-deadlock
+    // on the lock; see that hook's own CONTRACT) is required to drive stop()
+    // concurrently, mirroring this file's own PersistRaceLatch/BlockingSink
+    // idiom rather than the reentrant single-thread hook pattern
+    // guardian_outbox_send_executor's tests use (that idiom only works for a
+    // race that occupies a GENUINELY unlocked gap - see PersistRaceLatch's own
+    // doc comment).
+    yuzu::test::TempDbFile db{unique_kv_path()};
+
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-persist-race-test", false);
+        REQUIRE(engine.start_local().has_value());
+        // A real sink is needed WHILE the gaps below are opened -
+        // emit_guard_event() bails before ever reaching offer() (so the
+        // admission fault below would never fire) when no sink is wired yet
+        // (legacy_sink_dropped_unwired_'s own doc comment). Unwired AFTER
+        // both gaps exist (same rationale as the UP-3 restart case above):
+        // isolates the persist path under test from kick()'s own
+        // repair-dispatch loop, which would otherwise try to deliver (and
+        // clear) a gap via a real send.
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+
+        // Open the FIRST gap - this is what the kicker thread's snapshot will
+        // capture and, on a reverted (unfixed) engine, unconditionally write
+        // even after it is stale.
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d1;
+        d1.guard_type = "file";
+        d1.rule_id = "gapped-rule-1";
+        d1.rule_name = "gapped-rule-1";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d1);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+        engine.set_event_sink(nullptr);
+
+        PersistRaceLatch latch;
+        engine.set_legacy_sink_persist_race_hook_for_test([&] { latch.hook(); });
+
+        std::thread kicker;
+        std::thread stopper;
+        std::atomic<bool> kicker_done{false};
+        std::atomic<bool> stopper_done{false};
+        // Exception-safe cleanup (plan hygiene rules 2/3/6, same posture as
+        // require_legacy_sink_retired/run_bounded above): a failing
+        // REQUIRE/CHECK below must not leave the kicker thread parked forever
+        // holding legacy_sink_persist_mu_ (which would also wedge the stopper
+        // thread blocked trying to acquire it, and the whole test binary with
+        // it) - release the latch unconditionally and give both helpers a
+        // generous, bounded chance to finish before aborting the process
+        // (rather than hanging meson's runner).
+        yuzu::test::ScopeExit cleanup([&] {
+            latch.release();
+            // A thread that was never launched (e.g. a REQUIRE fired before
+            // `stopper`'s assignment below) is not joinable and is vacuously
+            // "done" here - only a LAUNCHED-but-still-running helper should
+            // hold up this wait; requiring done unconditionally on a
+            // never-launched thread would spin the full 30s and then
+            // std::abort() the whole binary on an ordinary, already-reported
+            // REQUIRE failure.
+            const bool both_done = yuzu::test::spin_until(
+                [&] {
+                    return (!kicker.joinable() || kicker_done.load(std::memory_order_acquire)) &&
+                           (!stopper.joinable() || stopper_done.load(std::memory_order_acquire));
+                },
+                std::chrono::seconds{30});
+            if (!both_done) {
+                spdlog::critical(
+                    "legacy_sink persist-race cleanup: kicker/stopper did not both "
+                    "complete even after releasing the latch (30s) - aborting rather "
+                    "than hanging the whole test binary (#4783)");
+                std::abort();
+            }
+            if (kicker.joinable())
+                kicker.join();
+            if (stopper.joinable())
+                stopper.join();
+        });
+
+        kicker = std::thread([&] {
+            engine.legacy_sink_kick();
+            kicker_done.store(true, std::memory_order_release);
+        });
+        REQUIRE(latch.wait_entered(std::chrono::seconds{5}));
+
+        // While the kicker is parked (holding legacy_sink_persist_mu_ on the
+        // fixed engine, holding nothing on a reverted one) with its stale
+        // 1-gap snapshot already captured, open a SECOND gap - the executor's
+        // real, current state is now 2 gaps, strictly newer than anything the
+        // kicker already decided to write. Re-wire a sink first (same
+        // "emit_guard_event() bails before offer() on a null sink" rationale
+        // as the first gap above) and unwire it again afterward.
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d2;
+        d2.guard_type = "file";
+        d2.rule_id = "gapped-rule-2";
+        d2.rule_name = "gapped-rule-2";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d2);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 2);
+        engine.set_event_sink(nullptr);
+
+        stopper = std::thread([&] {
+            engine.stop();
+            stopper_done.store(true, std::memory_order_release);
+        });
+
+        // Red-path head start only, deliberately NOT asserted either way: on
+        // the FIXED engine, stop()'s own final persist blocks trying to
+        // acquire legacy_sink_persist_mu_ (the kicker still holds it, parked
+        // in the hook) and this always times out - that is the invariant
+        // under test, not a defect in the wait. On a REVERTED (unfixed)
+        // engine nothing serializes the two, so this generous window gives
+        // stop() every opportunity to run to completion BEFORE the kicker
+        // resumes - faithfully reproducing the production interleaving from
+        // the bug report, where stop() finishes entirely while kick() is
+        // still stuck mid-sequence.
+        (void)yuzu::test::spin_until(
+            [&] { return stopper_done.load(std::memory_order_acquire); },
+            std::chrono::milliseconds{500});
+
+        latch.release();
+
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                return kicker_done.load(std::memory_order_acquire) &&
+                       stopper_done.load(std::memory_order_acquire);
+            },
+            std::chrono::seconds{30}));
+        kicker.join();
+        stopper.join();
+
+        // Read the persisted record DIRECTLY, off the SAME kv handle, right
+        // here - BEFORE `engine` goes out of scope below. Deliberately NOT a
+        // "process 2" restart-and-restore check (contrast the UP-3 restart
+        // case above): ~GuardianEngine() calls stop() again unconditionally
+        // (idempotent per its own doc comment) once this scope ends, and that
+        // SECOND, redundant stop() would perform its own fresh
+        // snapshot+persist of the LIVE in-memory executor state - which the
+        // race above never touched, only the ON-DISK record did - silently
+        // re-repairing the very corruption this test exists to catch before
+        // any later read ever observed it. The regression this closes: on a
+        // reverted (unfixed) engine, the kicker's late, stale write regresses
+        // the persisted ledger back to ONE gap, silently losing
+        // gapped-rule-2 from the record. On the fixed engine, whichever of
+        // the two persists actually lands LAST always does so with a
+        // snapshot taken fresh under legacy_sink_persist_mu_ - reflecting
+        // BOTH gaps regardless of which thread got there first.
+        auto persisted =
+            kv.get_entry(GuardianEngine::kv_namespace(),
+                        GuardianEngine::legacy_sink_loss_ledger_key_for_test());
+        REQUIRE(persisted.has_value());
+        REQUIRE(persisted->has_value());
+        const std::string& raw = **persisted;
+        CHECK(raw.find("gapped-rule-1") != std::string::npos);
+        CHECK(raw.find("gapped-rule-2") != std::string::npos);
+
+        // "Process 1" ends here - engine/kv destruct (~GuardianEngine calls
+        // stop() again; idempotent per its own doc comment, so this is just a
+        // redundant, harmless re-persist of the same already-current
+        // in-memory state - see the comment above for why that makes a
+        // post-destruction read unsuitable as this test's proof).
+    }
+}
+
+TEST_CASE("#4783 Gate 8: legacy_sink_kick() and stop() still both persist correctly "
+          "with no contention - legacy_sink_persist_mu_ does not change the ordinary, "
+          "non-racing case",
+          "[guardian][engine][legacy_sink]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-persist-no-contention-test", false);
+        REQUIRE(engine.start_local().has_value());
+        // Hook left null throughout - proves the null-hook call site (the
+        // production default) is inert. A real sink must be wired WHILE each
+        // gap is opened (emit_guard_event() bails before ever reaching
+        // offer() - and so before the admission fault below could fire - on a
+        // null sink), then unwired before each kick() so its repair-dispatch
+        // loop cannot deliver (and clear) the gap it would otherwise try to
+        // report on.
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d1;
+        d1.guard_type = "file";
+        d1.rule_id = "gapped-rule-a";
+        d1.rule_name = "gapped-rule-a";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d1);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 1);
+        engine.set_event_sink(nullptr);
+
+        // Sequential, uncontended kick(): persists the 1-gap state.
+        engine.legacy_sink_kick();
+
+        engine.set_event_sink(
+            [](const gpb::GuaranteedStateEvent&) { return yuzu::agent::LegacySendOutcome::Sent; });
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::ThrowOnNode);
+        yuzu::agent::GuardDrift d2;
+        d2.guard_type = "file";
+        d2.rule_id = "gapped-rule-b";
+        d2.rule_name = "gapped-rule-b";
+        yuzu::agent::guardian_emit_drift_for_test(engine, d2);
+        engine.legacy_sink_executor_for_test().set_admission_fault_for_test(
+            yuzu::agent::GuardianLegacySinkExecutor::AdmissionFaultForTest::None);
+        REQUIRE(engine.legacy_sink_gap_rules() == 2);
+        engine.set_event_sink(nullptr);
+
+        // A second sequential, uncontended kick(): must persist the CHANGED
+        // (2-gap) state, not silently skip because a prior write already ran.
+        engine.legacy_sink_kick();
+
+        // stop()'s own final persist, still sequential/uncontended: must
+        // match the last real change (still 2 gaps - nothing changed since
+        // the second kick()).
+        engine.stop();
+    }
+
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        GuardianEngine engine(&kv, "agent-persist-no-contention-test", false);
+        REQUIRE(engine.start_local().has_value());
+        CHECK(engine.legacy_sink_gap_rules() == 2);
+        const auto gaps = engine.legacy_sink_executor_for_test().all_gaps_for_test();
+        REQUIRE(gaps.size() == 2);
+        std::vector<std::string> rule_ids;
+        for (const auto& g : gaps)
+            rule_ids.push_back(g.first);
+        std::sort(rule_ids.begin(), rule_ids.end());
+        CHECK(rule_ids == std::vector<std::string>{"gapped-rule-a", "gapped-rule-b"});
         engine.stop();
     }
 }
