@@ -98,9 +98,31 @@ public:
     /// Optional; a null registry makes the counters no-ops.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    // ── Group CRUD (deny-or-benign display class — may stay plain) ───────────
+    // ── Group CRUD (deny-or-benign display class — may stay plain, EXCEPT
+    // get_group: see get_group_checked below) ────────────────────────────
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);
+    /// LEGACY fail-soft: `get_group_checked(id).value_or(std::nullopt)` — a
+    /// store-not-open / pool-acquire-timeout / query-error degrade is
+    /// INDISTINGUISHABLE from "no such group" (both render as `nullopt`).
+    /// The `GET /api/v1/management-groups/{id}` REST route and its MCP twin
+    /// `get_management_group` have both moved to `get_group_checked` (fail
+    /// closed with a retryable 503/error on a degrade, a flat 404 only on a
+    /// genuine not-found); other callers (parent-id validation in
+    /// `create_group`/`update_group`) stay on this fail-soft form
+    /// unchanged — a degraded parent lookup there already refuses the
+    /// mutation via a DIFFERENT check (the "parent group not found" /
+    /// ancestor-walk `nullopt` guards). Prefer `get_group_checked` for any
+    /// NEW code that needs to tell the two apart (#1762 shape).
     std::optional<ManagementGroup> get_group(const std::string& id) const;
+    /// Degrade-distinguishable twin of `get_group()` (#1762): `nullopt` on a
+    /// genuine not-found, `unexpected` on store-not-open / pool-acquire-
+    /// timeout / query-error (each bumps
+    /// `yuzu_server_mgmt_group_read_degrade_total{reason=...}`, matching
+    /// `get_members_checked`/`get_agent_groups` above) so a caller that needs
+    /// to tell "the read failed" apart from "the group does not exist" can
+    /// fail closed (503/retryable) instead of a flat 404.
+    [[nodiscard]] std::expected<std::optional<ManagementGroup>, std::string>
+    get_group_checked(const std::string& id) const;
     std::optional<ManagementGroup> find_group_by_name(const std::string& name) const;
     std::vector<ManagementGroup> list_groups() const;
     std::vector<ManagementGroup> get_children(const std::string& parent_id) const;
@@ -127,9 +149,8 @@ public:
     ///     compliance-check targets dispatched this tick, never a false
     ///     target set) rather than mis-authorizing anyone.
     /// Four further dispatch-TARGETING call sites remain on this fail-soft
-    /// form as KNOWN, DISCLOSED residuals (a follow-up to convert them to
-    /// `get_members_checked` is to be filed — this comment does not itself
-    /// change their behaviour):
+    /// form as KNOWN, DISCLOSED residuals — tracked at #4907 (this comment
+    /// does not itself change their behaviour):
     ///   - `dispatch_scope_ladder.hpp`'s `group_members_fn` closure — the
     ///     shared group-dispatch resolver several confined-dispatch call
     ///     sites wire through — under-reaches to zero on a degrade.
@@ -138,13 +159,18 @@ public:
     ///     zero-reach cause every other unreachable-scope case there does
     ///     (routed-concerns.md's "Dispatch zero-reach cause discrimination"
     ///     row), not a distinguishable "store degraded" report.
-    ///   - `server.cpp`'s `PreflightRoutes` group-cohort resolver (~line
-    ///     17353) — a degrade FREEZES the pre-flight run's cohort at an EMPTY
-    ///     set for that group (the run's targets are resolved once at
-    ///     creation, not re-resolved later), rather than surfacing the read
-    ///     failure to the operator.
-    ///   - `server.cpp`'s Guardian rule-push resolution for a `group:` scope
-    ///     (~line 18739) — a degrade targets NO device for that push; the
+    ///   - The PreflightRoutes cohort resolver lambda (wired in
+    ///     `ServerImpl`'s `PreflightRoutes::register_routes` call, `server.cpp`)
+    ///     — a degrade does NOT freeze an empty cohort; `resolve_targets`
+    ///     resolves to zero targets, so `preflight_routes.cpp`'s run-start
+    ///     handler takes its existing empty-scope branch: it audits
+    ///     `preflight.run`/`no_devices`, answers "No visible devices in that
+    ///     scope.", and creates NO RUN AT ALL — a genuine store degrade is
+    ///     indistinguishable from a genuinely empty/unauthorized scope, and
+    ///     the operator must retry (there is no run to self-heal once the
+    ///     degrade clears).
+    ///   - The Guardian `group:`-scope push resolution in `ServerImpl`
+    ///     (`server.cpp`) — a degrade targets NO device for that push; the
     ///     periodic heartbeat reconcile pass repairs the gap on a later tick,
     ///     so this one is bounded-staleness rather than a permanent miss.
     /// Prefer `get_members_checked` for NEW code, especially anything that

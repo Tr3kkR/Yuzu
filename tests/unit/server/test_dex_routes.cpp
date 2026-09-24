@@ -2969,7 +2969,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(r->status == 200);
         CHECK(r->body.find("Latitude 5420") != std::string::npos);
         CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
-        CHECK(r->body.find("no reporting device carries a model tag this cycle") == std::string::npos);
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") == std::string::npos);
     }
 
     SECTION("model selector: zero reporting devices this cycle -> lists nothing + an "
@@ -2994,7 +2994,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->body.find("name=\"model\"") == std::string::npos); // no selector
-        CHECK(r->body.find("no reporting device carries a model tag this cycle") != std::string::npos);
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") != std::string::npos);
         CHECK(r->body.find("degraded") == std::string::npos);
     }
 
@@ -3011,7 +3011,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(r->status == 200);
         CHECK(r->body.find("App performance data unavailable (not configured or "
                            "degraded) — retry shortly.") != std::string::npos);
-        CHECK(r->body.find("no reporting device carries a model tag this cycle") == std::string::npos);
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") == std::string::npos);
         CHECK(r->body.find("name=\"model\"") == std::string::npos);
     }
 }

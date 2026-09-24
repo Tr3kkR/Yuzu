@@ -3270,6 +3270,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // : std::nullopt` then bails on `!trend`) — so an unguarded call here
         // is safe and an unwired API never reaches this note at all.
         std::vector<std::string> model_values;
+        // dex_perf_api_ is non-null here: every trend branch above returns
+        // the unavailable placeholder when it is null.
         for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
             if (!c.cohort.empty())
                 model_values.push_back(c.cohort);

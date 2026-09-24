@@ -72,9 +72,12 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 /// never renders a claimed "degraded" state. An unwired `DexPerfApi` does NOT
 /// reach this note: the caller (dex_routes.cpp's route handler) returns an
 /// "unavailable" placeholder before ever populating `model_values` in that
-/// case. The empty-list case this note actually covers is devices reporting
-/// with no `model` tag value at all, rendered as "no reporting device carries
-/// a model tag this cycle" rather than a selector. `active_model` mirrors `scope_group_id`'s
+/// case. The empty-list case this note actually covers is NOT uniformly
+/// "devices reporting with no `model` tag value" (governance round-2, G8-2)
+/// — it is equally reached when zero devices report anything this cycle at
+/// all (a genuinely empty fleet snapshot), so the rendered text is
+/// deliberately neutral over both causes: "Model: no device-model values in
+/// the current fleet snapshot." rather than a selector. `active_model` mirrors `scope_group_id`'s
 /// convention (empty = unfiltered). The two scopes are MUTUALLY EXCLUSIVE in
 /// this slice (group takes precedence — see dex_routes.cpp's route handler);
 /// selecting one clears the other via the emitted links so a caller can never

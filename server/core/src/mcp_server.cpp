@@ -792,7 +792,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
     {"get_management_group",
-     "Get one management group's metadata plus its current member list. Mirrors GET "
+     "Get one management group's metadata plus its current member list. #1762 "
+     "(governance round-2): a DEGRADED read of EITHER the group row itself or its "
+     "member list (store closed / pool-acquire timeout / query error) returns a "
+     "retryable error, never a fabricated healthy result — do not conflate that with "
+     "the not-found case (a genuinely nonexistent group_id, no retry hint). Mirrors GET "
      "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
@@ -9865,10 +9869,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_management_group (B4, #2146 API-parity) ───────────────
-            // Mirrors GET /api/v1/management-groups/{id}. get_group's nullopt
-            // collapses "no such group" with "store degraded" (the store API's
-            // own limitation — REST reports both as a flat 404, mirrored here
-            // exactly rather than inventing a distinction REST does not make).
+            // Mirrors GET /api/v1/management-groups/{id}. get_group_checked
+            // (#1762) distinguishes a genuine not-found (404-equivalent) from
+            // a store degrade (a retryable error) — the two are no longer
+            // collapsed.
             if (tool_name == "get_management_group") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
                     res.set_content(
@@ -9902,13 +9906,24 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto g = mgmt_store->get_group(group_id);
+                // get_group_checked (not the fail-soft get_group()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as a flat "group not found" (#1762 shape);
+                // fail closed with a retryable error instead, matching the
+                // REST twin's 503. A genuine not-found still reports
+                // retry-hint-exempt, mirroring REST's flat 404 with no retry
+                // hint.
+                auto g = mgmt_store->get_group_checked(group_id);
                 if (!g) {
-                    // retry-hint-exempt: ManagementGroupStore::get_group's nullopt is a
-                    // genuine "no such group" (its own store-degrade case is
-                    // distinct and much rarer); REST reports the SAME flat 404 with no
-                    // retry hint, so this mirrors it rather than inventing one REST
-                    // does not have.
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*g) {
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
@@ -9935,7 +9950,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // §1 Rule 1).
                 res.set_content(
                     success_response(
-                        id, tool_result(management_group_detail_json(*g, *members), kObjectOutputSchema)),
+                        id, tool_result(management_group_detail_json(**g, *members), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -10048,8 +10063,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto existing = mgmt_store->get_group(group_id);
                 if (!existing) {
-                    // retry-hint-exempt: same collapsed not-found/degrade shape as
-                    // get_management_group above — mirrors REST's flat 404 exactly.
+                    // retry-hint-exempt: this write path stays on the fail-soft
+                    // get_group() (unlike get_management_group above, which
+                    // moved to get_group_checked for #1762) — a collapsed
+                    // not-found/degrade nullopt, mirroring REST's PUT route's
+                    // own flat 404 exactly (also still on get_group()).
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;

@@ -217,9 +217,13 @@ numbers match.
   current heartbeat cycle**, not every model ever tagged; a model with only
   retained historical data (no device of that model currently reporting) is
   omitted from the dropdown but can still be viewed directly by URL
-  (`?model=<value>`). When no device is reporting this cycle (or the
-  read is unavailable), the picker shows an honest "no reporting devices this
-  cycle" note instead of an empty or misleading selector. A **version filter**
+  (`?model=<value>`). When the current fleet snapshot carries no device-model
+  values at all — whether because no device is reporting this cycle, or
+  devices are reporting but none carry a `model` tag — the picker shows an
+  honest "Model: no device-model values in the current fleet snapshot." note
+  instead of an empty or misleading selector (a genuine empty cohort list is
+  never conflated with a degraded read — `fleet_snapshot` has no degrade
+  channel). A **version filter**
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all

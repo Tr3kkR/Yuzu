@@ -46,9 +46,10 @@
 /// to durable storage) — it is orthogonal to the `result` STRING passed in as
 /// an audit-row field, and it is that string's meaning which varies by site:
 ///   * MOST call sites — the dashboard fragments and most fail-closed REST
-///     gates (`dex.device.view`, `dex.signal.view`), AND the MCP
-///     `get_dex_device_app_perf` tool's `dex.device.app_perf.view` row —
-///     audit BEFORE the read with a literal `result="success"`, asserting
+///     gates (`dex.device.view`, `dex.signal.view`), the MCP
+///     `get_dex_device_app_perf` tool's `dex.device.app_perf.view` row, AND
+///     the MCP `list_guardian_events` tool's `dex.device.view` row — audit
+///     BEFORE the read with a literal `result="success"`, asserting
 ///     only that the request was authorised and the read was ATTEMPTED. It
 ///     does **not** assert data was disclosed: a subsequent store-level
 ///     degrade (see `yuzu_server_guardian_read_degrade_total`,
@@ -70,7 +71,12 @@
 ///     convention — the tool response body carries the degrade signal
 ///     instead of the audit row). This is NOT the same posture as
 ///     `get_dex_device_app_perf` above, despite both being MCP DEX
-///     behavioural rows — do not assume the two share an ordering.
+///     behavioural rows — do not assume the two share an ordering. The MCP
+///     `get_dex_device_history` tool's `dex.device.view` row shares this
+///     THIRD posture exactly (audits after `dex_api_->device_history(...)`
+///     runs, with the same constant `"success"`) — two different MCP tools
+///     emitting the same verb under the same post-read-constant-success
+///     convention, not a drift between them.
 ///   * A fourth, surface-specific split on the SAME verb: `guardian.device.
 ///     view` is audited post-read-by-outcome on REST and MCP (bucket two
 ///     above), but the device-page Guardian lens dashboard fragment

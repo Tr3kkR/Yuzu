@@ -102,8 +102,12 @@
 /// uses, so the dashboard picker and the public REST resource can never list
 /// different values. `fleet_snapshot` has no degrade channel (see its own doc
 /// comment), so a genuine empty cohort list is never rendered as a claimed
-/// "degraded" state — it is disclosed as "no reporting device carries a model
-/// tag this cycle" instead. An unwired `dex_perf_api_` does NOT reach this
+/// "degraded" state — it is disclosed as "Model: no device-model values in
+/// the current fleet snapshot." instead, deliberately neutral wording since
+/// the empty case covers BOTH devices reporting with no `model` tag AND zero
+/// devices reporting anything at all this cycle (governance round-2, G8-2 —
+/// the earlier "no reporting device carries a model tag" wording falsely
+/// presupposed reporting devices existed). An unwired `dex_perf_api_` does NOT reach this
 /// code path at all: `DexRoutes`'s route handler returns an "unavailable"
 /// placeholder from its trend fetch before ever calling `fleet_snapshot`
 /// (see `dex_routes.cpp`'s F2a fragment handler).

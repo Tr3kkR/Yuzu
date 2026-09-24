@@ -280,20 +280,41 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
 }
 
 std::optional<ManagementGroup> ManagementGroupStore::get_group(const std::string& id) const {
-    if (!open_)
-        return std::nullopt;
+    return get_group_checked(id).value_or(std::nullopt);
+}
+
+std::expected<std::optional<ManagementGroup>, std::string>
+ManagementGroupStore::get_group_checked(const std::string& id) const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_group_checked: store not open — DEGRADED");
+        return std::unexpected("database not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return std::nullopt;
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::get_group_checked: pool acquire timed out — DEGRADED");
+        return std::unexpected("pool acquire timed out");
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("SELECT ") + kGroupCols +
          " FROM management_group_store.management_groups WHERE id = $1")
             .c_str(),
         std::vector<std::string>{id});
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
-        return std::nullopt;
-    return read_group(r.get(), 0);
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_group_checked: query failed: {} — DEGRADED",
+                         PQerrorMessage(lease.get()));
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
+    if (PQntuples(r.get()) == 0)
+        return std::optional<ManagementGroup>{std::nullopt};
+    return std::optional<ManagementGroup>{read_group(r.get(), 0)};
 }
 
 std::optional<ManagementGroup>

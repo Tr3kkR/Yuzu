@@ -833,7 +833,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
     },
     "/hardware": {
-      "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two; see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
+      "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two (tracked at #4909); see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
     },
     "/hardware/{id}": {
       "get": {"summary": "Hardware CI record (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read via require_fleet_read; an id outside the caller's fleet-read scope collapses to the same 404 as a genuinely nonexistent id (same existence-oracle closure as /devices/{id}). Composes identity + CI blob + installed software + tags into one record — each independently distinguishes degraded from absent. Audited on success as inventory.device.ci; a persist failure on the audit fails the request closed (503).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {identity, ci, software, tags, ci_state}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, or audit subsystem degraded"}}}
@@ -846,7 +846,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Create a management group", "tags": ["Management Groups"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagementGroup"}}}}, "responses": {"201": {"description": "Group created"}}}
     },
     "/management-groups/{id}": {
-      "get": {"summary": "Get a management group with members", "tags": ["Management Groups"], "description": "Member list is read via ManagementGroupStore::get_members_checked (#1762) — a store-not-open / pool-acquire-timeout / query-error degrade fails closed with 503 rather than rendering an authoritative empty members:[] (retry_after_ms 2000).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Management group details"}, "404": {"description": "Group not found"}, "503": {"description": "Management group store read degraded (member resolution failed); retry shortly (A4 envelope, retry_after_ms 2000)."}}},
+      "get": {"summary": "Get a management group with members", "tags": ["Management Groups"], "description": "Both the group row itself AND its member list are read via degrade-distinguishing twins — ManagementGroupStore::get_group_checked and get_members_checked (#1762) — so a store-not-open / pool-acquire-timeout / query-error degrade on EITHER read fails closed with 503 rather than rendering a flat 404 (group-row degrade) or an authoritative empty members:[] (member-list degrade); retry_after_ms 2000 either way. A genuine not-found (the group row does not exist) still 404s.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Management group details"}, "404": {"description": "Group not found"}, "503": {"description": "Management group store read degraded (group-row or member resolution failed); retry shortly (A4 envelope, retry_after_ms 2000)."}}},
       "put": {"summary": "Update a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Group updated"}}},
       "delete": {"summary": "Delete a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Group deleted"}}}
     },
@@ -2580,8 +2580,25 @@ void RestApiV1::register_routes(
                  }
 
                  auto id = req.matches[1].str();
-                 auto g = mgmt_store->get_group(id);
+                 // get_group_checked (not the fail-soft get_group()) — a
+                 // store-not-open / pool-acquire-timeout / query-error degrade
+                 // must not render as a flat "group not found" 404 (#1762
+                 // shape); fail closed with a retryable 503 instead. A
+                 // genuine not-found (the row does not exist) still 404s.
+                 auto g = mgmt_store->get_group_checked(id);
                  if (!g) {
+                     const auto cid = detail::make_correlation_id();
+                     res.set_header("X-Correlation-Id", cid);
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "management group store read degraded", cid,
+                                               /*retry_after_ms=*/2000,
+                                               "the management group store could not be read; "
+                                               "retry shortly"),
+                         "application/json");
+                     return;
+                 }
+                 if (!*g) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "group not found"), "application/json");
                      return;
@@ -2606,7 +2623,7 @@ void RestApiV1::register_routes(
                  // Shared builder (management_group_model.hpp) - the MCP twin
                  // get_management_group calls the SAME function, so the two
                  // JSON shapes cannot drift (docs/api-twin-recipe.md §1 Rule 1).
-                 res.set_content(ok_json(management_group_detail_json(*g, *members)),
+                 res.set_content(ok_json(management_group_detail_json(**g, *members)),
                                  "application/json");
              });
 

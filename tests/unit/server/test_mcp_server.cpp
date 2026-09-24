@@ -19281,6 +19281,55 @@ TEST_CASE("MCP get_management_group: a degraded member read fails closed with a 
     CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultShortRetryMs);
 }
 
+// Governance round-2 (G8-1, #1762): get_management_group used to call the
+// LEGACY fail-soft ManagementGroupStore::get_group(), whose nullopt collapses
+// a store-not-open / pool-acquire-timeout / query-error degrade with a
+// genuine "no such group" — so a degraded GROUP-ROW read (not just the member
+// read the round-1 test above covers) reported the SAME "group not found"
+// error as a genuinely nonexistent id. It now calls get_group_checked() and
+// answers the SAME retryable error the member-degrade case does; a genuine
+// not-found still reports "group not found" unchanged.
+TEST_CASE("MCP get_management_group: a degraded GROUP-ROW read fails closed with a retryable "
+          "error, never a flat not-found (#1762 G8-1)",
+          "[pg][mcp][management_group][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Degrade Tier Group Row";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    // Drop the groups table itself (CASCADE also drops the dependent FK
+    // constraints) so get_group_checked() degrades before the tool ever
+    // reaches get_members_checked().
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(
+            conn.get(), "DROP TABLE management_group_store.management_groups CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5003,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC transport-level 200, error in the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "management group store read degraded");
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultShortRetryMs);
+}
+
 TEST_CASE("MCP update_management_group: happy path renames a group",
           "[mcp][pg][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);

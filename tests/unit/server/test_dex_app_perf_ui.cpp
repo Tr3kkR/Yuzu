@@ -339,7 +339,7 @@ TEST_CASE("render_dex_app_perf_trend: device-model cohort filter — selector, "
         const auto h =
             render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 30, "", {}, "");
         CHECK_FALSE(has(h, "name=\"model\""));
-        CHECK(has(h, "no reporting device carries a model tag this cycle"));
+        CHECK(has(h, "no device-model values in the current fleet snapshot"));
         CHECK_FALSE(has(h, "degraded"));
     }
 

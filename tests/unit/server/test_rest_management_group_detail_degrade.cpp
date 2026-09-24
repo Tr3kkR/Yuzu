@@ -51,6 +51,10 @@ struct GroupDetailHarness {
 
     GroupDetailHarness() {
         REQUIRE(rbac.is_open());
+        // Wire the same metrics registry production does
+        // (server.cpp's `mgmt_group_store_->set_metrics(&metrics_)`) so the
+        // degrade-counter assertions below observe real bumps.
+        mgmt_bundle->set_metrics(&metrics);
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -163,4 +167,54 @@ TEST_CASE("GET /management-groups/{id}: a degraded member read fails closed with
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["message"] == "management group store read degraded");
     CHECK(body["error"]["retry_after_ms"] == 2000);
+}
+
+// Governance round-2 (G8-1, #1762): GET /api/v1/management-groups/{id} used to
+// call the LEGACY fail-soft ManagementGroupStore::get_group(), whose nullopt
+// collapses a store-not-open / pool-acquire-timeout / query-error degrade with
+// a genuine "no such group" — so a degraded GROUP-ROW read (not just the
+// member read the round-1 fix above covers) rendered as a flat 404, hiding a
+// store outage behind "not found". The route now calls get_group_checked()
+// and fails closed with the SAME retryable 503 A4 envelope on a group-row
+// degrade; a genuine not-found still 404s (covered by the store-level test in
+// test_management_group_store.cpp).
+TEST_CASE("GET /management-groups/{id}: a degraded GROUP-ROW read fails closed with a "
+          "retryable 503, never a flat 404 (#1762 G8-1)",
+          "[pg][rest][management_group][degraded]") {
+    GroupDetailHarness h;
+
+    ManagementGroup g;
+    g.name = "degrade-test-group-row";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+
+    // Drop the groups table itself (CASCADE also drops the members/roles FK
+    // constraints that reference it) so get_group_checked() degrades — this
+    // must be reported BEFORE the route ever reaches get_members_checked().
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(
+            conn.get(), "DROP TABLE management_group_store.management_groups CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/api/v1/management-groups/" + gid);
+    REQUIRE(res);
+    // Before this fix: get_group()'s nullopt collapsed "no such group" with
+    // "store degraded" -> a flat 404. After: a retryable 503 A4 envelope.
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "management group store read degraded");
+    CHECK(body["error"]["retry_after_ms"] == 2000);
+    // sre G8-4: the degrade counter bumps on the group-row read path too
+    // (same counter get_members_checked already fed — reason=query_error
+    // here, since the table itself no longer exists).
+    CHECK(h.metrics
+              .counter("yuzu_server_mgmt_group_read_degrade_total",
+                       {{"reason", "query_error"}})
+              .value() >= 1.0);
 }
