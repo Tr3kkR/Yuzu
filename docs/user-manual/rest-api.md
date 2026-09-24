@@ -7735,7 +7735,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
+| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`, at most 256 bytes. Enforced at creation (#4665) — a violation returns `400`, not just documented convention. |
 | `name` | string | Yes | Human-readable name (unique per server). |
 | `spark` | object | Structured | `{type, params}` trigger block, e.g. `{"type":"registry-change"}` or `{"type":"file-change"}`. |
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
@@ -7751,8 +7751,8 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
 
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
-- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+- **4xx:** `400` missing required fields, invalid JSON, a request body nesting deeper than 32 levels (`kMcpMaxJsonDepth`), a `rule_id` that doesn't match `[A-Za-z0-9._-]+` or exceeds 256 bytes (#4665), or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
+- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`; an invalid `rule_id` is audited as `denied` too — #4665).
 - **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
