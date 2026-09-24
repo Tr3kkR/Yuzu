@@ -1580,6 +1580,52 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     auto empty_scope = bad.errored_rule_count(std::vector<std::string>{});
     REQUIRE(empty_scope.has_value());
     CHECK(*empty_scope == 0);
+    // #4855: dex_device_signal_summary_checked is the type-distinguishable
+    // twin — a closed store degrades to std::nullopt, never a silent empty
+    // vector indistinguishable from "no signals" (that indistinguishability
+    // is exactly what fabricated the healthy score-100 bug this twin fixes).
+    CHECK_FALSE(bad.dex_device_signal_summary_checked("a1").has_value());
+    // The plain form stays #2659-style empty-on-degrade (unchanged, byte-
+    // identical to every other DEX/analytics read on a closed store).
+    CHECK(bad.dex_device_signal_summary("a1").empty());
+}
+
+// #4855: dex_device_signal_summary_checked must distinguish a genuine
+// QUERY-LEVEL failure (not just store-not-open above) from "no signals" —
+// dropping the underlying table mid-test (guardian_agent_rule_status's own
+// degrade tests use the identical DROP-TABLE-on-a-second-connection
+// technique) forces exactly that failure mode while the store itself stays
+// open (every OTHER table is intact).
+TEST_CASE("GuaranteedStateStore: dex_device_signal_summary_checked distinguishes a query-level "
+          "degrade from genuinely no signals",
+          "[pg][guaranteed_state_store][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    // Baseline: a real (empty) result is Some(empty), not None — the ONLY
+    // thing this twin exists to distinguish is the degrade case below.
+    {
+        auto ok = store.dex_device_signal_summary_checked("no-such-agent");
+        REQUIRE(ok.has_value());
+        CHECK(ok->empty());
+    }
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto degraded = store.dex_device_signal_summary_checked("no-such-agent");
+    CHECK_FALSE(degraded.has_value());
+    // The plain form still collapses the SAME degrade to empty (#2659
+    // posture, unchanged) — the two forms must read the identical failure
+    // differently ONLY at the type level, not the underlying query.
+    CHECK(store.dex_device_signal_summary("no-such-agent").empty());
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",

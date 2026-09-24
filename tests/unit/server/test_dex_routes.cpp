@@ -918,6 +918,42 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
     CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
 }
 
+// #4855: a degraded per-device signal-summary read must surface a COUNT of
+// devices that could not be scored, never silently thin the great/fair/poor
+// population (which would read as a healthier fleet than is actually known).
+// DROP TABLE forces every connected device's per-device read to degrade
+// while the store itself stays open.
+TEST_CASE("DEX overview: a degraded per-device read counts + surfaces unscored devices, never "
+          "silently thinning the scored population",
+          "[pg][dex][routes][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
+    auto html = render_dex_overview_fragment(&store, "", 7, fleet);
+    CHECK(html.find("2 device(s) could not be scored") != std::string::npos);
+    CHECK(html.find("no devices reporting") != std::string::npos); // the median tile, honest
+
+    // The pure model (build_dex_overview_model) must count the same thing.
+    const auto model = build_dex_overview_model(&store, fleet, "7d", 7, "", nullptr);
+    CHECK(model.unscored == 2);
+    CHECK(model.overall_experience == -1);
+    CHECK(model.great == 0);
+    CHECK(model.fair == 0);
+    CHECK(model.poor == 0);
+    CHECK(dex_overview_json(model).find("\"unscored\":2") != std::string::npos);
+}
+
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
           "[pg][dex][routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);

@@ -1237,11 +1237,12 @@ double dex_family_health_deduction(const DexSignalGroup& g,
     return 0.0;
 }
 
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since) {
-    if (!store)
-        return -1;
-    const auto device_signals = store->dex_device_signal_summary(agent_id, since);
+// The pure scoring formula (#4855 extraction) — everything dex_device_score
+// below did with `device_signals` once it had them, factored out so the ONE
+// checked store read the score builder now performs (closing the #4855 torn
+// read between score + signals) can feed this directly instead of forcing a
+// second read just to get a score.
+int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {
     double total = 0.0;
     for (const auto& fw : dex_family_weights()) {
         const DexSignalGroup* g = nullptr;
@@ -1263,6 +1264,20 @@ int dex_device_score(const GuaranteedStateStore* store, const std::string& agent
         total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
     }
     return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
+}
+
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since) {
+    if (!store)
+        return -1;
+    // #4855: a degraded read must never render as a signal-free, perfectly
+    // healthy device — use the type-distinguishable checked twin and refuse
+    // to score (-1, "unscored") rather than fabricate a 100 from an empty
+    // container indistinguishable from "genuinely no signals".
+    const auto device_signals = store->dex_device_signal_summary_checked(agent_id, since);
+    if (!device_signals)
+        return -1;
+    return dex_score_from_signals(*device_signals);
 }
 
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
@@ -1675,10 +1690,13 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             seg_sum.push_back(0);
             return seg_os.size() - 1;
         };
+        int unscored = 0;
         for (const auto& [id, os] : fleet.connected_agents) {
             const int s = dex_device_score(store, id, since);
-            if (s < 0)
+            if (s < 0) {
+                ++unscored; // #4855: null store OR a degraded per-device read
                 continue;
+            }
             ds.push_back(s);
             const std::size_t i = seg_idx(os.empty() ? std::string("unknown") : os);
             ++seg_n[i];
@@ -1751,6 +1769,12 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                       : "types monitored &middot; " +
                             num(static_cast<int64_t>(cscope.size())) + " platform(s)");
         h += "</div>";
+        // #4855: a degraded per-device read must never silently thin the
+        // scored population -- surface the count so "N great/fair/poor"
+        // reads as "of the devices we could read", not "of the fleet".
+        if (unscored > 0)
+            h += "<div class=\"gp-note\">" + num(unscored) +
+                 " device(s) could not be scored (DEX store read degraded).</div>";
         if (!ds.empty()) {
             auto seg = [](int n, const char* color) {
                 return n <= 0 ? std::string()
