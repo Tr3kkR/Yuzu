@@ -2668,15 +2668,15 @@ void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
+                                FleetReadFn fleet_read_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
                     std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(dex_perf_api), std::move(group_list_fn), std::move(fleet_read_fn),
-                    std::move(tag_values_fn));
+                    std::move(dex_perf_api), std::move(group_list_fn),
+                    std::move(fleet_read_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -2684,7 +2684,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
+                                FleetReadFn fleet_read_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2697,7 +2697,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     dex_perf_api_ = std::move(dex_perf_api);
     fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
-    tag_values_fn_ = std::move(tag_values_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
     // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
@@ -3256,14 +3255,22 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             versions = app_perf_version_summaries(*trend);
         }
-        // GAP-1 (#4857): model-selector values — a narrow, disclosed
-        // presentation-side data dependency OUTSIDE the DexPerfApi seam (see
-        // TagValuesFn's own doc comment). Best-effort: an unwired/degraded
-        // tag_values_fn_ just hides the selector (empty vector), same
-        // convention as an empty `groups` list above; it never blocks render.
-        const std::vector<std::string> model_values =
-            tag_values_fn_ ? tag_values_fn_(kDexDefaultCohortKey).value_or(std::vector<std::string>{})
-                          : std::vector<std::string>{};
+        // GAP-1 CLOSED (#4857, architect D1 ruling): model-selector values now
+        // come from THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`,
+        // via the SAME `dex_perf_cohorts()` helper the public
+        // `GET /api/v1/dex/perf/cohorts` resource uses — the dashboard picker
+        // and that resource read the identical cohort population and can
+        // never drift. The untagged residual (cohort == "") is excluded: it
+        // is not a selectable model value. `fleet_snapshot` has no degrade
+        // channel (dex_perf_api.hpp), so an unwired `dex_perf_api_` and a
+        // genuine zero-reporting-devices cycle collapse to the SAME empty
+        // list — never distinguished, never claimed as a "degrade".
+        std::vector<std::string> model_values;
+        if (dex_perf_api_) {
+            for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
+                if (!c.cohort.empty())
+                    model_values.push_back(c.cohort);
+        }
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version, model_values, model),
                         "text/html; charset=utf-8");

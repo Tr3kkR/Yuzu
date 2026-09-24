@@ -363,6 +363,14 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                  "</option>";
         }
         h += "</select></div>";
+    } else {
+        // #4857 D1: `fleet_snapshot` has no degrade channel, so an unwired
+        // `DexPerfApi` and a genuine zero-reporting-devices cycle collapse to
+        // the SAME empty `model_values` — disclose it honestly rather than
+        // silently omitting the selector (the pre-#4857 `TagValuesFn`
+        // convention this replaces) or claiming a "degraded" state neither
+        // case actually is.
+        h += "<div class=\"gp-note\">Model: no reporting devices this cycle.</div>";
     }
 
     if (versions.empty()) {

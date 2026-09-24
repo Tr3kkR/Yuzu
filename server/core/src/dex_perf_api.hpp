@@ -94,10 +94,16 @@
 /// #4576 completed `DexApi`'s own dashboard deferral. `AppPerfProviders` (the
 /// pre-seam provider bundle) is RETIRED — this seam's `dex_perf_api` instance
 /// is now the SOLE consumer for every surface (REST, MCP, dashboard).
-/// GAP-1: the model-picker's device-tag distinct-values read has NO home in
-/// `DexPerfApi` (no public fleet-wide "distinct tag values" resource exists
-/// yet) — `DexRoutes` carries it as its own standalone, disclosed
-/// `TagValuesFn` outside this seam (see that type's own doc comment).
+/// GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's device-model
+/// scope-selector values are no longer a standalone `DexRoutes::TagValuesFn`
+/// reading `TagStore` outside this seam — `DexRoutes` now derives them from
+/// THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`, via the SAME
+/// `dex_perf_cohorts()` helper the `GET /api/v1/dex/perf/cohorts` resource
+/// uses, so the dashboard picker and the public REST resource can never list
+/// different values. `fleet_snapshot` has no degrade channel (see its own doc
+/// comment) — an unwired `dex_perf_api_` and a genuine zero-reporting-devices
+/// cycle collapse to the same empty cohort list, rendered as one honest note
+/// ("no reporting devices this cycle"), never a claimed "degraded" state.
 /// See `dex_app_perf_builders.hpp`'s banner for why VerifyApi's `.cohort`
 /// input shape specifically is not folded into this seam (a Fable review of
 /// the plan found it dead in production and would drag VerifyApi's types
