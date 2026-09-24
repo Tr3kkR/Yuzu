@@ -98,6 +98,32 @@
  * at kick/fire time is not enough, because the supersession can happen AFTER
  * the repair is already queued and BEFORE it reaches the front.
  *
+ * ADMISSION-TIME EPISODE BINDING (adversarial-review finding, 2026-09-24 - a
+ * residual gap in SEQ-GUARDED CLEARING that DEQUEUE-TIME SUPERSESSION alone
+ * does not close). The caller (GuardianEngine::legacy_sink_kick()) captures a
+ * GapRecord snapshot via gapped_rules_needing_repair() and only builds+offers
+ * the repair event afterwards - an unbounded window in which the SAME rule's
+ * gap can be cleared-and-reopened (or simply accrue a further loss) before
+ * offer()'s is_gap_repair branch ever runs. The original code stamped
+ * `repair_seq` on whatever gap was live for `rule_id` at admission time with no
+ * check that it was still the SAME loss episode the caller captured - so a
+ * stale repair could bind itself to a brand-new gap, and because its own
+ * admission `seq` necessarily postdates that gap's `lost_seq` (offer() always
+ * runs after the episode it is racing against), SEQ-GUARDED CLEARING's
+ * `it.seq > lost_seq` check passed trivially on a later Sent and erased
+ * evidence of a loss the repair never actually observed. `offer()` now takes
+ * an optional `expected_gap_lost_seq`; when present, the admission stamp only
+ * fires if it still equals the CURRENT `GapRecord::lost_seq` (monotonic, so
+ * `==` is exact - a mismatch can only mean the episode moved on, never that it
+ * fell behind). On a mismatch, `repair_seq` is deliberately left untouched
+ * rather than stamped-then-unstamped: DEQUEUE-TIME SUPERSESSION above already
+ * suppresses any item whose seq isn't the rule's live `repair_seq`, so an
+ * unstamped stale repair is caught by that existing machinery for free, with
+ * no new suppression counter needed. `std::nullopt` (the default, used by
+ * every direct test call that does not care about this refinement) preserves
+ * the original unconditional-stamp behavior - only GuardianEngine::
+ * legacy_sink_kick(), the one production caller, supplies a real value.
+ *
  * CORRECTNESS PROPERTIES (each was a specific defect class found in design
  * review of the delivery plan - see the class's own test file for the regression
  * each property guards):
@@ -146,7 +172,13 @@
  * check runs BEFORE `in_flight` is cleared (do NOT copy
  * guardian_outbox_send_executor.hpp's check_stall_locked() verbatim here - it
  * early-returns on `!in_flight`, which would suppress exactly the check this
- * class needs at that point).
+ * class needs at that point). If the throw hit AFTER an item was already
+ * popped off the FIFO but BEFORE account_outcome_locked() ran for it (an
+ * allocation failure between the pop and the send - the identifying fields are
+ * captured immediately after the pop for exactly this reason), the catch ALSO
+ * records a best-effort gap for that item (send_exceptions/events_lost +
+ * record_gap_locked, same chokepoint offer()'s own loss sites use) so it is
+ * never silently dropped uncounted - correctness property 1 holds even here.
  *
  * ORPHAN-EXIT CONTRACT: identical to the sibling executors - a worker wedged in
  * a blocking Write() cannot be joined or force-cancelled. active_worker_count()
@@ -181,6 +213,8 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <new> // std::bad_alloc (test-fault-injection throws below)
+#include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -398,8 +432,14 @@ public:
     /// to RefusedAdmission. `is_gap_repair` marks this offer as a synthesized
     /// repair report for an existing gap (see the class doc comment); it is the
     /// caller's (GuardianEngine::legacy_sink_kick(), guardian_engine.cpp) job to
-    /// build that event, not this class's.
-    [[nodiscard]] OfferOutcome offer(Event ev, SendFn send, bool is_gap_repair = false) noexcept {
+    /// build that event, not this class's. `expected_gap_lost_seq` (only
+    /// meaningful when `is_gap_repair` is true) is the `GapRecord::lost_seq` the
+    /// caller captured when it selected this repair (gapped_rules_needing_repair())
+    /// - see the class doc comment's ADMISSION-TIME EPISODE BINDING section.
+    /// `std::nullopt` preserves the pre-existing unconditional-stamp behavior.
+    [[nodiscard]] OfferOutcome offer(Event ev, SendFn send, bool is_gap_repair = false,
+                                     std::optional<std::uint64_t> expected_gap_lost_seq =
+                                         std::nullopt) noexcept {
         // Declared here (not inside the try) so the catch block below can still
         // use whatever was successfully computed before an exception hit -
         // correctness property 4's "record a best-effort gap" clause.
@@ -490,15 +530,30 @@ public:
                     state_->bytes += bytes;
                     if (is_gap_repair) {
                         if (auto gi = state_->gaps.find(rule_id); gi != state_->gaps.end()) {
-                            gi->second.repair_seq = seq;
-                            // #4783 Gate 4 UP-2: stamp the CURRENT kick round as
-                            // this rule's last repair attempt - see GapRecord's own
-                            // doc comment and gapped_rules_needing_repair()'s
-                            // rotation sort. Read now, under this same lock, so it
-                            // reflects whichever kick() call most recently bumped
-                            // it (or 0 if this offer is racing ahead of the first
-                            // kick() - harmless, it just sorts to the front once).
-                            gi->second.last_attempt_kick = state_->kick_epoch;
+                            // ADMISSION-TIME EPISODE BINDING (class doc comment):
+                            // only bind this repair to the gap - and so only make
+                            // it eligible to clear on a later Sent - if it still
+                            // describes the SAME loss episode the caller captured.
+                            // A mismatch means the episode moved on (a further
+                            // loss, or a clear-and-reopen) since selection; leave
+                            // repair_seq untouched so DEQUEUE-TIME SUPERSESSION
+                            // (worker_loop) suppresses this now-stale item before
+                            // its send() ever runs, instead of letting it bind to
+                            // - and later wrongly clear - a gap it never observed.
+                            if (!expected_gap_lost_seq.has_value() ||
+                                gi->second.lost_seq == *expected_gap_lost_seq) {
+                                gi->second.repair_seq = seq;
+                                // #4783 Gate 4 UP-2: stamp the CURRENT kick round
+                                // as this rule's last repair attempt - see
+                                // GapRecord's own doc comment and
+                                // gapped_rules_needing_repair()'s rotation sort.
+                                // Read now, under this same lock, so it reflects
+                                // whichever kick() call most recently bumped it
+                                // (or 0 if this offer is racing ahead of the first
+                                // kick() - harmless, it just sorts to the front
+                                // once).
+                                gi->second.last_attempt_kick = state_->kick_epoch;
+                            }
                         }
                     }
                 }
@@ -525,11 +580,18 @@ public:
             auto catch_loss_log_level = spdlog::level::off;
             try {
                 std::lock_guard<std::mutex> lk{state_->mu};
-                // This path never reached the locked block above (the throw hit
-                // before or during the pre-lock ticket allocation) - its own seq
-                // comes from the SAME state_->next_seq counter, under this lock,
-                // so ordering stays consistent with the main path regardless of
-                // which branch actually assigns it.
+                // The throw may have hit before the locked block above ever ran
+                // (the pre-lock ticket allocation), OR inside it - ThrowOnNode
+                // throws AFTER the locked block's own seq bump (deliberately, see
+                // that block's own comment), and the capacity-refusal branch's
+                // loss_log_hook std::function copy can also throw there. Either
+                // way this catch's own seq comes from the SAME state_->next_seq
+                // counter, under this lock, so ordering stays consistent with the
+                // main path regardless of which branch actually assigns it - a
+                // throw inside the locked block just means TWO seqs get consumed
+                // for this one offer() call (harmless, see the seq-bump comment
+                // above: numbering gaps are unobservable, only relative order
+                // matters), not that this catch's own bump double-counts anything.
                 const std::uint64_t seq = ++state_->next_seq;
                 ++state_->counters.admission_failures;
                 ++state_->counters.events_lost;
@@ -1163,6 +1225,21 @@ private:
                             std::shared_ptr<AliveTicket> ticket) noexcept {
         const GuardianDetachedWorkerRole role; // first statement
         for (;;) {
+            // #4783 adversarial-review finding, 2026-09-24 (non-blocking, folded
+            // in): identifying fields for whatever item this iteration pops,
+            // captured EARLY (right after the pop, before any later step that
+            // can throw - concretely, the in_flight_rule_id copy-assignment
+            // below) so the outer catch(...) can still record a best-effort gap
+            // for a popped-but-never-accounted item, mirroring offer()'s own
+            // early-extraction discipline. `have_unaccounted_item` is true only
+            // in the narrow window between the pop and account_outcome_locked()
+            // actually running - without this, a throw in that window silently
+            // dropped the item with no loss/gap accounting at all, violating
+            // this class's own correctness property 1 ("every offered event is
+            // delivered exactly once or counted as lost").
+            std::string popped_rule_id, popped_guard_type, popped_rule_name, popped_event_type;
+            std::uint64_t popped_seq = 0;
+            bool have_unaccounted_item = false;
             // Whole-iteration fault boundary: wraps the ENTIRE body, not just the
             // send() call below (which has its own inner try/catch to convert a
             // throw into a counted, accounted outcome rather than an abandoned
@@ -1179,6 +1256,14 @@ private:
                 Item it = std::move(st->queue.front());
                 st->queue.pop_front();
                 st->bytes -= it.bytes;
+
+                // Capture NOW - see this loop's own comment above.
+                popped_rule_id = it.rule_id;
+                popped_guard_type = it.ev.guard_type();
+                popped_rule_name = it.ev.rule_name();
+                popped_event_type = it.ev.event_type();
+                popped_seq = it.seq;
+                have_unaccounted_item = true;
 
                 if (it.gap_repair) {
                     // #4783 follow-up: DEQUEUE-TIME SUPERSESSION - re-validate
@@ -1201,6 +1286,7 @@ private:
                     const auto gi = st->gaps.find(it.rule_id);
                     if (gi == st->gaps.end() || gi->second.repair_seq != it.seq) {
                         ++st->counters.repairs_suppressed;
+                        have_unaccounted_item = false; // never a real report - not a loss
                         lk.unlock();
                         continue;
                     }
@@ -1234,6 +1320,10 @@ private:
                 }
                 const bool recovered = st->stall_logged;
                 const auto loss_level = account_outcome_locked(*st, it, r, threw);
+                // Accounted for now (whatever loss_level came back - Sent/
+                // LinkDown are legitimately spdlog::level::off, not a residual
+                // loss) - see this loop's own comment above.
+                have_unaccounted_item = false;
                 // #4783 Gate 4 UP-4: the test-hook copy, same "under the SAME
                 // lock this call already holds, no extra acquisition" posture
                 // as offer()'s own two loss sites - only bothers copying it
@@ -1258,12 +1348,34 @@ private:
                 }
                 // `it` (and its SendFn copy) destructs here, before `ticket`.
             } catch (...) {
+                auto catch_loss_log_level = spdlog::level::off;
+                LossLogHook catch_loss_hook;
                 try {
                     std::lock_guard<std::mutex> lk{st->mu};
                     ++st->counters.worker_faults;
                     st->in_flight = false;
+                    if (have_unaccounted_item) {
+                        // #4783 adversarial-review finding, 2026-09-24: this
+                        // item was popped off the FIFO but the throw hit before
+                        // account_outcome_locked() ever ran - without this, it
+                        // would be silently dropped with no loss/gap accounting
+                        // at all (correctness property 1's "exactly once or
+                        // counted as lost" is a false statement without it).
+                        // Same chokepoint offer()'s own loss sites use.
+                        ++st->counters.send_exceptions;
+                        ++st->counters.events_lost;
+                        catch_loss_log_level = record_gap_locked(
+                            *st, popped_rule_id, popped_guard_type, popped_rule_name, popped_seq);
+                        if (catch_loss_log_level != spdlog::level::off)
+                            catch_loss_hook = st->loss_log_hook_for_test;
+                    }
                 } catch (...) {
                 }
+                // #4783 Gate 4 UP-4: logged OUTSIDE the lock, same rationale as
+                // every other loss site in this class.
+                if (catch_loss_log_level != spdlog::level::off)
+                    log_loss(popped_rule_id, "SendException", popped_event_type,
+                             catch_loss_log_level, catch_loss_hook);
             }
         }
         // `role`, then `ticket`, destruct after the loop - the ticket's

@@ -1751,7 +1751,8 @@ void GuardianEngine::set_event_sink(EventSink sink) {
 
 void GuardianEngine::emit_guard_event(
     const GuardDrift& d, bool is_gap_repair,
-    std::optional<std::chrono::system_clock::time_point> timestamp_override) {
+    std::optional<std::chrono::system_clock::time_point> timestamp_override,
+    std::optional<std::uint64_t> expected_gap_lost_seq) {
     // Snapshot the sink under sink_mtx_, then release BEFORE handing off to
     // legacy_sink_executor_ (#4783) — never hold the lock any longer than needed,
     // and never take mtx_ here (a guard worker can fire while apply_rules/stop hold
@@ -1848,7 +1849,11 @@ void GuardianEngine::emit_guard_event(
     // `is_gap_repair` (#4783 commit 4) threads straight through: only
     // legacy_sink_kick() ever passes true, for a synthesized guard.unhealthy
     // report rebuilding an existing gap — see that method's own doc comment.
-    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink), is_gap_repair);
+    // `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24) also
+    // threads straight through — see offer()'s own doc comment and the class
+    // doc comment's ADMISSION-TIME EPISODE BINDING section.
+    (void)legacy_sink_executor_->offer(std::move(ev), std::move(sink), is_gap_repair,
+                                       expected_gap_lost_seq);
 }
 
 void GuardianEngine::legacy_sink_kick() noexcept {
@@ -1876,7 +1881,14 @@ void GuardianEngine::legacy_sink_kick() noexcept {
             // #4783 follow-up review, part (c): stamp the repair with the gap's
             // OWN last_lost, not this kick's wall-clock now — see
             // emit_guard_event()'s doc comment in guardian_engine.hpp for why.
-            emit_guard_event(d, /*is_gap_repair=*/true, gap.last_lost);
+            // Adversarial-review finding, 2026-09-24: also pass the gap's OWN
+            // lost_seq (captured in this SAME gapped_rules_needing_repair() call,
+            // above) as expected_gap_lost_seq — see that doc comment and
+            // guardian_legacy_sink_executor.hpp's ADMISSION-TIME EPISODE BINDING
+            // section for why offer() must re-validate this repair still
+            // describes the loss episode captured here, not whatever gap is live
+            // by the time this call actually reaches offer().
+            emit_guard_event(d, /*is_gap_repair=*/true, gap.last_lost, gap.lost_seq);
         }
     } catch (...) {
         // Firewalled: runs on the bare heartbeat thread (agent.cpp) - same posture

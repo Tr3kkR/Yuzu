@@ -896,9 +896,18 @@ private:
     /// executor's own seq-guarded clearing and dequeue-time supersession check —
     /// it lets the server's existing `updated_at >=` upsert guard independently
     /// reject a stale repair, even if it somehow still reached the wire.
+    ///
+    /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded
+    /// straight through to offer()'s own parameter of the same name — see
+    /// guardian_legacy_sink_executor.hpp's ADMISSION-TIME EPISODE BINDING
+    /// section. ONLY legacy_sink_kick() ever passes this, with the
+    /// `GapRecord::lost_seq` it captured from the SAME gapped_rules_needing_repair()
+    /// call that produced `drift`/`timestamp_override` — every real guard
+    /// callsite leaves it at nullopt.
     void emit_guard_event(const GuardDrift& drift, bool is_gap_repair = false,
                           std::optional<std::chrono::system_clock::time_point>
-                              timestamp_override = std::nullopt);
+                              timestamp_override = std::nullopt,
+                          std::optional<std::uint64_t> expected_gap_lost_seq = std::nullopt);
 
     // Test seam: drift emission is otherwise reachable only through an armed
     // guard, and guards are Windows-only / no-op elsewhere — so the event_id

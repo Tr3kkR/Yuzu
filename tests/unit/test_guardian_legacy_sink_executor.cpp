@@ -970,6 +970,92 @@ TEST_CASE("#4783 gap: a repair's own Sent does not clear a loss NEWER than the "
     CHECK(gaps_after[0].second.repair_seq == 0);
 }
 
+TEST_CASE("#4783 adversarial-review finding (2026-09-24): a repair captured for "
+          "an OLD loss episode must not bind to / clear a NEWER gap opened for "
+          "the same rule after selection - ADMISSION-TIME EPISODE BINDING",
+          "[guardian][legacy_sink]") {
+    // Reproduces the reported reachable interleaving directly: kick() selects a
+    // gap for loss L1 via gapped_rules_needing_repair() (capturing lost_seq),
+    // then - before the corresponding offer() ever runs - a real Sent clears
+    // that gap outright, and a fresh loss L2 for the SAME rule reopens it. The
+    // paused kick's repair for L1 only reaches offer() after all of that. Before
+    // the fix, offer()'s is_gap_repair branch stamped repair_seq on whatever gap
+    // was live for the rule_id with no check that it was still L1 - and because
+    // the repair's own admission seq necessarily postdates L2's lost_seq (offer()
+    // always runs after the episode it is racing against), SEQ-GUARDED
+    // CLEARING's `it.seq > lost_seq` check passed trivially on a later Sent and
+    // silently erased L2, a loss the repair never actually observed.
+    GuardianLegacySinkExecutor exec;
+
+    // Episode 1 (L1): open a gap for A.
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // legacy_sink_kick()'s own shape: capture the gap's lost_seq via
+    // gapped_rules_needing_repair() - what a real kick would build the repair
+    // event AND expected_gap_lost_seq from - well BEFORE actually offering it.
+    const auto captured = exec.gapped_rules_needing_repair(10);
+    REQUIRE(captured.size() == 1);
+    REQUIRE(captured[0].first == "A");
+    const auto captured_lost_seq = captured[0].second.lost_seq;
+
+    // Before the captured repair is ever offered: episode 1 resolves for real -
+    // a genuine Sent clears the gap outright.
+    CHECK(exec.offer(make_event("A", "drift.remediated"),
+                     [](const Event&) { return LegacySendOutcome::Sent; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 0; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // Episode 2 (L2): a fresh, unrelated loss for the SAME rule reopens the gap.
+    // Its lost_seq is necessarily a later seq than L1's (State::next_seq is
+    // monotonic across every offer(), admitted or refused, regardless of rule).
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return exec.stats().gap_rules == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+    const auto episode2 = exec.all_gaps_for_test();
+    REQUIRE(episode2.size() == 1);
+    CHECK(episode2[0].second.lost_seq > captured_lost_seq);
+    CHECK(episode2[0].second.repair_seq == 0); // nothing mid-repair yet
+
+    // NOW offer the STALE repair captured back at episode 1, passing the
+    // CAPTURED lost_seq as expected_gap_lost_seq, exactly as a delayed
+    // legacy_sink_kick() call would.
+    RecordingSend stale_repair_send;
+    CHECK(exec.offer(make_event("A", "guard.unhealthy"), std::ref(stale_repair_send),
+                     /*is_gap_repair=*/true, captured_lost_seq) == OfferOutcome::Queued);
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // The stale repair must NEVER have been sent - ADMISSION-TIME EPISODE
+    // BINDING refused to stamp repair_seq (captured_lost_seq no longer matches
+    // the live gap's lost_seq), so DEQUEUE-TIME SUPERSESSION suppressed it
+    // before send() ever ran. Episode 2's gap must still be open, still
+    // describing episode 2's OWN lost_seq - not silently erased by a repair
+    // that never actually observed it.
+    CHECK(stale_repair_send.count() == 0);
+    CHECK(exec.stats().repairs_suppressed == 1);
+    const auto after_stale = exec.all_gaps_for_test();
+    REQUIRE(after_stale.size() == 1);
+    CHECK(after_stale[0].second.lost_seq == episode2[0].second.lost_seq);
+    CHECK(after_stale[0].second.repair_seq == 0);
+
+    // A LIVE (correctly-scoped) repair for episode 2, using ITS OWN lost_seq,
+    // still works normally - the fix refuses only a MISMATCHED episode, not gap
+    // repair in general.
+    RecordingSend live_repair_send;
+    CHECK(exec.offer(make_event("A", "guard.unhealthy"), std::ref(live_repair_send),
+                     /*is_gap_repair=*/true, episode2[0].second.lost_seq) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return live_repair_send.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+    CHECK(exec.stats().gap_rules == 0); // the live repair correctly cleared it
+}
+
 // ── #4783 Gate 4 UP-2: fair, eligibility-filtered gap-repair rotation ───────
 //
 // gapped_rules_needing_repair()'s selection used to be "the first `max` gaps in
