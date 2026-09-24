@@ -664,6 +664,16 @@ inline bool has_passwd_tag(std::string_view s) {
 /// lexing (checked against it differentially); the column is the tag alone (a Defaults
 /// `!authenticate` also removes the password prompt); aliases and includes are not
 /// resolved; and a line sudo itself rejects is reported best-effort.
+/// Output bounds for one user spec. Every clause repeats the User_List in its
+/// subject, so a single grammar-legal 256 KiB line could otherwise expand into
+/// gigabytes of rows (a 128 KiB User_List times ~18K ':'-joined clauses). A
+/// User_List or Host_List longer than kMaxSudoersListBytes, or a line yielding
+/// more than kMaxSudoersLineEntries entries, is not decoded: the caller reports
+/// the line once as `unmodelled` with its raw text, and a NOPASSWD:/PASSWD: tag in
+/// it still trips the undecoded_passwd_tag failure. Output per line stays O(line).
+inline constexpr std::size_t kMaxSudoersListBytes = 4096;
+inline constexpr std::size_t kMaxSudoersLineEntries = 4096;
+
 inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersStatement& st) {
     const auto& t = st.toks;
     const std::string_view text = st.text;
@@ -684,11 +694,13 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
         }
     };
     const auto users = member_list();
-    if (!users) return std::nullopt;
+    if (!users || users->size() > kMaxSudoersListBytes) return std::nullopt;
     std::vector<SudoersEntry> out;
     for (;;) {
         const auto host = member_list();
-        if (!host || !is('=')) return std::nullopt;
+        if (!host || !is('=') || host->size() > kMaxSudoersListBytes ||
+            out.size() >= kMaxSudoersLineEntries)
+            return std::nullopt;
         ++k;
         const std::string subject = *users + "@" + *host;
         std::string runas = "-", nopasswd = "false";
