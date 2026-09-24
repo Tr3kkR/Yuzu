@@ -74,11 +74,13 @@ struct FirmwareRow {
 
 enum class ReadOutcome { ok, absent, denied, failed };
 
-/// POSIX errno numbers as plain integers (stable on Linux and macOS): ENOENT/ENOTDIR = the
-/// file definitively is not there; EACCES/EPERM = refused; anything else failed.
+/// POSIX errno numbers as plain integers (stable on Linux and macOS): ENOENT = the file
+/// definitively is not there; EACCES/EPERM = refused; anything else failed. ENOTDIR is NOT
+/// absence: it means a path component that should be a directory is not one, a malformed
+/// filesystem state, not the OS reporting "nothing here".
 [[nodiscard]] constexpr ReadOutcome classify_errno(int e) noexcept {
     if (e == 0) return ReadOutcome::ok;
-    if (e == 2 || e == 20) return ReadOutcome::absent;  // ENOENT, ENOTDIR
+    if (e == 2) return ReadOutcome::absent;             // ENOENT
     if (e == 1 || e == 13) return ReadOutcome::denied;  // EPERM, EACCES
     return ReadOutcome::failed;
 }
@@ -451,7 +453,10 @@ using WmiRow = std::map<std::string, std::string>; // same type as yuzu::shared:
 enum class FwupdOutcome { unavailable, no_devices, denied, failed };
 
 /// Classifies a failed D-Bus call by error name (empty = the bus itself failed to open, judged
-/// by errno): daemon not installed/activatable = `unavailable` (a state, not a failure),
+/// by errno). `unavailable` (a state, not a failure) is reserved for the two NAMED replies that
+/// prove the daemon is not there (ServiceUnknown / NameHasNoOwner): a missing bus socket only
+/// proves this process cannot reach the bus (a container or namespace without it), never that
+/// fwupd is absent, so an unnamed bus-open failure is `failed` (or `denied` for EACCES/EPERM).
 /// `NothingToDo` = reachable daemon with no devices, a refusal = `denied`, else `failed`.
 [[nodiscard]] inline FwupdOutcome classify_fwupd_error(std::string_view dbus_error_name,
                                                        int err) noexcept {
@@ -462,11 +467,8 @@ enum class FwupdOutcome { unavailable, no_devices, denied, failed };
     if (dbus_error_name == "org.freedesktop.DBus.Error.AccessDenied" ||
         dbus_error_name == "org.freedesktop.fwupd.PermissionDenied")
         return FwupdOutcome::denied;
-    if (dbus_error_name.empty()) { // e.g. a container without the system bus socket
-        const auto o = classify_errno(err);
-        if (o != ReadOutcome::failed && o != ReadOutcome::ok)
-            return o == ReadOutcome::absent ? FwupdOutcome::unavailable : FwupdOutcome::denied;
-    }
+    if (dbus_error_name.empty() && classify_errno(err) == ReadOutcome::denied)
+        return FwupdOutcome::denied;
     return FwupdOutcome::failed;
 }
 

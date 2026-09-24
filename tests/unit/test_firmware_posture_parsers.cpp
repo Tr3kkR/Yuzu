@@ -414,7 +414,7 @@ TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware
     CHECK(classify_hresult(0x80004005u) == ReadOutcome::failed);  // E_FAIL
     CHECK(classify_errno(0) == ReadOutcome::ok);
     CHECK(classify_errno(2) == ReadOutcome::absent);  // ENOENT
-    CHECK(classify_errno(20) == ReadOutcome::absent); // ENOTDIR
+    CHECK(classify_errno(20) == ReadOutcome::failed); // ENOTDIR: a malformed path, never absence
     CHECK(classify_errno(13) == ReadOutcome::denied); // EACCES
     CHECK(classify_errno(1) == ReadOutcome::denied);  // EPERM
     CHECK(classify_errno(5) == ReadOutcome::failed);  // EIO
@@ -423,7 +423,11 @@ TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware
     CHECK(classify_fwupd_error("org.freedesktop.fwupd.NothingToDo", 0) == FwupdOutcome::no_devices);
     CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.AccessDenied", 0) == FwupdOutcome::denied);
     CHECK(classify_fwupd_error("org.freedesktop.fwupd.PermissionDenied", 0) == FwupdOutcome::denied);
-    CHECK(classify_fwupd_error("", 2) == FwupdOutcome::unavailable); // no bus socket
+    // An unopenable bus proves only that this process cannot reach it (a container without the
+    // bus socket), never that fwupd is absent: only the NAMED replies above are `unavailable`.
+    CHECK(classify_fwupd_error("", 2) == FwupdOutcome::failed);  // ENOENT: no bus socket
+    CHECK(classify_fwupd_error("", 20) == FwupdOutcome::failed); // ENOTDIR
+    CHECK(classify_fwupd_error("", 1) == FwupdOutcome::denied);  // EPERM
     CHECK(classify_fwupd_error("", 13) == FwupdOutcome::denied);
     CHECK(classify_fwupd_error("", 5) == FwupdOutcome::failed);
     CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 0) == FwupdOutcome::failed);

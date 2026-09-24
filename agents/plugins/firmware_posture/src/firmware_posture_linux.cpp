@@ -15,8 +15,9 @@
  *           auto|disabled -- the default `enabled` fails configure by design).
  *
  * Failure vs absence (run-context CONTRACT DECISION): a DEFINITIVE not-there
- * (dmi file ENOENT/ENOTDIR, no system bus, fwupd not installed) adds NO
- * failure token. Everything else (EACCES, EIO, oversized, signature mismatch,
+ * (dmi file ENOENT, fwupd's ServiceUnknown/NameHasNoOwner reply) adds NO
+ * failure token. Everything else (EACCES, EIO, ENOTDIR, a system bus that
+ * cannot be opened, oversized, signature mismatch,
  * budget exhausted, unexpected D-Bus error) is recorded through
  * FirmwareReport::fail / note_failure as a `<source>:<cause>` token; a refused
  * read (EACCES/EPERM, AccessDenied) also sets the denial flag. Every
@@ -64,7 +65,7 @@
  * org.freedesktop.fwupd.NothingToDo "Device is not updatable"; an unknown id
  * -> org.freedesktop.fwupd.NotFound; no fwupd on a running bus ->
  * org.freedesktop.DBus.Error.ServiceUnknown; no bus at all -> sd_bus_open_system
- * fails ENOENT. NOT probed on real hardware or as the agent's service user
+ * fails ENOENT (reported as a failed read, not as fwupd being absent). NOT probed on real hardware or as the agent's service user
  * (no such host in this run): an unprivileged caller's polkit outcome is
  * unmeasured, which is exactly why AccessDenied is treated as a refusal (denied).
  */
@@ -182,8 +183,9 @@ void collect_dmi(FirmwareReport& report) {
             report.note_failure(std::string{"dmi:"} + name + ":oversized");
             break;
         case DmiRead::State::error: {
-            // ENOENT/ENOTDIR (no DMI on this platform, or no bios_release on
-            // this board) is a definitive absence: not in the map, no token.
+            // ENOENT (no DMI on this platform, or no bios_release on this
+            // board) is a definitive absence: not in the map, no token. ENOTDIR
+            // is a malformed path, so it falls through to a failure token.
             const ReadOutcome o = classify_errno(r.err);
             if (o == ReadOutcome::absent)
                 break;
@@ -405,8 +407,9 @@ void collect_fwupd(FirmwareReport& report) {
     BusGuard bus;
     const int open_rc = sd_bus_open_system(&bus.bus);
     if (open_rc < 0 || !bus.bus) {
-        // No system bus (ENOENT) classifies as unavailable; anything else is
-        // a real failure. An empty D-Bus name = the failure is an errno.
+        // An unopenable bus proves this process cannot reach it, not that
+        // fwupd is absent: it is a failed read (bus_open:<errno>), never
+        // unavailable. An empty D-Bus name = the failure is an errno.
         handle_fwupd_failure(report, {}, open_rc, "bus_open");
         return;
     }
