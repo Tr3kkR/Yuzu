@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -56,6 +57,57 @@ Event make_event(const std::string& rule_id, const std::string& event_type,
     return ev;
 }
 
+/// A use-after-destruction tripwire for the send functors below (#4783).
+///
+/// EVERY functor in this file is handed to the executor by `std::ref(...)` and
+/// then invoked on a DETACHED worker thread, so it MUST outlive the moment that
+/// worker drains the queue. The way to get this wrong is declaration order: a
+/// functor declared AFTER the `ScopeExit` that releases a blocking send is
+/// destroyed FIRST (reverse declaration order), and that ScopeExit then releases
+/// the worker straight into a dead object.
+///
+/// That mistake was fatal on Windows and SILENT on Linux, for a measured reason
+/// rather than luck of timing: under MSVC's debug STL (`_ITERATOR_DEBUG_LEVEL=2`,
+/// which `buildtype=debug` selects) even an EMPTY std::vector owns one heap block
+/// - its `_Container_proxy` - so the destructor frees real memory, the debug CRT
+/// dead-fills it, and the next `emplace_back` faults (0xC0000005). Under
+/// libstdc++ - and under MSVC's own RELEASE STL - an empty vector owns no
+/// allocation at all, its destructor frees nothing, and the identical
+/// use-after-destruction appears to work. So the only configuration that
+/// reported this bug did so by allocator policy, not by design.
+///
+/// This check restores a loud, deterministic failure on every platform and
+/// buildtype: a destroyed functor's operator() aborts with a specific message
+/// instead of quietly corrupting the heap. `std::abort()` rather than a Catch2
+/// assertion because it fires on a detached worker and Catch2's assertion macros
+/// are not thread-safe. Reading `alive_` after destruction is itself formally UB
+/// - but the storage is a still-live stack slot at that point, so it reads the
+/// value the destructor wrote, which is precisely the signal wanted here.
+struct DestroyedFunctorTripwire {
+    DestroyedFunctorTripwire() = default;
+    ~DestroyedFunctorTripwire() { alive_.store(false, std::memory_order_relaxed); }
+    DestroyedFunctorTripwire(const DestroyedFunctorTripwire&) = delete;
+    DestroyedFunctorTripwire& operator=(const DestroyedFunctorTripwire&) = delete;
+
+    /// Call as the FIRST statement of the owning functor's operator().
+    void check(const char* what) const {
+        if (alive_.load(std::memory_order_relaxed))
+            return;
+        std::fprintf(stderr,
+                     "FATAL: %s::operator() ran AFTER the functor was destroyed. This is a "
+                     "declaration-order bug in this test file: a send functor handed to the "
+                     "executor by std::ref() is invoked on a DETACHED worker, so it must be "
+                     "declared BEFORE (and therefore outlive) the ScopeExit that releases the "
+                     "blocking send and drains the queue.\n",
+                     what);
+        std::fflush(stderr);
+        std::abort();
+    }
+
+private:
+    std::atomic<bool> alive_{true};
+};
+
 /// A send that blocks until release() is called, then returns `result`. Mirrors
 /// test_guardian_outbox_send_executor.cpp's StallingSend.
 struct StallingSend {
@@ -64,8 +116,12 @@ struct StallingSend {
     bool release_flag{false};
     std::atomic<int> invocations{0};
     LegacySendOutcome result{LegacySendOutcome::Sent};
+    /// Declared LAST so it is destroyed FIRST among the members - `alive_` is
+    /// already false by the time any member the send path touches is torn down.
+    DestroyedFunctorTripwire tripwire;
 
     LegacySendOutcome operator()(const Event&) {
+        tripwire.check("StallingSend");
         invocations.fetch_add(1);
         std::unique_lock<std::mutex> lk{mu};
         cv.wait(lk, [&] { return release_flag; });
@@ -86,8 +142,11 @@ struct RecordingSend {
     std::mutex mu;
     std::vector<std::pair<std::string, std::string>> invocations;
     LegacySendOutcome result{LegacySendOutcome::Sent};
+    /// Declared LAST - see StallingSend::tripwire.
+    DestroyedFunctorTripwire tripwire;
 
     LegacySendOutcome operator()(const Event& ev) {
+        tripwire.check("RecordingSend");
         std::lock_guard<std::mutex> lk{mu};
         invocations.emplace_back(ev.rule_id(), ev.event_type());
         return result;
@@ -106,8 +165,11 @@ struct MixedOutcomeSend {
     std::mutex mu;
     std::vector<std::string> invocations;
     std::set<std::string> fail_ids;
+    /// Declared LAST - see StallingSend::tripwire.
+    DestroyedFunctorTripwire tripwire;
 
     LegacySendOutcome operator()(const Event& ev) {
+        tripwire.check("MixedOutcomeSend");
         std::lock_guard<std::mutex> lk{mu};
         invocations.push_back(ev.rule_id());
         return fail_ids.count(ev.rule_id()) ? LegacySendOutcome::WriteFailed
@@ -1109,6 +1171,23 @@ TEST_CASE("#4783 Gate 4 UP-2: the repair cap applies to ELIGIBLE gaps only - 20 
         spin_until([&] { return exec.stats().gap_rules == static_cast<std::size_t>(kRules); }));
     REQUIRE(exec.wait_workers_retired_for_test(5s));
 
+    // DECLARATION ORDER IS LOAD-BEARING (#4783). `repair_send` is handed to the
+    // executor below by std::ref() and, unlike every other test in this file,
+    // the 20 items holding that reference are still QUEUED when this TEST_CASE's
+    // scope exits - nothing here drains them first, because the point of the
+    // test is that they stay mid-repair. `cleanup` then releases the sentinel
+    // and waits for the worker to retire, which drains all 20 through
+    // `repair_send`. So `repair_send` must be declared BEFORE `sentinel`/
+    // `cleanup` in order to be destroyed AFTER them (reverse declaration order).
+    // Declared the other way round it was destroyed first and the worker called
+    // into a dead object - silent on libstdc++, a hard 0xC0000005 on the MSVC
+    // debug STL; see DestroyedFunctorTripwire's own comment for the measured
+    // reason those two platforms disagreed. `cleanup` itself deliberately stays
+    // immediately after `sentinel`, BEFORE the offer() that blocks the worker,
+    // so an early REQUIRE failure still releases a worker parked in cv.wait()
+    // rather than destroying the StallingSend underneath it.
+    RecordingSend repair_send;
+
     // Block the worker so every repair offered below stays queued (mid-repair,
     // repair_seq != 0) for the rest of the test - it must never actually
     // complete, or it would clear its own eligibility state the normal way
@@ -1125,7 +1204,6 @@ TEST_CASE("#4783 Gate 4 UP-2: the repair cap applies to ELIGIBLE gaps only - 20 
     // Queue a repair for the first 20 rules via the normal offer()/is_gap_repair
     // mechanism - each becomes mid-repair (repair_seq != 0) and stays that way,
     // since the sentinel above blocks the worker from ever reaching them.
-    RecordingSend repair_send;
     std::set<std::string> already_mid_repair;
     for (int i = 0; i < kAlreadyMidRepair; ++i) {
         const auto rid = padded_rule_id(i);
