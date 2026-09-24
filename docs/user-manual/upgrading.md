@@ -2800,12 +2800,20 @@ following the documented contract are unaffected. This only changes behaviour fo
 relying on the previously-permissive accept-anything-non-empty behaviour to create a `rule_id`
 outside `[A-Za-z0-9._-]+` or longer than 256 bytes.
 
-**What to do:** **enforcement is create-only, not retroactive.** An existing rule whose `rule_id`
-predates this release and doesn't conform to the charset keeps working exactly as before — it is
-never revalidated, re-rejected, or torn down on upgrade, and the agent still enforces it. You would
-only notice this change if you (or your automation) try to **create a new** rule with a
-non-conforming `rule_id`. If you have such automation, switch it to a conforming id before
-upgrading; there is no flag to restore the old accept-anything behaviour.
+**What to do:** **enforcement at the server is create-only — but the upgraded agent revalidates
+every rule_id on *every* push it receives, not just newly-created ones.** An existing rule whose
+`rule_id` predates this release and doesn't conform to the charset is never torn down and the
+prior enforcement it already established survives on the agent — but the server keeps including
+that row in every future policy push to every agent in its scope, and an upgraded agent rejects
+the **whole push** the moment any one rule in it fails validation (this is deliberate: a partial
+apply that silently dropped just the bad rule while reporting success was the worse failure mode).
+In practice this means: no *new* policy — for any rule, not just the non-conforming one — reaches
+agents in that scope until the offending row is removed. **REST `DELETE
+/guaranteed-state/rules/{rule_id}` cannot remove it** — the route only matches ids of the shape
+`[A-Za-z0-9._-]+`, which a non-conforming id by definition isn't. Use MCP `delete_guardian_rule`
+(no such restriction) or a direct database delete. If you have automation that might have created
+a non-conforming `rule_id` before this release, find and remove it with MCP before upgrading, or
+be ready to do so immediately after if a push starts failing.
 
 ## Upgrade Order
 

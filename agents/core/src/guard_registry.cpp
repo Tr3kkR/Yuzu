@@ -392,23 +392,23 @@ void RegistryGuard::run() try {
                     spdlog::info("Guardian RegistryGuard[{}]: {} {}\\{} [{}] {} -> {} ({}us)",
                                  log_id_token(cfg_.rule_id), d.remediation_action,
                                  log_key_token(cfg_.hive), log_key_token(cfg_.key),
-                                 log_key_token(cfg_.value_name), detected, cfg_.expected,
-                                 d.remediation_latency_us);
+                                 log_key_token(cfg_.value_name), log_key_token(detected),
+                                 log_key_token(cfg_.expected), d.remediation_latency_us);
                 else
                     spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\{} [{}] "
                                  "(detected={}, type={}{})",
                                  log_id_token(cfg_.rule_id), d.remediation_action,
                                  log_key_token(cfg_.hive), log_key_token(cfg_.key),
-                                 log_key_token(cfg_.value_name), detected, cfg_.value_type,
-                                 target.get() ? "" : ", key absent");
+                                 log_key_token(cfg_.value_name), log_key_token(detected),
+                                 cfg_.value_type, target.get() ? "" : ", key absent");
             } else {
                 // Backoff window or Bounded give-up: drift detected + reported (this
                 // event is the alert) but the fix is withheld this cycle.
                 spdlog::info("Guardian RegistryGuard[{}]: drift {}\\{} [{}] detected={} -- "
                              "{}, not remediating",
                              log_id_token(cfg_.rule_id), log_key_token(cfg_.hive),
-                             log_key_token(cfg_.key), log_key_token(cfg_.value_name), detected,
-                             dec.gave_up ? "given up (alert)" : "backing off");
+                             log_key_token(cfg_.key), log_key_token(cfg_.value_name),
+                             log_key_token(detected), dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
         // A successful write-back restored `expected`: the self-write's notify will
@@ -522,7 +522,7 @@ void RegistryGuard::run() try {
 
     spdlog::info("Guardian RegistryGuard[{}]: watching {}\\{} [{}] (expect {}={}) [resilient]",
                  log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key),
-                 cfg_.value_type, log_key_token(cfg_.value_name), cfg_.expected);
+                 cfg_.value_type, log_key_token(cfg_.value_name), log_key_token(cfg_.expected));
 
     reconcile(); // initial compare + initial arm
 

@@ -278,6 +278,42 @@ SENSITIVE_PATTERNS = [
     # -- guardian_engine.cpp.
     Pattern("path={}", "path={}"),
     Pattern("service={}", "service={}"),
+    # guard_registry.cpp's registry assertion VALUES -- operator-authored
+    # `cfg_.expected` (a REG_SZ/REG_EXPAND_SZ value has no charset/format
+    # constraint anywhere on its ingest path -- verified against
+    # guardian_rule_spec.cpp's registry-assertion validator, which checks
+    # only hive/key/value_type) and endpoint-read `detected`. #4665's
+    # Phase-2 adversarial review (CDX-01/K5) found and reproduced these as a
+    # real, previously-unwrapped physical-line forgery sink -- the same
+    # driver-evidence threat model as every other pattern in this list, just
+    # against an assertion datum rather than an identifier. Two shapes:
+    # Scoped to RegistryGuard lines specifically: guard_service.cpp and
+    # guard_systemd.cpp ALSO have "detected={}" text (their own drift/FAILED
+    # lines), but their `detected_value` is a closed-set enum-to-string
+    # mapping (service_state_token()/systemd_state_token(), a handful of
+    # fixed literals -- verified by reading both), not operator-controlled
+    # free text, so those are correctly NOT sensitive and must not be
+    # flagged. Only RegistryGuard's `detected` (a raw REG_SZ/REG_EXPAND_SZ
+    # read-back) is free text.
+    Pattern("detected={}", "detected={}", requires_prefix="Guardian RegistryGuard["),
+    # The "watching ... (expect {}={}) [resilient]" summary line's OWN
+    # value_name+expected pair -- deliberately spans both placeholders in
+    # one pattern (matching this file's own established style for
+    # guardian_push_builder.cpp's "rule {} ('{}')" two-placeholder form),
+    # so a future mutation wrapping only one of the two is still caught.
+    Pattern("(expect {}={})", "(expect {}={})"),
+    # The remediation-outcome ("armed[...] -> detected -> expected (Nus)")
+    # success line has NO distinguishing key=value text around its bare
+    # `detected`/`expected` placeholders -- anchor on the literal suffix
+    # immediately after the value_name bracket instead (verified unique to
+    # this one call site: guard_service.cpp's near-identical remediation
+    # line uses `'{}' {} -> {}`, a single-quote before the arrow, not
+    # `] {} -> {}`, so this text does not collide with it). Deliberately
+    # stops right after the SECOND placeholder's closing brace -- extending
+    # it to include the trailing " ({}us)" text would also span the
+    # NEXT placeholder (d.remediation_latency_us, a plain integer, not
+    # sensitive), wrongly demanding it be wrapped too.
+    Pattern("] {} -> {}", "] {} -> {}"),
 ]
 
 
@@ -469,8 +505,143 @@ def sensitive_placeholder_indices(literal: str) -> dict[int, list[str]]:
     return hits
 
 
+_SAFE_CALL_NAME_RE = re.compile(
+    r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*("
+    + "|".join(re.escape(c.rstrip("(")) for c in ALL_SAFE_CALLS)
+    + r")\("
+)
+
+
+def _is_whole_call_wrapped(text: str) -> bool:
+    """True iff `text`, taken as a WHOLE expression (not a substring match
+    anywhere within it), is a single call to one of ALL_SAFE_CALLS --
+    optionally namespace-qualified, e.g. `::yuzu::log_key_token(w.spark_key)`
+    -- whose parens balance exactly at the end of `text`. `log_id_token(a)`
+    passes; `raw + log_key_token(x)` and `log_id_token(a) + b` do NOT,
+    because the call is not the whole expression, only a substring of it --
+    this is the distinction #4665's Phase-2 adversarial review (CDX-03/K6)
+    found the old substring-any check couldn't make."""
+    text = text.strip()
+    m = _SAFE_CALL_NAME_RE.match(text)
+    if m is None:
+        return False
+    i = m.end()  # just past the opening '(' the regex matched.
+    depth = 1
+    n = len(text)
+    while i < n and depth > 0:
+        c = text[i]
+        if c == '"':
+            i = _skip_string_literal(text, i)
+            continue
+        if c == "'":
+            i = _skip_char_literal(text, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    return depth == 0 and i == n
+
+
+_STD_STRING_CTOR_RE = re.compile(r"^std::string\s*[({]\s*")
+
+
+def _is_fixed_string_literal(text: str) -> bool:
+    """True iff `text` is nothing but a (optionally parenthesised, optionally
+    `std::string{...}`/`std::string("...")`-constructed) double-quoted
+    string literal -- a fixed, non-identifier, non-value-carrying expression.
+    This is the ONE other shape a ternary branch may legitimately take
+    without being wrapped: guardian_spark_runtime.cpp has real examples of
+    both the bare form (`detail.empty() ? "no reason given" :
+    log_key_token(detail)`) and the std::string-constructed form
+    (`rule_id ? log_id_token(*rule_id) : std::string{"<all>"}`) -- neither
+    branch carries operator-authored content, so neither needs a wrap; the
+    OTHER (non-literal) branch of each ternary still must be wrapped."""
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    m = _STD_STRING_CTOR_RE.match(text)
+    if m is not None and text.endswith((")", "}")):
+        text = text[m.end() : -1].strip()
+    return len(text) >= 2 and text[0] == '"' and _skip_string_literal(text, 0) == len(text)
+
+
+def _split_top_level_ternary(text: str) -> tuple[str, str] | None:
+    """If `text` is a `cond ? true_branch : false_branch` expression with the
+    '?' and its matching ':' both at paren/quote depth 0, return
+    (true_branch, false_branch), whitespace-trimmed. Otherwise None. Only the
+    FIRST top-level '?'/':' pair is located; a nested ternary inside either
+    branch is handled by the recursive safety check in argument_is_wrapped,
+    not by this splitter finding it."""
+    depth = 0
+    q_idx = None
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i = _skip_string_literal(text, i)
+            continue
+        if c == "'":
+            i = _skip_char_literal(text, i)
+            continue
+        if text.startswith("::", i):
+            # The C++ scope-resolution operator, not a ternary colon -- a
+            # single ':' inside it (e.g. the first one in `::yuzu::...`)
+            # would otherwise be mistaken for the ternary's own ':' the
+            # moment it appears after the '?', silently mis-splitting every
+            # namespace-qualified true-branch call (::yuzu::log_id_token(...)
+            # is exactly this shape and is real production code).
+            i += 2
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "?" and depth == 0 and q_idx is None:
+            q_idx = i
+        elif c == ":" and depth == 0 and q_idx is not None:
+            return text[q_idx + 1 : i].strip(), text[i + 1 :].strip()
+        i += 1
+    return None
+
+
+def _branch_is_safe(text: str) -> bool:
+    """A ternary branch is safe if it is itself wholly wrapped, a fixed
+    string literal, or (recursively) a nested ternary whose own two branches
+    are each safe by this same rule."""
+    if _is_whole_call_wrapped(text) or _is_fixed_string_literal(text):
+        return True
+    nested = _split_top_level_ternary(text)
+    if nested is not None:
+        return _branch_is_safe(nested[0]) and _branch_is_safe(nested[1])
+    return False
+
+
 def argument_is_wrapped(arg_text: str) -> bool:
-    return any(call in arg_text for call in ALL_SAFE_CALLS)
+    """An argument bound to a sensitive placeholder is safe only if its
+    ENTIRE value-producing expression is wrapped -- not merely if a wrap
+    call's text appears SOMEWHERE within it. The prior "any(call in
+    arg_text ...)" substring-any check silently passed both
+    `cond ? raw_id : log_id_token(raw_id)` and `raw_key + log_key_token(x)`,
+    since each contains a safe-call substring without every value-producing
+    path actually being safe -- confirmed exploitable by #4665's Phase-2
+    adversarial review (CDX-03/K6) via exactly those two constructions.
+    Two shapes are accepted: the whole expression is a single balanced call
+    to a safe helper, or the whole expression is a top-level ternary whose
+    EACH branch is independently safe (wrapped, a fixed string literal, or a
+    nested ternary of the same shape). Anything else -- concatenation, a
+    bare raw identifier/member-access, a ternary with a raw non-literal
+    branch -- is UNSAFE."""
+    text = arg_text.strip()
+    if _is_whole_call_wrapped(text):
+        return True
+    ternary = _split_top_level_ternary(text)
+    if ternary is not None:
+        true_branch, false_branch = ternary
+        return _branch_is_safe(true_branch) and _branch_is_safe(false_branch)
+    return False
 
 
 def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
@@ -556,10 +727,20 @@ def _selfcheck() -> None:
         # a ternary hiding the wrap call inside its own argument slot --
         # guardian_spark_runtime.cpp's real "subscription {} lost" shape.
         'spdlog::warn("Guardian spark: key \'{}\' subscription {} lost ({})", ::yuzu::log_key_token(key), subscription_id, detail.empty() ? "no reason given" : ::yuzu::log_key_token(detail));',
+        # the REAL guardian_spark_runtime.cpp:1730 shape: a std::string{...}-
+        # constructed fixed literal as the ternary's un-wrapped branch, not a
+        # bare quoted string -- must be recognised as safe too.
+        'spdlog::critical("Guardian spark #4508: a wedge candidate survived a withdrawal of rule \'{}\' - the sweep was skipped or reordered", rule_id ? ::yuzu::log_id_token(*rule_id) : std::string{"<all>"});',
         # the REAL guard_registry.cpp:523 shape: the bracket holds value_type
-        # (correctly raw, a closed-set string), value_name is correctly
-        # wrapped one slot later in "(expect {}=" -- the excludes_suffix case.
-        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), cfg_.expected);',
+        # (correctly raw, a closed-set string), value_name AND expected are
+        # both correctly wrapped in "(expect {}={})" -- the excludes_suffix
+        # case (for value_type's bracket) composed with the new
+        # "(expect {}={})" pattern (for value_name+expected).
+        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), log_key_token(cfg_.expected));',
+        # the REAL guard_registry.cpp:392/399/407 success/failure shapes,
+        # fully fixed: detected AND expected both wrapped.
+        'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), log_key_token(cfg_.expected), d.remediation_latency_us);',
+        'spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\\\{} [{}] (detected={}, type={}{})", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), cfg_.value_type, target.get() ? "" : ", key absent");',
     ]
     for src in must_not:
         if flagged(src):
@@ -580,8 +761,27 @@ def _selfcheck() -> None:
         # guard_registry.cpp's 392-style shape (value_name genuinely in the
         # bracket, no "(expect " suffix -- the excludes_suffix condition must
         # NOT blind this pattern to a real regression here): hive/key wrapped,
-        # value_name left raw.
+        # value_name/detected/expected all left raw -- the #4665 Phase-2
+        # adversarial-review (CDX-01/K5) shape, now flagged on THREE
+        # independent grounds (value_name, detected, expected).
         'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_name, detected, cfg_.expected, d.remediation_latency_us);',
+        # the same shape with value_name/hive/key correctly wrapped but
+        # detected/expected left raw -- isolates the NEW patterns from the
+        # pre-existing value_name one (must still be flagged on their own).
+        'spdlog::info("Guardian RegistryGuard[{}]: {} {}\\\\{} [{}] {} -> {} ({}us)", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), detected, cfg_.expected, d.remediation_latency_us);',
+        # the "(expect {}={})" line with only `expected` left raw (value_name
+        # wrapped) -- must still be flagged; the pattern spans both
+        # placeholders precisely so this single-slot mutation isn't missed.
+        'spdlog::info("Guardian RegistryGuard[{}]: watching {}\\\\{} [{}] (expect {}={}) [resilient]", log_id_token(cfg_.rule_id), log_key_token(cfg_.hive), log_key_token(cfg_.key), cfg_.value_type, log_key_token(cfg_.value_name), cfg_.expected);',
+        # intra-argument mutations (CDX-03/K6): a wrap call's TEXT appears
+        # somewhere in the argument slot, but the argument as a WHOLE is not
+        # wrapped -- the exact two constructions the adversarial review used
+        # to prove the old substring-any check was too permissive. Each case
+        # below is otherwise-clean (its only sensitive placeholder is the
+        # mutated one) so the flag is driven purely by the intra-argument
+        # weakness, not a separate already-known-raw argument.
+        'spdlog::error("Guardian: reconcile threw for rule \'{}\' - persisted but not armed", enabled ? rule.rule_id() : log_id_token(rule.rule_id()));',
+        'spdlog::warn("Guardian outbox send stalled (event_id {})", raw_prefix + log_id_token(event_id));',
     ]
     for src in mutations:
         if not flagged(src):

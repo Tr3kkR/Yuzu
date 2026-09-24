@@ -30,6 +30,15 @@ CI job on the same shared runner box (#1871).
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml (merge ref),
 alongside tests/test_no_connless_pq_escape.py.
+
+#4665 Phase-2 adversarial review (CDX-06/K4) found the driver's own F1-F28 `cmd_selftest()` --
+including F27 (PUSH_CMD_RE/T0_FALLBACK_RE anchoring) and F28 (an end-to-end classify_t2()
+legacy-branch forgery regression) -- was reachable only via a manual `fullsync_blackout_diag.py
+selftest` invocation, not exercised by anything in meson or CI; this file's own _selfcheck()
+only ever re-asserted the ARM_LEGACY_RE/T1_RE shapes (F26-equivalent), so a future regression to
+PUSH_CMD_RE matching or classify_t2()'s anchored legacy branch would have gone undetected by
+every automated gate. main() below now also calls the driver's real cmd_selftest() directly (the
+same module already imported for T2_RE, no new machinery) so all 28 fixtures run here too.
 """
 import importlib.util
 import json
@@ -87,6 +96,16 @@ def _selfcheck(driver: types.ModuleType) -> None:
 def main() -> int:
     driver = _load_driver()
     _selfcheck(driver)
+
+    # #4665 CDX-06/K4: run the driver's own full F1-F28 selftest here too, so
+    # F27 (PUSH_CMD_RE/T0_FALLBACK_RE anchoring) and F28 (classify_t2()
+    # end-to-end legacy-branch forgery) get automated coverage in the `docs`
+    # suite/CI, not only via a manual `fullsync_blackout_diag.py selftest`
+    # invocation.
+    if driver.cmd_selftest() != 0:
+        print("FAIL: the driver's own F1-F28 cmd_selftest() reported a failure (see "
+              "[selftest] lines above) -- see the driver's cmd_selftest for which fixture")
+        return 1
 
     fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     expected_line = fixture["expected_line"]
