@@ -1941,6 +1941,14 @@ std::uint64_t GuardianEngine::legacy_sink_gap_rules() const {
     return static_cast<std::uint64_t>(legacy_sink_executor_->stats().gap_rules);
 }
 
+std::uint64_t GuardianEngine::legacy_sink_dropped_unwired() const {
+    // No mtx_: legacy_sink_dropped_unwired_ is a plain atomic member, incremented
+    // directly by emit_guard_event() with no lock - same no-mtx_ rationale as
+    // legacy_sink_events_lost() above, one step simpler since there is no executor
+    // indirection to cross here.
+    return legacy_sink_dropped_unwired_.load();
+}
+
 void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
     assert(!started_ &&
            "set_legacy_sink_max_events_for_test: must be called before start_local()");

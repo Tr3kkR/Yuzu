@@ -405,6 +405,41 @@ private:
 
 } // namespace
 
+// ── #4783 governance follow-up: legacy_sink_dropped_unwired() ───────────────
+
+TEST_CASE("legacy_sink_dropped_unwired(): 0 until a sink is wired, then increments once "
+          "per emit_guard_event() call that runs with no sink - and stays independent of "
+          "events_lost()/gap_rules(), which this drop mode never touches (#4783 "
+          "governance follow-up)",
+          "[guardian][engine][legacy_sink]") {
+    LegacySinkFixture f; // no set_event_sink() call below - the sink stays unwired
+                         // throughout, standing in for the pre-network-arm window
+                         // between start_local() and agent.cpp's post-Subscribe
+                         // set_event_sink() call.
+
+    CHECK(f.engine->legacy_sink_dropped_unwired() == 0);
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "dropped-unwired-rule";
+    d.rule_name = "dropped-unwired-rule";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    CHECK(f.engine->legacy_sink_dropped_unwired() == 1);
+    // This drop mode never reaches legacy_sink_executor_ (emit_guard_event() bails
+    // before ever calling offer()), so it opens no integrity gap and is never
+    // counted by events_lost()/gap_rules() - the whole point of adding a THIRD,
+    // independent counter rather than folding this into an existing one.
+    CHECK(f.engine->legacy_sink_gap_rules() == 0);
+    CHECK(f.engine->legacy_sink_events_lost() == 0);
+
+    // A second unwired call accumulates rather than resetting.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+    CHECK(f.engine->legacy_sink_dropped_unwired() == 2);
+
+    f.engine->stop();
+}
+
 // ── CH-1 L1 (cross-platform): the detached send stalls, never the emitter ───
 
 TEST_CASE("CH-1 L1: a blocking legacy sink stalls the DETACHED SEND, never the emitting "

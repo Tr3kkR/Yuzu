@@ -352,6 +352,15 @@ public:
     /// above.
     [[nodiscard]] std::uint64_t legacy_sink_gap_rules() const;
 
+    /// #4783 governance follow-up: cumulative count of emit_guard_event() calls that
+    /// bailed because no sink was wired yet (see legacy_sink_dropped_unwired_'s own
+    /// doc comment near its declaration below - the pre-network-arm A3 drop, a
+    /// routine window on every agent boot before agent.cpp's post-Subscribe
+    /// set_event_sink call). Surfaced as `yuzu.guardian_legacy_sink_dropped_unwired`
+    /// (sparse). Production accessor, same rationale as legacy_sink_events_lost()
+    /// above.
+    [[nodiscard]] std::uint64_t legacy_sink_dropped_unwired() const;
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     ///
@@ -909,8 +918,10 @@ private:
     /// #4783: count of emit_guard_event() calls that bailed because no sink was wired
     /// yet (event_sink_ null - the pre-network-arm A3 drop, unchanged semantics).
     /// Previously a silent, uncounted return; now countable so "the sink was never
-    /// wired" is distinguishable from "wired and delivered". No production consumer
-    /// yet (that is commit 4's heartbeat-tag wiring); read directly in tests.
+    /// wired" is distinguishable from "wired and delivered". Governance follow-up:
+    /// now wired to a production consumer too - legacy_sink_dropped_unwired() above
+    /// reads it (no lock needed, plain atomic), and agent.cpp's heartbeat surfaces it
+    /// fleet-wide as yuzu_fleet_guardian_legacy_sink_dropped_unwired.
     std::atomic<std::uint64_t> legacy_sink_dropped_unwired_{0};
     /// #4783 Gate 8 re-review: serializes the ENTIRE snapshot/decide/persist/
     /// record-gen sequence in both legacy_sink_kick() and stop()'s final

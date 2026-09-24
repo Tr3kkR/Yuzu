@@ -82,18 +82,40 @@ TEST_CASE("health heartbeat: non-zero legacy-sink gap-rules emits the pinned key
     CHECK(std::string(kGuardianLegacySinkGapRulesTag) == "yuzu.guardian_legacy_sink_gap_rules");
 }
 
-TEST_CASE("health heartbeat: all six counters independent and additive",
+TEST_CASE("health heartbeat: non-zero legacy-sink dropped-unwired emits the pinned key + "
+          "value (#4783 governance follow-up)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_heartbeat_tags(tags,
+                                        GuardianHealthStats{.legacy_sink_dropped_unwired = 8});
+    CHECK(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_legacy_sink_dropped_unwired") == "8");
+    CHECK(std::string(kGuardianLegacySinkDroppedUnwiredTag) ==
+          "yuzu.guardian_legacy_sink_dropped_unwired");
+}
+
+TEST_CASE("health heartbeat: zero legacy-sink dropped-unwired omits the tag (sparse)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_heartbeat_tags(tags,
+                                        GuardianHealthStats{.legacy_sink_dropped_unwired = 0});
+    CHECK(tags.empty());
+}
+
+TEST_CASE("health heartbeat: all seven counters independent and additive",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
     emit_guardian_health_heartbeat_tags(
         tags, GuardianHealthStats{.unhealthy_suppressed = 1, .unhealthy_refreshed = 2,
                                   .priority_demoted = 3, .outbox_backpressure_drops = 4,
-                                  .legacy_sink_events_lost = 5, .legacy_sink_gap_rules = 6});
-    CHECK(tags.size() == 6);
+                                  .legacy_sink_events_lost = 5, .legacy_sink_gap_rules = 6,
+                                  .legacy_sink_dropped_unwired = 7});
+    CHECK(tags.size() == 7);
     CHECK(tags.at("yuzu.guardian_unhealthy_suppressed") == "1");
     CHECK(tags.at("yuzu.guardian_unhealthy_refreshed") == "2");
     CHECK(tags.at("yuzu.guardian_priority_demoted") == "3");
     CHECK(tags.at("yuzu.guardian_outbox_backpressure_drops") == "4");
     CHECK(tags.at("yuzu.guardian_legacy_sink_events_lost") == "5");
     CHECK(tags.at("yuzu.guardian_legacy_sink_gap_rules") == "6");
+    CHECK(tags.at("yuzu.guardian_legacy_sink_dropped_unwired") == "7");
 }

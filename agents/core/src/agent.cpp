@@ -2533,12 +2533,17 @@ public:
                                             guardian_->outbox_backpressure_drops(),
                                         // #4783 commit 4: never gated on prefer_spark_ -
                                         // legacy_sink_executor_ is always live, so these
-                                        // two report truthfully whichever backend is
-                                        // actually enforcing.
+                                        // three report truthfully whichever backend is
+                                        // actually enforcing. legacy_sink_dropped_unwired
+                                        // (governance follow-up) is the third: the
+                                        // pre-network-arm drop, previously counted
+                                        // in-process only with no fleet visibility.
                                         .legacy_sink_events_lost =
                                             guardian_->legacy_sink_events_lost(),
                                         .legacy_sink_gap_rules =
-                                            guardian_->legacy_sink_gap_rules()});
+                                            guardian_->legacy_sink_gap_rules(),
+                                        .legacy_sink_dropped_unwired =
+                                            guardian_->legacy_sink_dropped_unwired()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).
