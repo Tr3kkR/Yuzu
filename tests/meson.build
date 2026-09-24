@@ -262,6 +262,7 @@ agent_test_exe = executable(
     'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
@@ -308,6 +309,7 @@ agent_test_exe = executable(
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
     'unit/test_guardian_outbox_send_executor.cpp',
+    'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_guardian_arm_ack.cpp',

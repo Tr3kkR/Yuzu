@@ -1995,10 +1995,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // all went dark as "fresh forever".
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
-    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - same absent-not-
-    // zero rule and same reason it bites hardest here: the writer is sparse, so a
-    // healthy or inert (prefer_spark off) fleet must see all 3 families ABSENT, never
-    // a fabricated 0.
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // absent-not-zero rule and same reason it bites hardest here: the writer is
+    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
+    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
+    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
