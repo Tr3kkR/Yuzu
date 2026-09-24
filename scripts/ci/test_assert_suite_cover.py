@@ -187,6 +187,30 @@ def test_extra_suite_selected_but_unused_is_fine(failures):
     pass
 
 
+def test_main_forwards_skipped_suites(failures):
+    # main() is what the Windows leg runs; the first real --skipped-suite call is a PR that skips a
+    # family, so drive it here with a stubbed introspection instead of waiting for one.
+    import contextlib
+    import io
+    tests = [_entry("agent unit tests", ["agent"]), _entry("docs lint", ["docs"]),
+             _entry("server shard A", ["server", "server-nonpg"])]
+    real = _mod.introspect_tests
+    _mod.introspect_tests = lambda builddir: tests
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = _mod.main(["--builddir", "b", "--suite", "docs", "--suite", "agent",
+                            "--skipped-suite", "server-nonpg"])
+        check(rc == 0 and "1 skipped as unaffected" in out.getvalue()
+              and "(server-nonpg)" in out.getvalue(),
+              "main(): --skipped-suite reaches the proof and the OK line names it", failures)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _mod.main(["--builddir", "b", "--suite", "docs", "--suite", "agent"])
+        check(rc == 1, "main(): a family neither selected nor skipped still fails", failures)
+    finally:
+        _mod.introspect_tests = real
+
+
 def main():
     failures = []
     test_clean_coverage(failures)
@@ -202,6 +226,7 @@ def main():
     test_skipped_and_selected_conflict(failures)
     test_entry_in_both_excluded_and_skipped_counts_once(failures)
     test_entry_selected_and_skipped_label_is_a_conflict(failures)
+    test_main_forwards_skipped_suites(failures)
 
     if failures:
         print(f"\nassert-suite-cover selftest: {len(failures)} FAILED")
