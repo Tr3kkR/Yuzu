@@ -15,8 +15,8 @@
  *   jvm     usr/lib/jvm/<d>, opt/java/<d>, usr/lib64/jvm/<d> (openSUSE/SLES) and
  *           var/opt/java/<d> (rpm-ostree hosts, where /opt is a symlink to var/opt):
  *           <d>/release (parse_release_file). A home with no `release` file but a
- *           bin/java or jre/bin/java (distro OpenJDK 8 ships none) is reported with
- *           an unknown version and `release_missing`, never dropped.
+ *           bin/java or jre/bin/java (Debian/Ubuntu and RHEL-family OpenJDK 8 packages
+ *           ship none) is reported with an unknown version and `release_missing`.
  *   NOT walked: any other location (an Oracle-RPM /usr/java, tarball installs under
  *   /usr/local or a home directory). "None found" covers the roots above only.
  *
@@ -54,19 +54,24 @@
  * ConstraintAccumulator, shared across every root of an action, so a later
  * successful root never erases an earlier failure.
  *
- * BOUNDED WORK AND MEMORY. kMaxDirEntries per directory; kMaxReleaseBytes per
- * `release` file and kMaxReleaseValueBytes per recognised value; and, across ALL
- * roots and nesting levels of one action, WalkLimits (rows, row bytes, entries
- * visited) -- the per-directory cap alone multiplies with nesting. Exhausting any
- * of them stops the walk with `row_cap`.
+ * BOUNDED WORK AND MEMORY. kMaxDirEntries per directory (`row_cap`, the walk goes
+ * on); kMaxReleaseBytes per `release` file and kMaxReleaseValueBytes per recognised
+ * value (`oversized`, `field_oversized`); and, across ALL roots and nesting levels
+ * of one action, WalkLimits (rows, row bytes, entries visited) -- the per-directory
+ * cap alone multiplies with nesting. Exhausting a WalkLimit stops the walk with
+ * `row_cap`.
  *
  * NETWORK MOUNTS ARE NOT WALKED. An open/getdents on a hard NFS/CIFS/FUSE mount
  * whose server is down blocks in the kernel with no deadline and pins one of the
  * agent's shared command workers. The production leg reads /proc/self/mountinfo
- * (scan_mounts); a candidate root that is on, under or contains a network mount
- * (yuzu::shared::is_network_fstype) is skipped BEFORE any syscall touches it and
- * records `network_fs_skipped`. Residual: a hang on a local-disk-backed path, and
- * a network filesystem type the deny-list does not name.
+ * once, at dispatch start (scan_mounts, streamed: a container host's table runs to
+ * tens of megabytes); a candidate root that is on, under or contains a network
+ * mount (yuzu::shared::is_network_fstype) is skipped BEFORE any syscall touches it
+ * and records `network_fs_skipped`. A healthy network-mounted JDK is skipped too,
+ * and a network-typed `/` skips every candidate. Residuals a plugin cannot close:
+ * a mount that appears after the snapshot, a STACKED filesystem (an overlay,
+ * ecryptfs or loop device over a dead network mount reports its own local type), a
+ * network type the deny-list does not name, and a hang on a local block device.
  */
 #pragma once
 
@@ -126,8 +131,14 @@ inline constexpr std::string_view kTokMountinfoUnreadable = "linux:runtimes:moun
 inline constexpr std::size_t kMaxDirEntries = 16384;
 /// `release` read bound.
 inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
-/// `/proc/self/mountinfo` read bound (a container host lists thousands of mounts).
-inline constexpr std::size_t kMaxMountinfoBytes = 4 * 1024 * 1024;
+/// `/proc/self/mountinfo` is STREAMED, not slurped: procfs reports st_size 0 and a container host's
+/// table runs to tens of megabytes (16k mounts measured at 24.7 MB), so a whole-file cap fails the
+/// guard OPEN on exactly the busiest hosts and a larger one multiplies memory by the command pool.
+/// Bounds: kMountinfoChunk bytes per read, at most kMaxMountinfoLine bytes of one unfinished line
+/// carried between reads (a real line is a few KiB), and a runaway bound on the whole read.
+inline constexpr std::size_t kMountinfoChunk = 64 * 1024;
+inline constexpr std::size_t kMaxMountinfoLine = 64 * 1024;
+inline constexpr std::size_t kMaxMountinfoBytes = 256 * 1024 * 1024;
 
 /// Aggregate bounds for ONE action's walk, shared by every root and nesting level. A real host
 /// holds tens of runtimes; these leave two orders of magnitude of headroom while capping what a
@@ -653,35 +664,76 @@ inline ReadResult read_file_bounded_at(int dirfd, const char* name, std::size_t 
     return r;
 }
 
-/// True iff <home>/bin/java or <home>/jre/bin/java exists (any type, never followed): the
-/// footprint of a JVM home whose installer wrote no `release` file (distro OpenJDK 8 ships none;
-/// RHEL's has only jre/bin/java). Each hop is opened O_NOFOLLOW; an unreadable `bin` or `jre` is
-/// recorded, a symlinked or missing one is not a JVM home's layout and reads as "no".
+/// True iff <home>/bin/java or <home>/jre/bin/java is a regular file or a symlink (never followed):
+/// the footprint of a JVM home whose installer wrote no `release` file (Debian/Ubuntu and
+/// RHEL-family OpenJDK 8; RHEL's has only jre/bin/java). Each hop is opened O_NOFOLLOW. A failed open of `bin`/`jre`
+/// or a failed stat of `java` (other than ENOENT) is recorded, never read as "no java"; a symlinked
+/// `bin`/`jre` is refused visibly (`symlink_refused`) when no binary was found through the other
+/// route; a directory or other special file named `java` is not a JVM.
 inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
-    const auto java_in_bin = [&acc](DIR* dir) {
-        const DirHandle bin = take_or_record(open_child(dir, "bin"), acc);
+    bool alias_seen = false;
+    const auto open_hop = [&](DIR* dir, const char* name) {
+        Opened o = open_child(dir, name);
+        alias_seen = alias_seen || o.status == OpenStatus::alias;
+        return take_or_record(std::move(o), acc);
+    };
+    const auto java_in = [&](DIR* dir) {
+        const DirHandle bin = open_hop(dir, "bin");
         if (!bin) return false;
         struct stat st{};
-        return ::fstatat(::dirfd(bin.get()), "java", &st, AT_SYMLINK_NOFOLLOW) == 0;
+        if (::fstatat(::dirfd(bin.get()), "java", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (const auto tok = stat_errno_token(errno)) acc.add_failure(*tok);
+            return false;
+        }
+        return S_ISREG(st.st_mode) || S_ISLNK(st.st_mode);
     };
-    if (java_in_bin(home)) return true;
-    const DirHandle jre = take_or_record(open_child(home, "jre"), acc);
-    return jre && java_in_bin(jre.get());
+    if (java_in(home)) return true;
+    const DirHandle jre = open_hop(home, "jre");
+    if (jre && java_in(jre.get())) return true;
+    if (alias_seen) acc.add_failure(kTokSymlinkRefused);
+    return false;
 }
 
 /// The mount table at `path` (production: /proc/self/mountinfo) reduced to its network mount
-/// points. `ok` is false when it cannot be read (absent, refused, oversized): the caller then
-/// walks unguarded and records `mountinfo_unreadable`.
+/// points, streamed line-wise (see kMountinfoChunk). `ok` is false when it cannot be read in full
+/// (absent, refused, not a regular file, an I/O error, a line over kMaxMountinfoLine, more than
+/// `max_total` bytes): the caller then records `mountinfo_unreadable`, and the walk runs guarded
+/// only by the mounts found before the failure.
 struct MountScan {
     std::vector<std::string> network_mounts;
     bool ok = false;
 };
 
-inline MountScan scan_mounts(const char* path) {
+inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMountinfoBytes) {
     MountScan s;
-    const auto r = read_file_bounded_at(AT_FDCWD, path, kMaxMountinfoBytes);
-    if (r.status != ReadStatus::ok) return s;
-    s.network_mounts = network_mount_points(r.text);
+    const int fd = ::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return s;
+    const yuzu::agent::ScopedFd guard{fd};
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return s;
+    const auto take = [&s](std::string_view lines) {
+        for (auto& m : network_mount_points(lines)) s.network_mounts.push_back(std::move(m));
+    };
+    std::string chunk(kMountinfoChunk, '\0');
+    std::string pending; // the unfinished last line of what has been read so far
+    std::size_t total = 0;
+    for (;;) {
+        const ssize_t n = ::read(fd, chunk.data(), chunk.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return s;
+        }
+        if (n == 0) break;
+        total += static_cast<std::size_t>(n);
+        if (total > max_total) return s;
+        pending.append(chunk.data(), static_cast<std::size_t>(n));
+        if (const auto nl = pending.rfind('\n'); nl != std::string::npos) {
+            take(std::string_view{pending}.substr(0, nl + 1));
+            pending.erase(0, nl + 1);
+        }
+        if (pending.size() > kMaxMountinfoLine) return s;
+    }
+    take(pending);
     s.ok = true;
     return s;
 }
@@ -739,7 +791,7 @@ inline MountScan scan_mounts(const char* path) {
 
 /// jvm: <root>/{usr/lib/jvm,opt/java,usr/lib64/jvm,var/opt/java}/<d>/release. A directory with
 /// neither a `release` file nor a bin/java or jre/bin/java is not a JVM home (silent); one with a
-/// java binary but no `release` (distro OpenJDK 8) is a row with an unknown version plus
+/// java binary but no `release` (e.g. Debian/Ubuntu OpenJDK 8) is a row with an unknown version plus
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
 /// Symlinked homes are aliases.
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
@@ -799,9 +851,10 @@ inline MountScan scan_mounts(const char* path) {
 }
 
 /// Production's WalkConfig: the default bounds plus the network mount points read from
-/// /proc/self/mountinfo (`mountinfo_unreadable` when it cannot be read).
-[[nodiscard]] inline WalkConfig production_config() {
-    auto scan = walk::scan_mounts("/proc/self/mountinfo");
+/// /proc/self/mountinfo (`mountinfo_unreadable` when it cannot be read). The path is a parameter
+/// so the unit suite can point it at a fixture.
+[[nodiscard]] inline WalkConfig production_config(const char* mountinfo_path = "/proc/self/mountinfo") {
+    auto scan = walk::scan_mounts(mountinfo_path);
     WalkConfig cfg;
     cfg.network_mounts = std::move(scan.network_mounts);
     cfg.mountinfo_unreadable = !scan.ok;
@@ -816,7 +869,7 @@ inline MountScan scan_mounts(const char* path) {
 /// command actually reports. Returns 0 unconditionally: a degraded read is not a failed
 /// command; the degradation rides the status row and set_result_status.
 inline int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root,
-                        const WalkConfig& cfg = {}) {
+                        const WalkConfig& cfg) {
     yuzu::shared::ConstraintAccumulator acc;
     if (cfg.mountinfo_unreadable) acc.add_failure(kTokMountinfoUnreadable);
     const auto rows = action_rows_at(a, root, acc, cfg);

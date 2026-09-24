@@ -1,8 +1,8 @@
 /**
  * runtimes_plugin.cpp -- installed language-runtime inventory for Yuzu:
- * .NET and JVM. A software-inventory fact distinct from installed_apps'
- * packaged-application view: a .NET runtime and a JDK are not discrete
- * application entries.
+ * .NET and JVM. A software-inventory fact read from the runtime's own install
+ * tree, so it also sees runtimes no package manager owns; installed_apps
+ * lists the packaged-application view.
  *
  * Actions:
  *   "dotnet" -- installed .NET (Core/5+) runtimes and SDKs.

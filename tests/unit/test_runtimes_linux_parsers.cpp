@@ -28,12 +28,11 @@
  * CommandContext case red; reporting OK/FULL regardless of the accumulator turns
  * the forced-constraint CommandContext case red; requiring an alias target to
  * OPEN turns the dangling-alias case red; each budget, the release-less-home probe, the extra
- * jvm roots, the network-mount guard and the FIFO/fd cases carry their mutation in their own
- * comment. Four mutants are OUTPUT-EQUIVALENT by design and survive: the sticky `exhausted` flag
- * (rows and tokens are identical without it; it only stops further opens/listings once a budget is
- * spent) and the two "guard before any syscall" orderings (skipping the guard's position changes
- * which syscalls run, not the rows or tokens); the real NFS hang check covers those.
- * The two chmod-000 cases SKIP at euid 0;
+ * jvm roots, the network-mount guard, the mount-table stream and the FIFO/fd cases carry their
+ * mutation in their own comment. Only the ENTRIES-budget `exhausted` flag is output-equivalent
+ * (it changes which directories are opened, not the rows or tokens); the guard-before-any-syscall
+ * orderings are pinned on Linux by watching IN_OPEN with inotify, and push_row's sticky flag by the
+ * cross-root byte-budget case. The chmod cases SKIP at euid 0;
  * the constrained path stays covered there by the symlink, cap and oversize
  * cases and by the forced-constraint CommandContext case, none of which needs
  * permission bits.
@@ -65,6 +64,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/inotify.h>
+#endif
 #endif
 
 namespace rt = yuzu::runtimes;
@@ -269,7 +271,12 @@ TEST_CASE("runtimes linux: the failure token spellings and the bounds are a cont
     static_assert(lnx::kMaxRows == 4096);
     static_assert(lnx::kMaxRowBytes == 1048576);
     static_assert(lnx::kMaxEntriesVisited == 65536);
-    static_assert(lnx::kMaxMountinfoBytes == 4194304);
+    static_assert(lnx::kMountinfoChunk == 65536);
+    static_assert(lnx::kMaxMountinfoLine == 65536);
+    static_assert(lnx::kMaxMountinfoBytes == 268435456);
+    // The bounds a production walk actually runs under: WalkLimits{} must carry every one of them.
+    static_assert(lnx::WalkLimits{}.dir_entries == 16384 && lnx::WalkLimits{}.rows == 4096 &&
+                  lnx::WalkLimits{}.row_bytes == 1048576 && lnx::WalkLimits{}.entries_visited == 65536);
 }
 
 TEST_CASE("runtimes linux: join_logical avoids a doubled slash",
@@ -278,9 +285,7 @@ TEST_CASE("runtimes linux: join_logical avoids a doubled slash",
     CHECK(lnx::join_logical("/usr", "bin") == "/usr/bin");
 }
 
-// == walks over the fixture tree (POSIX) =================================================
-
-#if !defined(_WIN32)
+// == mount-table guard, pure layer (every OS: MSVC compiles AND runs these) ===============
 
 namespace {
 
@@ -291,6 +296,54 @@ fs::path fixture_dir() {
     return fs::path("tests/unit/fixtures/wave10/runtimes/linux");
 #endif
 }
+
+std::string read_text_fixture(const char* name) {
+    std::ifstream in(fixture_dir() / name, std::ios::binary);
+    REQUIRE(in.good());
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+} // namespace
+
+TEST_CASE("runtimes linux: mountinfo parsing reports the network mounts and nothing local",
+          "[runtimes][linux][mounts]") {
+    // The real capture (an overlay root, proc/sysfs/tmpfs/devpts/cgroup2/ext4 bind mounts and one
+    // nfs4 mount): exactly the nfs4 mount point comes back.
+    CHECK(lnx::network_mount_points(read_text_fixture("mountinfo_docker_nfs4.txt")) ==
+          std::vector<std::string>{"/mnt/nfs"});
+    // SYNTHETIC lines modelled on the real ones: octal escapes decode, optional fields before the
+    // separator are skipped, fuse.overlayfs is local, a malformed line names nothing.
+    const std::string text =
+        "10 1 0:5 / /srv/a\\040b rw shared:1 master:2 - cifs //srv/share rw\n"
+        "11 1 0:6 / /mnt/s rw - fuse.sshfs u@h:/ rw\n"
+        "12 1 0:7 / /mnt/local rw - fuse.overlayfs overlay rw\n"
+        "13 1 0:8 / /mnt/tmp rw - tmpfs nfs:/looks-remote rw\n"
+        "no separator here\n"
+        "14 1 0:9 /only - nfs4 h:/x rw\n"
+        "15 1 0:10 / /mnt/n rw - nfs4 h:/x rw\n";
+    CHECK(lnx::network_mount_points(text) ==
+          std::vector<std::string>{"/srv/a b", "/mnt/s", "/mnt/n"});
+    CHECK(lnx::network_mount_points("").empty());
+    CHECK(lnx::unescape_mountinfo("a\\040b\\011c\\134d\\12") == "a b\tc\\d\\12"); // short escape kept verbatim
+}
+
+TEST_CASE("runtimes linux: a path touches a network mount when on, under or containing it",
+          "[runtimes][linux][mounts]") {
+    const std::vector<std::string> mounts{"/opt/java"};
+    CHECK(lnx::touches_network_mount("/opt/java", mounts));
+    CHECK(lnx::touches_network_mount("/opt/java/jdk-17", mounts)); // under
+    CHECK(lnx::touches_network_mount("/opt", mounts));             // contains
+    CHECK_FALSE(lnx::touches_network_mount("/opt/javax", mounts)); // segment boundary
+    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", mounts));
+    CHECK(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{"/"})); // NFS root
+    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{}));
+}
+
+// == walks over the fixture tree (POSIX) =================================================
+
+#if !defined(_WIN32)
+
+namespace {
 
 /// Materializes tree.manifest under `root`. Returns false with `error` set on any
 /// failure so the caller can REQUIRE with a useful message.
@@ -403,8 +456,7 @@ int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*
     yuzu::CommandContext ctx{raw};
     const auto a = rt::parse_action(action);
     if (!a) return 1;
-    return g_leg_cfg ? lnx::run_linux_at(ctx, *a, *g_leg_root, *g_leg_cfg)
-                     : lnx::run_linux_at(ctx, *a, *g_leg_root);
+    return lnx::run_linux_at(ctx, *a, *g_leg_root, g_leg_cfg ? *g_leg_cfg : lnx::WalkConfig{});
 }
 
 LegRun run_leg(rt::Action action, const fs::path& root) {
@@ -932,12 +984,6 @@ std::string release_with(std::string_view version) {
     return "JAVA_VERSION=\"" + std::string{version} + "\"\n";
 }
 
-std::string read_text_fixture(const char* name) {
-    std::ifstream in(fixture_dir() / name, std::ios::binary);
-    REQUIRE(in.good());
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-
 int open_fd_count() {
     int n = 0;
     for (int fd = 0; fd < 1024; ++fd)
@@ -967,6 +1013,23 @@ TEST_CASE("runtimes linux: the row and row-byte budgets bound the rows and repor
         CHECK(acc.any_failure() == c.capped);
         if (c.capped) CHECK(acc.reason() == std::string{lnx::kTokRowCap});
     }
+}
+
+TEST_CASE("runtimes linux: a spent byte budget stops the walk, so a smaller later row is not admitted "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk][cap]") {
+    // The rows returned must be a PREFIX of the walk. MUTATION: dropping `b.exhausted = true` in
+    // push_row admits /opt/java/c after /usr/lib/jvm/b was refused for size (1 row becomes 2).
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_bytes_root_"};
+    write_text(dir.path / "usr/lib/jvm/a/release", release_with("1"));
+    write_text(dir.path / "usr/lib/jvm/b/release", release_with(std::string(100, '9')));
+    write_text(dir.path / "opt/java/c/release", release_with("1"));
+    lnx::WalkLimits l;
+    l.row_bytes = std::string{"jvm|unmodelled|1|/usr/lib/jvm/a|-"}.size() +
+                  std::string{"jvm|unmodelled|1|/opt/java/c|-"}.size();
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc, limits_cfg(l)).size() == 1);
+    CHECK(acc.reason() == std::string{lnx::kTokRowCap});
 }
 
 TEST_CASE("runtimes linux: the entries-visited budget spans nesting levels and roots (SYNTHETIC)",
@@ -1031,7 +1094,7 @@ TEST_CASE("runtimes linux: an oversized release VALUE is field_oversized and the
     CHECK(acc.reason() == std::string{lnx::kTokFieldOversized} + "," + std::string{lnx::kTokReleaseUnparsable});
 }
 
-TEST_CASE("runtimes linux: a distro OpenJDK 8 home has no release file and is still a row (REAL CAPTURE)",
+TEST_CASE("runtimes linux: an OpenJDK 8 home with no release file is still a row (REAL CAPTURE)",
           "[runtimes][linux][walk][jdk8]") {
     // Ubuntu, Rocky and Alpine OpenJDK 8 packages ship NO `release` file (jdk_layouts.manifest).
     // MUTATION: dropping the java-binary probe leaves zero rows and `supported`; probing only
@@ -1060,6 +1123,38 @@ TEST_CASE("runtimes linux: a distro OpenJDK 8 home has no release file and is st
     const auto rows = lnx::jvm_rows_at(syn.path, acc);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "jvm|unmodelled|-|/opt/java/only-bin|-");
+}
+
+TEST_CASE("runtimes linux: a release-less home's java probe records what it cannot check (SYNTHETIC)",
+          "[runtimes][linux][walk][jdk8]") {
+    // MUTATIONS: folding a failed stat into "no java"; dropping the alias flag; refusing though the
+    // jre route found java; accepting any dirent named java as a JVM.
+    const auto probe = [](auto&& setup, std::vector<std::string> rows, std::string_view reason) {
+        yuzu::test::TempDir d{"yuzu_test_runtimes_probe_"};
+        setup(d.path / "opt/java");
+        Acc acc;
+        CHECK(lnx::jvm_rows_at(d.path, acc) == rows);
+        CHECK(acc.reason() == reason);
+    };
+    const auto link = [](const char* to, const fs::path& at) { fs::create_symlink(to, at); };
+    probe([&](const fs::path& j) { write_text(j / "h/real/java", ""); link("real", j / "h/bin"); },
+          {}, lnx::kTokSymlinkRefused); // a symlinked bin is never followed, but never silent
+    probe([&](const fs::path& j) { write_text(j / "g/jre/bin/java", ""); link("jre/bin", j / "g/bin"); },
+          {"jvm|unmodelled|-|/opt/java/g|-"}, lnx::kTokReleaseMissing); // found via jre: no refusal
+    probe([&](const fs::path& j) {
+              make_dir(j / "d/bin/java");
+              make_dir(j / "f/bin");
+              REQUIRE(::mkfifo((j / "f/bin/java").c_str(), 0644) == 0);
+          },
+          {}, ""); // a directory or FIFO named java is no JVM
+    if (running_privileged()) return; // bin/ readable but not searchable: fstatat(java) is EACCES
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_binstat_"};
+    write_text(dir.path / "opt/java/h/bin/java", "");
+    REQUIRE(::chmod((dir.path / "opt/java/h/bin").c_str(), 0644) == 0);
+    const PermRestore restore{dir.path / "opt/java/h/bin"};
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc).empty());
+    CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
 }
 
 TEST_CASE("runtimes linux: openSUSE keeps JVMs under /usr/lib64/jvm (REAL CAPTURE layout)",
@@ -1099,41 +1194,7 @@ TEST_CASE("runtimes linux: /opt -> var/opt (rpm-ostree) is a covered alias, not 
     CHECK(rows[0] == "jvm|jdk|17.0.20|/var/opt/java/temurin-17|Eclipse Adoptium");
 }
 
-TEST_CASE("runtimes linux: mountinfo parsing reports the network mounts and nothing local",
-          "[runtimes][linux][mounts]") {
-    // The real capture (an overlay root, proc/sysfs/tmpfs/devpts/cgroup2/ext4 bind mounts and one
-    // nfs4 mount): exactly the nfs4 mount point comes back.
-    CHECK(lnx::network_mount_points(read_text_fixture("mountinfo_docker_nfs4.txt")) ==
-          std::vector<std::string>{"/mnt/nfs"});
-    // SYNTHETIC lines modelled on the real ones: octal escapes decode, optional fields before the
-    // separator are skipped, fuse.overlayfs is local, a malformed line names nothing.
-    const std::string text =
-        "10 1 0:5 / /srv/a\\040b rw shared:1 master:2 - cifs //srv/share rw\n"
-        "11 1 0:6 / /mnt/s rw - fuse.sshfs u@h:/ rw\n"
-        "12 1 0:7 / /mnt/local rw - fuse.overlayfs overlay rw\n"
-        "13 1 0:8 / /mnt/tmp rw - tmpfs nfs:/looks-remote rw\n"
-        "no separator here\n"
-        "14 1 0:9 /only - nfs4 h:/x rw\n"
-        "15 1 0:10 / /mnt/n rw - nfs4 h:/x rw\n";
-    CHECK(lnx::network_mount_points(text) ==
-          std::vector<std::string>{"/srv/a b", "/mnt/s", "/mnt/n"});
-    CHECK(lnx::network_mount_points("").empty());
-    CHECK(lnx::unescape_mountinfo("a\\040b\\011c\\134d\\12") == "a b\tc\\d\\12"); // short escape kept verbatim
-}
-
-TEST_CASE("runtimes linux: a path touches a network mount when on, under or containing it",
-          "[runtimes][linux][mounts]") {
-    const std::vector<std::string> mounts{"/opt/java"};
-    CHECK(lnx::touches_network_mount("/opt/java", mounts));
-    CHECK(lnx::touches_network_mount("/opt/java/jdk-17", mounts)); // under
-    CHECK(lnx::touches_network_mount("/opt", mounts));             // contains
-    CHECK_FALSE(lnx::touches_network_mount("/opt/javax", mounts)); // segment boundary
-    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", mounts));
-    CHECK(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{"/"})); // NFS root
-    CHECK_FALSE(lnx::touches_network_mount("/usr/lib/jvm", std::vector<std::string>{}));
-}
-
-TEST_CASE("runtimes linux: a candidate on a network mount is skipped before any syscall touches it "
+TEST_CASE("runtimes linux: a candidate on a network mount is skipped and the other roots are still read "
           "(SYNTHETIC)",
           "[runtimes][linux][walk][mounts]") {
     // opt/java is a regular FILE here: had the walk opened it, `not_a_directory` would join the
@@ -1172,6 +1233,62 @@ TEST_CASE("runtimes linux: a candidate on a network mount is skipped before any 
     CHECK(a3.reason() == std::string{lnx::kTokNetworkFsSkipped});
 }
 
+#if defined(__linux__)
+
+namespace {
+
+/// IN_OPEN watch: the only way to observe that a walk NEVER touched a directory (skipping the
+/// guard's position changes which syscalls run, not the rows or tokens).
+struct OpenWatch {
+    int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    explicit OpenWatch(const fs::path& p) {
+        REQUIRE(fd >= 0);
+        REQUIRE(::inotify_add_watch(fd, p.c_str(), IN_OPEN) >= 0);
+    }
+    ~OpenWatch() { ::close(fd); }
+    OpenWatch(const OpenWatch&) = delete;
+    OpenWatch& operator=(const OpenWatch&) = delete;
+    [[nodiscard]] bool opened() const {
+        char buf[512];
+        return ::read(fd, buf, sizeof buf) > 0;
+    }
+};
+
+} // namespace
+
+TEST_CASE("runtimes linux: a network-mounted candidate is never opened, directly or through an alias "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk][mounts]") {
+    // MUTATION: checking the guard after walk_path, or after resolving an alias's target, opens the
+    // mount (in production a hung one) before skipping it; rows and tokens are unchanged.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_never_"};
+    make_dir(dir.path / "opt/java/jdk");
+    make_dir(dir.path / "usr/lib/dotnet/sdk/8.0.100");
+    make_dir(dir.path / "usr/share");
+    fs::create_symlink("../lib/dotnet", dir.path / "usr/share/dotnet");
+    const OpenWatch jvm{dir.path / "opt/java"}, dotnet{dir.path / "usr/lib/dotnet"};
+    lnx::WalkConfig cfg;
+    cfg.network_mounts = {"/opt/java", "/usr/lib/dotnet"};
+    Acc a, b;
+    CHECK(lnx::jvm_rows_at(dir.path, a, cfg).empty());
+    CHECK(lnx::dotnet_rows_at(dir.path, b, cfg).empty());
+    CHECK(a.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    CHECK(b.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    CHECK_FALSE(jvm.opened());
+    CHECK_FALSE(dotnet.opened());
+}
+
+TEST_CASE("runtimes linux: the read loop bounds a file whose fstat size lies (procfs)",
+          "[runtimes][linux][walk]") {
+    // procfs reports st_size 0, so the in-loop bound is the ONLY bound. MUTATION: removing it reads
+    // a procfs (or growing) file without limit.
+    const auto r = lnx::walk::read_file_bounded_at(AT_FDCWD, "/proc/self/status", 64);
+    CHECK(r.status == lnx::walk::ReadStatus::failed);
+    CHECK(r.token == lnx::kTokOversized);
+}
+
+#endif // __linux__
+
 TEST_CASE("runtimes linux: the mount table is scanned, an unreadable one is reported and the tree still read",
           "[runtimes][linux][walk][mounts]") {
     const auto scan = lnx::walk::scan_mounts((fixture_dir() / "mountinfo_docker_nfs4.txt").c_str());
@@ -1193,6 +1310,41 @@ TEST_CASE("runtimes linux: the mount table is scanned, an unreadable one is repo
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
+TEST_CASE("runtimes linux: production_config arms the guard from the mount table it is pointed at",
+          "[runtimes][linux][mounts]") {
+    // MUTATION: a config that never reads the table (or drops its result) leaves the guard unarmed.
+    const auto cfg = lnx::production_config((fixture_dir() / "mountinfo_docker_nfs4.txt").c_str());
+    CHECK(cfg.network_mounts == std::vector<std::string>{"/mnt/nfs"});
+    CHECK_FALSE(cfg.mountinfo_unreadable);
+    CHECK(lnx::production_config((fixture_dir() / "no_such_mountinfo").c_str()).mountinfo_unreadable);
+}
+
+TEST_CASE("runtimes linux: the mount table is streamed: a line split across reads is kept and the bounds "
+          "hold (SYNTHETIC)",
+          "[runtimes][linux][mounts]") {
+    // MUTATION: parsing each read on its own loses the network line that straddles the first 64 KiB
+    // boundary; a whole-table size cap fails the guard OPEN on the busiest hosts.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_stream_"};
+    const std::string local = "20 1 0:20 / /mnt/l rw - ext4 /dev/sda1 rw\n";
+    std::string text(lnx::kMountinfoChunk - 21, 'x'); // a filler line that ends 20 bytes before the boundary
+    text += "\n21 1 0:21 / /mnt/straddle rw - nfs4 h:/x rw\n";
+    while (text.size() < 3 * lnx::kMountinfoChunk) text += local;
+    text += "22 1 0:22 / /mnt/last rw - cifs //h/s rw"; // no trailing newline
+    write_text(dir.path / "mountinfo", text);
+    const auto scan = lnx::walk::scan_mounts((dir.path / "mountinfo").c_str());
+    CHECK(scan.ok);
+    CHECK(scan.network_mounts == std::vector<std::string>{"/mnt/straddle", "/mnt/last"});
+    // The two bounds: a line over kMaxMountinfoLine, and more bytes than the runaway cap.
+    write_text(dir.path / "longline", std::string(lnx::kMaxMountinfoLine + lnx::kMountinfoChunk, 'x'));
+    CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "longline").c_str()).ok);
+    const auto size = fs::file_size(dir.path / "mountinfo");
+    CHECK(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size).ok);
+    CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "mountinfo").c_str(), size - 1).ok);
+    // A FIFO reads as an empty table (EOF, no writer): only the regular-file check refuses it.
+    REQUIRE(::mkfifo((dir.path / "fifo").c_str(), 0644) == 0);
+    CHECK_FALSE(lnx::walk::scan_mounts((dir.path / "fifo").c_str()).ok);
+}
+
 TEST_CASE("runtimes linux: a FIFO or directory named release is refused without blocking (SYNTHETIC)",
           "[runtimes][linux][walk]") {
     // MUTATION: dropping O_NONBLOCK from the release open makes the FIFO case hang forever; dropping
@@ -1204,6 +1356,22 @@ TEST_CASE("runtimes linux: a FIFO or directory named release is refused without 
     Acc acc;
     CHECK(lnx::jvm_rows_at(dir.path, acc).empty());
     CHECK(acc.reason() == std::string{lnx::kTokNotRegular});
+}
+
+TEST_CASE("runtimes linux: a FIFO where a directory is expected is not_a_directory, never a hang "
+          "(SYNTHETIC)",
+          "[runtimes][linux][walk]") {
+    // MUTATION: dropping O_DIRECTORY from kDirFlags makes open(2) of a FIFO block for a writer.
+    for (const char* rel : {"usr/lib/dotnet/sdk", "usr/lib/dotnet/shared", "opt/java/h/bin", "opt/java/h/jre"}) {
+        INFO("fifo at: " << rel);
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_fifodir_"};
+        make_dir((dir.path / rel).parent_path());
+        REQUIRE(::mkfifo((dir.path / rel).c_str(), 0644) == 0);
+        Acc acc;
+        (void)lnx::action_rows_at(std::string_view{rel}.starts_with("opt") ? rt::Action::jvm : rt::Action::dotnet,
+                                  dir.path, acc);
+        CHECK(acc.reason() == std::string{lnx::kTokNotADirectory});
+    }
 }
 
 TEST_CASE("runtimes linux: a plain file where a directory is expected is constrained, not absent "

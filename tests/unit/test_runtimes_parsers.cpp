@@ -234,7 +234,7 @@ TEST_CASE("runtimes: dotnet_entry_from_dir maps frameworks, sdk, unmodelled and 
 
 // -- status rows and composition ---------------------------------------------------------
 
-TEST_CASE("runtimes: an absent family is supported with zero data rows", "[runtimes]") {
+TEST_CASE("runtimes: none found at the standard roots is supported with zero data rows", "[runtimes]") {
     yuzu::shared::ConstraintAccumulator acc;
     const auto out = rt::compose_output("jvm", {}, acc);
     REQUIRE(out.size() == 1);

@@ -58,8 +58,8 @@ int run_macos(yuzu::CommandContext& ctx, Action a);
 
 /// A completed read: writes the status row FIRST, then every data row, and
 /// reports OK/FULL, or CONSTRAINED/PARTIAL (reason = the accumulated tokens)
-/// when the accumulator recorded any failure. Zero rows + no failure is a
-/// genuinely absent runtime family (OK/FULL, status `supported`).
+/// when the accumulator recorded any failure. Zero rows + no failure means none
+/// found at the standard roots (OK/FULL, status `supported`).
 inline void emit_read(yuzu::CommandContext& ctx, Action a,
                       const std::vector<std::string>& data_rows,
                       const yuzu::shared::ConstraintAccumulator& acc) {
