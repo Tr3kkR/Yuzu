@@ -210,7 +210,12 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   before, those two are verified fail-closed rather than added best-effort. The
   manifest self-test verifies all four private binary sets, registered service
   executables, `Running` states, and live authenticated probes, so drift fails
-  before a build starts.
+  before a build starts. It also prints a read-only per-cluster durability
+  settings fingerprint for all four clusters on every run (#2167 follow-up),
+  and, when invoked with `-ExportCiEnv` (the CI job only), exports
+  `YUZU_CI_PSQL` — this runner's own agent's manifest `psql` — so
+  `scripts/ci/ensure-postgres.sh`'s per-job durability conformance guard
+  resolves a proven `psql.exe` instead of an unauthenticated TCP probe.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg

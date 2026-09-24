@@ -18,6 +18,19 @@
 #      one instance per agent, no cross-job contention (#2094). Falls back
 #      to the shared pre-set DSN (with a ::warning) until the box is
 #      provisioned with the extra clusters.
+#
+#      Durability conformance (#2167 follow-up): before exporting the DSN
+#      (agent 0's cluster included — it was not probed at all before this),
+#      path 1 reads fsync/synchronous_commit/full_page_writes from the
+#      cluster (see pg_durability_decide in pg-durability.sh) and, only
+#      under GitHub Actions against a loopback host with a
+#      toolchain-manifest-vouched psql (YUZU_CI_PSQL, exported by
+#      deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv), heals a drifted
+#      setting with ALTER SYSTEM + pg_reload_conf() and re-reads with a
+#      bounded retry. Elsewhere, drift is reported, never healed. A
+#      manifest-vouched per-agent probe failure is retried then fails the
+#      job — it never falls back to the shared agent-0 cluster. Without any
+#      psql, conformance is UNVERIFIED (a warning, not a failure).
 #   2. Docker available -> idempotent `yuzu-ci-postgres` container on
 #      127.0.0.1:15432 (self-hosted Linux — the same boxes run the
 #      docker-publish jobs, so docker is a given). Port 15432 deliberately
@@ -116,6 +129,106 @@ tcp_probe() { # host port — pure-bash, works in MSYS2 too
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
 }
 
+# Durability conformance guard (Wee Tam Windows CI, #2167 follow-up): sourced
+# unconditionally but only ever CALLED from path 1 below — paths 2-4 apply
+# durability-off once via -c flags at provisioning/container-creation time
+# and never drift, so they stay byte-for-byte unaffected. See
+# docs/ci-architecture.md "Postgres for server tests".
+# shellcheck source=./pg-durability.sh
+source "$(dirname "${BASH_SOURCE[0]}")/pg-durability.sh"
+
+# p1_psql — the only psql invocation path 1's conformance guard uses. -X (no
+# psqlrc) / -w (never prompt: the check now runs for ANY pre-set DSN,
+# including a password-less local/test shell that would otherwise hang the
+# job on a tty prompt); PGCONNECT_TIMEOUT bounds a hung listener;
+# MSYS2_ARG_CONV_EXCL='*' stops MSYS2 rewriting the DSN/SQL argv before
+# native psql.exe sees them (precedent
+# scripts/ci/verify-healthcheck-invariants.sh:79; inert on Linux/macOS).
+p1_psql() {
+  PGCONNECT_TIMEOUT=10 MSYS2_ARG_CONV_EXCL='*' "$P1_PSQL" -X -w "$@"
+}
+
+# p1_conform <dsn> — read -> decide -> heal -> bounded re-read the
+# durability-off settings on the cluster this job is about to export.
+# Returns 0 (proceed to emit_dsn) or 1 (caller must SOFT_EXIT). Read-only
+# when psql is unavailable or the settings already read 'ok'; heals only
+# when pg_heal_allowed permits it (GitHub Actions, loopback host,
+# manifest-vouched psql — never a developer's pre-set DSN, a bespoke remote
+# DB, or any other self-hosted box with a machine-level loopback DSN).
+# Never prints $dsn unredacted.
+p1_conform() {
+  local dsn="$1" hp='' red='' rows='' rc=0 decision='' allow=0 attempt=0
+  local q="SELECT name, setting, source FROM pg_settings WHERE name IN ('fsync','synchronous_commit','full_page_writes') ORDER BY name"
+  hp="$(pg_dsn_host_port "$dsn")"
+  red="$(pg_dsn_redact "$dsn")"
+
+  if [[ "$P1_PSQL_SRC" == "none" ]]; then
+    echo "::warning::ensure-postgres: durability conformance UNVERIFIED on ${hp} — no psql (set YUZU_CI_PSQL, exported by deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv from the toolchain manifest, or put psql on PATH). See docs/ci-architecture.md 'Postgres for server tests'." >&2
+    return 0
+  fi
+
+  rc=0
+  rows="$(p1_psql "$dsn" -tA -c "$q" 2>&1)" || rc=$?
+  if [[ "$rc" != "0" ]]; then
+    echo "::error::ensure-postgres: durability read failed on ${hp} (${red}): ${rows}" >&2
+    return 1
+  fi
+
+  allow=0
+  pg_heal_allowed "${GITHUB_ACTIONS:-}" "${hp%%:*}" "$P1_PSQL_SRC" && allow=1
+  decision="$(pg_durability_decide "$allow" "$rows" || true)"
+
+  case "$decision" in
+    ok)
+      echo "ensure-postgres: durability conformance ok on ${hp} ($(echo "$rows" | tr '\n' ' '))" >&2
+      return 0
+      ;;
+    drift*)
+      if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+        echo "::warning::ensure-postgres: ${decision#drift } not off on ${hp} — NOT healing (heal runs only under GitHub Actions, against a loopback host, with the manifest-vouched YUZU_CI_PSQL); for a disposable CI cluster tune it via ALTER SYSTEM ... = off + SELECT pg_reload_conf()." >&2
+      else
+        echo "ensure-postgres: note — ${decision#drift } not off on ${hp}; the [pg] shard runs with full durability (expected for a non-CI cluster; not healing)." >&2
+      fi
+      return 0
+      ;;
+    heal*)
+      echo "::warning::ensure-postgres: ${hp} had ${decision#heal } not off (${rows//$'\n'/ }) — healing with ALTER SYSTEM SET ... = off + pg_reload_conf(); this box needs re-provisioning attention (deploy/windows/Provision-Windows-Runner.ps1)." >&2
+      rc=0
+      rows="$(p1_psql "$dsn" -q -v ON_ERROR_STOP=1 -tA \
+        -c 'ALTER SYSTEM SET fsync = off' \
+        -c 'ALTER SYSTEM SET synchronous_commit = off' \
+        -c 'ALTER SYSTEM SET full_page_writes = off' \
+        -c 'SELECT pg_reload_conf()' 2>&1)" || rc=$?
+      if [[ "$rc" != "0" ]]; then
+        echo "::error::ensure-postgres: heal failed on ${hp}: ${rows}" >&2
+        return 1
+      fi
+      # pg_reload_conf() only signals the postmaster; SIGHUP handling (and,
+      # on Windows EXEC_BACKEND, a new backend's GUC state at spawn) is
+      # asynchronous, so the re-read is bounded rather than trusted once.
+      for attempt in 1 2 3 4 5; do
+        rc=0
+        rows="$(p1_psql "$dsn" -tA -c "$q" 2>&1)" || rc=$?
+        if [[ "$rc" == "0" ]] && [[ "$(pg_durability_decide 0 "$rows")" == "ok" ]]; then
+          echo "ensure-postgres: durability healed on ${hp} (attempt ${attempt})" >&2
+          return 0
+        fi
+        sleep 1
+      done
+      echo "::error::ensure-postgres: ${hp} still not durability-off 5s after heal (${rows}) — check pg_settings.source (a per-role/per-database override or command-line -c beats ALTER SYSTEM); re-provision." >&2
+      return 1
+      ;;
+    fail*)
+      echo "::error::ensure-postgres: durability settings unreadable on ${hp} (${decision#fail }): ${rows}" >&2
+      return 1
+      ;;
+    *)
+      echo "::error::ensure-postgres: durability decision unrecognised on ${hp}: ${decision}" >&2
+      return 1
+      ;;
+  esac
+}
+
 # PGOPTIONS is process-environment-level, not DSN content: pg_pool.cpp's
 # conninfo_has_options_ gate checks getenv("PGOPTIONS") unconditionally,
 # regardless of which of the 4 paths below built the connection string.
@@ -152,35 +265,72 @@ if [[ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
     echo "::error::ensure-postgres: pre-set YUZU_TEST_POSTGRES_DSN must not set options= (disables PgPool statement_timeout/lock_timeout safety bounds) - put durability settings in postgresql.conf via ALTER SYSTEM instead. See docs/ci-architecture.md 'Postgres for server tests'." >&2
     exit "$SOFT_EXIT"
   fi
+  # psql resolution for the durability conformance guard below: prefer the
+  # toolchain-manifest-vouched psql (YUZU_CI_PSQL, exported only by
+  # deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv from a
+  # Provision-Windows-Runner.ps1 manifest — Assert-Toolchain has already
+  # proven this exact psql.exe against this exact cluster with SELECT 1,
+  # seconds before this step runs), else whatever is on PATH.
+  P1_PSQL="$(pg_psql_path_from_env "${YUZU_CI_PSQL:-}")"
+  P1_PSQL_SRC=manifest
+  if [[ -z "$P1_PSQL" || ! -x "$P1_PSQL" ]]; then
+    P1_PSQL="$(command -v psql 2>/dev/null || true)"
+    P1_PSQL_SRC=path
+  fi
+  [[ -n "$P1_PSQL" ]] || P1_PSQL_SRC=none
+
   # Per-agent derivation (#2094): on a multi-agent box the pre-set DSN
   # (machine env on Wee Tam) names the agent-0 cluster; agent <n> shifts
   # the port by <n> (Wee Tam: 5433 -> 5434..5436, provisioned by
   # deploy/windows/Provision-Windows-Runner.ps1). Probe before switching
   # and fall back LOUDLY to the shared DSN while a box has not been
   # provisioned with per-agent clusters yet — the cutover needs no flag
-  # day, and the warning is the provisioning reminder.
+  # day, and the warning is the provisioning reminder. That fallback is for
+  # an UNPROVISIONED box only (P1_PSQL_SRC=path/none): once the manifest
+  # vouches for this agent's psql, a failed SELECT 1 is a real cluster
+  # fault or a transient, never a broken-psql false positive, so it is
+  # retried briefly then fails hard — never a silent fallback onto the
+  # shared agent-0 cluster (that recreates the #2094 cross-job contention
+  # and contaminates the timing determination this guard exists to make).
   if [[ -n "$AGENT_IDX" && "$AGENT_IDX" != "0" \
         && "$YUZU_TEST_POSTGRES_DSN" =~ ^(.*@([^:/@]+)):([0-9]+)(/.*)$ ]]; then
     PA_HOST="${BASH_REMATCH[2]}"
     PA_PORT=$((BASH_REMATCH[3] + AGENT_IDX))
     PA_DSN="${BASH_REMATCH[1]}:${PA_PORT}${BASH_REMATCH[4]}"
     PA_HOW=""
-    if command -v psql >/dev/null 2>&1; then
+    if [[ -n "$P1_PSQL" ]]; then
       # Authenticate the exact DSN we are about to export (same rationale
       # as path 4's SELECT 1 gate, PR #1334 S5).
-      if psql "$PA_DSN" -tA -c 'SELECT 1' >/dev/null 2>&1; then
+      PA_OK=1
+      p1_psql "$PA_DSN" -tA -c 'SELECT 1' >/dev/null 2>&1 || PA_OK=0
+      if [[ "$PA_OK" != "1" && "$P1_PSQL_SRC" == "manifest" ]]; then
+        for _ in 1 2 3; do
+          sleep 2
+          p1_psql "$PA_DSN" -tA -c 'SELECT 1' >/dev/null 2>&1 && { PA_OK=1; break; }
+        done
+      fi
+      if [[ "$PA_OK" == "1" ]]; then
         PA_HOW="psql SELECT 1 verified"
+      elif [[ "$P1_PSQL_SRC" == "manifest" ]]; then
+        echo "::error::ensure-postgres: per-agent Postgres on ${PA_HOST}:${PA_PORT} for ${RUNNER_NAME} failed 'psql SELECT 1' although the toolchain manifest declares it (Assert-Toolchain proved it seconds ago) — NOT falling back to the shared agent-0 cluster (cross-job contention, #2094). Check the service/orphaned backends; see docs/ci-architecture.md 'Postgres for server tests'." >&2
+        exit "$SOFT_EXIT"
       fi
     elif tcp_probe "$PA_HOST" "$PA_PORT"; then
       PA_HOW="TCP probe only — psql unavailable, credential unverified"
     fi
     if [[ -n "$PA_HOW" ]]; then
-      emit_dsn "$PA_DSN" "pre-set runner env, per-agent port ${PA_PORT} for ${RUNNER_NAME} (${PA_HOW}; #2094)"
+      P1_DSN="$PA_DSN"
+      P1_HOW="pre-set runner env, per-agent port ${PA_PORT} for ${RUNNER_NAME} (${PA_HOW}; #2094)"
+      p1_conform "$P1_DSN" || exit "$SOFT_EXIT"
+      emit_dsn "$P1_DSN" "$P1_HOW"
       exit 0
     fi
     echo "::warning::ensure-postgres: no per-agent Postgres on ${PA_HOST}:${PA_PORT} for ${RUNNER_NAME} — falling back to the SHARED pre-set DSN (cross-job contention multiplier, #2094). Provision the per-agent clusters (deploy/windows/Provision-Windows-Runner.ps1) to remove it." >&2
   fi
-  emit_dsn "$YUZU_TEST_POSTGRES_DSN" "pre-set runner env"
+  P1_DSN="$YUZU_TEST_POSTGRES_DSN"
+  P1_HOW="pre-set runner env"
+  p1_conform "$P1_DSN" || exit "$SOFT_EXIT"
+  emit_dsn "$P1_DSN" "$P1_HOW"
   exit 0
 fi
 

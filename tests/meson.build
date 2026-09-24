@@ -2444,6 +2444,16 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+  # Wee Tam Windows CI durability-off guard (#2167 follow-up): the pure
+  # decide/heal-allowed/DSN-parsing functions ensure-postgres.sh path 1
+  # sources — enforced here so the guard's own logic is checked on every
+  # platform with bash, mirroring the selftest above.
+  test('pg durability decision selftest',
+    _bash_test,
+    args: [files('../scripts/ci/pg-durability.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 30,
+  )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
   # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.

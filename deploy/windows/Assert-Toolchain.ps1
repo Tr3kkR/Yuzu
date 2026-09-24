@@ -4,11 +4,25 @@
   emitted by Provision-Windows-Runner.ps1 still holds: every required tool is
   present at its recorded path, every contract env var is set, and every
   per-agent PostgreSQL service points at its private binary tree and serves.
+  It also prints a read-only, per-cluster durability-settings fingerprint
+  (fsync/synchronous_commit/full_page_writes/data_directory/databases/
+  active_backends) for all four Wee Tam clusters on every run, so a drift is
+  visible in seconds instead of as a 700 s [pg]-shard TIMEOUT (#2167 follow-
+  up) — this never affects $fail; SELECT 1 remains the health gate.
 
   Run it (a) at the end of provisioning, and (b) as a registration / preflight
   gate, so a mis-provisioned box fails in SECONDS rather than 90 minutes into a
   build. This is the catch for the cutover faults (toolchain off PATH, MSYS2
   /usr/bin missing, gateway escript/rebar3 unresolved).
+
+  -ExportCiEnv (passed only by ci.yml's windows job, which has a pg step)
+  additionally exports YUZU_CI_PSQL to $env:GITHUB_ENV for THIS runner's own
+  agent, read from the same manifest this script just validated — the
+  contract scripts/ci/ensure-postgres.sh's durability conformance guard
+  relies on to resolve a proven psql.exe instead of an unauthenticated TCP
+  probe. Provision-Windows-Runner.ps1's own children (Update-ToolchainManifest
+  .ps1, Test-ToolchainContract.ps1) also run under Actions with GITHUB_ENV
+  set, so this must stay opt-in — never write the job env unless asked.
 
   Exit 0 = healthy; exit 1 = an incompatible manifest, a version mismatch,
   or at least one required tool/env item missing.
@@ -16,7 +30,8 @@
 [CmdletBinding()]
 param(
   [string]$ManifestPath = 'C:\actions-runner\toolchain-manifest.json',
-  [string]$ContractPath = (Join-Path $PSScriptRoot 'toolchain-contract.json')
+  [string]$ContractPath = (Join-Path $PSScriptRoot 'toolchain-contract.json'),
+  [switch]$ExportCiEnv
 )
 $ErrorActionPreference = 'Stop'
 
@@ -132,6 +147,14 @@ if(-not $hasClusterContract){
     Write-Host ("  [MISS] manifest has {0} PostgreSQL cluster(s), expected runner_count={1} — re-run provisioning" -f @($m.postgres_clusters).Count, ($m.runner_count ?? '<unset>')) -ForegroundColor Red
     $fail++
   }
+  # Read-only, per-cluster durability-settings fingerprint (#2167 follow-up):
+  # printed for every cluster on every run (this step, and therefore this
+  # query, runs before ensure-postgres.sh on every Windows job), so a drift
+  # is visible from ANY job's log in seconds. data_directory and
+  # active_backends discriminate a wrong-data-directory or foreign-load
+  # hypothesis if a cluster's settings ever look wrong. Never touches $fail.
+  $fingerprintSql = "SELECT format('fsync=%s synchronous_commit=%s full_page_writes=%s data_directory=%s databases=%s active_backends=%s', current_setting('fsync'), current_setting('synchronous_commit'), current_setting('full_page_writes'), current_setting('data_directory'), (SELECT count(*) FROM pg_database), (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND state <> 'idle' AND pid <> pg_backend_pid()))"
+
   $oldPassword = $env:PGPASSWORD
   $env:PGPASSWORD = 'yuzu'
   try {
@@ -194,6 +217,17 @@ if(-not $hasClusterContract){
           Write-Host ("  [MISS] agent {0}: authenticated SELECT 1 failed on :{1}{2}" -f $c.agent, $c.port, $detail) -ForegroundColor Red
           $clusterOk = $false
           $fail++
+        } else {
+          # Read-only — a failure here never affects $fail or $clusterOk;
+          # SELECT 1 above remains the health gate.
+          try {
+            $fp = (Invoke-YuzuContractProbe -Executable $c.psql `
+              -Arguments @('-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc',$fingerprintSql) `
+              -TimeoutSeconds ([int]$contract.probe_timeout_seconds))
+            Write-Host ("  [info] agent {0} :{1} {2}" -f $c.agent, $c.port, $fp.Trim()) -ForegroundColor Cyan
+          } catch {
+            Write-Host ("  [warn] agent {0}: settings fingerprint unavailable ({1})" -f $c.agent, $_.Exception.Message) -ForegroundColor Yellow
+          }
         }
       }
       if($clusterOk){
@@ -203,6 +237,23 @@ if(-not $hasClusterContract){
   } finally {
     if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
     else { $env:PGPASSWORD = $oldPassword }
+  }
+
+  if($ExportCiEnv){
+    if(-not $env:GITHUB_ENV){
+      Write-Host "  [warn] -ExportCiEnv but GITHUB_ENV is unset — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
+    } elseif($env:RUNNER_NAME -match '-(\d+)$' -and [int]$Matches[1] -le 9){
+      $idx = [int]$Matches[1]
+      $own = @($m.postgres_clusters) | Where-Object { [int]$_.agent -eq $idx } | Select-Object -First 1
+      if($own -and $own.psql -and (Test-Path -LiteralPath $own.psql)){
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "YUZU_CI_PSQL=$($own.psql)"
+        Write-Host ("  [OK]   exported YUZU_CI_PSQL for agent {0} ({1})" -f $idx, $own.psql) -ForegroundColor Green
+      } else {
+        Write-Host "  [warn] no manifest psql for agent $idx — YUZU_CI_PSQL not exported; ensure-postgres.sh will report durability UNVERIFIED" -ForegroundColor Yellow
+      }
+    } else {
+      Write-Host "  [warn] RUNNER_NAME '$($env:RUNNER_NAME)' has no -<n> suffix — YUZU_CI_PSQL not exported" -ForegroundColor Yellow
+    }
   }
 }
 

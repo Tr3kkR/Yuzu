@@ -1195,6 +1195,43 @@ Resolution order inside the script:
    gate), caught by the `[pg][hardening]` test "PgPool injects
    statement_timeout and lock_timeout GUCs". Put durability tuning in
    `postgresql.conf` via `ALTER SYSTEM` instead (#2167).
+
+   **Durability conformance guard (#2167 follow-up).** Path 1 clusters
+   (native Windows, incl. agent 0 — previously not probed at all) get
+   durability-off applied once at provisioning
+   (`deploy/windows/Provision-Windows-Runner.ps1`'s agent-0 and per-agent
+   tune blocks), with no drift guard, unlike path 2's Docker
+   tuning-label recreate-on-drift. Every path-1 job now reads
+   `fsync`/`synchronous_commit`/`full_page_writes` from the cluster it is
+   about to export (`scripts/ci/pg-durability.sh`'s pure
+   `pg_durability_decide`) before exporting the DSN. When all three
+   already read `off`, that's a one-line `ok`. Otherwise: only under
+   GitHub Actions, against a loopback host, with a
+   toolchain-manifest-vouched `psql` (`YUZU_CI_PSQL`, see below) does the
+   guard **heal** — `ALTER SYSTEM SET … = off` ×3 + `pg_reload_conf()`,
+   then a bounded (5 × 1s) re-read, since a reload's SIGHUP handling is
+   asynchronous. Everywhere else (a developer's pre-set DSN, a bespoke
+   remote DB, any other self-hosted box with a machine-level loopback
+   DSN) drift is only **reported** (a `::warning` under Actions, a plain
+   informational line otherwise) — this guard never mutates a cluster it
+   cannot prove is disposable CI infrastructure. `YUZU_CI_PSQL` is
+   exported to `$GITHUB_ENV` by
+   `deploy/windows/Assert-Toolchain.ps1 -ExportCiEnv` (passed only by
+   `ci.yml`'s Windows job), read from the same
+   `Provision-Windows-Runner.ps1` manifest Assert-Toolchain has just
+   validated — Assert-Toolchain proves that exact `psql.exe` against that
+   exact cluster with `SELECT 1` seconds before this step runs, so a
+   **manifest-vouched per-agent `SELECT 1` failure is retried briefly,
+   then fails the job — it never falls back to the shared agent-0
+   cluster** (that would recreate the #2094 cross-job contention and
+   contaminate the timing determination this guard exists to make
+   legible). Without any `psql` (no `YUZU_CI_PSQL`, none on `PATH`),
+   conformance is **UNVERIFIED** — a warning, not a failure. Assert-
+   Toolchain also prints a read-only, one-line settings fingerprint
+   (`fsync=… synchronous_commit=… full_page_writes=… data_directory=…
+   databases=… active_backends=…`) for **all four** Wee Tam clusters on
+   every Windows job, so a drift is visible in seconds from any job's log
+   instead of surfacing as a 700s `[pg]`-shard `TIMEOUT`.
 2. **Docker** (self-hosted Linux) — idempotent persistent container
    (`docker start` || `docker run --restart unless-stopped`, image pinned
    to the same digest as `deploy/docker/Dockerfile.postgres`'s base;
@@ -1248,14 +1285,17 @@ a database would silently skip that coverage. `exit "$SOFT_EXIT"`
 (= exit 1) is reached on every failure path: Docker container not ready
 in 60 s (path 2), brew cluster not ready (path 3), native-cluster
 credential failure when `psql` is available (path 4), and nothing found
-(path 5). The one non-fatal exception is path 4 without `psql`: a TCP
-probe alone produces a `::warning` and still exports the conventional
-DSN (credential **unverified** — wrong credentials then surface as
-downstream `[pg]` test failures; install `psql` on the runner's PATH,
-e.g. `C:\Program Files\PostgreSQL\18\bin` on the `yuzu-weetam-windows` runners, to
-get the authenticated gate instead). Locally the tests still skip when
-`YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
-fail rather than skip.
+(path 5) — **plus, since the #2167 follow-up, a manifest-vouched path-1
+per-agent `SELECT 1` failure after retries, and a path-1 durability read
+that is unreadable/unparseable or that stays not-off 5s after a heal**
+(check `pg_settings.source` — a per-role/per-database override or a
+command-line `-c` beats `ALTER SYSTEM`). The one non-fatal exception is
+path 4 without `psql`: a TCP probe alone produces a `::warning` and still
+exports the conventional DSN (credential **unverified** — wrong
+credentials then surface as downstream `[pg]` test failures; install
+`psql` on the runner's PATH to get the authenticated gate instead).
+Locally the tests still skip when `YUZU_TEST_POSTGRES_DSN` is unset;
+when it is set but unreachable they fail rather than skip.
 
 On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
 pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,

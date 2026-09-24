@@ -1591,8 +1591,11 @@ jobs:
         shell: pwsh
         # Every active Windows runner must have a manifest before this change
         # is deployed. Missing or unknown-schema manifests fail closed --
-        # there is no compatibility bridge.
-        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
+        # there is no compatibility bridge. The extra switch below exports
+        # YUZU_CI_PSQL for the Ensure Postgres step below (this is the only
+        # Windows job with a pg step; nightly.yml/release.yml stay
+        # unchanged).
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json' -ExportCiEnv
 
       - name: Assert runner disk (>= 45 GB free)
         run: |

@@ -818,6 +818,42 @@ Check 'the authenticated PostgreSQL probe uses the bounded process primitive' {
   $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $boundedAt)
   $psqlAt -ge 0 -and $boundedAt -gt $psqlAt -and $timeoutAt -gt $boundedAt
 }
+Check 'the settings fingerprint probe uses the bounded process primitive' {
+  $assertText = Get-Content -LiteralPath $AssertPath -Raw
+  $psqlAt = $assertText.IndexOf('if($c.psql')
+  $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $psqlAt)
+  $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $psqlAt)
+  $probeAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $fingerprintAt)
+  $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $probeAt)
+  $psqlAt -ge 0 -and $fingerprintAt -gt $psqlAt -and $probeAt -gt $fingerprintAt -and
+    $timeoutAt -gt $probeAt -and $probeAt -lt $clusterOkAt
+}
+Check 'the settings fingerprint never fails the assertion' {
+  $assertText = Get-Content -LiteralPath $AssertPath -Raw
+  $psqlAt = $assertText.IndexOf('if($c.psql')
+  $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $psqlAt)
+  $probeAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $fingerprintAt)
+  $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $probeAt)
+  $span = $assertText.Substring($probeAt, $clusterOkAt - $probeAt)
+  $probeAt -ge 0 -and $clusterOkAt -gt $probeAt -and $span -notmatch '\$fail\+\+'
+}
+Check 'the CI psql export is opt-in and agent-guarded' {
+  $assertText = Get-Content -LiteralPath $AssertPath -Raw
+  $exportIfAt = $assertText.IndexOf('if($ExportCiEnv)')
+  $matchAt = $assertText.IndexOf("-match '-(\d+)\$'", $exportIfAt)
+  $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $matchAt)
+  $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
+  $exportIfAt -ge 0 -and $matchAt -gt $exportIfAt -and $writeAt -gt $matchAt -and
+    $occurrences -eq 1 -and $assertText -match '\[switch\]\$ExportCiEnv'
+}
+Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion' {
+  $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw
+  $windowsJobAt = $ciText.IndexOf("`n  windows:")
+  $manifestAt = $ciText.IndexOf('- name: Assert toolchain manifest', $windowsJobAt)
+  $nextManifestStepAt = $ciText.IndexOf("`n      - name:", $manifestAt + 1)
+  $manifestStep = if($nextManifestStepAt -gt $manifestAt){ $ciText.Substring($manifestAt, $nextManifestStepAt - $manifestAt) } else { '' }
+  $manifestStep -match 'Assert-Toolchain\.ps1[^\r\n]*-ExportCiEnv'
+}
 Check 'provisioning parameter defaults equal every reviewed pin' {
   $mapping = [ordered]@{
     PythonVersion='python'; MesonVersion='meson'; ErlangVersion='erlang'
