@@ -60,6 +60,15 @@ history:
     `guardian_io_executor.hpp` reword (the sentence's physical-stuck clause moved
     off the word "wedge", leaving "wedge marking" its only wedge-rooted term)
     folded in directly as a same-round hardening commit.
+  - 2026-09-21 - #4659, R5.7 consumer preconditions - (b) records the inert overlay on
+    `subscription_establishment()`, its two stale windows and the first reader's counter rule;
+    (c) replaces "not verified" with the measured rename, move, remove and SMB outcomes (the
+    resolution is tracked in #4676; raw probe transcripts in
+    `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`); (e), (f) and (g) verified
+    already consistent with the corrected (b) and left unchanged (an earlier draft of (b),
+    written before #4658 landed on this branch, narrowed the check to Registry-only and
+    contradicted them — caught and fixed in adversarial review before merge, see the counter
+    rule's `pass_failed` fix too).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -1308,17 +1317,54 @@ Fault callback, or the engine's own pre-start replay failure), so
 once a deleted target's re-arm has resolved to the ancestor the watch is Healthy, `inert` is
 false, and the cache can still read `Notification` if the `None` report was dropped (the
 Registry test that characterises exactly this drops every `None` and deletes the target). A
-Registry sweeper or File worker in persistent failure also leaves a stale `Notification`, unflagged
-until it flips `inert` after three consecutive failed passes. Checking
+Registry sweeper or File worker in persistent failure also leaves a stale `Notification`,
+unflagged until it flips `inert` after `kSweeperInertAfterFailures` / `kFileWorkerInertAfterFailures`
+(3 for either, the latter added by #4658 — see (g)) consecutive failed passes. Checking
 `!stats_by_type()[type].inert` alongside `subscription_health() == Healthy` narrows the Registry
-sweeper-failure and File worker-failure cases, and only once the flag has flipped (three
-consecutive failed passes for either, `kSweeperInertAfterFailures` /
-`kFileWorkerInertAfterFailures`); it does not cover a dropped report.
-(c) `Notification` means the mechanism holds the
+sweeper-failure and File worker-failure cases, and only once the flag has flipped for either; it
+does not cover a dropped report. `subscription_establishment()` itself reports
+`coverage = None` while the type's mechanism `stats().inert` is true; `established_at` is left
+untouched. That overlay is a conservative snapshot, not a coherent one: `inert` is read beside the
+cached value, so `None` can coexist with a newer staged `Notification`, and a stale `Notification`
+can be read once `inert` has cleared. It leaves two windows open. Before the flip, at the default
+50 ms sweep cadence, Registry retries back off 50 ms then 100 ms and `inert` flips on the third
+consecutive failed pass, so a stale `Notification` can be read for that long plus the pass
+durations. After recovery, `inert` clears on the first good pass but each sweep pass visits a
+bounded subset of watches, so a cached value can stay stale until its watch is next visited. The
+first reader closes both with a counter rule (decided 2026-09-21): it snapshots the mechanism's
+debug counters (`sweep_pass_failed` and `established_failed` for Registry, `pass_failed` and
+`established_failed` for File — `pass_failed` is the complete File failure detector per (g)
+below; `established_failed` alone misses an alternating failure/success pattern that never flips
+`inert`) and `stats().inert` before arming, requires `inert` to be false, and re-reads them when the
+measurement ends (any movement, or `inert`, invalidates the sample, recorded as a per-attempt
+reliability failure and never silently excluded); it uses fresh keys
+in isolated directories (no adopted or joined keys, no writes to a File watch's directory during
+an episode); it censors Ancestor-mode subscriptions; it reads only while `is_running()`; and it
+runs in-process, because the counters are `_for_test` accessors that exist on Windows only
+(`nullopt` elsewhere). Log lines are diagnostic only, never the closure. (c) `Notification`
+means the mechanism holds the
 watch and issued the read (Registry: the key exists and the notify is armed; File: the parent
 directory handle is watched, even when the file itself is absent). It is a probe result, NOT an
-end-to-end detection guarantee; whether File's handle-based watch reports the rename of the
-watched directory as a loss is not verified. (d) `coverage == None` with `established_at` unset
+end-to-end detection guarantee. A standalone probe that opens the directory as File does measured
+its handle-based watch on 2026-09-21 (Windows 11 Pro 25H2 build 26200.9457, local NTFS, three
+runs per case, 30 s windows). A rename or move of the watched directory gives no completion: the
+read follows the directory object, writes under the new path are detected, and writes under a
+recreated original path are not. `RemoveDirectory` gives an immediate failed completion
+(`ERROR_ACCESS_DENIED`, `STATUS_DELETE_PENDING`), which is the mechanism's `!ok` branch. A rename
+of the PARENT is refused while the watch handle is open. A change to the watched directory itself
+is not reported. On an SMB share (Samba 4.23.10 in a container, not a Windows file server; the
+silent-drop case was not measured), a hung server fails the read after about 64 s
+(`STATUS_IO_TIMEOUT`, one run) and a gone server fails it at once
+(`STATUS_CONNECTION_DISCONNECTED`, one run). A server-side rename of the watched directory gives
+no completion in 30 s, and a server-side delete gives only the child's REMOVED record, no failed
+completion in 30 s. After a failed completion the old handle stays dead until reopened. The real
+File mechanism was not run against a rename: its outcome is inferred from these results and
+`process_completion_locked`. So a local rename or move, and a rename or delete on a share, leave
+coverage at `Notification` while the target path is unwatched; #4676 tracks the resolution. Until
+it lands, a reader must treat File `Notification` as unconfirmed for a target that could be
+renamed, and a post-establishment write to the original path is only a point-in-time liveness
+check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
+`coverage == None` with `established_at` unset
 means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily deaf).
 With `established_at` set it means one of: the Registry one-shot flap (brief, on the order of
 one re-arm); a Registry target that has since been deleted (Target -> Ancestor: the watch now
