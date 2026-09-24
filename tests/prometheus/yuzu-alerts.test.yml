@@ -2780,3 +2780,36 @@ tests:
       - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
         eval_time: 25m
         exp_samples: []
+
+  # ── YuzuServerPostgresUnreachable (HA WS-8, ADR-2002 §12) ────────────────
+  #
+  # CASE - sustained unreachability fires, per instance. RED if the comparison
+  # is inverted (== 1 would page on every healthy replica) or the gauge name
+  # drifts from what health_routes.cpp exports on /metrics.
+  - interval: 1m
+    name: postgres unreachable - sustained zero fires
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0x10"
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s2"}'
+        values: "1x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE - a failover-length red blip stays quiet. Every replica goes red for
+  # an ordinary Patroni switchover (10-30s, one scrape here); paging on that
+  # would page every failover. RED if `for:` is dropped or shortened below a
+  # scrape interval.
+  - interval: 1m
+    name: postgres unreachable - a one-scrape failover blip stays quiet
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable"}'
+        eval_time: 7m
+        exp_samples: []

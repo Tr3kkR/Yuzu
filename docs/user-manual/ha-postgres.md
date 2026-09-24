@@ -138,6 +138,13 @@ production-grade. You **must**:
   reconnects. These are transient — a retry succeeds — and are bounded by the RTO above. Operators
   running behind the agentic/REST API should expect a short window of 5xx responses during the
   ~30–40 s failover, not a sustained outage.
+- **`/readyz` goes red on every server replica for the failover, then green.** Each replica's
+  reachability probe (HA WS-8) sees the old primary go away — or, briefly, reaches a node that is
+  still a standby — and reports not ready until it reaches the new primary; recovery is one
+  successful probe (about 2 s). A load balancer health-checking `/readyz` stops routing during
+  that window; one that fails open when all backends are down keeps forwarding and gets `503`s.
+  The probe drops its connection whenever it lands on a standby, so it never stays pinned to a
+  demoted node, even behind a proxy that does not kill sessions on failover.
 
 ## Backup and disaster recovery
 

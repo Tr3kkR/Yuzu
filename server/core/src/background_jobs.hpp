@@ -226,6 +226,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are durably re-fetchable)"},
     {"store_worker_pool.worker_loop", "StoreWorkerPool::workers_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers; tracked #4098)"},
+    {"pg_reachability_probe.tick", "PgReachabilityProbe::thread_", BackgroundJobClass::ReplicaSafe,
+     "HA WS-8 per-replica read-only probe (SELECT pg_is_in_recovery() on its own dedicated connection) feeding THIS replica's /readyz pg_reachable row; MUST run per-replica — each replica measures its OWN path to Postgres; never leader-gate (a follower would then report stale/unready and be evicted from the LB)"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site

@@ -171,6 +171,35 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: `/readyz` now goes red when Postgres is unreachable, and shutdown can hold for a drain grace (HA WS-8, ADR-2002 §12)
+
+`/readyz` gains a gating `pg_reachable` row, fed by a small probe on its own Postgres connection. Before
+this change, `/readyz` stayed **200** through a Postgres outage whenever the server had idle pooled
+connections or no traffic (the pool's connect breaker only notices a failed *new* connection, and every
+store's row only reports whether it opened at startup). A load balancer health-checking `/readyz` kept
+sending traffic to a server that could not serve it.
+
+What you may observe after upgrading:
+
+- **`/readyz` answers 503 during a database outage or failover**, with `"failed_stores":["pg_reachable"]`
+  and a `"pg"` reason (`unreachable`, `stale`, `read_only`, `not_yet_probed`). During a Postgres failover
+  every replica goes red at once, for roughly the failover time. If an orchestrator's **liveness** probe
+  points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
+  server.
+- **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
+  pool against `max_connections` (the other extra one is the leader-election connection).
+- **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
+  `docs/user-manual/metrics.md`.
+- **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
+  `SIGTERM` the server keeps serving for at least that long after `/readyz` turns `503 draining`, so a load
+  balancer stops routing to it before the listener closes. The default 0 keeps today's shutdown timing;
+  set it for any deployment behind a load balancer (guidance in `docs/user-manual/server-admin.md`, "Load
+  balancers and shutdown drain"). The execution-drain wait it sits alongside is now timed in wall-clock
+  seconds (at most 30 s) rather than counted as 30 polls.
+
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
+`max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
+
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
 The legacy pre-v1 `GET /api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`,
@@ -1614,7 +1643,9 @@ a rollback is genuinely needed.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
   graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
-  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  draining in-flight executions (or `--shutdown-drain-seconds`, if that is longer — at most 60 s, HA
+  WS-8; every worst case below then grows by the difference: ~145 s, and ~205 s on the rare
+  thread-exhaustion path `docs/user-manual/server-admin.md` describes), up to 5 s on the gRPC shutdown deadline
   (moved up by #3495 to run earlier in the sequence, ahead of the four
   joins below and several other quick housekeeping joins not separately
   listed here, though still after the execution drain — see below),

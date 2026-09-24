@@ -421,6 +421,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
+    'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory

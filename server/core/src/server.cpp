@@ -228,6 +228,8 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
+#include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
@@ -1838,6 +1840,17 @@ public:
                           "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
                           "Total PostgreSQL connection attempts that failed", "counter");
+        // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
+        metrics_.describe("yuzu_server_pg_reachable",
+                          "1 when this replica's dedicated reachability probe can reach a writable "
+                          "Postgres primary (the /readyz pg_reachable row), else 0",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_last_success_age_seconds",
+                          "Seconds since this replica's Postgres reachability probe last succeeded",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_probe_failures_total",
+                          "Total Postgres reachability probes that failed or reached a standby",
+                          "counter");
         metrics_.describe("yuzu_pg_acquire_timeout_total",
                           "Total PostgreSQL pool acquires that timed out before a connection was "
                           "available",
@@ -7718,6 +7731,33 @@ public:
             nvd_sync_->start();
         }
 
+        // HA WS-8 (ADR-2002 §12): the runtime "can this replica reach the `yuzu`
+        // primary?" signal for /readyz. Constructed past every fail-closed check
+        // (same #1867 rationale as the NVD thread above), and its FIRST probe runs
+        // SYNCHRONOUSLY here, before start_web_server() binds the listener, so
+        // there is no post-bind `not_yet_probed` 503 window (every libpq wait is
+        // deadline-bounded — ≤ kConnectDeadline + kQueryDeadline). A failing first
+        // probe does NOT fail boot: the pool just proved Postgres reachable, so a
+        // failure here is a transient blip or a broken dedicated-connection DSN —
+        // either way /readyz reports it loudly and the node stays out of rotation,
+        // which is the correct posture, rather than refusing to start.
+        if (pg_pool_ && !startup_failed_) {
+            pg_reachability_probe_ = PgReachabilityProbe::make_libpq(
+                build_coord_dsn(cfg_.postgres_dsn),
+                PgReachabilityProbe::Observer{.on_failure = [this] {
+                    metrics_.counter("yuzu_server_pg_reachability_probe_failures_total")
+                        .increment();
+                }});
+            pg_reachability_probe_->probe_once();
+            const auto v = pg_reachability_probe_->verdict();
+            if (v != pg_reachability::Verdict::Ready) {
+                spdlog::error("[readyz] boot-time Postgres reachability probe failed "
+                              "(pg_reachable={}); /readyz reports not ready until it succeeds",
+                              pg_reachability::reason(v));
+            }
+            pg_reachability_probe_->start();
+        }
+
         // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
         // its election loop HERE in run() — past every fail-closed check (same
         // #1867 rationale as the NVD thread above: a construction/early-run failure
@@ -9163,14 +9203,32 @@ public:
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
 
-        // Graceful drain: wait for in-flight executions (up to 30s)
-        if (execution_tracker_) {
-            for (int i = 0; i < 30; ++i) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                if (running.empty())
+        // Graceful drain (HA WS-8, ADR-2002 §12): /readyz now answers 503
+        // `draining`; keep the listener open — and every other route serving —
+        // for at least --shutdown-drain-seconds so a load balancer stops routing
+        // here BEFORE the socket closes, and for as long as executions are in
+        // flight (capped at kExecutionDrainCap). Decision + bounds:
+        // shutdown_drain_rules.hpp.
+        {
+            using namespace std::chrono;
+            const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
+                                               shutdown_drain::kMaxShutdownDrainSeconds)};
+            if (min_grace.count() > 0) {
+                spdlog::info("Draining: /readyz reports 503; holding the listener open for {}s "
+                             "so load balancers stop routing here (--shutdown-drain-seconds)",
+                             min_grace.count());
+            }
+            const auto drain_start = steady_clock::now();
+            for (;;) {
+                const auto elapsed = steady_clock::now() - drain_start;
+                std::size_t running = 0;
+                if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
+                    running = execution_tracker_->query_executions({.status = "running"}).size();
+                if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
                     break;
-                spdlog::info("Draining: {} executions in flight, waiting...", running.size());
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (running > 0)
+                    spdlog::info("Draining: {} executions in flight, waiting...", running);
+                std::this_thread::sleep_for(seconds(1));
             }
         }
 
@@ -9182,10 +9240,11 @@ public:
         // the server fully live and EVERY route (except /readyz, which
         // already checks draining_ above) admitted and FULLY PROCESSED for
         // the whole cascade's duration, including racing new work against
-        // stores this same function tears down a few lines later. The 30s
-        // execution-drain window above already gives a load balancer a
-        // /readyz-503 grace period before this point, so closing the
-        // listening socket here does not shorten that signal.
+        // stores this same function tears down a few lines later. The drain
+        // wait above is the load balancer's /readyz-503 grace period: it lasts
+        // at least --shutdown-drain-seconds (default 0 — set it for any
+        // LB-fronted deployment), and longer only while executions are in
+        // flight. With neither, the socket closes here immediately.
         //
         // begin_closing() BEFORE web_server_->stop(): flips the shutdown
         // signal the /events, /api/v1/events, and dashboard-executions-
@@ -9243,6 +9302,14 @@ public:
         if (web_server_) {
             web_server_->stop();
         }
+
+        // HA WS-8: stop the Postgres reachability probe's loop thread. Its OBJECT
+        // is deliberately NOT reset here — /readyz handlers already admitted may
+        // still be running until listen() returns (bounded by the web-thread wait
+        // below), and they read the probe's atomics. The join is bounded by one
+        // poll slice (~200ms): every libpq wait in the probe observes stop().
+        if (pg_reachability_probe_)
+            pg_reachability_probe_->stop();
 
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
@@ -14628,6 +14695,7 @@ private:
                              .draining = &draining_,
                              .server_start_time = server_start_time_,
                              .pg_pool = pg_pool_.get(),
+                             .pg_reachability_probe = pg_reachability_probe_.get(),
                              .response_store = response_store_.get(),
                              .audit_store = audit_store_.get(),
                              .instruction_store = instruction_store_.get(),
@@ -20430,6 +20498,13 @@ private:
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
     std::unique_ptr<LeaderElector> leader_elector_;
     std::thread leader_thread_;
+
+    // HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe behind
+    // /readyz's `pg_reachable` row. Dedicated connection (NOT pg_pool_), own loop
+    // thread. stop() joins the THREAD; the OBJECT lives until ~ServerImpl because
+    // /readyz handlers may still be running after web_server_->stop() (they read
+    // its atomics only) — never reset() it inside stop().
+    std::unique_ptr<PgReachabilityProbe> pg_reachability_probe_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

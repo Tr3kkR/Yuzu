@@ -1563,6 +1563,24 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
+**Update (2026-09-24, WS-8 readyz — monolith).** The monolith's single `/readyz` plays the core role and
+is what the operator LB targets (the tier split is a no-op until ADR-1005's split lands, §1c). Two
+gaps closed:
+- **"Red when core cannot reach `yuzu`" is now true at runtime.** Every store's `is_open()` is latched
+  at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
+  `/readyz` used to stay green through an outage. A dedicated-connection probe
+  (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
+  two failed probes, immediately on reaching a standby (`pg_is_in_recovery()` — core is the sole
+  writer, so a standby-pointed replica cannot serve), or after 15 s without a success. Every libpq call
+  runs under a client-side deadline (non-blocking API) because a blocking query against a frozen
+  backend was measured at 101 s; a standby answer drops the connection so the probe re-resolves
+  through the proxy rather than pinning a demoted node. Consequence, accepted: a Postgres failover
+  turns **every** replica red for the failover window — truthful, since nothing can serve writes.
+  Leadership is deliberately not a readiness condition.
+- **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
+  turns `503 draining`, so the fronting layer drains before the socket closes.
+The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are

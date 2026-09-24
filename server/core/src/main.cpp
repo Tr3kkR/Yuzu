@@ -20,6 +20,7 @@
 #include <CLI/CLI.hpp>
 
 #include "server_ota_options.hpp"
+#include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -328,6 +329,14 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
+                   "On shutdown, keep serving for at least this many seconds after /readyz "
+                   "starts answering 503, so a load balancer stops routing here before the "
+                   "listener closes (default 0; 0-60). Set it to at least the load balancer's "
+                   "health-check interval x unhealthy threshold, plus one interval.")
+        ->default_val(0)
+        ->check(CLI::Range(0, yuzu::server::shutdown_drain::kMaxShutdownDrainSeconds))
+        ->envname("YUZU_SHUTDOWN_DRAIN_SECONDS");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
