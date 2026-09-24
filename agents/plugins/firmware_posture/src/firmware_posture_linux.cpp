@@ -17,14 +17,16 @@
  * Failure vs absence (run-context CONTRACT DECISION): a DEFINITIVE not-there
  * (dmi file ENOENT, fwupd's ServiceUnknown/NameHasNoOwner reply) adds NO
  * failure token. Everything else (EACCES, EIO, ENOTDIR, a system bus that
- * cannot be opened, oversized, signature mismatch,
- * budget exhausted, unexpected D-Bus error) is recorded through
- * FirmwareReport::fail / note_failure as a `<source>:<cause>` token; a refused
- * read (EACCES/EPERM, AccessDenied) also sets the denial flag. Every
- * classification (classify_errno, classify_fwupd_error) and every row mapping
+ * cannot be opened, oversized, signature mismatch, budget exhausted,
+ * unexpected D-Bus error) is recorded through FirmwareReport::fail /
+ * note_failure as a `<source>:<cause>` token; a refused read (EACCES/EPERM,
+ * AccessDenied) also sets the denial flag. Every classification
+ * (classify_errno, classify_fwupd_error), every outcome-to-row/token mapping
+ * (apply_fwupd_failure, record_dmi_read_error) and every row mapping
  * (parse_dmi_sysfs/dmi_rows, fwupd_device_rows) is a pure function in the
- * parsers header; this TU only performs the calls, builds a FirmwareReport
- * and hands it to finish_report -- the one writer of rows and result status.
+ * parsers header; this TU only performs the calls and formats errno names,
+ * builds a FirmwareReport and hands it to finish_report -- the one writer of
+ * rows and result status.
  *
  * A build without libsystemd (-Dsystemd_guard=auto|disabled) is a
  * reduced-coverage BUILD, not an OS statement: it reports update_pending
@@ -65,9 +67,10 @@
  * org.freedesktop.fwupd.NothingToDo "Device is not updatable"; an unknown id
  * -> org.freedesktop.fwupd.NotFound; no fwupd on a running bus ->
  * org.freedesktop.DBus.Error.ServiceUnknown; no bus at all -> sd_bus_open_system
- * fails ENOENT (reported as a failed read, not as fwupd being absent). NOT probed on real hardware or as the agent's service user
- * (no such host in this run): an unprivileged caller's polkit outcome is
- * unmeasured, which is exactly why AccessDenied is treated as a refusal (denied).
+ * fails ENOENT (reported as a failed read, not as fwupd being absent). NOT
+ * probed on real hardware or as the agent's service user (no such host in
+ * this run): an unprivileged caller's polkit outcome is unmeasured, which is
+ * exactly why AccessDenied is treated as a refusal (denied).
  */
 #include "firmware_posture_legs.hpp"
 
@@ -96,6 +99,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+// classify_errno (parsers header) spells these errnos as bare integers so the pure layer needs no
+// OS header; pin them to this platform's real values, as the Windows leg does for its constants.
+static_assert(EPERM == 1 && ENOENT == 2 && EACCES == 13 && ENOTDIR == 20,
+              "classify_errno's integer literals must match this platform's errno values");
 
 namespace yuzu::firmware_posture {
 
@@ -186,12 +194,8 @@ void collect_dmi(FirmwareReport& report) {
             // ENOENT (no DMI on this platform, or no bios_release on this
             // board) is a definitive absence: not in the map, no token. ENOTDIR
             // is a malformed path, so it falls through to a failure token.
-            const ReadOutcome o = classify_errno(r.err);
-            if (o == ReadOutcome::absent)
-                break;
-            unreadable_keys.emplace_back(name);
-            report.note_failure(std::string{"dmi:"} + name + ":" + errno_token(r.err),
-                                o == ReadOutcome::denied);
+            record_dmi_read_error(report, unreadable_keys, name, classify_errno(r.err),
+                                  errno_token(r.err));
             break;
         }
         }
@@ -262,30 +266,15 @@ std::string_view dbus_error_name(const sd_bus_error& err) {
     return err.name ? std::string_view{err.name} : std::string_view{};
 }
 
-/// A failed sd_bus_open_system / GetDevices, translated through the pure
-/// classifier. Returns true when the caller continues to the row mapper
-/// (NothingToDo: a reachable daemon with an empty device list); false when
-/// the outcome was final (row and/or token already recorded).
+/// A failed sd_bus_open_system / GetDevices: classify through the pure
+/// classifier, then map through apply_fwupd_failure (the pure half). Returns
+/// true when the caller continues to the row mapper (NothingToDo: a reachable
+/// daemon with an empty device list); false when the outcome was final (row
+/// and/or token already recorded).
 bool handle_fwupd_failure(FirmwareReport& report, std::string_view dbus_name, int neg_rc,
                           std::string_view what) {
     const int e = neg_rc < 0 ? -neg_rc : EIO;
-    switch (classify_fwupd_error(dbus_name, e)) {
-    case FwupdOutcome::no_devices:
-        return true;
-    case FwupdOutcome::unavailable:
-        // fwupd DEFINITIVELY not there: the row alone, no token (contract).
-        report.add(fwupd_unavailable_row());
-        return false;
-    case FwupdOutcome::denied:
-        report.fail("update_pending", kSrcFwupd, "fwupd:" + std::string{what} + ":permission_denied",
-                    true);
-        return false;
-    case FwupdOutcome::failed:
-        report.fail("update_pending", kSrcFwupd,
-                    "fwupd:" + std::string{what} + ":" + errno_token(e));
-        return false;
-    }
-    return false;
+    return apply_fwupd_failure(report, classify_fwupd_error(dbus_name, e), what, errno_token(e));
 }
 
 /// Reads a device array (reply signature 'aa{sv}', table rows 1-2) into
@@ -408,8 +397,9 @@ void collect_fwupd(FirmwareReport& report) {
     const int open_rc = sd_bus_open_system(&bus.bus);
     if (open_rc < 0 || !bus.bus) {
         // An unopenable bus proves this process cannot reach it, not that
-        // fwupd is absent: it is a failed read (bus_open:<errno>), never
-        // unavailable. An empty D-Bus name = the failure is an errno.
+        // fwupd is absent: a failed read (bus_open:<errno>), or a refusal
+        // (bus_open:permission_denied) for EACCES/EPERM, never unavailable. An
+        // empty D-Bus name = the failure is an errno.
         handle_fwupd_failure(report, {}, open_rc, "bus_open");
         return;
     }

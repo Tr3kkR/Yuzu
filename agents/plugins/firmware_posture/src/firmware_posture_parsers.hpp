@@ -7,8 +7,9 @@
  * Rows: firmware|<field>|<value>|<source>, source in smbios wmi dmi fwupd iokit sysctl, every
  * field via yuzu::util::safe_output_field. Value states that are not data: `absent` (the OS
  * definitively reports nothing; no failure token, status stays OK), `unreadable` (the read
- * failed; always paired with a failure token and a non-OK status), `unavailable` (the mechanism
- * is not installed, e.g. no fwupd; not a failure), and `unmodelled=` on fwupd devices (flag bits
+ * failed; always paired with a failure token and a non-OK status), `unavailable` (the system bus
+ * answered and reports the mechanism not installed, e.g. fwupd's ServiceUnknown; not a failure),
+ * and `unmodelled=` on fwupd devices (flag bits
  * this mapper does not name). Failure tokens are `<source>:<detail>`.
  */
 #pragma once
@@ -19,6 +20,7 @@
 #include <constraint_accumulator.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -95,12 +97,44 @@ enum class ReadOutcome { ok, absent, denied, failed };
 }
 
 /// WMI / COM HRESULT bit patterns: WBEM_E_ACCESS_DENIED / E_ACCESSDENIED are refusals; a
-/// missing namespace, class or object (0x8004100E, 0x80041010, 0x80041002) is absence.
+/// missing namespace, class or object (0x8004100E, 0x80041010, 0x80041002) is absence. This is
+/// the meaning of the bare HRESULT only: whether a given wmi_bounded token may read `absent` also
+/// depends on the STAGE that produced it (classify_wmi_error_token).
 [[nodiscard]] constexpr ReadOutcome classify_hresult(std::uint32_t hr) noexcept {
     if (hr == 0) return ReadOutcome::ok;
     if (hr == 0x80041003u || hr == 0x80070005u) return ReadOutcome::denied;
     if (hr == 0x8004100Eu || hr == 0x80041010u || hr == 0x80041002u) return ReadOutcome::absent;
     return ReadOutcome::failed;
+}
+
+/// The HRESULT a wmi_bounded error token ends in (`..._0x<8 hex digits>`, e.g.
+/// wmi_connect_failed_0x80041003), or nullopt for a token that carries none (com_init_failed,
+/// wmi_deadline_exceeded, ...). Extraction only: what the HRESULT means is classify_hresult's job.
+[[nodiscard]] inline std::optional<std::uint32_t> hresult_from_token(std::string_view token) noexcept {
+    constexpr std::size_t kTail = 10; // "0x" + 8 hex digits
+    if (token.size() < kTail) return std::nullopt;
+    const char* first = token.data() + token.size() - kTail;
+    if (first[0] != '0' || first[1] != 'x') return std::nullopt;
+    std::uint32_t hr = 0;
+    const char* last = token.data() + token.size();
+    const auto [ptr, ec] = std::from_chars(first + 2, last, hr, 16);
+    if (ec != std::errc{} || ptr != last) return std::nullopt;
+    return hr;
+}
+
+/// Classifies a wmi_bounded error token, STAGE-AWARE. Only a CONNECT- or QUERY-stage token whose
+/// HRESULT names a missing namespace, class or object may read `absent` (the namespace or class
+/// itself is not there: a definitive answer). Any later stage (the proxy blanket, or enumeration:
+/// `wmi_next_failed_*`) runs AFTER the class was proven present by a successful connect and query,
+/// so the same HRESULT there is a runtime fault (a damaged repository or provider), never absence:
+/// `denied` for a refusal HRESULT, else `failed`. A token with no HRESULT is `failed`.
+[[nodiscard]] inline ReadOutcome classify_wmi_error_token(std::string_view token) noexcept {
+    const auto hr = hresult_from_token(token);
+    const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
+    const bool absence_stage = token.starts_with("wmi_connect_failed_") ||
+                               token.starts_with("wmi_query_failed_");
+    if (o == ReadOutcome::absent && !absence_stage) return ReadOutcome::failed;
+    return o == ReadOutcome::ok ? ReadOutcome::failed : o;
 }
 
 /// Everything a leg gathered: rows to write plus the failure accounting.
@@ -536,9 +570,49 @@ struct FwupdRows {
     return out;
 }
 
-/// fwupd is not installed / not on the bus: a state, not a failure.
+/// fwupd is not on a system bus that answered (ServiceUnknown / NameHasNoOwner): a state, not a
+/// failure.
 [[nodiscard]] inline FirmwareRow fwupd_unavailable_row() {
     return {"update_pending", std::string{kUnavailable}, std::string{kSrcFwupd}};
+}
+
+/// The pure half of the Linux leg's failed-D-Bus-call handling: maps an already-classified outcome
+/// onto the report. `what` is the failing call (bus_open, get_devices, ...) and `errno_tok` the
+/// caller-formatted errno name (kept in the leg: it is platform vocabulary). Returns true when the
+/// caller continues to the row mapper (NothingToDo: a reachable daemon with no devices); false
+/// when the outcome was final (row and/or token already recorded). `unavailable` writes the row
+/// alone with NO token; `failed` and `denied` write an `unreadable` row plus a token.
+[[nodiscard]] inline bool apply_fwupd_failure(FirmwareReport& report, FwupdOutcome outcome,
+                                              std::string_view what, std::string_view errno_tok) {
+    switch (outcome) {
+    case FwupdOutcome::no_devices:
+        return true;
+    case FwupdOutcome::unavailable:
+        report.add(fwupd_unavailable_row());
+        return false;
+    case FwupdOutcome::denied:
+        report.fail("update_pending", kSrcFwupd,
+                    "fwupd:" + std::string{what} + ":permission_denied", true);
+        return false;
+    case FwupdOutcome::failed:
+        report.fail("update_pending", kSrcFwupd,
+                    "fwupd:" + std::string{what} + ":" + std::string{errno_tok});
+        return false;
+    }
+    return false;
+}
+
+/// The pure half of the Linux leg's DMI read-error arm. ENOENT (`absent`) is a definitive absence:
+/// nothing recorded and the key stays out of the map. Every other outcome marks the key unreadable
+/// (so its field row reads `unreadable`, never `absent`) and records `dmi:<file>:<errno>`; a
+/// refusal also sets the denial flag.
+inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::string>& unreadable_keys,
+                                  std::string_view file, ReadOutcome outcome,
+                                  std::string_view errno_tok) {
+    if (outcome == ReadOutcome::absent) return;
+    unreadable_keys.emplace_back(file);
+    report.note_failure("dmi:" + std::string{file} + ":" + std::string{errno_tok},
+                        outcome == ReadOutcome::denied);
 }
 
 struct DtNode {

@@ -22,6 +22,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -431,6 +432,138 @@ TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware
     CHECK(classify_fwupd_error("", 13) == FwupdOutcome::denied);
     CHECK(classify_fwupd_error("", 5) == FwupdOutcome::failed);
     CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 0) == FwupdOutcome::failed);
+}
+
+// Fails under: dropping the `dbus_error_name.empty()` guard (a NAMED, unrelated error carrying
+// an EACCES errno would read `denied`), or an unnamed non-refusal errno reading as a refusal.
+TEST_CASE("classify_fwupd_error: only an UNNAMED failure is judged by its errno", "[firmware_posture]") {
+    CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 13) == FwupdOutcome::failed);
+    CHECK(classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 2) == FwupdOutcome::failed);
+    CHECK(classify_fwupd_error("", 111) == FwupdOutcome::failed);
+    CHECK(classify_fwupd_error("", 0) == FwupdOutcome::failed);
+}
+
+// The outcome -> row/token/status mapping the Linux leg applies to a failed D-Bus call. Fails
+// under: an unopenable bus mapping back to the `unavailable` row (the defect an external review
+// found), a `failed` outcome recording no token, or `denied` not setting the denial flag.
+TEST_CASE("apply_fwupd_failure: an unopenable bus is unreadable plus a token, never unavailable",
+          "[firmware_posture]") {
+    FirmwareReport rep;
+    CHECK_FALSE(apply_fwupd_failure(rep, classify_fwupd_error("", 2), "bus_open", "enoent"));
+    REQUIRE(rep.rows.size() == 1);
+    CHECK(row_str(rep.rows[0]) == "firmware|update_pending|unreadable|fwupd");
+    const auto v = select_verdict(rep.constraints, rep.denied);
+    CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(v.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(v.rc == 1);
+    CHECK(v.reason == "fwupd:bus_open:enoent");
+}
+
+TEST_CASE("apply_fwupd_failure: a refused bus connect is PERMISSION_DENIED with its own token",
+          "[firmware_posture]") {
+    FirmwareReport rep;
+    CHECK_FALSE(apply_fwupd_failure(rep, classify_fwupd_error("", 13), "bus_open", "eacces"));
+    REQUIRE(rep.rows.size() == 1);
+    CHECK(row_str(rep.rows[0]) == "firmware|update_pending|unreadable|fwupd");
+    CHECK(rep.denied);
+    const auto v = select_verdict(rep.constraints, rep.denied);
+    CHECK(v.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(v.reason == "fwupd:bus_open:permission_denied");
+}
+
+// Fails under: the named-reply `unavailable` gaining a failure token, or losing its row.
+TEST_CASE("apply_fwupd_failure: a named ServiceUnknown reply is the unavailable state, no token",
+          "[firmware_posture]") {
+    FirmwareReport rep;
+    const auto o = classify_fwupd_error("org.freedesktop.DBus.Error.ServiceUnknown", 0);
+    CHECK_FALSE(apply_fwupd_failure(rep, o, "get_devices", "errno_0"));
+    REQUIRE(rep.rows.size() == 1);
+    CHECK(row_str(rep.rows[0]) == "firmware|update_pending|unavailable|fwupd");
+    const auto v = select_verdict(rep.constraints, rep.denied);
+    CHECK(v.status == YUZU_RESULT_STATUS_OK);
+    CHECK(v.rc == 0);
+    CHECK(v.reason.empty());
+}
+
+TEST_CASE("apply_fwupd_failure: NothingToDo continues to the row mapper with nothing recorded",
+          "[firmware_posture]") {
+    FirmwareReport rep;
+    const auto o = classify_fwupd_error("org.freedesktop.fwupd.NothingToDo", 0);
+    CHECK(apply_fwupd_failure(rep, o, "get_devices", "errno_0"));
+    CHECK(rep.rows.empty());
+    CHECK_FALSE(rep.constraints.any_failure());
+}
+
+// The DMI read-error arm. Fails under: ENOTDIR (a malformed path) reading as a silent absence, or
+// ENOENT (no DMI, or no bios_release on this board) gaining a token.
+TEST_CASE("record_dmi_read_error: ENOENT is silent absence; ENOTDIR and EACCES are unreadable plus a token",
+          "[firmware_posture][dmi]") {
+    {
+        FirmwareReport rep;
+        std::vector<std::string> keys;
+        record_dmi_read_error(rep, keys, "bios_release", classify_errno(2), "enoent");
+        CHECK(keys.empty());
+        CHECK_FALSE(rep.constraints.any_failure());
+    }
+    {
+        FirmwareReport rep;
+        std::vector<std::string> keys;
+        record_dmi_read_error(rep, keys, "bios_vendor", classify_errno(20), "enotdir");
+        REQUIRE(keys.size() == 1);
+        CHECK(keys[0] == "bios_vendor");
+        CHECK_FALSE(rep.denied);
+        const auto v = select_verdict(rep.constraints, rep.denied);
+        CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(v.reason == "dmi:bios_vendor:enotdir");
+        // Handed to the field mapper, the key's row reads `unreadable`, never `absent`.
+        auto files = kDmiPopulated;
+        files.erase("bios_vendor");
+        CHECK(row_str(dmi_rows(parse_dmi_sysfs(files, keys))[0]) == "firmware|vendor|unreadable|dmi");
+    }
+    {
+        FirmwareReport rep;
+        std::vector<std::string> keys;
+        record_dmi_read_error(rep, keys, "bios_version", classify_errno(13), "eacces");
+        CHECK(keys == std::vector<std::string>{"bios_version"});
+        CHECK(rep.denied);
+        CHECK(select_verdict(rep.constraints, rep.denied).status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    }
+}
+
+TEST_CASE("hresult_from_token: extracts only a trailing 0x<8 hex digits>", "[firmware_posture]") {
+    CHECK(hresult_from_token("wmi_connect_failed_0x80041003") == std::optional<std::uint32_t>{0x80041003u});
+    CHECK(hresult_from_token("x_0x8004100E") == std::optional<std::uint32_t>{0x8004100Eu});
+    CHECK_FALSE(hresult_from_token("wmi_deadline_exceeded").has_value());
+    CHECK_FALSE(hresult_from_token("com_init_failed").has_value());
+    CHECK_FALSE(hresult_from_token("wmi_query_failed_0x8004100").has_value()); // 7 digits
+    CHECK_FALSE(hresult_from_token("wmi_query_failed_0x8004100g").has_value());
+    CHECK_FALSE(hresult_from_token("").has_value());
+}
+
+// The stage-aware WMI error classification. Fails under: an enumeration-stage NOT_FOUND
+// (wmi_next_failed_0x80041002, a runtime fault AFTER the connect and query proved the class
+// present) reading as a definitive `absent` with no token; and, in the other direction, under
+// losing the connect/query-stage `absent` the earlier governance contract requires (a missing
+// namespace or class must emit an explicit absent row).
+TEST_CASE("classify_wmi_error_token: only connect- and query-stage tokens may read absent",
+          "[firmware_posture]") {
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x8004100e") == ReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010") == ReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002") == ReadOutcome::absent);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041002") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002") == ReadOutcome::failed);
+    // A refusal is a refusal at every stage.
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041003") == ReadOutcome::denied);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80070005") == ReadOutcome::denied);
+    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041003") == ReadOutcome::denied);
+    // No HRESULT, an unrelated HRESULT, or an HRESULT of 0: always a failed read.
+    CHECK(classify_wmi_error_token("wmi_deadline_exceeded") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("com_init_failed") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_query_failed_no_in_signature") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80004005") == ReadOutcome::failed);
+    CHECK(classify_wmi_error_token("wmi_connect_failed_0x00000000") == ReadOutcome::failed);
 }
 
 // Fails under: any arm swapping status (the one function every leg shares).

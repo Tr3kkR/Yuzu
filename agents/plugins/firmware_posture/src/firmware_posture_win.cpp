@@ -63,7 +63,6 @@
 #include <windows.h>
 #include <wbemidl.h>
 
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -107,25 +106,6 @@ constexpr int kMaxSmbiosAttempts = 3;
 
 // ── wmi ──────────────────────────────────────────────────────────────────
 
-/// The HRESULT a wmi_bounded error token ends in (`..._0x<8 hex digits>`,
-/// e.g. wmi_connect_failed_0x80041003), or nullopt for a token that carries
-/// none (com_init_failed, wmi_next_timeout, ...). Extraction only: what the
-/// HRESULT means is classify_hresult's job.
-std::optional<std::uint32_t> hresult_from_token(const std::string& token) {
-    constexpr std::size_t kTail = 10; // "0x" + 8 hex digits
-    if (token.size() < kTail)
-        return std::nullopt;
-    const char* first = token.data() + token.size() - kTail;
-    if (first[0] != '0' || first[1] != 'x')
-        return std::nullopt;
-    std::uint32_t hr = 0;
-    const char* last = token.data() + token.size();
-    const auto [ptr, ec] = std::from_chars(first + 2, last, hr, 16);
-    if (ec != std::errc{} || ptr != last)
-        return std::nullopt;
-    return hr;
-}
-
 void collect_wmi(FirmwareReport& report) {
     // rung 1: in-process bounded WMI query (Win32_BIOS); no wmic/PowerShell
     // spawn (not a spawn sink).
@@ -133,8 +113,9 @@ void collect_wmi(FirmwareReport& report) {
         L"root\\CIMV2", L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS");
 
     if (query.error.has_value()) {
-        const auto hr = hresult_from_token(*query.error);
-        const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
+        // Stage-aware: only a connect- or query-stage token may read `absent`; the same HRESULT
+        // from enumeration (wmi_next_failed_*) is a runtime fault after the class was proven there.
+        const ReadOutcome o = classify_wmi_error_token(*query.error);
         if (o == ReadOutcome::absent) {
             report.add_all(wmi_bios_rows({})); // namespace/class not there: a definitive absent row
             return;
