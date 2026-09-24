@@ -508,6 +508,11 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
     // us skip (a budget that dies exactly at a container boundary, or on a listing
     // of only non-directory entries, would otherwise skip the rest silently).
     bool budget_recorded = false;
+    // The byte cap has no equivalent dedup: `budget.exhausted()` above checks only
+    // entries/deadline, so once bytes run out the loop still opens (and lists, and
+    // discards) every remaining container, each recording its own `byte_cap` token.
+    // Bounded (at most 3 more, fixed by kPrefixes x kContainers) and each token is
+    // truthful for what it names, so this is wasted work, not a wrong result.
     [&] {
         for (const auto& prefix : detail::kPrefixes) {
             for (const auto& c : detail::kContainers) {
@@ -574,6 +579,7 @@ private:
     explicit WalkSlot(std::atomic<bool>* flag) noexcept : flag_(flag) {}
     [[nodiscard]] static std::atomic<bool>& flag_for(Action a) noexcept {
         static std::atomic<bool> flags[2]{};
+        static_assert(std::size(flags) == 2, "one slot per Action value; add one before adding a leg");
         return flags[static_cast<std::size_t>(a)];
     }
     std::atomic<bool>* flag_;
