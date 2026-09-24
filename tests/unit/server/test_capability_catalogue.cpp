@@ -34,6 +34,7 @@
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -144,6 +145,7 @@ struct LabeledSpan {
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
+        {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -170,6 +172,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_runtimes(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -386,5 +389,29 @@ TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exac
         CHECK(it->risk_tier == authz::RiskTier::Low);
         CHECK_FALSE(it->system_reserved);
         CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
+/// Exact-row pin for `browser_inventory` (Wave 10 Forensics-class plugin,
+/// P2a-3), the same way `kReversibleDestructive` protects
+/// `power_health.set_power_plan`'s fields and the autoruns pin above
+/// protects autoruns' — a field-for-field copy of execution_artifacts'
+/// Forensics/AdminOrApproval boundary (see the catalogue fragment's file
+/// header) must not silently drift.
+TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_browser_inventory();
+    for (const auto action : {"browsers", "profiles"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Forensics");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->risk_tier == authz::RiskTier::High);
+        CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(it->system_reserved);
     }
 }

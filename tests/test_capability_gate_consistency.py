@@ -98,6 +98,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -118,17 +119,19 @@ FRAGMENT_FILES = [
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
 # Wave 9 PR9.1b: +2 printing (printers/jobs).
 # Wave 9 PR9.1b (follow-up): +1 printing.clear_queue.
+# Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
 # Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (printing.clear_queue) + 2 (app_control) + 2 (runtimes, dotnet/jvm) = 214.
-# This branch's own base (209, pre-clear_queue/app_control) and dev's base
-# (212, pre-runtimes) each independently bumped from 209 -- merging both
-# means adding both increments on top of the shared 209, not picking one
-# side's total.
-EXPECTED_TOTAL_ROWS = 214
+# 1 (printing.clear_queue) + 2 (app_control) + 2 (runtimes, dotnet/jvm) +
+# 2 (browser_inventory) = 216.
+# This branch and dev each independently bumped this constant to 214 over the
+# same 209 baseline (runtimes' own +2 here, browser_inventory's own +2 there)
+# with neither aware of the other's addition -- merging both means adding both
+# increments on top of the shared base, not picking one side's 214.
+EXPECTED_TOTAL_ROWS = 216
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

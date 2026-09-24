@@ -306,6 +306,16 @@ numbers match.
   adjacent rows. It is the same behavioral-PII access class as the REST drill and
   carries the **same audit action (`dex.device.app_perf.view`)**; per-version
   crashes/hangs are a planned enrichment (a separate central crash-store join).
+  When this panel's data cannot be read (the app-perf backing store is either
+  not configured or degraded — the two are no longer distinguished), it shows
+  "App performance data unavailable (not configured or degraded) — retry
+  shortly." The **fleet-wide application performance** trend/app-list panel
+  above shows the SAME unified wording on its own unwired-or-degraded path.
+  The fleet-now Performance tab (the live heartbeat panel, unrelated to this
+  retained B1/B2 surface) and the per-version "which devices" drill each keep
+  their OWN unchanged, more specific wording ("no perf snapshot provider
+  wired" / "no app-perf device provider wired" respectively) — only the two
+  app-perf-over-time surfaces above collapsed to one message.
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 - **Per-observation** — click any row in a device's signal history to load the

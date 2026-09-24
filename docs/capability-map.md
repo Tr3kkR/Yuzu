@@ -64,14 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/172 done (75%) (21 partial)
-Future       [=========-----------------------]  10/34 done  (29%) (4 partial)
+Advanced     [========================--------]  129/175 done  (74%) (21 partial)
+Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/265 done (73%) (26 partial)
-Advanced     [========================--------]  129/175 done (74%) (21 partial)
-Future       [=========-----------------------]  10/35 done  (29%) (3 partial)
-─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done (72%) (25 partial)
+Overall      [=======================---------]  194/269 done  (72%) (26 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -1646,6 +1642,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | app_usage | Y | Y | Y | Security |
 | execution_artifacts | Y | - | - | Security |
 | app_control | Y | - | - | Security |
+| browser_inventory | - | Y | - | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
@@ -1668,7 +1665,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**57 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified fresh at this merge (`ls -d agents/plugins/*/` = 59 directories, minus `example` + `chargen` = 57; both `app_control` — added by Wave 8 PR8.6 — and `runtimes` — this PR, Linux leg only shipped — are now real directories, confirmed present). Prior recounts: 2026-09-21 (58 dirs / 56, `runtimes` present but `app_control` not yet); 2026-09-18 (57 dirs / 55, `app_control` present but `runtimes` not yet) — this merge is the first point both exist together. The 2026-09-18 recount also caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**58 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-22 (`ls -d agents/plugins/*/` = 60 directories, minus `example` + `chargen` = 58). This recount catches up `runtimes` (Wave 10 PR10.1-b), `browser_inventory` (Wave 10 P2a-3, Linux leg only this wave — macOS/Windows follow as their own PR) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

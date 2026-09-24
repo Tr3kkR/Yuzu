@@ -1932,7 +1932,11 @@ are rejected. Response:
 
 `crl_republished: false` means the revocation stands (the agent is refused on its
 next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
-will not see it until the next successful publish. Errors: `400` (missing/invalid
+will not see it until the next successful publish. The server retries on its own:
+the leader's freshness pass republishes on its next 15-second tick once the cause
+clears (up to about 5 minutes later if that attempt fails too). Repeating the
+`POST` is not a retry — it returns `404` because the serial is already revoked.
+Errors: `400` (missing/invalid
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
@@ -3503,7 +3507,7 @@ Create a new policy fragment from YAML.
 
 Delete a policy fragment.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3658,7 +3662,7 @@ Get policy detail including compliance summary.
 
 Delete a policy and all associated compliance data.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Delete`
 
 **Response:**
 
@@ -3680,7 +3684,7 @@ Enable a previously disabled policy.
 
 ```json
 {
-  "status": "enabled"
+  "status": "ok"
 }
 ```
 
@@ -3700,7 +3704,7 @@ Disable a policy, pausing compliance checks.
 
 ```json
 {
-  "status": "disabled"
+  "status": "ok"
 }
 ```
 
@@ -3714,13 +3718,13 @@ included in the body.
 
 Invalidate agent-side compliance cache for a specific policy. Resets all agent statuses to `pending`, forcing re-evaluation.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "agents_invalidated": 42
 }
 ```
@@ -3734,13 +3738,13 @@ retry, internal error string never included in the body.
 
 Invalidate compliance cache for all policies across all agents.
 
-**Permission:** `Policy:Write`
+**Permission:** `Policy:Execute`
 
 **Response:**
 
 ```json
 {
-  "status": "invalidated",
+  "status": "ok",
   "total_invalidated": 210
 }
 ```
