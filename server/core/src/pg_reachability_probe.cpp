@@ -363,7 +363,7 @@ private:
                     // a running server: re-check what THIS connection resolved, and
                     // report red rather than measure a pool that now shuffles hosts
                     // or may land on a standby (Gate 8 round 8).
-                    if (auto ok = pg::check_effective_connection(c); !ok)
+                    if (auto ok = pg::check_effective_connection(c, hosts.size()); !ok)
                         return "connection settings not supported: " + ok.error();
                     if (PQsetnonblocking(c, 1) != 0)
                         return pq_error(c, "could not set non-blocking mode");

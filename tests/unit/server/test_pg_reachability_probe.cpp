@@ -832,7 +832,8 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a silent first host from a PGHOST li
     } restore_host{"PGHOST"}, restore_port{"PGPORT"};
     ::setenv("PGHOST", ("127.0.0.1," + pg_host).c_str(), 1);
     ::setenv("PGPORT", (std::to_string(frozen.port) + "," + pg_port).c_str(), 1);
-    auto probe = make_host_list_probe(no_hosts);
+    // The multi-host guard adds read-write for a PGHOST list; so must this test.
+    auto probe = make_host_list_probe(no_hosts + " target_session_attrs=read-write");
     const auto t = std::chrono::steady_clock::now();
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
@@ -1086,6 +1087,20 @@ TEST_CASE("check_effective_connection: a service file's load_balance_hosts or re
         // PQconninfo reports libpq's default "any" for an unset attribute; the
         // message says so rather than implying the operator set it.
         CHECK(r.error().find("the default when none is set") != std::string::npos);
+    }
+    SECTION("a restart narrowed to one host still applies the full list's read-write rule") {
+        // Round 9 (self-review): the probe's restart after a silent host narrows
+        // the list; the check must follow the list the pool walks.
+        {
+            std::ofstream f(svc_file, std::ios::trunc);
+            f << "[yzsvc]\n" << hosts;
+        }
+        yuzu::server::pg::PgConn c{PQconnectdb((no_hosts + "service=yzsvc host=" + pg_host +
+                                                " port=" + pg_port)
+                                                   .c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        CHECK(yuzu::server::pg::check_effective_connection(c.get()).has_value()); // 1 host
+        CHECK_FALSE(yuzu::server::pg::check_effective_connection(c.get(), 2).has_value());
     }
     SECTION("the readiness probe re-checks on every connection: a service file edited to set "
             "load_balance_hosts turns it red") {

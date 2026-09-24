@@ -76,7 +76,11 @@ std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std
 /// bootstrap pool's first connection and refuses to start on an error; the
 /// readiness probe runs it on every new connection of its own (libpq re-reads a
 /// service file on each connect) and reports not-ready on an error.
-std::expected<void, std::string> check_effective_connection(PGconn* conn);
+/// `listed_hosts`: how many hosts the caller's full list had, when `conn` was made
+/// over a narrowed list (the probe's restart after a silent host) — the
+/// read-write rule follows the list the pool walks, not the narrowed one.
+std::expected<void, std::string> check_effective_connection(PGconn* conn,
+                                                            std::size_t listed_hosts = 0);
 
 /// `value` as a single-quoted libpq keyword/value conninfo value (`'` and `\`
 /// backslash-escaped). Shared by the DSN rebuild here and the readiness probe's

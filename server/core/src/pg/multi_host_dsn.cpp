@@ -83,7 +83,8 @@ std::string quote_conninfo_value(std::string_view value) {
     return out;
 }
 
-std::expected<void, std::string> check_effective_connection(PGconn* conn) {
+std::expected<void, std::string> check_effective_connection(PGconn* conn,
+                                                            std::size_t listed_hosts) {
     if (conn == nullptr)
         return std::unexpected(std::string("no connection to check"));
     const OptionsPtr info(PQconninfo(conn), &PQconninfoFree);
@@ -97,8 +98,8 @@ std::expected<void, std::string> check_effective_connection(PGconn* conn) {
             " is set in the Postgres connection settings and is not supported for the server: "
             "remove it (check the service file and environment too), or set "
             "load_balance_hosts=disable.");
-    const std::size_t hosts =
-        std::max<std::size_t>({list_len(get(v, "host")), list_len(get(v, "hostaddr")), 1});
+    const std::size_t hosts = std::max<std::size_t>(
+        {list_len(get(v, "host")), list_len(get(v, "hostaddr")), listed_hosts, 1});
     const std::string_view tsa = get(v, kTsa);
     if (hosts >= 2 && tsa != "read-write" && tsa != "primary") {
         const bool known = std::ranges::find(kKnownTsaValues, tsa) != std::end(kKnownTsaValues);
