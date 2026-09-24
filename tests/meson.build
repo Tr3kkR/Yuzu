@@ -536,7 +536,7 @@ agent_test_exe = executable(
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
-    'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over a materialized REAL CAPTURE tree manifest (walk bodies POSIX-only)
+    'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
   ),
   include_directories: [
@@ -2304,6 +2304,15 @@ test('capability catalogue completeness',
 test('capability gate consistency',
   _python3_test,
   args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# runtimes' definition-column contract (content/definitions/runtimes.yaml): row_kind first and the
+# column order match the wire row runtimes_parsers.hpp emits; parses the YAML directly.
+test('runtimes definition columns',
+  _python3_test,
+  args: [files('test_runtimes_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

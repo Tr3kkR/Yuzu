@@ -1012,10 +1012,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
-         "install path (directory walk, no subprocess)"},
+         "install path (Linux only; directory walk, no subprocess)"},
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
-         "release file (no subprocess)"},
+         "release file (Linux only; no subprocess)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

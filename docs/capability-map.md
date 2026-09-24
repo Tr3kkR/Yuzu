@@ -1623,7 +1623,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | discovery | Y | Y | Y | Network |
 | netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
-| runtimes | - | Y | - | Software | *Linux leg only; Windows and macOS legs planned* |
+| runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
