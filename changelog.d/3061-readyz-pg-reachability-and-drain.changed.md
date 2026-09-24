@@ -11,5 +11,7 @@
   orchestrator's stop timeout by the same amount). New metrics
   `yuzu_server_pg_reachable`, `yuzu_server_pg_reachability_last_success_age_seconds` and
   `yuzu_server_pg_reachability_probe_failures_total`, plus alert `YuzuServerPostgresUnreachable`. Each
-  server uses one more Postgres connection. Point liveness probes at `/livez`, not `/readyz` — see
+  server uses one more Postgres connection. A multi-host `--postgres-dsn` now requires
+  `target_session_attrs=read-write`: it is appended when absent, and any other explicit value except
+  `primary` refuses boot. Point liveness probes at `/livez`, not `/readyz` — see
   `docs/user-manual/upgrading.md`.

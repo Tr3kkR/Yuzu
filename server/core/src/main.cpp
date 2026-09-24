@@ -11,6 +11,7 @@
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
+#include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
 #include "scim_routes.hpp"
@@ -1140,6 +1141,25 @@ int main(int argc, char* argv[]) {
         cfg.gateway_cluster_addresses = std::move(*parsed);
     } else {
         std::cerr << "Invalid --gateway-cluster-addr: " << parsed.error() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    // ── Multi-host Postgres DSN guard (HA WS-8) ──
+    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
+    // pool's connections on a standby, and /readyz cannot see them all. Append
+    // read-write when the attribute is absent; refuse a weaker explicit value.
+    // Done here, before Server::create, so the pool, the leader elector and the
+    // readiness probe all use the same normalised DSN. See pg/multi_host_dsn.hpp.
+    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
+        guarded.has_value()) {
+        if (guarded->appended)
+            spdlog::warn("Postgres DSN lists {} hosts without target_session_attrs; using "
+                         "target_session_attrs=read-write so the server only connects to a "
+                         "writable primary (set it explicitly to silence this)",
+                         guarded->hosts);
+        cfg.postgres_dsn = std::move(guarded->dsn);
+    } else {
+        std::cerr << "Invalid --postgres-dsn: " << guarded.error() << "\n";
         return EXIT_FAILURE;
     }
 

@@ -1581,6 +1581,12 @@ gaps closed:
   or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
   Leadership is deliberately not a readiness condition.
+- **Multi-host DSNs.** The probe walks the DSN's hosts in libpq's order and stops where libpq stops,
+  so it measures the host the pool reaches; and a multi-host DSN must carry
+  `target_session_attrs=read-write` (appended when absent, a weaker value refuses boot), because without
+  it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
+  pool does not re-validate connections it holds, so a server that turns read-only in place (without the
+  restart a demotion implies) keeps failing those connections while `/readyz` is green.
 - **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
   turns `503 draining`, so the fronting layer drains before the socket closes.
 The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).

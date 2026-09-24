@@ -23,10 +23,15 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
+#include <cstdint>
+#include <memory>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -588,7 +593,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     // A RECONNECT walks the hosts in the DSN's order, as a fresh pool connection
     // does: kill the probe's backend; the next tick fails on the dead session, the
     // one after pays the frozen host's deadline again, then reaches the second
-    // host (Gate 8 round 3: the probe mirrors the pool's host choice).
+    // host (Gate 8 round 4: the probe mirrors the pool's host choice).
     REQUIRE(admin_scalar(db.dsn(),
                          "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
                          "WHERE application_name = $1 AND datname = current_database()",
@@ -600,5 +605,147 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     probe->probe_once(); // reconnect: frozen host first, then the second host
     CHECK(probe->verdict() == pr::Verdict::Ready);
     CHECK(std::chrono::steady_clock::now() - t3 >= pr::kConnectDeadline - 100ms);
+}
+#endif
+
+#ifndef _WIN32
+namespace {
+/// A minimal fake Postgres: answers SSL/GSS negotiation with 'N', then sends one
+/// FATAL ErrorResponse with the given SQLSTATE to the startup packet — what a
+/// real server sends for a failed login (28P01) or "cannot connect now" (57P03).
+struct FakePostgres {
+    int fd{-1};
+    int port{0};
+    std::string sqlstate;
+    std::atomic<bool> stop{false};
+    std::thread thread;
+
+    explicit FakePostgres(std::string code) : sqlstate(std::move(code)) {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;
+        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        ::listen(fd, 8);
+        socklen_t len = sizeof(a);
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        port = ntohs(a.sin_port);
+        thread = std::thread([this] { serve(); });
+    }
+    ~FakePostgres() {
+        stop = true;
+        thread.join();
+        ::close(fd);
+    }
+    FakePostgres(const FakePostgres&) = delete;
+    FakePostgres& operator=(const FakePostgres&) = delete;
+
+    static bool read_all(int c, unsigned char* p, std::size_t n) {
+        while (n > 0) {
+            const ssize_t r = ::read(c, p, n);
+            if (r <= 0)
+                return false;
+            p += r;
+            n -= static_cast<std::size_t>(r);
+        }
+        return true;
+    }
+    static std::uint32_t be32(const unsigned char* p) {
+        return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) |
+               (std::uint32_t{p[2]} << 8) | std::uint32_t{p[3]};
+    }
+    void handle(int c) {
+        for (;;) {
+            unsigned char hdr[8];
+            if (!read_all(c, hdr, sizeof(hdr)))
+                return;
+            const std::uint32_t len = be32(hdr), code = be32(hdr + 4);
+            if (code == 80877103 || code == 80877104) { // SSLRequest / GSSENCRequest
+                const char n = 'N';
+                (void)::write(c, &n, 1);
+                continue;
+            }
+            std::vector<unsigned char> rest(len > 8 ? len - 8 : 0);
+            if (!rest.empty() && !read_all(c, rest.data(), rest.size()))
+                return;
+            std::string body;
+            for (const auto& [f, v] : {std::pair<char, std::string>{'S', "FATAL"},
+                                       {'V', "FATAL"},
+                                       {'C', sqlstate},
+                                       {'M', "fake server refusal"}}) {
+                body += f;
+                body += v;
+                body += '\0';
+            }
+            body += '\0';
+            const std::uint32_t n = htonl(static_cast<std::uint32_t>(body.size() + 4));
+            std::string msg = "E";
+            msg.append(reinterpret_cast<const char*>(&n), 4);
+            msg += body;
+            (void)::write(c, msg.data(), msg.size());
+            return;
+        }
+    }
+    void serve() {
+        while (!stop.load()) {
+            pollfd p{fd, POLLIN, 0};
+            if (::poll(&p, 1, 100) <= 0)
+                continue;
+            const int c = ::accept(fd, nullptr, nullptr);
+            if (c < 0)
+                continue;
+            handle(c);
+            ::close(c);
+        }
+    }
+};
+
+std::pair<std::string, std::string> pg_host_port(const std::string& dsn) {
+    char* err = nullptr;
+    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
+        PQconninfoParse(dsn.c_str(), &err), &PQconninfoFree);
+    const std::unique_ptr<char, decltype(&PQfreemem)> err_owner(err, &PQfreemem);
+    std::string host = "localhost", port = "5432";
+    for (const PQconninfoOption* o = opts.get(); o && o->keyword; ++o) {
+        if (o->val && std::string(o->keyword) == "host")
+            host = o->val;
+        if (o->val && std::string(o->keyword) == "port")
+            port = o->val;
+    }
+    return {host, port};
+}
+} // namespace
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): a server-sent error ends the host walk, as libpq's "
+          "does — a later host is never tried",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 4: libpq moves to the next host only on connection-level
+    // failures and on 57P03; any other error the SERVER sends (a failed login,
+    // too many clients, a missing database) ends the attempt. A probe that walked
+    // on reached a later host the pool never tries and reported ready while the
+    // pool could not connect.
+    YUZU_REQUIRE_PG_DB(db);
+    FakePostgres refuses{"28P01"};
+    REQUIRE(refuses.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    auto probe = PgReachabilityProbe::make_libpq(multi_host_dsn(
+        db.dsn(), "127.0.0.1," + pg_host, std::to_string(refuses.port) + "," + pg_port));
+    probe->probe_once();
+    CHECK(probe->verdict() == pr::Verdict::Unreachable);
+    CHECK(wait_for_backends(db.dsn(), "yuzu-readyz-probe", 0) == 0); // host 2 never reached
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): 57P03 (cannot connect now) moves on to the next "
+          "host, as libpq's walk does",
+          "[server][readyz][pg_reachability][pg]") {
+    YUZU_REQUIRE_PG_DB(db);
+    FakePostgres starting{"57P03"};
+    REQUIRE(starting.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    auto probe = PgReachabilityProbe::make_libpq(multi_host_dsn(
+        db.dsn(), "127.0.0.1," + pg_host, std::to_string(starting.port) + "," + pg_port));
+    probe->probe_once();
+    CHECK(probe->verdict() == pr::Verdict::Ready);
 }
 #endif

@@ -199,6 +199,12 @@ What you may observe after upgrading:
   counted as 30 polls.
 - **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
   managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
+- **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`.** If your DSN lists more
+  than one host (or relies on a `PGHOST` list, or sets `load_balance_hosts`) and has no
+  `target_session_attrs`, the server now adds `target_session_attrs=read-write` and logs a warning —
+  your server will stop connecting to standbys, which it could previously do silently. If it sets any
+  value other than `read-write` or `primary`, **the server refuses to start**: change it to
+  `read-write` (or remove it) before upgrading.
 - **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.

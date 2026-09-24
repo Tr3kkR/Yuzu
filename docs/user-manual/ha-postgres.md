@@ -145,9 +145,10 @@ production-grade. You **must**:
   that window; one that fails open when all backends are down keeps forwarding and gets `503`s.
   The probe drops its connection whenever it lands on a server that refuses writes, so a proxy,
   DNS name or read-any port that sends a *new* connection to a standby cannot pin it there. With a
-  multi-host DSN (`host=n1,n2,n3`, use `target_session_attrs=read-write`) it tries the hosts in the
-  DSN's order, as the pool does, each under its own deadline, so a frozen first host costs one
-  deadline instead of holding the probe (list hosts explicitly — one name
+  multi-host DSN (`host=n1,n2,n3`; the server requires `target_session_attrs=read-write` there and
+  adds it when absent) it tries the hosts in the DSN's order, as the pool does, each under its own
+  deadline, so a frozen first host costs one deadline instead of holding the probe (list hosts
+  explicitly — one name
   resolving to several addresses is walked inside libpq, which does not move past a silent address
   on its own).
 

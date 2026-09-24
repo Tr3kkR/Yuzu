@@ -36,8 +36,10 @@
 #   G. read-only second host  `host=A,B` with NO target_session_attrs, B read-only:
 #                       stop A (red), start A -> /readyz 200 again, not pinned to B
 #                       (Gate 8 round 2 UH-R2-1).
-#   H. read-only FIRST host  same DSN, A turns read-only at runtime, B writable: /readyz
-#                       stays red — the pool's writes land on A (Gate 8 round 3).
+#   H. multi-host DSN without target_session_attrs: the server appends read-write
+#                       and logs it (Gate 8 round 4 guard, pg/multi_host_dsn.hpp).
+#   I. multi-host DSN with target_session_attrs=any: the server refuses to boot,
+#                       naming the value, never the password.
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -270,10 +272,11 @@ stop_server 210
 docker unpause "$PG" >/dev/null
 
 echo "== G: multi-host DSN without target_session_attrs, a read-only second host, a primary blip"
-# Round-2 governance UH-R2-1: the probe starts a reconnect from the host that last
-# CONNECTED; a read-only server keeps accepting connections, so without moving on
-# after a read-only answer the probe pinned itself to it and stayed red after the
-# primary came back. Host A = the writable primary, host B = read-only and up.
+# Regression for round-2 governance UH-R2-1: a probe that reconnected from the
+# host that last CONNECTED stayed pinned to read-only B after the primary A came
+# back. The probe now always walks the DSN's host order, like the pool; with the
+# multi-host guard the DSN also carries target_session_attrs=read-write, so libpq
+# refuses B outright. Host A = the writable primary, host B = read-only and up.
 psql_in "$PG2" "ALTER SYSTEM SET default_transaction_read_only = on" && psql_in "$PG2" "SELECT pg_reload_conf()"
 GDSN="postgresql://yuzu:${PG_PASS}@127.0.0.1:${PGPORT},127.0.0.1:${PG2PORT}/yuzu"
 boot "$GDSN" || exit 1
@@ -287,21 +290,31 @@ else fail "/readyz still not ready 30s after the primary came back: $(body /read
 stop_server 210
 psql_in "$PG2" "ALTER SYSTEM RESET default_transaction_read_only" && psql_in "$PG2" "SELECT pg_reload_conf()"
 
-echo "== H: multi-host DSN without target_session_attrs, the FIRST host turns read-only"
-# Gate 8 round 3 (CA-R3-1 / G8R3-CPP-1): the pool takes the first host that accepts a
-# connection, read-only or not, so with A read-only its writes fail. A probe that went
-# looking for a writable host (B) reported ready while every pool write failed. The
-# probe walks hosts in the DSN's order, like the pool, so /readyz must STAY red.
+echo "== H: multi-host DSN without target_session_attrs -> the server uses read-write"
+# Gate 8 round 4: without target_session_attrs libpq, and so the pool, takes the first
+# host that ACCEPTS a connection, standby included, and no single probe connection can
+# see every pool connection. The server therefore appends target_session_attrs=read-write
+# to a multi-host DSN that lacks it (pg/multi_host_dsn.hpp) and says so in its log.
+: > "$RIG/server.log"
 boot "$GDSN" || exit 1
-psql_in "$PG" "ALTER SYSTEM SET default_transaction_read_only = on" && psql_in "$PG" "SELECT pg_reload_conf()"
-if t=$(wait_for /readyz 503 15 '"pg":"read_only"'); then pass "/readyz 503 read_only ${t}s after the first host turned read-only"
-else fail "/readyz not read_only within 15s: $(body /readyz)"; fi
-green=0
-for _ in $(seq 1 30); do [[ "$(code /readyz)" == 200 ]] && green=$((green + 1)); sleep 0.5; done
-if (( green == 0 )); then pass "/readyz stayed red for 15s — it does not report a writable host the pool never uses"
-else fail "/readyz went green ${green}x in 15s while the pool's first host is read-only"; fi
+if grep -q 'using target_session_attrs=read-write' "$RIG/server.log"; then
+    pass "the server logged that it appended target_session_attrs=read-write"
+else fail "no target_session_attrs=read-write notice in the server log"; fi
 stop_server 210
-psql_in "$PG" "ALTER SYSTEM RESET default_transaction_read_only" && psql_in "$PG" "SELECT pg_reload_conf()"
+
+echo "== I: multi-host DSN with a weaker target_session_attrs -> refused at boot"
+IDSN="postgresql://yuzu:${PG_PASS}@127.0.0.1:${PGPORT},127.0.0.1:${PG2PORT}/yuzu?target_session_attrs=any"
+: > "$RIG/server.log"
+"$SERVER_BIN" --listen "127.0.0.1:${GRPC}" --no-tls --no-https --no-default-certs \
+    --web-address 127.0.0.1 --web-port "$WEB" --management "127.0.0.1:${MGMT}" \
+    --postgres-dsn "$IDSN" --config "$RIG/yuzu-server.cfg" --data-dir "$RIG" \
+    --ca-dir "$RIG/certs" >> "$RIG/server.log" 2>&1 &
+SERVER_PID=$!
+if wait_exit 20 "$(date +%s)"; then
+    if grep -q "Invalid --postgres-dsn: .*'any'" "$RIG/server.log" && ! grep -q "$PG_PASS" "$RIG/server.log"; then
+        pass "refused to start ${ELAPSED}s in, naming the value and not the password"
+    else fail "exited, but without the expected refusal message (or with the password in it)"; fi
+else fail "server did not refuse a multi-host DSN with target_session_attrs=any"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

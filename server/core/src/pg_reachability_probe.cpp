@@ -85,12 +85,40 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
     }
 }
 
+/// libpq's message, first line only (verbose mode adds a LOCATION line that is
+/// noise in the server log; the SQLSTATE stays on the first line).
 std::string pq_error(PGconn* c, const char* fallback) {
     const char* m = c ? PQerrorMessage(c) : nullptr;
     std::string s = (m && *m) ? std::string(m) : std::string(fallback);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
-        s.pop_back();
+    if (const auto nl = s.find_first_of("\r\n"); nl != std::string::npos)
+        s.erase(nl);
     return s;
+}
+
+/// Does this connection error END libpq's host walk? libpq (fe-connect.c) moves
+/// on to the next host after a CONNECTION-level failure, and after the one
+/// server-sent error 57P03 ("cannot connect now"); any other error the SERVER
+/// sends — a failed login (28P01/28000), too many clients (53300), a missing
+/// database (3D000) — ends the whole attempt. The probe must stop in the same
+/// place, or it reaches a later host the pool never tries and reports ready
+/// while the pool cannot connect (Gate 8 round 4, reproduced). Server-sent
+/// errors carry their SQLSTATE in verbose mode ("...failed: FATAL:  28P01:
+/// ..."); connection-level failures (refused, timeout, target_session_attrs
+/// rejection) carry none.
+bool server_error_ends_walk(std::string_view msg) {
+    for (std::size_t pos = msg.find(":  "); pos != std::string_view::npos;
+         pos = msg.find(":  ", pos + 1)) {
+        const std::string_view rest = msg.substr(pos + 3);
+        if (rest.size() < 7 || rest[5] != ':' || rest[6] != ' ')
+            continue;
+        bool code = true;
+        for (std::size_t k = 0; k < 5; ++k)
+            code =
+                code && ((rest[k] >= '0' && rest[k] <= '9') || (rest[k] >= 'A' && rest[k] <= 'Z'));
+        if (code)
+            return rest.substr(0, 5) != "57P03";
+    }
+    return false;
 }
 
 std::vector<std::string> split_commas(std::string_view v) {
@@ -235,7 +263,9 @@ private:
     /// pool never uses and reported ready while every pool write failed (Gate 8
     /// rounds 2 and 3, both reproduced). Cost, accepted: silent hosts listed
     /// ahead of the primary are walked on every reconnect, exactly as a new pool
-    /// connection walks them. Returns every host's error on total failure.
+    /// connection walks them. Like libpq, the walk STOPS at a server-sent error
+    /// other than 57P03 (server_error_ends_walk). Returns every host's error on
+    /// total failure.
     std::optional<std::string> connect_any(const std::atomic<bool>& stop) {
         std::string errors;
         const std::size_t n = targets_.size();
@@ -249,6 +279,8 @@ private:
             if (n > 1)
                 errors += (errors.empty() ? "" : "; ") + ("host " + std::to_string(i + 1) + ": ");
             errors += *err;
+            if (server_error_ends_walk(*err))
+                break; // libpq stops here too; so does the pool's connection
         }
         return errors.empty() ? std::string("no connection target") : errors;
     }
@@ -271,6 +303,7 @@ private:
         PGconn* c = conn_.get();
         if (c == nullptr)
             return std::string("PQconnectStartParams returned null (out of memory)");
+        PQsetErrorVerbosity(c, PQERRORS_VERBOSE); // SQLSTATE in server-sent errors
         if (PQstatus(c) == CONNECTION_BAD) {
             if (target.expand_dbname) // the unparseable-DSN fallback: never echo libpq's text
                 return std::string("the configured Postgres DSN could not be parsed");
