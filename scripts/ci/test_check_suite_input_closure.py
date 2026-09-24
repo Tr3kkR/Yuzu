@@ -89,7 +89,7 @@ def _with(obj, deps):
 def test_clean(failures):
     ok, msgs, stats = _run(CLEAN)
     check(ok and msgs == [], "clean build: ok, no messages", failures)
-    check(stats == {"server_objects": 2, "agent_objects": 2, "inputs": 10},
+    check(stats == {"server_objects": 2, "agent_objects": 2, "inputs": 10, "violations": 0},
           "clean build: object and input counts", failures)
 
 
@@ -102,8 +102,10 @@ def test_server_family_may_depend_on_agents_core_headers(failures):
 
 
 def test_agent_object_depends_on_server_class_path(failures):
-    ok, msgs, _ = _run(_with(AGENT_OBJ, ["../tests/unit/test_y.cpp", "../server/core/src/totp.hpp"]))
+    ok, msgs, stats = _run(_with(AGENT_OBJ, ["../tests/unit/test_y.cpp", "../server/core/src/totp.hpp"]))
     check(not ok, "agent test including a server header fails", failures)
+    check(stats["violations"] == 1, "a violation is counted (main() names the class table only then)",
+          failures)
     check(any("agent-family object" in m and "server/core/src/totp.hpp" in m and "class server" in m
               for m in msgs), "message names the family, the file and its class", failures)
 
@@ -177,6 +179,13 @@ def test_hollow_families_fail(failures):
           "no server objects with deps: FAILS", failures)
     ok, msgs, _ = _run({})
     check(not ok and len(msgs) == 2, "empty dependency log: both families reported hollow", failures)
+    # objects exist, but every dependency path falls outside the repo root (a wrong --repo-root)
+    outside = {k: ["/elsewhere/x.hpp"] for k in CLEAN}
+    ok, msgs, _ = _run(outside)
+    check(not ok and sum("record no source input" in m for m in msgs) == 2,
+          "objects whose deps resolve outside the repo: FAILS for both families", failures)
+    check(_run(outside)[2]["violations"] == 0, "a hollow run is not reported as a table mismatch",
+          failures)
 
 
 def test_classifier_is_not_called_without_inputs(failures):
@@ -265,6 +274,16 @@ def test_binary_prefixes(failures):
           "prefixes: a .exe suffix maps to the meson .p directory", failures)
     check(not any("python" in p or "rebar3" in p for p in server | agent),
           "prefixes: interpreters are not test binaries", failures)
+    # a family is any label with the family's prefix, so a new label cannot hide a binary
+    more = [_t("e2e", BUILD + "/tests/yuzu_e2e_tests", ["server-e2e"]),
+            _t("agent2", BUILD + "/tests/yuzu_agent2_tests", ["agent-extra"]),
+            _t("checks", "/usr/bin/python3", ["server", "server-checks"]),
+            _t("other", BUILD + "/tests/yuzu_other_tests", ["docs"])]
+    server2, agent2 = _mod.test_binary_prefixes(more, BUILD)
+    check("tests/yuzu_e2e_tests.p/" in server2 and "tests/yuzu_agent2_tests.p/" in agent2,
+          "prefixes: a label that starts with the family name is in the family", failures)
+    check(not any("python" in p for p in server2) and not any("other" in p for p in server2 | agent2),
+          "prefixes: an interpreter in a server suite, and a binary in neither family, are not", failures)
 
 
 def test_object_family(failures):

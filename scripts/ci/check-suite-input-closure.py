@@ -19,14 +19,16 @@ both families) in the same change. The class table is therefore proven per build
 that breaks the proof fails here rather than skipping a suite silently.
 
 Object families: everything under `agents/` and the objects of the agent/tar test binaries are the
-agent family; everything under `server/` and the objects of the server test binary are the server
-family. Which binaries are which is read from `meson introspect --tests` (a test entry whose suite
-is server* is the server family, agent/tar the agent family), so a new test binary is picked up
-without editing this file. Objects under sdk/, proto/, tools/ and anything else are shared or
-irrelevant and are not checked.
+agent family; everything under `server/` and the objects of the server test binaries are the server
+family. Which binaries are which is read from `meson introspect --tests`: a built test binary with
+any suite label starting `server` is in the server family, one starting `agent` or `tar` in the
+agent family, so a new test binary or a new label such as `server-e2e` is picked up without editing
+this file. Objects under sdk/, proto/, tools/ and anything else are shared or irrelevant and are not
+checked.
 
 A family with no dependency records at all is a FAILURE, not a pass: an unbuilt or wiped build dir
-would otherwise prove nothing and look identical to a clean result.
+would otherwise prove nothing and look identical to a clean result. So is a family whose records
+resolve to no in-repo input (every dependency path fell outside --repo-root): that too proves nothing.
 
 What this does NOT cover (each is also affected-suites.sh's documented limit):
   - a file a test reads at RUN time: affected-suites.sh's mention-scan owns that;
@@ -53,8 +55,9 @@ import re
 import subprocess
 import sys
 
-SERVER_SUITES = {"server", "server-nonpg", "server-pg", "server-pg-smoke", "server-checks"}
-AGENT_SUITES = {"agent", "tar"}
+# A built test binary is in a family when any of its suite labels starts with one of these.
+SERVER_SUITE_PREFIXES = ("server",)
+AGENT_SUITE_PREFIXES = ("agent", "tar")
 
 # A family may depend on a path of its own class or `both`; anything else is a violation.
 FORBIDDEN_CLASSES = {"server": {"agent", "none"}, "agent": {"server", "none"}}
@@ -114,9 +117,9 @@ def test_binary_prefixes(tests, builddir_abs):
         rel = re.sub(r"\.exe$", "", pp.relpath(exe, builddir_abs))
         suites = _bare(t.get("suite", []))
         prefixes = (f"{rel}.p/", f"{rel}.exe.p/")
-        if suites & SERVER_SUITES:
+        if any(s.startswith(SERVER_SUITE_PREFIXES) for s in suites):
             server.update(prefixes)
-        if suites & AGENT_SUITES:
+        if any(s.startswith(AGENT_SUITE_PREFIXES) for s in suites):
             agent.update(prefixes)
     return server, agent
 
@@ -204,11 +207,16 @@ def check_closure(deps, server_prefixes, agent_prefixes, builddir_abs, repo_root
         if counts[fam] == 0:
             failures.append(f"no {fam}-family object has dependency records — the build dir is "
                             f"unbuilt or wiped, so nothing was proven")
+        elif not inputs[fam]:
+            failures.append(f"the {counts[fam]} {fam}-family objects record no source input under "
+                            f"the repo root ({repo_root}) — the dependency paths do not resolve "
+                            f"there, so nothing was proven")
     paths = sorted(set(inputs["server"]) | set(inputs["agent"]))
     classes = classify(paths) if paths else {}
-    failures += find_violations(inputs, classes)
+    violations = find_violations(inputs, classes)
+    failures += violations
     stats = {"server_objects": counts["server"], "agent_objects": counts["agent"],
-             "inputs": len(paths)}
+             "inputs": len(paths), "violations": len(violations)}
     return not failures, failures, stats
 
 
@@ -251,16 +259,22 @@ def main(argv=None):
         ok, failures, stats = check_closure(
             deps, server_prefixes, agent_prefixes, builddir_abs, repo_root, classify)
     except (subprocess.CalledProcessError, OSError, ValueError) as e:
-        gh("error", f"check-suite-input-closure: could not classify the inputs: {e}")
+        detail = (getattr(e, "stderr", None) or "").strip()
+        gh("error", f"check-suite-input-closure: could not classify the inputs: {e}"
+                    + (f" — {detail}" if detail else ""))
         return 1
     if not ok:
         for f in failures[:MAX_REPORTED]:
             gh("error", f"check-suite-input-closure: {f}")
         if len(failures) > MAX_REPORTED:
             gh("error", f"check-suite-input-closure: ... and {len(failures) - MAX_REPORTED} more")
-        gh("error", "check-suite-input-closure: the class table in scripts/ci/affected-suites.sh "
-                    "no longer matches the build. Either remove the dependency, or reclassify the "
-                    "path there (making a PR that touches it run both families) in the same change.")
+        if stats["violations"]:
+            gh("error", "check-suite-input-closure: the class table in scripts/ci/affected-suites.sh "
+                        "no longer matches the build. Either remove the dependency, or reclassify the "
+                        "path there (making a PR that touches it run both families) in the same change. "
+                        "Two merged changes can cause this together (one adds the include, another "
+                        "moves the file), so it can appear on a PR that touched neither; the fix is the "
+                        "same.")
         return 1
     print(f"check-suite-input-closure: OK — {stats['server_objects']} server-family and "
           f"{stats['agent_objects']} agent-family objects, {stats['inputs']} distinct source "

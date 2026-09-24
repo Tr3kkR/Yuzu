@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 # affected-suites.sh — fail-closed classifier: which heavy meson test suites can a PR reach?
 #
-# ci.yml's PR fast-path runs every suite on every leg. The two heavy families are
+# Without it, ci.yml's PR fast-path would run every suite on every leg. The two heavy families are
 #
-#   server  the yuzu_server_tests binary — suites server-nonpg, server-pg, server-pg-smoke,
-#           server-checks (12 Postgres shards, the slowest step on Windows and Linux)
-#   agent   the yuzu_agent_tests / yuzu_tar_tests binaries — suites agent, tar (the single
-#           longest test entry on macOS and Windows)
+#   server  suites server-nonpg, server-pg, server-pg-smoke (yuzu_server_tests: 12 Postgres shards,
+#           the slowest step on Windows and Linux) and server-checks
+#   agent   suites agent, tar (the agent and tar test binaries: the single longest test entry on
+#           macOS and Windows)
 #
 # A PR whose changed paths cannot reach a family's build inputs or run-time inputs cannot change
 # that family's results, and every push to dev/main still runs the full matrix, so the PR run skips
 # the family. The docs, proto and gateway suites always run.
 #
-# Input (stdin): one changed FILE per line, `path` or `path<TAB>previous_path` (the latter for a
-#   rename, so the source of a rename out of a heavy directory is classified too — the GitHub files
-#   API reports only the new name in `.filename`). Produce it with:
-#     gh api --paginate repos/O/R/pulls/N/files \
-#       --jq '.[] | [.filename, (.previous_filename // "")] | @tsv'
+# Input (stdin): one changed path per line, as scripts/ci/pr-changed-paths.sh prints it from the
+#   merge commit CI builds (a rename is two lines, the old path and the new, so the source of a
+#   rename out of a heavy directory is classified too).
 # Output (stdout): exactly two lines
 #     skip_server=true|false
 #     skip_agent=true|false
-# Diagnostics go to stderr. Every uncertainty prints false/false (run everything): an empty list or
-# a record with no path, a list shorter or longer than --total (the API caps a PR's file list at
-# 3000; a --total that is given but empty is an error, not "no guard"), a path that cannot be read
-# back exactly (a backslash from jq's @tsv escaping, a C-quoted path), an unreadable tests root.
+# Diagnostics go to stderr. Every uncertainty prints false/false (run everything): an empty list; a
+# path that cannot be read back exactly (C-quoted by git, a TAB or backslash in it, absolute, or a
+# `..` component); a missing or unreadable tests tree or tests/meson.build, or a symlink inside the
+# tests tree; a scan or temp-directory failure.
 #
 # THE CLASS TABLE lives in classify_path below and nowhere else: this comment,
 # docs/ci-architecture.md and `--classify PATH` all defer to it. What the classes mean (the first
@@ -31,12 +29,12 @@
 #   both    can affect either family: the build graph and CI infrastructure, the code both
 #           binaries are built from (agents/ is `both` because the server test binary includes 15
 #           agents/core headers), the test-tree files they share, docs/capability-registries/,
-#           and anything unrecognised
+#           any .gitattributes (it changes line endings on checkout), and anything unrecognised
 #   server  reaches only the server family (server/, content/, tests/unit/server/)
 #   agent   reaches only the agent family (the agent/tar test translation units)
 #   none    text no compiled test reads at build time: docs, changelog and ledger fragments,
-#           agent-config directories, gateway, deploy, site, the non-C++ test drivers, and an
-#           explicit allowlist of inert root files
+#           agent-config directories, gateway, deploy, site, the non-C++ test drivers, the runner
+#           inventory, and an explicit allowlist of inert root files
 #
 # The one derived rule (RUN-TIME READS). A test can read a file that is in no build graph — the
 # tables under docs/capability-registries/, docs/user-manual/metrics.md. So a path that would leave
@@ -57,7 +55,7 @@
 # ci.yml step bodies that apply the verdict are tests/shell/test_suite_selection_wiring.sh.
 #
 # Usage:
-#   affected-suites.sh [--total N] [--tests-root DIR] < changed-files
+#   affected-suites.sh [--tests-root DIR] < changed-paths
 #   affected-suites.sh --classify PATH             print one path's class (both|server|agent|none)
 #   affected-suites.sh --classify-many < paths     one `path<TAB>class` line per input path
 # Locally, for a branch (GNU grep expected; BSD grep is quadratic in the number of changed paths):
@@ -67,16 +65,14 @@
 set -euo pipefail
 
 tests_root="tests/unit"
-expected_total=""
-total_given=false
 classify_only=""
 classify_many=false
 
 usage() {
   cat >&2 <<'EOF'
 usage:
-  affected-suites.sh [--total N] [--tests-root DIR] < changed-files
-  affected-suites.sh --classify PATH [--tests-root DIR]
+  affected-suites.sh [--tests-root DIR] < changed-paths
+  affected-suites.sh --classify PATH
   affected-suites.sh --classify-many < paths
 EOF
   exit 2
@@ -84,7 +80,6 @@ EOF
 
 while (( $# )); do
   case "$1" in
-    --total)         (( $# >= 2 )) || usage; expected_total="$2"; total_given=true; shift 2 ;;
     --tests-root)    (( $# >= 2 )) || usage; tests_root="$2"; shift 2 ;;
     --classify)      (( $# >= 2 )) || usage; classify_only="$2"; shift 2 ;;
     --classify-many) classify_many=true; shift ;;
@@ -100,8 +95,13 @@ emit_all_run() {
 # classify_path PATH -> both | server | agent | none
 classify_path() {
   case "$1" in
+    # --- line endings on checkout: can change what any test reads, wherever the file sits ---
+    .gitattributes|*/.gitattributes) echo both ;;
     # --- build graph and CI infrastructure: decides how ANY suite is built or run ---
     meson.build|*/meson.build|meson.options|meson/*|vcpkg.json|vcpkg-configuration.json|vcpkg-native.ini|triplets/*|requirements-ci.*|setup_msvc_env.sh|Makefile) echo both ;;
+    # the runner inventory feeds only preflight's health check; the docs-only gate treats it as
+    # docs, and ci.yml builds any PR this table says a test family can reach, so the two must agree
+    .github/runner-inventory.json|.github/workflows/runner-inventory-sentinel.yml) echo none ;;
     .github/*|scripts/*|tools/*|.clusterfuzzlite/*) echo both ;;
     # --- code the binaries are built from ---
     agents/*|common/*|sdk/*|proto/*|enterprise/*) echo both ;;
@@ -121,8 +121,8 @@ classify_path() {
     docs/capability-registries/*) echo both ;;         # read as data by server and agent tests
     docs/*|changelog.d/*|governance.d/*|.claude/*|.codex/*|gateway/*|deploy/*|site/*) echo none ;;
     */*) echo both ;;                                  # any other directory: unknown
-    # --- root-level files: only an explicit allowlist is inert; .gitattributes (line endings on
-    # checkout), .clang-*, and any file not named here are unknown, so both ---
+    # --- root-level files: only an explicit allowlist is inert; .clang-* and any file not named
+    # here are unknown, so both ---
     *.md|LICENSE|NOTICE|.gitignore|.dockerignore|.editorconfig|.pre-commit-config.yaml) echo none ;;
     docker-compose*.yml|cliff.toml|Synthetic-UAT-Puppeteer.js) echo none ;;
     *) echo both ;;
@@ -144,48 +144,26 @@ fi
 
 # --- read the list -------------------------------------------------------------------------------
 paths=()
-n_files=0
 while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -z "$line" ]] && continue
-  n_files=$((n_files + 1))
-  new_path="${line%%$'\t'*}"
-  old_path=""
-  [[ "$line" == *$'\t'* ]] && old_path="${line#*$'\t'}"
-  # A changed file always has a name. A record without one is malformed input, and it must not
-  # count as a file that contributes no path: that would let a list of such records read as
-  # "nothing reaches either family".
-  if [[ -z "$new_path" ]]; then
-    echo "affected-suites: record with no filename -> running everything (fail-closed)" >&2
+  # Not readable back exactly: git C-quotes a path holding a quote, backslash or control character
+  # (it then starts with `"`), and a raw TAB or backslash means the list did not come from git.
+  # An absolute path or a `..` component cannot be a repository-relative name either.
+  if [[ "$line" == *\\* || "$line" == *$'\t'* || "$line" == \"* || "$line" == /* ||
+        "$line" == .. || "$line" == ../* || "$line" == */../* || "$line" == */.. ]]; then
+    echo "affected-suites: path cannot be classified exactly ($line) -> running everything (fail-closed)" >&2
     emit_all_run
   fi
-  for p in "$new_path" "$old_path"; do
-    [[ -z "$p" ]] && continue
-    # Not readable back exactly: jq's @tsv turns tab/newline/backslash into a backslash escape and
-    # git C-quotes control characters. Either way the prefix cannot be trusted.
-    if [[ "$p" == *\\* || "$p" == \"* || "$p" == /* || "$p" == ../* || "$p" == */../* ]]; then
-      echo "affected-suites: path cannot be classified exactly ($p) -> running everything (fail-closed)" >&2
-      emit_all_run
-    fi
-    paths+=("$p")
-  done
+  paths+=("$line")
 done
 
-if (( n_files == 0 || ${#paths[@]} == 0 )); then
-  echo "affected-suites: empty file list -> running everything (fail-closed)" >&2
+if (( ${#paths[@]} == 0 )); then
+  echo "affected-suites: empty path list -> running everything (fail-closed)" >&2
   emit_all_run
 fi
-if [[ "$total_given" == true ]]; then
-  if [[ ! "$expected_total" =~ ^[0-9]+$ ]]; then
-    echo "affected-suites: invalid --total '$expected_total' -> running everything (fail-closed)" >&2
-    emit_all_run
-  fi
-  if (( n_files != expected_total )); then
-    echo "affected-suites: received $n_files of $expected_total files (truncated or inconsistent) -> running everything (fail-closed)" >&2
-    emit_all_run
-  fi
-fi
-if [[ ! -d "$tests_root" ]]; then
-  echo "affected-suites: tests root '$tests_root' not found, so run-time reads cannot be checked -> running everything (fail-closed)" >&2
+meson_file="$(dirname "$tests_root")/meson.build"
+if [[ ! -d "$tests_root" || ! -f "$meson_file" ]]; then
+  echo "affected-suites: tests tree '$tests_root' or '$meson_file' not found, so run-time reads cannot be checked -> running everything (fail-closed)" >&2
   emit_all_run
 fi
 
@@ -215,7 +193,15 @@ if [[ ( -z "$server_why" || -z "$agent_why" ) && ${#candidates[@]} -gt 0 ]]; the
     echo "affected-suites: '$tests_root/server' not found, so run-time reads cannot be checked -> running everything (fail-closed)" >&2
     emit_all_run
   fi
-  work="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-affected-suites.XXXXXX")"
+  # grep -r does not follow a symlink inside the tree, so a read behind one would go unseen.
+  if [[ -n "$(find "$tests_root" -type l 2>/dev/null | head -n 1)" ]]; then
+    echo "affected-suites: a symlink under '$tests_root' cannot be scanned reliably -> running everything (fail-closed)" >&2
+    emit_all_run
+  fi
+  work="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-affected-suites.XXXXXX")" || {
+    echo "affected-suites: no temporary directory -> running everything (fail-closed)" >&2
+    emit_all_run
+  }
   trap 'rm -rf "$work"' EXIT
   printf '%s\n' "${candidates[@]}" > "$work/patterns"
 
@@ -235,9 +221,7 @@ if [[ ( -z "$server_why" || -z "$agent_why" ) && ${#candidates[@]} -gt 0 ]]; the
     fi
   }
 
-  : > "$work/meson"
-  meson_file="$(dirname "$tests_root")/meson.build"
-  if [[ -f "$meson_file" ]]; then scan_to "$work/meson" "$meson_file"; fi
+  scan_to "$work/meson" "$meson_file"
   # The server binary compiles tests/unit/server/ AND the helper headers directly under tests/unit/
   # (test_helpers.hpp, ...), so a read placed in a shared helper belongs to the server family too.
   server_sources=("$tests_root/server")

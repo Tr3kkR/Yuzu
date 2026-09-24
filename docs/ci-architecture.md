@@ -11,9 +11,10 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 ## Tier summary (mirrors CLAUDE.md)
 
 - **Tier 1 — PR fast-path** (`ci.yml` on `pull_request`): one Linux variant
-  (gcc-15 debug on the `yuzu-bigtam-linux` pool) that runs as TWO jobs — the
-  `pg-a` leg and `Linux gcc-15 debug (pg B)`, which splits the Postgres shards
-  (see "PR-time test selection" below) — one Windows variant (MSVC debug on
+  (gcc-15 debug on the `yuzu-bigtam-linux` pool) that runs as two legs,
+  `(pg A)` and `(pg B)`, splitting the Postgres shards, with the required
+  `Linux gcc-15 debug` check as a gate job over both (see "PR-time test
+  selection" below) — one Windows variant (MSVC debug on
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
   A PR also skips a whole test family (server, or agent and tar) when no path it
@@ -21,7 +22,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
   (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
-  the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
+  the Linux matrix's `pg_mode` key (via `include:`, not an axis of its own) means
   only ONE leg (gcc-15/debug) runs the full 12-shard `server-pg` suite on a
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`s
@@ -167,42 +168,49 @@ code.
 ## PR-time test selection (Tier 1 only)
 
 Two changes cut a pull request's test time without changing what a push runs. Both are
-PR-only: a push to dev/main, a `workflow_dispatch` and the trusted-fork gate run every suite
-on the same legs as before, and that push run is what makes skipping on a PR safe.
+PR-only: a push to dev/main, and the trusted-fork gate (a dispatch that calls `ci.yml`), run
+every suite on the same legs as before.
 
 ### Suite selection: a PR skips a test family it cannot reach
 
-The two heavy families are **server** (`yuzu_server_tests`: suites `server-nonpg`,
-`server-pg`, `server-pg-smoke`, `server-checks`) and **agent** (`yuzu_agent_tests` and
-`yuzu_tar_tests`: suites `agent`, `tar`). The `docs`, `proto` and `gateway` suites always run.
-If no path a PR changes can reach a family's build inputs or run-time inputs, its results
-cannot differ from the base's, so the PR run does not spend the minutes: the agent unit
-test alone is ~197 s on Windows, ~170 s on macOS and ~87 s on Linux, and the 12 Postgres
-shards are 5-9 minutes.
+The two heavy families are **server** (suites `server-nonpg`, `server-pg` and
+`server-pg-smoke`, all `yuzu_server_tests`, plus `server-checks`) and **agent** (suites
+`agent` and `tar`: the agent and tar test binaries). The `docs`, `proto` and `gateway` suites
+always run. If no path a PR changes can reach a family's build inputs or run-time inputs, its
+results cannot differ from the base's, so the PR run does not spend the minutes: the agent
+unit test alone is ~197 s on Windows, ~170 s on macOS and ~87 s on Linux, and the 12 Postgres
+shards are 5-9 minutes. A PR into `main` (a release or a hotfix) never skips.
 
-**Where it is decided.** The preflight job's `affected` step lists the PR's files from the
-API (a rename lists both names, because `.filename` alone hides a rename out of a heavy
-directory), runs `scripts/ci/affected-suites.sh`, and publishes `skip_server_suites` and
-`skip_agent_suites`. The build jobs read them:
+**Where it is decided.** Preflight lists the paths the PR changes from the merge commit the run
+builds (`scripts/ci/pr-changed-paths.sh`: the commit's diff against its first parent, the base
+tip; the checkout fetches depth 2 for it). That list is bound to the commit every build job
+checks out, needs no API call, has no file-count cap, and names both sides of a rename. The
+`affected` step runs `scripts/ci/affected-suites.sh` over it and publishes `skip_server_suites`
+and `skip_agent_suites`, and also records the verdict, the forcing path and the classifier's
+version as a `::notice` annotation, which outlives the job log. The build jobs read them:
 
 | Leg | When a family is skipped |
 |---|---|
-| Linux, `pg-a` leg | the agent/tar `--suite` flags, or the by-name server entries, are dropped; the pg step and the smoke step do not run |
+| Linux `(pg A)` | the agent/tar `--suite` flags, or the by-name server entries, are dropped; the pg step and the smoke step do not run |
+| Linux `(pg B)` | on a server skip there is no such leg at all (the matrix excludes it) |
 | Windows | the family's suites move from `--suite` to `--skipped-suite` in `assert-suite-cover.py` (the pg suites too, on a server skip), so its proof still accounts for every registered entry and the OK line names what was skipped; the pg and smoke steps do not run |
 | macOS | the step passes meson's `--no-suite` |
-| Linux, `pg-b` leg | on a server skip it still builds and provisions Postgres, then runs no test, so that its check name always exists |
+
+The same list feeds the docs-only gate (#1978), and a docs-only verdict must also be a
+no-family verdict from the classifier: a docs file a test reads at run time, or a
+`.gitattributes` under `docs/`, can change a test result, so such a PR builds.
 
 **The class table** lives in `classify_path` in `scripts/ci/affected-suites.sh` and nowhere
 else; this section only says what the classes mean. The first matching arm wins, and a path no
 arm names is `both`, so an unknown path runs everything.
 `scripts/ci/affected-suites.sh --classify PATH` prints a path's class.
 
-| Class | What it covers | Effect |
+| Class | What it covers (a summary; `classify_path` is exact) | Effect |
 |---|---|---|
-| `both` | the build graph and CI infrastructure (any `meson.build`, `vcpkg*`, `.github/`, `scripts/`, `tools/`), the code both binaries are built from (`agents/`, `common/`, `sdk/`, `proto/`), the test-tree files they share (`tests/meson.build`, helper headers, fixtures), `docs/capability-registries/`, and anything unrecognised | both families run |
+| `both` | the build graph and CI infrastructure (any `meson.build`, `vcpkg*`, `.github/`, `scripts/`, `tools/`), the code both binaries are built from (`agents/`, `common/`, `sdk/`, `proto/`, `enterprise/`), the test-tree files they share (`tests/meson.build`, helper headers, fixtures, `tests/fuzz/`), `docs/capability-registries/`, any `.gitattributes`, and anything unrecognised | both families run |
 | `server` | `server/`, `content/` (embedded into the server binary), `tests/unit/server/` | agent and tar skipped |
-| `agent` | the agent and tar test translation units (`tests/unit/*.cpp`, `tests/unit/agent/`) | server skipped |
-| `none` | text no compiled test reads at build time: `docs/`, changelog and ledger fragments, `.claude/`, `.codex/`, `gateway/`, `deploy/`, `site/`, the non-C++ test drivers, and an explicit allowlist of inert root files (any other root file is `both`, e.g. `.gitattributes`) | both skipped |
+| `agent` | the agent and tar test translation units (`tests/unit/*.cpp` except the shared runner main, `tests/unit/agent/`) | server skipped |
+| `none` | text no compiled test reads at build time: `docs/`, changelog and ledger fragments, `.claude/`, `.codex/`, `gateway/`, `deploy/`, `site/`, the non-C++ test drivers, the runner inventory, and an explicit allowlist of inert root files (any other root file is `both`) | both skipped |
 
 `agents/` is `both`, not agent-only, on purpose: the server test binary includes 15
 `agents/core` headers (the heartbeat tag-key tables), so nothing narrower than the directory
@@ -219,86 +227,116 @@ at run time from parts (keep a run-time read to one literal path), the relative 
 `tests/meson.build` uses (`unit/x`), and production code under `server/` or `agents/` that
 names a path (only tests are scanned).
 
-**Fail-closed.** Every uncertainty runs everything: an empty list or a record with no
-filename, a list that disagrees with the API's `changed_files` count (the API caps a PR at
-3000 files; a `--total` given empty is an error), a path that cannot be read back exactly, an
-API or classifier error, a missing tests tree. A `none`-class PR still builds and still runs
-`docs`, `proto` and `gateway`.
+**Fail-closed.** Every uncertainty runs everything: a changed-path list that cannot be bound to
+the run's merge commit (HEAD is not the run's commit, not a two-parent merge, or its second
+parent is not the PR head), an empty list, a path that cannot be read back exactly, a missing
+tests tree or `tests/meson.build`, a symlink in the tests tree, a scan or temp-directory
+failure, or a classifier error. Each fail-closed branch raises a `::warning`. A `none`-class PR
+still builds and still runs `docs`, `proto` and `gateway`.
 
 **Soundness against the real build.** `scripts/ci/check-suite-input-closure.py` runs after
-Build on the Linux `pg-a` legs and on macOS (the Windows legs share the source tree and are
+Build on the Linux `(pg A)` legs and on macOS (the Windows legs share the source tree and are
 not checked). It reads ninja's own dependency log, classifies every compile-time input of
 each test family with the SAME table (`affected-suites.sh --classify-many`), and fails when an
 agent-family object depends on a `server` or `none` path, or a server-family object on an
 `agent` or `none` path. So the table is proven per build, and a table edit that breaks the
-proof fails there instead of skipping a suite silently. It identifies the test binaries from
-`meson introspect --tests` (a new binary is picked up without editing the script) and fails
-on an unbuilt dir rather than passing vacuously. **Limits:** it sees only the preprocessor
-branches this build takes (a Windows-only `#ifdef` include is invisible), only
-compiler-visible inputs (a `custom_target` that reads `content/` into an object shows as a
-build-dir path), and not run-time reads, which are the previous paragraph's job. If it fails,
-either remove the dependency or reclassify the path in `classify_path` in the same change.
+proof fails there instead of skipping a suite silently. It finds the test binaries through
+`meson introspect --tests` (any suite label starting `server`, or `agent`/`tar`, puts a binary
+in that family, so a new binary or label is picked up without editing the script), and it
+fails rather than passing vacuously on an unbuilt dir or on dependency paths that resolve to
+nothing under the repo root. **Limits:** it sees only the preprocessor branches this build
+takes (a Windows-only `#ifdef` include is invisible), only compiler-visible inputs (a
+`custom_target` that reads `content/` into an object shows as a build-dir path), not the
+objects of fixture plugins and helper programs under `tests/`, and not run-time reads, which
+the run-time-read rule above covers. If it fails, either remove the dependency or reclassify
+the path in `classify_path` in the same change. Two merged changes can trip it together (one
+adds an include, another moves the file), so it can fail on a PR that touched neither.
 
 **Wiring.** No skip branch can run in the PR that introduces it (a PR touching `.github/` or
 `scripts/` is class `both`), so `tests/shell/test_suite_selection_wiring.sh` extracts the real
-step bodies from `ci.yml` and runs them against stubs for every skip combination on every
-leg, plus lexical pins for the `if:` gates, the env mapping, the matrix axis, the leg-only step
-guards and the required-check names. It runs in preflight on every PR, like
-`tests/shell/test_affected_suites.sh`, which pins the classifier itself; neither is a `docs`
-meson suite, because they spawn a process per case (the Windows leg would run them too).
+step bodies from `ci.yml` and runs them: the preflight chain on a real merge commit in a
+scratch repository (every binding failure included), each leg's test step against stubs for
+every skip combination, and the `linux-pr-gate` step for every result combination; plus
+lexical pins for the `if:` gates, the env mapping, the matrix axis and excludes, the check
+names, the leg-only step guards, the closure-guard steps and its own registration. It runs in
+preflight on every PR, like `tests/shell/test_affected_suites.sh`, which pins the classifier
+itself; neither is a `docs` meson suite, because they spawn processes per case (the Windows leg
+would run them too) and the classifier's production environment is the hosted preflight
+runner.
 
 **Changing the table.** Edit `classify_path` and add the case to
 `tests/shell/test_affected_suites.sh`. Nothing else states the table: the guard reads it
 through `--classify-many`, and this section defers to the code. To see what a branch would
 skip: `git diff --no-renames --name-only origin/dev...HEAD | bash scripts/ci/affected-suites.sh`
-(GNU grep; BSD grep is quadratic in the number of changed paths).
+(GNU grep; BSD grep is quadratic in the number of changed paths, so the classifier test's
+real-tree cases take about 45 s on macOS and under a second in preflight).
 
 **Measured** on the 391 code PRs merged to dev in the window ending 2026-09-24: 79% run both
 families, 13% skip agent and tar (server-side changes), 5% skip both (docs, skills, ledger,
 gateway or deploy only, which today still run every suite because a changelog fragment or a
 ledger row is code-side to the docs-only gate), 2% skip server (agent-test-only).
 
-### Linux Postgres split across two jobs
+**What catches a wrong skip.** A push to dev runs every suite, and the next PR that reaches the
+skipped family runs it on the merge commit, which carries the break, so that PR's required
+checks go red: the break is caught within a PR or two, but in someone else's PR. The push run is
+a weak alarm on its own today: 84 of the last 100 dev push runs (2026-09-14 to 2026-09-24)
+failed, and nothing reports a red push run, so a new failure there is easy to miss (#4902
+tracks the alert). Pushes to dev also keep only one pending run, so a burst of merges can leave
+an intermediate merge without a push run of its own.
 
-On a PR the Linux leg runs as two jobs so the 12 Postgres shards use two runners and two
-per-runner Postgres instances:
+**Turning it off.** Revert the change that introduced it, as an ordinary PR; that PR is class
+`both`, so its own CI runs everything, and no ruleset step is involved. Re-run only the latest
+run of a PR: re-running a superseded run joins the PR's concurrency group and cancels the
+current one.
 
-| Job (check name) | Runs |
+### Linux Postgres split across two legs
+
+On a PR the Linux gcc-15/debug work is two matrix legs, so the 12 Postgres shards use two
+runners and two per-runner Postgres instances:
+
+| Check name | Runs |
 |---|---|
-| `Linux gcc-15 debug` (the `pg-a` leg; name unchanged) | every non-pg suite, plus `--suite server-pg-a` |
-| `Linux gcc-15 debug (pg B)` (the `pg-b` leg; PR only) | build, then `--suite server-pg-b`; skips the gateway, capability-matrix and non-pg steps |
+| `Linux gcc-15 debug (pg A)` | every non-pg suite, plus `--suite server-pg-a` |
+| `Linux gcc-15 debug (pg B)` | build, then `--suite server-pg-b`; skips the gateway, capability-matrix and non-pg steps; absent when the PR cannot reach the server family |
+| `Linux gcc-15 debug` | the `linux-pr-gate` job: green only when every Linux leg is |
 
 The `pg_part` matrix axis carries this, and its value names the meson suite. An `exclude:`
-removes `pg-b` on any event that is not a `pull_request`, so a push still runs the whole
-`server-pg` on the one `pg-a` leg. Every `server-pg` test entry in `tests/meson.build`
-carries exactly one of the labels `server-pg-a` and `server-pg-b`;
-`scripts/ci/check-pg-shard-partition.py` (`check_pg_halves`) fails on a shard with neither (it
-would never run on a PR), with both, or on an empty half, and ci.yml's pg step fails on a
-selector that selects nothing (meson would exit 0 for it).
+removes `pg-b` on any event that is not a `pull_request`, and on a PR that skips the server
+family, so a push still runs the whole `server-pg` on the one leg, under the unchanged name
+`Linux gcc-15 debug`. Every `server-pg` test entry in `tests/meson.build` carries exactly one of
+the labels `server-pg-a` and `server-pg-b`; `scripts/ci/check-pg-shard-partition.py`
+(`check_pg_halves`) fails on a shard with neither (it would never run on a PR), with both, or
+on an empty half, and ci.yml's pg step fails on a selector that selects nothing (meson would
+exit 0 for it).
 
-**Balance.** The `pg-a` leg also carries about 170 s of work the second does not (the non-pg
-suites, the smoke test, the gateway and capability-matrix gates), so the split is about 1:5
-by shard time, not 1:1. Median wall time of each shard over six PR runs on Big Tam
-(2026-09-24, `--num-processes 2`): half `b` = C 114.8 s, F 59.9, A 53.8, B 50.2, H 46.4,
-J 37.0, E 33.8, D 33.0 (429 s); half `a` = G 29.4, K 24.8, I 19.3, L 13.2 (87 s). By that
-model the two legs finish within about 20 s of each other, at roughly 4.5 to 5 min each
-against about 8 min before (an estimate; the first pre-merge runs replace it). To rebalance,
-re-measure from recent green PR runs (`gh run view <run> --job <id> --log | grep 'server pg
-unit tests shard'`), move a shard by editing its `suite:` label, and keep the legs' totals
-close. This is the only place the figures are kept.
+**The required check.** The dev and main rulesets require `Linux gcc-15 debug`, and on a PR
+that context is the `linux-pr-gate` job, not a leg: it waits for every Linux leg (`needs`,
+`if: always()`), and passes only when preflight succeeded and either every leg succeeded or
+preflight found a docs-only PR (no leg runs). A failed, cancelled or skipped leg fails it. So
+the split needs no ruleset change and adds no required context. It runs on every pull request,
+because a job skipped by its own `if:` counts as passed for a required check; on any other event
+it is skipped under a different name, so a push commit never carries a skipped check named
+`Linux gcc-15 debug`.
+
+**Balance.** The `(pg A)` leg also carries work the second does not (the non-pg suites, the
+gateway and capability-matrix gates), so the split is about 1:5 by shard time, not 1:1. Median
+wall time of each shard over six PR runs on Big Tam (2026-09-24, `--num-processes 2`): half `b`
+= C 114.8 s, F 59.9, A 53.8, B 50.2, H 46.4, J 37.0, E 33.8, D 33.0 (429 s); half `a` =
+G 29.4, K 24.8, I 19.3, L 13.2 (87 s). With about 170 s of other work on `(pg A)`, the two legs
+finish within about 20 s of each other, at roughly 4.5 to 5 min each against about 8 min
+before. An independent sample (six PR runs, 2026-09-07/08) instead puts `(pg B)` about 60 s
+behind, so these are estimates until the first real runs; moving shard F or A to half `a` is the
+first correction to try. To rebalance, re-measure from recent green PR runs (`gh run view <run>
+--job <id> --log | grep 'server pg unit tests shard'`), move a shard by editing its `suite:`
+label, and keep the legs' totals close. This is the only place the figures are kept.
 
 **Cost.** A PR now holds two of Big Tam's four runner agents, and each leg holds one of the
-three heavy test slots (`with-test-slot.sh 3`), so a busy box queues more PRs than before.
-The two jobs each do the setup and the build, so a PR uses more Big Tam runner time in
-total, not less. Windows remains the slowest leg (10-14 min), so this shortens the Linux
-check, not the time to a green PR, until Windows moves too.
-
-**Required check.** `Linux gcc-15 debug (pg B)` is a new status context. A repo admin must
-add it to the `dev` ruleset's required checks **after** this lands (requiring it earlier
-blocks every PR that has no such job), and `docs-required-checks` emits it as a success stub
-on docs-only PRs (a matrix job skipped at the job level emits none of its inner names).
-Until it is registered, the `pg-b` shards gate nothing on a PR, and auto-merge can complete
-before that job finishes; the push run after the merge still runs all 12 shards.
+three heavy test slots (`with-test-slot.sh 3`), so a busy box queues more PRs than before. A
+replay of 300 PR runs and 82 dev pushes estimates that a PR leg waiting over 60 s for a runner
+rises from about 10% to about 19%, and total Big Tam runner time per PR rises by about 70 s,
+roughly offset by the suites skipped. Windows remains the slowest leg (it finished last in 160 of
+189 PR runs; 10-14 min), so this shortens the Linux check, not the time to a green PR, for most
+PRs. Re-measure after about 20 PRs.
 
 ## Gates outside the tier ladder
 
@@ -955,7 +993,8 @@ broke CI on 3 separate shard-layout changes in as many weeks, each silently,
 because nothing proved the three copies still agreed. Replaced with a
 structural contract: every pg shard's `test()` entry in `tests/meson.build`
 now carries `suite: ['server', 'server-pg']`, so `ci.yml` selects the whole
-group with `--suite server-pg` instead of enumerating names, and a new
+group with `--suite server-pg` (on a PR, its halves `server-pg-a` and
+`server-pg-b`; see "PR-time test selection") instead of enumerating names, and a new
 `scripts/ci/check-pg-shard-partition.py` runs as its own meson test
 (`'server pg shard partition invariant'`, `suite: ['server', 'server-checks']`
 — the second label is what lets the Windows non-pg step's
@@ -989,8 +1028,8 @@ leg runs at all there) now run the `[pg-smoke]` subset instead. The Linux `matri
 `pg_mode: full|smoke` key, added via `include:` on the existing
 compiler/build_type combinations — never a third axis (would double the
 matrix and break `max-parallel: 3`'s 4-runner arithmetic) and never in the
-job `name:` (job names are the branch-protection ruleset's required-check
-contexts; `docs-required-checks` mirrors them). `full` resolves on
+job `name:` (a job name is a check name; on a PR the required Linux context
+is the `linux-pr-gate` job). `full` resolves on
 gcc-15/debug only (every PR, plus that leg's push); the other three push
 legs (clang-21/debug, gcc-15/release, clang-21/release) resolve to `smoke`.
 
@@ -1063,7 +1102,7 @@ inert). Tracked on #3443, not silently dropped.
 
 **Nightly and sanitizer legs are unaffected and still run the full
 population, redundantly**: both invoke `meson test` UNFILTERED (no `--suite`
-at all), so every `test()` entry runs once regardless of suite — the 11 pg
+at all), so every `test()` entry runs once regardless of suite — the 12 pg
 shards AND the smoke entry both fire, meaning the 11 `[pg-smoke]` cases
 execute twice there. Harmless (seconds of cost) but real, and not specific
 to any one platform — the same is true of a plain local `meson test` in any
@@ -1074,7 +1113,7 @@ PG-tagged invocation in the Test sequence, so (per the JUnit-overwrite
 behavior the "Persistent runner-local test history" section below
 documents for both platforms) it is what `ci-suite-stats` sees for that
 leg's PG timing — a full leg's `ci-suite-stats` entry still reflects the
-11-shard run, not the smoke entry, since `pg_mode` fully separates which
+12-shard run, not the smoke entry, since `pg_mode` fully separates which
 one actually executes per leg. The same overwrite silently drops the
 non-pg step's own `flake-retry` recovery reporting from that job's
 queryable history too, not just its per-suite timing rows — the non-pg
@@ -1093,9 +1132,9 @@ could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
 a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 `strategy.max-parallel: 3` caps how many legs of that SAME matrix run
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
-on `pull_request` events (two gcc-15/debug legs, `pg-a` and `pg-b`, via the
-existing `exclude`s, so it never binds; the residual that a PR now needs two
-runners is accepted, see "PR-time test selection"). This is a mitigation, not a guarantee: the freed runner is not
+on `pull_request` events (at most two gcc-15/debug legs, `pg-a` and `pg-b`,
+via the existing `exclude`s, so it never binds; the cost of a PR needing two
+runners is measured in "PR-time test selection", Cost). This is a mitigation, not a guarantee: the freed runner is not
 reserved for any specific job. `proto-compat` (this same workflow) targets
 the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
 carries and runs on the same push trigger — it can claim the freed runner
@@ -1223,9 +1262,10 @@ itself evidence of runner/job termination rather than a fabricated result.
 **Linux AND Windows gap, since the "Suite isolation" split above:** the
 finalizer imports one `meson-logs/testlog.junit.xml`, and both platforms'
 Test steps now run multiple separate `meson test` invocations against the
-same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
+same builddir (Linux: up to 3; Windows: 2 — the non-pg step plus
 exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
-one or the job fails loud earlier), each overwriting that file. Only
+one or the job fails loud earlier — or 1 on a PR that skips the server
+family), each overwriting that file. Only
 the LAST invocation's per-suite `ci_test_suites` rows and any `flake-retry`
 recovery it reports survive — the earlier, cheaper invocation(s) still gate
 the job (their own exit code), but produce no queryable history via
@@ -1282,11 +1322,11 @@ that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
-matrix-expanded required contexts (`Linux gcc-15 debug`, `Linux gcc-15 debug (pg B)`,
-`Windows MSVC debug`, `macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
-(a top-level-skipped matrix job emits none of its inner check names), so a
-`docs-required-checks` stub emits those exact names as success when
-`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
+matrix-expanded required contexts `Windows MSVC debug` and `macOS debug` would otherwise stay
+"Expected" forever on a docs-only PR (a top-level-skipped matrix job emits none of its inner
+check names), so a `docs-required-checks` stub emits those exact names as success when
+`code_changed == 'false'`. The Linux context, `Linux gcc-15 debug`, is the `linux-pr-gate` job,
+which runs on every PR and passes on a docs-only one. `ci.yml` no longer path-filters `pull_request`;
 the `push:` trigger keeps its docs `paths-ignore`.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
@@ -1412,15 +1452,15 @@ libpq connection attempt inside a PG-tagged test.
 
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
-| Linux (gcc-15/debug, every PR + primary push) | full (12 shards) | run | ADR-0006 reference platform |
+| Linux (gcc-15/debug, every PR that can reach the server family, split across the (pg A) and (pg B) legs; the primary push leg) | full (12 shards) | run | ADR-0006 reference platform |
 | Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (12 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
+| Windows (debug, every PR that can reach the server family, and every push) | full (12 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
 | Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 
 **#3508 (moving pg shards off Windows PRs entirely) is deliberately NOT
-adopted here** — Windows PR legs keep full `server-pg` coverage rather than
-dropping to `[pg-smoke]`. The Windows server still ships (ADR-0035 is
+adopted here** — Windows PR legs keep full `server-pg` coverage (on every PR
+that can reach the server family) rather than dropping to `[pg-smoke]`. The Windows server still ships (ADR-0035 is
 `proposed`, not accepted, and `release.yml` signs `yuzu-server.exe` +
 builds `YuzuServerSetup`), and there is no agent<->server integration step
 in the Windows job that would make full pg coverage there redundant — the

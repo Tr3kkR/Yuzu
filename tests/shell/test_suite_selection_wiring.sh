@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# test_suite_selection_wiring.sh — contract net for the ci.yml step bodies that APPLY
-# scripts/ci/affected-suites.sh's verdict (docs/ci-architecture.md, "PR-time test selection").
+# test_suite_selection_wiring.sh — contract net for the ci.yml step bodies that DECIDE and APPLY
+# PR-time test selection (docs/ci-architecture.md, "PR-time test selection").
 #
 # WHY THIS EXISTS. The classifier has its own fixture tests, but the wiring decides which suites a
 # leg ACTUALLY runs, and no skip branch can run in the pull request that introduces it: a PR that
@@ -8,10 +8,12 @@
 # (the server verdict wired to the agent suites) would first run on a LATER PR and silently skip the
 # wrong family. So this extracts the REAL step bodies from ci.yml (tests/shell/extract_run_block.py,
 # the idiom test_trusted_inputs_validate.sh uses, so it cannot assert a copy of the logic) and runs
-# them against stubs that record their argv. Pinned:
+# them. Pinned:
 #
-#   preflight `affected`   the two output lines for a real classifier verdict, and false/false on
-#                          every failure path: API error, count mismatch, classifier error, garbage
+#   preflight chain        on a REAL merge commit in a scratch repository: the changed-path list,
+#                          the docs-only gate (which also defers to the classifier) and the
+#                          `affected` verdict; every binding failure (not a merge commit, wrong PR
+#                          head, wrong run commit) and every classifier failure fails closed
 #   Linux non-pg suites    agent/tar dropped only when the agent family is skipped; the by-name
 #                          server call only when the server family is not
 #   Linux pg shards        server-pg-a / server-pg-b on a PR, the whole server-pg on a push, and a
@@ -19,11 +21,14 @@
 #   Windows non-pg suites  the cover guard and the real run share ONE suites array, and every suite
 #                          is in exactly one of selected / skipped / excluded
 #   macOS test             --no-suite for exactly the skipped family
+#   linux-pr-gate          the required Linux context is green only when every Linux leg is (or on a
+#                          docs-only PR), and never when preflight failed
 #
 # plus lexical pins for what a step body cannot show: the `if:` gates, the env mapping between the
-# preflight outputs and the consumers, the matrix axis, the leg-only step guards, and the check-name
-# contract with docs-required-checks. A stub `python3`/`python`/`meson`/`gh` records its argv and
-# never runs anything, so this needs no build and no network.
+# preflight outputs and the consumers, the matrix axis and its excludes, the check names, the
+# leg-only step guards, the closure-guard steps and the registration of these tests. Stub
+# `python3`/`python`/`meson` record their argv and never run anything, so this needs no build and
+# no network.
 #
 # Where it runs: ci.yml's preflight "Shell gate tests" step, on every PR (Windows never runs it).
 # Run:  bash tests/shell/test_suite_selection_wiring.sh
@@ -34,6 +39,7 @@ CI_YML="$ROOT/.github/workflows/ci.yml"
 EXTRACT="$ROOT/tests/shell/extract_run_block.py"
 [ -f "$CI_YML" ] || { echo "missing $CI_YML" >&2; exit 2; }
 BASH_BIN="$(command -v bash)"
+GIT_BIN="$(command -v git)"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-suite-wiring.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -47,11 +53,14 @@ check() { # check <desc> <expected> <actual>
 BODY="$TMP/body"; mkdir -p "$BODY"
 MATRIX_SUBST=(--subst matrix.compiler=MATRIX_COMPILER --subst matrix.build_type=MATRIX_BUILD_TYPE)
 extract() { python3 "$EXTRACT" "$CI_YML" "$@" || { echo "extraction failed: $*" >&2; exit 2; }; }
+extract "$BODY/prpaths.sh"     --job preflight --name 'List the paths this pull request changes'
+extract "$BODY/codegate.sh"    --job preflight --name 'Determine code-vs-docs change set (docs-only gate)'
 extract "$BODY/affected.sh"    --job preflight --name 'Determine affected test suites (skip families this PR cannot reach)'
 extract "$BODY/linux_nonpg.sh" --job linux   --name 'Test (non-pg suites)'   "${MATRIX_SUBST[@]}"
 extract "$BODY/linux_pg.sh"    --job linux   --name 'Test (pg shards, full)' "${MATRIX_SUBST[@]}"
 extract "$BODY/win_nonpg.sh"   --job windows --name 'Test (non-pg suites)'   --subst matrix.build_type=MATRIX_BUILD_TYPE
 extract "$BODY/mac_test.sh"    --job macos   --name Test
+extract "$BODY/gate.sh"        --job linux-pr-gate --name 'Require every Linux leg'
 
 # ── stubs: record argv, run nothing ──────────────────────────────────────────
 STUBS="$TMP/bin"; mkdir -p "$STUBS"
@@ -64,13 +73,6 @@ exit "${!rcvar:-0}"
 EOF
 chmod +x "$STUBS/recorder"
 for name in python3 python meson; do ln -s recorder "$STUBS/$name"; done
-cat > "$STUBS/gh" <<'EOF'
-#!/usr/bin/env bash
-# Answers only the PR-files read, from a fixture that is already the jq-processed TSV.
-[ -n "${GH_STUB_FAIL:-}" ] && exit 1
-cat "${GH_STUB_FILE:?}"
-EOF
-chmod +x "$STUBS/gh"
 
 # A work tree the non-preflight bodies run in: with-test-slot.sh only execs what follows `--`.
 W="$TMP/work"; mkdir -p "$W/scripts/ci"
@@ -86,7 +88,8 @@ LOG="$TMP/calls.log"
 run_body() {
   local cwd="$1" body="$2"; shift 2
   : > "$LOG"; : > "$TMP/out"; : > "$TMP/err"
-  ( cd "$cwd" && env -i PATH="$STUBS:$(dirname "$BASH_BIN"):/usr/bin:/bin" HOME="$TMP" STUB_LOG="$LOG" \
+  ( cd "$cwd" && env -i PATH="$STUBS:$(dirname "$BASH_BIN"):$(dirname "$GIT_BIN"):/usr/bin:/bin" \
+      HOME="$TMP" GIT_CONFIG_NOSYSTEM=1 STUB_LOG="$LOG" \
       GITHUB_WORKSPACE="$W" MATRIX_COMPILER=gcc-15 MATRIX_BUILD_TYPE=debug "$@" \
       "$BASH_BIN" -e "$body" ) > "$TMP/out" 2> "$TMP/err"
   RC=$?
@@ -161,34 +164,143 @@ for sv in "" true; do for ag in "" true; do
   check "macos         skip_server='${sv:-}' skip_agent='${ag:-}'" "$want" "$(calls)"
 done; done
 
-# ── preflight `affected` ─────────────────────────────────────────────────────
-RT="$TMP/rt"; mkdir -p "$RT"
-pre_case() { # pre_case <desc> <cwd> <fixture tsv text> <changed_files> <want server> <want agent> [VAR=val ...]
-  local desc="$1" cwd="$2" tsv="$3" total="$4" ws="$5" wa="$6"; shift 6
-  printf '%b' "$tsv" > "$TMP/files.tsv"
-  : > "$TMP/gho"; : > "$TMP/summary"
-  run_body "$cwd" "$BODY/affected.sh" GH_STUB_FILE="$TMP/files.tsv" GH_TOKEN=x PR_NUMBER=7 \
-    CHANGED_FILES="$total" GITHUB_REPOSITORY=o/r RUNNER_TEMP="$RT" GITHUB_OUTPUT="$TMP/gho" \
-    GITHUB_STEP_SUMMARY="$TMP/summary" "$@"
-  check "preflight     $desc: outputs" "skip_server_suites=$ws|skip_agent_suites=$wa" \
-    "$(tr '\n' '|' < "$TMP/gho" | sed 's/|$//')"
-  check "preflight     $desc: exits 0 (a failure here must never block the workflow)" 0 "$RC"
-  grep -q '^### Suite selection' "$TMP/summary" && s=1 || s=0
-  check "preflight     $desc: writes the step summary" 1 "$s"
+# ── linux-pr-gate: the required Linux context ────────────────────────────────
+gate() { # gate <desc> <want rc> <preflight result> <code_changed> <linux result>
+  run_body "$W" "$BODY/gate.sh" PREFLIGHT_RESULT="$3" CODE_CHANGED="$4" LINUX_RESULT="$5"
+  check "linux gate    $1" "$2" "$RC"
 }
-pre_case "skills + ledger only skip both"      "$ROOT" '.claude/skills/x/SKILL.md\t\ngovernance.d/1.jsonl\t\n' 2 true true
-pre_case "a server change skips the agent family" "$ROOT" 'server/core/src/a.cpp\t\ndocs/z.md\t\n' 2 false true
-pre_case "shared code runs both"               "$ROOT" 'common/include/yuzu/x.hpp\t\n' 1 false false
-pre_case "a list shorter than changed_files fails closed" "$ROOT" '.claude/x\t\n' 5 false false
-pre_case "an API failure fails closed"         "$ROOT" '.claude/x\t\n' 1 false false GH_STUB_FAIL=1
-# a classifier the step cannot trust: garbage output, and a non-zero exit — both fail closed
+gate "every leg green -> green"                    0 success true  success
+gate "a failed leg -> red"                         1 success true  failure
+gate "a cancelled leg -> red"                      1 success true  cancelled
+gate "legs skipped on a code PR -> red"            1 success true  skipped
+gate "docs-only PR, no leg ran -> green"           0 success false skipped
+gate "preflight failed -> red, whatever else"      1 failure false skipped
+gate "preflight failed, legs green -> still red"   1 failure true  success
+gate "preflight cancelled -> red"                  1 cancelled true success
+gate "no code_changed verdict -> red"              1 success ""    skipped
+
+# ── preflight chain on a real merge commit ───────────────────────────────────
+# A scratch repository holding the three real scripts and a miniature tests tree. Each case makes a
+# PR branch off `base` and merges it with --no-ff into a branch off `base`, the shape of GitHub's
+# test merge commit (first parent the base tip, second parent the PR head); the bodies run there.
+REPO="$TMP/repo"; RT="$TMP/rt"; mkdir -p "$REPO" "$RT"
+fgit() { env -i PATH="$(dirname "$GIT_BIN"):/usr/bin:/bin" HOME="$TMP" GIT_CONFIG_NOSYSTEM=1 \
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t \
+  GIT_COMMITTER_EMAIL=t@example.invalid "$GIT_BIN" -C "$REPO" "$@"; }
+fgit init -q -b base
+mkdir -p "$REPO/scripts/ci" "$REPO/tests/unit/server" "$REPO/server/core/src" "$REPO/docs/user-manual" \
+         "$REPO/.github"
+for f in pr-changed-paths.sh detect-code-change.sh affected-suites.sh; do
+  cp "$ROOT/scripts/ci/$f" "$REPO/scripts/ci/$f"
+done
+printf '# test registrations\n' > "$REPO/tests/meson.build"
+printf '// a server test\n' > "$REPO/tests/unit/server/test_s.cpp"
+printf '// an agent test that reads docs/user-manual/metrics.md\n' > "$REPO/tests/unit/test_a.cpp"
+printf 'metrics\n' > "$REPO/docs/user-manual/metrics.md"
+printf 'guide\n' > "$REPO/docs/guide.md"
+printf 'int x;\n' > "$REPO/server/core/src/x.cpp"
+printf '{}\n' > "$REPO/.github/runner-inventory.json"
+fgit add -A && fgit commit -q -m base
+
+# pr <name> <edit, run in the repository>: sets PR_HEAD and MERGE, and leaves MERGE checked out.
+pr() {
+  fgit checkout -q -b "pr-$1" base
+  (cd "$REPO" && eval "$2")
+  fgit add -A && fgit commit -q -m "pr $1"
+  PR_HEAD="$(fgit rev-parse HEAD)"
+  fgit checkout -q -b "m-$1" base
+  fgit merge -q --no-ff -m "merge $1" "pr-$1"
+  MERGE="$(fgit rev-parse HEAD)"
+}
+out() { sed -n "s/^$1=//p" "$2"; }
+# chain <desc> <want code_changed> <want "skip_server skip_agent", or "-" when affected is skipped>
+#       [run commit] [PR head]   — the last two default to the merge commit and the PR head
+chain() {
+  local desc="$1" want_cc="$2" want_skip="$3" sha="${4:-$MERGE}" head="${5:-$PR_HEAD}" ok cc n
+  : > "$TMP/o_paths"; : > "$TMP/o_gate"; : > "$TMP/o_aff"
+  run_body "$REPO" "$BODY/prpaths.sh" GITHUB_SHA="$sha" PR_HEAD_SHA="$head" RUNNER_TEMP="$RT" \
+    GITHUB_OUTPUT="$TMP/o_paths"
+  check "chain         $desc: the list step exits 0" 0 "$RC"
+  ok="$(out ok "$TMP/o_paths")"
+  run_body "$REPO" "$BODY/codegate.sh" GITHUB_EVENT_NAME=pull_request PATHS_OK="$ok" RUNNER_TEMP="$RT" \
+    GITHUB_OUTPUT="$TMP/o_gate"
+  check "chain         $desc: the docs-only gate exits 0" 0 "$RC"
+  cc="$(out code_changed "$TMP/o_gate")"
+  check "chain         $desc: code_changed" "$want_cc" "$cc"
+  if [ "$cc" = true ]; then
+    : > "$TMP/summary"
+    run_body "$REPO" "$BODY/affected.sh" GITHUB_SHA="$sha" PATHS_OK="$ok" RUNNER_TEMP="$RT" \
+      GITHUB_OUTPUT="$TMP/o_aff" GITHUB_STEP_SUMMARY="$TMP/summary"
+    check "chain         $desc: affected exits 0" 0 "$RC"
+    check "chain         $desc: skip_server skip_agent" "$want_skip" \
+      "$(out skip_server_suites "$TMP/o_aff") $(out skip_agent_suites "$TMP/o_aff")"
+    grep -q '^::notice title=Suite selection::' "$TMP/out" && n=1 || n=0
+    check "chain         $desc: the verdict is recorded as a notice" 1 "$n"
+  else
+    check "chain         $desc: affected would not run" "$want_skip" "-"
+  fi
+  fgit checkout -q base
+}
+pr docs      'printf "more\n" >> docs/guide.md'
+chain "a docs-only PR builds nothing"                          false "-"
+pr inventory 'printf "{\"x\":1}\n" > .github/runner-inventory.json'
+chain "the runner inventory is docs-only to both gates"        false "-"
+pr metrics   'printf "more\n" >> docs/user-manual/metrics.md'
+chain "a doc a test reads builds, and runs that family"        true  "true false"
+pr gitattr   'printf "capability-registries/*.tsv text eol=crlf\n" > docs/.gitattributes'
+chain "a .gitattributes under docs/ builds and runs both"      true  "false false"
+pr rename    'mv server/core/src/x.cpp docs/x.md'
+chain "a rename out of server/ into docs/ runs the server family" true "false true"
+pr agent     'printf "// more\n" >> tests/unit/test_a.cpp'
+chain "an agent test alone skips the server family"            true  "true false"
+pr server    'printf "int y;\n" >> server/core/src/x.cpp'
+chain "server code alone skips the agent family"               true  "false true"
+# binding failures: the list is refused, and both gates fail closed
+pr bind      'printf "more\n" >> docs/guide.md'
+chain "a PR head that is not the merge's second parent fails closed" true "false false" "$MERGE" "$(fgit rev-parse base)"
+pr bind2     'printf "more\n" >> docs/guide.md'
+chain "a run commit that is not HEAD fails closed"             true  "false false" "$(fgit rev-parse base)"
+pr bind3     'printf "more\n" >> docs/guide.md'
+fgit checkout -q pr-bind3                        # HEAD is the PR head itself: one parent
+MERGE="$(fgit rev-parse HEAD)"
+chain "a HEAD that is not a merge commit fails closed"         true  "false false"
+: > "$TMP/o_paths"
+run_body "$REPO" "$BODY/prpaths.sh" GITHUB_SHA="" PR_HEAD_SHA="" RUNNER_TEMP="$RT" GITHUB_OUTPUT="$TMP/o_paths"
+check "chain         a missing PR head is refused: ok=false" "false" "$(out ok "$TMP/o_paths")"
+grep -q '^::warning title=Changed paths unavailable::' "$TMP/out" && n=1 || n=0
+check "chain         a refused list is announced as a warning" 1 "$n"
+: > "$TMP/o_gate"
+run_body "$REPO" "$BODY/codegate.sh" GITHUB_EVENT_NAME=push PATHS_OK="" RUNNER_TEMP="$RT" GITHUB_OUTPUT="$TMP/o_gate"
+check "chain         a push always builds" "true" "$(out code_changed "$TMP/o_gate")"
+
+# ── preflight `affected`: a classifier the step cannot trust ─────────────────
+printf 'docs/z.md\n' > "$RT/pr-changed-paths.txt"
+aff_case() { # aff_case <desc> <cwd> <PATHS_OK> <want server> <want agent>
+  : > "$TMP/o_aff"; : > "$TMP/summary"
+  run_body "$2" "$BODY/affected.sh" GITHUB_SHA=0123 PATHS_OK="$3" RUNNER_TEMP="$RT" \
+    GITHUB_OUTPUT="$TMP/o_aff" GITHUB_STEP_SUMMARY="$TMP/summary"
+  check "preflight     $1: outputs" "skip_server_suites=$4|skip_agent_suites=$5" \
+    "$(tr '\n' '|' < "$TMP/o_aff" | sed 's/|$//')"
+  check "preflight     $1: exits 0 (a failure here must never block the workflow)" 0 "$RC"
+  grep -q '^### Suite selection' "$TMP/summary" && s=1 || s=0
+  check "preflight     $1: writes the step summary" 1 "$s"
+}
+aff_case "no list fails closed" "$ROOT" false false false
+grep -q '^::warning title=Suite selection::' "$TMP/out" && n=1 || n=0
+check "preflight     the fail-closed path is announced as a warning" 1 "$n"
 mkdir -p "$TMP/w2/scripts/ci"
 printf '#!/usr/bin/env bash\necho "skip_server=maybe"\necho "skip_agent=true"\n' > "$TMP/w2/scripts/ci/affected-suites.sh"
-pre_case "garbled classifier output fails closed" "$TMP/w2" '.claude/x\t\n' 1 false false
+aff_case "garbled classifier output fails closed" "$TMP/w2" true false false
 printf '#!/usr/bin/env bash\necho boom >&2\nexit 3\n' > "$TMP/w2/scripts/ci/affected-suites.sh"
-pre_case "a classifier that exits non-zero fails closed" "$TMP/w2" '.claude/x\t\n' 1 false false
+aff_case "a classifier that exits non-zero fails closed" "$TMP/w2" true false false
 printf '#!/usr/bin/env bash\necho "skip_server=true"\necho "skip_agent=true"\necho "extra"\n' > "$TMP/w2/scripts/ci/affected-suites.sh"
-pre_case "a classifier with an extra line is still read line by line" "$TMP/w2" '.claude/x\t\n' 1 true true
+aff_case "a classifier with an extra line is still read line by line" "$TMP/w2" true true true
+# the docs-only gate: a classifier that errors, or answers anything but skip-both, makes the PR build
+printf '#!/usr/bin/env bash\nexit 3\n' > "$TMP/w2/scripts/ci/affected-suites.sh"
+cp "$ROOT/scripts/ci/detect-code-change.sh" "$TMP/w2/scripts/ci/detect-code-change.sh"
+: > "$TMP/o_gate"
+run_body "$TMP/w2" "$BODY/codegate.sh" GITHUB_EVENT_NAME=pull_request PATHS_OK=true RUNNER_TEMP="$RT" GITHUB_OUTPUT="$TMP/o_gate"
+check "docs gate     a docs-only list with a failing classifier builds" "true" "$(out code_changed "$TMP/o_gate")"
 
 # ── lexical pins: what no step body can show ─────────────────────────────────
 flat="$(tr '\n' ' ' < "$CI_YML" | tr -s ' ')"
@@ -199,26 +311,45 @@ check "env: SKIP_AGENT_SUITES is mapped from skip_agent_suites on the three cons
   "$(count 'SKIP_AGENT_SUITES: ${{ needs.preflight.outputs.skip_agent_suites }}')"
 check "env: no consumer maps a family's variable from the other family's output" 0 \
   "$(( $(count 'SKIP_SERVER_SUITES: ${{ needs.preflight.outputs.skip_agent_suites }}') + $(count 'SKIP_AGENT_SUITES: ${{ needs.preflight.outputs.skip_server_suites }}') ))"
+check "env: both gates read the list step's verdict" 2 "$(count 'PATHS_OK: ${{ steps.prpaths.outputs.ok }}')"
+check "env: the list is bound to the event's PR head" 1 \
+  "$(sed -n '/- name: List the paths this pull request changes/,/run: |/p' "$CI_YML" | grep -c -F 'PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}')"
 check "gate: the pg and smoke steps of both legs are off only when the server family is skipped" 4 \
   "$(count "&& needs.preflight.outputs.skip_server_suites != 'true'")"
+check "gate: affected runs only on a PR into anything but main, with code changes" 1 \
+  "$(count "if: github.event_name == 'pull_request' && github.base_ref != 'main' && steps.codegate.outputs.code_changed == 'true'")"
+check "gate: the list step runs on pull requests" 1 \
+  "$(sed -n '/- name: List the paths this pull request changes/,/run: |/p' "$CI_YML" | grep -c "if: github.event_name == 'pull_request'")"
+check "checkout: preflight fetches the merge commit's parents" 1 \
+  "$(sed -n '/^  preflight:/,/^      - name: /p' "$CI_YML" | grep -c 'fetch-depth: 2')"
 # every mention of a skip output is a job output, an env mapping or one of those gates: a bare
 # truthiness test or `!= 'false'` would treat an EMPTY output (a push, a docs-only PR) as "skip"
 stray="$(grep -n 'skip_server_suites\|skip_agent_suites' "$CI_YML" | grep -v \
   -e '^[0-9]*: *skip_\(server\|agent\)_suites: \${{ steps.affected.outputs' \
   -e 'SKIP_\(SERVER\|AGENT\)_SUITES: \${{ needs.preflight.outputs.skip_\(server\|agent\)_suites }}' \
   -e "&& needs.preflight.outputs.skip_server_suites != 'true'" \
+  -e "- pg_part: \${{ (github.event_name != 'pull_request' || needs.preflight.outputs.skip_server_suites == 'true') && 'pg-b' || 'NONE' }}" \
   -e 'echo "skip_\(server\|agent\)_suites=\$skip_' \
   -e '^[0-9]*: *#' || true)"
 check "gate: no other use of a skip output (an empty output must always mean run)" "" "$stray"
 check "matrix: pg_part is the axis pg-a / pg-b" 1 "$(count 'pg_part: [pg-a, pg-b]')"
-check "matrix: pg-b is excluded on every non-PR event" 1 \
-  "$(count "- pg_part: \${{ github.event_name == 'pull_request' && 'NONE' || 'pg-b' }}")"
-check "name: the pg-b leg is the only one whose check name changes" 1 \
-  "$(count "name: \"Linux \${{ matrix.compiler }} \${{ matrix.build_type }}\${{ matrix.pg_part == 'pg-b' && ' (pg B)' || '' }}\"")"
-# the docs-only stub must emit the names the matrix renders: three unchanged contexts + the pg B one
+check "matrix: pg-b only on a pull request that can reach the server family" 1 \
+  "$(count "- pg_part: \${{ (github.event_name != 'pull_request' || needs.preflight.outputs.skip_server_suites == 'true') && 'pg-b' || 'NONE' }}")"
+LEG_NAME="Linux \${{ matrix.compiler }} \${{ matrix.build_type }}\${{ github.event_name == 'pull_request' && (matrix.pg_part == 'pg-b' && ' (pg B)' || ' (pg A)') || '' }}"
+check "name: a PR's legs are (pg A) / (pg B); any other event keeps the plain names" 1 "$(count "name: \"$LEG_NAME\"")"
+check "name: the telemetry leg name is the same template" 1 "$(count "YUZU_LEG_NAME: \"$LEG_NAME\"")"
+gate_block="$(sed -n '/^  linux-pr-gate:/,/^    steps:/p' "$CI_YML")"
+check "linux gate: it is the required context on a PR, under another name elsewhere" 1 \
+  "$(printf '%s\n' "$gate_block" | grep -c -F "name: \${{ github.event_name == 'pull_request' && 'Linux gcc-15 debug' || 'Linux PR gate (pull requests only)' }}")"
+check "linux gate: it waits for preflight and every Linux leg" 1 \
+  "$(printf '%s\n' "$gate_block" | grep -c -F 'needs: [preflight, linux]')"
+check "linux gate: it runs on every pull request, even after a failure or a cancel" 1 \
+  "$(printf '%s\n' "$gate_block" | grep -c -F "if: always() && github.event_name == 'pull_request'")"
+check "linux gate: exactly one job carries the required Linux name" 1 "$(count "'Linux gcc-15 debug' ||")"
+# the docs-only stub must emit the names the Windows and macOS matrices render on a PR
 stub="$(sed -n '/^  docs-required-checks:/,/^  [a-z-]*:$/p' "$CI_YML" | grep '^ *- "' | sed 's/^ *- //' | tr '\n' ' ')"
-check "stubs: docs-required-checks lists the three existing contexts and the pg B context" \
-  '"Linux gcc-15 debug" "Linux gcc-15 debug (pg B)" "Windows MSVC debug" "macOS debug" ' "$stub"
+check "stubs: docs-required-checks lists the Windows and macOS contexts" \
+  '"Windows MSVC debug" "macOS debug" ' "$stub"
 # the steps only the pg-a leg runs: adding a heavy step without this guard makes the pg-b leg run
 # it too, and dropping the guard from one of these gives the pg-b leg work it must not do
 guarded="$(awk '/^  linux:/{j=1} /^  windows:/{j=0}
@@ -226,6 +357,16 @@ guarded="$(awk '/^  linux:/{j=1} /^  windows:/{j=0}
   j&&/^        if: matrix.pg_part != .pg-b.$/{print n}' "$CI_YML" | tr '\n' '|')"
 want_guarded="Install Erlang/OTP and rebar3|Verify vendored grpcbox integrity|Compile gateway (warm _build for the codegen check)|Verify gateway proto codegen is up to date|Verify test-family separation (affected-suites class table)|Capability matrix drift gate (#2204)|Capability matrix gate tests (#2204 F10)|Assert canary libpq link provenance (static on Linux)|Test (non-pg suites)|Break-glass CLI test|Agent graceful-shutdown smoke test|"
 check "legs: the steps skipped on the pg-b leg are exactly the intended eleven" "$want_guarded" "$guarded"
+# the closure guard: present on the Linux and macOS jobs, and neither step can be made to pass anyway
+guard_steps="$(awk '/^      - name: Verify test-family separation/{g=1; print "STEP"; next}
+  g&&/^      - /{g=0} g&&/^      #/{g=0} g' "$CI_YML")"
+check "closure guard: one step on Linux, one on macOS" 2 "$(printf '%s\n' "$guard_steps" | grep -c '^STEP$')"
+check "closure guard: both run the checker, and nothing lets them pass on a failure" "2|0" \
+  "$(printf '%s\n' "$guard_steps" | grep -c 'run: python3 scripts/ci/check-suite-input-closure.py --builddir ')|$(printf '%s\n' "$guard_steps" | grep -c -e 'continue-on-error' -e '|| true' -e '|| :')"
+# these tests are what pin the wiring; a deleted registration would silently stop them
+shell_gates="$(sed -n '/- name: Shell gate tests/,/^      - name: /p' "$CI_YML")"
+check "registration: the classifier test and this test run in preflight" "1|1" \
+  "$(printf '%s\n' "$shell_gates" | grep -c '^ *bash tests/shell/test_affected_suites.sh')|$(printf '%s\n' "$shell_gates" | grep -c '^ *bash tests/shell/test_suite_selection_wiring.sh')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

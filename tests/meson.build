@@ -2132,7 +2132,7 @@ if build_server
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]'],
        suite: ['server', 'server-pg', 'server-pg-b'], timeout: 700, priority: 100)
 
-  # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 11 shards
+  # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 12 shards
   # above on the 3 non-primary Linux push legs (ci.yml pg_mode=smoke); the
   # gcc-15/debug leg (every PR, plus the primary push leg) keeps the full
   # server-pg suite unchanged. Membership is the [pg-smoke] tag, hand-picked
@@ -2197,7 +2197,8 @@ if build_server
   # reddening CI unconditionally). Discovery is via `meson introspect --tests`
   # keyed on suite membership, so adding/splitting/rebalancing a shard needs
   # no update here: give the new/changed test() entry the right suite: kwarg
-  # (['server', 'server-pg']) and this check verifies the rest on its own.
+  # (['server', 'server-pg', 'server-pg-a'] or [..., 'server-pg-b'], see the
+  # PR-time halves note above) and this check verifies the rest on its own.
   # depends: ensures ninja builds the binary before this runs; it needs no
   # Postgres DSN (--list-tests only enumerates TEST_CASE macros, never runs
   # one).

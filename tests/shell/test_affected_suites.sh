@@ -7,8 +7,10 @@
 # build, a throwaway tests tree):
 #   - the class table, including the case-arm ordering traps (`*` in a case pattern matches `/`)
 #   - the run-time-read rule: a path that a test source names verbatim affects that test's family
-#   - every fail-closed input: empty list, count mismatch, unreadable path, missing tests tree
-#   - renames: the SOURCE of a rename out of a heavy directory still counts
+#   - every fail-closed input: empty list, unreadable path, missing tests tree or meson file, a
+#     symlink in the tests tree, an unreadable tests directory, no temporary directory
+#   - renames: the SOURCE of a rename out of a heavy directory still counts (it arrives as its own
+#     line, the way scripts/ci/pr-changed-paths.sh lists a rename)
 # and finally runs the classifier over the real repository as a smoke test.
 #
 # Where it runs: ci.yml's preflight "Shell gate tests" step, on every PR, like
@@ -33,12 +35,14 @@ cat > "$T/tests/meson.build" <<'EOF'
 EOF
 cat > "$T/tests/unit/server/test_s.cpp" <<'EOF'
 // reads docs/read-by-server.md and mentions docs/user-manual/policy-engine.md in an error string
+// and names tests/unit/test_named_by_server.cpp (an agent-class path)
 EOF
 cat > "$T/tests/unit/test_a.cpp" <<'EOF'
 // reads docs/user-manual/metrics.md
 EOF
 cat > "$T/tests/unit/agent/test_b.cpp" <<'EOF'
-// reads .claude/read-by-agent.md
+// reads .claude/read-by-agent.md, content/definitions/read-by-agent.yaml (a server-class path)
+// and docs/a[1].md (a literal path a regular expression would not match)
 EOF
 # a helper header directly under tests/unit/ is compiled into the server binary too
 cat > "$T/tests/unit/test_helpers.hpp" <<'EOF'
@@ -105,6 +109,15 @@ done
 for p in .gitattributes .clang-tidy .clang-format some-new-root-file.cfg; do
   expect_class both "$p"
 done
+# ...and a .gitattributes anywhere, even under an inert directory: it changes checkout bytes there
+for p in docs/.gitattributes docs/capability-registries/.gitattributes gateway/.gitattributes \
+         .claude/x/.gitattributes; do
+  expect_class both "$p"
+done
+# the runner inventory is inert here, as it is to the docs-only gate (ci.yml needs the two to agree)
+expect_class none .github/runner-inventory.json
+expect_class none .github/workflows/runner-inventory-sentinel.yml
+expect_class both .github/workflows/other.yml
 # the traps: `*` in a case pattern crosses `/`, so arm order is part of the contract
 expect_class both  tests/unit/sub/deeper/x.cpp        # not `tests/unit/*.cpp` (agent)
 expect_class both  tests/weird/x.txt                  # not `tests/*` (none)
@@ -113,62 +126,70 @@ expect_class both  unknown-dir/x                      # any other directory is u
 expect_class both  agents/README.md                   # a doc inside agents/ is still both
 
 # --- list-level results: "skip_server skip_agent" -------------------------------------------------
-expect "false true"  "server code alone skips the agent suites"        'server/core/src/a.cpp\t\n'
-expect "true false"  "an agent test alone skips the server suites"     'tests/unit/test_x.cpp\t\n'
-expect "false false" "shared code runs both"                           'common/include/x.hpp\t\n'
-expect "false false" "server + agent test run both"                    'server/core/src/a.cpp\t\ntests/unit/test_x.cpp\t\n'
-expect "true true"   "skills, ledger, changelog, docs skip both"       '.claude/skills/x.md\t\ngovernance.d/1.jsonl\t\nchangelog.d/1-x.fixed.md\t\ndocs/z.md\t\n'
-expect "true true"   "gateway-only and deploy-only PRs skip both"      'gateway/apps/x.erl\t\ndeploy/windows/x.ps1\t\n'
-expect "false false" "one build file among docs runs both"             'docs/z.md\t\nserver/core/meson.build\t\n'
-expect "false false" "an unknown directory runs both"                  'weird/x\t\n'
-expect "false false" "a CI script runs both"                           'scripts/ci/affected-suites.sh\t\n'
-expect "false true"  "plain paths without the TAB column are accepted" 'server/core/src/a.cpp\ndocs/z.md\n'
-expect "false true"  "a file with no trailing newline is still read"   'server/core/src/a.cpp\t'
+expect "false true"  "server code alone skips the agent suites"        'server/core/src/a.cpp\n'
+expect "true false"  "an agent test alone skips the server suites"     'tests/unit/test_x.cpp\n'
+expect "false false" "shared code runs both"                           'common/include/x.hpp\n'
+expect "false false" "server + agent test run both"                    'server/core/src/a.cpp\ntests/unit/test_x.cpp\n'
+expect "true true"   "skills, ledger, changelog, docs skip both"       '.claude/skills/x.md\ngovernance.d/1.jsonl\nchangelog.d/1-x.fixed.md\ndocs/z.md\n'
+expect "true true"   "gateway-only and deploy-only PRs skip both"      'gateway/apps/x.erl\ndeploy/windows/x.ps1\n'
+expect "false false" "one build file among docs runs both"             'docs/z.md\nserver/core/meson.build\n'
+expect "false false" "an unknown directory runs both"                  'weird/x\n'
+expect "false false" "a CI script runs both"                           'scripts/ci/affected-suites.sh\n'
+expect "false true"  "a file with no trailing newline is still read"   'server/core/src/a.cpp'
 
 # --- run-time reads: a test naming a path verbatim makes it affect that family ----------------------
-expect "false true"  "a doc a SERVER test names runs the server family"   'docs/read-by-server.md\t\n'
-expect "false true"  "an error-string mention counts too (over-broad by design)" 'docs/user-manual/policy-engine.md\t\n'
-expect "true false"  "a doc an AGENT test names runs the agent family"    'docs/user-manual/metrics.md\t\n'
-expect "true false"  "a nested agent test's read counts (agent/ is not server/)" '.claude/read-by-agent.md\t\n'
-expect "false false" "tests/meson.build naming a path runs both"          'docs/named-by-meson.md\t\n'
-expect "true true"   "a doc no test names skips both"                     'docs/user-manual/unread.md\t\n'
-expect "false false" "capability registries always run both"              'docs/capability-registries/x.tsv\t\n'
-expect "true true"   "a changed path that merely extends a named path is not named" 'docs/user-manual/metrics.md.bak\t\n'
-expect "false false" "a path a shared helper header names runs both families" 'docs/read-by-helper.md\t\n'
-expect "false true"  "a path named only inside a binary-looking server source is still found" 'docs/read-by-binary.md\t\n'
+expect "false true"  "a doc a SERVER test names runs the server family"   'docs/read-by-server.md\n'
+expect "false true"  "an error-string mention counts too (over-broad by design)" 'docs/user-manual/policy-engine.md\n'
+expect "true false"  "a doc an AGENT test names runs the agent family"    'docs/user-manual/metrics.md\n'
+expect "true false"  "a nested agent test's read counts (agent/ is not server/)" '.claude/read-by-agent.md\n'
+expect "false false" "tests/meson.build naming a path runs both"          'docs/named-by-meson.md\n'
+expect "true true"   "a doc no test names skips both"                     'docs/user-manual/unread.md\n'
+expect "false false" "capability registries always run both"              'docs/capability-registries/x.tsv\n'
+expect "true true"   "a changed path that merely extends a named path is not named" 'docs/user-manual/metrics.md.bak\n'
+expect "false false" "a path a shared helper header names runs both families" 'docs/read-by-helper.md\n'
+expect "false true"  "a path named only inside a binary-looking server source is still found" 'docs/read-by-binary.md\n'
+# the scan still runs for the family pass 1 left skippable, and reads BOTH directions
+expect "false false" "a mixed list still scans for the family the class table left open" 'server/core/src/a.cpp\ndocs/user-manual/metrics.md\n'
+expect "false false" "a server-class path an agent test names runs the agent family too" 'content/definitions/read-by-agent.yaml\n'
+expect "false false" "an agent-class path a server test names runs the server family too" 'tests/unit/test_named_by_server.cpp\n'
+expect "true false"  "a path is matched literally, never as a pattern"  'docs/a[1].md\n'
 
 # --- renames: the source path counts -------------------------------------------------------------
-expect "false true"  "rename server code -> docs still runs the server family" 'docs/x.md\tserver/core/src/x.cpp\n'
-expect "false false" "rename agents/ -> docs runs both"                        'docs/x.md\tagents/core/src/x.cpp\n'
-expect "true true"   "rename docs -> docs skips both"                          'docs/new.md\tdocs/old.md\n'
+expect "false true"  "rename server code -> docs still runs the server family" 'docs/x.md\nserver/core/src/x.cpp\n'
+expect "false false" "rename agents/ -> docs runs both"                        'agents/core/src/x.cpp\ndocs/x.md\n'
+expect "true true"   "rename docs -> docs skips both"                          'docs/new.md\ndocs/old.md\n'
 
 # --- fail closed ---------------------------------------------------------------------------------
 expect "false false" "empty list"                          ''
 expect "false false" "only blank lines"                    '\n\n'
-expect "false false" "list shorter than --total"           'docs/z.md\t\n'               --total 2
-expect "false false" "list longer than --total"            'docs/z.md\t\ndocs/y.md\t\n'  --total 1
-expect "false false" "non-numeric --total"                 'docs/z.md\t\n'               --total many
-expect "false false" "--total given but empty is not 'no guard'" 'docs/z.md\t\n'            --total ""
-expect "false false" "a record with no filename"           '\t\n'
-expect "false false" "a record with no filename, with --total" '\t\n'                        --total 1
-expect "false false" "a record with only a previous name"  '\tdocs/old.md\n'
-expect "true true"   "matching --total keeps the result"   'docs/z.md\t\n'               --total 1
-expect "false false" "backslash from @tsv escaping"        'docs/a\\\\tb.md\t\n'
-expect "false false" "C-quoted path"                       '"docs/a b.md"\t\n'
-expect "false false" "absolute path"                       '/etc/passwd\t\n'
-expect "false false" "parent-directory escape"             'docs/../server/x.cpp\t\n'
-expect "false false" "a heavy path hidden behind a doc rename column" 'docs/x.md\t"server/a b.cpp"\n'
-expect "false false" "tests root missing"                  'docs/z.md\t\n'               --tests-root "$T/nope"
-rm -rf "$T/none-server" && mkdir -p "$T/none-server/tests/unit"
-expect "false false" "tests/unit/server missing, so reads cannot be checked" 'docs/z.md\t\n' --tests-root "$T/none-server/tests/unit"
+expect "false false" "a TAB in a line (not a list git printed)" 'docs/x.md\tserver/core/src/x.cpp\n'
+expect "false false" "a raw backslash"                     'docs/a\\\\b.md\n'
+expect "false false" "C-quoted path"                       '"docs/a\\tb.md"\n'
+expect "false false" "absolute path"                       '/etc/passwd\n'
+expect "false false" "parent-directory escape"             'docs/../server/x.cpp\n'
+expect "false false" "a bare parent directory"             '..\n'
+expect "false false" "tests root missing"                  'docs/z.md\n'               --tests-root "$T/nope"
+rm -rf "$T/none-server" && mkdir -p "$T/none-server/tests/unit" && : > "$T/none-server/tests/meson.build"
+expect "false false" "tests/unit/server missing, so reads cannot be checked" 'docs/z.md\n' --tests-root "$T/none-server/tests/unit"
+rm -rf "$T/no-meson" && mkdir -p "$T/no-meson/tests/unit/server"
+expect "false false" "tests/meson.build missing, so its reads cannot be checked" 'docs/z.md\n' --tests-root "$T/no-meson/tests/unit"
 # ...but a list that is already decided needs no scan, so it does not depend on the tests tree
-expect "false false" "a decided list does not need the tests tree" 'common/include/x.hpp\t\n' --tests-root "$T/nope"
+expect "false false" "a decided list does not need the tests tree" 'common/include/x.hpp\n' --tests-root "$T/nope"
+# grep -r does not follow a symlink inside the tree, so the classifier refuses to scan one
+rm -rf "$T/linked" && mkdir -p "$T/linked/tests/unit/server" && : > "$T/linked/tests/meson.build"
+printf '// reads docs/behind-a-link.md\n' > "$T/linked/reader.cpp"
+ln -s ../../../reader.cpp "$T/linked/tests/unit/server/test_linked.cpp"
+expect "false false" "a symlink in the tests tree fails closed" 'docs/behind-a-link.md\n' --tests-root "$T/linked/tests/unit"
+# no temporary directory: the scan cannot run, so nothing may be skipped (and the script still answers)
+got="$(printf 'docs/z.md\n' | TMPDIR="$T/no-such-dir" bash "$SCRIPT" --tests-root "$TR" 2>/dev/null | tr '\n' ' ')"
+if [ "$got" = "skip_server=false skip_agent=false " ]; then report 0 "no temporary directory fails closed"
+else report 1 "no temporary directory fails closed" "got '$got'"; fi
 
 # A grep that cannot read the tests tree must not read as "nothing names this path". Root can read
 # a mode-000 directory, so this case only means something for an ordinary user.
 if [ "$(id -u)" != 0 ]; then
   chmod 000 "$T/tests/unit/server"
-  expect "false false" "an unreadable server test dir fails closed" 'docs/z.md\t\n'
+  expect "false false" "an unreadable server test dir fails closed" 'docs/z.md\n'
   chmod 755 "$T/tests/unit/server"
 else
   printf '  [skip] unreadable-directory case (running as root)\n'
@@ -177,7 +198,7 @@ fi
 # --- usage errors are not results ----------------------------------------------------------------
 rc=0; bash "$SCRIPT" --bogus >/dev/null 2>&1 </dev/null || rc=$?
 [ "$rc" = 2 ] && report 0 "unknown flag exits 2" || report 1 "unknown flag exits 2" "rc=$rc"
-rc=0; bash "$SCRIPT" --total >/dev/null 2>&1 </dev/null || rc=$?
+rc=0; bash "$SCRIPT" --tests-root >/dev/null 2>&1 </dev/null || rc=$?
 [ "$rc" = 2 ] && report 0 "flag without a value exits 2" || report 1 "flag without a value exits 2" "rc=$rc"
 
 # --classify-many is what scripts/ci/check-suite-input-closure.py calls, so its shape is a contract.
@@ -205,12 +226,12 @@ if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     else report 1 "real tree: the run-time-read scan ran and found real readers" "$(head -c 300 "$T/real.err")"; fi
   fi
   # Every doc a real test reads must classify as affecting; the two known readers are the pin.
-  got="$(printf 'docs/user-manual/metrics.md\t\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
+  got="$(printf 'docs/user-manual/metrics.md\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
   case "$got" in
     *skip_agent=false*) report 0 "real tree: docs/user-manual/metrics.md (read by an agent test) runs the agent family" ;;
     *) report 1 "real tree: metrics.md runs the agent family" "got: $got" ;;
   esac
-  got="$(printf 'docs/capability-registries/dex_obs_platforms.tsv\t\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
+  got="$(printf 'docs/capability-registries/dex_obs_platforms.tsv\n' | (cd "$ROOT" && bash "$SCRIPT" 2>/dev/null) | tr '\n' ' ')"
   case "$got" in
     *skip_server=false*skip_agent=false*) report 0 "real tree: a capability registry table runs both (class row)" ;;
     *) report 1 "real tree: a capability registry table runs both (class row)" "got: $got" ;;
