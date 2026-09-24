@@ -417,6 +417,17 @@ public:
     /// `Throw` mirrors a std::bad_alloc anywhere in the guarded launch region.
     enum class LaunchFaultForTest { None, SpawnRefused, Throw };
 
+    /// Test-only fault injection for worker_loop's post-pop item-identity
+    /// capture (#4783 Gate 3 cpp-safety/cpp-expert/security-guardian finding,
+    /// 2026-09-24 - three independent reviewers converged on the same defect).
+    /// `ThrowDuringCapture` fires AFTER popped_rule_id is captured but BEFORE
+    /// the remaining fields (guard_type/rule_name/event_type/seq) - mirroring
+    /// the realistic worst case (an allocation failure partway through the
+    /// four capture copies, not on the very first one) and proving the outer
+    /// catch(...) still accounts the loss using whatever was captured before
+    /// the throw, rather than silently dropping it.
+    enum class WorkerFaultForTest { None, ThrowDuringCapture };
+
     GuardianLegacySinkExecutor() : GuardianLegacySinkExecutor(Config{}) {}
     explicit GuardianLegacySinkExecutor(Config cfg) : state_(std::make_shared<State>()) {
         state_->max_events = cfg.max_events;
@@ -894,6 +905,9 @@ public:
     void set_admission_fault_for_test(AdmissionFaultForTest f) {
         state_->admission_fault_for_test.store(f, std::memory_order_relaxed);
     }
+    void set_worker_fault_for_test(WorkerFaultForTest f) {
+        state_->worker_fault_for_test.store(f, std::memory_order_relaxed);
+    }
 
     /// TEST-ONLY (#4783 Gate 4 UP-4 de-escalation): observe the per-loss
     /// attribution log without depending on spdlog's own default-logger state,
@@ -941,6 +955,12 @@ private:
         std::size_t max_events{4096};                     // copied from Config at construction
         std::size_t max_bytes{4u << 20};                  // copied from Config at construction
         std::atomic<AdmissionFaultForTest> admission_fault_for_test{AdmissionFaultForTest::None};
+        /// #4783 Gate 3 finding, 2026-09-24: worker_loop's post-pop capture fault
+        /// seam - see WorkerFaultForTest's own doc comment. Lives on State (not
+        /// the executor instance, unlike launch_fault_for_test_) because
+        /// worker_loop is a static function that only ever sees a
+        /// shared_ptr<State>, never `this`.
+        std::atomic<WorkerFaultForTest> worker_fault_for_test{WorkerFaultForTest::None};
         /// #4783 follow-up: the executor-wide admission sequence counter - every
         /// offer() call that reaches the lock (admitted or refused alike) gets the
         /// next value. See the class doc comment's SEQ-GUARDED CLEARING section.
@@ -1257,13 +1277,37 @@ private:
                 st->queue.pop_front();
                 st->bytes -= it.bytes;
 
+                // #4783 Gate 3 cpp-safety finding, 2026-09-24: have_unaccounted_item
+                // is set FIRST, before any of the capture copies below - each of
+                // those four std::string copy-assignments is itself an allocation,
+                // hence throw-capable. Setting the flag only AFTER them would
+                // reproduce, inside this very fix, the exact defect class it exists
+                // to close: an allocation failure during the capture itself would
+                // reach the outer catch(...) with the flag still false, and the
+                // popped item would be dropped uncounted again. If the very first
+                // copy below throws, popped_rule_id (etc.) stay at their
+                // default-constructed empty value - the catch's send_exceptions/
+                // events_lost counters still increment correctly (the bar
+                // correctness property 1 sets), and record_gap_locked() degrades to
+                // gap_ledger_faults on an empty rule_id no worse than it already
+                // does for any other malformed input; misattribution to an empty
+                // rule_id is a lesser, accepted defect next to dropping the loss
+                // entirely.
+                have_unaccounted_item = true;
                 // Capture NOW - see this loop's own comment above.
                 popped_rule_id = it.rule_id;
+                // Test-only: WorkerFaultForTest::ThrowDuringCapture fires HERE,
+                // after popped_rule_id but before the remaining fields - the
+                // realistic worst case, proving the catch below still accounts
+                // the loss (using the rule_id already captured) rather than
+                // dropping it.
+                if (st->worker_fault_for_test.load(std::memory_order_relaxed) ==
+                    WorkerFaultForTest::ThrowDuringCapture)
+                    throw std::bad_alloc{};
                 popped_guard_type = it.ev.guard_type();
                 popped_rule_name = it.ev.rule_name();
                 popped_event_type = it.ev.event_type();
                 popped_seq = it.seq;
-                have_unaccounted_item = true;
 
                 if (it.gap_repair) {
                     // #4783 follow-up: DEQUEUE-TIME SUPERSESSION - re-validate

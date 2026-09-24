@@ -43,6 +43,7 @@ using Event = GuardianLegacySinkExecutor::Event;
 using OfferOutcome = GuardianLegacySinkExecutor::OfferOutcome;
 using LaunchFaultForTest = GuardianLegacySinkExecutor::LaunchFaultForTest;
 using AdmissionFaultForTest = GuardianLegacySinkExecutor::AdmissionFaultForTest;
+using WorkerFaultForTest = GuardianLegacySinkExecutor::WorkerFaultForTest;
 using GapSnapshotEntry = GuardianLegacySinkExecutor::GapSnapshotEntry;
 using Snapshot = GuardianLegacySinkExecutor::Snapshot;
 
@@ -686,6 +687,55 @@ TEST_CASE("a throwing send counts send_exceptions, records a gap, and the worker
     CHECK(s.gap_rules == 1);
     CHECK(s.worker_faults == 0); // the send's own throw is caught locally, not a
                                  // whole-iteration fault
+}
+
+TEST_CASE("#4783 Gate 3 finding, 2026-09-24: a throw DURING worker_loop's post-pop "
+          "item-identity capture still counts as a loss and opens a gap - the item "
+          "is never silently dropped uncounted",
+          "[guardian][legacy_sink]") {
+    // Three independent Gate 3 reviewers (cpp-safety, cpp-expert, security-guardian)
+    // converged on the same finding against the ORIGINAL folded-in worker_loop fix:
+    // have_unaccounted_item was set AFTER the throw-capable capture copies, not
+    // before, reproducing (inside that very fix) the defect class it existed to
+    // close. Fixed by setting the flag first. This test proves the fix: a throw
+    // injected right after popped_rule_id is captured (the realistic worst case -
+    // one capture succeeded, a later one didn't) still reaches the outer catch
+    // with have_unaccounted_item already true, so the loss is counted and a gap
+    // opens under the CORRECT rule_id (captured before the throw), not dropped.
+    GuardianLegacySinkExecutor exec;
+    exec.set_worker_fault_for_test(WorkerFaultForTest::ThrowDuringCapture);
+
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::Sent; }) ==
+         OfferOutcome::Queued);
+
+    REQUIRE(spin_until([&] { return exec.stats().send_exceptions == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    auto s = exec.stats();
+    CHECK(s.send_exceptions == 1);
+    CHECK(s.events_lost == 1);
+    CHECK(s.gap_rules == 1); // NOT 0 - the whole point: this loss is NOT silently
+                             // dropped uncounted, unlike the pre-fix defect
+    CHECK(s.worker_faults == 1); // the outer catch(...) bumps this unconditionally
+                                 // for ANY whole-iteration throw, same as before
+                                 // this fix - the new behavior is send_exceptions/
+                                 // events_lost/gap_rules ALSO firing, not instead
+
+    // The gap opened under the CORRECT rule_id (captured before the injected
+    // throw hit) - confirms popped_rule_id's early-capture placement, not just
+    // that *some* gap was recorded.
+    auto gaps = exec.all_gaps_for_test();
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == "A");
+
+    // Worker survives and continues serving new offers afterward.
+    exec.set_worker_fault_for_test(WorkerFaultForTest::None);
+    RecordingSend send_b;
+    CHECK(exec.offer(make_event("B", "drift.detected"), std::ref(send_b)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send_b.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
 }
 
 TEST_CASE("a gap-ledger fault degrades gap_ledger_degraded instead of crashing the "
