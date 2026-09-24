@@ -118,9 +118,9 @@ pg_durability_decide() {
 #   $1 MUST be exactly "true" (GITHUB_ACTIONS) — never a developer shell or
 #      a non-Actions CI tier;
 #   $2 MUST be a loopback host, "127.0.0.1" or "localhost" (IPv6 loopback is
-#      deliberately absent: pg_dsn_host_port's host group [^:/@]+ can never
-#      yield "::1"/"[::1]", so an IPv6 DSN always reads '?' here and is
-#      drift-only, never healed);
+#      deliberately absent: pg_dsn_parse_authority's host class
+#      [^]:/?,@[] excludes ':' and '[]', so an IPv6 DSN never parses at
+#      all — it always reads '?' here and is drift-only, never healed);
 #   $3 MUST be exactly "manifest" (the psql came from YUZU_CI_PSQL, which is
 #      only ever exported by deploy/windows/Assert-Toolchain.ps1
 #      -ExportCiEnv from a Provision-Windows-Runner.ps1 manifest — the
@@ -147,16 +147,91 @@ pg_heal_allowed() {
   return 1
 }
 
-# pg_dsn_host_port <dsn> — prints "host:port" for a URI-form DSN (the same
-# regex the per-agent derivation in ensure-postgres.sh path 1 uses), else
-# "?".
-pg_dsn_host_port() {
+# pg_dsn_parse_authority <dsn> — the ONE authority-only parser, shared by
+# pg_dsn_host_port (display), pg_dsn_target_provable (the heal gate) and
+# the per-agent derivation in ensure-postgres.sh. One parser, so the three
+# can never disagree: a GREEDY whole-string match (anchored on the LAST '@')
+# would read a password fragment as "host:port" — e.g.
+# `password=S3cr3t@vault:2024/x` as `vault:2024` — and print it. Nothing
+# past the authority is ever parsed, so a query string, a second '@', or a
+# password field can never be read as the target or printed.
+#
+# On success, sets (and returns 0):
+#   PG_DSN_SCHEME    e.g. "postgresql://"
+#   PG_DSN_USERINFO  e.g. "yuzu:yuzu@", or "" when the DSN has none
+#   PG_DSN_HOST, PG_DSN_PORT
+#   PG_DSN_REST      the optional "/rest" tail, or ""
+# On failure (rc 1), all five are cleared to "".
+#
+# Grammar (deliberately narrow — anything else is refused):
+#   - `^postgres(ql)?://` case-sensitive (libpq's own URI-prefix match is
+#     case-sensitive; anything else is a plain dbname to libpq, never a
+#     URI — so `POSTGRESQL://` and `x://` are refused).
+#   - the authority is everything up to the first '/' after "://", or the
+#     rest of the string if there is none; the REST (from that '/' on)
+#     must contain no '@' at all — checked BEFORE the authority's own
+#     '@'-count, so a well-formed authority whose PATH also looks like
+#     "@host:port/" (e.g. a second dbname segment) is refused for this
+#     specific, readable reason rather than silently vouching for a
+#     target this parser never actually inspected.
+#   - the whole DSN must contain no '?' anywhere: a query string is a bag
+#     of libpq keyword=value parameters and can carry a hidden
+#     host/hostaddr/port override past the parsed authority.
+#   - the authority holds AT MOST ONE '@'; more is ambiguous and refused.
+#   - the host is `[^]:/?,@[]+` — excludes IPv6 brackets/colons and a
+#     ',' multi-host list, both report-only, never parsed.
+#   - the port is `[0-9]+`, required.
+pg_dsn_parse_authority() {
   local dsn="$1"
-  if [[ "$dsn" =~ ^(.*@([^:/@]+)):([0-9]+)(/.*)$ ]]; then
-    echo "${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+  PG_DSN_SCHEME='' PG_DSN_USERINFO='' PG_DSN_HOST='' PG_DSN_PORT='' PG_DSN_REST=''
+  case "$dsn" in *'?'*) return 1 ;; esac
+  [[ "$dsn" =~ ^(postgres(ql)?://)([^/]*)(/.*)?$ ]] || return 1
+  PG_DSN_SCHEME="${BASH_REMATCH[1]}"
+  local authority="${BASH_REMATCH[3]}"
+  PG_DSN_REST="${BASH_REMATCH[4]:-}"
+  case "$PG_DSN_REST" in *'@'*) return 1 ;; esac
+  local at_count=0 rest="$authority"
+  while [[ "$rest" == *"@"* ]]; do
+    at_count=$((at_count + 1))
+    rest="${rest#*@}"
+  done
+  [[ "$at_count" -le 1 ]] || return 1
+  local hostport="$authority"
+  if [[ "$at_count" -eq 1 ]]; then
+    PG_DSN_USERINFO="${authority%%@*}@"
+    hostport="${authority#*@}"
+  fi
+  # Bracket-expression note: POSIX gives '\' no escaping power inside
+  # `[...]`, and a literal ']' must sit immediately after the opening
+  # '[^' to avoid closing the class early — `[^]:/?,@[]` (not
+  # `[^:/?,@\[\]]`, which silently matches NOTHING: the stray `\]` closes
+  # the class one character early).
+  [[ "$hostport" =~ ^([^]:/?,@[]+):([0-9]+)$ ]] || { PG_DSN_USERINFO=''; return 1; }
+  PG_DSN_HOST="${BASH_REMATCH[1]}"
+  PG_DSN_PORT="${BASH_REMATCH[2]}"
+  return 0
+}
+
+# pg_dsn_host_port <dsn> — prints "host:port" from pg_dsn_parse_authority,
+# else "?".
+pg_dsn_host_port() {
+  if pg_dsn_parse_authority "$1"; then
+    echo "${PG_DSN_HOST}:${PG_DSN_PORT}"
   else
     echo "?"
   fi
+}
+
+# pg_dsn_rebuild_port <dsn> <new_port> — for a DSN pg_dsn_target_provable
+# accepts ONLY, prints the same DSN with its authority's port replaced by
+# <new_port>, rebuilt from the parsed parts (scheme/userinfo/host/rest)
+# rather than regex-substituted over the live string, which could rewrite
+# a numeral inside the password field instead of the port. Returns 1, prints nothing, on a
+# DSN this parser does not accept; callers MUST gate on
+# pg_dsn_target_provable first.
+pg_dsn_rebuild_port() {
+  pg_dsn_parse_authority "$1" || return 1
+  echo "${PG_DSN_SCHEME}${PG_DSN_USERINFO}${PG_DSN_HOST}:${2}${PG_DSN_REST}"
 }
 
 # pg_dsn_redact <dsn> — strips userinfo (user[:password]) from a URI-form
@@ -175,73 +250,14 @@ pg_dsn_redact() {
   printf '%s' "$dsn" | sed -E 's#://.*@#://***@#; s/password[[:space:]]*=[[:space:]]*('"'"'([^'"'"'\\]|\\.)*'"'"'|[^[:space:]]*)/password=***/g'
 }
 
-# pg_dsn_target_provable <dsn> — returns 0 only when a URI-form DSN's
-# AUTHORITY (the substring between "://" and the first following '/', per
-# RFC 3986) is a RELIABLE statement of where libpq actually connects, i.e.
-# it is safe input to pg_heal_allowed's loopback check. This is a stricter,
-# independent shape check than pg_dsn_host_port's — that function's
-# host-capture group is GREEDY (`.*@`, anchored on the LAST '@' anywhere in
-# the whole string, including past the first '/'), which is exactly what
-# let `postgresql://%2Fsock/x@127.0.0.1:5433/db` read as host:port
-# 127.0.0.1:5433 although libpq itself ends the host at the FIRST '/' after
-# "://" and so actually dials the Unix-socket directory "%2Fsock" — a
-# provability check built on the same greedy regex cannot catch that
-# shape, so this function re-derives the authority boundary from scratch:
-#   - the whole string matches a scheme + "://" + authority (+ optional
-#     "/rest") shape, with the authority captured as everything up to the
-#     first '/' after "://" — never past it;
-#   - the REST (the optional "/rest" tail, i.e. everything from that first
-#     '/' onward) contains no '@' at all. Without this, an authority that
-#     is itself well-formed but whose PATH also contains a second
-#     '@host:port/'-shaped substring — e.g.
-#     `postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433
-#     /rest` — would pass every authority-shape check below although
-#     pg_dsn_host_port's greedy regex anchors on the LAST '@' in the whole
-#     string and so reads the PATH's host:port (127.0.0.1:5433, loopback)
-#     instead of the authority's own (notloopback.example:1234, not
-#     loopback) — vouching for a target this function never actually
-#     inspected. Checked up front, before the authority's own '@'-count,
-#     so this shape fails for this specific, readable reason;
-#   - the authority contains no '?': a URI-form DSN's query string is
-#     itself a bag of libpq keyword=value parameters (RFC 3986-style
-#     `key=value[&...]`) — `postgresql://yuzu@127.0.0.1:56551/postgres
-#     ?port=56552` parses its authority as host=127.0.0.1 port=56551, but
-#     libpq's own conninfo parser applies the query string's `port=56552`
-#     on top, so the connection actually lands on 56552. Any query string
-#     could carry a hidden `host=`/`hostaddr=`/`port=` override, so its
-#     mere presence disqualifies the DSN, regardless of what it happens to
-#     contain today (checked on the whole DSN, not just the authority — a
-#     '?' could in principle appear before the authority too);
-#   - the authority contains exactly one '@' and matches `<userinfo>@
-#     <host>:<port>` with no '/' or '@' inside the host (userinfo MAY
-#     contain ':', e.g. `user:password@host:port`) — a userinfo-free
-#     authority, a second '@' inside it, or a non-numeric/missing port all
-#     mean this function cannot derive a trustworthy host:port from it;
-#   - AGREEMENT INVARIANT with pg_dsn_host_port, kept as a root-cause
-#     backstop independent of the two checks above: pg_heal_allowed is
-#     always called with the host pg_dsn_host_port derives from this same
-#     DSN, never with this function's own parse of it — so "provable" only
-#     means what it claims to mean if pg_dsn_host_port's read of this DSN
-#     is EXACTLY the host:port this function just derived from the
-#     authority. This holds by construction today given the checks above,
-#     but is asserted explicitly so a future change to either regex cannot
-#     silently reopen the gap the previous check closed only by accident.
-# Returns 1 (not provable) on any of the above; 0 only when all hold.
+# pg_dsn_target_provable <dsn> — returns 0 only when pg_dsn_parse_authority
+# accepts <dsn>, i.e. its host:port is a RELIABLE statement of where libpq
+# actually connects and is safe input to pg_heal_allowed's loopback check.
+# A DSN this refuses (keyword-form, IPv6, multi-host, a query string, or
+# any shape pg_dsn_parse_authority's grammar excludes) is report-only —
+# see that function's doc comment for the full grammar and rationale.
 pg_dsn_target_provable() {
-  local dsn="$1"
-  case "$dsn" in *'?'*) return 1 ;; esac
-  [[ "$dsn" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^/]*)(/.*)?$ ]] || return 1
-  local authority="${BASH_REMATCH[1]}"
-  case "${BASH_REMATCH[2]:-}" in *'@'*) return 1 ;; esac
-  local at_count=0 rest="$authority"
-  while [[ "$rest" == *"@"* ]]; do
-    at_count=$((at_count + 1))
-    rest="${rest#*@}"
-  done
-  [[ "$at_count" -eq 1 ]] || return 1
-  [[ "$authority" =~ ^[^@]+@[^:/@]+:[0-9]+$ ]] || return 1
-  [[ "$(pg_dsn_host_port "$dsn")" == "${authority#*@}" ]] || return 1
-  return 0
+  pg_dsn_parse_authority "$1" >/dev/null
 }
 
 # pg_psql_path_from_env <value> — backslash -> forward-slash (Windows-form
@@ -364,10 +380,32 @@ pg_durability_selftest() {
   # function never actually inspected.
   rc=0; pg_dsn_target_provable 'postgresql://yuzu@notloopback.example:1234/dbname@127.0.0.1:5433/rest' || rc=$?
   pg_durability_check "dsn_target_provable path-embedded @host:port past a well-formed authority not provable" "1" "$rc"
+  # libpq's URI-scheme match is `^postgres(ql)?://`, case-sensitive
+  # — anything else (a different case, or a different scheme entirely) is
+  # a plain dbname to libpq, not a URI, and must never be judged provable.
+  rc=0; pg_dsn_target_provable 'POSTGRESQL://yuzu@127.0.0.1:5433/db' || rc=$?
+  pg_durability_check "dsn_target_provable wrong-case scheme not provable" "1" "$rc"
+  rc=0; pg_dsn_target_provable 'x://yuzu@127.0.0.1:5433/db' || rc=$?
+  pg_durability_check "dsn_target_provable non-postgres scheme not provable" "1" "$rc"
+  rc=0; pg_dsn_target_provable 'postgresql://yuzu@127.0.0.1,127.0.0.1:5433/db' || rc=$?
+  pg_durability_check "dsn_target_provable comma multi-host not provable" "1" "$rc"
 
   out="$(pg_dsn_host_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"; pg_durability_check "dsn_host_port uri" "127.0.0.1:5433" "$out"
   out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu')"; pg_durability_check "dsn_host_port keyword-form" "?" "$out"
   out="$(pg_dsn_host_port 'postgresql://yuzu@[::1]:5433/db')"; pg_durability_check "dsn_host_port ipv6" "?" "$out"
+  # A greedy whole-string regex reads the password fragment "vault:2024"
+  # as host:port for both these DSNs; the authority-only parser must
+  # refuse them outright.
+  out="$(pg_dsn_host_port 'host=127.0.0.1 port=5433 user=yuzu password=S3cr3t@vault:2024/x dbname=yuzu_test')"
+  pg_durability_check "dsn_host_port keyword-form password fragment not leaked" "?" "$out"
+  out="$(pg_dsn_host_port 'postgresql://yuzu@127.0.0.1:5433/yuzu_test?password=S3cr3t@vault:2024/x')"
+  pg_durability_check "dsn_host_port query-string password fragment not leaked" "?" "$out"
+
+  out="$(pg_dsn_rebuild_port 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test' 5434)"
+  pg_durability_check "dsn_rebuild_port shifts only the port" "postgresql://yuzu:yuzu@127.0.0.1:5434/yuzu_test" "$out"
+  rc=0; out="$(pg_dsn_rebuild_port 'host=127.0.0.1 port=5433 user=yuzu' 5434)" || rc=$?
+  pg_durability_check "dsn_rebuild_port refuses a non-provable DSN" "1" "$rc"
+  pg_durability_check "dsn_rebuild_port refuses a non-provable DSN (empty output)" "" "$out"
 
   out="$(pg_dsn_redact 'postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test')"
   pg_durability_check "dsn_redact uri" "postgresql://***@127.0.0.1:5433/yuzu_test" "$out"

@@ -232,11 +232,12 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   job. A `YUZU_CI_PSQL` that is set but not executable is ignored with a
   `::warning`, and the guard's heal and manifest no-fallback rule are OFF
   for that job — same as omitting `-ExportCiEnv` entirely. The heal runs as
-  the DSN's own role (`yuzu`, seeded `SUPERUSER` above); the minimum grant
-  for a non-superuser role to run it is `ALTER SYSTEM` on the three
-  settings, `EXECUTE` on `pg_reload_conf()`, and read access to
-  `pg_file_settings` (see `docs/ci-architecture.md` "Postgres for server
-  tests").
+  the DSN's own role (`yuzu`, created `SUPERUSER` by
+  `Provision-Windows-Runner.ps1`); the minimum grant for a non-superuser
+  role to run it is `ALTER SYSTEM` on the three settings, `EXECUTE` on
+  `pg_reload_conf()`, `SELECT` on `pg_file_settings`, and `EXECUTE` on
+  `pg_show_all_file_settings()` (see `docs/ci-architecture.md` "Postgres
+  for server tests").
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg

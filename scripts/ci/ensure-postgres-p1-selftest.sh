@@ -327,9 +327,21 @@ heal_call_line="$(grep 'yuzu-heal-identity-guard' "$state/calls.log")"
 expect_contains "heal" "heal call" "ALTER SYSTEM SET fsync = off" "$heal_call_line"
 expect_contains "heal" "heal call" "ALTER SYSTEM SET synchronous_commit = off" "$heal_call_line"
 expect_contains "heal" "heal call" "ALTER SYSTEM SET full_page_writes = off" "$heal_call_line"
-expect_contains "heal" "heal call" "SELECT pg_reload_conf()" "$heal_call_line"
+expect_contains "heal" "heal call" "SELECT pg_catalog.pg_reload_conf()" "$heal_call_line"
 expect "heal" "guard ordering (identity -> config-parse -> first ALTER SYSTEM)" "true" \
   "$([[ "$heal_call_line" == *'yuzu-heal-identity-guard'*'yuzu-heal-config-parse-guard'*'ALTER SYSTEM SET fsync'* ]] && echo true || echo false)"
+# Pin the heal session's safety-critical argv, not just that SOME ALTER
+# lands: dropping an IS NULL disjunct, the port check, the NOT,
+# ON_ERROR_STOP=1 or -X, or narrowing the config guard incorrectly, must
+# fail this case. The fake psql cannot evaluate the SQL, so its text is
+# the only thing a harness can pin.
+expect_contains "heal" "heal call" "-X -w --dbname=${DSN0} -q -v ON_ERROR_STOP=1 -tA" "$heal_call_line"
+expect_contains "heal" "heal call (identity guard, full predicate)" \
+  "pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = 5433) THEN RAISE EXCEPTION" \
+  "$heal_call_line"
+expect_contains "heal" "heal call (config-parse guard, refined predicate)" \
+  "error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION" \
+  "$heal_call_line"
 
 # ── 3. drift, not healed (psql from PATH, not the manifest) ────────────────
 N=$((N + 1))
@@ -448,7 +460,10 @@ expect_not_contains "heal-fails" "stdout" "YUZU_TEST_POSTGRES_DSN=" "$OUT"
 # ── 6a. the config-parse guard RAISEs — a DISTINCT fake outcome from the
 #        identity guard (case 6b below), still before any ALTER SYSTEM. ──
 N=$((N + 1))
-state="$(new_state 0 "$CAP_DEFAULT" '' '' '' '' '' '' 3 "$FAKE_CONFIG_GUARD_FAIL_OUT")"
+# rc 1, not 3: real psql under -q -v ON_ERROR_STOP=1 -c exits 1 on a
+# RAISE — psql's rc 3 is an -f script-file
+# exit code, never reached by this -c-only invocation.
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '' '' '' '' 1 "$FAKE_CONFIG_GUARD_FAIL_OUT")"
 invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
 err="$(cat "$state/stderr")"
 calls="$(cat "$state/calls.log")"
@@ -457,7 +472,10 @@ expect_contains "heal-config-guard-fails" "stderr" "heal failed on" "$err"
 expect_contains "heal-config-guard-fails" "stderr" "config-parse guard" "$err"
 expect_contains "heal-config-guard-fails" "stderr" "yuzu-heal-config-parse-guard" "$err"
 expect_not_contains "heal-config-guard-fails" "stderr" "fake-psql-sentinel-should-not-appear" "$err"
-expect_not_contains "heal-config-guard-fails" "calls.log" "ALTER SYSTEM issued" "$calls"
+# (No "no ALTER lands" check here: the fake psql never writes "ALTER
+# SYSTEM issued" once guard_rc/config_guard_rc fires, so such a check would
+# test the fake, not ensure-postgres.sh. Cases 2 and 18 pin the guard SQL
+# in the heal argv instead.)
 
 # ── 6b. the heal's own in-session identity guard fires (simulated: the
 #        fake exits 3 on the heal call without ever writing "ALTER SYSTEM
@@ -465,7 +483,8 @@ expect_not_contains "heal-config-guard-fails" "calls.log" "ALTER SYSTEM issued" 
 #        and the real capture's CONTEXT: line is WITHHELD (p1_server_diag's
 #        allowlist is ERROR/FATAL/WARNING/DETAIL/HINT only). ──────────────
 N=$((N + 1))
-state="$(new_state 0 "$CAP_DEFAULT" '' '' '' "$FAKE_GUARD_FAIL_OUT" '' 3)"
+# rc 1, not 3 — same real-psql correction as case 6a above.
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '' "$FAKE_GUARD_FAIL_OUT" '' 1)"
 invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0
 err="$(cat "$state/stderr")"
 calls="$(cat "$state/calls.log")"
@@ -475,7 +494,7 @@ expect_contains "heal-guard-fails" "stderr" "identity guard" "$err"
 expect_contains "heal-guard-fails" "stderr" "yuzu-heal-identity-guard" "$err"
 expect_not_contains "heal-guard-fails" "stderr" "fake-psql-sentinel-should-not-appear" "$err"
 expect_not_contains "heal-guard-fails" "stderr" "CONTEXT" "$err"
-expect_not_contains "heal-guard-fails" "calls.log" "ALTER SYSTEM issued" "$calls"
+# (See the note in case 6a on why there is no "no ALTER lands" check.)
 
 # ── 7. still not off after heal (rc=0 on the re-read: trusted rows print) ──
 N=$((N + 1))
@@ -709,6 +728,48 @@ expect_contains "env-override-not-provable" "stderr" "cannot prove the target" "
 expect_contains "env-override-not-provable" "stderr" "PGHOST" "$err"
 expect_not_contains "env-override-not-provable" "calls.log" "ALTER SYSTEM issued" "$calls"
 
+# ── 15b/15c/15d. the same refusal for EACH of the other three
+#          PGHOST-family variables, so dropping any one of PGHOSTADDR,
+#          PGSERVICE or PGPORT from the refusal fails a case. ─────────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGHOSTADDR=::1
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "env-override-pghostaddr" "rc" "0" "$RC"
+expect_contains "env-override-pghostaddr" "stderr" "cannot prove the target" "$err"
+expect_not_contains "env-override-pghostaddr" "calls.log" "ALTER SYSTEM issued" "$calls"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGSERVICE=yuzu
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "env-override-pgservice" "rc" "0" "$RC"
+expect_contains "env-override-pgservice" "stderr" "cannot prove the target" "$err"
+expect_not_contains "env-override-pgservice" "calls.log" "ALTER SYSTEM issued" "$calls"
+
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGPORT=5499
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "env-override-pgport" "rc" "0" "$RC"
+expect_contains "env-override-pgport" "stderr" "cannot prove the target" "$err"
+expect_not_contains "env-override-pgport" "calls.log" "ALTER SYSTEM issued" "$calls"
+
+# ── 15e. a set-but-EMPTY PGSERVICE still refuses — libpq honours
+#          PGSERVICE="" and matches a `[]` service section, so a
+#          non-emptiness test would let it slip through. ─────────────────
+N=$((N + 1))
+state="$(new_state 0 "$CAP_DEFAULT" '' '' '')"
+invoke "$state" 'yuzu-fake-windows-0' true "$DSN0" "$FAKEBIN/psql" 0 PGSERVICE=
+err="$(cat "$state/stderr")"
+calls="$(cat "$state/calls.log")"
+expect "env-override-pgservice-empty" "rc" "0" "$RC"
+expect_contains "env-override-pgservice-empty" "stderr" "cannot prove the target" "$err"
+expect_not_contains "env-override-pgservice-empty" "calls.log" "ALTER SYSTEM issued" "$calls"
+
 # ── 16. per-agent read-fail (runner -1): the conformance READ itself fails
 #          on the derived :5434 DSN — rc 1, no DSN exported. ───────────────
 N=$((N + 1))
@@ -755,7 +816,15 @@ per_agent_heal_call_line="$(grep 'yuzu-heal-identity-guard' "$state/calls.log")"
 expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET fsync = off" "$per_agent_heal_call_line"
 expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET synchronous_commit = off" "$per_agent_heal_call_line"
 expect_contains "per-agent-heal-port" "heal call" "ALTER SYSTEM SET full_page_writes = off" "$per_agent_heal_call_line"
-expect_contains "per-agent-heal-port" "heal call" "SELECT pg_reload_conf()" "$per_agent_heal_call_line"
+expect_contains "per-agent-heal-port" "heal call" "SELECT pg_catalog.pg_reload_conf()" "$per_agent_heal_call_line"
+# The same argv pins as case 2, for the derived :5434 DSN and port.
+expect_contains "per-agent-heal-port" "heal call" "-X -w --dbname=${DSN1} -q -v ON_ERROR_STOP=1 -tA" "$per_agent_heal_call_line"
+expect_contains "per-agent-heal-port" "heal call (identity guard, full predicate)" \
+  "pg_catalog.inet_server_addr() IS NULL OR pg_catalog.inet_server_port() IS NULL OR NOT ((pg_catalog.inet_server_addr() << '127.0.0.0/8' OR pg_catalog.inet_server_addr() = '::1') AND pg_catalog.inet_server_port() = 5434) THEN RAISE EXCEPTION" \
+  "$per_agent_heal_call_line"
+expect_contains "per-agent-heal-port" "heal call (config-parse guard, refined predicate)" \
+  "error IS NOT NULL AND error <> 'setting could not be applied' AND error NOT LIKE '%cannot be changed without restarting the server'; IF bad_errors IS NOT NULL THEN RAISE EXCEPTION" \
+  "$per_agent_heal_call_line"
 
 # ── 19. AGENT_IDX="">9 parity: a runner name suffix of 10+ digits is NOT
 #          treated as a pool agent index — the base DSN is exported as-is,
