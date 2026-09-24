@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <thread>
 #include <utility>
 
@@ -60,6 +61,21 @@ std::chrono::steady_clock::time_point StallObservableSink::write_started_at() co
 }
 
 // ---------------------------------------------------------------------------
+// Drain-reader lease (BLOCKER-1 fix, #4666 PR-1 adversarial review): the control block
+// LogHandoff::drain_gate_ points at. See the header's DRAIN-READER LEASE paragraph for
+// the full mechanism; this is the implementation. Defined at namespace scope (not
+// anonymous) because DrainGate is forward-declared in the header as
+// yuzu::agent::DrainGate.
+// ---------------------------------------------------------------------------
+
+struct DrainGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    int active_readers{0};
+    bool closed{false};
+};
+
+// ---------------------------------------------------------------------------
 // Global drain-lookup slot for drain_log_bounded() (plan 1.8). File-local: no header
 // exposure needed, only LogHandoff's own private static members and the
 // drain_log_bounded() free function below ever touch this.
@@ -71,6 +87,9 @@ struct DrainHandle {
     std::weak_ptr<spdlog::details::thread_pool> pool;
     std::weak_ptr<spdlog::async_logger> logger;
     std::vector<std::weak_ptr<StallObservableSink>> sinks;
+    std::shared_ptr<DrainGate> gate; // strong -- see DrainLease below; the gate itself
+                                      // is a tiny mutex+cv+counter, never a blocking
+                                      // destructor, so holding it strongly is safe.
 };
 
 std::mutex& drain_mutex() {
@@ -83,6 +102,47 @@ std::shared_ptr<DrainHandle>& drain_slot() {
     return slot;
 }
 
+/// RAII drain-reader lease. Held for the ENTIRE span drain_log_bounded() can hold any
+/// strong shared_ptr<thread_pool> reference -- declared FIRST in drain_log_bounded()
+/// so it destructs LAST (C++ reverse-declaration-order destruction), strictly AFTER
+/// every local `pool`/`p` shared_ptr in that function has already been dropped. This is
+/// what makes active_readers==0 a reliable signal to teardown()'s
+/// wait_for_drain_quiescence() that no external strong pool_ reference can remain.
+class DrainLease {
+public:
+    explicit DrainLease(std::shared_ptr<DrainGate> gate) : gate_(std::move(gate)) {
+        if (!gate_)
+            return;
+        std::lock_guard<std::mutex> lk(gate_->mu);
+        if (gate_->closed)
+            return; // teardown() has already closed admission -- refuse
+        ++gate_->active_readers;
+        acquired_ = true;
+    }
+
+    ~DrainLease() {
+        if (!acquired_)
+            return;
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lk(gate_->mu);
+            if (--gate_->active_readers == 0)
+                notify = true;
+        }
+        if (notify)
+            gate_->cv.notify_all();
+    }
+
+    [[nodiscard]] bool acquired() const noexcept { return acquired_; }
+
+    DrainLease(const DrainLease&) = delete;
+    DrainLease& operator=(const DrainLease&) = delete;
+
+private:
+    std::shared_ptr<DrainGate> gate_;
+    bool acquired_{false};
+};
+
 } // namespace
 
 void LogHandoff::register_global_drain_handle(LogHandoff* self) {
@@ -91,6 +151,7 @@ void LogHandoff::register_global_drain_handle(LogHandoff* self) {
     handle->pool = self->pool_;
     handle->logger = self->logger_;
     handle->sinks.assign(self->wrapped_sinks_.begin(), self->wrapped_sinks_.end());
+    handle->gate = self->drain_gate_;
     std::lock_guard<std::mutex> lk(drain_mutex());
     drain_slot() = std::move(handle);
 }
@@ -104,6 +165,22 @@ void LogHandoff::clear_global_drain_handle(const LogHandoff* self) {
         drain_slot().reset();
 }
 
+void LogHandoff::close_drain_admission() {
+    if (!drain_gate_)
+        return; // construction never reached the point of assigning this -- nothing to
+                // close (create_with_sinks() only builds a full LogHandoff once every
+                // throwing step, including this one, has already succeeded)
+    std::lock_guard<std::mutex> lk(drain_gate_->mu);
+    drain_gate_->closed = true;
+}
+
+void LogHandoff::wait_for_drain_quiescence() {
+    if (!drain_gate_)
+        return;
+    std::unique_lock<std::mutex> lk(drain_gate_->mu);
+    drain_gate_->cv.wait(lk, [&] { return drain_gate_->active_readers == 0; });
+}
+
 bool drain_log_bounded(std::chrono::milliseconds wait) {
     std::shared_ptr<DrainHandle> handle;
     {
@@ -114,6 +191,13 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
     }
     if (!handle)
         return false; // nothing installed
+
+    // Declared BEFORE any local pool/sink shared_ptr below -- see DrainLease's own
+    // comment for why the destruction order is load-bearing, not stylistic.
+    DrainLease lease(handle->gate);
+    if (!lease.acquired())
+        return false; // teardown() has already closed admission (concurrently tearing
+                       // down, or already gone) -- nothing to drain
 
     auto pool = handle->pool.lock();
     if (!pool)
@@ -131,9 +215,10 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
     };
     while (pending() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    // Release our temporary strong ref as soon as we are done reading through it --
-    // never hold it a moment longer than the read it was for (see the header's own
-    // "documented, deliberate residual" paragraph on why this matters).
+    // Release our temporary strong ref as soon as we are done reading through it. This
+    // no longer needs to be "as early as possible to minimize a residual race" (that
+    // residual is closed by the lease above) -- it is simply good hygiene, matching the
+    // rest of this function's style.
     pool.reset();
 
     if (auto logger = handle->logger.lock())
@@ -150,6 +235,9 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
         std::this_thread::yield();
     }
     return false;
+    // `lease` destructs here, after every local pool/sink shared_ptr above has already
+    // gone out of scope -- decrementing active_readers and, if it reaches zero, waking
+    // a concurrently-waiting teardown()'s wait_for_drain_quiescence().
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +326,11 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             }
         });
 
+        // Drain-reader-lease control block (BLOCKER-1 fix) -- built here, still inside
+        // the "everything that can throw happens before the object exists" phase, same
+        // as pool/logger/error_state above.
+        auto drain_gate = std::make_shared<DrainGate>();
+
         // Only now, once every throwing step above has succeeded, build the actual
         // object -- its destructor unconditionally runs teardown() if not yet torn
         // down (see the header's TEARDOWN CONTRACT), so a PARTIALLY populated
@@ -248,6 +341,7 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
         handoff->logger_ = std::move(logger);
         handoff->wrapped_sinks_ = std::move(wrapped);
         handoff->error_state_ = std::move(error_state);
+        handoff->drain_gate_ = std::move(drain_gate);
         register_global_drain_handle(handoff.get());
         return handoff;
     } catch (const std::exception& e) {
@@ -278,8 +372,20 @@ LogHandoff::create(const Options& options) {
             fallback_reason = e.what();
         }
     }
-    if (sinks.empty())
-        sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+    if (sinks.empty()) {
+        // SHOULD-FIX (#4666 PR-1 adversarial review): this construction sat outside
+        // create_with_sinks()'s own try/catch below, so a bad_alloc-class throw here
+        // (memory exhaustion) escaped as a raw exception instead of the documented
+        // std::expected contract every other construction-failure path in this file
+        // honors. Same mapping as create_with_sinks()'s own catch clauses.
+        try {
+            sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("LogHandoff construction failed: ") + e.what());
+        } catch (...) {
+            return std::unexpected("LogHandoff construction failed: unknown exception");
+        }
+    }
 
     auto result = create_with_sinks(std::move(sinks));
     if (result.has_value()) {
@@ -333,12 +439,23 @@ void LogHandoff::teardown(std::chrono::milliseconds grace) noexcept {
         return; // idempotent -- second call (or the destructor after an explicit call)
                 // is a no-op
 
-    // T0: deregister BEFORE any teardown work (see the header's TEARDOWN CONTRACT).
+    // T0: deregister from the global slot AND stop admitting new drain_log_bounded()
+    // leases, both BEFORE any teardown work (see the header's TEARDOWN CONTRACT and
+    // the DRAIN-READER LEASE paragraph -- BLOCKER-1 fix, #4666 PR-1 adversarial
+    // review).
     clear_global_drain_handle(this);
+    close_drain_admission();
 
     try {
         auto action = [] { hard_exit(kLogTeardownExitCode); };
         ShutdownDeadlineGuard<decltype(action)> guard{grace, action};
+        // Still INSIDE the watchdog's scope, not after it: if a drain_log_bounded()
+        // lease admitted just before close_drain_admission() above never releases (a
+        // genuinely wedged sink), this wait is what the watchdog is covering -- not an
+        // unwatched drain thread discovered later. Only once every admitted lease has
+        // released does teardown_body()'s pool_.reset() run, which is what guarantees
+        // teardown_body() always observes the last reference itself.
+        wait_for_drain_quiescence();
         teardown_body();
     } catch (...) {
         // teardown_body() must not throw in ordinary operation, but if something deep
@@ -358,8 +475,10 @@ void LogHandoff::teardown_with_action_for_test(std::chrono::milliseconds grace,
         return;
 
     clear_global_drain_handle(this);
+    close_drain_admission();
 
     ShutdownDeadlineGuard<std::function<void()>> guard{grace, std::move(action)};
+    wait_for_drain_quiescence(); // see teardown()'s own comment on this call
     teardown_body(); // let any exception propagate normally -- this is a TEST-ONLY
                       // entry point; unlike teardown() (noexcept, fail-closed to
                       // hard_exit) an exception here should fail the calling Catch2

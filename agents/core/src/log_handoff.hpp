@@ -36,13 +36,13 @@
 /// queued"): spdlog's circular_q pre-allocates all `kLogQueueCapacity + 1` slots at
 /// thread_pool CONSTRUCTION time. sizeof(spdlog::details::async_msg) is 408 bytes on
 /// x64 (measured against the vendored spdlog 1.17.0). kLogQueueCapacity=8192 therefore
-/// costs approximately (8192 + 1) * 408 bytes =~ 3.4 MiB of RSS, ALWAYS, from the moment
-/// a LogHandoff is constructed -- not a ceiling that only costs memory once messages
-/// pile up. See docs/resource-ledgers/4666-log-handoff.md for the full resource-ledger
-/// accounting. Payload bytes beyond the fixed per-slot allocation (a queued message's
-/// formatted text) are additional and unbounded by this primitive -- they are bounded
-/// only by kLogQueueCapacity * (typical line length), measured on the rig in a later PR,
-/// never asserted here.
+/// costs 8193 * 408 bytes = 3,342,744 bytes = 3.34 MB (~=3.19 MiB) of RSS, ALWAYS, from
+/// the moment a LogHandoff is constructed -- not a ceiling that only costs memory once
+/// messages pile up. See docs/resource-ledgers/4666-log-handoff.md for the full
+/// resource-ledger accounting. Payload bytes beyond the fixed per-slot allocation (a
+/// queued message's formatted text) are additional and unbounded by this primitive --
+/// they are bounded only by kLogQueueCapacity * (typical line length), measured on the
+/// rig in a later PR, never asserted here.
 ///
 /// NON-I/O ERROR HANDLER (plan 1.2): installed on the logger (not the spdlog-global
 /// handler, which does NOT reach a logger installed later via set_default_logger --
@@ -135,21 +135,46 @@
 /// drain_log_bounded() (plan 1.8): a pre-abort breadcrumb helper, free function so
 /// guardian_engine.cpp/guardian_spark_runtime.hpp's abort paths (PR-2) can call it
 /// without depending on LogHandoff's internals. NULL-SAFE: returns false immediately if
-/// no LogHandoff is currently registered (install() was never called, or teardown() has
-/// already deregistered it). Looks up the currently-installed instance's pool/logger/
-/// sinks via WEAK references held in a small internal snapshot object, so a
-/// CONCURRENT teardown() can never leave this function dereferencing a freed pool --
-/// worst case it observes "nothing installed" (teardown() already deregistered) or "the
-/// pool is already gone" (teardown() finished destroying it, which only happens after a
-/// successful, complete drain) and returns promptly either way. Documented, deliberate
-/// residual: in the narrow window where drain_log_bounded() races a CONCURRENTLY
-/// in-flight teardown() and momentarily holds the pool's last live reference, releasing
-/// that reference (at the end of THIS function, or during its internal spin) can itself
-/// trigger the pool's blocking join if the sink is genuinely wedged -- exceeding this
-/// function's own `wait` bound in that rare case. The PROCESS-WIDE safety property still
-/// holds even then (teardown()'s own watchdog still fires hard_exit() on the whole
-/// process after its grace elapses, regardless of which thread ends up blocked in the
-/// join) -- only this function's OWN bound can, rarely, be exceeded, never the process's.
+/// no LogHandoff is currently registered (create()/create_with_sinks() was never called
+/// or failed, or teardown() has already deregistered it). Looks up the
+/// currently-installed instance's pool/logger/sinks via WEAK references held in a small
+/// internal snapshot object, so a CONCURRENT teardown() can never leave this function
+/// dereferencing a freed pool.
+///
+/// DRAIN-READER LEASE (fixes a real, reproduced defect -- an earlier draft of this
+/// primitive claimed a residual race here was harmless; it was not, see below):
+/// drain_log_bounded() holds a `DrainLease` (log_handoff.cpp) for its ENTIRE
+/// pool-touching span, which increments LogHandoff's own `drain_gate_->active_readers`
+/// for that span and decrements it again strictly AFTER every local strong
+/// `shared_ptr<thread_pool>` this function ever creates has already been dropped
+/// (guaranteed by C++ reverse-declaration-order destruction -- the lease is declared
+/// BEFORE any local pool/sink shared_ptr, so it destructs AFTER them). teardown()'s T0
+/// closes admission of new leases (LogHandoff::close_drain_admission()) BEFORE doing
+/// any teardown work, then -- still INSIDE its own already-armed ShutdownDeadlineGuard
+/// scope, not after it -- calls LogHandoff::wait_for_drain_quiescence(), which blocks
+/// until active_readers reaches zero. Only once that returns does teardown_body() run
+/// its own pool_.reset(). This guarantees teardown_body()'s pool_.reset() is ALWAYS the
+/// call that observes the last reference (if any drain_log_bounded() call was ever
+/// concurrently in flight, it has, by construction, already dropped its own copy before
+/// active_readers can reach zero) -- so the actual blocking ~thread_pool() join can
+/// ONLY ever happen on teardown()'s own thread, inside its own watchdog's scope, never
+/// on a drain_log_bounded() caller's thread. A drain_log_bounded() call itself is
+/// therefore bounded by its own `wait` parameter as documented, with no exception: it
+/// never becomes responsible for the pool's blocking destructor.
+///
+/// THE DEFECT THIS REPLACES (kept here as a historical note, not a live property):
+/// a prior revision let drain_log_bounded() hold a bare strong pool_ reference with no
+/// lease/admission-close protocol. If teardown() ran concurrently, its own
+/// pool_.reset() became a non-destructive ref-decrement (the drainer still held a live
+/// copy), so teardown_body() returned quickly and the ShutdownDeadlineGuard local to
+/// teardown() was destroyed and cancelled on that NORMAL scope exit -- before the real
+/// blocking work (the pool's actual destruction) had happened. The drainer's own later
+/// release of its reference could then be the one that dropped the last owner, running
+/// ~thread_pool()'s blocking join on the drain thread with NO watchdog covering it at
+/// all -- silently violating the "process-wide safety property" this file claimed.
+/// Reproduced independently by two reviewers with standalone repros before this fix
+/// landed; see the routed Spark row's clause (4) and
+/// docs/resource-ledgers/4666-log-handoff.md for the corrected proof this fix provides.
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
@@ -174,7 +199,7 @@
 namespace yuzu::agent {
 
 /// Message-count bound (plan 1.2/Decision 3), NOT a byte bound -- see the FIXED
-/// RESOURCE COST note above for the ~3.4 MiB fixed RSS this implies.
+/// RESOURCE COST note above for the 3.34 MB (~=3.19 MiB) fixed RSS this implies.
 inline constexpr std::size_t kLogQueueCapacity = 8192;
 
 /// Default grace for LogHandoff::teardown()'s internal watchdog (Decision 8). Distinct
@@ -243,10 +268,35 @@ private:
     std::atomic<std::int64_t> started_at_ticks_{0}; // steady_clock::duration::rep
 };
 
+/// Opaque control block backing drain_log_bounded()'s reader lease (log_handoff.cpp);
+/// forward-declared only -- see the file banner's DRAIN-READER LEASE paragraph. No
+/// caller outside log_handoff.cpp ever names this type.
+class DrainGate;
+
 /// Owns the private single-thread pool, the async logger, and the wrapper sinks (plan
 /// 1.2/1.4). Non-copyable, non-movable -- there is exactly one owner, matching
 /// ShutdownDeadlineGuard's own precedent for a shutdown-path primitive with a single,
 /// stack/member-local owner. See the file banner above for the full contract.
+///
+/// THREAD-SAFETY CONTRACT (should-fix from the #4666 PR-1 adversarial review):
+/// teardown()/teardown_with_action_for_test() are documented callable "from any
+/// thread" and ARE internally synchronized against a CONCURRENT drain_log_bounded()
+/// call (the DRAIN-READER LEASE above) and against each other/the destructor (the
+/// torn_down_ exchange). They are NOT synchronized against a concurrent call to the
+/// plain accessors below (overrun_total()/queue_depth()/in_write()/stalled_for()/
+/// log_errors_total()/last_log_error_for_test()) or against install()/logger() --
+/// those read pool_/logger_/wrapped_sinks_/error_state_ directly, with no lock, while
+/// teardown_body() resets them. This is UNREACHABLE in PR-1 (nothing calls these
+/// accessors from a second thread yet) but is a REAL CONSTRAINT for PR-3's planned
+/// heartbeat poller, which by construction runs on a different thread than whatever
+/// calls teardown(). Matching ShutdownDeadlineGuard's own precedent ("safe to call
+/// from the constructing thread only", shutdown_deadline_guard.hpp), the rule for a
+/// caller introducing a second thread here is: EITHER serialize every accessor/
+/// install()/logger() call against teardown() with the caller's own lock, OR (if a
+/// wait-free poller is required) snapshot pool_/logger_/wrapped_sinks_ the same
+/// weak-ptr way drain_log_bounded() already does, before PR-3 wires a poller against
+/// this class. Do not assume the accessors are already safe for that use just because
+/// nothing today calls them concurrently.
 class YUZU_EXPORT LogHandoff {
 public:
     /// Production-shaped construction options -- the "sinks per mode" decision table
@@ -381,6 +431,19 @@ private:
 
     void teardown_body();
 
+    /// T0 half of the drain-reader-lease fix: stops admitting NEW drain_log_bounded()
+    /// leases. Called BEFORE the ShutdownDeadlineGuard is constructed (fast, never
+    /// blocks). Null-safe (a no-op if drain_gate_ was never set, e.g. a construction
+    /// failure before it was assigned).
+    void close_drain_admission();
+
+    /// The blocking half: waits until every already-admitted drain_log_bounded() lease
+    /// has released (drain_gate_->active_readers == 0). MUST be called INSIDE the
+    /// ShutdownDeadlineGuard's scope (see teardown()/teardown_with_action_for_test())
+    /// so a lease that never releases is still bounded by the watchdog, never an
+    /// unwatched wait. Null-safe, same as close_drain_admission().
+    void wait_for_drain_quiescence();
+
     static void register_global_drain_handle(LogHandoff* self);
     static void clear_global_drain_handle(const LogHandoff* self);
 
@@ -388,6 +451,7 @@ private:
     std::shared_ptr<spdlog::async_logger> logger_;
     std::vector<std::shared_ptr<StallObservableSink>> wrapped_sinks_;
     std::shared_ptr<ErrorState> error_state_;
+    std::shared_ptr<DrainGate> drain_gate_; // see close_drain_admission()/wait_for_drain_quiescence()
     std::atomic<bool> torn_down_{false};
     bool log_file_fallback_{false};
     std::string log_file_fallback_reason_;

@@ -425,6 +425,96 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
 }
 
 // ---------------------------------------------------------------------------
+// BLOCKER-1 regression (#4666 PR-1 adversarial review, both reviewers independently
+// reproduced with standalone repros): a concurrent drain_log_bounded() call must never
+// let teardown()'s deadline watchdog cancel on a normal scope exit while the pool is
+// still genuinely wedged. Before the drain-reader-lease fix, teardown_body()'s
+// pool_.reset() was a non-destructive ref-decrement whenever a drain_log_bounded() call
+// was concurrently holding a strong pool reference -- teardown() returned quickly, its
+// ShutdownDeadlineGuard cancelled on that NORMAL return, and the deadline action never
+// fired at all, even though the sink was (and remained) wedged. This test is the
+// falsifier: RED on the unfixed code (the wait below times out because the action never
+// fires), GREEN after the drain-reader lease closes the interleaving (teardown() blocks
+// inside wait_for_drain_quiescence() until the drain thread releases its lease, so the
+// watchdog is still armed when `grace` elapses and the action fires on schedule).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires while a "
+          "concurrent drain_log_bounded() call holds the pool wedged, and neither "
+          "thread inherits an unwatched blocking join",
+          "[log_handoff]") {
+    Harness h; // initially paused
+    yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
+
+    h.handoff->logger()->info("park");
+    REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
+
+    // A long-lived concurrent drain -- holds a strong pool ref for up to 2s while the
+    // sink stays wedged, comfortably past teardown()'s own short grace below, so the
+    // drain is still genuinely in flight at the moment the watchdog is expected to
+    // fire.
+    std::atomic<bool> drain_result{false};
+    std::atomic<bool> drain_done{false};
+    std::thread drain_thread([&] {
+        drain_result.store(drain_log_bounded(2000ms), std::memory_order_release);
+        drain_done.store(true, std::memory_order_release);
+    });
+
+    // Give the drain a moment to acquire its lease and start spinning before teardown()
+    // begins -- matches both reviewers' repro timing (~50ms); scaled for sanitizer
+    // builds like every other liveness bound in this suite.
+    std::this_thread::sleep_for(100ms * yuzu::test::kSpinScale);
+
+    std::mutex fired_mu;
+    std::condition_variable fired_cv;
+    bool fired = false;
+    std::chrono::steady_clock::time_point fired_at;
+    const auto teardown_start = std::chrono::steady_clock::now();
+    const auto grace = 300ms;
+
+    std::thread teardown_thread([&] {
+        h.handoff->teardown_with_action_for_test(grace, [&] {
+            {
+                std::lock_guard<std::mutex> lk(fired_mu);
+                fired = true;
+                fired_at = std::chrono::steady_clock::now();
+            }
+            fired_cv.notify_all();
+        });
+    });
+
+    // THE FALSIFIER: see this TEST_CASE's own header comment for the exact red/green
+    // shape.
+    {
+        std::unique_lock<std::mutex> lk(fired_mu);
+        const bool ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
+                                          [&] { return fired; });
+        REQUIRE(ok);
+    }
+    const auto fired_after = fired_at - teardown_start;
+    CHECK(fired_after >= grace / 2);
+    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
+
+    // The drain thread must NOT have completed yet -- it is still legitimately spinning
+    // inside its own 2s wait (the sink is still wedged). This proves the interleaving
+    // this test exists to exercise was genuinely live at the moment the watchdog fired,
+    // not accidentally avoided by scheduling luck.
+    CHECK_FALSE(drain_done.load(std::memory_order_acquire));
+
+    // Unwedge: the drain thread's pending() check goes false and it returns (releasing
+    // its lease well before its own 2s bound), which lets teardown()'s
+    // wait_for_drain_quiescence() finally observe active_readers==0 and proceed.
+    h.sink->release();
+
+    drain_thread.join();
+    teardown_thread.join();
+
+    // Neither thread was left blocked on an unwatched join: both joined within this
+    // test's own bounded waits above.
+    SUCCEED("teardown()'s watchdog covered the concurrent drain; both threads joined cleanly");
+}
+
+// ---------------------------------------------------------------------------
 // U6: TSan - concurrent producers plus a repeatedly toggled gate
 // ---------------------------------------------------------------------------
 
