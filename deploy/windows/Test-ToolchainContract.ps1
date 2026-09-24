@@ -822,17 +822,16 @@ Check 'the settings fingerprint probe uses the bounded process primitive' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $psqlAt = $assertText.IndexOf('if($c.psql')
   $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $psqlAt)
-  $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $psqlAt)
-  $probeAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $fingerprintAt)
-  $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $probeAt)
-  $psqlAt -ge 0 -and $fingerprintAt -gt $psqlAt -and $probeAt -gt $fingerprintAt -and
-    $timeoutAt -gt $probeAt -and $probeAt -lt $clusterOkAt
+  $probeAt = $assertText.IndexOf('$fp = (Invoke-YuzuContractProbe', $psqlAt)
+  $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $probeAt)
+  $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $fingerprintAt)
+  $psqlAt -ge 0 -and $probeAt -gt $psqlAt -and $fingerprintAt -gt $probeAt -and
+    $timeoutAt -gt $fingerprintAt -and $timeoutAt -lt $clusterOkAt
 }
 Check 'the settings fingerprint never fails the assertion' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $psqlAt = $assertText.IndexOf('if($c.psql')
-  $fingerprintAt = $assertText.IndexOf('$fingerprintSql', $psqlAt)
-  $probeAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $fingerprintAt)
+  $probeAt = $assertText.IndexOf('$fp = (Invoke-YuzuContractProbe', $psqlAt)
   $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $probeAt)
   $span = $assertText.Substring($probeAt, $clusterOkAt - $probeAt)
   $probeAt -ge 0 -and $clusterOkAt -gt $probeAt -and $span -notmatch '\$fail\+\+'
@@ -840,7 +839,7 @@ Check 'the settings fingerprint never fails the assertion' {
 Check 'the CI psql export is opt-in and agent-guarded' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
   $exportIfAt = $assertText.IndexOf('if($ExportCiEnv)')
-  $matchAt = $assertText.IndexOf("-match '-(\d+)\$'", $exportIfAt)
+  $matchAt = $assertText.IndexOf('-match ''-(\d+)$''', $exportIfAt)
   $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $matchAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
   $exportIfAt -ge 0 -and $matchAt -gt $exportIfAt -and $writeAt -gt $matchAt -and
