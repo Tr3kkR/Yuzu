@@ -890,7 +890,7 @@ expect "keyword-form-host-unparsed" "rc" "0" "$RC"
 expect_contains "keyword-form-host-unparsed" "stderr" "host unparsed" "$err"
 expect_not_contains "keyword-form-host-unparsed" "stderr" " on ?" "$err"
 
-# ── 24/25. CR5-2: PGOPTIONS is fatal only on a non-empty value, matched
+# ── 24/25. PGOPTIONS is fatal only on a non-empty value, matched
 #          case-insensitively (a set-but-empty PGOPTIONS disables nothing
 #          in pg_pool.cpp/leader_elector.cpp). ─────────────────────────────
 N=$((N + 1))
@@ -923,7 +923,7 @@ expect_not_contains "pghostaddr-lowercase-refused" "calls.log" "ALTER SYSTEM iss
 
 # ── 27. static pin: the durability read query and the heal's config-parse
 #          guard both resolve pg_settings/pg_file_settings/string_agg via
-#          pg_catalog, never bare (CR5-6: search_path is untrusted since
+#          pg_catalog, never bare (search_path is untrusted since
 #          the yuzu role is SUPERUSER). ────────────────────────────────────
 N=$((N + 1))
 expect "pg-catalog-static-pin" "read query qualifies pg_settings via pg_catalog" "1" \
