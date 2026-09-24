@@ -1437,6 +1437,44 @@ TEST_CASE("#4783 Gate 4 UP-3: an absent, malformed, or schema-mismatched legacy-
     }
 }
 
+TEST_CASE("#4783 Gate 4 unhappy-path finding, 2026-09-24: a single empty-rule_id "
+          "gap entry in an otherwise-valid record is SKIPPED, not treated as "
+          "Malformed - every OTHER rule's legitimate gap state still restores",
+          "[guardian][engine][legacy_sink]") {
+    // Reproduces the reported amplification chain's restore half directly: a
+    // rare local fault (worker_loop's own guard against this now refuses to
+    // CREATE such an entry in the first place - see its doc comment - but this
+    // proves the RESTORE side is hardened independently, defense in depth) can
+    // in principle leave one empty-rule_id entry in the persisted record
+    // alongside genuinely legitimate ones. Before this fix, ANY empty-rule_id
+    // entry made read_legacy_sink_loss_record() reject the WHOLE record as
+    // Malformed - silently discarding every other rule's real open-gap state
+    // on restart. Now it is skipped individually.
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    {
+        auto opened = KvStore::open(db.path);
+        REQUIRE(opened.has_value());
+        KvStore kv(std::move(*opened));
+        REQUIRE(kv.set(GuardianEngine::kv_namespace(),
+                       GuardianEngine::legacy_sink_loss_ledger_key_for_test(),
+                       R"({"schema":1,"counters":{"events_lost":2},"gaps":[)"
+                       R"({"rule_id":"","guard_type":"file","rule_name":"phantom",)"
+                       R"("lost":1,"first_lost_ms":1000,"last_lost_ms":1000},)"
+                       R"({"rule_id":"real-rule","guard_type":"file","rule_name":"rn",)"
+                       R"("lost":1,"first_lost_ms":2000,"last_lost_ms":2000}]})"));
+    }
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv(std::move(*opened));
+    GuardianEngine engine(&kv, "agent-ledger-phantom-skip-test", false);
+    REQUIRE(engine.start_local().has_value());
+    // The legitimate rule's gap AND the counters survived - proving this
+    // was NOT treated as Malformed (which would have discarded both).
+    CHECK(engine.legacy_sink_gap_rules() == 1); // "" was skipped, "real-rule" kept
+    CHECK(engine.legacy_sink_events_lost() == 2); // counters restored normally
+    engine.stop();
+}
+
 TEST_CASE("#4783 Gate 4 UP-3: stop() persists a final snapshot even with no prior "
           "kick() having run - an open gap survives an immediate shutdown",
           "[guardian][engine][legacy_sink]") {

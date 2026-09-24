@@ -426,7 +426,12 @@ public:
     /// four capture copies, not on the very first one) and proving the outer
     /// catch(...) still accounts the loss using whatever was captured before
     /// the throw, rather than silently dropping it.
-    enum class WorkerFaultForTest { None, ThrowDuringCapture };
+    /// `ThrowOnFirstCapture` (#4783 Gate 4 unhappy-path finding, same date)
+    /// fires BEFORE popped_rule_id is captured at all - the one case where
+    /// the outer catch has NO rule_id to work with. Proves the empty-rule_id
+    /// guard on the catch's record_gap_locked() call: the loss is still
+    /// counted globally, but no "phantom" empty-rule_id GapRecord is created.
+    enum class WorkerFaultForTest { None, ThrowDuringCapture, ThrowOnFirstCapture };
 
     GuardianLegacySinkExecutor() : GuardianLegacySinkExecutor(Config{}) {}
     explicit GuardianLegacySinkExecutor(Config cfg) : state_(std::make_shared<State>()) {
@@ -606,8 +611,23 @@ public:
                 const std::uint64_t seq = ++state_->next_seq;
                 ++state_->counters.admission_failures;
                 ++state_->counters.events_lost;
-                catch_loss_log_level = record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
-                loss_log_hook = state_->loss_log_hook_for_test;
+                // #4783 Gate 4 unhappy-path finding, 2026-09-24: only open a
+                // per-rule gap when rule_id was actually captured - see
+                // worker_loop's identical guard (its own doc comment has the
+                // full rationale: an empty-rule_id GapRecord is a "phantom" no
+                // real rule can ever repair, and - because
+                // read_legacy_sink_loss_record() rejects the WHOLE restart
+                // snapshot on any single empty-rule_id entry - persisting one
+                // can silently discard every OTHER rule's legitimate open-gap
+                // state on the next restart. The loss is still counted
+                // globally (events_lost/admission_failures above) either way.
+                // This is the pre-existing sibling of the worker_loop finding,
+                // not introduced by this range - fixed here for the same
+                // reason, once found.
+                if (!rule_id.empty()) {
+                    catch_loss_log_level = record_gap_locked(*state_, rule_id, guard_type, rule_name, seq);
+                    loss_log_hook = state_->loss_log_hook_for_test;
+                }
             } catch (...) {
             }
             // #4783 Gate 4 UP-4: logged OUTSIDE the lock_guard above, same
@@ -1294,6 +1314,12 @@ private:
                 // rule_id is a lesser, accepted defect next to dropping the loss
                 // entirely.
                 have_unaccounted_item = true;
+                // Test-only: WorkerFaultForTest::ThrowOnFirstCapture fires HERE,
+                // before ANY capture - the one case where the catch below has
+                // no rule_id to work with, proving its empty-rule_id guard.
+                if (st->worker_fault_for_test.load(std::memory_order_relaxed) ==
+                    WorkerFaultForTest::ThrowOnFirstCapture)
+                    throw std::bad_alloc{};
                 // Capture NOW - see this loop's own comment above.
                 popped_rule_id = it.rule_id;
                 // Test-only: WorkerFaultForTest::ThrowDuringCapture fires HERE,
@@ -1408,10 +1434,36 @@ private:
                         // Same chokepoint offer()'s own loss sites use.
                         ++st->counters.send_exceptions;
                         ++st->counters.events_lost;
-                        catch_loss_log_level = record_gap_locked(
-                            *st, popped_rule_id, popped_guard_type, popped_rule_name, popped_seq);
-                        if (catch_loss_log_level != spdlog::level::off)
-                            catch_loss_hook = st->loss_log_hook_for_test;
+                        // #4783 Gate 4 unhappy-path finding, 2026-09-24: only
+                        // open a per-rule gap when popped_rule_id was actually
+                        // captured. have_unaccounted_item is set before the
+                        // capture copies (see this loop's own comment above)
+                        // specifically so a throw can hit DURING them - and if
+                        // the throw hits on popped_rule_id's OWN copy (the
+                        // first one), popped_rule_id is still its
+                        // default-constructed "". record_gap_locked("", ...)
+                        // would open a "phantom" gap no real rule can ever
+                        // repair (guardian_engine.cpp rejects empty-rule_id
+                        // rules at load, so nothing will ever offer a matching
+                        // repair for it) - it would enter the normal repair
+                        // rotation, get persisted to the restart-durable
+                        // snapshot, and because
+                        // read_legacy_sink_loss_record() rejects the WHOLE
+                        // record as Malformed on any single empty-rule_id
+                        // entry, silently discard every OTHER rule's
+                        // legitimate open-gap state on the next restart - a
+                        // rare local fault amplified into full ledger loss.
+                        // The loss is still counted globally
+                        // (send_exceptions/events_lost above) either way; this
+                        // only withholds per-rule tracking that cannot be
+                        // meaningfully attributed with no rule_id to attribute
+                        // it to.
+                        if (!popped_rule_id.empty()) {
+                            catch_loss_log_level = record_gap_locked(
+                                *st, popped_rule_id, popped_guard_type, popped_rule_name, popped_seq);
+                            if (catch_loss_log_level != spdlog::level::off)
+                                catch_loss_hook = st->loss_log_hook_for_test;
+                        }
                     }
                 } catch (...) {
                 }

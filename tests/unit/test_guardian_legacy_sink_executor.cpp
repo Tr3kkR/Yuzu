@@ -738,6 +738,45 @@ TEST_CASE("#4783 Gate 3 finding, 2026-09-24: a throw DURING worker_loop's post-p
     REQUIRE(exec.wait_workers_retired_for_test(5s));
 }
 
+TEST_CASE("#4783 Gate 4 unhappy-path finding, 2026-09-24: a throw BEFORE any "
+          "post-pop capture still counts as a loss globally but does NOT open a "
+          "phantom empty-rule_id gap",
+          "[guardian][legacy_sink]") {
+    // The unhappy-path reviewer traced a real amplification chain from the
+    // accepted "misattribution to an empty rule_id" residual: a phantom
+    // empty-rule_id GapRecord would (a) never resolve on its own (no real
+    // rule is ever named "" - guardian_engine.cpp rejects that at load), (b)
+    // enter the normal repair rotation and get dispatched over the wire, and
+    // (c) if persisted before it cleared, poison the ENTIRE restart snapshot
+    // (read_legacy_sink_loss_record() rejected the whole record on any single
+    // empty-rule_id entry - see the sibling engine-level test for that half).
+    // Fixed at the root: the catch's record_gap_locked() call is now guarded
+    // on a non-empty popped_rule_id. This test proves that guard directly.
+    GuardianLegacySinkExecutor exec;
+    exec.set_worker_fault_for_test(WorkerFaultForTest::ThrowOnFirstCapture);
+
+    CHECK(exec.offer(make_event("A", "drift.detected"),
+                     [](const Event&) { return LegacySendOutcome::Sent; }) ==
+         OfferOutcome::Queued);
+
+    REQUIRE(spin_until([&] { return exec.stats().send_exceptions == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    auto s = exec.stats();
+    CHECK(s.send_exceptions == 1); // the loss IS counted globally...
+    CHECK(s.events_lost == 1);
+    CHECK(s.gap_rules == 0); // ...but NO gap was opened - no phantom "" entry
+    CHECK(exec.all_gaps_for_test().empty());
+
+    // Worker survives and continues serving new offers afterward.
+    exec.set_worker_fault_for_test(WorkerFaultForTest::None);
+    RecordingSend send_b;
+    CHECK(exec.offer(make_event("B", "drift.detected"), std::ref(send_b)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send_b.count() == 1; }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+}
+
 TEST_CASE("a gap-ledger fault degrades gap_ledger_degraded instead of crashing the "
           "worker, which continues to the next item",
           "[guardian][legacy_sink]") {

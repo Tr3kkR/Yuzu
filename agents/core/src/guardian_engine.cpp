@@ -531,6 +531,7 @@ read_legacy_sink_loss_record(KvStore& kv, GuardianLegacySinkExecutor::Stats& cou
         counters.repairs_suppressed = c.value("repairs_suppressed", std::uint64_t{0});
         std::vector<GuardianLegacySinkExecutor::GapSnapshotEntry> gaps;
         gaps.reserve(j["gaps"].size());
+        std::size_t skipped_empty_rule_id = 0;
         for (const auto& ge : j["gaps"]) {
             if (!ge.is_object())
                 return LegacySinkLossReadOutcome::Malformed;
@@ -541,9 +542,33 @@ read_legacy_sink_loss_record(KvStore& kv, GuardianLegacySinkExecutor::Stats& cou
             g.lost = ge.value("lost", std::uint64_t{0});
             g.first_lost_ms = ge.value("first_lost_ms", std::int64_t{0});
             g.last_lost_ms = ge.value("last_lost_ms", std::int64_t{0});
-            if (g.rule_id.empty()) // every real entry always has one - guard against a hand-crafted/corrupt record
-                return LegacySinkLossReadOutcome::Malformed;
+            // #4783 Gate 4 unhappy-path finding, 2026-09-24 (defense in depth):
+            // SKIP a single empty-rule_id entry rather than rejecting the WHOLE
+            // record - every real entry always has one, but a rare "phantom"
+            // gap (guardian_legacy_sink_executor.hpp's worker_loop/offer()
+            // catch blocks both now refuse to create one in the first place,
+            // see their own doc comments) is not the only conceivable source
+            // of one, and this ledger is a best-effort loss-VISIBILITY marker,
+            // never a durable-correctness store - discarding every OTHER
+            // rule's legitimate open-gap state over ONE bad entry is a far
+            // worse outcome than losing that one entry's own history. A
+            // genuinely corrupt/hand-crafted record (bad JSON, wrong shape)
+            // still fails Malformed via the type checks above/the outer
+            // catch - this narrows ONLY the single-bad-entry case.
+            if (g.rule_id.empty()) {
+                ++skipped_empty_rule_id;
+                continue;
+            }
             gaps.push_back(std::move(g));
+        }
+        if (skipped_empty_rule_id > 0) {
+            try {
+                spdlog::warn("Guardian: legacy-sink loss ledger record had {} entr{} with an "
+                            "empty rule_id - skipped, the other {} entr{} restored normally",
+                            skipped_empty_rule_id, skipped_empty_rule_id == 1 ? "y" : "ies",
+                            gaps.size(), gaps.size() == 1 ? "y" : "ies");
+            } catch (...) {
+            }
         }
         counters_out = counters;
         gaps_out = std::move(gaps);
