@@ -939,7 +939,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
             spdlog::error("GuaranteedStateStore: observation projection SAVEPOINT failed "
                           "event_id={}: {}",
-                          row.event_id, PQerrorMessage(conn));
+                          log_id_token(row.event_id), PQerrorMessage(conn));
         }
     }
 
@@ -1052,7 +1052,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("GuaranteedStateStore: SAVEPOINT observation_projection failed in "
                               "batch (event_id={}): {}",
-                              row.event_id, PQerrorMessage(conn));
+                              log_id_token(row.event_id), PQerrorMessage(conn));
             }
         }
     }
