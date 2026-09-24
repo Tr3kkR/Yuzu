@@ -184,6 +184,8 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -4689,6 +4691,25 @@ public:
             }
         }
 
+        // Wave 10: browser_inventory (Forensics class, per-user browser
+        // profile data) ships default-off — an operator must
+        // explicitly enable it via PUT
+        // /api/v1/plugin-config/browser_inventory/kill-switch. Seeded
+        // immediately after the store is constructed and open; ON CONFLICT
+        // DO NOTHING (plugin_config_store.cpp) means this never clobbers an
+        // operator's own kill-switch decision on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "browser_inventory",
+                    "default-off: forensics class (Wave 10); enable per PUT "
+                    "/api/v1/plugin-config/browser_inventory/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: browser_inventory default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -7535,20 +7556,17 @@ public:
                 // serve-or-503, it does NOT build). Best-effort: a failure just means
                 // /ca/crl returns 503 until the next revoke republishes.
                 //
-                // WS-3 note (adversarial review CDX-P1-01/K7): this boot-time one-shot
-                // is an AUTOMATIC CRL publish that is deliberately NOT leader-gated —
-                // it runs before the elector is constructed (below), and gating it
-                // would skip the boot CRL on the single-replica deployment (leadership
-                // is acquired asynchronously). It is a SEPARATE call site from WS-10's
-                // classified `ca.publish_crl` background pass (the freshness re-publish
-                // in the health loop, which IS gated). Cross-replica crlNumber-
-                // allocation atomicity for BOTH sites is WS-6's job (durable CRL
-                // numbering); until then a concurrent multi-replica *boot* could race
-                // the number — E6-capped today (single-replica is the only supported
-                // topology). Tracked: #4126 (WS-6).
+                // Deliberately NOT leader-gated (#4126, re-decided in HA WS-6 6.1): it
+                // runs before the elector is constructed (below), and gating it would
+                // skip the boot CRL on a single replica (leadership is acquired
+                // asynchronously). It is safe ungated because publish_crl() allocates
+                // the crlNumber under CaStore::publish_next_crl's cross-replica table
+                // lock: N replicas booting together publish up to N consecutive CRLs,
+                // never a duplicate number — at most N-1 redundant versions, harmless. Distinct from WS-10's
+                // `ca.publish_crl` freshness pass in the health loop, which stays gated.
                 if (!publish_crl())
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                                 "the next revocation republishes");
+                                 "the leader's freshness pass or the next revocation republishes");
             }
             // else: nullopt — genuinely no root (operator brought their own certs) —
             // no signer/recognizer/revocation-checker wiring, same as before.
@@ -8218,39 +8236,59 @@ public:
                 // eventually serves a CRL past its nextUpdate (external validators
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
-                // CRL is missing or within 24h of nextUpdate. publish_crl()
-                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
-                // 7 days out so this fires at most ~once/6 days in steady state.
+                // CRL is missing or within 24h of nextUpdate; once it runs,
+                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                //
+                // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
+                // built from the current revoked set — a revoke whose own publish
+                // failed (lock timeout, pool exhaustion) would otherwise stay out of
+                // the served CRL until the nextUpdate window, and retrying the revoke
+                // returns "already revoked" without publishing. The check compares
+                // counts in the database, never timestamps from different replicas'
+                // clocks, so clock skew cannot make it fire repeatedly.
                 if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
                     // Backoff (steady_clock — immune to NTP jumps): after a failed
-                    // freshness publish, don't retry every tick — wait 5 min so a
-                    // persistent failure (bad CA key) doesn't spam logs + the
-                    // failure counter (gov L1/L5).
+                    // publish, don't retry every tick — wait 5 min so a persistent
+                    // failure (bad CA key) doesn't spam logs + the failure counter
+                    // (gov L1/L5).
                     const auto now_steady = std::chrono::steady_clock::now();
-                    if (now_steady >= crl_freshness_retry_after_) {
+                    YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
+                    // WS-3 3.2: only the fenced leader runs this pass, so N replicas
+                    // don't each publish a redundant CRL. Numbering correctness does
+                    // NOT depend on this gate — publish_next_crl's table lock provides
+                    // it (WS-6 6.1). The OPERATOR revoke path (ca_routes.cpp) publishes
+                    // on its own plane and is deliberately NOT gated (two-dispatch-
+                    // planes rule; it carries no background-job assert).
+                    if (now_steady >= crl_freshness_retry_after_ &&
+                        leader_gate_permits<background_job_class("ca.publish_crl")>(
+                            leader_elector_.get())) {
                         // nextUpdate is a wall-clock epoch → compare with wall time.
                         const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
                         auto latest = ca_store_->latest_crl();
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
-                        if (stale) {
-                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            // WS-3 3.2: the background freshness re-publish bumps
-                            // crlNumber (a DB single-writer), so gate it to the fenced
-                            // leader — two replicas must not diverge the number. The
-                            // OPERATOR revoke path (ca_routes.cpp) publishes on its own
-                            // plane and is deliberately NOT gated here (two-dispatch-
-                            // planes rule; it carries no background-job assert).
-                            // Numbering correctness itself is WS-6.
-                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
-                                    leader_elector_.get())) {
-                                if (publish_crl())
-                                    spdlog::info(
-                                        "PKI: CRL re-published for freshness (nextUpdate window)");
-                                else
-                                    crl_freshness_retry_after_ =
-                                        now_steady + std::chrono::minutes(5);
+                        bool unpublished_revocation = false;
+                        if (!stale) {
+                            auto missing = ca_store_->has_unpublished_revocations();
+                            if (!missing) {
+                                // Throttle: a persistent read failure logs once a minute, not
+                                // every 15 s tick.
+                                spdlog::warn("PKI: unpublished-revocation check skipped: {}",
+                                             missing.error());
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(1);
+                            } else {
+                                unpublished_revocation = *missing;
                             }
+                        }
+                        if (stale || unpublished_revocation) {
+                            bool skipped = false;
+                            if (publish_crl(/*background=*/true, &skipped))
+                                spdlog::info(
+                                    "PKI: CRL re-published ({})",
+                                    stale ? "nextUpdate window"
+                                          : "the latest CRL did not cover every revocation");
+                            else if (!skipped) // another publish is running; recheck next tick
+                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
                         }
                     }
                 }
@@ -11005,94 +11043,114 @@ private:
     /// signed by the CA, and return its DER. Backs GET /api/v1/ca/crl (served from
     /// the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
     /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
-    /// CA / load / sign failure.
-    std::optional<std::vector<std::uint8_t>> publish_crl() {
-        // Serialise number-allocation + record so the crlNumber stays monotonic
-        // under concurrent publishers (gov architect SHOULD).
-        std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
+    /// CA / load / sign / persist failure. Number allocation, the revoked-set read
+    /// and the insert are one transaction in CaStore::publish_next_crl, serialised
+    /// across every replica by a table lock (HA WS-6 6.1); the key is loaded BEFORE
+    /// that lock is taken. If a subordinate import swaps the root in between, the
+    /// store refuses (RootChanged) and this retries once with the new root.
+    /// `background` = the freshness pass: it skips rather than queue behind another publish in
+    /// this process, so it never delays the revocation sweep that runs after it on the same
+    /// thread. A skip is not a failure (no counter; `*skipped` is set so the caller retries on
+    /// the next tick instead of backing off).
+    std::optional<std::vector<std::uint8_t>> publish_crl(bool background = false,
+                                                         bool* skipped = nullptr) {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root_or_err = ca_store_->get_root();
-        if (!root_or_err) {
-            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
-                          root_or_err.error());
-            return std::nullopt;
-        }
-        auto& root = *root_or_err;
-        if (!root)
-            return std::nullopt;
-        const std::filesystem::path dir =
-            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
-        FileKeyProvider kp(dir);
-        auto ca_key = kp.load_key(root->key_ref);
-        if (!ca_key) {
-            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+        auto fail = [this]() -> std::optional<std::vector<std::uint8_t>> {
             metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
             return std::nullopt;
-        }
-        detail::ScopedKeyZero ca_key_zero{*ca_key};
+        };
+        try {
+            for (int attempt = 1; attempt <= 2; ++attempt) {
+                auto root_or_err = ca_store_->get_root();
+                if (!root_or_err) {
+                    spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                                  root_or_err.error());
+                    return fail();
+                }
+                auto& root = *root_or_err;
+                if (!root)
+                    return std::nullopt;
+                const std::filesystem::path dir =
+                    cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+                FileKeyProvider kp(dir);
+                auto ca_key = kp.load_key(root->key_ref);
+                if (!ca_key) {
+                    spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+                    return fail();
+                }
+                detail::ScopedKeyZero ca_key_zero{*ca_key};
 
-        auto revoked_or_err = ca_store_->list_revoked();
-        if (!revoked_or_err) {
-            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
-            // degraded read here would publish a CRL that silently un-revokes every real
-            // revocation in every cache that trusts it. Abort the whole publish instead.
-            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
-                          revoked_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
+                // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
+                // cert fingerprint plus the STABLE key id (invariant across a subordinate
+                // re-key) so the CRL history is attributable to the key, not just a cert.
+                std::string issuer_key_id;
+                if (auto kid = pki::issuer_key_id(root->cert_pem))
+                    issuer_key_id = *kid;
+
+                auto build = [&](std::uint64_t number, const std::vector<IssuedCertRecord>& rows)
+                    -> std::optional<CaStore::BuiltCrl> {
+                    std::vector<pki::CrlRevocation> revoked;
+                    revoked.reserve(rows.size());
+                    for (const auto& r : rows) {
+                        revoked.push_back({r.serial_hex, std::chrono::system_clock::time_point{
+                                                             std::chrono::seconds{r.revoked_at}}});
+                    }
+                    // This replica's clock, read under the lock. Across replicas with skewed
+                    // clocks thisUpdate can still run backwards relative to crlNumber.
+                    const auto now = std::chrono::system_clock::now();
+                    const pki::Validity validity{now, now + std::chrono::hours(24 * 7)};
+                    auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
+                    if (!der) {
+                        spdlog::error("PKI: build_crl failed for CRL v{}", number);
+                        return std::nullopt;
+                    }
+                    return CaStore::BuiltCrl{
+                        std::move(*der),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_before.time_since_epoch())
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            validity.not_after.time_since_epoch())
+                            .count()};
+                };
+
+                auto rec = background
+                               ? ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id,
+                                                             std::chrono::milliseconds{0})
+                               : ca_store_->publish_next_crl(build, root->fingerprint_sha256,
+                                                             issuer_key_id);
+                if (rec)
+                    return std::move(rec->der);
+                if (background && rec.error() == CaStore::PublishError::Busy) {
+                    if (skipped)
+                        *skipped = true;
+                    return std::nullopt;
+                }
+                if (rec.error() == CaStore::PublishError::RootChanged && attempt == 1) {
+                    spdlog::info("PKI: CA root changed during CRL publish — retrying with the "
+                                 "new root");
+                    continue;
+                }
+                // B-1 (#1240): never report success unless the new CRL is durably recorded.
+                // Otherwise the revoke handler would audit ca.crl.published/success while
+                // /ca/crl keeps serving the PREVIOUS CRL (missing the just-revoked serial).
+                // ADR-0036/ADR-0053: an abort on a degraded revoked-set read or number read
+                // lands here too — never publish over a possibly-incomplete set.
+                spdlog::error("PKI: CRL publish failed — see the CaStore::publish_next_crl "
+                              "log line above for the cause");
+                return fail();
+            }
+        } catch (const std::exception& e) {
+            // The store rolled back; never let a builder exception escape a background thread.
+            spdlog::error("PKI: CRL publish threw: {} — CRL not published", e.what());
+            return fail();
+        } catch (...) {
+            spdlog::error("PKI: CRL publish threw a non-standard exception — CRL not published");
+            return fail();
         }
-        std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : *revoked_or_err) {
-            revoked.push_back(
-                {r.serial_hex,
-                 std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
-        }
-        const auto now = std::chrono::system_clock::now();
-        const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        auto number_or_err = ca_store_->next_crl_number();
-        if (!number_or_err) {
-            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
-            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
-            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
-                          number_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        const std::uint64_t number = *number_or_err;
-        auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
-        if (!der) {
-            spdlog::error("PKI: build_crl failed");
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        CrlVersionRecord rec;
-        rec.version = static_cast<int64_t>(number);
-        rec.der = *der;
-        rec.this_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_before.time_since_epoch())
-                .count();
-        rec.next_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
-                .count();
-        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
-        // cert fingerprint plus the STABLE key id (invariant across a subordinate
-        // re-key) so the CRL history is attributable to the key, not just a cert.
-        rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (auto kid = pki::issuer_key_id(root->cert_pem))
-            rec.issuer_key_id = *kid;
-        if (!ca_store_->record_crl(rec)) {
-            // B-1 (#1240): do NOT report success on a persistence failure. Returning
-            // the freshly-built DER here would make the revoke handler audit
-            // ca.crl.published/success and set crl_republished:true while /ca/crl
-            // keeps serving the PREVIOUS CRL (missing the just-revoked serial) — a
-            // false success that also evades the stale-CRL alert. Fail honestly so
-            // the caller reports crl_republished:false and the failure audit fires.
-            spdlog::error("PKI: failed to record CRL v{} — reporting publish failure", number);
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        return der;
+        return fail();
     }
 
     // -- Web server -----------------------------------------------------------
@@ -16326,77 +16384,24 @@ private:
         // empty). The fleet + picker seams read B2; the per-device drill reads B1
         // (audited at the route); the group roll-up resolves members then aggregates
         // B1 — two bounded single-store reads composed, never a held cross-store
-        // lease (ADR-0012 §1).
-        AppPerfProviders app_perf_providers;
-        app_perf_providers.fleet =
-            [this](std::string_view app, std::string_view version)
-            -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
-        };
-        app_perf_providers.apps =
-            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->list_apps(truncated);
-        };
-        app_perf_providers.device =
-            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->get_agent_app_perf(agent_id);
-        };
-        app_perf_providers.group =
-            [this](std::string_view group_id, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN aggregate B1
-            // (a second bounded read) — never a lease held across the other (ADR-0012
-            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
-        };
-        // Device-model (tag) cohort trend for the app-perf page — same
-        // ManagementGroupStore->AppPerfGroupReader composition as `.group`
-        // above, just resolving membership via TagStore instead. A degraded
-        // tag read fails the WHOLE lookup closed (nullopt), never "no match".
-        app_perf_providers.tag_cohort =
-            [this](std::string_view tag_key, std::string_view tag_value, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !tag_store_)
-                return std::nullopt;
-            auto agents = tag_store_->agents_with_tag(std::string(tag_key), std::string(tag_value));
-            if (!agents)
-                return std::nullopt; // fail closed on a degraded tag read (TagStore contract)
-            return app_perf_group_reader_->get_group_trend(*agents, app, version);
-        };
-        app_perf_providers.tag_values =
-            [this](std::string_view tag_key) -> std::optional<std::vector<std::string>> {
+        // lease (ADR-0012 §1). `AppPerfProviders` (the pre-seam callback-bundle
+        // this block used to build) is RETIRED (#4626) — `dex_perf_api` below
+        // (make_local_dex_perf_api) now does this exact composition (fleet/apps/
+        // device/group/tag_cohort/version_devices) internally, and is the SOLE
+        // consumer every surface (REST, MCP, dashboard) reads.
+        //
+        // GAP-1 (#4857): `.tag_values` has NO home in `DexPerfApi` (no public
+        // fleet-wide "distinct tag values" resource exists yet — see
+        // `DexRoutes::TagValuesFn`'s own doc comment) — kept here, standalone,
+        // as a disclosed presentation-side data dependency outside the seam.
+        DexRoutes::TagValuesFn dex_tag_values_fn =
+            [this](const std::string& tag_key) -> std::optional<std::vector<std::string>> {
             if (!tag_store_)
                 return std::nullopt;
-            auto values = tag_store_->get_distinct_values(std::string(tag_key));
+            auto values = tag_store_->get_distinct_values(tag_key);
             if (!values)
                 return std::nullopt;
             return *values;
-        };
-        // The version-row "which devices" drill (B1, fleet-wide only — see the
-        // dashboard route's own registration comment for the documented v1
-        // group-scope gap). `visible_agent_ids` is threaded straight through
-        // from the caller's own require_fleet_read scope, never widened.
-        app_perf_providers.version_devices =
-            [this](std::string_view app, std::string_view version,
-                   const std::optional<std::vector<std::string>>& visible_agent_ids,
-                   bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->list_devices_for_version(app, version, visible_agent_ids,
-                                                                    truncated);
         };
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
@@ -16410,14 +16415,13 @@ private:
         auto verify_api =
             make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
         // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API seam —
-        // ONE instance backing the 9 GET /api/v1/dex/perf/* resources (minus
-        // /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/app-perf.
-        // Wired with the SAME `dex_perf_fn` closure (below) DexRoutes/the
-        // fragments already share, so the heartbeat-now denominator can never
-        // diverge between the seam and the fragments — mirrors DexApi's own
-        // FleetFn threading (dex_api, below). ADDITIONAL to app_perf_providers
-        // above (not a replacement): other consumers (the dashboard fragments)
-        // still read app_perf_providers directly until they migrate too.
+        // the SOLE instance backing the 9 GET /api/v1/dex/perf/* resources
+        // (minus /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/
+        // app-perf, the MCP DEX perf tools, AND (#4626) the dashboard
+        // fragments (DexRoutes) — every consumer reads this one instance, so
+        // none can disagree. Wired with the SAME `dex_perf_fn` closure (below)
+        // DexRoutes shares, so the heartbeat-now denominator can never diverge
+        // — mirrors DexApi's own FleetFn threading (dex_api, below).
         auto dex_perf_api = make_local_dex_perf_api(
             dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
             app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get());
@@ -16532,18 +16536,21 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn,
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
             scoped_perm_fn, visible_set_fn,
-            // F2b app-perf-over-time providers + the scope-selector group list.
-            app_perf_providers, dex_group_list_fn,
+            // ADR-0031 WS-A4 (sixth family, #4626): the DEX app-perf-over-time
+            // API seam (F2a heartbeat-now + F2b over-time) + the scope-selector
+            // group list — replaces the retired `app_perf_providers` bundle.
+            dex_perf_api, dex_group_list_fn,
             // The devices-by-version drill's sole gate (ADR-0017) — the SAME
             // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
             // surfaces resolve visibility identically.
-            fleet_read_fn);
+            fleet_read_fn,
+            // GAP-1 (#4857): the device-model scope selector's distinct-tag-
+            // values reader (see TagValuesFn's own doc comment).
+            dex_tag_values_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -16720,10 +16727,21 @@ private:
 
         // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
         // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
-        // banner). Same store/scope/audit wiring the lenses had inside DeviceRoutes.
+        // banner) and rewired onto the DexApi/GuardianApi seams (issue #4576 +
+        // the deferred guardian-lens rewire). `dex_api` is already gated on
+        // `guaranteed_state_store_` presence above (null -> null, matching the
+        // fragment's own pre-rewire `!store_` 503-placeholder posture
+        // byte-for-byte); `guardian_api` itself is constructed unconditionally
+        // (its OWN degrade posture is per-method, not per-instance), so the
+        // SAME `guaranteed_state_store_` presence gate is applied explicitly
+        // here to preserve that byte-identical posture for this lens too.
+        // Same scope/audit wiring the lenses had inside DeviceRoutes.
         device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
-        device_lens_routes_->register_routes(*web_server_, scoped_perm_fn,
-                                             guaranteed_state_store_.get(), audit_fn);
+        device_lens_routes_->register_routes(
+            *web_server_, scoped_perm_fn, dex_api,
+            guaranteed_state_store_ ? DeviceLensRoutes::GuardianApiPtr{guardian_api}
+                                    : DeviceLensRoutes::GuardianApiPtr{},
+            audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
@@ -18494,13 +18512,13 @@ private:
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
 
-        // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
-        // store seams shared by the REST endpoints and the MCP twins so both read
-        // the SAME substrate. Each lambda null-checks the store at call time and
-        // returns std::nullopt on an unwired/closed store (the read surfaces map a
-        // nullopt to a 503 degrade, never a silent empty). The `app_perf_providers`
-        // bundle is built once ABOVE (before the DexRoutes registration) so the
-        // dashboard, REST and MCP surfaces all share the same store seams.
+        // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
+        // (built once ABOVE, before the DexRoutes registration) is the ONE
+        // seam shared by the dashboard, the REST endpoints, and the MCP twins
+        // (#4626) so all three read the SAME substrate — each method
+        // null-checks its backing store at call time and returns
+        // std::nullopt on an unwired/closed store (the read surfaces map a
+        // nullopt to a 503/"unavailable" degrade, never a silent empty).
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -18839,8 +18857,6 @@ private:
             [this](const std::string& username, const std::string& agent_id) -> bool {
                 return response_agent_in_scope(username, agent_id);
             },
-            // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
             engine_principal_store_.get(),
             // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
@@ -18917,8 +18933,8 @@ private:
             // seam — the 9 GET /api/v1/dex/perf/* handlers + the per-device
             // drill require this and answer 503 when it is null, the exact
             // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
-            // guards produced (app_perf_providers stays wired above too — this
-            // is additive until every consumer migrates).
+            // guards produced. The SOLE instance (#4626) — also shared by
+            // DexRoutes (dashboard) and the MCP DEX perf tools below.
             dex_perf_api,
             // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam,
             // constructed unconditionally above — each method individually
@@ -19128,17 +19144,17 @@ private:
             // readiness guard answers "store unavailable" (byte-identical).
             mcp_server_->set_dex_api(dex_api);
             // ADR-0031 WS-A4 (sixth family): the SAME DexPerfApi seam instance
-            // the REST /api/v1/dex/perf/* handlers use (constructed above,
-            // additive alongside app_perf_providers), so the 9 MCP DEX
-            // app-perf tool twins + get_dex_device_app_perf never disagree
-            // with REST. Unlike dex_api above, dex_perf_api is constructed
+            // the REST /api/v1/dex/perf/* handlers AND DexRoutes (dashboard,
+            // #4626) use, so the 9 MCP DEX app-perf tool twins +
+            // get_dex_device_app_perf never disagree with REST/dashboard.
+            // Unlike dex_api above, dex_perf_api is constructed
             // UNCONDITIONALLY — never nullptr — because each backing store
             // pointer is checked individually INSIDE the impl (dex_perf_api.cpp),
-            // exactly matching the old per-lambda null-checks in
-            // app_perf_providers; the tools' !dex_perf_api_ guard therefore
-            // never fires in practice (dex_perf_api_local.hpp's own banner
-            // states this), but stays as defense-in-depth against a future
-            // wiring change, and every server's stores fail closed at boot
+            // exactly matching the old per-lambda null-checks the retired
+            // `AppPerfProviders` bundle used; the tools' !dex_perf_api_ guard
+            // therefore never fires in practice (dex_perf_api_local.hpp's own
+            // banner states this), but stays as defense-in-depth against a
+            // future wiring change, and every server's stores fail closed at boot
             // regardless — behaviourally identical to the old direct calls.
             mcp_server_->set_dex_perf_api(dex_perf_api);
             // ADR-0031 WS-A4 (seventh family): the SAME schedule-read API
@@ -19319,9 +19335,6 @@ private:
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,
-                // DEX app-perf-over-time read providers (slice 2) — same bundle the
-                // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers,
                 // #289 / Issue 13.5: the quarantine store backs the
                 // quarantine_device write tool (record + real isolate), and the
                 // tag-push closure fires the agent tag-push after set_tag exactly
@@ -19802,6 +19815,8 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
+        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
+        yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
@@ -20033,11 +20048,6 @@ private:
     std::string agent_ca_cert_pem_;
     std::mutex csr_issue_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
-    // Serialises publish_crl() so next_crl_number()+record_crl() are atomic across
-    // concurrent publishers (startup pre-publish vs a revoke, or two revokes) —
-    // otherwise both could read the same number and last-writer-wins overwrites,
-    // breaking RFC 5280 monotonic crlNumber (gov architect SHOULD).
-    std::mutex crl_publish_mu_;
     // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
     // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
     std::mutex yuzu_issued_cache_mu_;

@@ -21,7 +21,8 @@
 ///                            event-outbox poll, ADR-2002 §5) are ReplicaSafe and
 ///                            must NEVER be leader-gated.
 ///   - FencedLeaderOnly     — side-effecting singleton work that double-fires
-///                            across replicas (agent dispatch, CRL numbering).
+///                            across replicas (agent dispatch, redundant CRL
+///                            re-publishes).
 ///                            Runs only on the WS-3 fenced leader; ENFORCEMENT is
 ///                            slice 10.3 (rides WS-3 3.2), not this file. ADDING a
 ///                            FencedLeaderOnly pass REQUIRES wrapping its dispatch
@@ -180,7 +181,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "DB-WRITE: CRL row + crlNumber bump must be single-writer or numbering diverges (WS-6)"},
+     "DB-WRITE: freshness re-publish; numbering is safe on any replica (WS-6 6.1 table lock), gated only to avoid N redundant CRLs per stale tick"},
     {"registry.teardown_revoked_streams", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica: tears down only the Subscribe streams connected to THIS replica"},
     {"mcp_stream_bridge.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
