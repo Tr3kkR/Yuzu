@@ -1234,24 +1234,20 @@ int main(int argc, char* argv[]) {
     // ── Multi-host Postgres DSN guard (HA WS-8) ──
     // A multi-host DSN without target_session_attrs=read-write lets libpq put the
     // pool's connections on a standby, and /readyz cannot see them all. Add
-    // read-write when the attribute is absent; refuse a weaker explicit value.
-    // Done after logging is configured (so the line reaches --log-file and
-    // --log-format json) and before the auth bootstrap pool and Server::create,
-    // so every connection — both pools, the leader elector and the readiness
-    // probe — uses the same normalised DSN. See pg/multi_host_dsn.hpp.
+    // read-write when the attribute is absent; refuse a weaker explicit value, and
+    // refuse load_balance_hosts. Done after logging is configured (so the line
+    // reaches --log-file and --log-format json) and before the auth bootstrap
+    // pool and Server::create, so every connection — both pools, the leader
+    // elector and the readiness probe — uses the same normalised DSN. See
+    // pg/multi_host_dsn.hpp.
     if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
         guarded.has_value()) {
-        if (guarded->appended) {
-            const std::string why =
-                guarded->hosts > 1
-                    ? std::format("names {} hosts{}", guarded->hosts,
-                                  guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "")
-                    : std::string("sets load_balance_hosts");
-            spdlog::warn("Postgres connection {} without target_session_attrs; using "
-                         "target_session_attrs=read-write so the server only connects to a "
-                         "writable primary (set it explicitly to silence this)",
-                         why);
-        }
+        if (guarded->appended)
+            spdlog::warn("Postgres connection names {} hosts{} without target_session_attrs; "
+                         "using target_session_attrs=read-write so the server only connects to "
+                         "a writable primary (set it explicitly to silence this)",
+                         guarded->hosts,
+                         guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "");
         cfg.postgres_dsn = std::move(guarded->dsn);
     } else {
         spdlog::critical("Invalid --postgres-dsn: {}", guarded.error());

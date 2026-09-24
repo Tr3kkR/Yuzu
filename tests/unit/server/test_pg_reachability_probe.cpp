@@ -27,6 +27,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <tuple>
 
@@ -36,6 +37,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -44,6 +46,17 @@ namespace pr = yuzu::server::pg_reachability;
 using namespace std::chrono_literals;
 
 namespace {
+
+/// Host-list probes in these tests use a 3s pool connect_timeout default
+/// (production: PgPool's 10s), so the probe waits 3s on each silent host —
+/// exactly as a pool built with that default would — and the tests stay fast.
+constexpr int kTestPoolConnectTimeoutS = 3;
+constexpr std::chrono::seconds kTestHostWait{kTestPoolConnectTimeoutS};
+
+std::unique_ptr<PgReachabilityProbe> make_host_list_probe(const std::string& dsn) {
+    return PgReachabilityProbe::make_libpq(dsn, {}, std::string(PgReachabilityProbe::kProbeSql),
+                                           kTestPoolConnectTimeoutS);
+}
 
 constexpr std::int64_t ns(std::chrono::nanoseconds d) {
     return d.count();
@@ -597,20 +610,21 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     }
     const std::string dsn = multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
                                            std::to_string(frozen.port) + "," + pg_port);
-    auto probe = PgReachabilityProbe::make_libpq(dsn);
+    auto probe = make_host_list_probe(dsn);
     const auto t = std::chrono::steady_clock::now();
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(took >= pr::kConnectDeadline - 100ms); // paid the frozen host's deadline once
-    CHECK(took < pr::kConnectDeadline + 5s);
+    CHECK(took >= kTestHostWait - 100ms); // paid the frozen host's connect_timeout once
+    CHECK(took < kTestHostWait + 5s);
     // The connection is now held on the second host: the next tick is fast.
     const auto t2 = std::chrono::steady_clock::now();
     probe->probe_once();
     CHECK(probe->verdict() == pr::Verdict::Ready);
     CHECK(std::chrono::steady_clock::now() - t2 < 1s);
 
-    // A RECONNECT walks the hosts as libpq does for a fresh pool connection: kill the probe's backend; the next tick fails on the dead session, the
+    // A RECONNECT walks the hosts as libpq does for a fresh pool connection:
+    // kill the probe's backend; the next tick fails on the dead session, the
     // one after pays the frozen host's deadline again, then reaches the second
     // host (Gate 8 round 4: the probe mirrors the pool's host choice).
     REQUIRE(admin_scalar(db.dsn(),
@@ -623,7 +637,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     const auto t3 = std::chrono::steady_clock::now();
     probe->probe_once(); // reconnect: frozen host first, then the second host
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(std::chrono::steady_clock::now() - t3 >= pr::kConnectDeadline - 100ms);
+    CHECK(std::chrono::steady_clock::now() - t3 >= kTestHostWait - 100ms);
 }
 #endif
 
@@ -793,13 +807,139 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a silent first host from a PGHOST li
     } restore_host{"PGHOST"}, restore_port{"PGPORT"};
     ::setenv("PGHOST", ("127.0.0.1," + pg_host).c_str(), 1);
     ::setenv("PGPORT", (std::to_string(frozen.port) + "," + pg_port).c_str(), 1);
-    auto probe = PgReachabilityProbe::make_libpq(no_hosts);
+    auto probe = make_host_list_probe(no_hosts);
     const auto t = std::chrono::steady_clock::now();
     probe->probe_once();
     const auto took = std::chrono::steady_clock::now() - t;
     CHECK(probe->verdict() == pr::Verdict::Ready);
-    CHECK(took >= pr::kConnectDeadline - 100ms);
-    CHECK(took < pr::kConnectDeadline + 5s);
+    CHECK(took >= kTestHostWait - 100ms);
+    CHECK(took < kTestHostWait + 5s);
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): an empty host entry whose default socket is silent "
+          "still costs one deadline, not an endless restart",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 6 (cross-platform): libpq shows an EMPTY host entry as its
+    // built-in default (a Unix socket directory, /tmp for this libpq), so a
+    // name-based "already tried" check never matched it and a silent default
+    // socket restarted forever. A silent Unix listener at that default path
+    // (salted by an ephemeral TCP port number) reproduces it.
+    YUZU_REQUIRE_PG_DB(db);
+    SilentListener port_salt; // only its unique port number is used
+    REQUIRE(port_salt.port > 0);
+    const std::string sock_path = "/tmp/.s.PGSQL." + std::to_string(port_salt.port);
+    UniqueFd unix_fd{::socket(AF_UNIX, SOCK_STREAM, 0)};
+    REQUIRE(unix_fd.v >= 0);
+    sockaddr_un ua{};
+    ua.sun_family = AF_UNIX;
+    REQUIRE(sock_path.size() < sizeof(ua.sun_path));
+    std::memcpy(ua.sun_path, sock_path.c_str(), sock_path.size() + 1);
+    ::unlink(sock_path.c_str());
+    REQUIRE(::bind(unix_fd.v, reinterpret_cast<sockaddr*>(&ua), sizeof(ua)) == 0);
+    struct Unlink {
+        std::string path;
+        ~Unlink() { ::unlink(path.c_str()); }
+    } unlink_after{sock_path};
+    REQUIRE(::listen(unix_fd.v, 8) == 0);
+
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    auto probe = make_host_list_probe(
+        multi_host_dsn(db.dsn(), "," + pg_host, std::to_string(port_salt.port) + "," + pg_port));
+    const auto t = std::chrono::steady_clock::now();
+    probe->probe_once();
+    const auto took = std::chrono::steady_clock::now() - t;
+    CHECK(probe->verdict() == pr::Verdict::Ready);
+    CHECK(took < 2 * kTestHostWait + 5s);
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): the per-host deadline follows the DSN's "
+          "connect_timeout, as the pool's connect does",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 6 (security-guardian + architect): the pool gives up on a
+    // host after connect_timeout — never at all when it is 0. A probe that
+    // waited longer, or moved on where the pool waits for ever, reported ready
+    // while the pool could not connect.
+    YUZU_REQUIRE_PG_DB(db);
+    SilentListener frozen;
+    REQUIRE(frozen.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    const std::string dsn = multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
+                                           std::to_string(frozen.port) + "," + pg_port);
+    SECTION("connect_timeout=2: the silent host is abandoned after ~2s, as the pool does") {
+        auto probe = PgReachabilityProbe::make_libpq(dsn + " connect_timeout=2");
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+        CHECK(took >= 2s - 100ms);
+        CHECK(took < pr::kConnectDeadline - 1s);
+    }
+    SECTION("connect_timeout=8: the probe waits the full 8s on the silent host, as the pool does") {
+        // Round 6 (unhappy-path UP6-1): moving on sooner than the pool passes a
+        // host that fails the pool's connects a little later, and reports ready.
+        auto probe = PgReachabilityProbe::make_libpq(dsn + " connect_timeout=8");
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+        CHECK(took >= 8s - 100ms);
+        CHECK(took < 8s + 5s);
+    }
+    SECTION("connect_timeout=0: the pool would wait for ever, so the probe does not move on") {
+        auto probe = PgReachabilityProbe::make_libpq(dsn + " connect_timeout=0");
+        probe->probe_once();
+        probe->probe_once();
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
+    }
+    SECTION("no connect_timeout: the pool's default applies (3s here, 10s in production)") {
+        auto probe = make_host_list_probe(dsn);
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+        CHECK(took >= 3s - 100ms);
+        CHECK(took < pr::kConnectDeadline - 1s);
+    }
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): the restart over untried hosts — all silent, "
+          "duplicates, a hostaddr-only list",
+          "[server][readyz][pg_reachability][pg]") {
+    YUZU_REQUIRE_PG_DB(db);
+    SilentListener a, b;
+    REQUIRE(a.port > 0);
+    REQUIRE(b.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    const std::string pa = std::to_string(a.port), pb = std::to_string(b.port);
+    SECTION("every host silent: one deadline each, then the probe fails") {
+        auto probe = make_host_list_probe(
+            multi_host_dsn(db.dsn(), "127.0.0.1,127.0.0.1", pa + "," + pb));
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
+        CHECK(took >= 2 * kTestHostWait - 200ms);
+        CHECK(took < 3 * kTestHostWait + 2s);
+    }
+    SECTION("a silent host listed twice costs one deadline, not two") {
+        auto probe = make_host_list_probe(multi_host_dsn(
+            db.dsn(), "127.0.0.1,127.0.0.1," + pg_host, pa + "," + pa + "," + pg_port));
+        const auto t = std::chrono::steady_clock::now();
+        probe->probe_once();
+        const auto took = std::chrono::steady_clock::now() - t;
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+        CHECK(took < 2 * kTestHostWait - 1s);
+    }
+    SECTION("a hostaddr-only list is walked the same way") {
+        if (pg_host != "localhost" && pg_host != "127.0.0.1")
+            SKIP("test Postgres is not on loopback; hostaddr needs a numeric address");
+        // multi_host_dsn() sets host=; replace it with a hostaddr list.
+        std::string dsn = multi_host_dsn(db.dsn(), "x,y", pa + "," + pg_port);
+        dsn.replace(dsn.find("host=x,y"), 8, "hostaddr=127.0.0.1,127.0.0.1");
+        auto probe = make_host_list_probe(dsn);
+        probe->probe_once();
+        CHECK(probe->verdict() == pr::Verdict::Ready);
+    }
 }
 
 TEST_CASE("PgReachabilityProbe (libpq, pg): a failure libpq treats as final ends the host walk "
@@ -833,6 +973,8 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a failure libpq treats as final ends
 TEST_CASE("PgReachabilityProbe (libpq, pg): load_balance_hosts=random walks hosts in a random "
           "order, as libpq's pool connections do",
           "[server][readyz][pg_reachability][pg]") {
+    // The server now REFUSES load_balance_hosts at boot (pg/multi_host_dsn.hpp,
+    // round 6); this pins that libpq, not the probe, owns the host order.
     // Gate 8 round 5 (CA-R5-1): with load_balance_hosts=random libpq shuffles the
     // host list per connection, so a host that ends the walk (here a 28P01
     // refusal) fails SOME new pool connections. A probe walking in DSN order

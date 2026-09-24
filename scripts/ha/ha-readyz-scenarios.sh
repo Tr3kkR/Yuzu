@@ -36,10 +36,12 @@
 #   G. read-only second host  `host=A,B` with NO target_session_attrs, B read-only:
 #                       stop A (red), start A -> /readyz 200 again, not pinned to B
 #                       (Gate 8 round 2 UH-R2-1).
-#   H. multi-host DSN without target_session_attrs: the server appends read-write
+#   H. multi-host DSN without target_session_attrs: the server adds read-write
 #                       and logs it (Gate 8 round 4 guard, pg/multi_host_dsn.hpp).
 #   I. multi-host DSN with target_session_attrs=any: the server refuses to boot,
 #                       naming the value, never the password.
+#   J. load_balance_hosts=random (even with read-write): the server refuses to
+#                       boot (Gate 8 round 6 operator decision), never naming the password.
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -298,7 +300,7 @@ echo "== H: multi-host DSN without target_session_attrs -> the server uses read-
 : > "$RIG/server.log"
 boot "$GDSN" || exit 1
 if grep -q 'using target_session_attrs=read-write' "$RIG/server.log"; then
-    pass "the server logged that it appended target_session_attrs=read-write"
+    pass "the server logged that it added target_session_attrs=read-write"
 else fail "no target_session_attrs=read-write notice in the server log"; fi
 stop_server 210
 
@@ -315,6 +317,20 @@ if wait_exit 20 "$(date +%s)"; then
         pass "refused to start ${ELAPSED}s in, naming the value and not the password"
     else fail "exited, but without the expected refusal message (or with the password in it)"; fi
 else fail "server did not refuse a multi-host DSN with target_session_attrs=any"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
+
+echo "== J: load_balance_hosts=random -> refused at boot"
+JDSN="postgresql://yuzu:${PG_PASS}@127.0.0.1:${PGPORT},127.0.0.1:${PG2PORT}/yuzu?target_session_attrs=read-write&load_balance_hosts=random"
+: > "$RIG/server.log"
+"$SERVER_BIN" --listen "127.0.0.1:${GRPC}" --no-tls --no-https --no-default-certs \
+    --web-address 127.0.0.1 --web-port "$WEB" --management "127.0.0.1:${MGMT}" \
+    --postgres-dsn "$JDSN" --config "$RIG/yuzu-server.cfg" --data-dir "$RIG" \
+    --ca-dir "$RIG/certs" >> "$RIG/server.log" 2>&1 &
+SERVER_PID=$!
+if wait_exit 20 "$(date +%s)"; then
+    if grep -q "Invalid --postgres-dsn: load_balance_hosts=random" "$RIG/server.log" && ! grep -q "$PG_PASS" "$RIG/server.log"; then
+        pass "refused to start ${ELAPSED}s in, naming load_balance_hosts and not the password"
+    else fail "exited, but without the expected refusal message (or with the password in it)"; fi
+else fail "server did not refuse load_balance_hosts=random"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

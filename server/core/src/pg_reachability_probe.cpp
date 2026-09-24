@@ -100,34 +100,66 @@ std::vector<std::string> split_commas(std::string_view v) {
 
 using ConnOptions = std::vector<std::pair<std::string, std::string>>;
 
-/// The probe's connection options: every option the DSN sets, exactly as libpq
-/// parsed it, plus `application_name` when the DSN names none. An unparseable
-/// DSN is handed to libpq raw (expand_dbname) and its connect reports a FIXED
-/// message, never libpq's parse text (which can echo part of a password).
+/// The probe's connection parameters — built EXACTLY as PgPool::connect_one
+/// builds the pool's (Gate 8 round 6, security-guardian + architect): the DSN
+/// passed whole through `dbname` with expand_dbname=1, so empty values and the
+/// PG* environment resolve as they do for the pool, then the pool's own
+/// `connect_timeout` default only where neither the DSN nor PGCONNECT_TIMEOUT
+/// sets one. (The pool's keepalive/tcp_user_timeout/options defaults do not
+/// change which host a connect reaches, and every probe socket wait has its own
+/// client-side deadline.) Plus `application_name` when neither the DSN nor
+/// PGAPPNAME names one. `unparseable` only suppresses libpq's error text, which
+/// can echo part of a password.
 struct ProbeConnInfo {
     ConnOptions opts;
     bool unparseable{false};
 };
 
-ProbeConnInfo probe_conninfo(const std::string& dsn) {
+bool option_set(const PQconninfoOption* o, std::string_view key) {
+    for (; o && o->keyword != nullptr; ++o)
+        if (std::string_view{o->keyword} == key)
+            return o->val != nullptr && *o->val != '\0';
+    return false;
+}
+
+bool env_set(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && *v != '\0';
+}
+
+ProbeConnInfo probe_conninfo(const std::string& dsn, int pool_connect_timeout_s) {
     char* errmsg = nullptr;
     std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> parsed(
         PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
     // Owned, never read (see above).
     const std::unique_ptr<char, decltype(&PQfreemem)> errmsg_owner(errmsg, &PQfreemem);
-    if (!parsed)
-        return {ConnOptions{{"dbname", dsn}}, true};
     ProbeConnInfo info;
-    bool has_app_name = false;
-    for (const PQconninfoOption* o = parsed.get(); o->keyword != nullptr; ++o) {
-        if (o->val == nullptr)
-            continue;
-        has_app_name = has_app_name || std::string_view{o->keyword} == "application_name";
-        info.opts.emplace_back(o->keyword, o->val);
-    }
-    if (!has_app_name)
+    info.unparseable = !parsed;
+    info.opts.emplace_back("dbname", dsn);
+    if (parsed && !option_set(parsed.get(), "connect_timeout") && !env_set("PGCONNECT_TIMEOUT"))
+        info.opts.emplace_back("connect_timeout", std::to_string(pool_connect_timeout_s));
+    if (parsed && !option_set(parsed.get(), "application_name") && !env_set("PGAPPNAME"))
         info.opts.emplace_back("application_name", kProbeApplicationName);
     return info;
+}
+
+/// libpq's per-host connect timeout for `c` (seconds; 0 = none, wait for ever),
+/// read back from the connection so the DSN, PGCONNECT_TIMEOUT and the pool's
+/// default resolve exactly as libpq resolved them. libpq treats <=0 as no
+/// timeout and raises 1 to 2.
+int effective_connect_timeout_s(PGconn* c) {
+    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> ci(PQconninfo(c),
+                                                                    &PQconninfoFree);
+    for (const PQconninfoOption* o = ci.get(); o && o->keyword != nullptr; ++o) {
+        if (std::string_view{o->keyword} != "connect_timeout" || o->val == nullptr)
+            continue;
+        char* end = nullptr;
+        const long v = std::strtol(o->val, &end, 10);
+        if (end == o->val || v <= 0)
+            return 0;
+        return v < 2 ? 2 : static_cast<int>(std::min<long>(v, 3600));
+    }
+    return 0;
 }
 
 /// One entry of the host list libpq is walking.
@@ -181,8 +213,8 @@ std::string pq_error(PGconn* c, const char* fallback) {
 /// The production ping: owns the dedicated connection between ticks.
 class LibpqPinger {
 public:
-    LibpqPinger(const std::string& dsn, std::string sql)
-        : info_(probe_conninfo(dsn)), sql_(std::move(sql)) {}
+    LibpqPinger(const std::string& dsn, std::string sql, int pool_connect_timeout_s)
+        : info_(probe_conninfo(dsn, pool_connect_timeout_s)), sql_(std::move(sql)) {}
 
     PgReachabilityProbe::PingResult ping(const std::atomic<bool>& stop) {
         using R = PgReachabilityProbe::PingResult;
@@ -224,16 +256,26 @@ private:
     ///
     /// The ONE thing added: libpq's non-blocking connect never moves past a host
     /// that accepts TCP and then goes silent (its blocking connect, which the
-    /// pool uses, moves on after `connect_timeout`). So each host gets its own
-    /// kConnectDeadline, measured from when libpq starts on it (PQhost/PQport);
-    /// on expiry the attempt is restarted over the hosts libpq has not yet
-    /// tried, and libpq walks those. Residual: a silent ADDRESS of a host name
-    /// with several addresses skips that name's remaining addresses (the pool
-    /// would try them) — a false red, never a false green.
+    /// pool uses, moves on after `connect_timeout`). So in a host list each host
+    /// address gets exactly the effective `connect_timeout` libpq resolved for
+    /// this connection — the pool's wait, neither shorter nor longer (a single
+    /// host is capped at kConnectDeadline: nothing to move on to) — measured from
+    /// when libpq starts on it (PQhost/PQport/PQhostaddr); on expiry the attempt
+    /// is restarted over the hosts libpq has not yet tried, at most once per
+    /// listed host. With no `connect_timeout` (<= 0; the pool's own default
+    /// applies when the DSN and PGCONNECT_TIMEOUT set none) the pool waits on a
+    /// silent host for ever, so the probe reports the failure after
+    /// kConnectDeadline instead of moving on. Residual: a silent ADDRESS of a
+    /// host name with several addresses makes the probe skip that name's other
+    /// addresses, which the pool would try next — so it can err either way, and
+    /// such names are a documented configuration to avoid (list the addresses
+    /// as hosts).
     std::optional<std::string> connect(const std::atomic<bool>& stop) {
         std::string stalled; // hosts given up on at their deadline, for the log
         std::vector<HostEntry> hosts;
         std::vector<bool> tried;
+        std::size_t restarts = 0;
+        int timeout_s = 0;
         ConnOptions opts = info_.opts;
         for (bool first = true;; first = false) {
             if (stop.load(std::memory_order_acquire))
@@ -247,8 +289,7 @@ private:
             }
             keys.push_back(nullptr);
             vals.push_back(nullptr);
-            conn_ = pg::PgConn{
-                PQconnectStartParams(keys.data(), vals.data(), info_.unparseable ? 1 : 0)};
+            conn_ = pg::PgConn{PQconnectStartParams(keys.data(), vals.data(), /*expand_dbname=*/1)};
             PGconn* c = conn_.get();
             if (c == nullptr)
                 return std::string("PQconnectStartParams returned null (out of memory)");
@@ -260,9 +301,26 @@ private:
             if (first) {
                 hosts = host_list(c);
                 tried.assign(hosts.size(), false);
+                timeout_s = effective_connect_timeout_s(c);
             }
+            // The pool's blocking connect gives up on each host ADDRESS after exactly
+            // connect_timeout, and so does the probe — not sooner (a probe that moved
+            // on early would pass a host that fails the pool's connects a little
+            // later, and report ready: Gate 8 round 6), not later (it would reach a
+            // slow host the pool abandons). No timeout means the pool waits on a
+            // silent host for ever: the probe does not move past it either, and
+            // reports the failure after kConnectDeadline.
+            // With a single host there is nothing to move on to, so the deadline is
+            // capped at kConnectDeadline (giving up sooner than the pool can only err
+            // red) and a frozen single primary is still detected in ~11s.
+            const Clock::duration ct = std::chrono::seconds(timeout_s);
+            const Clock::duration per_host =
+                timeout_s <= 0      ? Clock::duration(pr::kConnectDeadline)
+                : hosts.size() >= 2 ? ct
+                                    : std::min<Clock::duration>(ct, pr::kConnectDeadline);
             std::string current; // "host:port" libpq is on
-            auto host_deadline = Clock::now() + pr::kConnectDeadline;
+            std::string current_addr; // plus the address, for the per-address deadline
+            auto host_deadline = Clock::now() + per_host;
             // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
             // returned PGRES_POLLING_WRITING.
             PostgresPollingStatusType st = PGRES_POLLING_WRITING;
@@ -277,11 +335,16 @@ private:
                     return stalled + pq_error(c, "connection failed");
                 const char* h = PQhost(c);
                 const char* pt = PQport(c);
+                const char* ha = PQhostaddr(c);
                 const std::string at = std::string(h ? h : "") + ":" + (pt ? pt : "");
-                if (at != current) { // libpq moved to another host: a new deadline
+                const std::string at_addr = at + "@" + (ha ? ha : "");
+                if (at != current) { // libpq moved to another host
                     current = at;
-                    host_deadline = Clock::now() + pr::kConnectDeadline;
                     mark_tried(hosts, tried, h, pt);
+                }
+                if (at_addr != current_addr) { // ...or another address: a new deadline
+                    current_addr = at_addr;
+                    host_deadline = Clock::now() + per_host;
                 }
                 const int sock = PQsocket(c); // may change between addresses — re-read
                 if (sock < 0)
@@ -293,8 +356,16 @@ private:
                 }
                 if (stop.load(std::memory_order_acquire))
                     return std::string("stopped");
+                if (timeout_s <= 0)
+                    return stalled + current +
+                           " connect timed out (no connect_timeout: the server's own "
+                           "connections wait on this host too)";
                 stalled += current + " connect timed out; ";
-                ConnOptions next = with_untried_hosts(hosts, tried);
+                // At most one attempt per listed host, whatever PQhost reports, so
+                // the whole connect is bounded by hosts x addresses x connect_timeout —
+                // the same bound as one of the pool's connects.
+                ConnOptions next = ++restarts >= hosts.size() ? ConnOptions{}
+                                                             : with_untried_hosts(hosts, tried);
                 if (next.empty()) // nothing left to try (or a single host)
                     return stalled.substr(0, stalled.size() - 2);
                 opts = std::move(next);
@@ -304,17 +375,28 @@ private:
         }
     }
 
+    /// Mark the entries libpq is on. An EMPTY host entry is shown by PQhost as
+    /// libpq's built-in default (a socket directory, or `localhost` on
+    /// Windows), never as "" — so a host matching no entry by name is taken to
+    /// be the empty entries' default (cross-platform, Gate 8 round 6: otherwise
+    /// such an entry is never marked and the restart loop never ends).
     static void mark_tried(const std::vector<HostEntry>& hosts, std::vector<bool>& tried,
                            const char* h, const char* port) {
         const std::string_view hv = h ? h : "", pv = port ? port : "";
+        auto port_ok = [&](const HostEntry& e) { return e.port.empty() || e.port == pv; };
+        bool matched = false;
         for (std::size_t i = 0; i < hosts.size(); ++i) {
             const std::string& shown = hosts[i].host.empty() ? hosts[i].hostaddr : hosts[i].host;
-            if (shown == hv && (hosts[i].port.empty() || hosts[i].port == pv))
-                tried[i] = true;
+            if (!shown.empty() && shown == hv && port_ok(hosts[i]))
+                tried[i] = matched = true;
         }
+        if (!matched)
+            for (std::size_t i = 0; i < hosts.size(); ++i)
+                if (hosts[i].host.empty() && hosts[i].hostaddr.empty() && port_ok(hosts[i]))
+                    tried[i] = true;
     }
 
-    /// The probe's options with host/hostaddr/port replaced by the hosts libpq
+    /// The probe's parameters with host/hostaddr/port overridden by the hosts libpq
     /// has not tried yet, in the original order (libpq re-shuffles them under
     /// load_balance_hosts=random). Empty when none remain.
     ConnOptions with_untried_hosts(const std::vector<HostEntry>& hosts,
@@ -335,10 +417,7 @@ private:
         }
         if (!any)
             return {};
-        ConnOptions out;
-        for (const auto& kv : info_.opts)
-            if (kv.first != "host" && kv.first != "hostaddr" && kv.first != "port")
-                out.push_back(kv);
+        ConnOptions out = info_.opts; // later array entries override the expanded DSN
         if (has_host)
             out.emplace_back("host", hl);
         if (has_addr)
@@ -414,8 +493,9 @@ private:
 } // namespace
 
 std::unique_ptr<PgReachabilityProbe> PgReachabilityProbe::make_libpq(std::string dsn, Observer obs,
-                                                                     std::string probe_sql) {
-    auto pinger = std::make_shared<LibpqPinger>(dsn, std::move(probe_sql));
+                                                                     std::string probe_sql,
+                                                                     int pool_connect_timeout_s) {
+    auto pinger = std::make_shared<LibpqPinger>(dsn, std::move(probe_sql), pool_connect_timeout_s);
     return std::make_unique<PgReachabilityProbe>(
         [pinger](const std::atomic<bool>& stop) { return pinger->ping(stop); }, std::move(obs));
 }

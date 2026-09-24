@@ -24,12 +24,14 @@
 /// successes is at most interval + connect deadline + query deadline =
 /// 2 + 5 + 2 = 9s, so 15s never reds a healthy replica with a single host. With a
 /// multi-host DSN a reconnect walks the hosts as libpq does for the pool's
-/// fresh connections, paying one connect deadline per silent host it meets
-/// before the one that answers; the probe holds its connection in steady state. A FROZEN backend (a
-/// `docker pause`d / black-holed primary whose kernel still ACKs, so no
-/// socket-level timeout fires) is normally caught before that by the probe's
-/// own client-side deadlines — the query times out (2s), the reconnect times
-/// out (5s), two failures ⇒ Unreachable, measured ~11s end to end
+/// fresh connections, paying the pool's `connect_timeout` per silent host it
+/// meets before the one that answers (so a reconnect behind a silent host can
+/// run past kStaleAfter and read `stale` — as slow as the pool's own connects); the probe holds its connection in steady
+/// state. A FROZEN backend (a `docker pause`d / black-holed primary whose
+/// kernel still ACKs, so no socket-level timeout fires) is normally caught
+/// before that by the probe's own client-side deadlines — the query times out
+/// (2s), the reconnect times out (5s), two failures ⇒ Unreachable, measured
+/// ~11s end to end
 /// (scripts/ha/ha-readyz-scenarios.sh, scenario A). `kStaleAfter` is the
 /// backstop that holds even if a tick wedges outside those deadlines.
 
@@ -41,9 +43,12 @@ namespace yuzu::server::pg_reachability {
 
 /// Pause between the end of one probe and the start of the next.
 inline constexpr std::chrono::milliseconds kProbeInterval{2000};
-/// Client-side deadline on establishing the probe connection. Enforced by
-/// the probe's own poll loop — libpq's `connect_timeout` does not apply to
-/// `PQconnectStart`/`PQconnectPoll`.
+/// Client-side deadline on establishing the probe connection to a single host,
+/// or to any host when no `connect_timeout` applies. In a host list each host
+/// address instead gets exactly the pool's effective `connect_timeout` (10s by
+/// default), so the probe moves on no sooner and no later than the pool.
+/// Enforced by the probe's own poll loop — libpq's `connect_timeout` does not
+/// apply to `PQconnectStart`/`PQconnectPoll`.
 inline constexpr std::chrono::milliseconds kConnectDeadline{5000};
 /// Client-side deadline on the probe query round-trip. Server-side
 /// `statement_timeout` cannot bind a frozen backend (and would not survive a

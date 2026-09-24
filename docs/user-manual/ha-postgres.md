@@ -147,7 +147,9 @@ production-grade. You **must**:
   DNS name or read-any port that sends a *new* connection to a standby cannot pin it there. With a
   multi-host DSN (`host=n1,n2,n3`; the server requires `target_session_attrs=read-write` there and
   adds it when absent) libpq walks the hosts for the probe exactly as for the pool, and the probe gives
-  each host its own deadline, so a frozen first host costs one deadline instead of holding the probe.
+  each host its own deadline (exactly the pool's `connect_timeout`, 10 s unless you set one), so a frozen
+  first host costs one timeout instead of holding the probe; with `connect_timeout=0` it does not move
+  on, because the pool would not either. `load_balance_hosts` is refused at startup.
   List the Postgres servers themselves, not a pooler per node: a pooler (pgbouncer) can keep reporting
   a demoted node as writable to libpq and keeps its server connections open across the demotion.
   One host name that resolves to several addresses: a silent address makes the probe give up that

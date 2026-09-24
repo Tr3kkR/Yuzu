@@ -107,16 +107,30 @@ std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std
     const std::string_view tsa = get(v, kTsa); // empty counts as absent, as in libpq
     out.hosts = std::max<std::size_t>({list_len(host), list_len(hostaddr), 1});
     out.hosts_from_env = hosts_from_env && out.hosts > 1;
-    out.balanced = !lbh.empty() && lbh != "disable";
 
-    if (out.hosts < 2 && !out.balanced)
+    // load_balance_hosts: REFUSED (operator decision, Gate 8 round 6). libpq then
+    // shuffles hosts (and a name's addresses) for every new pool connection,
+    // while the /readyz probe holds one connection — so a host that fails some
+    // new connections cannot show on /readyz. With read-write there is only one
+    // acceptable host anyway, so the shuffle balances nothing.
+    if (!lbh.empty() && lbh != "disable") {
+        const bool known = lbh == "random";
+        const bool env = get(v, "load_balance_hosts").empty();
+        return std::unexpected(
+            std::string("load_balance_hosts") + (known ? "=" + std::string(lbh) : std::string()) +
+            (env ? " (from PGLOADBALANCEHOSTS)" : "") +
+            " is not supported for the server's Postgres connection: the server writes to "
+            "one primary, and /readyz cannot see a host that fails only some of the pool's "
+            "connections. Remove it, or set load_balance_hosts=disable.");
+    }
+    if (out.hosts < 2)
         return out;
     if (tsa == "read-write" || tsa == "primary")
         return out;
     if (!tsa.empty()) {
         const bool known = std::ranges::find(kKnownTsaValues, tsa) != std::end(kKnownTsaValues);
         return std::unexpected(
-            "a multi-host or load-balanced Postgres DSN needs target_session_attrs=read-write "
+            "a multi-host Postgres DSN needs target_session_attrs=read-write "
             "(or primary); " +
             (known ? "'" + std::string(tsa) + "'" : std::string("the value given")) +
             " lets the server's connections land on a server that cannot take writes, which "

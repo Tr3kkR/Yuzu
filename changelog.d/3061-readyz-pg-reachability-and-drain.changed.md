@@ -13,5 +13,6 @@
   `yuzu_server_pg_reachability_probe_failures_total`, plus alert `YuzuServerPostgresUnreachable`. Each
   server uses one more Postgres connection. A multi-host `--postgres-dsn` now requires
   `target_session_attrs=read-write`: it is added when absent (the DSN is rebuilt from libpq's parse and
-  re-checked), and any other explicit value except `primary` refuses boot. Point liveness probes at `/livez`, not `/readyz` — see
+  re-checked), and any other explicit value except `primary` refuses boot, as does
+  `load_balance_hosts` (other than `disable`). Point liveness probes at `/livez`, not `/readyz` — see
   `docs/user-manual/upgrading.md`.

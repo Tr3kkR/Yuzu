@@ -44,19 +44,24 @@ void require_same_plus_read_write(const std::string& in, const std::string& out)
     CHECK(*after == *before);
 }
 
-/// Process environment is shared by the whole test binary: set, run, restore.
+/// Process environment is shared by the whole test binary: set, run, restore —
+/// the restore in a destructor, so it also runs if `f` throws.
 #ifndef _WIN32
 template <typename F>
 auto with_env(const char* name, const char* value, F&& f) {
-    const char* prev = std::getenv(name);
-    const std::optional<std::string> saved = prev ? std::optional<std::string>(prev) : std::nullopt;
+    struct Restore {
+        const char* name;
+        std::optional<std::string> saved;
+        ~Restore() {
+            if (saved)
+                ::setenv(name, saved->c_str(), 1);
+            else
+                ::unsetenv(name);
+        }
+    } restore{name, std::getenv(name) ? std::optional<std::string>(std::getenv(name))
+                                      : std::nullopt};
     ::setenv(name, value, 1);
-    auto r = f();
-    if (saved)
-        ::setenv(name, saved->c_str(), 1);
-    else
-        ::unsetenv(name);
-    return r;
+    return f();
 }
 #endif
 
@@ -124,14 +129,34 @@ TEST_CASE("multi-host DSN guard: no target_session_attrs gets read-write",
         CHECK(r->appended);
         CHECK(r->hosts == 2);
     }
-    SECTION("load_balance_hosts turns the guard on even for one host") {
-        const auto r = enforce_multi_host_read_write("host=a load_balance_hosts=random");
-        REQUIRE(r.has_value());
-        CHECK(r->appended);
-        CHECK(r->balanced);
+}
+
+TEST_CASE("multi-host DSN guard: load_balance_hosts is refused, whatever else the DSN says",
+          "[server][multi_host_dsn]") {
+    // Gate 8 round 6 (operator decision): libpq would shuffle hosts for every new
+    // pool connection while the /readyz probe holds one.
+    for (const std::string dsn :
+         {"host=a load_balance_hosts=random", "host=a,b load_balance_hosts=random",
+          "host=a,b load_balance_hosts=random target_session_attrs=read-write",
+          "postgresql://u:s3cret@a,b/yuzu?load_balance_hosts=random"}) {
+        INFO(dsn);
+        const auto r = enforce_multi_host_read_write(dsn);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("load_balance_hosts=random") != std::string::npos);
+        CHECK(r.error().find("s3cret") == std::string::npos);
+    }
+    SECTION("an unrecognised value is refused and not echoed") {
+        const auto r = enforce_multi_host_read_write("host=a,b load_balance_hosts='x password=hunter2'");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("hunter2") == std::string::npos);
+    }
+    SECTION("disable is the default and is accepted") {
         const auto off = enforce_multi_host_read_write("host=a load_balance_hosts=disable");
         REQUIRE(off.has_value());
         CHECK_FALSE(off->appended);
+        const auto multi = enforce_multi_host_read_write("host=a,b load_balance_hosts=disable");
+        REQUIRE(multi.has_value());
+        CHECK(multi->appended);
     }
 }
 
@@ -148,6 +173,11 @@ TEST_CASE("multi-host DSN guard: shapes a text append broke keep their meaning",
              "postgresql://u:p?w@a:5432,b:5433/yuzu",
              "postgresql://u:p@a,b/yuzu?",
              "postgresql://u:p@a,b/yuzu?sslmode=disable&",
+             // Round 6: shapes whose values carry '=', spaces or quotes, and
+             // repeated keywords (libpq keeps the last).
+             "host=a,b options='-c statement_timeout=5000 -c lock_timeout=100'",
+             "host=a,b passfile=/etc/yuzu/pgpass dbname='host=evil user=x'",
+             "host=a,b dbname=one dbname=two port=5432 port=5433,5434",
          }) {
         INFO(in);
         const auto before = libpq_reads(in);
@@ -172,8 +202,7 @@ TEST_CASE("multi-host DSN guard: shapes a text append broke keep their meaning",
 TEST_CASE("multi-host DSN guard: read-write and primary are accepted as given",
           "[server][multi_host_dsn]") {
     for (const std::string dsn :
-         {"host=a,b target_session_attrs=read-write", "host=a,b target_session_attrs=primary",
-          "host=a,b load_balance_hosts=random target_session_attrs=read-write"}) {
+         {"host=a,b target_session_attrs=read-write", "host=a,b target_session_attrs=primary"}) {
         INFO(dsn);
         const auto r = enforce_multi_host_read_write(dsn);
         REQUIRE(r.has_value());
@@ -230,8 +259,7 @@ TEST_CASE("multi-host DSN guard: a host list or load balancing from the environm
 
     const auto lb = with_env("PGLOADBALANCEHOSTS", "random",
                              [] { return enforce_multi_host_read_write("host=a dbname=yuzu"); });
-    REQUIRE(lb.has_value());
-    CHECK(lb->appended);
-    CHECK(lb->balanced);
+    REQUIRE_FALSE(lb.has_value());
+    CHECK(lb.error().find("PGLOADBALANCEHOSTS") != std::string::npos);
 }
 #endif

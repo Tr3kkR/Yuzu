@@ -171,12 +171,13 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
-## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write` (HA WS-8)
+## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write`, and `load_balance_hosts` is refused (HA WS-8)
 
 Affects you only if the server's Postgres connection names **more than one host** — `host=n1,n2,n3`,
 `postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment — or sets
-`load_balance_hosts` (in the DSN or `PGLOADBALANCEHOSTS`). A single host, including a proxy or managed
-endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy compose), is unaffected.
+`load_balance_hosts` (in the DSN or `PGLOADBALANCEHOSTS`). A single host without `load_balance_hosts`,
+including a proxy or managed endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy
+compose), is unaffected.
 
 Check before upgrading — look for a host list or load balancing in the DSN and the server's environment:
 
@@ -194,6 +195,10 @@ grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|P
 - **Any other value** (`any`, `read-only`, `standby`, `prefer-standby`, or an unrecognised one): **the
   server refuses to start** with `Invalid --postgres-dsn: ...`. Change it to `read-write` (or remove it)
   before upgrading.
+- **`load_balance_hosts` set to anything but `disable`** (in the DSN or `PGLOADBALANCEHOSTS`), with any
+  number of hosts: **the server refuses to start**. Remove it (or set `disable`) before upgrading. The
+  server writes to one primary, so with read-write the shuffle balances nothing — and `/readyz` holds
+  one connection, so it cannot see a host that fails only some of the pool's shuffled connections.
 - **Not checked — set `target_session_attrs=read-write` yourself:** a host list that comes from a
   `service=` entry or `PGSERVICE` (libpq reads it only at connect time), and one host *name* that
   resolves to several servers (DNS round-robin, a Kubernetes headless service).
@@ -227,7 +232,7 @@ What you may observe after upgrading:
 - **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
   managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
 - **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`** — a breaking change
-  with its own section below.
+  with its own section above.
 - **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.

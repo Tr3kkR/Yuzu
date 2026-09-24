@@ -1575,18 +1575,22 @@ gaps closed:
   in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
   client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
   resolver instead), because a blocking query against a frozen backend was
-  measured at 101 s; libpq walks a multi-host DSN itself, and the probe only gives each host its own
-  deadline, restarting the walk over the untried hosts when one goes silent (libpq's non-blocking
+  measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
+  probe only gives each host its own deadline (exactly the pool's effective `connect_timeout`),
+  restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
+  timeout is unlimited, because the pool does not either (libpq's non-blocking
   connect never advances past a silent host); and a read-only answer drops the
   connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
   or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
   Leadership is deliberately not a readiness condition.
-- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order,
-  `load_balance_hosts=random` shuffle, which failures move on and which end the attempt), so the probe
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
+  failures move on and which end the attempt, the pool's connection parameters), so the probe
   measures the host the pool reaches — every re-implementation of that walk diverged (governance
   rounds 2–5); and a multi-host DSN must carry
-  `target_session_attrs=read-write` (appended when absent, a weaker value refuses boot), because without
+  `target_session_attrs=read-write` (added when absent, a weaker value refuses boot) and may not set
+  `load_balance_hosts` (refused at boot: the pool would shuffle per connection while the probe holds one),
+  because without
   it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
   pool does not re-validate connections it holds, so a server that turns read-only in place (without the
   restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps

@@ -43,15 +43,20 @@
 /// reporting ready while the pool could not connect (all reproduced). The one
 /// addition: libpq's non-blocking connect never advances past a host that
 /// accepts TCP and then goes silent (its blocking connect, which the pool uses,
-/// moves on after `connect_timeout`), so a host libpq has been on for
-/// `kConnectDeadline` is given up and the attempt restarted over the hosts it
-/// has not tried — read back from libpq (`PQconninfo`), so a `PGHOST` or
-/// `service=` list counts too. A frozen first host of `host=n1,n2,n3` costs one
-/// deadline, not every tick (Gate 4 UP-1, reproduced). Residual: a silent
+/// moves on after `connect_timeout`), so in a host list a host address libpq
+/// has been on for exactly its effective `connect_timeout` (the probe passes the DSN through
+/// `dbname` exactly as the pool does, so empty values, the PG* environment and
+/// the pool's timeout default resolve identically) is given up and the attempt
+/// restarted over the hosts it has not tried — once per host; with no
+/// `connect_timeout` at all the pool waits for ever and so the probe reports the
+/// failure after `kConnectDeadline` rather than moving on. The host list is read back from
+/// libpq (`PQconninfo`), so a `PGHOST` or `service=` list counts too. A frozen
+/// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
+/// UP-1, reproduced). Residual: a silent
 /// ADDRESS of a host name with several addresses gives up that name's other
-/// addresses too, where the pool would try them — a false red, never a false
-/// green. With `target_session_attrs=read-write` libpq itself refuses a
-/// read-only host, so such a host reads `unreachable` (the log detail says
+/// addresses too, where the pool would try them — it can err either way, so
+/// such names are documented as a configuration to avoid. With
+/// `target_session_attrs=read-write` libpq itself refuses a read-only host, so such a host reads `unreachable` (the log detail says
 /// why), not `read_only`.
 ///
 /// Any failure, AND reaching a server that does not accept writes, CLOSES the
@@ -126,8 +131,12 @@ public:
     /// `build_coord_dsn`). Does not connect until `probe_once()`. `probe_sql`
     /// exists for tests only (e.g. `SELECT true` to simulate a standby without
     /// one); production always passes the default.
+    /// `pool_connect_timeout_s` is the server pool's `connect_timeout` default
+    /// (`PgPool::Options::connect_timeout_s`), applied exactly where the pool
+    /// applies it, so the probe gives up on a host no later than the pool does.
     static std::unique_ptr<PgReachabilityProbe> make_libpq(std::string dsn, Observer obs = {},
-                                                           std::string probe_sql = kProbeSql);
+                                                           std::string probe_sql = kProbeSql,
+                                                           int pool_connect_timeout_s = 10);
 
     /// Test seam: any ping function, with an injectable interval so a loop test
     /// does not take seconds.
