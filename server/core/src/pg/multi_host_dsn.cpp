@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string_view>
 
@@ -11,71 +12,133 @@ namespace yuzu::server::pg {
 
 namespace {
 
+using OptionsPtr = std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)>;
+using Values = std::map<std::string, std::string, std::less<>>;
+
+constexpr std::string_view kTsa = "target_session_attrs";
+
+/// libpq's own `target_session_attrs` values. Only these are ever echoed in the
+/// refusal: an unparsed value could be a DSN fragment carrying a password.
+constexpr std::string_view kKnownTsaValues[] = {"any",     "read-write", "read-only",
+                                                "primary", "standby",    "prefer-standby"};
+
 std::size_t list_len(std::string_view v) {
     return v.empty() ? 0 : static_cast<std::size_t>(std::count(v.begin(), v.end(), ',')) + 1;
 }
 
-/// Append `key=value` in the DSN's own syntax (URI query or keyword pair).
-std::string append_param(const std::string& dsn, const char* key, const char* value) {
-    const std::size_t s = dsn.find_first_not_of(" \t\r\n");
-    const std::string_view v =
-        s == std::string::npos ? std::string_view{} : std::string_view{dsn}.substr(s);
-    const bool uri = v.rfind("postgres://", 0) == 0 || v.rfind("postgresql://", 0) == 0;
-    if (uri)
-        return dsn + (dsn.find('?') == std::string::npos ? "?" : "&") + key + "=" + value;
-    return dsn + " " + key + "=" + value;
+/// Parse with libpq. libpq's error text is owned and freed, never read: it can
+/// echo a DSN fragment, including part of a password (e.g. a bad percent-escape).
+OptionsPtr parse(const std::string& dsn) {
+    char* errmsg = nullptr;
+    OptionsPtr opts(PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
+    const std::unique_ptr<char, decltype(&PQfreemem)> errmsg_owner(errmsg, &PQfreemem);
+    return opts;
+}
+
+/// Every option the DSN sets (a non-null value), keyed by libpq keyword.
+Values values_of(const PQconninfoOption* o) {
+    Values v;
+    for (; o->keyword != nullptr; ++o)
+        if (o->val != nullptr)
+            v.emplace(o->keyword, o->val);
+    return v;
+}
+
+std::string_view get(const Values& v, std::string_view key) {
+    const auto it = v.find(key);
+    return it == v.end() ? std::string_view{} : std::string_view{it->second};
+}
+
+/// Rebuild a keyword/value DSN from libpq's own parse, every value single-quoted
+/// (libpq escapes `'` and `\` with a backslash inside quotes). Appending text to
+/// the operator's string instead is fragile: a keyword value ending in an
+/// unquoted `\` swallows the appended pair, a URI with a raw `?` in the password
+/// puts it inside the host list, and a URI ending in `?`/`&` stops parsing
+/// (Gate 8 round 5, all reproduced against libpq 16).
+std::string rebuild_with_read_write(const Values& v) {
+    std::string out;
+    for (const auto& [key, val] : v) {
+        if (key == kTsa)
+            continue;
+        out += key;
+        out += "='";
+        for (const char ch : val) {
+            if (ch == '\'' || ch == '\\')
+                out += '\\';
+            out += ch;
+        }
+        out += "' ";
+    }
+    out += kTsa;
+    out += "='read-write'";
+    return out;
 }
 
 } // namespace
 
 std::expected<MultiHostDsn, std::string> enforce_multi_host_read_write(const std::string& dsn) {
-    MultiHostDsn out{dsn, false, 1};
-    char* errmsg = nullptr;
-    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
-        PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
-    const std::unique_ptr<char, decltype(&PQfreemem)> errmsg_owner(errmsg, &PQfreemem);
+    MultiHostDsn out{.dsn = dsn};
+    // An unset DSN stays unset: the server refuses to start on it (ADR-0006/0007
+    // fail closed). Rewriting it would hand back a non-empty DSN that connects
+    // wherever the libpq environment points (Gate 8 round 5, architect F1).
+    if (dsn.empty())
+        return out;
+    const OptionsPtr opts = parse(dsn);
     if (!opts)
         return out; // unparseable: unchanged; the pool fails it at boot
+    const Values v = values_of(opts.get());
 
-    std::string_view host, hostaddr, tsa, lbh;
-    for (const PQconninfoOption* o = opts.get(); o->keyword != nullptr; ++o) {
-        if (o->val == nullptr)
-            continue;
-        const std::string_view k{o->keyword};
-        if (k == "host")
-            host = o->val;
-        else if (k == "hostaddr")
-            hostaddr = o->val;
-        else if (k == "target_session_attrs")
-            tsa = o->val;
-        else if (k == "load_balance_hosts")
-            lbh = o->val;
-    }
-    // A host list may come from the environment when the DSN names none.
-    if (host.empty())
-        if (const char* e = std::getenv("PGHOST"))
-            host = e;
-    if (hostaddr.empty())
-        if (const char* e = std::getenv("PGHOSTADDR"))
-            hostaddr = e;
+    // A host list or load-balancing setting may come from the environment when
+    // the DSN names none (libpq falls back to it the same way).
+    bool hosts_from_env = false;
+    auto with_env = [&](std::string_view key, const char* env, bool* from_env) {
+        if (auto s = get(v, key); !s.empty())
+            return s;
+        const char* e = std::getenv(env);
+        if (e == nullptr || *e == '\0')
+            return std::string_view{};
+        if (from_env != nullptr)
+            *from_env = true;
+        return std::string_view{e};
+    };
+    const std::string_view host = with_env("host", "PGHOST", &hosts_from_env);
+    const std::string_view hostaddr = with_env("hostaddr", "PGHOSTADDR", &hosts_from_env);
+    const std::string_view lbh = with_env("load_balance_hosts", "PGLOADBALANCEHOSTS", nullptr);
+    const std::string_view tsa = get(v, kTsa); // empty counts as absent, as in libpq
     out.hosts = std::max<std::size_t>({list_len(host), list_len(hostaddr), 1});
+    out.hosts_from_env = hosts_from_env && out.hosts > 1;
+    out.balanced = !lbh.empty() && lbh != "disable";
 
-    const bool balanced = !lbh.empty() && lbh != "disable";
-    if (out.hosts < 2 && !balanced)
+    if (out.hosts < 2 && !out.balanced)
         return out;
-    if (tsa.empty()) {
-        out.dsn = append_param(dsn, "target_session_attrs", "read-write");
-        out.appended = true;
-        return out;
-    }
     if (tsa == "read-write" || tsa == "primary")
         return out;
-    return std::unexpected(
-        "a multi-host Postgres DSN needs target_session_attrs=read-write (or primary); '" +
-        std::string(tsa) +
-        "' lets the server's connections land on a server that cannot take writes, "
-        "which /readyz cannot detect. Remove target_session_attrs (the server then uses "
-        "read-write) or set it to read-write.");
+    if (!tsa.empty()) {
+        const bool known = std::ranges::find(kKnownTsaValues, tsa) != std::end(kKnownTsaValues);
+        return std::unexpected(
+            "a multi-host or load-balanced Postgres DSN needs target_session_attrs=read-write "
+            "(or primary); " +
+            (known ? "'" + std::string(tsa) + "'" : std::string("the value given")) +
+            " lets the server's connections land on a server that cannot take writes, which "
+            "/readyz cannot detect. Remove target_session_attrs (the server then uses "
+            "read-write) or set it to read-write.");
+    }
+
+    // Rebuild, then prove it: the new DSN must parse, carry read-write, and set
+    // every other option exactly as the operator's did. Anything else refuses boot
+    // rather than run on a DSN that says something different.
+    std::string rebuilt = rebuild_with_read_write(v);
+    const OptionsPtr check = parse(rebuilt);
+    Values expect = v;
+    expect[std::string(kTsa)] = "read-write";
+    if (!check || values_of(check.get()) != expect)
+        return std::unexpected(
+            "could not add target_session_attrs=read-write to the multi-host Postgres DSN "
+            "without changing its meaning; set target_session_attrs=read-write in the DSN "
+            "yourself.");
+    out.dsn = std::move(rebuilt);
+    out.appended = true;
+    return out;
 }
 
 } // namespace yuzu::server::pg

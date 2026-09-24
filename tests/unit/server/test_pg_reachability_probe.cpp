@@ -26,13 +26,16 @@
 #include <utility>
 #include <vector>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <tuple>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -336,25 +339,41 @@ TEST_CASE("PgReachabilityProbe (libpq): a refused port is Unreachable after the 
 namespace {
 /// A TCP listener that completes the handshake (kernel backlog) and then never
 /// reads or writes — a peer that ACKs but never answers, like a paused primary.
+/// Owns one POSIX fd: closed exactly once, on every path (incl. a throwing ctor).
+struct UniqueFd {
+    int v{-1};
+    UniqueFd() = default;
+    explicit UniqueFd(int f) : v(f) {}
+    ~UniqueFd() {
+        if (v >= 0)
+            ::close(v);
+    }
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+};
+
+/// A loopback listener on an ephemeral port — salted per process, safe on shared
+/// CI runners. The port is 0 on any failure; callers REQUIRE port > 0.
+std::pair<std::unique_ptr<UniqueFd>, int> loopback_listener() {
+    auto fd = std::make_unique<UniqueFd>(::socket(AF_INET, SOCK_STREAM, 0));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    socklen_t len = sizeof(a);
+    if (fd->v < 0 || ::bind(fd->v, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+        ::listen(fd->v, 8) != 0 ||
+        ::getsockname(fd->v, reinterpret_cast<sockaddr*>(&a), &len) != 0)
+        return {std::move(fd), 0};
+    return {std::move(fd), ntohs(a.sin_port)};
+}
+
+/// A TCP listener that completes the handshake (kernel backlog) and then never
+/// reads or writes — a peer that ACKs but never answers, like a paused primary.
 struct SilentListener {
-    int fd{-1};
+    std::unique_ptr<UniqueFd> fd;
     int port{0};
-    SilentListener() {
-        fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port = 0; // ephemeral — salted per process, safe on shared CI runners
-        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-        ::listen(fd, 8);
-        socklen_t len = sizeof(a);
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-        port = ntohs(a.sin_port);
-    }
-    ~SilentListener() {
-        if (fd >= 0)
-            ::close(fd);
-    }
+    SilentListener() { std::tie(fd, port) = loopback_listener(); }
     std::string dsn() const {
         return "host=127.0.0.1 port=" + std::to_string(port) + " dbname=yuzu user=yuzu";
     }
@@ -559,7 +578,8 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
           "deadline, then the next host serves",
           "[server][readyz][pg_reachability][pg]") {
     // Gate 4 UP-1: libpq's non-blocking connect never advances past a host that
-    // accepts TCP and goes silent; the probe splits the list itself.
+    // accepts TCP and goes silent; the probe gives each host its own deadline and
+    // restarts libpq's walk over the hosts not yet tried.
     YUZU_REQUIRE_PG_DB(db);
     SilentListener frozen;
     REQUIRE(frozen.port > 0);
@@ -590,8 +610,7 @@ TEST_CASE("PgReachabilityProbe (libpq, pg): a frozen FIRST host of a multi-host 
     CHECK(probe->verdict() == pr::Verdict::Ready);
     CHECK(std::chrono::steady_clock::now() - t2 < 1s);
 
-    // A RECONNECT walks the hosts in the DSN's order, as a fresh pool connection
-    // does: kill the probe's backend; the next tick fails on the dead session, the
+    // A RECONNECT walks the hosts as libpq does for a fresh pool connection: kill the probe's backend; the next tick fails on the dead session, the
     // one after pays the frozen host's deadline again, then reaches the second
     // host (Gate 8 round 4: the probe mirrors the pool's host choice).
     REQUIRE(admin_scalar(db.dsn(),
@@ -614,33 +633,34 @@ namespace {
 /// FATAL ErrorResponse with the given SQLSTATE to the startup packet — what a
 /// real server sends for a failed login (28P01) or "cannot connect now" (57P03).
 struct FakePostgres {
-    int fd{-1};
+    std::unique_ptr<UniqueFd> fd;
     int port{0};
     std::string sqlstate;
     std::atomic<bool> stop{false};
-    std::thread thread;
+    std::thread thread; // declared last: started only once everything above exists
 
     explicit FakePostgres(std::string code) : sqlstate(std::move(code)) {
-        fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        a.sin_port = 0;
-        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-        ::listen(fd, 8);
-        socklen_t len = sizeof(a);
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-        port = ntohs(a.sin_port);
-        thread = std::thread([this] { serve(); });
+        std::tie(fd, port) = loopback_listener();
+        if (port > 0)
+            thread = std::thread([this] { serve(); });
     }
     ~FakePostgres() {
         stop = true;
-        thread.join();
-        ::close(fd);
+        if (thread.joinable())
+            thread.join();
     }
     FakePostgres(const FakePostgres&) = delete;
     FakePostgres& operator=(const FakePostgres&) = delete;
 
+    /// Never raises SIGPIPE (a probe that drops the connection first must not
+    /// kill the test binary): MSG_NOSIGNAL where it exists, SO_NOSIGPIPE on Darwin.
+    static void send_all(int c, const void* p, std::size_t n) {
+#ifdef MSG_NOSIGNAL
+        (void)::send(c, p, n, MSG_NOSIGNAL);
+#else
+        (void)::send(c, p, n, 0);
+#endif
+    }
     static bool read_all(int c, unsigned char* p, std::size_t n) {
         while (n > 0) {
             const ssize_t r = ::read(c, p, n);
@@ -663,17 +683,21 @@ struct FakePostgres {
             const std::uint32_t len = be32(hdr), code = be32(hdr + 4);
             if (code == 80877103 || code == 80877104) { // SSLRequest / GSSENCRequest
                 const char n = 'N';
-                (void)::write(c, &n, 1);
+                send_all(c, &n, 1);
                 continue;
             }
             std::vector<unsigned char> rest(len > 8 ? len - 8 : 0);
             if (!rest.empty() && !read_all(c, rest.data(), rest.size()))
                 return;
+            if (sqlstate == "close")
+                return; // accept, read the startup packet, hang up without a word
             std::string body;
             for (const auto& [f, v] : {std::pair<char, std::string>{'S', "FATAL"},
                                        {'V', "FATAL"},
                                        {'C', sqlstate},
                                        {'M', "fake server refusal"}}) {
+                if (f == 'C' && v.empty())
+                    continue; // an ErrorResponse with no SQLSTATE at all
                 body += f;
                 body += v;
                 body += '\0';
@@ -683,20 +707,27 @@ struct FakePostgres {
             std::string msg = "E";
             msg.append(reinterpret_cast<const char*>(&n), 4);
             msg += body;
-            (void)::write(c, msg.data(), msg.size());
+            send_all(c, msg.data(), msg.size());
             return;
         }
     }
     void serve() {
         while (!stop.load()) {
-            pollfd p{fd, POLLIN, 0};
+            pollfd p{fd->v, POLLIN, 0};
             if (::poll(&p, 1, 100) <= 0)
                 continue;
-            const int c = ::accept(fd, nullptr, nullptr);
-            if (c < 0)
+            const UniqueFd c{::accept(fd->v, nullptr, nullptr)};
+            if (c.v < 0)
                 continue;
-            handle(c);
-            ::close(c);
+            // A peer that sends half a packet and stays open must not wedge join().
+            timeval tv{};
+            tv.tv_sec = 5;
+            (void)::setsockopt(c.v, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#ifdef SO_NOSIGPIPE
+            const int one = 1;
+            (void)::setsockopt(c.v, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+            handle(c.v);
         }
     }
 };
@@ -717,23 +748,112 @@ std::pair<std::string, std::string> pg_host_port(const std::string& dsn) {
 }
 } // namespace
 
-TEST_CASE("PgReachabilityProbe (libpq, pg): a server-sent error ends the host walk, as libpq's "
-          "does — a later host is never tried",
+TEST_CASE("PgReachabilityProbe (libpq, pg): a silent first host from a PGHOST list costs one "
+          "deadline, then the next host is tried",
           "[server][readyz][pg_reachability][pg]") {
-    // Gate 8 round 4: libpq moves to the next host only on connection-level
-    // failures and on 57P03; any other error the SERVER sends (a failed login,
-    // too many clients, a missing database) ends the attempt. A probe that walked
-    // on reached a later host the pool never tries and reported ready while the
-    // pool could not connect.
+    // The host list libpq walks can come from the environment; the probe reads
+    // it back from libpq (PQconninfo), so it moves past a silent host there too.
+    YUZU_REQUIRE_PG_DB(db);
+    SilentListener frozen;
+    REQUIRE(frozen.port > 0);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    std::string no_hosts; // the test DSN without host/hostaddr/port
+    {
+        char* err = nullptr;
+        std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
+            PQconninfoParse(db.dsn().c_str(), &err), &PQconninfoFree);
+        const std::unique_ptr<char, decltype(&PQfreemem)> err_owner(err, &PQfreemem);
+        REQUIRE(opts);
+        for (const PQconninfoOption* o = opts.get(); o->keyword; ++o) {
+            const std::string k = o->keyword;
+            if (!o->val || k == "host" || k == "hostaddr" || k == "port")
+                continue;
+            std::string q = "'";
+            for (const char* c = o->val; *c; ++c) {
+                if (*c == '\'' || *c == '\\')
+                    q += '\\';
+                q += *c;
+            }
+            no_hosts += k + "=" + q + "' ";
+        }
+    }
+    struct EnvRestore {
+        const char* name;
+        std::optional<std::string> saved;
+        explicit EnvRestore(const char* n) : name(n) {
+            if (const char* v = std::getenv(n))
+                saved = v;
+        }
+        ~EnvRestore() {
+            if (saved)
+                ::setenv(name, saved->c_str(), 1);
+            else
+                ::unsetenv(name);
+        }
+    } restore_host{"PGHOST"}, restore_port{"PGPORT"};
+    ::setenv("PGHOST", ("127.0.0.1," + pg_host).c_str(), 1);
+    ::setenv("PGPORT", (std::to_string(frozen.port) + "," + pg_port).c_str(), 1);
+    auto probe = PgReachabilityProbe::make_libpq(no_hosts);
+    const auto t = std::chrono::steady_clock::now();
+    probe->probe_once();
+    const auto took = std::chrono::steady_clock::now() - t;
+    CHECK(probe->verdict() == pr::Verdict::Ready);
+    CHECK(took >= pr::kConnectDeadline - 100ms);
+    CHECK(took < pr::kConnectDeadline + 5s);
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): a failure libpq treats as final ends the host walk "
+          "— a later host is never tried",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 rounds 4–5: libpq moves to the next host only on a connect failure
+    // or timeout, 57P03, or a target_session_attrs rejection; anything else — a
+    // failed login, too many clients, an error with no SQLSTATE, a peer that
+    // hangs up — ends the attempt. A probe that walked on reached a later host
+    // the pool never tries and reported ready while the pool could not connect.
+    YUZU_REQUIRE_PG_DB(db);
+    const auto [pg_host, pg_port] = pg_host_port(db.dsn());
+    // 28P01 = a failed login; 53300 = too many clients, the likelier one in
+    // production (sre, round 5); "" = an ErrorResponse with no SQLSTATE, which
+    // libpq also treats as final — a probe that decided from the SQLSTATE walked
+    // on past it (cpp-expert, round 5).
+    // "close" = TCP accepted then closed with no reply (e.g. a proxy with no
+    // healthy backend) — final for libpq too (unhappy-path, round 5).
+    for (const char* code : {"28P01", "53300", "", "close"}) {
+        INFO(code);
+        FakePostgres refuses{code};
+        REQUIRE(refuses.port > 0);
+        auto probe = PgReachabilityProbe::make_libpq(multi_host_dsn(
+            db.dsn(), "127.0.0.1," + pg_host, std::to_string(refuses.port) + "," + pg_port));
+        probe->probe_once();
+        CHECK(probe->verdict() == pr::Verdict::Unreachable);
+        CHECK(wait_for_backends(db.dsn(), "yuzu-readyz-probe", 0) == 0); // host 2 never reached
+    }
+}
+
+TEST_CASE("PgReachabilityProbe (libpq, pg): load_balance_hosts=random walks hosts in a random "
+          "order, as libpq's pool connections do",
+          "[server][readyz][pg_reachability][pg]") {
+    // Gate 8 round 5 (CA-R5-1): with load_balance_hosts=random libpq shuffles the
+    // host list per connection, so a host that ends the walk (here a 28P01
+    // refusal) fails SOME new pool connections. A probe walking in DSN order
+    // would never meet it behind the real primary, or always meet it ahead.
     YUZU_REQUIRE_PG_DB(db);
     FakePostgres refuses{"28P01"};
     REQUIRE(refuses.port > 0);
     const auto [pg_host, pg_port] = pg_host_port(db.dsn());
-    auto probe = PgReachabilityProbe::make_libpq(multi_host_dsn(
-        db.dsn(), "127.0.0.1," + pg_host, std::to_string(refuses.port) + "," + pg_port));
-    probe->probe_once();
-    CHECK(probe->verdict() == pr::Verdict::Unreachable);
-    CHECK(wait_for_backends(db.dsn(), "yuzu-readyz-probe", 0) == 0); // host 2 never reached
+    const std::string dsn =
+        multi_host_dsn(db.dsn(), "127.0.0.1," + pg_host,
+                       std::to_string(refuses.port) + "," + pg_port) +
+        " load_balance_hosts=random";
+    bool saw_ready = false, saw_unreachable = false;
+    for (int i = 0; i < 40 && !(saw_ready && saw_unreachable); ++i) {
+        auto probe = PgReachabilityProbe::make_libpq(dsn); // fresh: a new connection
+        probe->probe_once();
+        saw_ready = saw_ready || probe->verdict() == pr::Verdict::Ready;
+        saw_unreachable = saw_unreachable || probe->verdict() == pr::Verdict::Unreachable;
+    }
+    CHECK(saw_ready);       // P(miss) = 2^-40 if the order is really random
+    CHECK(saw_unreachable); // a fixed DSN-order walk always hits the refusal first
 }
 
 TEST_CASE("PgReachabilityProbe (libpq, pg): 57P03 (cannot connect now) moves on to the next "

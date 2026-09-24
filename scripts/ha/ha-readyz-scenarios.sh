@@ -274,7 +274,7 @@ docker unpause "$PG" >/dev/null
 echo "== G: multi-host DSN without target_session_attrs, a read-only second host, a primary blip"
 # Regression for round-2 governance UH-R2-1: a probe that reconnected from the
 # host that last CONNECTED stayed pinned to read-only B after the primary A came
-# back. The probe now always walks the DSN's host order, like the pool; with the
+# back. The probe now lets libpq walk the host list, as the pool does; with the
 # multi-host guard the DSN also carries target_session_attrs=read-write, so libpq
 # refuses B outright. Host A = the writable primary, host B = read-only and up.
 psql_in "$PG2" "ALTER SYSTEM SET default_transaction_read_only = on" && psql_in "$PG2" "SELECT pg_reload_conf()"

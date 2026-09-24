@@ -34,19 +34,25 @@
 /// system resolver's timeouts), and on a libpq built with GSSAPI (or a server
 /// choosing a huge SCRAM iteration count) the authentication exchange.
 ///
-/// A MULTI-HOST DSN IS SPLIT, ONE DEADLINE PER HOST. libpq's non-blocking
-/// connect never advances past a host that accepts TCP and then goes silent;
-/// only its blocking path applies `connect_timeout` per host. So the probe
-/// parses the DSN (`PQconninfoParse`) and tries each host in turn — a frozen
-/// first host of `host=n1,n2,n3` costs one deadline, not every tick (Gate 4
-/// UP-1, reproduced). Hosts are always tried in the DSN's order — the order the
-/// pool's own connections use — so the probe measures the host the pool reaches
-/// (Gate 8 round 3: any smarter preference diverged from the pool).
-/// Residuals, all keeping libpq's no-advance behaviour: one host NAME resolving
-/// to several addresses (libpq iterates those itself), and a host list that
-/// comes from `service=` or `PGHOST` (PQconninfoParse does not expand either).
-/// With `target_session_attrs=read-write` libpq itself refuses a read-only host,
-/// so such a host reads `unreachable` (the log detail says why), not `read_only`.
+/// LIBPQ WALKS THE HOST LIST; THE PROBE ONLY ADDS A DEADLINE PER HOST. The
+/// probe connects with the DSN as given, so libpq alone decides the order
+/// (DSN order, or a fresh shuffle under `load_balance_hosts=random`), which
+/// failures move on to the next host or address, and which end the attempt —
+/// exactly as for the pool's own connections. Gate 8 rounds 2–5 found every
+/// probe that re-implemented part of that walk diverging from the pool and
+/// reporting ready while the pool could not connect (all reproduced). The one
+/// addition: libpq's non-blocking connect never advances past a host that
+/// accepts TCP and then goes silent (its blocking connect, which the pool uses,
+/// moves on after `connect_timeout`), so a host libpq has been on for
+/// `kConnectDeadline` is given up and the attempt restarted over the hosts it
+/// has not tried — read back from libpq (`PQconninfo`), so a `PGHOST` or
+/// `service=` list counts too. A frozen first host of `host=n1,n2,n3` costs one
+/// deadline, not every tick (Gate 4 UP-1, reproduced). Residual: a silent
+/// ADDRESS of a host name with several addresses gives up that name's other
+/// addresses too, where the pool would try them — a false red, never a false
+/// green. With `target_session_attrs=read-write` libpq itself refuses a
+/// read-only host, so such a host reads `unreachable` (the log detail says
+/// why), not `read_only`.
 ///
 /// Any failure, AND reaching a server that does not accept writes, CLOSES the
 /// connection so the next tick reconnects. The probe query checks both

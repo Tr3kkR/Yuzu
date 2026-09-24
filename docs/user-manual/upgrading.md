@@ -171,6 +171,33 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## ⚠️ Breaking: a multi-host `--postgres-dsn` now needs `target_session_attrs=read-write` (HA WS-8)
+
+Affects you only if the server's Postgres connection names **more than one host** — `host=n1,n2,n3`,
+`postgresql://n1,n2/yuzu`, a `PGHOST`/`PGHOSTADDR` list in the server's environment — or sets
+`load_balance_hosts` (in the DSN or `PGLOADBALANCEHOSTS`). A single host, including a proxy or managed
+endpoint (RDS, Azure Flexible Server, Cloud SQL, the shipped HAProxy compose), is unaffected.
+
+Check before upgrading — look for a host list or load balancing in the DSN and the server's environment:
+
+```bash
+grep -rnE 'YUZU_POSTGRES_DSN|postgres-dsn|PGHOST|PGHOSTADDR|PGLOADBALANCEHOSTS|PGSERVICE' \
+  /etc/yuzu/ /etc/systemd/system/yuzu-server.service* <your compose/env files> 2>/dev/null
+```
+
+- **No `target_session_attrs` set:** the server adds `target_session_attrs=read-write` and logs a
+  warning at startup (`... using target_session_attrs=read-write ...`). It will no longer connect to a
+  standby, which it previously could do silently whenever a standby was listed first. The DSN is
+  rebuilt from libpq's own parse — the same settings in keyword form — and checked option by option
+  before use. Set the attribute yourself to silence the warning.
+- **`read-write` or `primary`:** unchanged.
+- **Any other value** (`any`, `read-only`, `standby`, `prefer-standby`, or an unrecognised one): **the
+  server refuses to start** with `Invalid --postgres-dsn: ...`. Change it to `read-write` (or remove it)
+  before upgrading.
+- **Not checked — set `target_session_attrs=read-write` yourself:** a host list that comes from a
+  `service=` entry or `PGSERVICE` (libpq reads it only at connect time), and one host *name* that
+  resolves to several servers (DNS round-robin, a Kubernetes headless service).
+
 ## Behaviour change: `/readyz` now goes red when Postgres is unreachable, and shutdown can hold for a drain grace (HA WS-8, ADR-2002 §12)
 
 `/readyz` gains a gating `pg_reachable` row, fed by a small probe on its own Postgres connection. Before
@@ -199,12 +226,8 @@ What you may observe after upgrading:
   counted as 30 polls.
 - **`/readyz` also goes red on a primary that refuses writes** (`default_transaction_read_only` on — some
   managed Postgres services do this when storage fills), reported as `"pg":"read_only"`.
-- **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`.** If your DSN lists more
-  than one host (or relies on a `PGHOST` list, or sets `load_balance_hosts`) and has no
-  `target_session_attrs`, the server now adds `target_session_attrs=read-write` and logs a warning —
-  your server will stop connecting to standbys, which it could previously do silently. If it sets any
-  value other than `read-write` or `primary`, **the server refuses to start**: change it to
-  `read-write` (or remove it) before upgrading.
+- **Multi-host `--postgres-dsn` now requires `target_session_attrs=read-write`** — a breaking change
+  with its own section below.
 - **Docker healthchecks.** The demo and viz-UAT composes healthcheck `/readyz`; that is right for
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.

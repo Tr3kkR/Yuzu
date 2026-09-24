@@ -85,42 +85,6 @@ bool wait_socket(int sock, Want want, Clock::time_point deadline, const std::ato
     }
 }
 
-/// libpq's message, first line only (verbose mode adds a LOCATION line that is
-/// noise in the server log; the SQLSTATE stays on the first line).
-std::string pq_error(PGconn* c, const char* fallback) {
-    const char* m = c ? PQerrorMessage(c) : nullptr;
-    std::string s = (m && *m) ? std::string(m) : std::string(fallback);
-    if (const auto nl = s.find_first_of("\r\n"); nl != std::string::npos)
-        s.erase(nl);
-    return s;
-}
-
-/// Does this connection error END libpq's host walk? libpq (fe-connect.c) moves
-/// on to the next host after a CONNECTION-level failure, and after the one
-/// server-sent error 57P03 ("cannot connect now"); any other error the SERVER
-/// sends — a failed login (28P01/28000), too many clients (53300), a missing
-/// database (3D000) — ends the whole attempt. The probe must stop in the same
-/// place, or it reaches a later host the pool never tries and reports ready
-/// while the pool cannot connect (Gate 8 round 4, reproduced). Server-sent
-/// errors carry their SQLSTATE in verbose mode ("...failed: FATAL:  28P01:
-/// ..."); connection-level failures (refused, timeout, target_session_attrs
-/// rejection) carry none.
-bool server_error_ends_walk(std::string_view msg) {
-    for (std::size_t pos = msg.find(":  "); pos != std::string_view::npos;
-         pos = msg.find(":  ", pos + 1)) {
-        const std::string_view rest = msg.substr(pos + 3);
-        if (rest.size() < 7 || rest[5] != ':' || rest[6] != ' ')
-            continue;
-        bool code = true;
-        for (std::size_t k = 0; k < 5; ++k)
-            code =
-                code && ((rest[k] >= '0' && rest[k] <= '9') || (rest[k] >= 'A' && rest[k] <= 'Z'));
-        if (code)
-            return rest.substr(0, 5) != "57P03";
-    }
-    return false;
-}
-
 std::vector<std::string> split_commas(std::string_view v) {
     std::vector<std::string> out;
     std::size_t start = 0;
@@ -136,39 +100,51 @@ std::vector<std::string> split_commas(std::string_view v) {
 
 using ConnOptions = std::vector<std::pair<std::string, std::string>>;
 
-struct ConnTarget {
+/// The probe's connection options: every option the DSN sets, exactly as libpq
+/// parsed it, plus `application_name` when the DSN names none. An unparseable
+/// DSN is handed to libpq raw (expand_dbname) and its connect reports a FIXED
+/// message, never libpq's parse text (which can echo part of a password).
+struct ProbeConnInfo {
     ConnOptions opts;
-    bool expand_dbname{false}; ///< true only for the unparseable-DSN fallback
+    bool unparseable{false};
 };
 
-/// One connection attempt per host (UP-1). libpq's NON-blocking connect
-/// (`PQconnectStart`/`PQconnectPoll`) never moves past a host that accepts the
-/// TCP handshake and then goes silent — only the BLOCKING path applies
-/// `connect_timeout` per host and advances. A multi-host DSN
-/// (`host=n1,n2,n3 target_session_attrs=read-write`, the pattern
-/// docs/user-manual/ha-postgres.md documents) would otherwise wait out the
-/// whole deadline on a frozen n1 every tick while the pool serves from n2.
-/// So the probe splits the host list itself and gives each host its own
-/// deadline. Residuals, documented: a single host NAME that resolves to several
-/// addresses is iterated inside libpq and keeps the no-advance behaviour, and a
-/// host list supplied through `service=` or `PGHOST` is not split (PQconninfoParse
-/// expands neither). On a list shape libpq itself would reject, returns ONE target
-/// carrying the original values, so libpq reports that error; on a parse failure,
-/// one raw-DSN target whose connect reports a FIXED message (connect_one).
-std::vector<ConnTarget> build_targets(const std::string& dsn) {
-    ConnOptions base;
-    std::vector<std::string> hosts, addrs, ports;
-    bool has_app_name = false;
+ProbeConnInfo probe_conninfo(const std::string& dsn) {
     char* errmsg = nullptr;
-    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts(
+    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> parsed(
         PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree);
-    // Owned, never read: libpq's parse message can echo a DSN fragment, including
-    // part of a password (e.g. a bad percent-escape), so it must not reach a log.
+    // Owned, never read (see above).
     const std::unique_ptr<char, decltype(&PQfreemem)> errmsg_owner(errmsg, &PQfreemem);
-    if (!opts) // unparseable: hand libpq the raw DSN; connect_one reports a fixed message
-        return {ConnTarget{ConnOptions{{"dbname", dsn}}, true}};
-    for (const PQconninfoOption* o = opts.get(); o->keyword != nullptr; ++o) {
+    if (!parsed)
+        return {ConnOptions{{"dbname", dsn}}, true};
+    ProbeConnInfo info;
+    bool has_app_name = false;
+    for (const PQconninfoOption* o = parsed.get(); o->keyword != nullptr; ++o) {
         if (o->val == nullptr)
+            continue;
+        has_app_name = has_app_name || std::string_view{o->keyword} == "application_name";
+        info.opts.emplace_back(o->keyword, o->val);
+    }
+    if (!has_app_name)
+        info.opts.emplace_back("application_name", kProbeApplicationName);
+    return info;
+}
+
+/// One entry of the host list libpq is walking.
+struct HostEntry {
+    std::string host, hostaddr, port;
+};
+
+/// The host list libpq resolved for `c` — the DSN's, else the environment's
+/// (`PGHOST`/`PGHOSTADDR`/`PGPORT`), which PQconninfo reports as applied. Empty
+/// when there is at most one host or the list shapes disagree (libpq then fails
+/// the connection itself), so the caller has nothing to move on to.
+std::vector<HostEntry> host_list(PGconn* c) {
+    std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> ci(PQconninfo(c),
+                                                                    &PQconninfoFree);
+    std::vector<std::string> hosts, addrs, ports;
+    for (const PQconninfoOption* o = ci.get(); o && o->keyword != nullptr; ++o) {
+        if (o->val == nullptr || *o->val == '\0')
             continue;
         const std::string_view k{o->keyword};
         if (k == "host")
@@ -177,61 +153,42 @@ std::vector<ConnTarget> build_targets(const std::string& dsn) {
             addrs = split_commas(o->val);
         else if (k == "port")
             ports = split_commas(o->val);
-        else {
-            if (k == "application_name")
-                has_app_name = true;
-            base.emplace_back(o->keyword, o->val);
-        }
     }
-    if (!has_app_name)
-        base.emplace_back("application_name", kProbeApplicationName);
-
-    const std::size_t n = std::max<std::size_t>({hosts.size(), addrs.size(), 1});
-    const bool shape_ok = (hosts.empty() || hosts.size() == n) &&
-                          (addrs.empty() || addrs.size() == n) &&
-                          (ports.size() <= 1 || ports.size() == n);
-    auto join = [](const std::vector<std::string>& v) {
-        std::string s;
-        for (std::size_t i = 0; i < v.size(); ++i)
-            s += (i ? "," : "") + v[i];
-        return s;
-    };
-    std::vector<ConnTarget> targets;
-    if (n == 1 || !shape_ok) {
-        ConnOptions t = base;
-        if (!hosts.empty())
-            t.emplace_back("host", join(hosts));
-        if (!addrs.empty())
-            t.emplace_back("hostaddr", join(addrs));
-        if (!ports.empty())
-            t.emplace_back("port", join(ports));
-        targets.push_back(ConnTarget{std::move(t)});
-        return targets;
-    }
+    const std::size_t n = std::max(hosts.size(), addrs.size());
+    if (n < 2 || (!hosts.empty() && hosts.size() != n) || (!addrs.empty() && addrs.size() != n) ||
+        (ports.size() > 1 && ports.size() != n))
+        return {};
+    std::vector<HostEntry> out(n);
     for (std::size_t i = 0; i < n; ++i) {
-        ConnOptions t = base;
-        if (!hosts.empty())
-            t.emplace_back("host", hosts[i]);
-        if (!addrs.empty())
-            t.emplace_back("hostaddr", addrs[i]);
-        if (!ports.empty())
-            t.emplace_back("port", ports.size() == 1 ? ports[0] : ports[i]);
-        targets.push_back(ConnTarget{std::move(t)});
+        out[i].host = hosts.empty() ? std::string{} : hosts[i];
+        out[i].hostaddr = addrs.empty() ? std::string{} : addrs[i];
+        out[i].port = ports.empty() ? std::string{} : ports.size() == 1 ? ports[0] : ports[i];
     }
-    return targets;
+    return out;
+}
+
+/// libpq's message on one line (a multi-host failure lists one line per host).
+/// Server log only — never the /readyz body.
+std::string pq_error(PGconn* c, const char* fallback) {
+    const char* m = c ? PQerrorMessage(c) : nullptr;
+    std::string s = (m && *m) ? std::string(m) : std::string(fallback);
+    std::ranges::replace_if(s, [](char ch) { return ch == '\n' || ch == '\r' || ch == '\t'; }, ' ');
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+    return s;
 }
 
 /// The production ping: owns the dedicated connection between ticks.
 class LibpqPinger {
 public:
     LibpqPinger(const std::string& dsn, std::string sql)
-        : targets_(build_targets(dsn)), sql_(std::move(sql)) {}
+        : info_(probe_conninfo(dsn)), sql_(std::move(sql)) {}
 
     PgReachabilityProbe::PingResult ping(const std::atomic<bool>& stop) {
         using R = PgReachabilityProbe::PingResult;
         if (!conn_ || PQstatus(conn_.get()) != CONNECTION_OK) {
             conn_.reset();
-            if (auto err = connect_any(stop)) {
+            if (auto err = connect(stop)) {
                 conn_.reset();
                 return R{R::Kind::Failed, std::move(*err)};
             }
@@ -254,81 +211,141 @@ public:
     }
 
 private:
-    /// Try each target IN THE DSN'S ORDER, each under its own kConnectDeadline —
-    /// the same order libpq, and so the server's pool, uses for a fresh
-    /// connection. The probe must measure the host the pool would reach, not be
-    /// cleverer than it: two governance rounds tried a "start from the last host
-    /// that worked" preference, and it either pinned the probe to a read-only
-    /// host after the primary came back or — rotated — found a writable host the
-    /// pool never uses and reported ready while every pool write failed (Gate 8
-    /// rounds 2 and 3, both reproduced). Cost, accepted: silent hosts listed
-    /// ahead of the primary are walked on every reconnect, exactly as a new pool
-    /// connection walks them. Like libpq, the walk STOPS at a server-sent error
-    /// other than 57P03 (server_error_ends_walk). Returns every host's error on
-    /// total failure.
-    std::optional<std::string> connect_any(const std::atomic<bool>& stop) {
-        std::string errors;
-        const std::size_t n = targets_.size();
-        for (std::size_t i = 0; i < n; ++i) {
+    /// Connect the way a new pool connection does, and let LIBPQ walk the host
+    /// list: its order (DSN order, or a fresh shuffle per connection under
+    /// `load_balance_hosts=random`), which failures move it to the next host or
+    /// address (a refused or failed connect, 57P03, a target_session_attrs
+    /// rejection) and which end the attempt (a failed login, too many clients,
+    /// an SSL or protocol failure, a peer that hangs up), and the addresses of
+    /// a name. Four governance rounds found a probe that
+    /// re-implemented any part of that walk diverging from the pool and
+    /// reporting ready while the pool could not connect (Gate 8 rounds 2-5, all
+    /// reproduced); so the probe does not.
+    ///
+    /// The ONE thing added: libpq's non-blocking connect never moves past a host
+    /// that accepts TCP and then goes silent (its blocking connect, which the
+    /// pool uses, moves on after `connect_timeout`). So each host gets its own
+    /// kConnectDeadline, measured from when libpq starts on it (PQhost/PQport);
+    /// on expiry the attempt is restarted over the hosts libpq has not yet
+    /// tried, and libpq walks those. Residual: a silent ADDRESS of a host name
+    /// with several addresses skips that name's remaining addresses (the pool
+    /// would try them) — a false red, never a false green.
+    std::optional<std::string> connect(const std::atomic<bool>& stop) {
+        std::string stalled; // hosts given up on at their deadline, for the log
+        std::vector<HostEntry> hosts;
+        std::vector<bool> tried;
+        ConnOptions opts = info_.opts;
+        for (bool first = true;; first = false) {
             if (stop.load(std::memory_order_acquire))
                 return std::string("stopped");
-            auto err = connect_one(targets_[i], stop);
-            if (!err)
-                return std::nullopt;
+            std::vector<const char*> keys, vals;
+            keys.reserve(opts.size() + 1);
+            vals.reserve(opts.size() + 1);
+            for (const auto& [k, v] : opts) {
+                keys.push_back(k.c_str());
+                vals.push_back(v.c_str());
+            }
+            keys.push_back(nullptr);
+            vals.push_back(nullptr);
+            conn_ = pg::PgConn{
+                PQconnectStartParams(keys.data(), vals.data(), info_.unparseable ? 1 : 0)};
+            PGconn* c = conn_.get();
+            if (c == nullptr)
+                return std::string("PQconnectStartParams returned null (out of memory)");
+            if (PQstatus(c) == CONNECTION_BAD) {
+                if (info_.unparseable) // never echo libpq's text for an unparseable DSN
+                    return std::string("the configured Postgres DSN could not be parsed");
+                return stalled + pq_error(c, "connection failed");
+            }
+            if (first) {
+                hosts = host_list(c);
+                tried.assign(hosts.size(), false);
+            }
+            std::string current; // "host:port" libpq is on
+            auto host_deadline = Clock::now() + pr::kConnectDeadline;
+            // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
+            // returned PGRES_POLLING_WRITING.
+            PostgresPollingStatusType st = PGRES_POLLING_WRITING;
+            bool restart = false;
+            while (!restart) {
+                if (st == PGRES_POLLING_OK) {
+                    if (PQsetnonblocking(c, 1) != 0)
+                        return pq_error(c, "could not set non-blocking mode");
+                    return std::nullopt;
+                }
+                if (st == PGRES_POLLING_FAILED) // libpq ended the walk
+                    return stalled + pq_error(c, "connection failed");
+                const char* h = PQhost(c);
+                const char* pt = PQport(c);
+                const std::string at = std::string(h ? h : "") + ":" + (pt ? pt : "");
+                if (at != current) { // libpq moved to another host: a new deadline
+                    current = at;
+                    host_deadline = Clock::now() + pr::kConnectDeadline;
+                    mark_tried(hosts, tried, h, pt);
+                }
+                const int sock = PQsocket(c); // may change between addresses — re-read
+                if (sock < 0)
+                    return stalled + std::string("connection has no socket");
+                if (wait_socket(sock, st == PGRES_POLLING_READING ? Want::Read : Want::Write,
+                                host_deadline, stop)) {
+                    st = PQconnectPoll(c);
+                    continue;
+                }
+                if (stop.load(std::memory_order_acquire))
+                    return std::string("stopped");
+                stalled += current + " connect timed out; ";
+                ConnOptions next = with_untried_hosts(hosts, tried);
+                if (next.empty()) // nothing left to try (or a single host)
+                    return stalled.substr(0, stalled.size() - 2);
+                opts = std::move(next);
+                restart = true;
+            }
             conn_.reset();
-            if (n > 1)
-                errors += (errors.empty() ? "" : "; ") + ("host " + std::to_string(i + 1) + ": ");
-            errors += *err;
-            if (server_error_ends_walk(*err))
-                break; // libpq stops here too; so does the pool's connection
         }
-        return errors.empty() ? std::string("no connection target") : errors;
     }
 
-    std::optional<std::string> connect_one(const ConnTarget& target,
-                                           const std::atomic<bool>& stop) {
-        std::vector<const char*> keys, vals;
-        keys.reserve(target.opts.size() + 1);
-        vals.reserve(target.opts.size() + 1);
-        for (const auto& [k, v] : target.opts) {
-            keys.push_back(k.c_str());
-            vals.push_back(v.c_str());
+    static void mark_tried(const std::vector<HostEntry>& hosts, std::vector<bool>& tried,
+                           const char* h, const char* port) {
+        const std::string_view hv = h ? h : "", pv = port ? port : "";
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            const std::string& shown = hosts[i].host.empty() ? hosts[i].hostaddr : hosts[i].host;
+            if (shown == hv && (hosts[i].port.empty() || hosts[i].port == pv))
+                tried[i] = true;
         }
-        keys.push_back(nullptr);
-        vals.push_back(nullptr);
+    }
 
-        const auto deadline = Clock::now() + pr::kConnectDeadline;
-        conn_ = pg::PgConn{
-            PQconnectStartParams(keys.data(), vals.data(), target.expand_dbname ? 1 : 0)};
-        PGconn* c = conn_.get();
-        if (c == nullptr)
-            return std::string("PQconnectStartParams returned null (out of memory)");
-        PQsetErrorVerbosity(c, PQERRORS_VERBOSE); // SQLSTATE in server-sent errors
-        if (PQstatus(c) == CONNECTION_BAD) {
-            if (target.expand_dbname) // the unparseable-DSN fallback: never echo libpq's text
-                return std::string("the configured Postgres DSN could not be parsed");
-            return pq_error(c, "connection failed");
+    /// The probe's options with host/hostaddr/port replaced by the hosts libpq
+    /// has not tried yet, in the original order (libpq re-shuffles them under
+    /// load_balance_hosts=random). Empty when none remain.
+    ConnOptions with_untried_hosts(const std::vector<HostEntry>& hosts,
+                                   const std::vector<bool>& tried) const {
+        std::string hl, al, pl;
+        bool any = false, has_host = false, has_addr = false, has_port = false;
+        for (std::size_t i = 0; i < hosts.size(); ++i) {
+            if (tried[i])
+                continue;
+            const char* sep = any ? "," : "";
+            hl += sep + hosts[i].host;
+            al += sep + hosts[i].hostaddr;
+            pl += sep + hosts[i].port;
+            has_host = has_host || !hosts[i].host.empty();
+            has_addr = has_addr || !hosts[i].hostaddr.empty();
+            has_port = has_port || !hosts[i].port.empty();
+            any = true;
         }
-        // libpq contract: after PQconnectStart, proceed as if PQconnectPoll had
-        // returned PGRES_POLLING_WRITING.
-        PostgresPollingStatusType st = PGRES_POLLING_WRITING;
-        for (;;) {
-            if (st == PGRES_POLLING_OK)
-                break;
-            if (st == PGRES_POLLING_FAILED)
-                return pq_error(c, "connection failed");
-            const int sock = PQsocket(c); // may change between addresses — re-read
-            if (sock < 0)
-                return std::string("connection has no socket");
-            if (!wait_socket(sock, st == PGRES_POLLING_READING ? Want::Read : Want::Write, deadline,
-                             stop))
-                return std::string(stop.load(std::memory_order_acquire) ? "stopped"
-                                                                        : "connect timed out");
-            st = PQconnectPoll(c);
-        }
-        if (PQsetnonblocking(c, 1) != 0)
-            return pq_error(c, "could not set non-blocking mode");
-        return std::nullopt;
+        if (!any)
+            return {};
+        ConnOptions out;
+        for (const auto& kv : info_.opts)
+            if (kv.first != "host" && kv.first != "hostaddr" && kv.first != "port")
+                out.push_back(kv);
+        if (has_host)
+            out.emplace_back("host", hl);
+        if (has_addr)
+            out.emplace_back("hostaddr", al);
+        if (has_port)
+            out.emplace_back("port", pl);
+        return out;
     }
 
     /// The probe query (`kProbeSql` in production) under kQueryDeadline. Sets
@@ -389,7 +406,7 @@ private:
         return std::nullopt;
     }
 
-    std::vector<ConnTarget> targets_;
+    ProbeConnInfo info_;
     std::string sql_;
     pg::PgConn conn_;
 };

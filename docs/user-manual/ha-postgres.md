@@ -146,11 +146,12 @@ production-grade. You **must**:
   The probe drops its connection whenever it lands on a server that refuses writes, so a proxy,
   DNS name or read-any port that sends a *new* connection to a standby cannot pin it there. With a
   multi-host DSN (`host=n1,n2,n3`; the server requires `target_session_attrs=read-write` there and
-  adds it when absent) it tries the hosts in the DSN's order, as the pool does, each under its own
-  deadline, so a frozen first host costs one deadline instead of holding the probe (list hosts
-  explicitly — one name
-  resolving to several addresses is walked inside libpq, which does not move past a silent address
-  on its own).
+  adds it when absent) libpq walks the hosts for the probe exactly as for the pool, and the probe gives
+  each host its own deadline, so a frozen first host costs one deadline instead of holding the probe.
+  List the Postgres servers themselves, not a pooler per node: a pooler (pgbouncer) can keep reporting
+  a demoted node as writable to libpq and keeps its server connections open across the demotion.
+  One host name that resolves to several addresses: a silent address makes the probe give up that
+  name's other addresses (the pool would try them), so list the addresses as hosts instead.
 
 ## Backup and disaster recovery
 

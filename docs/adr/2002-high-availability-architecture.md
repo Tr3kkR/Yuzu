@@ -1575,18 +1575,23 @@ gaps closed:
   in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
   client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
   resolver instead), because a blocking query against a frozen backend was
-  measured at 101 s; a multi-host DSN is split so each host gets its own deadline (libpq's
-  non-blocking connect never advances past a silent first host); and a read-only answer drops the
+  measured at 101 s; libpq walks a multi-host DSN itself, and the probe only gives each host its own
+  deadline, restarting the walk over the untried hosts when one goes silent (libpq's non-blocking
+  connect never advances past a silent host); and a read-only answer drops the
   connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
   or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
   Leadership is deliberately not a readiness condition.
-- **Multi-host DSNs.** The probe walks the DSN's hosts in libpq's order and stops where libpq stops,
-  so it measures the host the pool reaches; and a multi-host DSN must carry
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order,
+  `load_balance_hosts=random` shuffle, which failures move on and which end the attempt), so the probe
+  measures the host the pool reaches — every re-implementation of that walk diverged (governance
+  rounds 2–5); and a multi-host DSN must carry
   `target_session_attrs=read-write` (appended when absent, a weaker value refuses boot), because without
   it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
   pool does not re-validate connections it holds, so a server that turns read-only in place (without the
-  restart a demotion implies) keeps failing those connections while `/readyz` is green.
+  restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
+  failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
+  green only when a new connection reaches a different, writable host.
 - **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
   turns `503 draining`, so the fronting layer drains before the socket closes.
 The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).

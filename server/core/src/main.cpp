@@ -1144,25 +1144,6 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // ── Multi-host Postgres DSN guard (HA WS-8) ──
-    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
-    // pool's connections on a standby, and /readyz cannot see them all. Append
-    // read-write when the attribute is absent; refuse a weaker explicit value.
-    // Done here, before Server::create, so the pool, the leader elector and the
-    // readiness probe all use the same normalised DSN. See pg/multi_host_dsn.hpp.
-    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
-        guarded.has_value()) {
-        if (guarded->appended)
-            spdlog::warn("Postgres DSN lists {} hosts without target_session_attrs; using "
-                         "target_session_attrs=read-write so the server only connects to a "
-                         "writable primary (set it explicitly to silence this)",
-                         guarded->hosts);
-        cfg.postgres_dsn = std::move(guarded->dsn);
-    } else {
-        std::cerr << "Invalid --postgres-dsn: " << guarded.error() << "\n";
-        return EXIT_FAILURE;
-    }
-
 #ifdef _WIN32
     if (install_service || remove_service) {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
@@ -1249,6 +1230,33 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── Multi-host Postgres DSN guard (HA WS-8) ──
+    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
+    // pool's connections on a standby, and /readyz cannot see them all. Add
+    // read-write when the attribute is absent; refuse a weaker explicit value.
+    // Done after logging is configured (so the line reaches --log-file and
+    // --log-format json) and before the auth bootstrap pool and Server::create,
+    // so every connection — both pools, the leader elector and the readiness
+    // probe — uses the same normalised DSN. See pg/multi_host_dsn.hpp.
+    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
+        guarded.has_value()) {
+        if (guarded->appended) {
+            const std::string why =
+                guarded->hosts > 1
+                    ? std::format("names {} hosts{}", guarded->hosts,
+                                  guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "")
+                    : std::string("sets load_balance_hosts");
+            spdlog::warn("Postgres connection {} without target_session_attrs; using "
+                         "target_session_attrs=read-write so the server only connects to a "
+                         "writable primary (set it explicitly to silence this)",
+                         why);
+        }
+        cfg.postgres_dsn = std::move(guarded->dsn);
+    } else {
+        spdlog::critical("Invalid --postgres-dsn: {}", guarded.error());
+        return EXIT_FAILURE;
+    }
 
     // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
     // Refuse to start rather than silently serve on an OpenSSL build where our
