@@ -107,14 +107,25 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "throwing send; excludes the pre-network-arm drop and the stop()-time backlog discard, "
      "which are not loss of already-committed guard state. Always live regardless of the "
      "Spark flip (prefer_spark) - the legacy IGuard sink is the current production path. "
-     "MONITOR-ONLY, same posture as the rest of this family"},
+     "MONOTONIC AND RESTART-DURABLE (#4783 Gate 4 UP-3): the agent persists this counter "
+     "(and the open-gap ledger below) to its own KvStore and restores it at boot, so a mid-"
+     "outage agent restart does not reset it back to 0 - only the raw lost EVENT content is "
+     "not durable (docs/spark-legacy-delta-registry.md D13). MONITOR-ONLY, same posture as "
+     "the rest of this family"},
     {"yuzu.guardian_legacy_sink_gap_rules", "yuzu_fleet_guardian_legacy_sink_gap_rules",
-     "Fleet sum of rules with an OPEN sticky legacy-sink integrity gap (#4783) - a rule whose "
-     "last drift/compliance report was lost and has not yet been confirmed repaired. The "
-     "agent self-heals this every heartbeat (GuardianEngine::legacy_sink_kick()) by "
-     "synthesizing a guard.unhealthy report for each open gap; a persistently non-zero sum "
-     "means repairs are also failing to deliver, not just the original reports. MONITOR-ONLY, "
-     "same posture as the rest of this family"},
+     "Fleet sum of rules whose SERVER-SIDE CENSUS may be stale because the agent's last "
+     "drift/compliance report for that rule was lost and has not yet been confirmed repaired "
+     "(#4783) - a count of AFFECTED RULES, not a count of lost events (see "
+     "yuzu_fleet_guardian_legacy_sink_events_lost for that). The agent self-heals this every "
+     "heartbeat (GuardianEngine::legacy_sink_kick()) by synthesizing a guard.unhealthy report "
+     "for each open gap; a persistently non-zero sum means repairs are also failing to "
+     "deliver, not just the original reports. MONOTONIC-PER-GAP AND RESTART-DURABLE (#4783 "
+     "Gate 4 UP-3): the agent persists its open-gap ledger to its own KvStore and restores it "
+     "at boot, so a mid-outage agent restart no longer reads as a false \"resolved\" the way "
+     "a genuine repair would (docs/spark-legacy-delta-registry.md D13) - an interior loss can "
+     "still self-clear on a later successful event with no repair ever firing (D13's Gate 4 "
+     "UP-4, an accepted trade-off, not a bug in this gauge). MONITOR-ONLY, same posture as "
+     "the rest of this family"},
 };
 
 /// Derived with std::size, never a literal - see the sibling table's comment in
