@@ -176,6 +176,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -220,6 +221,17 @@ public:
         std::chrono::system_clock::time_point last_lost{};
         std::uint64_t lost_seq{0};
         std::uint64_t repair_seq{0};
+        /// #4783 Gate 4 UP-2: the kick_epoch (State::kick_epoch) at the moment a
+        /// repair was last QUEUED for this rule (offer()'s is_gap_repair branch) -
+        /// 0 if no repair has ever been queued. gapped_rules_needing_repair()'s
+        /// rotation sort reads this as its PRIMARY key (least-recently-attempted
+        /// first) so a stable set of >kMaxGapRepairsPerKick eligible gaps cycles
+        /// through every entry instead of starving whichever ones happen to sort
+        /// first. Deliberately NOT reset when a queued repair later fails
+        /// (WriteFailed/threw, which resets `repair_seq` back to 0) - keeping the
+        /// stale value sends a chronically-failing rule to the back of the
+        /// rotation too, so it cannot starve the rules behind it either.
+        std::uint64_t last_attempt_kick{0};
     };
 
     struct Stats {
@@ -338,8 +350,17 @@ public:
                                                  is_gap_repair, seq});
                     state_->bytes += bytes;
                     if (is_gap_repair) {
-                        if (auto gi = state_->gaps.find(rule_id); gi != state_->gaps.end())
+                        if (auto gi = state_->gaps.find(rule_id); gi != state_->gaps.end()) {
                             gi->second.repair_seq = seq;
+                            // #4783 Gate 4 UP-2: stamp the CURRENT kick round as
+                            // this rule's last repair attempt - see GapRecord's own
+                            // doc comment and gapped_rules_needing_repair()'s
+                            // rotation sort. Read now, under this same lock, so it
+                            // reflects whichever kick() call most recently bumped
+                            // it (or 0 if this offer is racing ahead of the first
+                            // kick() - harmless, it just sorts to the front once).
+                            gi->second.last_attempt_kick = state_->kick_epoch;
+                        }
                     }
                 }
 
@@ -389,6 +410,16 @@ public:
         std::string stalled_rule_id;
         try {
             std::unique_lock<std::mutex> lk{state_->mu};
+            // #4783 Gate 4 UP-2: bump the kick round FIRST, before any other
+            // kick() logic - gapped_rules_needing_repair() (called by the
+            // production caller, GuardianEngine::legacy_sink_kick(), immediately
+            // after this returns) reads the now-current kick_epoch to stamp any
+            // repair it queues via offer(). This is a separate lock acquisition
+            // from that later call, but since nothing else can run kick() or
+            // offer() concurrently against the SAME rule in a way that matters
+            // here, bumping it up front is what makes it "current" for the
+            // selection that follows.
+            ++state_->kick_epoch;
             if (!state_->queue.empty() && !state_->worker_running && !state_->stopping) {
                 ticket = std::make_shared<AliveTicket>(state_);
                 state_->worker_running = true;
@@ -448,24 +479,71 @@ public:
         return s;
     }
 
-    /// Up to `max` gapped rules, unfiltered by repair_seq - the caller
-    /// (GuardianEngine::legacy_sink_kick()) decides which to actually (re)offer a
-    /// repair for (skipping any with a non-zero repair_seq - one is already
-    /// queued for that rule).
+    /// Up to `max` gaps ELIGIBLE for a new repair attempt right now - i.e. with
+    /// `repair_seq == 0` (NOT already mid-repair; #4783 Gate 4 UP-2 - a gap with
+    /// one outstanding is excluded from consideration here rather than counted
+    /// against `max` and then skipped by the caller, which is what let an
+    /// already-saturated kick offer fewer than `max` NEW repairs). Selection
+    /// among the eligible set is a least-recently-attempted round-robin: sorted
+    /// by (last_attempt_kick ascending, first_lost ascending, rule_id ascending -
+    /// the rule_id tie-break makes selection fully deterministic, independent of
+    /// unordered_map iteration order) and the first `max` are returned.
+    ///
+    /// GUARANTEE: every open gap not already mid-repair receives a repair attempt
+    /// within ceil(n_eligible / kMaxGapRepairsPerKick) kicks, where n_eligible is
+    /// the number of gaps with repair_seq == 0 at a given kick. Each kick selects
+    /// the `max` least-recently-attempted eligible gaps, and offer()'s
+    /// is_gap_repair branch stamps every queued repair's last_attempt_kick to the
+    /// CURRENT kick round - so a gap selected this kick sorts to the BACK of the
+    /// rotation for every following kick until every other still-eligible gap has
+    /// had an equal-or-more-recent turn, guaranteeing it resurfaces within
+    /// ceil(n_eligible / max) kicks of its last attempt. Because the rule_id
+    /// tie-break makes the ordering deterministic rather than dependent on
+    /// unordered_map iteration order, this holds even for a perfectly stable set
+    /// of gaps - the failure mode this fixes was exactly that stability: a fixed
+    /// subset returned (and only ever offered) by every kick, forever.
     [[nodiscard]] std::vector<std::pair<std::string, GapRecord>>
     gapped_rules_needing_repair(std::size_t max) const {
         std::lock_guard<std::mutex> lk{state_->mu};
-        std::vector<std::pair<std::string, GapRecord>> out;
-        out.reserve(std::min(max, state_->gaps.size()));
+        // Pointers into the map's own nodes - stable under this lock, so this
+        // avoids copying every eligible GapRecord just to sort and then discard
+        // most of them.
+        std::vector<const std::pair<const std::string, GapRecord>*> eligible;
+        eligible.reserve(state_->gaps.size());
         for (const auto& kv : state_->gaps) {
-            if (out.size() >= max)
-                break;
-            out.emplace_back(kv.first, kv.second);
+            if (kv.second.repair_seq == 0)
+                eligible.push_back(&kv);
         }
+        const std::size_t take = std::min(max, eligible.size());
+        std::partial_sort(eligible.begin(), eligible.begin() + take, eligible.end(),
+                          [](const auto* a, const auto* b) {
+                              return std::tie(a->second.last_attempt_kick, a->second.first_lost,
+                                              a->first) <
+                                     std::tie(b->second.last_attempt_kick, b->second.first_lost,
+                                              b->first);
+                          });
+        std::vector<std::pair<std::string, GapRecord>> out;
+        out.reserve(take);
+        for (std::size_t i = 0; i < take; ++i)
+            out.emplace_back(eligible[i]->first, eligible[i]->second);
         return out;
     }
 
     // ---- test seams -------------------------------------------------------
+
+    /// EVERY current gap, unfiltered by eligibility and unsorted - unlike
+    /// gapped_rules_needing_repair() (production selection: eligible-only,
+    /// rotation-sorted, capped), this is a raw snapshot for inspecting a gap's
+    /// state (e.g. `repair_seq` while a repair is still mid-flight, which makes
+    /// it ineligible and therefore invisible to gapped_rules_needing_repair()).
+    [[nodiscard]] std::vector<std::pair<std::string, GapRecord>> all_gaps_for_test() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        std::vector<std::pair<std::string, GapRecord>> out;
+        out.reserve(state_->gaps.size());
+        for (const auto& kv : state_->gaps)
+            out.emplace_back(kv.first, kv.second);
+        return out;
+    }
 
     [[nodiscard]] std::size_t pending_count_for_test() const {
         std::lock_guard<std::mutex> lk{state_->mu};
@@ -551,6 +629,12 @@ private:
         /// offer() call that reaches the lock (admitted or refused alike) gets the
         /// next value. See the class doc comment's SEQ-GUARDED CLEARING section.
         std::uint64_t next_seq{0};
+        /// #4783 Gate 4 UP-2: bumped once per kick() call (the first statement in
+        /// its locked block, before any other kick() logic) - the "round number"
+        /// stamped onto GapRecord::last_attempt_kick when a repair is queued for a
+        /// rule, so gapped_rules_needing_repair()'s rotation sort can tell which
+        /// gaps were attempted longest ago.
+        std::uint64_t kick_epoch{0};
     };
 
     /// RAII orphan-exit marker (#3966 idiom - see

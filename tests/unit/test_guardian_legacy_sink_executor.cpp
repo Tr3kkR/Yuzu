@@ -15,8 +15,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -91,6 +93,31 @@ struct RecordingSend {
         return invocations.size();
     }
 };
+
+/// A send that records every invocation's rule_id in order, thread-safely, and
+/// returns WriteFailed for any rule_id in `fail_ids`, Sent otherwise. Used by the
+/// #4783 Gate 4 UP-2 rotation tests to simulate a chronically-failing rule mixed
+/// in among rules that repair successfully first try.
+struct MixedOutcomeSend {
+    std::mutex mu;
+    std::vector<std::string> invocations;
+    std::set<std::string> fail_ids;
+
+    LegacySendOutcome operator()(const Event& ev) {
+        std::lock_guard<std::mutex> lk{mu};
+        invocations.push_back(ev.rule_id());
+        return fail_ids.count(ev.rule_id()) ? LegacySendOutcome::WriteFailed
+                                            : LegacySendOutcome::Sent;
+    }
+};
+
+/// Zero-padded "r000".."r099"-shaped rule_id, so lexicographic string order
+/// matches numeric order - used by the #4783 Gate 4 UP-2 rotation tests so the
+/// rule_id tie-break in gapped_rules_needing_repair()'s sort is predictable.
+std::string padded_rule_id(int i) {
+    std::string n = std::to_string(i);
+    return "r" + std::string(3 - n.size(), '0') + n;
+}
 
 /// Runs `fn` on a detached helper thread and requires it to complete within
 /// `timeout` (sanitizer-scaled, matching spin_until's convention). If `fn` never
@@ -789,13 +816,17 @@ TEST_CASE("#4783 gap: a queued repair superseded by a newer real Sent before "
     REQUIRE(spin_until([&] { return real_send.invocations.load() >= 1; }));
 
     // Queue a repair for A behind the in-flight real event - its repair_seq is
-    // stamped as the (currently) live one.
+    // stamped as the (currently) live one. #4783 Gate 4 UP-2:
+    // gapped_rules_needing_repair() now excludes mid-repair gaps (repair_seq !=
+    // 0) - it is production SELECTION, not raw introspection - so checking that
+    // exclusion here goes through all_gaps_for_test() instead.
     RecordingSend repair_send;
     CHECK(exec.offer(make_event("A", "guard.unhealthy"), std::ref(repair_send),
                      /*is_gap_repair=*/true) == OfferOutcome::Queued);
-    auto gaps_mid = exec.gapped_rules_needing_repair(10);
+    auto gaps_mid = exec.all_gaps_for_test();
     REQUIRE(gaps_mid.size() == 1);
     CHECK(gaps_mid[0].second.repair_seq != 0);
+    CHECK(exec.gapped_rules_needing_repair(10).empty()); // ineligible - mid-repair
 
     // Release the real event - it completes Sent with a NEWER seq than the
     // gap's lost_seq, clearing the gap per the previous test's mechanism.
@@ -836,7 +867,10 @@ TEST_CASE("#4783 gap: a repair's own Sent does not clear a loss NEWER than the "
                      /*is_gap_repair=*/true) == OfferOutcome::Queued);
     REQUIRE(spin_until([&] { return blocking_repair.invocations.load() >= 1; }));
 
-    auto gaps_mid = exec.gapped_rules_needing_repair(10);
+    // #4783 Gate 4 UP-2: R is still mid-repair (repair_seq != 0) here, which now
+    // makes it ineligible/invisible to gapped_rules_needing_repair() - inspect
+    // the raw gap via all_gaps_for_test() instead.
+    auto gaps_mid = exec.all_gaps_for_test();
     REQUIRE(gaps_mid.size() == 1);
     REQUIRE(gaps_mid[0].second.repair_seq != 0);
     const auto repair_seq = gaps_mid[0].second.repair_seq;
@@ -852,7 +886,7 @@ TEST_CASE("#4783 gap: a repair's own Sent does not clear a loss NEWER than the "
                               [](const Event&) { return LegacySendOutcome::Sent; });
     CHECK(refused == OfferOutcome::RefusedCapacity);
 
-    auto gaps_before_release = exec.gapped_rules_needing_repair(10);
+    auto gaps_before_release = exec.all_gaps_for_test();
     REQUIRE(gaps_before_release.size() == 1);
     CHECK(gaps_before_release[0].second.lost_seq > repair_seq);
 
@@ -868,6 +902,249 @@ TEST_CASE("#4783 gap: a repair's own Sent does not clear a loss NEWER than the "
     auto gaps_after = exec.gapped_rules_needing_repair(10);
     REQUIRE(gaps_after.size() == 1);
     CHECK(gaps_after[0].second.repair_seq == 0);
+}
+
+// ── #4783 Gate 4 UP-2: fair, eligibility-filtered gap-repair rotation ───────
+//
+// gapped_rules_needing_repair()'s selection used to be "the first `max` gaps in
+// unordered_map iteration order, unfiltered by repair_seq" - with a STABLE set
+// of more than `max` gapped rules, that returned the SAME subset every call
+// (bug (a): a fixed subset gets repaired, forever, everything else starves),
+// and the caller's own repair_seq filter meant an already-busy kick could offer
+// fewer than `max` NEW repairs (bug (b): the cap counted LISTED entries,
+// including ones already mid-repair, rather than ELIGIBLE ones). These three
+// tests exercise the fix directly against the executor, independently of
+// GuardianEngine::legacy_sink_kick() (engine-level coverage is
+// test_guardian_engine_legacy_sink.cpp) - each test's own offer()/kick() loop
+// mirrors legacy_sink_kick()'s real shape: kick(); take up to the cap from
+// gapped_rules_needing_repair(); offer() a repair for each (skipping any with a
+// non-zero repair_seq, which is now always a no-op - the eligibility filter
+// already excluded those - but is kept here to mirror the real caller exactly).
+
+TEST_CASE("#4783 Gate 4 UP-2: 100 gapped rules rotate fairly across kicks - "
+          "every rule is offered a repair exactly once within ceil(100/32)=4 "
+          "kicks, none twice before all 100 have had a turn",
+          "[guardian][legacy_sink]") {
+    constexpr std::size_t kCap = 32; // mirrors kMaxGapRepairsPerKick (guardian_engine.cpp);
+                                     // not includable here (guardian_engine.cpp-local),
+                                     // hand-kept in sync
+    constexpr int kRules = 100;
+
+    GuardianLegacySinkExecutor exec;
+
+    // Open 100 gaps via WriteFailed, sequentially. The single detached worker
+    // processes FIFO, so first_lost ends up non-decreasing in the SAME order
+    // these are offered (r000..r099) - the rule_id tie-break in
+    // gapped_rules_needing_repair()'s sort makes selection deterministic
+    // regardless, but this keeps the expected per-kick counts easy to reason
+    // about below.
+    for (int i = 0; i < kRules; ++i) {
+        CHECK(exec.offer(make_event(padded_rule_id(i), "drift.detected"),
+                         [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+             OfferOutcome::Queued);
+    }
+    REQUIRE(
+        spin_until([&] { return exec.stats().gap_rules == static_cast<std::size_t>(kRules); }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // Block the single worker on a sentinel rule_id OUTSIDE the 100, so every
+    // repair offered below stays QUEUED (never dequeued/sent) for the rest of
+    // the selection phase - repair_seq is stamped at OFFER time regardless of
+    // when (or whether) the send itself runs, so this keeps every one of the
+    // 100 gaps present in the map across all 4 kicks without a Sent repair
+    // erasing (and thus trivially "rotating away") a gap before the next kick's
+    // selection - which would defeat the point of this test (see the class doc
+    // comment's SEQ-GUARDED CLEARING section for why Sent erases a gap outright
+    // rather than just clearing repair_seq).
+    StallingSend sentinel;
+    ScopeExit cleanup{[&] {
+        sentinel.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+    CHECK(exec.offer(make_event("ZZZ_sentinel", "drift.detected"), std::ref(sentinel)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return sentinel.invocations.load() >= 1; }));
+
+    RecordingSend repair_send;
+    std::vector<std::vector<std::string>> offered_per_kick(4);
+    for (int k = 0; k < 4; ++k) {
+        exec.kick();
+        auto gaps = exec.gapped_rules_needing_repair(kCap);
+        for (const auto& [rule_id, gap] : gaps) {
+            if (gap.repair_seq != 0) // mirrors legacy_sink_kick()'s own guard - now a no-op
+                continue;
+            CHECK(exec.offer(make_event(rule_id, "guard.unhealthy"), std::ref(repair_send),
+                             /*is_gap_repair=*/true) == OfferOutcome::Queued);
+            offered_per_kick[k].push_back(rule_id);
+        }
+    }
+
+    // 32 + 32 + 32 + 4 == 100, and every rule_id appears in exactly one kick's list.
+    std::set<std::string> seen;
+    std::size_t total = 0;
+    for (const auto& v : offered_per_kick) {
+        total += v.size();
+        for (const auto& rid : v)
+            CHECK(seen.insert(rid).second); // false == already seen == offered twice - FAIL
+    }
+    CHECK(total == static_cast<std::size_t>(kRules));
+    CHECK(seen.size() == static_cast<std::size_t>(kRules));
+    for (int i = 0; i < kRules; ++i)
+        CHECK(seen.count(padded_rule_id(i)) == 1);
+    CHECK(offered_per_kick[0].size() == kCap);
+    CHECK(offered_per_kick[1].size() == kCap);
+    CHECK(offered_per_kick[2].size() == kCap);
+    CHECK(offered_per_kick[3].size() == static_cast<std::size_t>(kRules) - 3 * kCap);
+
+    // Release the sentinel: all 100 queued repairs now drain and succeed.
+    sentinel.release();
+    REQUIRE(spin_until([&] { return repair_send.count() == static_cast<std::size_t>(kRules); }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+    CHECK(exec.stats().gap_rules == 0); // every repair's own seq postdated its rule's loss
+}
+
+TEST_CASE("#4783 Gate 4 UP-2: a chronically-failing rule does not starve the "
+          "other 95 gapped rules, and is retried only after all 95 have had "
+          "their own turn",
+          "[guardian][legacy_sink]") {
+    constexpr std::size_t kCap = 32; // mirrors kMaxGapRepairsPerKick
+    constexpr int kRules = 100;
+    const std::set<std::string> failing = {padded_rule_id(0), padded_rule_id(1),
+                                           padded_rule_id(2), padded_rule_id(3),
+                                           padded_rule_id(4)};
+
+    GuardianLegacySinkExecutor exec;
+
+    for (int i = 0; i < kRules; ++i) {
+        CHECK(exec.offer(make_event(padded_rule_id(i), "drift.detected"),
+                         [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+             OfferOutcome::Queued);
+    }
+    REQUIRE(
+        spin_until([&] { return exec.stats().gap_rules == static_cast<std::size_t>(kRules); }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // Unlike the rotation test above, repairs here are allowed to actually
+    // drain BETWEEN kicks - a WriteFailed repair must reset repair_seq to 0
+    // (become eligible again) for the starvation-avoidance property to be
+    // exercised at all; a permanently-stalled queue would never let that happen.
+    MixedOutcomeSend send;
+    send.fail_ids = failing;
+
+    std::vector<std::string> offer_log; // global order, across all 4 kicks
+    for (int k = 0; k < 4; ++k) {
+        exec.kick();
+        auto gaps = exec.gapped_rules_needing_repair(kCap);
+        for (const auto& [rule_id, gap] : gaps) {
+            if (gap.repair_seq != 0)
+                continue;
+            CHECK(exec.offer(make_event(rule_id, "guard.unhealthy"), std::ref(send),
+                             /*is_gap_repair=*/true) == OfferOutcome::Queued);
+            offer_log.push_back(rule_id);
+        }
+        REQUIRE(exec.wait_workers_retired_for_test(5s));
+    }
+
+    // Every one of the 100 rule_ids was offered at least once; the 5 failing
+    // ones were offered exactly twice (the initial attempt plus one retry),
+    // every other rule exactly once.
+    std::map<std::string, int> offer_count;
+    for (const auto& rid : offer_log)
+        ++offer_count[rid];
+    REQUIRE(offer_count.size() == static_cast<std::size_t>(kRules));
+    for (int i = 0; i < kRules; ++i) {
+        const auto rid = padded_rule_id(i);
+        CHECK(offer_count[rid] == (failing.count(rid) ? 2 : 1));
+    }
+
+    // The 95 non-failing rules each complete within the 4 kicks; the 5 failing
+    // ones are retried only AFTER every one of the 95 has already been offered
+    // its (successful) repair - i.e. in global offer order, the LAST first-time
+    // offer of a non-failing rule precedes the SECOND offer of every failing one.
+    std::size_t last_non_failing_index = 0;
+    std::vector<std::size_t> failing_retry_index;
+    std::map<std::string, int> seen_so_far;
+    for (std::size_t idx = 0; idx < offer_log.size(); ++idx) {
+        const auto& rid = offer_log[idx];
+        const int occurrence = ++seen_so_far[rid];
+        if (failing.count(rid) != 0) {
+            if (occurrence == 2)
+                failing_retry_index.push_back(idx);
+        } else {
+            last_non_failing_index = idx; // every non-failing id is offered exactly once
+        }
+    }
+    REQUIRE(failing_retry_index.size() == failing.size());
+    for (auto idx : failing_retry_index)
+        CHECK(idx > last_non_failing_index);
+
+    CHECK(exec.stats().gap_rules == failing.size()); // only the 5 chronic failures remain open
+    auto remaining = exec.all_gaps_for_test();
+    std::set<std::string> remaining_ids;
+    for (const auto& [rid, gap] : remaining)
+        remaining_ids.insert(rid);
+    CHECK(remaining_ids == failing);
+}
+
+TEST_CASE("#4783 Gate 4 UP-2: the repair cap applies to ELIGIBLE gaps only - 20 "
+          "of 40 already mid-repair still yields exactly 20 NEW offers, not 12 "
+          "(the old cap-counts-listed-entries bug) and not 40 (cap ignored)",
+          "[guardian][legacy_sink]") {
+    constexpr std::size_t kCap = 32; // mirrors kMaxGapRepairsPerKick
+    constexpr int kRules = 40;
+    constexpr int kAlreadyMidRepair = 20;
+
+    GuardianLegacySinkExecutor exec;
+
+    for (int i = 0; i < kRules; ++i) {
+        CHECK(exec.offer(make_event(padded_rule_id(i), "drift.detected"),
+                         [](const Event&) { return LegacySendOutcome::WriteFailed; }) ==
+             OfferOutcome::Queued);
+    }
+    REQUIRE(
+        spin_until([&] { return exec.stats().gap_rules == static_cast<std::size_t>(kRules); }));
+    REQUIRE(exec.wait_workers_retired_for_test(5s));
+
+    // Block the worker so every repair offered below stays queued (mid-repair,
+    // repair_seq != 0) for the rest of the test - it must never actually
+    // complete, or it would clear its own eligibility state the normal way
+    // rather than via the explicit already-in-flight setup this test is for.
+    StallingSend sentinel;
+    ScopeExit cleanup{[&] {
+        sentinel.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+    CHECK(exec.offer(make_event("ZZZ_sentinel", "drift.detected"), std::ref(sentinel)) ==
+         OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return sentinel.invocations.load() >= 1; }));
+
+    // Queue a repair for the first 20 rules via the normal offer()/is_gap_repair
+    // mechanism - each becomes mid-repair (repair_seq != 0) and stays that way,
+    // since the sentinel above blocks the worker from ever reaching them.
+    RecordingSend repair_send;
+    std::set<std::string> already_mid_repair;
+    for (int i = 0; i < kAlreadyMidRepair; ++i) {
+        const auto rid = padded_rule_id(i);
+        CHECK(exec.offer(make_event(rid, "guard.unhealthy"), std::ref(repair_send),
+                         /*is_gap_repair=*/true) == OfferOutcome::Queued);
+        already_mid_repair.insert(rid);
+    }
+    REQUIRE(exec.all_gaps_for_test().size() == static_cast<std::size_t>(kRules));
+
+    exec.kick();
+    auto gaps = exec.gapped_rules_needing_repair(kCap);
+
+    // Exactly the 20 NOT already mid-repair - the cap (32) never binds because
+    // only 20 are eligible. The old "cap counts listed entries" bug would have
+    // returned 32 raw entries (in whatever order unordered_map iteration
+    // happened to produce) and left the caller to filter out the ones already
+    // mid-repair - offering as few as 32 - 20 == 12 NEW repairs if all 20
+    // already-mid-repair entries happened to be among that raw 32.
+    CHECK(gaps.size() == static_cast<std::size_t>(kRules - kAlreadyMidRepair));
+    for (const auto& [rule_id, gap] : gaps) {
+        CHECK(gap.repair_seq == 0);
+        CHECK(already_mid_repair.count(rule_id) == 0);
+    }
 }
 
 TEST_CASE("wait_idle_for_test can read true while a retiring worker is still "
