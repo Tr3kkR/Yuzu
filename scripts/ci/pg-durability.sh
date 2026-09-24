@@ -5,27 +5,32 @@
 # full_page_writes=off settings of the per-agent cluster it is about to use,
 # instead of discovering drift as a 700 s [pg]-shard TIMEOUT).
 #
-# This file is SOURCED into the CI step shell by scripts/ci/ensure-postgres.sh
-# (which is itself `source`d at .github/workflows/ci.yml:1731), so every
-# top-level name here is prefixed `pg_`/`pg_durability_` to avoid leaking into
-# that shell. There is no top-level side-effecting code other than the guarded
-# --selftest dispatch at the bottom.
+# This file is SOURCED into the CI step shell via the `source
+# scripts/ci/ensure-postgres.sh` step in ci.yml, so every top-level name here
+# is prefixed `pg_`/`pg_durability_` to avoid leaking into that shell. There
+# is no top-level side-effecting code other than the guarded --selftest
+# dispatch at the bottom.
 #
 # bash 3.2 (macOS /bin/bash) AND bash 5.x (MSYS2 on the Wee Tam Windows
-# runners) both source this file under `set -u` (ensure-postgres.sh:41), so
-# every `local` below is initialised on the same line it is declared — an
-# uninitialised `local rc` read before assignment is silently tolerated by
-# bash 3.2 but aborts bash 5 with "rc: unbound variable" (reproduced on this
-# Mac: /opt/homebrew/bin/bash 5.3 aborts, /bin/bash 3.2 does not). No
-# mapfile/associative-arrays/${var,,} (bash 3.2 has none of those).
+# runners) both source this file under `set -euo pipefail` (the top of
+# ensure-postgres.sh), so every `local` below is initialised on the same
+# line it is declared — an uninitialised `local rc` read before assignment
+# is silently tolerated by bash 3.2 but aborts bash 5 with "rc: unbound
+# variable" (reproduced on this Mac: /opt/homebrew/bin/bash 5.3 aborts,
+# /bin/bash 3.2 does not). No mapfile/associative-arrays/${var,,} (bash 3.2
+# has none of those).
 #
 # Fixture provenance for --selftest: verbatim captures from a throwaway
 # trust-auth PostgreSQL 18.6 cluster (Homebrew, aarch64-apple-darwin),
 # 127.0.0.1:54318, captured 2026-09-24. Query used for the multi-row
 # fixtures: SELECT name, setting, source FROM pg_settings WHERE name IN
-# ('fsync','synchronous_commit','full_page_writes') ORDER BY name -tA. The
-# single-CRLF-line-endings fixture is a synthetic derivative of the
-# post-heal capture (line endings rewritten), not a separate live capture.
+# ('fsync','synchronous_commit','full_page_writes') ORDER BY name -tA. Two
+# fixtures are NOT separate live captures: the single-CRLF-line-endings
+# fixture is a synthetic derivative of the post-heal capture (line endings
+# rewritten), and the missing-synchronous_commit fixture is a synthetic
+# truncation of the default capture (its third row dropped) — the query
+# above always returns all three rows, so a genuinely short read only
+# happens via a synthetic fixture like this one.
 
 # pg_durability_decide <allow_heal 0|1> <rows_text>
 #
@@ -33,9 +38,9 @@
 # tolerated, blank lines ignored). Exactly the three settings fsync,
 # full_page_writes, synchronous_commit must each appear. Prints exactly one
 # of:
-#   ok                    — all three already read 'off' (or, for
-#                            synchronous_commit, any value written by the
-#                            heal statement below is 'off' — see note)
+#   ok                    — all three already read 'off' (any value other
+#                            than 'off' counts as not-off, including
+#                            synchronous_commit=local)
 #   heal <names>          — allow_heal=1 and at least one of the three is not
 #                            'off'; <names> lists every such setting, in the
 #                            order its row appeared
@@ -50,7 +55,6 @@ pg_durability_decide() {
   local line='' name='' setting='' source_col='' rest=''
   local seen_fsync=0 seen_fpw=0 seen_sc=0 saw_any_row=0
   local not_off_names=''
-  local IFS_SAVE="$IFS"
   # Strip \r (CRLF tolerance) without touching bash-3.2-unsupported
   # substitutions; a plain parameter substitution is fine on both.
   rows_text="${rows_text//$'\r'/}"
@@ -65,7 +69,7 @@ pg_durability_decide() {
     # A line with exactly 2 '|' has $rest empty even when it IS 3 fields
     # (the common case) — but also when there are only 2 fields and no
     # third '|' at all (setting would then hold everything after the first
-    # '|', so a genuine 2-field line "name|value" is Category B, which
+    # '|', so a genuine 2-field line "name|value" is a 2-field line, which
     # pg_settings.source never legitimately omits). Require a non-empty
     # source_col to accept the row as well-formed.
     [[ -z "$source_col" ]] && continue
@@ -77,7 +81,6 @@ pg_durability_decide() {
       *) : ;;
     esac
   done <<<"$rows_text"
-  IFS="$IFS_SAVE"
 
   if [[ "$saw_any_row" != "1" ]]; then
     echo "fail unparseable"
@@ -124,7 +127,8 @@ pg_heal_allowed() {
 }
 
 # pg_dsn_host_port <dsn> — prints "host:port" for a URI-form DSN (the same
-# regex ensure-postgres.sh:163 uses for per-agent port derivation), else "?".
+# regex the per-agent derivation in ensure-postgres.sh path 1 uses), else
+# "?".
 pg_dsn_host_port() {
   local dsn="$1"
   if [[ "$dsn" =~ ^(.*@([^:/@]+)):([0-9]+)(/.*)$ ]]; then
@@ -136,10 +140,15 @@ pg_dsn_host_port() {
 
 # pg_dsn_redact <dsn> — strips userinfo (user[:password]) from a URI-form
 # DSN's authority, e.g. postgresql://yuzu:yuzu@127.0.0.1:5433/db ->
-# postgresql://***@127.0.0.1:5433/db. Unchanged when there is no '@'.
+# postgresql://***@127.0.0.1:5433/db, AND redacts a keyword-form `password=`
+# value (path 1 accepts both forms). The URI-authority strip is greedy
+# (`://.*@`, taking the LAST '@' in the string) so a raw '@' inside the
+# password itself does not leak a fragment after it — this can over-redact
+# a literal '@' in a query string, which is an acceptable trade-off next to
+# a leaked credential. Unchanged when there is no '@' and no `password=`.
 pg_dsn_redact() {
   local dsn="$1"
-  printf '%s' "$dsn" | sed -E 's#://[^@[:space:]]*@#://***@#'
+  printf '%s' "$dsn" | sed -E 's#://.*@#://***@#; s/password=[^[:space:]]*/password=***/g'
 }
 
 # pg_psql_path_from_env <value> — backslash -> forward-slash (Windows-form
@@ -151,11 +160,11 @@ pg_psql_path_from_env() {
 }
 
 # ── selftest ─────────────────────────────────────────────────────────────
-# pg_durability_check <name> <expected> <actual> — prints "  ok" or
-# "  FAIL: <name> expected=<expected> actual=<actual>" (shape of
-# check-plugin-readme-touch.sh's fixture-run style) and returns 1 on
-# mismatch, else 0. Increments PGD_FAILURES on mismatch (initialised by the
-# caller — nounset-safe).
+# pg_durability_check <name> <expected> <actual> — one `  ok:`/`  FAIL:` line
+# per case (check-plugin-readme-touch.sh's own selftest prints only on
+# failure; this one always names the passing case too, for an easy tally)
+# and returns 1 on mismatch, else 0. Increments PGD_FAILURES on mismatch
+# (initialised by the caller — nounset-safe).
 pg_durability_check() {
   local name="$1" expected="$2" actual="$3"
   if [[ "$actual" == "$expected" ]]; then
@@ -175,7 +184,7 @@ pg_durability_selftest() {
   local cap_default=$'fsync|on|default\nfull_page_writes|on|default\nsynchronous_commit|on|default'
   local cap_off=$'fsync|off|configuration file\nfull_page_writes|off|configuration file\nsynchronous_commit|off|configuration file'
   local cap_local=$'fsync|off|configuration file\nfull_page_writes|off|configuration file\nsynchronous_commit|local|configuration file'
-  local cap_off_crlf
+  local cap_off_crlf=''
   cap_off_crlf="$(printf '%s\r\n' 'fsync|off|configuration file' 'full_page_writes|off|configuration file' 'synchronous_commit|off|configuration file')"
   local cap_missing_sc=$'fsync|on|default\nfull_page_writes|on|default'
   local cap_refused=$'psql: error: connection to server at "127.0.0.1", port 54319 failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?'
@@ -220,6 +229,20 @@ pg_durability_selftest() {
   esac
   out="$(pg_dsn_redact 'postgresql://127.0.0.1:5433/yuzu_test')"
   pg_durability_check "dsn_redact no-@ unchanged" "postgresql://127.0.0.1:5433/yuzu_test" "$out"
+
+  out="$(pg_dsn_redact 'postgresql://yuzu:p@ss@127.0.0.1:5433/db')"
+  pg_durability_check "dsn_redact uri password containing @" "postgresql://***@127.0.0.1:5433/db" "$out"
+  case "$out" in
+    *ss@*) echo "  FAIL: dsn_redact leaked a password fragment: $out" >&2; PGD_FAILURES=$((PGD_FAILURES + 1)) ;;
+    *) echo "  ok: dsn_redact does not leak a password fragment after an embedded @" ;;
+  esac
+
+  out="$(pg_dsn_redact 'host=127.0.0.1 port=5433 user=yuzu password=s3cret dbname=yuzu_test')"
+  pg_durability_check "dsn_redact keyword-form" "host=127.0.0.1 port=5433 user=yuzu password=*** dbname=yuzu_test" "$out"
+  case "$out" in
+    *s3cret*) echo "  FAIL: dsn_redact leaked a keyword-form password: $out" >&2; PGD_FAILURES=$((PGD_FAILURES + 1)) ;;
+    *) echo "  ok: dsn_redact does not leak a keyword-form password" ;;
+  esac
 
   out="$(pg_psql_path_from_env 'D:\ci\pgbin\agent-1\bin\psql.exe')"; pg_durability_check "psql_path_from_env backslash" "D:/ci/pgbin/agent-1/bin/psql.exe" "$out"
   out="$(pg_psql_path_from_env '')"; pg_durability_check "psql_path_from_env empty" "" "$out"

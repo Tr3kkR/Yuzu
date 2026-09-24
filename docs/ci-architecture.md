@@ -1220,7 +1220,9 @@ Resolution order inside the script:
    `ci.yml`'s Windows job), read from the same
    `Provision-Windows-Runner.ps1` manifest Assert-Toolchain has just
    validated — Assert-Toolchain proves that exact `psql.exe` against that
-   exact cluster with `SELECT 1` seconds before this step runs, so a
+   exact cluster with `SELECT 1` earlier in this same job (vcpkg setup,
+   install, configure and build all run in between — minutes, not
+   seconds), so a
    **manifest-vouched per-agent `SELECT 1` failure is retried briefly,
    then fails the job — it never falls back to the shared agent-0
    cluster** (that would recreate the #2094 cross-job contention and
@@ -1286,16 +1288,22 @@ a database would silently skip that coverage. `exit "$SOFT_EXIT"`
 in 60 s (path 2), brew cluster not ready (path 3), native-cluster
 credential failure when `psql` is available (path 4), and nothing found
 (path 5) — **plus, since the #2167 follow-up, a manifest-vouched path-1
-per-agent `SELECT 1` failure after retries, and a path-1 durability read
-that is unreadable/unparseable or that stays not-off 5s after a heal**
-(check `pg_settings.source` — a per-role/per-database override or a
-command-line `-c` beats `ALTER SYSTEM`). The one non-fatal exception is
-path 4 without `psql`: a TCP probe alone produces a `::warning` and still
-exports the conventional DSN (credential **unverified** — wrong
-credentials then surface as downstream `[pg]` test failures; install
-`psql` on the runner's PATH to get the authenticated gate instead).
-Locally the tests still skip when `YUZU_TEST_POSTGRES_DSN` is unset;
-when it is set but unreachable they fail rather than skip.
+per-agent `SELECT 1` failure after retries, a path-1 durability read
+that is unreadable/unparseable, a path-1 heal whose `ALTER SYSTEM`/
+`pg_reload_conf()` fails outright, and a path-1 cluster that stays
+not-off 5s after a heal** (check `pg_settings.source` — a per-role/
+per-database override or a command-line `-c` beats `ALTER SYSTEM`). The
+non-fatal exceptions are: path 4 without `psql` (a TCP probe alone
+produces a `::warning` and still exports the conventional DSN —
+credential **unverified**, wrong credentials then surface as downstream
+`[pg]` test failures; install `psql` on the runner's PATH to get the
+authenticated gate instead); path 1 without any `psql` at all
+(conformance is **UNVERIFIED** — a warning, not a failure); and path-1
+drift outside the heal bound — a developer's pre-set DSN, a bespoke
+remote DB, or any other self-hosted box the guard cannot prove is
+disposable CI infrastructure — which is only **reported**, never healed
+or failed. Locally the tests still skip when `YUZU_TEST_POSTGRES_DSN` is
+unset; when it is set but unreachable they fail rather than skip.
 
 On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
 pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,

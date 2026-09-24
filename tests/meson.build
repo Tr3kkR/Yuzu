@@ -2454,6 +2454,17 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 30,
   )
+  # The glue around pg-durability.sh's pure functions — ensure-postgres.sh's
+  # psql resolution ladder, per-agent probe-and-fallback, no-fallback rule
+  # and fail arms — driven through a FAKE psql (canned rows/exit codes, no
+  # database, no network, milliseconds) rather than the decide function in
+  # isolation above.
+  test('pg durability p1 glue selftest',
+    _bash_test,
+    args: [files('../scripts/ci/ensure-postgres-p1-selftest.sh')],
+    suite: 'docs',
+    timeout: 60,
+  )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
   # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.

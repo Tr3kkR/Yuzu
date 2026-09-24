@@ -816,6 +816,7 @@ Check 'the authenticated PostgreSQL probe uses the bounded process primitive' {
   $psqlAt = $assertText.IndexOf('if($c.psql')
   if($psqlAt -lt 0){ return $false }
   $boundedAt = $assertText.IndexOf('Invoke-YuzuContractProbe', $psqlAt)
+  if($boundedAt -lt 0){ return $false }
   $timeoutAt = $assertText.IndexOf('-TimeoutSeconds ([int]$contract.probe_timeout_seconds)', $boundedAt)
   $boundedAt -gt $psqlAt -and $timeoutAt -gt $boundedAt
 }
@@ -841,7 +842,12 @@ Check 'the settings fingerprint never fails the assertion' {
   $clusterOkAt = $assertText.IndexOf('if($clusterOk)', $probeAt)
   if($clusterOkAt -le $probeAt){ return $false }
   $span = $assertText.Substring($probeAt, $clusterOkAt - $probeAt)
-  $span -notmatch '\$fail\+\+'
+  # A catch inside the span implies the enclosing try (a try with no catch
+  # is a parse error the file's own parse-validity Check already catches
+  # above), so this also proves the probe is still guarded, not merely
+  # that $fail is untouched — deleting the try/catch around the fingerprint
+  # would otherwise still pass this Check.
+  ($span -notmatch '\$fail\+\+') -and ($span -match '\}\s*catch\s*\{')
 }
 Check 'the CI psql export is opt-in and agent-guarded' {
   $assertText = Get-Content -LiteralPath $AssertPath -Raw
@@ -851,7 +857,24 @@ Check 'the CI psql export is opt-in and agent-guarded' {
   if($matchAt -lt 0){ return $false }
   $writeAt = $assertText.IndexOf('YUZU_CI_PSQL=', $matchAt)
   $occurrences = @([regex]::Matches($assertText, [regex]::Escape('YUZU_CI_PSQL='))).Count
-  $writeAt -gt $matchAt -and $occurrences -eq 1 -and $assertText -match '\[switch\]\$ExportCiEnv'
+  if(-not ($writeAt -gt $matchAt -and $occurrences -eq 1)){ return $false }
+  # Assert via the AST, not a file-wide text match, that [switch]$ExportCiEnv
+  # is declared IN THE PARAM BLOCK (a match anywhere in the file, e.g. a
+  # comment or a string, would satisfy a bare -match).
+  $assertTokens = $null
+  $assertParseErrors = $null
+  $assertAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path -LiteralPath $AssertPath).Path, [ref]$assertTokens, [ref]$assertParseErrors)
+  if($assertParseErrors.Count -gt 0){ return $false }
+  $exportParam = @($assertAst.ParamBlock.Parameters) | Where-Object {
+    $_.Name.VariablePath.UserPath -eq 'ExportCiEnv'
+  } | Select-Object -First 1
+  if(-not $exportParam){ return $false }
+  $isSwitch = @($exportParam.Attributes) | Where-Object {
+    $_ -is [System.Management.Automation.Language.TypeConstraintAst] -and
+    $_.TypeName.Name -eq 'switch'
+  }
+  [bool]$isSwitch
 }
 Check 'ci.yml passes the CI psql export switch to the Windows manifest assertion' {
   $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw

@@ -181,7 +181,11 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   **agent-0** DSN; `scripts/ci/ensure-postgres.sh` derives "base port + agent
   index" from the runner's `-<n>` name suffix at job time and probes before
   switching, falling back to the shared agent-0 cluster with a `::warning` if
-  a per-agent cluster is missing. Rationale: 4 concurrent jobs sharing one
+  a per-agent cluster is missing **on an unprovisioned box** (its psql came
+  from PATH, or there is none) — once the toolchain manifest vouches for the
+  agent's own `psql` (`YUZU_CI_PSQL`, #2167 follow-up below), a per-agent
+  probe failure fails the job instead of falling back. Rationale: 4
+  concurrent jobs sharing one
   cluster mutually DoS their `[pg]` server suites through the shared
   WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
   wrapper change is involved — re-running the provisioning script is the whole

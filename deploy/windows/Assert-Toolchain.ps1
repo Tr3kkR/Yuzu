@@ -10,19 +10,22 @@
   visible in seconds instead of as a 700 s [pg]-shard TIMEOUT (#2167 follow-
   up) — this never affects $fail; SELECT 1 remains the health gate.
 
-  Run it (a) at the end of provisioning, and (b) as a registration / preflight
-  gate, so a mis-provisioned box fails in SECONDS rather than 90 minutes into a
-  build. This is the catch for the cutover faults (toolchain off PATH, MSYS2
-  /usr/bin missing, gateway escript/rebar3 unresolved).
+  Run it (a) at the end of provisioning, (b) as a registration / preflight
+  gate, and (c) by Start-PinnedRunner.ps1 at runner start (where the
+  fingerprint above also prints, without -ExportCiEnv), so a mis-provisioned
+  box fails in SECONDS rather than 90 minutes into a build. This is the catch
+  for the cutover faults (toolchain off PATH, MSYS2 /usr/bin missing, gateway
+  escript/rebar3 unresolved).
 
   -ExportCiEnv (passed only by ci.yml's windows job, which has a pg step)
   additionally exports YUZU_CI_PSQL to $env:GITHUB_ENV for THIS runner's own
   agent, read from the same manifest this script just validated — the
   contract scripts/ci/ensure-postgres.sh's durability conformance guard
   relies on to resolve a proven psql.exe instead of an unauthenticated TCP
-  probe. Provision-Windows-Runner.ps1's own children (Update-ToolchainManifest
-  .ps1, Test-ToolchainContract.ps1) also run under Actions with GITHUB_ENV
-  set, so this must stay opt-in — never write the job env unless asked.
+  probe. The sibling scripts Provision-Windows-Runner.ps1 deploys alongside
+  this one (Update-ToolchainManifest.ps1, Test-ToolchainContract.ps1) also
+  run under Actions with GITHUB_ENV set, so this must stay opt-in — never
+  write the job env unless asked.
 
   Exit 0 = healthy; exit 1 = an incompatible manifest, a version mismatch,
   or at least one required tool/env item missing.
