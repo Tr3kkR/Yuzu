@@ -62,6 +62,7 @@ tus=(
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/app_control/src/app_control_plugin.cpp
     agents/plugins/app_control/src/app_control_win.cpp
+    agents/plugins/platform_security/src/platform_security_win.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
