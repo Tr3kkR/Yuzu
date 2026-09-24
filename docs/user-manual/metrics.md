@@ -1565,10 +1565,13 @@ The M1 flood-guard telemetry ([Guaranteed State](guaranteed-state.md)'s errored-
 staleness/priority-lane backstops), the #2993 outbox-backpressure signal, and the
 #4783 legacy-sink loss-visibility pair: 6 sparse counters rolled up as an
 **unlabelled fleet sum**, same absent-not-zero rule and same forged-value posture as
-the journal family above - a healthy or inert (`prefer_spark` off) fleet reads all
-six **absent**, never a fabricated `0`. **Monitor-only**, same reasons as the journal
-family: no churn-robust alert form exists over an unlabelled fleet sum of per-agent
-cumulative counters.
+the journal family above - a healthy fleet reads all six **absent**, never a
+fabricated `0`. An **inert** (`prefer_spark` off) fleet reads only the four M1/outbox
+gauges absent - the two `_legacy_sink_*` gauges are **always live regardless of the
+Spark flip** (the legacy `IGuard` sink is the current production detection path, see
+the row below) and CAN fire in that mode. **Monitor-only**, same reasons as the
+journal family: no churn-robust alert form exists over an unlabelled fleet sum of
+per-agent cumulative counters.
 
 | Metric | Type | Description |
 |---|---|---|

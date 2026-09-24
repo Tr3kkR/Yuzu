@@ -107,11 +107,15 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "throwing send; excludes the pre-network-arm drop and the stop()-time backlog discard, "
      "which are not loss of already-committed guard state. Always live regardless of the "
      "Spark flip (prefer_spark) - the legacy IGuard sink is the current production path. "
-     "MONOTONIC AND RESTART-DURABLE (#4783 Gate 4 UP-3): the agent persists this counter "
-     "(and the open-gap ledger below) to its own KvStore and restores it at boot, so a mid-"
-     "outage agent restart does not reset it back to 0 - only the raw lost EVENT content is "
-     "not durable (docs/spark-legacy-delta-registry.md D13). MONITOR-ONLY, same posture as "
-     "the rest of this family"},
+     "MONOTONIC PER AGENT AND RESTART-DURABLE (#4783 Gate 4 UP-3): each agent persists its "
+     "own counter (and the open-gap ledger below) to its own KvStore and restores it at boot, "
+     "so a mid-outage agent restart does not reset that agent's own value back to 0 - only "
+     "the raw lost EVENT content is not durable (docs/spark-legacy-delta-registry.md D13). "
+     "The EXPORTED FLEET SUM above is still cleared and rebuilt every sweep like the rest of "
+     "this family (not itself monotonic) - it drops when a reporting agent leaves the "
+     "retained set, same as every other gauge here; per-agent durability is what survives a "
+     "RESTART, not what the fleet aggregate does across a sweep. MONITOR-ONLY, same posture "
+     "as the rest of this family"},
     {"yuzu.guardian_legacy_sink_gap_rules", "yuzu_fleet_guardian_legacy_sink_gap_rules",
      "Fleet sum of rules whose SERVER-SIDE CENSUS may be stale because the agent's last "
      "drift/compliance report for that rule was lost and has not yet been confirmed repaired "
@@ -119,12 +123,15 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "yuzu_fleet_guardian_legacy_sink_events_lost for that). The agent self-heals this every "
      "heartbeat (GuardianEngine::legacy_sink_kick()) by synthesizing a guard.unhealthy report "
      "for each open gap; a persistently non-zero sum means repairs are also failing to "
-     "deliver, not just the original reports. MONOTONIC-PER-GAP AND RESTART-DURABLE (#4783 "
-     "Gate 4 UP-3): the agent persists its open-gap ledger to its own KvStore and restores it "
-     "at boot, so a mid-outage agent restart no longer reads as a false \"resolved\" the way "
-     "a genuine repair would (docs/spark-legacy-delta-registry.md D13) - an interior loss can "
-     "still self-clear on a later successful event with no repair ever firing (D13's Gate 4 "
-     "UP-4, an accepted trade-off, not a bug in this gauge). MONITOR-ONLY, same posture as "
+     "deliver, not just the original reports. RESTART-DURABLE PER AGENT (#4783 "
+     "Gate 4 UP-3): each agent persists its own open-gap ledger to its own KvStore and "
+     "restores it at boot, so a mid-outage agent restart no longer reads as a false "
+     "\"resolved\" the way a genuine repair would (docs/spark-legacy-delta-registry.md D13) - "
+     "an interior loss can still self-clear on a later successful event with no repair ever "
+     "firing (D13's Gate 4 UP-4, an accepted trade-off, not a bug in this gauge). The "
+     "EXPORTED FLEET SUM above is still cleared and rebuilt every sweep like the rest of this "
+     "family (not itself monotonic) - per-agent durability is what survives a RESTART, not "
+     "what the fleet aggregate does across a sweep. MONITOR-ONLY, same posture as "
      "the rest of this family"},
 };
 
